@@ -8,6 +8,36 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
+
+Auditing the caps above surfaced three defects on the same handlers. All three are
+**pre-existing** — none is introduced or worsened by the X9 work, which in each case
+narrowed the surface — so they are documented here and left for their own changes
+rather than folded into this branch.
+
+- `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` (**HIGH**) — `recv_fs_max_bytes` bounds the
+  *compressed* body; `RecvFS` then inflates each packed object with an unbounded
+  `io.ReadAll(zlibReader)`. Measured `compress/zlib` at `BestCompression` over a run of
+  identical bytes: 1005:1 at 1 MiB, 1028:1 at 16 MiB, 1029:1 at 128 MiB. So a 128 KiB request
+  inflates to ~128 MiB and one at the body cap to ~126 GiB. The buffered body is not this
+  handler's dominant allocation.
+- `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` (**HIGH**) — the derived id caps
+  (`maxPackFSIDs`/`maxCheckFSIDs`, 409,200) were derived against one axis, *never reject a
+  well-formed body*, and are silent on what an accepted list costs. Nothing deduplicates it,
+  so ~409k repeats of one valid id is a well-formed request: `PackFS` issues a sequential
+  Cassandra read per id and materializes every record in one `bytes.Buffer` before writing,
+  on `PermissionR` alone. `CheckFS` shares the per-id read (its map only translates ids) but
+  not the buffer. For contrast `check-blocks` caps ids at 100,000, picked as a work bound
+  when X11 closed, and bounds its lookup fan-out; these two allow 4x that with neither.
+- `ISSUE-RECVFS-FSID-UNVERIFIED-01` (**unrated, open question**) — `RecvFS` stores the
+  client-supplied `fs_id` without checking it hashes the content, while the download path is
+  integration-tested to require exactly that. Filed as a question rather than a defect
+  because SesameFS deliberately maintains a stored-vs-computed id mapping, so a naive
+  `fs_id == SHA-1(body)` check would reject writes the design intends to accept. The contract
+  has to be settled before anyone adds the check.
+
+---
+
 ## 2026-08-12 - Legacy batch move returns 501 instead of a false success (ISSUE-BATCH-MOVE-FALSE-SUCCESS-01)
 
 - `FileHandler.moveBatchFiles` in `internal/api/v2/files.go` (reached when the legacy
@@ -63,9 +93,16 @@ Session-by-session development history for SesameFS.
   all four; deliberately not pinning any "positive path" body shape for `PackFS`/`RecvFS` that
   would depend on incidental parser behavior rather than the size gate itself. Plus
   `TestFSIDCapsCannotCutWellFormedBodies` (the derivation invariant, asserted arithmetically)
-  and `TestFSIDCountCapsCutAmplification` (the degenerate body is refused at 50.6 MB against
-  the same 96 MB ceiling the `check-blocks` canary uses), and `TestEnvOverrideRecvFSMaxBytes`
-  in `internal/config/config_test.go` for the config contract.
+  and `TestFSIDCountCapsCutAmplification` (the degenerate body is refused, and the parse costs
+  16.0 MB — just its `string(body)` — against the same 96 MB ceiling the `check-blocks` canary
+  uses), and `TestEnvOverrideRecvFSMaxBytes` in `internal/config/config_test.go` for the config
+  contract.
+- That canary measures the **parser**, not a round trip, and the 413 is asserted separately
+  through the handler with no allocation measurement. The first version wrapped
+  `r.ServeHTTP` and reused the 96 MB ceiling anyway, which silently included
+  `readLimitedRequestBody`'s own 16 MiB read (~32 MiB cumulative as `io.ReadAll` doubles) —
+  a cost the ceiling was never derived for. It fit on go1.26/windows at 50.6 MB and failed
+  in the `gotest` container on go1.25/linux at 113.9 MB. Two claims, two windows.
 - `TestRecvFSBoundsBodySize` no longer pushes a 128 MiB body through HTTP to prove the default
   cap. That cost ~404 MB of allocation (~128 MiB body + ~269 MB of `io.ReadAll` growth), four
   times the 96 MB ceiling this same file treats as a failure condition elsewhere, and proved

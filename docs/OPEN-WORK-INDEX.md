@@ -138,6 +138,8 @@ on every replica in every DC until both close.
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
+| `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
+| `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |

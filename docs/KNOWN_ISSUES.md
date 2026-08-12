@@ -6581,8 +6581,13 @@ matters: the densest well-formed body the byte cap admits carries exactly the ca
 in ids, so the id cap is unreachable for real traffic and can only fire on
 degenerate input — it is not a new limit on large libraries.
 `TestFSIDCapsCannotCutWellFormedBodies` pins that invariant arithmetically;
-`TestFSIDCountCapsCutAmplification` measures the rejected path at 50.6 MB
-against a 96 MB ceiling.
+`TestFSIDCountCapsCutAmplification` asserts the 413 through the handler and,
+separately, measures the parse at 16.0 MB — just its `string(body)` — against the
+same 96 MB ceiling the `check-blocks` canary uses. The two are separate on purpose:
+an allocation canary wrapped around a whole round trip also measures
+`readLimitedRequestBody`'s 16 MiB read, which the ceiling was never derived for and
+which varies enough by platform to make a shared threshold meaningless (50.6 MB on
+go1.26/windows, 113.9 MB on go1.25/linux, same code).
 
 **Scope of the fix, precisely:** this closes the **unbounded body per request**
 and the id-list amplification within it. Two things it does **not** do, both now
@@ -6597,12 +6602,81 @@ tracked rather than left implicit:
   128 MiB body can inflate to ~126 GiB. The buffered body is not this handler's
   largest allocation, and reading this entry as "recv-fs memory is now bounded"
   would be wrong (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`).
+- **The derived id caps are not a work bound.** They were derived against one axis
+  only — never reject a well-formed body — and are silent on what an accepted list
+  costs. Nothing deduplicates it, so ~409,000 repeats of one valid id are a
+  well-formed request; `pack-fs` materializes the whole response for it. For
+  contrast, `check-blocks` caps ids at 100,000, chosen as a work bound. Tracked as
+  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
 
 #### Related Docs
 
 - `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md` (X9, and X10/X11 for what a cap is not)
 - `docs/GC-UPLOAD-FENCE-PR-PLAN.md` (PR-10 scope)
 - `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate bound this fix does not provide)
+
+---
+
+### ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01: `pack-fs`/`check-fs` bound the parse, not the work it triggers
+
+**Status**: 🟡 Open — found 2026-08-12 auditing the X9 caps
+**Severity**: High for `pack-fs` (one request can materialize a multi-GiB response), Medium for `check-fs`
+**Affected**: `PackFS`, `CheckFS` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12; the fs-id equivalent of `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` (X11)
+
+#### Problem
+
+`maxPackFSIDs`/`maxCheckFSIDs` (409,200) are derived from the 16 MiB byte caps so
+they can never cut a well-formed body — see `ISSUE-SYNC-UNBOUNDED-BODIES-01`. That
+derivation was chosen against exactly one axis, *do not reject real traffic*, and is
+silent on a second: **the work an accepted list triggers**. Nothing deduplicates the
+list, so a well-formed request may repeat one valid fs id ~409,000 times.
+
+`PackFS` is the severe half. Per requested id it issues one sequential Cassandra
+point read, marshals and zlib-compresses the object, and appends it to a single
+`bytes.Buffer`, which is only handed to `c.Data` once the whole loop finishes — so
+the entire response is materialized in memory. With a repeated id, response size is
+`409,200 × (that object's compressed size)`: ~80 MiB for a small file object, and
+multiple GiB if the repeat target is a large directory. It requires only
+`PermissionR`.
+
+`CheckFS` shares the fan-out but not the buffer: the per-id check is a Cassandra
+query, **not** a lookup in the `computedToStored` map (the map only translates the
+id), so an accepted list is ~409,000 sequential point reads holding the handler.
+`buildFSIDMapping` is per-request, not per-id, so it is not the amplifying term.
+
+The comparison that makes this concrete: `check-blocks` caps ids at **100,000**
+(`DefaultCheckBlocksMaxIDs`), a number picked as a work bound when X11 closed, and
+also bounds its lookup concurrency (`checkBlocksLookupFanout`). These two routes
+allow **4x** that with no fan-out bound at all.
+
+None of this is new in the X9 fix — before it, both routes had no body cap and
+therefore no id bound whatsoever, so the current state is strictly better. It is
+filed because the X9 caps should not be mistaken for a work bound.
+
+#### Fix Direction
+
+Three things, in increasing order of how much they need measuring first:
+
+1. **Deduplicate** the requested list. Cheap and the largest single win against the
+   repeated-id shape. Confirm first that returning one entry for a duplicated id
+   does not break the official client's pack-fs framing — the response is a stream
+   of `(id, size, data)` records and a client indexing by id will not care, but that
+   should be verified, not assumed.
+2. **Bound the response**, by size rather than only by id count, and prefer
+   streaming each record to `c.Writer` over accumulating `buf`. A cap on the
+   materialized response is the only thing that bounds the large-directory case.
+3. **Re-derive the id caps against work**, the way `check-blocks` was, rather than
+   against "the densest body the byte cap admits". That likely means a lower cap
+   plus a fan-out bound, and it needs the same measurement
+   `ISSUE-SYNC-METADATA-CONCURRENCY-01` calls for: what the official client
+   actually requests per pack-fs/check-fs.
+
+#### Related Docs
+
+- `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` / registry X11 (the same defect on the block route, closed — its resolution is the template)
+- `ISSUE-SYNC-UNBOUNDED-BODIES-01` (where the 409,200 caps come from, and why they are derived that way)
+- `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; this issue is per-request)
 
 ---
 
@@ -6652,11 +6726,70 @@ set a per-object cap with real headroom. Until then, note that the compressed bo
 cap does bound *how much work* an attacker gets per request — it just does not bound
 the memory that work allocates.
 
+When it is implemented, `io.LimitReader(zlibReader, max)` alone is not the fix:
+reading `max` and accepting what came back silently truncates. Read `max+1` (or
+check for a trailing byte) and **reject the object**, because a truncated fs object
+would be stored under an `fs_id` its stored body no longer corresponds to.
+
 #### Related Docs
 
 - `ISSUE-SYNC-UNBOUNDED-BODIES-01` (the body cap this sits behind)
 - `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; N concurrent inflates)
+- `ISSUE-RECVFS-FSID-UNVERIFIED-01` (the same handler trusts the id it stores)
 - `docs/SEAFILE-SYNC-PROTOCOL-RFC.md` §5.6.1 (the packed-object wire format)
+
+---
+
+### ISSUE-RECVFS-FSID-UNVERIFIED-01: `recv-fs` stores the client's fs_id without checking it addresses the content
+
+**Status**: 🟡 Open — **question, not a diagnosed defect**; establish the Seafile contract before anyone "fixes" it
+**Severity**: Unrated pending that answer — either content-addressing integrity, or by design
+**Affected**: `RecvFS` in `internal/api/sync.go`
+**Source of record**: opened 2026-08-12 during the X9 audit
+
+#### Problem
+
+`RecvFS` takes the 40 bytes the client supplies, decompresses the object body, and
+inserts `fs_objects(library_id=repoID, fs_id=<client-supplied>, …)`. It never
+recomputes `SHA-1(jsonData)` to confirm the id addresses the content it is filed
+under. The handler's own comment asserts the invariant it does not check: *"the
+fs_id is the SHA1 hash of the exact JSON content"*. The only `sha1.Sum` calls in
+this package are on the web-upload path in `seafhttp.go`, not here.
+
+On the read side the id *is* treated as content-addressed:
+`internal/integration/sync_protocol_regression_test.go` records that the served JSON
+"must re-hash to the requested fs_id (otherwise the desktop client rejects the
+object)". Nothing enforces the same on the write side.
+
+#### Fix Direction
+
+Not "add a hash check". The obvious fix — recompute and reject on mismatch — is very
+likely **wrong here**, and that is the point of filing this as a question.
+
+SesameFS deliberately maintains a *stored* fs id that differs from the *computed*
+one. `CheckFS` says so directly ("Client sends COMPUTED fs_ids (SHA-1 of corrected
+JSON), but we store objects with their ORIGINAL (stored) fs_ids"), and
+`buildFSIDMapping`/`collectCorrectedObjects` exist to translate between them. A
+strict `fs_id == SHA-1(body)` check in `RecvFS` would reject writes this design
+intends to accept.
+
+So the real question is which of these is true, and the answer decides everything:
+
+- the id is genuinely content-addressed and the mapping layer compensates for a
+  historical divergence — in which case verification belongs here, and its absence
+  means a client can file arbitrary content under an id another client will later
+  fetch by hash; or
+- the id is a client-chosen key that this deployment never treated as a hash — in
+  which case the comments asserting otherwise are the bug, and they should be
+  corrected before someone adds a check that breaks sync.
+
+Answer that from the Seafile protocol contract and the mapping layer's history
+first. Do not add a hash check on the strength of this entry alone.
+
+#### Related Docs
+
+- `docs/SEAFILE-SYNC-PROTOCOL-RFC.md` §5.6.1 (the wire format and its id definition)
+- `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` (same handler, unrelated cause)
 
 ---
 

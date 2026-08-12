@@ -402,9 +402,23 @@ func TestFSIDCapsCannotCutWellFormedBodies(t *testing.T) {
 // ~16.7M ids, ~268 MB). Both routes now share check-blocks' bounded parser, so
 // the list is refused during the parse instead of after it is materialized.
 //
-// Same allocation-canary caveats as TestParseCheckBlockIDsRejectsBeforeMaterializing:
-// TotalAlloc is process-global, so this must never be made parallel, and a failure
-// under a new Go version should be read as "re-measure the headroom" first.
+// Two claims, deliberately measured separately, because they need different
+// windows and conflating them is how the first version of this test broke:
+//
+//   - the *handler* answers 413 on a body the byte cap already admits. Asserted
+//     through a real round trip, with no allocation measurement — the round trip's
+//     cost is dominated by readLimitedRequestBody's own 16 MiB read (~32 MiB
+//     cumulative as io.ReadAll doubles) plus the parser's string(body), none of
+//     which is what this test is about, and all of which varies enough by Go
+//     version and platform to make a shared threshold meaningless. Measured at
+//     50.6 MB on go1.26/windows and 113.9 MB on go1.25/linux for the same code.
+//   - the *parser* refuses without materializing the list. Asserted on
+//     parseBoundedIDList directly, which is the same window — and therefore the
+//     same 96 MB threshold — as TestParseCheckBlockIDsRejectsBeforeMaterializing.
+//
+// Same allocation-canary caveats as that test: TotalAlloc is process-global, so
+// this must never be made parallel, and a failure under a new Go version should be
+// read as "re-measure the headroom" before "the cap regressed".
 func TestFSIDCountCapsCutAmplification(t *testing.T) {
 	// A body at the byte cap made of bare newlines: ~1 byte per id, the worst
 	// case, and one TrimSpace cannot collapse because both ends are non-space.
@@ -414,12 +428,13 @@ func TestFSIDCountCapsCutAmplification(t *testing.T) {
 		name    string
 		route   string
 		handler func(*SyncHandler) gin.HandlerFunc
+		spec    idListSpec
 		byteCap int
 	}{
-		{"pack-fs", "/seafhttp/repo/:repo_id/pack-fs", func(h *SyncHandler) gin.HandlerFunc { return h.PackFS }, maxPackFSBodyBytes},
-		{"check-fs", "/seafhttp/repo/:repo_id/check-fs", func(h *SyncHandler) gin.HandlerFunc { return h.CheckFS }, maxCheckFSBodyBytes},
+		{"pack-fs", "/seafhttp/repo/:repo_id/pack-fs", func(h *SyncHandler) gin.HandlerFunc { return h.PackFS }, packFSIDListSpec(), maxPackFSBodyBytes},
+		{"check-fs", "/seafhttp/repo/:repo_id/check-fs", func(h *SyncHandler) gin.HandlerFunc { return h.CheckFS }, checkFSIDListSpec(), maxCheckFSBodyBytes},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.name+" handler answers 413", func(t *testing.T) {
 			r := setupSyncTestRouter()
 			h := &SyncHandler{}
 			r.POST(tc.route, tc.handler(h))
@@ -428,23 +443,36 @@ func TestFSIDCountCapsCutAmplification(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, strings.Replace(tc.route, ":repo_id", "repo", 1), strings.NewReader(body))
 			req.ContentLength = int64(len(body))
 			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("degenerate body at the byte cap = %d, want 413; body=%s", w.Code, w.Body.String())
+			}
+		})
+
+		t.Run(tc.name+" parse does not materialize", func(t *testing.T) {
+			// Built outside the window on purpose: strings.Repeat plus the
+			// concatenation is ~32 MiB that has nothing to do with the parser.
+			body := []byte(degenerate(tc.byteCap))
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 
 			var m1, m2 runtime.MemStats
 			runtime.ReadMemStats(&m1)
-			r.ServeHTTP(w, req)
+			_, ok := parseBoundedIDList(c, body, tc.spec)
 			runtime.ReadMemStats(&m2)
 
-			if w.Code != http.StatusRequestEntityTooLarge {
-				t.Fatalf("degenerate body under the byte cap = %d, want 413; body=%s", w.Code, w.Body.String())
+			if ok || w.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("ok=%v code=%d, want rejected 413", ok, w.Code)
 			}
-			// Same 96 MB threshold the check-blocks canary uses: comfortably above
-			// the unavoidable cost (the body plus its string conversion, ~16 MiB
-			// each) and far below the ~268 MB a materializing parse would spend.
+			// Generous headroom over the unavoidable cost (string(body), ~16 MiB)
+			// while still far below the ~268 MB a materializing parse would spend.
 			const maxAllocBytes = 96 * 1024 * 1024
 			allocated := m2.TotalAlloc - m1.TotalAlloc
 			t.Logf("body=%d bytes, allocated %.1f MB", len(body), float64(allocated)/(1024*1024))
 			if allocated > maxAllocBytes {
-				t.Fatalf("allocated %.1f MB on a rejected body, want < %d MB: the id cap is being applied after the list is materialized",
+				t.Fatalf("allocated %.1f MB parsing a rejected body, want < %d MB: the id cap is being applied after the list is materialized",
 					float64(allocated)/(1024*1024), maxAllocBytes/(1024*1024))
 			}
 		})
