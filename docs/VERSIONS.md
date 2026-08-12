@@ -41,8 +41,8 @@ This document tracks the versions of all major dependencies and frameworks used 
 ## Backend (Go)
 
 ### Core
-- **Go**: `1.21` (check go.mod for exact version)
-- **Echo**: (check go.mod for version)
+- **Go**: `1.25.12` (`go.mod`; build image `golang:1.25.12-trixie`)
+- **Gin**: `v1.11.0` (`go.mod`) — this project uses Gin, not Echo
 
 ### Database
 - **Cassandra**: `5.0.9` (target; Compose files still require exact image/digest pinning before acceptance)
@@ -60,8 +60,8 @@ This document tracks the versions of all major dependencies and frameworks used 
 ## Docker
 
 ### Base Images
-- **Frontend**: `node:18-alpine` → `nginx:alpine` (multi-stage build)
-- **Backend**: `golang:1.21-alpine` → `alpine:latest` (multi-stage build)
+- **Frontend**: `node:22-bookworm` → `nginx:alpine` (multi-stage build, `frontend/Dockerfile`)
+- **Backend**: `golang:1.25.12-trixie` → `debian:trixie-slim` (multi-stage build, `Dockerfile`)
 - **Cassandra**: `cassandra:5.0.9` (pin the exact digest for production/acceptance)
 - **MinIO**: (check docker-compose.yaml)
 
@@ -114,7 +114,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 cd frontend && npm list react react-dom bootstrap reactstrap
 
 # Backend versions
-go list -m all | grep -E "echo|cassandra|minio"
+go list -m all | grep -E "gin-gonic|gocql|aws-sdk-go-v2"
 
 # Docker image versions
 docker-compose images

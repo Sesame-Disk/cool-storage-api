@@ -620,12 +620,12 @@ be reconsidered.
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| **Go** | 1.25.5 | Latest stable |
+| **Go** | 1.25.12 | Matches go.mod and the build image |
 | **Debian** | Trixie 13 slim | `debian:trixie-slim` |
 | **Cassandra** | 5.0.9 | Latest |
 | **gocql driver** | v2.0.0 | Apache official driver |
 | **aws-sdk-go-v2** | v1.41.0 | Latest |
-| **Gin** | v1.10.0 | HTTP framework |
+| **Gin** | v1.11.0 | HTTP framework |
 
 ---
 

@@ -405,6 +405,144 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR revision r3: the abort must fence what it rolls back
+
+Design-document changes only. No runtime code changed, X1/X2 remain open, and
+destructive GC remains disabled fleet-wide. This is a **protocol revision**, not an
+editorial pass: an implementation written against r2 is not compliant with r3.
+
+Two external reviews of r2 produced four findings; all four were reproduced against
+this branch's tree before being acted on. A third claim — that the first three had
+already been fixed — was **not** reproducible: every one of them was still present at
+`f9b0b1e77`.
+
+The whole of the protocol change is in the quarantine resolution's **abort**. r2 let an
+operator abandon a `RESOLVING` resolution by reading canonical state and writing
+`REJECTED`; that was insufficient three times over, and the three failures compose into
+one wedge — a block that no writer can use, that no work row drives, and whose only
+exit is manual.
+
+- **It classified from an ordinary read (correction 168).** Nothing in that sequence
+  invalidates the resolver being undone, and there are two of them: a **live** resolver
+  whose pointer CAS names only `(G, E, active_state, Cq, Nq, QUARANTINE)`, none of
+  which the rollback changes, so it applies afterwards; and a **dead** resolver whose
+  pointer LWT was accepted by part of the Paxos cohort and never learned, which a later
+  LWT replays. Both end at a live pointer over a `QUARANTINED` generation with terminal
+  `REJECTED` work. This is corrections 63 and 139 applied to an administrative
+  decision: an ordinary read never settles a Paxos proposal, and settlement is not
+  revocation.
+- **It fenced at most one of the two partitions a resolution writes to (correction
+  174).** The pointer takeover invalidates every statement naming the quarantine claim,
+  but the `QUARANTINED -> null` clear names no pointer column and by correction 68 may
+  not, since nothing writes `retire_claim_*` to `block_generations`. A resolver stalled
+  just before its clear therefore survived the fence: the abort saw `gc_state` still
+  `QUARANTINED`, took the "nothing to undo" branch, wrote `REJECTED`, and the resolver
+  then cleared the quarantine into a terminal work row — fenced pointer,
+  `gc_state = null`, contradiction unrecorded. `block_generations` now carries a
+  monotonic `resolution_epoch`, fixed by the `RESOLVING` record, named by the clear,
+  and bumped by the abort in **both** rollback branches. It is not a correction-68
+  violation for the reason correction 68 states: the column is written by that table's
+  own transitions, so the condition is satisfiable.
+- **It left no durable record of the abort itself (correction 173).** After the fences
+  the work still read `RESOLVING` with `decision = FALSE_POSITIVE`, a fenced pointer
+  and a changed claim — which is *also* what an ordinary `retire_claim_deadline`
+  takeover of a genuinely live resolution looks like, since takeover preserves the kind
+  and is expected to be followed by the resolution continuing. A scanner resuming that
+  row does what `RESOLVING` tells it to and continues the resolution just abandoned,
+  re-reading the live claim so the abort's own fence becomes the claim it matches. A
+  new `ABORTING` work state is confirmed **before** the settlement and before either
+  fence; an `ABORTING` row is resumed only as an abort. Correction 163 one level down:
+  the authorization to undo needs the same durability as the authorization to act.
+
+A fourth round found two more, both in the machinery the previous three had just added:
+
+- **The fence counter was never actually written (correction 175).** `resolution_epoch`
+  was documented as initialized to 0 by the `null -> QUARANTINED` transition, but that
+  transition's canonical CQL does not write the column — so `RESOLVING` could capture
+  `Rr = null` and the abort had no defined `Rr + 1`. Correction 92's rule about
+  projections, applied to a column: a value named only in prose is written by nothing.
+  Adding it to the quarantine `SET` clause would have been the wrong repair, for
+  correction 75's reason: a generation can be quarantined, resolved and quarantined
+  again, so a per-quarantine counter **resets**, and a stale first-cycle clear naming
+  `Rr = 0` would find `0` again and apply — an ABA on the fence built to stop an ABA.
+  It is now initialized once by the `MATERIALIZING` intent and written by nothing but
+  an abort.
+- **The abort classified two of four reachable `gc_state` values (correction 176).**
+  This design deliberately lets a delete authorization obtained under a pre-quarantine
+  claim survive quarantine and recertification, so `QUARANTINED -> null` followed by a
+  stalled worker's `DELETING` CAS is legal — and an abort requested afterwards fell
+  through every branch and stranded recovery in `ABORTING` forever. Neither existing
+  branch is usable: restoring `QUARANTINED` regresses an authorized, irrevocable delete
+  against a possibly half-removed object, one of the three shortcuts When The Physical
+  Delete Keeps Failing forbids; and "nothing to undo" reports a retained quarantine
+  that does not exist. The abort now performs no generation-row mutation, terminates as
+  `REJECTED` recording why, leaves the pointer fenced and the delete work running, and
+  alerts. Nothing unsafe has happened — G1 reached `RETIRED`, authority can never be
+  reacquired, the delete was correct regardless — but whether the block may have a G2
+  is now a fresh human decision, which is what the workflow exists to route.
+
+The abort therefore records `RESOLVING -> ABORTING`, serially settles the `blocks`
+partition, fences both partitions at `SERIAL + ALL`, and only then rolls back — or,
+where the delete already advanced, declines to roll back at all.
+- The takeover epoch `Nf` must exceed both the live claim epoch and any prospective
+  epoch fixed by the `RESOLVING` row. Reusing `Nq + 1` where the row already fixed
+  `Nr = Nq + 1` would leave `evidence(G1, Nr)` carrying `Cr` while the pointer carries
+  `Cf` at that same epoch — the epoch-match/claim-ID-mismatch that correction 89
+  defines as a protocol violation. The fix would otherwise have introduced its own
+  regression.
+- **Removed a contradiction that made the normative suite unsatisfiable (correction
+  169).** The verification plan still required a test asserting `RESOLVING -> REJECTED`
+  *does not apply*, eleven lines below the test asserting the state-aware abort *does*,
+  and the X2 closure list repeated it. `REJECTED` is reachable from `OPEN` directly and
+  from `RESOLVING` only through the complete settled-and-fenced abort; what the test
+  rejects is a **bare** transition that skips settlement, the fence, or the restore.
+  This is corrections 119 and 123 recurring in the section written about them.
+- **Fixed the post-commit abort branch (correction 170).** It prescribed
+  `ACTIVE -> RETIRING/QUARANTINE` unconditionally, which is right only after a
+  `RETIRING/QUARANTINE -> ACTIVE` reactivation. After a recertification the pointer
+  reads `RETIRED/GC_RETIRE` and G1 is not `ACTIVE`, so that form cannot apply and the
+  generation would stay unfenced while delete and G2 activation remain enabled. Once a
+  successor owns the pointer, G1 needs no pointer fence and has none available. All
+  three forms are now enumerated against existing mechanisms.
+- **Made a quarantined `MATERIALIZING` generation resolvable at all (correction 171).**
+  The false-positive `QUARANTINED -> null` clear conditioned on
+  `materialization_state = VERIFIED`, while the quarantine statement that creates the
+  state deliberately uses `storage_key` as its guard *because* a `MATERIALIZING`
+  generation is worth quarantining. The class the workflow most needs had an `IF`
+  clause that can never apply — correction 68's defect on a different statement. The
+  clear now matches generation/key plus quarantine operation/evidence identity, and the
+  marker is repaired to `VERIFIED` in its own write when re-verification proves the
+  object out.
+- **Froze the delete-escalation columns (correction 172).** `next_attempt_at` and
+  `escalated_at` carry the whole anti-hot-loop argument and are already asserted by a
+  verification case, but neither they nor any DLQ identity appeared in the
+  `gc_generation_deletes_by_day` shape or PR-1's freeze list. Added
+  `attempt_count`/`next_attempt_at`/`escalated_at`/`last_error` and a
+  `dlq_escalation_id` idempotent per `(org, block, generation, escalation)`.
+- Corrected the projection-family count from six to **seven**: the "six overall" figure
+  counted the five recovery tables plus the reverse-reference projection and dropped
+  `gc_provisional_generation_refs_by_day`, the inherited family correction 112 had just
+  restored after correction 101 lost it once already.
+- Fixed an off-by-one in the writer sequence: the re-check immediately before physical
+  work is step 7; step 6 is the `PENDING -> AUTHORIZED` promotion itself.
+- Re-pointed the `SimpleStrategy` citation to `docker-compose.prod.yml:176,184`. It was
+  correct against the audit baseline and invalidated by this branch's own two-line
+  `GC_ENABLED=false` insertion into that file; the baseline numbers are noted inline.
+- Corrected the version inventory this branch had touched but left stale:
+  `docs/VERSIONS.md` still claimed Go 1.21, `golang:1.21-alpine → alpine:latest` and
+  `node:18-alpine`, and named Echo — the repository uses Go 1.25.12,
+  `golang:1.25.12-trixie → debian:trixie-slim`, `node:22-bookworm`, and Gin. `README.md`
+  and `docs/ARCHITECTURE.md` said Go 1.25.5 against `go.mod`'s 1.25.12, and both docs
+  said Gin `v1.10.0` against `go.mod`'s `v1.11.0` — a stale figure this session first
+  copied forward from `ARCHITECTURE.md` and then attributed to `go.mod`, which is worse
+  than leaving it uncited. The `VERSIONS.md` version-checking command also still
+  grepped for `echo`.
+
+Verified unchanged by this revision: no Go code, no hot path, no consistency level on
+any writer operation, and no acceptance gate weakened. `git diff --check` passes.
+
+---
+
 ## 2026-08-11 - X1/X2 fence ADR accepted after final three-DC audit
 
 Design-document changes only. No runtime code changed, X1/X2 remain open, and

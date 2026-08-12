@@ -20,7 +20,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 
 | Component | Technology | Version |
 |-----------|------------|---------|
-| **Language** | Go | 1.25.5 |
+| **Language** | Go | 1.25.12 |
 | **Database** | Apache Cassandra | 5.0.9 |
 | **Object Storage** | S3-compatible | - |
 | **Archive Storage** | AWS Glacier | - |
