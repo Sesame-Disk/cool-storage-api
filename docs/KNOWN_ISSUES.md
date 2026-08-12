@@ -6590,7 +6590,7 @@ which varies enough by platform to make a shared threshold meaningless (50.6 MB 
 go1.26/windows, 113.9 MB on go1.25/linux, same code).
 
 **Scope of the fix, precisely:** this closes the **unbounded body per request**
-and the id-list amplification within it. Two things it does **not** do, both now
+and the id-list amplification within it. Three things it does **not** do, all now
 tracked rather than left implicit:
 
 - It does not bound aggregate memory under concurrency — N concurrent `RecvFS`
@@ -6754,8 +6754,12 @@ the memory that work allocates.
 
 When it is implemented, `io.LimitReader(zlibReader, max)` alone is not the fix:
 reading `max` and accepting what came back silently truncates. Read `max+1` (or
-check for a trailing byte) and **reject the object**, because a truncated fs object
-would be stored under an `fs_id` its stored body no longer corresponds to.
+check for a trailing byte) and **reject the object** — a partial decompressed object
+must not be parsed or persisted as if the complete packed object had arrived. Note
+that the reason is *not* "the stored body would no longer hash to its `fs_id`":
+whether that equality holds at all is exactly what
+`ISSUE-RECVFS-FSID-UNVERIFIED-01` leaves open, so this fix must not be justified by
+an invariant this repository has not established.
 
 #### Related Docs
 

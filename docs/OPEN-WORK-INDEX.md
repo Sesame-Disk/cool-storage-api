@@ -86,8 +86,9 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 - `ISSUE-SYNC-UNBOUNDED-BODIES-01` — **Fixed 2026-08-12** (registry X9). All four
   remaining sync handlers read through `readLimitedRequestBody`; `pack-fs` and
   `check-fs` also gained the id-count cap that stops a body under the byte cap from
-  expanding ~17x. It bounds one **compressed** body, and nothing more — the three
-  residuals are all above: the aggregate term is `ISSUE-SYNC-METADATA-CONCURRENCY-01`,
+  expanding ~17x. It bounds one request body at a time and nothing more — and for
+  `RecvFS`, only the **compressed** body at that. The three residuals are all above:
+  the aggregate term is `ISSUE-SYNC-METADATA-CONCURRENCY-01`,
   the inflate is `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`, and the work an
   accepted id list triggers is `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
 - `ISSUE-BATCH-MOVE-FALSE-SUCCESS-01` — **Fixed 2026-08-12.** Legacy same-repo batch

@@ -1467,11 +1467,14 @@ const (
 	maxCheckFSBodyBytes   = 16 * 1024 * 1024 // 16 MiB, same shape as check-blocks
 
 	// minFSIDWireBytes is the smallest on-the-wire cost of one well-formed 40-hex
-	// fs id: the 40 characters plus a single delimiter (a newline, or the "," in a
-	// JSON array). Deriving the id caps below from the byte caps above makes them
-	// unreachable for any well-formed body — 16 MiB cannot carry more ids than
-	// this — so they only ever fire on degenerate input, which is precisely the
-	// amplification they exist to stop and not a new limit on real clients.
+	// fs id, which the newline format sets: 40 characters plus one delimiter. JSON
+	// is strictly less dense — each id is also quoted, so ~43 bytes — and therefore
+	// cannot bind first; TestFSIDCapsCannotCutWellFormedBodies asserts both.
+	//
+	// Deriving the id caps below from the byte caps above makes them unreachable for
+	// any well-formed body — 16 MiB cannot carry more ids than this — so they only
+	// ever fire on degenerate input, which is precisely the amplification they exist
+	// to stop and not a new limit on real clients.
 	//
 	// Without them, a body *under* the byte cap still expands ~17x: 16 MiB of bare
 	// newlines becomes ~16.7M string headers (~268 MB). See parseBoundedIDList.
