@@ -42,8 +42,15 @@ mutation of `block_generations` — the `MATERIALIZING -> VERIFIED` repair as we
 counter is initialized by the `MATERIALIZING` intent and never by a quarantine
 transition, or it would be null on the first cycle and reset on the second
 (correction 175). The human exit after `DELETE_ALREADY_ADVANCED` is a **new** work
-identity with decision `ALLOW_SUCCESSOR_AFTER_DELETE`, never a reopen of `REJECTED`
-(correction 182). r3 also removes a
+identity with immutable `work_kind=SUCCESSOR_AFTER_DELETE` and, once authorized,
+`decision=ALLOW_SUCCESSOR_AFTER_DELETE` — never a reopen of `REJECTED`, and never an
+`OPEN` row that a scanner could mistake for "complete the quarantine" (corrections
+182 and 185). After the quarantine handoff is confirmed, every post-handoff
+`LOCAL_QUORUM` work-state read and mutation runs in the designated GC DC; operator
+requests that arrive elsewhere are routed there (correction 184). The consistency
+table no longer invents an `ABORTING -> RESOLVED` exit: once abort authority has
+linearized, the terminal work state is `REJECTED`; the ordinary lost-race finishes
+`RESOLVING -> RESOLVED` before abort authority exists (correction 186). r3 also removes a
 verification and X2-closure requirement that contradicted the abort contract and made
 the normative suite unsatisfiable (correction 169), gives the post-commit branch the
 right quarantine path for a recertified or superseded pointer (correction 170), allows
@@ -309,21 +316,21 @@ version must still be asserted by integration tests.
 | GC-owned candidate, handoff, and delete-work reads in the designated GC DC | `LOCAL_QUORUM`; these rows are produced and consumed under the single-DC GC ownership contract |
 | Existing terminal first-writer metadata LWT (initial pointer only) | Existing LWT operation, with serial phase `SERIAL` and regular commit `QUORUM` when it can touch a generation-managed `blocks` partition. The fence adds no second LWT here; `QUORUM` avoids making `paxos_state_purging=repaired` a prerequisite for a v2 `LOCAL_QUORUM` commit |
 | Rematerialization `G1 RETIRED/GC_RETIRE -> G2 ACTIVE` activation operation | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; runs inline in the materializing request; physical CAS executions may retry the same logical operation |
-| Quarantine discovery work | `LOCAL_QUORUM` in the originating writer/request path, then handed off and confirmed in the designated GC DC before any pointer/generation mutation; exact operation and contradiction identity |
+| Quarantine discovery work | `LOCAL_QUORUM` in the originating writer/request path, then handed off and confirmed in the designated GC DC before any pointer/generation mutation; exact operation and contradiction identity. After that handoff is confirmed, the row is **owned by exactly one designated GC DC** (correction 184) |
 | `ACTIVE -> RETIRING` (active pointer, `GC_RETIRE` or `QUARANTINE` claim acquisition) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; the `IF` clause must also match the observed `retire_claim_epoch` so the counter stays strictly monotonic, and the new claim kind is immutable for that epoch. `ALL` is the per-DC writer-visibility fence for both Paxos v1 and v2 |
 | `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE` (retained pointer fence) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the exact retained `G1/E1/C1/N1/GC_RETIRE` claim, increments `retire_claim_epoch` to a new quarantine epoch, and changes only claim owner/deadline/kind plus that monotonic epoch, so no later G2 activation can satisfy its `GC_RETIRE` predecessor condition |
 | Ambiguous `ACTIVE -> RETIRING` visibility reaffirmation | After `SERIAL` settlement identifies the exact `RETIRING/G/E/C/N/KIND` tuple, a second idempotent conditional write reasserts that tuple with serial phase `SERIAL` and regular commit `ALL`. No kind-specific drain starts until it applies and is acknowledged unambiguously |
 | Claim takeover after `retire_claim_deadline` | LWT serial phase `SERIAL`, regular commit `EACH_QUORUM` on `blocks`; same epoch-matching shape, replaces the owner without changing `active_state` |
 | Use-row drain, including `PENDING`, `AUTHORIZED`, and materializer uses | `EACH_QUORUM` |
 | Quarantine use drain | `EACH_QUORUM` until zero after an acknowledged `RETIRING/QUARANTINE` pointer fence; no retirement evidence, reactivation, or delete |
-| Quarantine work `OPEN -> RESOLVING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` on `gc_generation_quarantines_by_day`; matches the full quarantine operation/evidence identity, fixes the prospective `(Cr, Nr)` when applicable, and is confirmed **before** any `gc_state` or pointer mutation. `decision` is `FALSE_POSITIVE` for an ordinary false-positive resolution, or `ALLOW_SUCCESSOR_AFTER_DELETE` for a new work identity that authorizes a pointer-only successor after `DELETE_ALREADY_ADVANCED`. This is not a `blocks` partition, so a later inventoried optimization may localize its serial phase; the one-serial-domain rule does not bind it |
-| Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; the ordinary rejection path |
+| Quarantine work post-handoff reads and state mutations | After handoff confirmation — or from creation for `work_kind=SUCCESSOR_AFTER_DELETE` — every `LOCAL_QUORUM` read or conditional write on `gc_generation_quarantines_by_day` that classifies or advances `OPEN`/`RESOLVING`/`ABORTING`/`RESOLVED`/`REJECTED` MUST execute in the designated GC owner DC. Operator/API requests that arrive in any other DC MUST be routed to that owner; they MUST NOT perform the mutation in the caller DC. Successor rows are created in the owner DC; they do not use the writer-DC discovery exception. A scanner in the owner DC must never act on stale `OPEN` after an authorization that already returned (correction 184) |
+| Quarantine work `OPEN -> RESOLVING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` in the owner DC; matches the full quarantine operation/evidence identity and immutable `work_kind`, fixes the prospective `(Cr, Nr)` when applicable, and is confirmed **before** any `gc_state` or pointer mutation. For `work_kind=QUARANTINE`, `decision` is `FALSE_POSITIVE`. For `work_kind=SUCCESSOR_AFTER_DELETE`, `decision` is `ALLOW_SUCCESSOR_AFTER_DELETE`. This is not a `blocks` partition, so a later inventoried optimization may localize its serial phase; the one-serial-domain rule does not bind it |
+| Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` in the owner DC; ordinary rejection for `work_kind=QUARANTINE` only. A `SUCCESSOR_AFTER_DELETE` row has no "complete quarantine" path from `OPEN` |
 | Abort pointer fence (durable abort authority + linearization point) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; the **first** authoritative abort act. Matches the exact serially settled `(G, active_epoch, active_state, Cq, Nq, kind=QUARANTINE)` and installs `(Cf, Nf)` with `retire_claim_kind=QUARANTINE_ABORT` and `retire_abort_id=A`, preserving `active_state`, with `Nf` strictly greater than both the live and any recorded prospective epoch. This single LWT is durable abort authority and the revocation of every resolution pointer CAS naming `(Cq, Nq)`. It runs **before** any `RESOLVING -> ABORTING` work update. An ambiguous result leaves the work still `RESOLVING` with the fence **unresolved** — SERIAL-settle / retry the exact operation; do not treat the pointer as fenced, do not write `ABORTING`, and do not roll back. If settlement proves the resolution pointer step already committed, the abort never linearized: finish `RESOLVING -> RESOLVED` and raise a new quarantine |
-| Quarantine work `RESOLVING -> ABORTING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; permitted only after the abort pointer fence has applied (or SERIAL settlement proves the same `QUARANTINE_ABORT` / `retire_abort_id=A` identity). Records `abort_id=A` matching the pointer, plus actor, reason, and `abort_started_at`. A crash after the pointer fence but before this write leaves work at `RESOLVING` with pointer already `QUARANTINE_ABORT`; the scanner must adopt that abort identity into `ABORTING` and must **never** continue the false-positive resolution |
+| Quarantine work `RESOLVING -> ABORTING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` in the owner DC; permitted only after the abort pointer fence has applied (or SERIAL settlement proves the same `QUARANTINE_ABORT` / `retire_abort_id=A` identity). Records `abort_id=A` matching the pointer, plus actor, reason, and `abort_started_at`. A crash after the pointer fence but before this write leaves work at `RESOLVING` with pointer already `QUARANTINE_ABORT`; the scanner must adopt that abort identity into `ABORTING` and must **never** continue the false-positive resolution |
 | Abort generation fence (`resolution_epoch` bump after abort authority) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches `(G, storage_key, quarantine_operation_id, resolution_epoch = Rr)` and installs `Rr + 1`. Runs only after abort authority is durable on `blocks` and work is `ABORTING`, in **every** abort that still owns the generation — including "nothing to undo" and the `DELETING`/`DELETED` branch. An ambiguous result must `SELECT ... CONSISTENCY SERIAL` the generation partition and classify: settled `Rr + 1` with matching identity means this abort's fence already applied; settled `Rr` with matching identity means retry the exact same fence; any other settled identity or an unsettleable partition leaves the work `ABORTING` with no rollback |
-| Quarantine work `ABORTING -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`, permitted only after both fences above have applied — restoring `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step already ran. When `gc_state` has already reached `DELETING` or `DELETED`, perform no rollback of `gc_state`, materialization, storage identity, or delete lifecycle metadata; the abort's monotonic `resolution_epoch` fence may already have advanced and is retained. Records `abort_outcome` and `abort_observed_gc_state`. An ordinary read of the pointer never authorizes the rollback |
-| Quarantine work `RESOLVING -> RESOLVED` (abort lost the pointer race) | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; used when settlement proves the resolution pointer step committed before abort authority linearized. The abort never became durable; raise a new quarantine through the canonical path for the pointer's current state |
-| Quarantine work `ABORTING -> RESOLVED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; reserved for the rare case where abort authority linearized and a later classification still requires terminal `RESOLVED` rather than `REJECTED` — not the ordinary lost-race path |
+| Quarantine work `ABORTING -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` in the owner DC, permitted only after both fences above have applied — restoring `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step already ran. When `gc_state` has already reached `DELETING` or `DELETED`, perform no rollback of `gc_state`, materialization, storage identity, or delete lifecycle metadata; the abort's monotonic `resolution_epoch` fence may already have advanced and is retained. Records `abort_outcome` and `abort_observed_gc_state`. An ordinary read of the pointer never authorizes the rollback. Once abort authority has linearized, this is the only terminal work transition from `ABORTING` |
+| Quarantine work `RESOLVING -> RESOLVED` (abort lost the pointer race) | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` in the owner DC; used when settlement proves the resolution pointer step committed before abort authority linearized. The abort never became durable; raise a new quarantine through the canonical path for the pointer's current state. There is **no** `ABORTING -> RESOLVED` transition |
 | Operator `MATERIALIZING -> VERIFIED` repair (false-positive resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches the exact generation/key and quarantine operation/evidence identity **and `resolution_epoch = Rr`**. Required before `QUARANTINED -> null` when the object proves out. An abort that has already bumped past `Rr` makes this repair fail closed |
 | Operator `gc_state QUARANTINED -> null` (false-positive resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches the exact `(G, storage_key, quarantine_operation_id, quarantine_evidence_digest)` identity **and `resolution_epoch = Rr`**, the value the `RESOLVING` record fixed — never null, because the `MATERIALIZING` intent initializes it to `0` at row creation and no quarantine transition writes it — after fresh exact-object verification. The epoch is what an abort bumps to fence this statement; the pointer takeover cannot, because correction 68 forbids a generation-row condition on `retire_claim_*`. It does **not** condition on `materialization_state`: a `MATERIALIZING` generation is quarantinable, so requiring `VERIFIED` here would make that class unresolvable. Where the object proves out, the marker is repaired to `VERIFIED` first under the same `resolution_epoch = Rr` condition |
 | `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim; requires a confirmed delayed candidate and its discovery projection first |
@@ -2804,8 +2811,9 @@ RETIRED/QUARANTINE -> RETIRED/GC_RETIRE   (operator FALSE_POSITIVE resolution on
     -- ALLOW_SUCCESSOR_AFTER_DELETE path below only after DELETE_ALREADY_ADVANCED.
 
 RETIRED/QUARANTINE_ABORT -> RETIRED/GC_RETIRE
-    (new work identity; decision = ALLOW_SUCCESSOR_AFTER_DELETE only)
-    work RESOLVING confirmed first under a fresh OPEN row; never reopen REJECTED
+    (new work identity; work_kind=SUCCESSOR_AFTER_DELETE only)
+    work RESOLVING confirmed first under a fresh OPEN row with that work_kind;
+    never reopen REJECTED; decision = ALLOW_SUCCESSOR_AFTER_DELETE at RESOLVING
     fresh EACH_QUORUM zero check under the live QUARANTINE_ABORT fence
     prospective evidence(G1, Nr, Cr) + handoff confirmed BEFORE this CAS
     IF active_generation_id = G1
@@ -3657,23 +3665,26 @@ So authorization is itself durable, and it is written first:
 ```text
 OPEN -> RESOLVING            conditional; records resolution_id, decision, actor,
                              verification_digest, started_at, the prospective
-                             (Cr, Nr) for a RETIRED recertification, and the
-                             generation's observed resolution_epoch Rr.
-                             decision is FALSE_POSITIVE, or
-                             ALLOW_SUCCESSOR_AFTER_DELETE for a new work identity
-                             after DELETE_ALREADY_ADVANCED
+                             (Cr, Nr) when applicable, and the generation's
+                             observed resolution_epoch Rr.
+                             Matches immutable work_kind:
+                               QUARANTINE              -> decision = FALSE_POSITIVE
+                               SUCCESSOR_AFTER_DELETE  -> decision =
+                                                          ALLOW_SUCCESSOR_AFTER_DELETE
      -> RESOLVED             only after the pointer step is confirmed; also the
                              abort-lost-race terminal when abort authority never
-                             linearized
+                             linearized (from RESOLVING, never from ABORTING)
 
-OPEN -> REJECTED             contradiction confirmed; quarantine retained
+OPEN -> REJECTED             work_kind = QUARANTINE only; contradiction confirmed;
+                             quarantine retained
 
 RESOLVING -> ABORTING        conditional; only after the blocks abort fence has
                              applied (or SERIAL settlement proves the same
                              QUARANTINE_ABORT / retire_abort_id identity).
                              Records abort_id matching the pointer, abort_actor,
                              abort_reason, abort_started_at
-          -> REJECTED        the abort completed
+          -> REJECTED        the abort completed; the only terminal exit from
+                             ABORTING
 ```
 
 The transition to `RESOLVING` is confirmed **before** any `gc_state` or pointer
@@ -3681,12 +3692,15 @@ mutation. `ABORTING` is confirmed **only after** durable abort authority exists 
 `blocks`:
 
 ```text
-OPEN         -> no resolution was authorized: continue/complete the quarantine
+OPEN + work_kind=QUARANTINE
+             -> no resolution was authorized: continue/complete the quarantine
+OPEN + work_kind=SUCCESSOR_AFTER_DELETE
+             -> await/drive the successor workflow; NEVER "complete quarantine"
 RESOLVING    -> continue the recorded resolution, UNLESS the pointer already
                 reads QUARANTINE_ABORT with a retire_abort_id: then adopt that
                 identity into ABORTING and resume ONLY the abort
 ABORTING     -> resume ONLY the abort: generation fence, restore, REJECTED.
-                Never continue the resolution
+                Never continue the resolution. Never ABORTING -> RESOLVED
 RESOLVED     -> terminal; never reopen
 REJECTED     -> terminal; the pointer stays fenced
 ```
@@ -3958,16 +3972,23 @@ judgement the quarantine workflow exists to route to a human.
 #### Pointer-Only Successor After `DELETE_ALREADY_ADVANCED`
 
 `REJECTED` is terminal and must never reopen. The later human path is therefore a
-**new** quarantine-work identity, not a mutation of the rejected row:
+**new** work identity, not a mutation of the rejected row. That identity is
+distinguished at creation by an immutable `work_kind`, because `decision` is only
+set with `RESOLVING` and an undifferentiated `OPEN` would again mean two opposite
+recoveries (correction 185):
 
 ```text
-new OPEN row
+new OPEN row   -- created in the designated GC owner DC (routed there; never via
+               -- the writer-DC discovery exception)
     quarantine_operation_id = fresh identity
-    decision                = ALLOW_SUCCESSOR_AFTER_DELETE
-    -- not FALSE_POSITIVE: the contradiction was confirmed; the human is authorizing
-    -- a successor generation while G1's delete lifecycle continues untouched
-    fixes prospective (Cr, Nr) against the live QUARANTINE_ABORT claim
+    work_kind               = SUCCESSOR_AFTER_DELETE   -- immutable at creation
+    -- NOT the same OPEN as work_kind=QUARANTINE ("complete the quarantine")
+    decision                = null until RESOLVING
      -> RESOLVING
+          decision = ALLOW_SUCCESSOR_AFTER_DELETE
+          -- not FALSE_POSITIVE: the contradiction was confirmed; the human is
+          -- authorizing a successor generation while G1's delete lifecycle continues
+          fixes prospective (Cr, Nr) against the live QUARANTINE_ABORT claim
      -> fresh EACH_QUORUM zero check under the existing RETIRED/QUARANTINE_ABORT fence
      -> prospective evidence(G1, Nr, Cr) + handoff, confirmed before the pointer CAS
      -> RETIRED/QUARANTINE_ABORT -> RETIRED/GC_RETIRE
@@ -3979,10 +4000,12 @@ new OPEN row
      -> RESOLVED
 ```
 
-No automated path may take that step on the operator's behalf, and none may infer from
-`DELETING` that the contradiction was resolved. Nothing here is unsafe: G1 reached
-`RETIRED`, no writer can reacquire authority on it, and deleting `K1` was correct
-independently of how the quarantine ended. See corrections 176, 179, and 182.
+A scanner that wakes on `OPEN` + `SUCCESSOR_AFTER_DELETE` must not run the quarantine
+completion path. No automated path may take the successor step on the operator's
+behalf, and none may infer from `DELETING` that the contradiction was resolved.
+Nothing here is unsafe: G1 reached `RETIRED`, no writer can reacquire authority on
+it, and deleting `K1` was correct independently of how the quarantine ended. See
+corrections 176, 179, 182, and 185.
 
 Step 5's path depends on where the pointer actually is, and naming only the `ACTIVE`
 form — as an earlier revision did — leaves a recertified generation unfenced while
@@ -4114,9 +4137,27 @@ sole publisher is that designated scanner when it hands off an intent that won
 activation but published no reference. It is therefore GC-owned, along with
 candidate, retirement-handoff, and delete-work projections; those families are
 created and consumed in the designated GC DC and remain `LOCAL_QUORUM`. Quarantine
-work is the exception: any application/request path may discover it, so the durable
-row is handed off to and confirmed in the designated GC DC before pointer or
-generation mutation, and the scanner then owns it locally. A projection family may
+work is the exception at discovery: any application/request path may discover it, so
+the durable row is handed off to and confirmed in the designated GC DC before pointer
+or generation mutation. **After that handoff is confirmed, the row is owned by exactly
+one designated GC DC** (correction 184):
+
+```text
+After the quarantine handoff is confirmed — or, for work_kind=SUCCESSOR_AFTER_DELETE,
+from the moment the row is created —
+gc_generation_quarantines_by_day is owned by exactly one designated GC DC.
+
+Every LOCAL_QUORUM work-state read and mutation MUST execute in that owner DC.
+
+Operator/API requests arriving in any other DC MUST be routed to the owner;
+they MUST NOT perform the LOCAL_QUORUM mutation in their caller DC.
+
+SUCCESSOR_AFTER_DELETE rows are created in the owner DC under that routing rule;
+they do not use the writer-DC discovery exception that ordinary QUARANTINE rows use
+before handoff.
+```
+
+The scanner then owns the row locally under that contract. A projection family may
 not be moved from one ownership class to the other without changing its read
 consistency and acceptance tests.
 
@@ -4203,11 +4244,17 @@ resolution_state/resolution identity:
                  quarantine_operation_id)
     resolution_state       -- OPEN, RESOLVING, ABORTING, RESOLVED, or REJECTED;
                               never implicit
+    work_kind              -- immutable at row creation: QUARANTINE or
+                              SUCCESSOR_AFTER_DELETE. Distinguishes OPEN recovery
+                              before decision exists (correction 185)
     resolution_id          -- set with RESOLVING; identifies one authorized attempt
-    decision               -- FALSE_POSITIVE or ALLOW_SUCCESSOR_AFTER_DELETE;
-                              set with RESOLVING. REJECTED rows are terminal and
-                              never reopen; ALLOW_SUCCESSOR_AFTER_DELETE always
-                              uses a fresh OPEN identity after DELETE_ALREADY_ADVANCED
+    decision               -- set with RESOLVING only:
+                              FALSE_POSITIVE when work_kind=QUARANTINE;
+                              ALLOW_SUCCESSOR_AFTER_DELETE when
+                              work_kind=SUCCESSOR_AFTER_DELETE.
+                              REJECTED rows are terminal and never reopen;
+                              SUCCESSOR_AFTER_DELETE always uses a fresh identity
+                              after DELETE_ALREADY_ADVANCED
     resolution_actor       -- the authorizing operator
     verification_digest    -- the evidence the operator verified
     resolution_started_at
@@ -4222,10 +4269,10 @@ resolution_state/resolution identity:
     abort_started_at
     abort_outcome          -- set with REJECTED from ABORTING; e.g.
                               NOTHING_TO_UNDO, RESTORED_QUARANTINED,
-                              DELETE_ALREADY_ADVANCED, POINTER_ALREADY_COMMITTED
-                              (POINTER_ALREADY_COMMITTED finishes RESOLVING ->
-                              RESOLVED without ABORTING when abort authority never
-                              linearized)
+                              DELETE_ALREADY_ADVANCED
+                              (lost-race finishes RESOLVING -> RESOLVED without
+                              ABORTING when abort authority never linearized;
+                              there is no ABORTING -> RESOLVED)
     abort_observed_gc_state -- set with REJECTED when DELETE_ALREADY_ADVANCED;
                               the settled DELETING or DELETED value
     resolved_by
@@ -4723,12 +4770,14 @@ state and either loops or, worse, resolves it differently. A quarantined generat
 - is never transitioned out of `QUARANTINED` by any automated path, only by explicit
   operator action. Resolution is an audited workflow whose **first durable step is the
   authorization itself**. The operator conditionally moves the quarantine work from
-  `OPEN` to `RESOLVING`, recording `resolution_id`, `decision` (`FALSE_POSITIVE` or
-  `ALLOW_SUCCESSOR_AFTER_DELETE`), the
+  `OPEN` to `RESOLVING`, recording `resolution_id`, `decision` matching the row's
+  immutable `work_kind` (`FALSE_POSITIVE` or `ALLOW_SUCCESSOR_AFTER_DELETE`), the
   actor, the verification digest, and `started_at`, and confirms it **before touching
   `gc_state` or the pointer**. Without that record the two mutations are
   indistinguishable from an in-progress quarantine after a crash; see Resolution Needs
-  Its Own Durable State. Then, for a false positive: clear `gc_state` with a
+  Its Own Durable State. `work_kind` is fixed at row creation so an `OPEN`
+  `SUCCESSOR_AFTER_DELETE` row is never recovered as "complete quarantine". Then, for
+  a false positive: clear `gc_state` with a
   conditional `QUARANTINED -> null` update at `SERIAL + ALL` that matches the exact
   generation, `storage_key`, quarantine operation/evidence identity, and the
   `resolution_epoch = Rr` recorded by the `RESOLVING` row, after fresh
@@ -5401,8 +5450,11 @@ PR-2 additionally owns the split projection helpers: writer-originated recovery 
 expiry scans are explicit `EACH_QUORUM` reads, while GC-owned projections remain
 local to the designated GC DC. Quarantine work is handed off to that DC and
 confirmed there before mutation, because its discovery may originate in any writer
-DC. A generic projection reader that silently inherits the session's `LOCAL_QUORUM`
-is not acceptable for the writer-originated families.
+DC. After handoff confirmation, every post-handoff `LOCAL_QUORUM` work-state read or
+mutation runs only in that owner DC; operator/API requests that arrive elsewhere are
+routed to the owner and must not mutate in the caller DC (correction 184). A generic
+projection reader that silently inherits the session's `LOCAL_QUORUM` is not
+acceptable for the writer-originated families.
 
 PR-2 also implements the maintenance interlock: a durable cluster-wide
 topology-maintenance marker is acquired before any Cassandra topology mutation and
@@ -5466,7 +5518,8 @@ candidate and attempt the retention-safe `RETIRING/GC_RETIRE -> ACTIVE` escape; 
 append evidence and never remain the only path out of the writer fence. The
 retirement handoff writes epoch-stamped evidence before the pointer CAS and never
 authorizes `DELETING` from the generation row alone.
-Every quarantine first publishes its durable work. If the generation is
+Every quarantine first publishes its durable work with immutable
+`work_kind=QUARANTINE`. If the generation is
 pointer-selected `ACTIVE`, PR-6 acquires `RETIRING/QUARANTINE` at `SERIAL + ALL`,
 drains uses at `EACH_QUORUM` without permitting publication or delete, and only then
 transitions the generation at `SERIAL + ALL`. An ambiguous quarantine settles the
@@ -5496,8 +5549,10 @@ quarantine through the form matching the pointer's current state —
 `ACTIVE -> RETIRING/QUARANTINE`, `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE`, or the
 generation-row form when a successor already owns the pointer. After
 `DELETE_ALREADY_ADVANCED`, the later human exit is a **new** work identity with
-decision `ALLOW_SUCCESSOR_AFTER_DELETE`, never a reopen of terminal `REJECTED`. See
-corrections 168, 170, 177, 178, 181, and 182.
+immutable `work_kind=SUCCESSOR_AFTER_DELETE` and, at `RESOLVING`,
+`decision=ALLOW_SUCCESSOR_AFTER_DELETE` — never a reopen of terminal `REJECTED`, and
+never an `OPEN` that means "complete quarantine". There is no `ABORTING -> RESOLVED`
+transition. See corrections 168, 170, 177, 178, 181, 182, 184, 185, and 186.
 PR-6 must also implement bounded worker concurrency and a measured queue-throughput
 target; a serial queue is not an adequate capacity plan for the global cold path.
 
@@ -5818,7 +5873,16 @@ Required cases include:
   acknowledged `RETIRING/QUARANTINE` pointer fence, and a zero-use global drain; new
   uses and physical operations are rejected by both pointer kind and generation state;
   quarantine work is handed off and confirmed in the designated GC DC before either
-  mutation;
+  mutation; after that handoff, every post-handoff `LOCAL_QUORUM` work-state read or
+  mutation executes only in that owner DC, and operator requests from other DCs are
+  routed there rather than mutating in the caller DC;
+- **post-handoff quarantine-work ownership is single-DC.** A test sets owner=`dc-na`,
+  originates an operator `OPEN -> RESOLVING` request in `dc-eu`, and asserts the
+  caller DC does not execute the `LOCAL_QUORUM` mutation locally: the mutation is
+  routed/coordinated in `dc-na`, and a `dc-na` scanner never acts on stale `OPEN`
+  after authorization has already returned to the operator. A second test creates a
+  `SUCCESSOR_AFTER_DELETE` `OPEN` row from `dc-eu` and asserts creation itself is
+  routed to `dc-na`, not published through the writer-DC discovery exception;
 - a generation quarantined between pin insertion and authorization is rejected
   before authorization. If the quarantine pointer fence lands after a prior
   revalidation, the immediately-before-operation checkpoint detects
@@ -6007,11 +6071,21 @@ Required cases include:
   distinct alert and audit event are raised. A test that leaves recovery stuck in
   `ABORTING` with no matching branch, or that regresses `gc_state` out of `DELETING`,
   must fail. The same assertions run with `gc_state = DELETED`. A further test asserts
-  the later human recovery path is a **new** work identity with
-  `decision = ALLOW_SUCCESSOR_AFTER_DELETE` that performs a pointer-only audited
-  recertification (`RETIRED/QUARANTINE_ABORT -> RETIRED/GC_RETIRE`) under a fresh
-  `RESOLVING` authorization, never reopens terminal `REJECTED`, and does not require
-  `QUARANTINED -> null`;
+  the later human recovery path creates a **new** row with immutable
+  `work_kind=SUCCESSOR_AFTER_DELETE` and, at `RESOLVING`,
+  `decision=ALLOW_SUCCESSOR_AFTER_DELETE`, performs a pointer-only audited
+  recertification (`RETIRED/QUARANTINE_ABORT -> RETIRED/GC_RETIRE`) under that fresh
+  authorization, never reopens terminal `REJECTED`, and does not require
+  `QUARANTINED -> null`. A negative test creates that successor row as an
+  undifferentiated `OPEN` without `work_kind` and asserts recovery cannot tell
+  "complete quarantine" from "await successor authorization";
+- **`OPEN` recovery is keyed by immutable `work_kind`.** A test crashes after creating
+  an `OPEN` + `SUCCESSOR_AFTER_DELETE` row and before `RESOLVING`; the scanner must
+  not complete a quarantine. The same crash with `work_kind=QUARANTINE` must continue
+  or complete the quarantine. A schema without `work_kind` must fail this pair;
+- **there is no `ABORTING -> RESOLVED` transition.** A test that attempts it after
+  abort authority has linearized must not apply; lost-race termination is only
+  `RESOLVING -> RESOLVED` when the resolution pointer step committed first;
 - **every post-`RESOLVING` resolver mutation of `block_generations` names
   `resolution_epoch = Rr`.** A test pauses a resolver before its
   `MATERIALIZING -> VERIFIED` repair, completes the abort, then releases the resolver;
@@ -6042,10 +6116,10 @@ Required cases include:
   read "reachable only from `OPEN`", which contradicted the abort contract it sits
   beside and made the normative suite unsatisfiable; see correction 169;
 - the quarantine projection DDL carries `ABORTING`, the abort identity,
-  `abort_outcome`/`abort_observed_gc_state`, and `observed_resolution_epoch`, and
-  `block_generations` carries `resolution_epoch`; a
-  test drives an interrupted abort through a schema without them and asserts recovery
-  is ambiguous, so neither column set can be dropped as cosmetic;
+  `abort_outcome`/`abort_observed_gc_state`, `observed_resolution_epoch`, and
+  immutable `work_kind`, and `block_generations` carries `resolution_epoch`; a
+  test drives an interrupted abort or successor-OPEN through a schema without them
+  and asserts recovery is ambiguous, so neither column set can be dropped as cosmetic;
 - the quarantine projection DDL carries `RESOLVING` and the full resolution identity;
   a test drives an interrupted resolution through a schema without them and asserts the
   recovery is ambiguous, so the columns cannot be dropped as cosmetic;
@@ -6628,9 +6702,16 @@ X2 is closed only when:
   terminates as `REJECTED` recording `abort_outcome` /
   `abort_observed_gc_state`, leaves the delete work row and the pointer fence
   (`RETIRED/QUARANTINE_ABORT`) untouched, and raises a distinct alert. The later human
-  exit is a **new** work identity with decision `ALLOW_SUCCESSOR_AFTER_DELETE`, never
-  a reopen of terminal `REJECTED`. Recovery is never left in `ABORTING` with no
-  matching branch;
+  exit is a **new** work identity with immutable `work_kind=SUCCESSOR_AFTER_DELETE`
+  and `decision=ALLOW_SUCCESSOR_AFTER_DELETE` at `RESOLVING`, never a reopen of
+  terminal `REJECTED`, and never an `OPEN` recovered as "complete quarantine".
+  Recovery is never left in `ABORTING` with no matching branch. Once abort authority
+  has linearized, `ABORTING` terminates only as `REJECTED` — there is no
+  `ABORTING -> RESOLVED`;
+- after quarantine handoff confirmation, `gc_generation_quarantines_by_day` is owned by
+  exactly one designated GC DC: every post-handoff `LOCAL_QUORUM` work-state read or
+  mutation executes there, and operator requests from other DCs are routed to that
+  owner rather than mutating in the caller DC;
 - `resolution_epoch` is initialized by the `MATERIALIZING` intent, is never written by
   a quarantine transition, and never resets across quarantine cycles, so `Rr` is never
   null and no stale clear can match a reset counter;
@@ -8019,7 +8100,8 @@ reintroduce rejected designs:
      say where the new `RESOLVING` comes from: the rejected row cannot reopen
      (`REJECTED -> RESOLVING` is forbidden), and `FALSE_POSITIVE` is the wrong decision
      because the contradiction was confirmed. The exit is therefore a **new** `OPEN`
-     work identity with `decision = ALLOW_SUCCESSOR_AFTER_DELETE`, fixing a prospective
+     work identity — later distinguished at creation by `work_kind` (correction 185) —
+     with `decision = ALLOW_SUCCESSOR_AFTER_DELETE` at `RESOLVING`, fixing a prospective
      `(Cr, Nr)` against the live `QUARANTINE_ABORT` claim, then a fresh zero check /
      evidence / handoff, then `RETIRED/QUARANTINE_ABORT -> RETIRED/GC_RETIRE`. G1's
      delete lifecycle stays untouched.
@@ -8030,6 +8112,37 @@ reintroduce rejected designs:
      write history, the fence outcome is unresolved: remain at the furthest proven
      state, retry the exact operation, and do not advance to generation fence,
      rollback, or a terminal work transition on the strength of an ordinary read.
+
+184. **Post-handoff quarantine work is single-owner under `LOCAL_QUORUM`.** Discovery
+     may originate in any writer DC, and the ADR already required handoff confirmation
+     in the designated GC DC before pointer/generation mutation. It did not freeze the
+     same ownership for later work-state classification. `OPEN -> RESOLVING` and its
+     siblings commit at `LOCAL_QUORUM`, so an operator mutation in `dc-eu` while the
+     owner scanner reads in `dc-na` can leave the scanner on stale `OPEN` after
+     authorization returned — and `OPEN` versus `RESOLVING` drive opposite recoveries.
+     After handoff confirmation — and from creation for
+     `work_kind=SUCCESSOR_AFTER_DELETE`, which never uses the writer-DC discovery
+     exception — every `LOCAL_QUORUM` work-state read and mutation executes in the
+     designated GC owner DC; operator/API requests that arrive elsewhere are routed
+     there and must not mutate in the caller DC.
+
+185. **`OPEN` needs an immutable `work_kind` once successor recovery exists.**
+     Correction 182 introduced a new `OPEN` identity for
+     `ALLOW_SUCCESSOR_AFTER_DELETE`, while the global scanner rule still said
+     `OPEN -> complete the quarantine`. `decision` is set only with `RESOLVING`, so an
+     interrupted successor row at `OPEN` was indistinguishable from ordinary quarantine
+     work — the same class of ambiguity that motivated `RESOLVING` itself. Rows now
+     carry immutable `work_kind` at creation: `QUARANTINE` or `SUCCESSOR_AFTER_DELETE`.
+     `OPEN + QUARANTINE` completes quarantine; `OPEN + SUCCESSOR_AFTER_DELETE` awaits
+     or drives that administrative workflow and never runs quarantine completion.
+
+186. **Do not reserve a terminal transition without an enumerated interleaving.** The
+     consistency table kept `ABORTING -> RESOLVED` as a "rare case" after correction
+     181 moved the ordinary lost-race to `RESOLVING -> RESOLVED` before abort authority
+     exists. No normative interleaving remained in which abort authority had linearized
+     on `blocks` as `QUARANTINE_ABORT` and the work still needed terminal `RESOLVED`
+     rather than `REJECTED`. A frozen ADR cannot carry an unspecified terminal exit.
+     Once abort authority has linearized, `ABORTING` terminates only as `REJECTED`.
 
 ## Related Documents
 

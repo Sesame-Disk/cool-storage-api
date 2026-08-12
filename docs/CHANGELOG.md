@@ -405,6 +405,31 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: ownership, work_kind, no ABORTING->RESOLVED
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
+**not** frozen.
+
+A seventh review after corrections 181–183 confirmed two freeze blockers and one
+terminal-exit cleanup:
+
+- **Correction 184.** After quarantine handoff confirmation — and from creation for
+  `SUCCESSOR_AFTER_DELETE` rows — `gc_generation_quarantines_by_day` is owned by
+  exactly one designated GC DC. Every `LOCAL_QUORUM` work-state read/mutation runs
+  there; operator requests from other DCs are routed to the owner. Successor rows are
+  not published via the writer-DC discovery exception.
+- **Correction 185.** Successor recovery rows carry immutable
+  `work_kind=SUCCESSOR_AFTER_DELETE` at creation so `OPEN` is not recovered as
+  "complete quarantine". `decision=ALLOW_SUCCESSOR_AFTER_DELETE` is set only with
+  `RESOLVING`.
+- **Correction 186.** Removed the unspecified `ABORTING -> RESOLVED` "rare case".
+  Once abort authority linearized, `ABORTING` terminates only as `REJECTED`; the
+  ordinary lost-race finishes `RESOLVING -> RESOLVED` before abort authority exists.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR revision r3: abort authority linearizes on `blocks`
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
