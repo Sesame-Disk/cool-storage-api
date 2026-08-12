@@ -2,10 +2,12 @@ package v2
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,6 +363,13 @@ func TestLogout(t *testing.T) {
 		if _, err := handler.sessions.ValidateSession(session.Token); !errors.Is(err, auth.ErrSessionNotFound) {
 			t.Fatalf("ValidateSession() error = %v, want %v", err, auth.ErrSessionNotFound)
 		}
+
+		// ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01: the clear on logout must not
+		// reopen the JS-readable window the fix closes on login.
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to contain HttpOnly", setCookie)
+		}
 	})
 
 	t.Run("rejects invalid token", func(t *testing.T) {
@@ -448,4 +457,65 @@ func TestNewAuthHandler(t *testing.T) {
 	if handler.sessions == nil {
 		t.Error("Session manager should be created")
 	}
+}
+
+// TestAuthHandlerSetAuthCookie pins ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 at the
+// single writer HandleOIDCCallback (login) and Logout (clear) share, rather than
+// at a full HTTP round trip through HandleOIDCCallback — its success path requires
+// a real OIDC code exchange this test suite does not mock, so testing the helper
+// directly is what actually reaches the login-side write.
+func TestAuthHandlerSetAuthCookie(t *testing.T) {
+	t.Run("always sets HttpOnly", func(t *testing.T) {
+		h := &AuthHandler{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+		h.setAuthCookie(c, "user@example.com@sometoken", 3600)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to contain HttpOnly", setCookie)
+		}
+		// gin URL-encodes the cookie value, so "@" becomes "%40" — the actual
+		// production value has the same shape (email@token).
+		if !strings.Contains(setCookie, "sesamefs_auth=user%40example.com%40sometoken") {
+			t.Fatalf("Set-Cookie = %q, want it to carry the given value", setCookie)
+		}
+	})
+
+	t.Run("derives Secure from the request's TLS state", func(t *testing.T) {
+		h := &AuthHandler{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		c.Request.TLS = &tls.ConnectionState{}
+
+		h.setAuthCookie(c, "user@example.com@sometoken", 3600)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "Secure") {
+			t.Fatalf("Set-Cookie = %q, want Secure over a TLS request", setCookie)
+		}
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to still contain HttpOnly", setCookie)
+		}
+	})
+
+	t.Run("clearing uses maxAge=-1 and still sets HttpOnly", func(t *testing.T) {
+		h := &AuthHandler{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+		h.setAuthCookie(c, "", -1)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to contain HttpOnly on clear too", setCookie)
+		}
+		if !strings.Contains(setCookie, "Max-Age=0") {
+			t.Fatalf("Set-Cookie = %q, want an expiring Max-Age=0 (net/http's encoding of maxAge=-1)", setCookie)
+		}
+	})
 }

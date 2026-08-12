@@ -6328,35 +6328,37 @@ than hardened.
 
 ### ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01: `sesamefs_auth` is a replayable bearer token in a JS-readable cookie
 
-**Status**: 🟡 Open — "by design" (seahub compatibility), flagged for reassessment
+**Status**: ✅ Fixed 2026-08-12
 **Severity**: High — an XSS yields full session-token theft, not merely a read surface
-**Affected**: `internal/api/server.go` — the OIDC callback cookie write and the auth resolution order
-**Source of record**: SEC-3 / NF-3 in `docs/PROD-SECURITY-READINESS-20260724.md`
+**Affected**: `internal/api/server.go`, `internal/api/v2/auth.go` — the OIDC callback cookie
+write and the auth resolution order
 
-#### Problem
+#### What Is True Today
 
-The OIDC callback sets `sesamefs_auth` with `httpOnly=false` to match the seahub
-convention. That cookie's value is not a display artifact: the auth middleware
-accepts it as a credential (it sits in the resolution order between dev tokens
-and the `Authorization` header), so it is a live, replayable session/API bearer.
-Sync-client sessions can carry a TTL up to 180 days.
+All four writers of `sesamefs_auth` (login and logout, in both `internal/api/server.go` and
+`internal/api/v2/auth.go`) now set `httpOnly=true`, funneled through one `setAuthCookie`
+helper per package so the flag can't drift between login and logout again. `Secure` is
+unchanged (still derived from `c.Request.TLS`; the separate `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`
+covers the one site — `handleAutoLogin` — that hardcodes it, and the broader TLS-terminating-
+proxy gap tracked in `TECHNICAL-DEBT.md` #21).
 
-Consequence: any XSS anywhere on the origin reads `document.cookie` and walks
-away with a long-lived credential. The original SEC-3 rating of Medium
-understated this by treating the cookie as an information leak rather than as
-the credential it is.
-
-#### Fix Direction
-
-Either stop accepting the cookie as a credential (make it a non-authoritative
-hint and require the `Authorization` header), or set `httpOnly=true` and give
-the frontend whatever non-secret signal it actually needs. Establish first what
-reads it client-side — if nothing does, this is a one-line change.
+What was verified before closing: a repository-wide search (including `mobile-frontend/`)
+found no JS code anywhere in this repository that reads this cookie's value — the only
+`document.cookie` touching it was a best-effort clear in `frontend/src/utils/auth-state.js`,
+and the server already clears it authoritatively on logout regardless. The desktop-client SSO
+flow gets its token via `clientSSOStore` polling (`docs/OIDC.md`), not by reading this cookie
+from an embedded WebView, contradicting the comment that used to justify `httpOnly=false`. The
+project owner confirmed no client outside this repository depends on reading it either.
+`internal/api/server_test.go` (`TestServerSetAuthCookie`) and `internal/api/v2/auth_test.go`
+(`TestAuthHandlerSetAuthCookie`, and the extended `TestLogout`) pin `HttpOnly` on both helpers,
+covering login and logout without needing to mock a real OIDC exchange.
 
 #### Related Docs
 
-- `docs/PROD-SECURITY-READINESS-20260724.md` (SEC-3, NF-3, checklist item 6)
-- `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` (the same cookie, set inconsistently elsewhere)
+- `docs/PROD-SECURITY-READINESS-20260724.md` (SEC-3, NF-3, checklist item 6) — dated snapshot,
+  not retro-edited; this entry is the live status.
+- `docs/OIDC.md`, `docs/diagrams/auth-layer.md` — updated to match.
+- `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01` (the same cookie's `Secure` flag, still open, separate fix)
 
 ---
 

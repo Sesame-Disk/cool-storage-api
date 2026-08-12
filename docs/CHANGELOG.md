@@ -8,6 +8,29 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-12 - `sesamefs_auth` cookie is httpOnly (ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01)
+
+- All four writers of `sesamefs_auth` (login and logout, in both `internal/api/server.go` and
+  `internal/api/v2/auth.go`) now set `httpOnly=true`, funneled through one `setAuthCookie`
+  helper per package so the flag can't drift between login and logout again. Previously the
+  cookie was JS-readable, and the auth middleware accepts it as a live, replayable session
+  bearer with a TTL up to 180 days for sync clients — any XSS on the origin could walk away
+  with a long-lived credential.
+- Verified before closing: a repository-wide search (including `mobile-frontend/`) found no JS
+  code reading this cookie's value anywhere in this repository; the desktop-client SSO flow
+  gets its token via `clientSSOStore` polling, not by reading the cookie, contradicting the
+  stale "embedded WebView" comment that used to justify `httpOnly=false`. Confirmed with the
+  project owner that no client outside this repository depends on reading it either.
+- `Secure` is unchanged (still derived from `c.Request.TLS`) — that's the separate, still-open
+  `ISSUE-AUTOLOGIN-COOKIE-INSECURE-01`.
+- Added `TestServerSetAuthCookie` and `TestAuthHandlerSetAuthCookie`, testing each helper
+  directly so both login and logout are pinned without mocking a real OIDC exchange; extended
+  `TestLogout` to assert `HttpOnly` on the real end-to-end clear response.
+- Updated `docs/OIDC.md` and `docs/diagrams/auth-layer.md` to match; the stale "embedded
+  WebView" justification is gone.
+
+---
+
 ## 2026-07-16 - GC physical deletion is org-scoped end to end (P10 PR-3)
 
 - Normal block deletion and S3 orphan recovery now resolve `BlockStore` by

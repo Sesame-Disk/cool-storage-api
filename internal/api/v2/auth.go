@@ -175,12 +175,10 @@ func (h *AuthHandler) HandleOIDCCallback(c *gin.Context) {
 
 	// Set sesamefs_auth cookie so the browser can identify the user when
 	// serving org admin HTML pages (resolveOrgForPanel reads this cookie).
-	// httpOnly=false is required: the frontend JS reads this as a fallback.
 	// Cookie TTL matches session TTL so both expire at the same time.
 	seahubAuth := result.Email + "@" + result.SessionToken
-	isSecure := c.Request.TLS != nil
 	cookieMaxAge := int(h.config.Auth.OIDC.SessionTTL.Seconds())
-	c.SetCookie("sesamefs_auth", seahubAuth, cookieMaxAge, "/", "", isSecure, false)
+	h.setAuthCookie(c, seahubAuth, cookieMaxAge)
 
 	// Return the session token
 	c.JSON(http.StatusOK, gin.H{
@@ -336,11 +334,24 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		return
 	}
 
-	// Clear the sesamefs_auth session cookie (match flags from login: path="/", httpOnly=false)
-	isSecure := c.Request.TLS != nil
-	c.SetCookie("sesamefs_auth", "", -1, "/", "", isSecure, false)
+	// Clear the sesamefs_auth session cookie (match flags from login).
+	h.setAuthCookie(c, "", -1)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 	})
+}
+
+// setAuthCookie is the single writer for the sesamefs_auth session cookie in this
+// package, used by both HandleOIDCCallback (login) and Logout (clear). httpOnly is
+// always true: ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 found no code in this
+// repository — including mobile-frontend — that reads this cookie's value from JS;
+// the desktop-client SSO flow gets its token via clientSSOStore polling, not by
+// reading this cookie as an older comment here used to claim. Secure is still
+// derived per-request from c.Request.TLS, matching every other writer of this
+// cookie (the separate ISSUE-AUTOLOGIN-COOKIE-INSECURE-01 covers the one site
+// that hardcodes it).
+func (h *AuthHandler) setAuthCookie(c *gin.Context, value string, maxAge int) {
+	isSecure := c.Request.TLS != nil
+	c.SetCookie("sesamefs_auth", value, maxAge, "/", "", isSecure, true)
 }

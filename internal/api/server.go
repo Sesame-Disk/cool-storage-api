@@ -2277,12 +2277,10 @@ func (s *Server) handleOAuthCallback(c *gin.Context) {
 	}
 
 	// Set sesamefs_auth cookie (email@token) — matches seahub convention.
-	// httpOnly=false is intentional: the embedded WebView needs to read this via JS.
 	// Cookie TTL matches session TTL so both expire at the same time.
 	seahubAuth := result.Email + "@" + result.SessionToken
-	isSecure := c.Request.TLS != nil
 	cookieMaxAge := int(s.config.Auth.OIDC.SessionTTL.Seconds())
-	c.SetCookie("sesamefs_auth", seahubAuth, cookieMaxAge, "/", "", isSecure, false)
+	s.setAuthCookie(c, seahubAuth, cookieMaxAge)
 
 	// If this was a desktop client SSO login (returnURL starts with seafile://),
 	// show a confirmation page instead of redirecting to the web app home page.
@@ -2315,11 +2313,24 @@ func (s *Server) handleLogout(c *gin.Context) {
 	}
 
 	// Clear the auth cookie server-side (maxAge=-1 expires immediately)
-	isSecure := c.Request.TLS != nil
-	c.SetCookie("sesamefs_auth", "", -1, "/", "", isSecure, false)
+	s.setAuthCookie(c, "", -1)
 
 	// Redirect to home — the SPA will detect the missing session and show the login page
 	c.Redirect(http.StatusFound, "/")
+}
+
+// setAuthCookie is the single writer for the sesamefs_auth session cookie in this
+// package, used by both the OIDC callback (login) and handleLogout (clear).
+// httpOnly is always true: ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 found no code in
+// this repository — including mobile-frontend — that reads this cookie's value
+// from JS; the desktop-client SSO flow already gets its token via clientSSOStore
+// polling, not by reading this cookie from an embedded WebView as an older
+// comment here used to claim. Secure is still derived per-request from
+// c.Request.TLS, matching every other writer of this cookie (the separate
+// ISSUE-AUTOLOGIN-COOKIE-INSECURE-01 covers the one site that hardcodes it).
+func (s *Server) setAuthCookie(c *gin.Context, value string, maxAge int) {
+	isSecure := c.Request.TLS != nil
+	c.SetCookie("sesamefs_auth", value, maxAge, "/", "", isSecure, true)
 }
 
 // handleCreateRepoTag returns a stub response for tag creation

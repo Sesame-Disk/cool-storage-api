@@ -4,6 +4,7 @@ import (
 	"bytes"
 	stdgzip "compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1118,6 +1119,70 @@ func TestAuthTokenErrorFormat(t *testing.T) {
 	if _, ok := response["non_field_errors"]; !ok {
 		t.Error("auth error should have 'non_field_errors' field for Seafile compatibility")
 	}
+}
+
+// TestServerSetAuthCookie pins ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01 at the single
+// writer both handleSSOCallback (login) and handleLogout (clear) share, rather than
+// at a full HTTP round trip through either — HandleOIDCCallback's success path
+// requires a real OIDC code exchange this test suite does not mock, so testing the
+// helper directly is what actually reaches the login-side write.
+func TestServerSetAuthCookie(t *testing.T) {
+	t.Run("always sets HttpOnly", func(t *testing.T) {
+		s := &Server{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+		s.setAuthCookie(c, "user@example.com@sometoken", 3600)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to contain HttpOnly", setCookie)
+		}
+		// gin URL-encodes the cookie value, so "@" becomes "%40" — the actual
+		// production value has the same shape (email@token).
+		if !strings.Contains(setCookie, "sesamefs_auth=user%40example.com%40sometoken") {
+			t.Fatalf("Set-Cookie = %q, want it to carry the given value", setCookie)
+		}
+		if strings.Contains(setCookie, "Secure") {
+			t.Fatalf("Set-Cookie = %q, want no Secure over a plain-HTTP request", setCookie)
+		}
+	})
+
+	t.Run("derives Secure from the request's TLS state", func(t *testing.T) {
+		s := &Server{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		c.Request.TLS = &tls.ConnectionState{}
+
+		s.setAuthCookie(c, "user@example.com@sometoken", 3600)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "Secure") {
+			t.Fatalf("Set-Cookie = %q, want Secure over a TLS request", setCookie)
+		}
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to still contain HttpOnly", setCookie)
+		}
+	})
+
+	t.Run("clearing uses maxAge=-1 and still sets HttpOnly", func(t *testing.T) {
+		s := &Server{}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+		s.setAuthCookie(c, "", -1)
+
+		setCookie := w.Header().Get("Set-Cookie")
+		if !strings.Contains(setCookie, "HttpOnly") {
+			t.Fatalf("Set-Cookie = %q, want it to contain HttpOnly on clear too", setCookie)
+		}
+		if !strings.Contains(setCookie, "Max-Age=0") {
+			t.Fatalf("Set-Cookie = %q, want an expiring Max-Age=0 (net/http's encoding of maxAge=-1)", setCookie)
+		}
+	})
 }
 
 // TestAccountInfoTotalSpace tests account info total_space field

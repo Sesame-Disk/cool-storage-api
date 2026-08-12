@@ -122,7 +122,6 @@ on every replica in every DC until both close.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01` | HIGH | `sesamefs_auth` is a replayable bearer in a JS-readable cookie → XSS = token theft | Readiness SEC-3 / NF-3 |
 | `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
