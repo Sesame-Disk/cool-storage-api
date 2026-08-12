@@ -1174,9 +1174,8 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 	}
 
 	// Read commit data from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxPutCommitBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -1194,7 +1193,7 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 
 	// Store commit in database
 	now := time.Now()
-	err = h.db.Session().Query(`
+	err := h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, commitID, commit.ParentID, commit.RootID, userID, commit.Description, now).Exec()
@@ -1456,6 +1455,16 @@ func syncBlockDownloadStreamCause(err error) downloadadmission.ReleaseCause {
 // from it; the block cap is now configuration, see syncBlockMaxBytes below.
 const (
 	maxCheckBlocksBodyBytes = 16 * 1024 * 1024 // 16 MiB
+
+	// PutCommit, PackFS and CheckFS were the other three handlers still reading
+	// an unbounded body (ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9) — the same defect
+	// F12 fixed for PutBlock/CheckBlocks. Plain consts, not configuration: a
+	// commit object and an id list (PackFS/CheckFS request the same 40-char hex
+	// fs-id shape check-blocks does) are small, protocol-shaped payloads, not a
+	// variable-sized bulk payload like recv-fs below.
+	maxPutCommitBodyBytes = 1 * 1024 * 1024  // 1 MiB
+	maxPackFSBodyBytes    = 16 * 1024 * 1024 // 16 MiB, same shape as check-blocks
+	maxCheckFSBodyBytes   = 16 * 1024 * 1024 // 16 MiB, same shape as check-blocks
 )
 
 // checkBlocksMaxIDs resolves the accepted id-count cap.
@@ -1498,6 +1507,26 @@ func (h *SyncHandler) syncBlockMaxBytes() int64 {
 		return config.DefaultSyncBlockMaxBytes
 	}
 	return h.config.SeafHTTP.SyncBlockMaxBytes
+}
+
+// syncRecvFSMaxBytes resolves the per-request body cap for RecvFS.
+//
+// Unlike maxPutCommitBodyBytes/maxPackFSBodyBytes/maxCheckFSBodyBytes above,
+// this is configuration rather than a const: recv-fs carries a real batch of
+// packed FS objects, not a small id list, and there is no measured client
+// batch size or protocol-documented ceiling to anchor a fixed number on. The
+// default is deliberately generous so it is unlikely to cut a legitimate large
+// commit; an operator can raise it further without a code change.
+//
+// The nil-config fallback is the package default rather than something
+// permissive, for the same reason as syncBlockMaxBytes: a handler without
+// config is a wiring bug, and failing open here would restore the unbounded
+// read this cap exists to prevent.
+func (h *SyncHandler) syncRecvFSMaxBytes() int64 {
+	if h == nil || h.config == nil || h.config.SeafHTTP.RecvFSMaxBytes <= 0 {
+		return config.DefaultRecvFSMaxBytes
+	}
+	return h.config.SeafHTTP.RecvFSMaxBytes
 }
 
 func (h *SyncHandler) syncBlockAdmittedLifetime() time.Duration {
@@ -2634,9 +2663,8 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 	}
 
 	// Read FS IDs from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxPackFSBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -2750,9 +2778,8 @@ func (h *SyncHandler) RecvFS(c *gin.Context) {
 	}
 
 	// Read FS objects from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, h.syncRecvFSMaxBytes())
+	if !ok {
 		return
 	}
 
@@ -2886,9 +2913,8 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 	}
 
 	// Read FS IDs from body
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+	body, ok := readLimitedRequestBody(c, maxCheckFSBodyBytes)
+	if !ok {
 		return
 	}
 
@@ -2913,7 +2939,7 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 
 	// Get HEAD commit's root_fs_id to build the mapping
 	var headCommitID string
-	err = h.db.Session().Query(`
+	err := h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&headCommitID)
 	if err != nil {

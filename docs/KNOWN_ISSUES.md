@@ -6533,30 +6533,34 @@ reuse the sysadmin retention messaging helpers on the org-admin frontend shell
 
 ### ISSUE-SYNC-UNBOUNDED-BODIES-01: Four sync handlers still read the request body unbounded
 
-**Status**: 🟡 Open — PR-10 closed the two block routes, not the class
+**Status**: ✅ Fixed 2026-08-12
 **Severity**: Medium — authenticated memory-pressure DoS
 **Affected**: `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go`
 **Source of record**: **X9** in `docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`
 
-#### Problem
+#### What Is True Today
 
-PR-10 (#146) bounded `PutBlock` and `check-blocks` behind the shared
-`readLimitedRequestBody` helper, closing F12. Four sibling handlers on the same
-`SyncHandler` keep the identical unbounded `io.ReadAll(c.Request.Body)` — verified
-present 2026-07-25. F12 was scoped to the two block routes, so an authenticated
-client can drive the same memory-pressure DoS through any of the four.
+All four handlers now read through the shared `readLimitedRequestBody` helper (the
+same one PR-10 wired into `PutBlock`/`check-blocks` for F12), each with a cap
+derived from its own payload profile rather than one shared constant:
 
-This entry exists because X9 previously named an issue ID that had never been
-created, leaving the registry with a dangling reference.
+- `PutCommit`, `PackFS`, `CheckFS` — plain consts (`maxPutCommitBodyBytes` = 1 MiB;
+  `maxPackFSBodyBytes`, `maxCheckFSBodyBytes` = 16 MiB, matching `check-blocks`'s
+  existing const, since both carry the same small id-list shape).
+- `RecvFS` — **configuration**, not a const (`config.SeafHTTP.RecvFSMaxBytes`,
+  default 128 MiB via `config.DefaultRecvFSMaxBytes`, resolved by
+  `syncRecvFSMaxBytes()`). Unlike the other three, RecvFS carries a real batch of
+  packed FS objects with no measured client batch size or protocol-documented
+  ceiling to anchor a fixed number on (`docs/SEAFILE-SYNC-PROTOCOL-RFC.md` does
+  not specify one) — the default is deliberately generous, and an operator can
+  raise it via `SEAFHTTP_RECV_FS_MAX_BYTES` or `recv_fs_max_bytes` without a code
+  change if a real large commit needs more headroom.
 
-#### Fix Direction
-
-Each handler needs a cap derived from its own payload profile — a commit object,
-a packed FS batch, a received FS batch and an FS existence query have nothing in
-common, so a single shared constant would be wrong. Once each cap is chosen the
-change is one line per handler through `readLimitedRequestBody`. Note the same
-caveat as X10/X11: a per-request cap bounds one request, not the aggregate, and
-does not bound the work an accepted request triggers downstream.
+**Scope of the fix, precisely:** this closes the **unbounded body per request**.
+It does not bound aggregate memory under concurrency — N concurrent `RecvFS`
+requests near the cap can still sum to N × the cap. That is a distinct
+admission/concurrency problem (conceptually adjacent to the download-side D0-D6
+admission work, which has no write-side equivalent yet) and is not reopened here.
 
 #### Related Docs
 

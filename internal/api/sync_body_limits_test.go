@@ -352,3 +352,142 @@ func TestCheckBlocksBoundsChunkedBody(t *testing.T) {
 		t.Fatalf("chunked oversized body = %d, want 413; body=%s", w.Code, w.Body.String())
 	}
 }
+
+// TestPutCommitBoundsBodySize covers ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9 for
+// PutCommit, the first of the four sibling handlers PR-10 left on unbounded
+// io.ReadAll. Only the rejection boundary is pinned (cap+1 -> 413); the positive
+// case below asserts the size gate is passed (not 413) using an invalid body
+// that fails cleanly at JSON parsing (400) rather than reaching h.db, which is
+// nil in this handler and would panic on the unconditional DB write PutCommit
+// performs after a valid commit — that write is out of scope for this cap.
+func TestPutCommitBoundsBodySize(t *testing.T) {
+	postPutCommit := func(t *testing.T, body string, declaredLen int64) int {
+		t.Helper()
+		r := setupSyncTestRouter()
+		h := &SyncHandler{}
+		r.PUT("/seafhttp/repo/:repo_id/commit/:commit_id", h.PutCommit)
+		req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo/commit/somecommitid", strings.NewReader(body))
+		req.ContentLength = declaredLen
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if code := postPutCommit(t, strings.Repeat("a", maxPutCommitBodyBytes+1), int64(maxPutCommitBodyBytes+1)); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("PutCommit body over cap = %d, want 413", code)
+	}
+	// Not valid JSON, so it fails at "invalid commit format" (400) rather than
+	// reaching the database — this proves the size gate let it through, not a
+	// parser accident, since a malformed body is a stable, intentional 400.
+	invalidJSON := strings.Repeat("a", maxPutCommitBodyBytes)
+	if code := postPutCommit(t, invalidJSON, int64(maxPutCommitBodyBytes)); code == http.StatusRequestEntityTooLarge {
+		t.Errorf("PutCommit body at cap was rejected 413, want it through the size gate")
+	} else if code != http.StatusBadRequest {
+		t.Errorf("PutCommit body at cap (invalid JSON) = %d, want 400", code)
+	}
+}
+
+// TestPackFSBoundsBodySize covers ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9 for
+// PackFS. Only the rejection boundary is pinned: what PackFS does with a body
+// under the cap depends on parser/DB behavior that is not this cap's contract.
+func TestPackFSBoundsBodySize(t *testing.T) {
+	r := setupSyncTestRouter()
+	h := &SyncHandler{}
+	r.POST("/seafhttp/repo/:repo_id/pack-fs", h.PackFS)
+
+	body := strings.Repeat("a", maxPackFSBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/pack-fs", strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PackFS body over cap = %d, want 413", w.Code)
+	}
+}
+
+// TestPackFSBoundsChunkedBody mirrors TestCheckBlocksBoundsChunkedBody for
+// PackFS: a client that declares no Content-Length must still be cut by
+// MaxBytesReader, not merely by the declared-length fast path — precisely the
+// shape io.ReadAll without a limit could not bound before this fix.
+func TestPackFSBoundsChunkedBody(t *testing.T) {
+	r := setupSyncTestRouter()
+	h := &SyncHandler{}
+	r.POST("/seafhttp/repo/:repo_id/pack-fs", h.PackFS)
+
+	body := strings.NewReader(strings.Repeat("a", maxPackFSBodyBytes+1))
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/pack-fs", body)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("chunked oversized PackFS body = %d, want 413; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestCheckFSBoundsBodySize covers ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9 for
+// CheckFS. Only the rejection boundary is pinned: unlike PackFS/RecvFS, CheckFS
+// touches h.db unconditionally right after parsing (even for an empty id list),
+// so there is no body shape that reaches a positive result without a live DB.
+func TestCheckFSBoundsBodySize(t *testing.T) {
+	r := setupSyncTestRouter()
+	h := &SyncHandler{}
+	r.POST("/seafhttp/repo/:repo_id/check-fs", h.CheckFS)
+
+	body := strings.Repeat("a", maxCheckFSBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/check-fs", strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("CheckFS body over cap = %d, want 413", w.Code)
+	}
+}
+
+// TestRecvFSBoundsBodySize covers ISSUE-SYNC-UNBOUNDED-BODIES-01 / X9 for
+// RecvFS, the one handler of the four where the cap is configuration
+// (config.SeafHTTP.RecvFSMaxBytes) rather than a const, because unlike the
+// other three it carries a real batch payload with no measured client size to
+// anchor a fixed number on. Both the nil-config default and an explicit
+// configured cap are exercised, mirroring TestPutBlockBoundsBodySize's
+// "nil config uses the default cap" / "configured cap overrides the default".
+func TestRecvFSBoundsBodySize(t *testing.T) {
+	postRecvFS := func(t *testing.T, h *SyncHandler, bodyLen int) int {
+		t.Helper()
+		r := setupSyncTestRouter()
+		r.POST("/seafhttp/repo/:repo_id/recv-fs", h.RecvFS)
+		body := strings.Repeat("a", bodyLen)
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo/recv-fs", strings.NewReader(body))
+		req.ContentLength = int64(bodyLen)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	t.Run("nil config uses the default cap", func(t *testing.T) {
+		h := &SyncHandler{}
+		if got := h.syncRecvFSMaxBytes(); got != config.DefaultRecvFSMaxBytes {
+			t.Fatalf("cap = %d, want the %d default", got, config.DefaultRecvFSMaxBytes)
+		}
+		if code := postRecvFS(t, h, int(config.DefaultRecvFSMaxBytes)+1); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("RecvFS body over the default cap = %d, want 413", code)
+		}
+	})
+
+	t.Run("configured cap overrides the default", func(t *testing.T) {
+		const configured = 64 * 1024
+		h := &SyncHandler{config: &config.Config{}}
+		h.config.SeafHTTP.RecvFSMaxBytes = configured
+
+		if got := h.syncRecvFSMaxBytes(); got != configured {
+			t.Fatalf("cap = %d, want the configured %d", got, configured)
+		}
+		if code := postRecvFS(t, h, configured+1); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("RecvFS body over the configured cap = %d, want 413", code)
+		}
+	})
+}

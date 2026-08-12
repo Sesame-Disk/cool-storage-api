@@ -8,6 +8,30 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-12 - Bound the four remaining unbounded sync request bodies (ISSUE-SYNC-UNBOUNDED-BODIES-01)
+
+- `PutCommit`, `PackFS`, `RecvFS`, `CheckFS` in `internal/api/sync.go` now read through the
+  shared `readLimitedRequestBody` helper (the same one PR-10 wired into `PutBlock`/
+  `check-blocks` for F12), closing X9. Previously all four buffered the entire request body
+  with an unbounded `io.ReadAll`, so an authenticated client could drive memory pressure
+  arbitrarily high through any of them.
+- `PutCommit`/`PackFS`/`CheckFS` use plain byte-size consts (1 MiB / 16 MiB / 16 MiB), matching
+  the existing `check-blocks` const since they carry the same small id-list-or-metadata shape.
+- `RecvFS` gets a new **configuration** knob instead — `config.SeafHTTP.RecvFSMaxBytes`
+  (`recv_fs_max_bytes` in YAML, `SEAFHTTP_RECV_FS_MAX_BYTES` env override, default 128 MiB) —
+  because it carries a real batch of packed FS objects with no measured client size or
+  protocol-documented ceiling to anchor a fixed number on; the generous default can be raised
+  by an operator without a code change. Added to all seven shipped configs.
+- Scope, precisely: this bounds the body of **one request**, not aggregate memory under
+  concurrency — N concurrent `RecvFS` requests near the cap can still sum to N × the cap.
+- Added `TestPutCommitBoundsBodySize`, `TestPackFSBoundsBodySize`,
+  `TestPackFSBoundsChunkedBody`, `TestCheckFSBoundsBodySize`, `TestRecvFSBoundsBodySize` to
+  `internal/api/sync_body_limits_test.go`, pinning the rejection boundary (`cap+1` → 413) for
+  all four; deliberately not pinning any "positive path" body shape for `PackFS`/`RecvFS` that
+  would depend on incidental parser behavior rather than the size gate itself.
+
+---
+
 ## 2026-08-12 - `sesamefs_auth` cookie is httpOnly (ISSUE-SESSION-COOKIE-NOT-HTTPONLY-01)
 
 - All four writers of `sesamefs_auth` (login and logout, in both `internal/api/server.go` and
