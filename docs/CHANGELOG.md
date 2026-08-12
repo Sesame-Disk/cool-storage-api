@@ -405,6 +405,26 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR r3: abort scopes + full fence-source identity (corr 190)
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed; X1/X2 remain open; `GC_ENABLED=false` stays mandatory; r3 is
+**not** frozen.
+
+A tenth review after correction 189 found freeze blockers in successor-cancel after
+`RESOLVING`:
+
+- **Correction 190.** `abort_scope` is derived from `work_kind`: `QUARANTINE` is
+  `POINTER_AND_GENERATION`; `SUCCESSOR_AFTER_DELETE` is `POINTER_ONLY` (no generation
+  fence; `abort_outcome=SUCCESSOR_CANCELLED`). Each fence attempt persists the full
+  source authority tuple (`kind` + `retire_abort_id` when source is already
+  `QUARANTINE_ABORT`). Linearization proof is `retire_abort_id=A`. Ordinary
+  `QUARANTINE_ABORT` takeover preserves that id exactly. Correction 189's
+  single-assignment / revisable-attempt contract is unchanged.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: abort intent single-assignment (corr 189)
 
 The r3 protocol delta in this slice is documentation-only. The branch also retains
@@ -416,11 +436,11 @@ A ninth review after corrections 187–188 found freeze blockers in the abort-in
 contract:
 
 - **Correction 189.** Abort intent is single-assignment under
-  `IF pending_abort_id = null` with SERIAL settlement and exact-retry of
-  `(A,F,Cf,Nf,Df)`. Logical abort `A` is immutable; fence attempts may revise only
-  after a proven still-`QUARANTINE` / successor still-`QUARANTINE_ABORT` claim
-  supersession. Exact retry includes `Df`. Successor cancel after `RESOLVING` is a
-  pointer-only abort re-taking `QUARANTINE_ABORT`, not `OPEN -> REJECTED`.
+  `IF pending_abort_id = null` with SERIAL settlement and exact-retry of one
+  fence-attempt payload. Logical abort `A` is immutable; fence attempts may revise
+  only after a proven pre-linearization claim supersession. Exact retry includes
+  `Df`. Successor cancel after `RESOLVING` is not `OPEN -> REJECTED` (abort scope
+  and full source identity: correction 190).
 
 ---
 
