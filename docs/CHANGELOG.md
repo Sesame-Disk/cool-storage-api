@@ -405,11 +405,38 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-12 - X1/X2 fence ADR revision r3: abort authority linearizes on `blocks`
+
+The r3 protocol delta in this slice is documentation-only. The branch also retains
+the Compose/configuration changes introduced earlier in this series (Cassandra 5.0.9
+image pins and production `GC_ENABLED=false`). No runtime GC protocol code changed,
+X1/X2 remain open, and destructive GC remains disabled fleet-wide. r3 is **not**
+frozen for implementation.
+
+A sixth review after corrections 177–180 found a remaining cross-partition abort
+window and a recovery-spec gap:
+
+- **Blocker (correction 181).** Writing `RESOLVING -> ABORTING` before the pointer
+  fence does not revoke a stale resolver. The resolution pointer CAS never reads the
+  work row, so `ABORTING` can be durable while an old resolver later returns the
+  generation to `ACTIVE`. Durable abort authority and pointer revocation are now the
+  same `blocks` LWT: install `QUARANTINE_ABORT` with `(Cf, Nf)` and `retire_abort_id`,
+  then adopt that identity into `ABORTING`, then fence the generation, then roll back.
+- **Spec gap (correction 182).** After `DELETE_ALREADY_ADVANCED`, pointer-only
+  successor recovery cannot reopen terminal `REJECTED`. It is a **new** work identity
+  with `decision = ALLOW_SUCCESSOR_AFTER_DELETE`, not `FALSE_POSITIVE`.
+- **Wording (correction 183).** An ambiguous pointer fence leaves the outcome
+  **unresolved** under still-`RESOLVING` work; it is not "`ABORTING` and fenced".
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR revision r3: the abort must fence what it rolls back
 
-Design-document changes only. No runtime code changed, X1/X2 remain open, and
-destructive GC remains disabled fleet-wide. This is a **protocol revision**, not an
-editorial pass: an implementation written against r2 is not compliant with r3.
+The r3 protocol delta is documentation-only; the branch also retains the
+Compose/configuration changes introduced earlier in this series. No runtime GC
+protocol code changed, X1/X2 remain open, and destructive GC remains disabled
+fleet-wide. This is a **protocol revision**, not an editorial pass: an
+implementation written against r2 is not compliant with r3.
 
 Two external reviews of r2 produced four findings; all four were reproduced against
 this branch's tree before being acted on. A third claim — that the first three had
@@ -450,9 +477,10 @@ exit is manual.
   and is expected to be followed by the resolution continuing. A scanner resuming that
   row does what `RESOLVING` tells it to and continues the resolution just abandoned,
   re-reading the live claim so the abort's own fence becomes the claim it matches. A
-  new `ABORTING` work state is confirmed **before** the settlement and before either
-  fence; an `ABORTING` row is resumed only as an abort. Correction 163 one level down:
+  new `ABORTING` work state adopts that abort identity after the pointer fence; an
+  `ABORTING` row is resumed only as an abort. Correction 163 one level down:
   the authorization to undo needs the same durability as the authorization to act.
+  Correction 181 later moved the first authoritative act onto `blocks` itself.
 
 A fourth round found two more, both in the machinery the previous three had just added:
 
@@ -483,11 +511,13 @@ A fourth round found two more, both in the machinery the previous three had just
   regardless — but whether the block may have a G2 is now a fresh human decision,
   which is what the workflow exists to route.
 
-The abort therefore records `RESOLVING -> ABORTING`, serially settles the `blocks`
-partition, fences the **pointer first** (its linearization point) and the generation
-second at `SERIAL + ALL` with the same settlement/idempotence contract on both, and
-only then rolls back — or, where the delete already advanced, declines to roll back
-`gc_state` while retaining any `resolution_epoch` fence already applied.
+The abort therefore **linearizes on `blocks` first** (correction 181): a
+`QUARANTINE_ABORT` claim takeover is durable abort authority and pointer revocation
+in one event; only then does work move `RESOLVING -> ABORTING`, then the generation
+fence, then rollback — or, where the delete already advanced, declines to roll back
+`gc_state` while retaining any `resolution_epoch` fence already applied. After
+`DELETE_ALREADY_ADVANCED`, the human exit is a new `ALLOW_SUCCESSOR_AFTER_DELETE`
+work identity (correction 182).
 
 A fifth review of that abort machinery confirmed four further closures before r3 can
 freeze:
