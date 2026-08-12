@@ -146,9 +146,16 @@ fixed number on.
 Choosing the caps surfaced a second half the row does not describe. `pack-fs` and
 `check-fs` parsed their id list with `strings.Split`/`json.Unmarshal` over the
 whole body, so a body *under* the byte cap still expanded ~17x — the amplification
-X11's sibling fix had already removed from `check-blocks`. Both now share that
-parser (`parseBoundedIDList`), with id caps derived from their byte caps so they
-are unreachable for well-formed input and fire only on degenerate bodies.
+PR-10 had already removed from `check-blocks` when it closed F12 by rejecting an
+oversized id list *during* the parse. Both now share that parser
+(`parseBoundedIDList`), with id caps derived from their byte caps so they are
+unreachable for well-formed input and fire only on degenerate bodies.
+
+Deriving those caps that way bounds what a body can expand into and nothing else.
+It says nothing about what an accepted list costs — X11's territory, not F12's —
+and these two routes have none of the controls X11 grew: no dedup before lookup,
+no context on the per-id read, no fan-out bound, no admission capacity. Filed as
+`ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
 
 Choosing the `recv-fs` cap also surfaced something the row does not contemplate at
 all: the cap bounds the **compressed** body, and `RecvFS` then inflates each packed

@@ -6605,9 +6605,10 @@ tracked rather than left implicit:
 - **The derived id caps are not a work bound.** They were derived against one axis
   only — never reject a well-formed body — and are silent on what an accepted list
   costs. Nothing deduplicates it, so ~409,000 repeats of one valid id are a
-  well-formed request; `pack-fs` materializes the whole response for it. For
-  contrast, `check-blocks` caps ids at 100,000, chosen as a work bound. Tracked as
-  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
+  well-formed request; `pack-fs` materializes the whole response for it. No id cap
+  is a work bound on its own — `check-blocks`' 100,000 is a parse bound too, and
+  what closed X11 there was dedup, context, fan-out and admission, not the number.
+  Tracked as `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`.
 
 #### Related Docs
 
@@ -6645,10 +6646,21 @@ query, **not** a lookup in the `computedToStored` map (the map only translates t
 id), so an accepted list is ~409,000 sequential point reads holding the handler.
 `buildFSIDMapping` is per-request, not per-id, so it is not the amplifying term.
 
-The comparison that makes this concrete: `check-blocks` caps ids at **100,000**
-(`DefaultCheckBlocksMaxIDs`), a number picked as a work bound when X11 closed, and
-also bounds its lookup concurrency (`checkBlocksLookupFanout`). These two routes
-allow **4x** that with no fan-out bound at all.
+**X11 already met this exact shape on `check-blocks`, and its dated note describes
+it almost word for word:** "identical ids were resolved once per occurrence rather
+than once. So the cheapest possible request — one id repeated, then abandoned — was
+also among the most expensive to serve." It also names a second term this entry
+would otherwise miss: that route's mapping read "took no `context` at all, so a
+client disconnect could not stop the loop". `PackFS` and `CheckFS` have the same
+gap — both call `h.db.Session().Query(...)` with no context, so abandoning the
+request does not stop the work it started.
+
+Note what the 100,000 cap on `check-blocks` is and is not. The registry is explicit
+that it "was chosen as a safe parse bound rather than validated against Cassandra,
+the S3 pool, response size or client cancellation" — it is **not** a work bound and
+is not what closed X11. So "these routes allow 4x check-blocks' cap" is the wrong
+comparison to draw; the right one is that `check-blocks` grew the controls below and
+these two routes have none of them.
 
 None of this is new in the X9 fix — before it, both routes had no body cap and
 therefore no id bound whatsoever, so the current state is strictly better. It is
@@ -6656,25 +6668,39 @@ filed because the X9 caps should not be mistaken for a work bound.
 
 #### Fix Direction
 
-Three things, in increasing order of how much they need measuring first:
+X11's resolution is the template, and it is worth following closely because it
+already answered the question this entry would otherwise re-litigate. On
+`check-blocks` the route now deduplicates ids **before any lookup**, resolves them
+through a context-carrying DB call at a configured fan-out, and takes an admission
+from its **own** limiter instance — separate capacity, so one route storming cannot
+spend the other's slots. The same four moves apply here.
 
-1. **Deduplicate** the requested list. Cheap and the largest single win against the
-   repeated-id shape. Confirm first that returning one entry for a duplicated id
-   does not break the official client's pack-fs framing — the response is a stream
-   of `(id, size, data)` records and a client indexing by id will not care, but that
-   should be verified, not assumed.
-2. **Bound the response**, by size rather than only by id count, and prefer
-   streaming each record to `c.Writer` over accumulating `buf`. A cap on the
-   materialized response is the only thing that bounds the large-directory case.
-3. **Re-derive the id caps against work**, the way `check-blocks` was, rather than
-   against "the densest body the byte cap admits". That likely means a lower cap
-   plus a fan-out bound, and it needs the same measurement
-   `ISSUE-SYNC-METADATA-CONCURRENCY-01` calls for: what the official client
-   actually requests per pack-fs/check-fs.
+Two route-specific additions:
+
+- `PackFS` also needs its **response** bounded, not just its lookups: dedup fixes
+  the DB fan-out but a repeated id still emits one record per occurrence into a
+  single `bytes.Buffer`. Prefer streaming records to `c.Writer` over accumulating
+  them. Whoever does this must decide what happens when a cap is reached *after*
+  headers are on the wire — at that point a clean 413 is no longer available, which
+  is the same late-failure class as `ISSUE-ZIP-STREAM-LATEFAIL-01`.
+- Confirm the client contract before deduplicating the **response** (as opposed to
+  the work): the response is a stream of `(id, size, data)` records and a client
+  indexing by id should not care, but that must be verified, not assumed. Resolving
+  each distinct id once while still emitting one record per requested id needs no
+  such confirmation and is the safe half.
+
+**Do not lower the id caps as part of this.** X11 considered exactly that and
+deliberately declined: it kept 100k as the default and turned it into a validation
+ceiling, on the grounds that "lowering it on a guess would trade a bounded
+amplification for an unbounded risk of 413-ing a legitimate initial sync." It added
+`sync_check_blocks_ids_per_request` as the evidence a future reduction would need.
+The equivalent metric for these two routes is the prerequisite here too — the caps
+are derived to be unreachable by well-formed bodies precisely so they never do the
+413-ing X11 warns about.
 
 #### Related Docs
 
-- `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` / registry X11 (the same defect on the block route, closed — its resolution is the template)
+- `ISSUE-CHECKBLOCKS-WORK-AMPLIFICATION-01` / registry X11 and its 2026-07-31 dated note (the same defect on the block route; closed by dedup-before-lookup, a context-carrying resolve at a configured fan-out, and its own admission capacity — **not** by lowering the id cap, which it deliberately kept)
 - `ISSUE-SYNC-UNBOUNDED-BODIES-01` (where the 409,200 caps come from, and why they are derived that way)
 - `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate term; this issue is per-request)
 
@@ -6753,13 +6779,15 @@ would be stored under an `fs_id` its stored body no longer corresponds to.
 inserts `fs_objects(library_id=repoID, fs_id=<client-supplied>, …)`. It never
 recomputes `SHA-1(jsonData)` to confirm the id addresses the content it is filed
 under. The handler's own comment asserts the invariant it does not check: *"the
-fs_id is the SHA1 hash of the exact JSON content"*. The only `sha1.Sum` calls in
-this package are on the web-upload path in `seafhttp.go`, not here.
+fs_id is the SHA1 hash of the exact JSON content"*.
 
-On the read side the id *is* treated as content-addressed:
+Not for want of the machinery. `computeCorrectedObject` in this same file hashes an
+object's JSON to derive its `ComputedFSID`, which is how the computed↔stored mapping
+is built at all — so the write path declines a check the read path depends on. And
+on the read side the id *is* treated as content-addressed:
 `internal/integration/sync_protocol_regression_test.go` records that the served JSON
 "must re-hash to the requested fs_id (otherwise the desktop client rejects the
-object)". Nothing enforces the same on the write side.
+object)".
 
 #### Fix Direction
 
@@ -6769,9 +6797,12 @@ likely **wrong here**, and that is the point of filing this as a question.
 SesameFS deliberately maintains a *stored* fs id that differs from the *computed*
 one. `CheckFS` says so directly ("Client sends COMPUTED fs_ids (SHA-1 of corrected
 JSON), but we store objects with their ORIGINAL (stored) fs_ids"), and
-`buildFSIDMapping`/`collectCorrectedObjects` exist to translate between them. A
-strict `fs_id == SHA-1(body)` check in `RecvFS` would reject writes this design
-intends to accept.
+`buildFSIDMapping`/`collectCorrectedObjects` — built on the `computeCorrectedObject`
+hashing above — exist precisely to translate between them. A strict
+`fs_id == SHA-1(body)` check in `RecvFS` would reject writes this design intends to
+accept. The existence of that mapping layer is the whole reason this is a question:
+the divergence is known and compensated for, so what is undetermined is whether the
+write path is *allowed* to introduce a new one.
 
 So the real question is which of these is true, and the answer decides everything:
 

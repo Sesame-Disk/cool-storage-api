@@ -10,10 +10,12 @@ Session-by-session development history for SesameFS.
 
 ## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
 
-Auditing the caps above surfaced three defects on the same handlers. All three are
-**pre-existing** — none is introduced or worsened by the X9 work, which in each case
-narrowed the surface — so they are documented here and left for their own changes
-rather than folded into this branch.
+Auditing the caps above surfaced three follow-up findings on the same handlers: **two
+confirmed defects and one protocol-contract question**. All three are **pre-existing**
+— the X9 work did not introduce any of them, and for the two memory defects it
+narrowed the surface rather than widening it — so they are documented here and left
+for their own changes rather than folded into this branch. (The third is a semantic
+question about the write path; a body cap neither helps nor hurts it.)
 
 - `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` (**HIGH**) — `recv_fs_max_bytes` bounds the
   *compressed* body; `RecvFS` then inflates each packed object with an unbounded
@@ -24,11 +26,14 @@ rather than folded into this branch.
 - `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` (**HIGH**) — the derived id caps
   (`maxPackFSIDs`/`maxCheckFSIDs`, 409,200) were derived against one axis, *never reject a
   well-formed body*, and are silent on what an accepted list costs. Nothing deduplicates it,
-  so ~409k repeats of one valid id is a well-formed request: `PackFS` issues a sequential
-  Cassandra read per id and materializes every record in one `bytes.Buffer` before writing,
-  on `PermissionR` alone. `CheckFS` shares the per-id read (its map only translates ids) but
-  not the buffer. For contrast `check-blocks` caps ids at 100,000, picked as a work bound
-  when X11 closed, and bounds its lookup fan-out; these two allow 4x that with neither.
+  so ~409k repeats of one valid id is a well-formed request: `PackFS` issues a sequential,
+  context-less Cassandra read per id and materializes every record in one `bytes.Buffer`
+  before writing, on `PermissionR` alone. `CheckFS` shares the per-id read (its map only
+  translates ids) but not the buffer. X11 met this exact shape on `check-blocks` — "one id
+  repeated, then abandoned" — and closed it by deduplicating before lookup, resolving through
+  a context-carrying call at a configured fan-out, and taking its own admission capacity;
+  notably **not** by lowering the id cap, which it kept deliberately. That resolution is the
+  template.
 - `ISSUE-RECVFS-FSID-UNVERIFIED-01` (**unrated, open question**) — `RecvFS` stores the
   client-supplied `fs_id` without checking it hashes the content, while the download path is
   integration-tested to require exactly that. Filed as a question rather than a defect
