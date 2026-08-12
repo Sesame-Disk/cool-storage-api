@@ -475,15 +475,43 @@ A fourth round found two more, both in the machinery the previous three had just
   branch is usable: restoring `QUARANTINED` regresses an authorized, irrevocable delete
   against a possibly half-removed object, one of the three shortcuts When The Physical
   Delete Keeps Failing forbids; and "nothing to undo" reports a retained quarantine
-  that does not exist. The abort now performs no generation-row mutation, terminates as
-  `REJECTED` recording why, leaves the pointer fenced and the delete work running, and
-  alerts. Nothing unsafe has happened — G1 reached `RETIRED`, authority can never be
-  reacquired, the delete was correct regardless — but whether the block may have a G2
-  is now a fresh human decision, which is what the workflow exists to route.
+  that does not exist. The abort now performs no `gc_state`/lifecycle rollback,
+  terminates as `REJECTED` recording `abort_outcome` / `abort_observed_gc_state`,
+  leaves the pointer fenced and the delete work running, retains any
+  `resolution_epoch` fence already applied, and alerts. Nothing unsafe has happened —
+  G1 reached `RETIRED`, authority can never be reacquired, the delete was correct
+  regardless — but whether the block may have a G2 is now a fresh human decision,
+  which is what the workflow exists to route.
 
 The abort therefore records `RESOLVING -> ABORTING`, serially settles the `blocks`
-partition, fences both partitions at `SERIAL + ALL`, and only then rolls back — or,
-where the delete already advanced, declines to roll back at all.
+partition, fences the **pointer first** (its linearization point) and the generation
+second at `SERIAL + ALL` with the same settlement/idempotence contract on both, and
+only then rolls back — or, where the delete already advanced, declines to roll back
+`gc_state` while retaining any `resolution_epoch` fence already applied.
+
+A fifth review of that abort machinery confirmed four further closures before r3 can
+freeze:
+
+- **The generation fence needed settlement of its own (correction 177).** `Rr -> Rr+1`
+  is a LWT; a lost applied response or an accepted-but-unlearned proposal left recovery
+  unable to distinguish "already fenced" from "not applied", and an ordinary read still
+  seeing `Rr` could have advanced to rollback while a stalled clear remained live. The
+  generation partition now SERIAL-settles and classifies `Rr` versus `Rr+1` exactly as
+  `blocks` already does.
+- **Fence order was inverted (correction 178).** Generation-before-pointer left a
+  window in which a resolver that had already cleared `gc_state` could still win its
+  pointer CAS and return a known-suspect generation to `ACTIVE` before the abort
+  linearized. Pointer takeover now runs first; a clear between the fences remains
+  reversible under a still-fenced pointer.
+- **"`DELETING`/`DELETED` = no generation-row mutation" contradicted the fence
+  (correction 179).** The delete-advanced branch forbids `gc_state`/lifecycle rollback
+  while retaining the monotonic `resolution_epoch` bump; both are now said that way.
+  Schema records `abort_outcome` and `abort_observed_gc_state`, and the later human
+  path is a pointer-only recertification that does not require `QUARANTINED -> null`.
+- **The `MATERIALIZING -> VERIFIED` repair must name the same fence (correction 180).**
+  Otherwise an abort revokes only the clear and leaves a stalled repair able to fire
+  after `REJECTED`.
+
 - The takeover epoch `Nf` must exceed both the live claim epoch and any prospective
   epoch fixed by the `RESOLVING` row. Reusing `Nq + 1` where the row already fixed
   `Nr = Nq + 1` would leave `evidence(G1, Nr)` carrying `Cr` while the pointer carries

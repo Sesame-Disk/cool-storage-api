@@ -28,12 +28,17 @@ three failures compose into one wedge:
   resolution being abandoned (correction 173).
 
 An abort therefore now records `RESOLVING -> ABORTING` first, serially settles the
-`blocks` partition, fences **both** the generation's new monotonic `resolution_epoch`
-and the pointer's quarantine claim, and only then rolls back — against all four
+`blocks` partition, then fences the **pointer first** — that takeover is the abort's
+linearization point — and only afterwards fences the generation's monotonic
+`resolution_epoch`, with the same serial-settlement and exact-retry rules the pointer
+partition already has (corrections 177 and 178). It then rolls back against all four
 reachable values of `gc_state`, since an authorized delete that advanced to `DELETING`
-during the resolution forbids a rollback rather than permitting one (correction 176).
-The fence counter is initialized by the `MATERIALIZING` intent and never by a
-quarantine transition, or it would be null on the first cycle and reset on the second
+during the resolution forbids a `gc_state` rollback rather than permitting one
+(correction 176, clarified by 179). Every post-`RESOLVING` resolver mutation of
+`block_generations` — the `MATERIALIZING -> VERIFIED` repair as well as
+`QUARANTINED -> null` — names that same `resolution_epoch` (correction 180). The fence
+counter is initialized by the `MATERIALIZING` intent and never by a quarantine
+transition, or it would be null on the first cycle and reset on the second
 (correction 175). r3 also removes a
 verification and X2-closure requirement that contradicted the abort contract and made
 the normative suite unsatisfiable (correction 169), gives the post-commit branch the
@@ -310,11 +315,12 @@ version must still be asserted by integration tests.
 | Quarantine work `OPEN -> RESOLVING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM` on `gc_generation_quarantines_by_day`; matches the full quarantine operation/evidence identity, fixes the prospective `(Cr, Nr)`, and is confirmed **before** any `gc_state` or pointer mutation. This is not a `blocks` partition, so a later inventoried optimization may localize its serial phase; the one-serial-domain rule does not bind it |
 | Quarantine work `OPEN -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; the ordinary rejection path |
 | Quarantine work `RESOLVING -> ABORTING` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; matches the full resolution identity and records `abort_id`, actor, reason, and `abort_started_at`. Confirmed **before** the settlement and **before** either fence, so every later crash resumes an abort rather than the resolution it is undoing |
-| Abort generation fence (`resolution_epoch` bump before any rollback) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches `(G, storage_key, quarantine_operation_id, resolution_epoch = Rr)` and installs `Rr + 1`. Runs in **both** rollback branches, including "nothing to undo", because that branch is exactly the stalled-clear interleaving |
-| Abort pointer fence (quarantine claim takeover before any rollback) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the exact serially settled `(G, active_epoch, active_state, Cq, Nq, kind=QUARANTINE)` and installs `(Cf, Nf)` preserving `active_state` and the kind, with `Nf` strictly greater than both the live and any recorded prospective epoch. A non-applied result is classified, never assumed to be failure; an ambiguous result leaves the work `ABORTING` and fenced |
-| Quarantine work `ABORTING -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`, permitted only after `SELECT ... CONSISTENCY SERIAL` settles the `blocks` partition (plus the lineage walk for a recertification) **and both** fences above have applied — restoring `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step already ran, and performing **no** generation-row mutation at all when `gc_state` has already reached `DELETING` or `DELETED`. An ordinary read of the pointer never authorizes the rollback. Never permitted once the pointer step committed; see Resolution Needs Its Own Durable State and Aborting After The Delete Already Advanced |
+| Abort pointer fence (quarantine claim takeover; abort linearization point) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; issued **before** the generation fence. Matches the exact serially settled `(G, active_epoch, active_state, Cq, Nq, kind=QUARANTINE)` and installs `(Cf, Nf)` preserving `active_state` and the kind, with `Nf` strictly greater than both the live and any recorded prospective epoch. This is the abort's linearization point: if it applies, every resolution pointer CAS naming `(Cq, Nq)` fails; if settlement proves the resolution pointer step already committed, abort is forbidden and recovery goes to step 4. A non-applied result is classified, never assumed to be failure; an ambiguous result leaves the work `ABORTING` and fenced |
+| Abort generation fence (`resolution_epoch` bump after the pointer fence) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches `(G, storage_key, quarantine_operation_id, resolution_epoch = Rr)` and installs `Rr + 1`. Runs after the pointer fence has linearized, in **every** abort that still owns the generation — including "nothing to undo" and the `DELETING`/`DELETED` branch — because that bump is what invalidates a stalled `QUARANTINED -> null` or `MATERIALIZING -> VERIFIED` repair. An ambiguous result must `SELECT ... CONSISTENCY SERIAL` the generation partition and classify: settled `Rr + 1` with matching identity means this abort's fence already applied; settled `Rr` with matching identity means retry the exact same fence; any other settled identity or an unsettleable partition leaves the work `ABORTING` with no rollback |
+| Quarantine work `ABORTING -> REJECTED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`, permitted only after `SELECT ... CONSISTENCY SERIAL` settles the `blocks` partition (plus the lineage walk for a recertification) **and both** fences above have applied — restoring `gc_state = QUARANTINED` at `SERIAL + ALL` first when the generation step already ran. When `gc_state` has already reached `DELETING` or `DELETED`, perform no rollback of `gc_state`, materialization, storage identity, or delete lifecycle metadata; the abort's monotonic `resolution_epoch` fence may already have advanced and is retained. Records `abort_outcome` and `abort_observed_gc_state`. An ordinary read of the pointer never authorizes the rollback. Never permitted once the pointer step committed; see Resolution Needs Its Own Durable State and Aborting After The Delete Already Advanced |
 | Quarantine work `ABORTING -> RESOLVED` | LWT serial phase `SERIAL`, regular commit `LOCAL_QUORUM`; the step-4 outcome where settlement proves the pointer step already committed and there is nothing to abort |
-| Operator `gc_state QUARANTINED -> null` (false-positive resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches the exact `(G, storage_key, quarantine_operation_id, quarantine_evidence_digest)` identity **and `resolution_epoch = Rr`**, the value the `RESOLVING` record fixed — never null, because the `MATERIALIZING` intent initializes it to `0` at row creation and no quarantine transition writes it — after fresh exact-object verification. The epoch is what an abort bumps to fence this statement; the pointer takeover cannot, because correction 68 forbids a generation-row condition on `retire_claim_*`. It does **not** condition on `materialization_state`: a `MATERIALIZING` generation is quarantinable, so requiring `VERIFIED` here would make that class unresolvable. Where the object proves out, the marker is repaired to `VERIFIED` in its own write before the pointer step |
+| Operator `MATERIALIZING -> VERIFIED` repair (false-positive resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches the exact generation/key and quarantine operation/evidence identity **and `resolution_epoch = Rr`**. Required before `QUARANTINED -> null` when the object proves out. An abort that has already bumped past `Rr` makes this repair fail closed |
+| Operator `gc_state QUARANTINED -> null` (false-positive resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on the generation row; matches the exact `(G, storage_key, quarantine_operation_id, quarantine_evidence_digest)` identity **and `resolution_epoch = Rr`**, the value the `RESOLVING` record fixed — never null, because the `MATERIALIZING` intent initializes it to `0` at row creation and no quarantine transition writes it — after fresh exact-object verification. The epoch is what an abort bumps to fence this statement; the pointer takeover cannot, because correction 68 forbids a generation-row condition on `retire_claim_*`. It does **not** condition on `materialization_state`: a `MATERIALIZING` generation is quarantinable, so requiring `VERIFIED` here would make that class unresolvable. Where the object proves out, the marker is repaired to `VERIFIED` first under the same `resolution_epoch = Rr` condition |
 | `RETIRING/QUARANTINE -> ACTIVE` (operator resolution) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim; requires a confirmed delayed candidate and its discovery projection first |
 | `RETIRED/QUARANTINE -> RETIRED/GC_RETIRE` (operator recertification) | LWT serial phase `SERIAL`, regular commit `ALL` on `blocks`; matches the retained quarantine claim, installs the next `retire_claim_epoch`, and requires a fresh global zero check plus confirmed fresh evidence for that epoch first. There is no `RETIRED -> ACTIVE` form |
 | Final generation-reference check | `EACH_QUORUM` |
@@ -3631,8 +3637,8 @@ fence, which makes every crash point decidable:
 ```text
 OPEN         -> no resolution was authorized: continue/complete the quarantine
 RESOLVING    -> continue exactly the recorded authorized resolution
-ABORTING     -> resume ONLY the abort: settle, fence both partitions, restore,
-                REJECTED. Never continue the resolution
+ABORTING     -> resume ONLY the abort: settle, fence pointer then generation,
+                restore, REJECTED. Never continue the resolution
 RESOLVED     -> terminal; never reopen
 REJECTED     -> terminal; the pointer stays fenced
 ```
@@ -3672,8 +3678,8 @@ RESOLVING, pointer step committed                    resolution effectively comp
 That is precisely why the state exists, and it is why a bare rejection cannot define
 rollback: the same work state means three different amounts of undo.
 
-**Aborting therefore records itself first, settles second, fences both partitions
-third, and rolls back only then.**
+**Aborting therefore records itself first, settles second, fences the pointer
+third (linearization), fences the generation fourth, and rolls back only then.**
 
 Reading the canonical state is *not* sufficient, and an earlier revision of this
 section that began "aborting reads the canonical state" was wrong for a reason worth
@@ -3745,27 +3751,14 @@ own transitions, so the condition is satisfiable by construction.
    committed CAS may already have been superseded by G2 or G3 -- the same rule as
    A RESOLVING Recertification Is Settled By Lineage.
 
-2a. Fence the GENERATION partition. Conditionally bump resolution_epoch to
-    Rr + 1 at SERIAL + ALL, matching the exact (G, storage_key,
-    quarantine_operation_id, resolution_epoch = Rr) the RESOLVING row recorded.
-    A stalled resolver's QUARANTINED -> null then fails, because that statement
-    names resolution_epoch = Rr.
-
-    This bump runs in BOTH rollback branches, including "gc_state still
-    QUARANTINED, nothing to undo" -- that branch is precisely the interleaving
-    above, and skipping the fence there is what reopens it.
-
-2b. Fence the POINTER partition. Take over the quarantine claim with the
-    takeover LWT shape of Retire Ownership at SERIAL + ALL: match the exact settled
+2a. Fence the POINTER partition FIRST. This is the abort's linearization point.
+    Take over the quarantine claim with the takeover LWT shape of Retire Ownership
+    at SERIAL + ALL: match the exact settled
     (G, active_epoch, active_state, Cq, Nq, kind=QUARANTINE) and install (Cf, Nf),
     preserving both active_state and kind=QUARANTINE.
 
-    Neither fence substitutes for the other, and both must apply before step 3.
-    An incomplete pair leaves the work ABORTING and fenced; it is retried, never
-    completed halfway.
-
        applied      every resolution CAS naming (Cq, Nq) now fails, whether its
-                    resolver is alive or its proposal is replayed. Go to step 3
+                    resolver is alive or its proposal is replayed. Go to step 2b
        not applied  classify the returned row rather than assuming failure, and do
                     not collapse its two causes:
                       pointer step committed (directly, or proven by the lineage
@@ -3774,7 +3767,8 @@ own transitions, so the condition is satisfiable by construction.
                           fenced -> the pointer step did NOT commit; re-settle and
                           retry the fence against the new claim tuple
                       anything else -> retain ABORTING and fenced
-       ambiguous    stay ABORTING and fenced. No restore, no REJECTED
+       ambiguous    stay ABORTING and fenced. No generation fence, no restore,
+                    no REJECTED
 
    Nf must be strictly greater than both the live claim epoch and any
    prospective epoch recorded by the RESOLVING row. Reusing Nq + 1 when the
@@ -3785,8 +3779,51 @@ own transitions, so the condition is satisfiable by construction.
    statement, and so that a resumed resolver reads its own fence locally instead
    of retrying blindly.
 
-3. Roll back and reject, now that neither partition can move. `gc_state` has four
-   reachable values here, not two:
+   Ordering the pointer fence before the generation fence is load-bearing. The
+   reverse order leaves a window in which a resolver that already cleared
+   QUARANTINED -> null can still win RETIRING/QUARANTINE -> ACTIVE (or the
+   recertification CAS) before the abort takes over the claim, returning a
+   known-suspect generation to service -- the fail-open window this workflow
+   exists to forbid. If the old resolver still clears gc_state between 2a and
+   2b, the pointer remains fenced, writers cannot use the generation, and
+   step 3 restores QUARANTINED. That mutation is reversible; an ACTIVE window
+   is not. See correction 178.
+
+2b. Fence the GENERATION partition SECOND. Conditionally bump resolution_epoch
+    to Rr + 1 at SERIAL + ALL, matching the exact (G, storage_key,
+    quarantine_operation_id, resolution_epoch = Rr) the RESOLVING row recorded.
+    A stalled resolver's QUARANTINED -> null and its MATERIALIZING -> VERIFIED
+    repair then fail, because both statements name resolution_epoch = Rr.
+
+    This bump runs in EVERY abort that still owns the generation after step 2a,
+    including "gc_state still QUARANTINED, nothing to undo" and the
+    DELETING/DELETED branch -- skipping it there reopens the stalled-clear
+    interleaving, and the epoch bump is not a gc_state rollback.
+
+    The generation fence is itself a LWT and needs the same settlement contract
+    the pointer fence already has. "Only this abort produces exactly Rr + 1 from
+    the Rr frozen by its work row" is the load-bearing property; it must be
+    written and tested, not inferred:
+
+       applied      generation fence proven; go to step 3
+       ambiguous    SELECT ... CONSISTENCY SERIAL the generation partition.
+                    Do not advance on an ordinary read.
+                      settled identity matches and resolution_epoch == Rr + 1
+                          -> this abort's fence already applied; continue
+                      settled identity matches and resolution_epoch == Rr
+                          -> fence did not apply; retry the exact same
+                             Rr -> Rr + 1 statement
+                      settled resolution_epoch > Rr + 1, or identity mismatch
+                          -> protocol conflict; remain ABORTING, fail closed
+                      unable to settle
+                          -> remain ABORTING; no rollback, no REJECTED
+       not applied  classify from the returned/settled row with the same
+                    rules as the ambiguous case above; never assume failure
+                    from a timeout alone
+
+3. Roll back and reject, now that the pointer cannot move and every abandoned
+   resolution mutation of block_generations names a revoked epoch. `gc_state`
+   has four reachable values here, not two:
 
        gc_state still QUARANTINED -> ABORTING -> REJECTED directly; nothing to undo
        gc_state already null      -> conditionally restore gc_state = QUARANTINED at
@@ -3794,8 +3831,10 @@ own transitions, so the condition is satisfiable by construction.
                                      identity and retaining the bumped
                                      resolution_epoch, then ABORTING -> REJECTED
        gc_state DELETING or DELETED
-                                  -> the rollback is impossible and must not be
-                                     attempted; no generation-row mutation at all.
+                                  -> no rollback of gc_state, materialization,
+                                     storage identity, or delete lifecycle metadata.
+                                     The resolution_epoch fence from step 2b may
+                                     already have advanced and is retained.
                                      See Aborting After The Delete Already Advanced
 
 4. Pointer step proven committed: there is nothing left to abort. Finish to
@@ -3836,26 +3875,33 @@ restore gc_state = QUARANTINED   forbidden. It regresses an authorized, irrevoca
                                  bytes are being deleted
 ```
 
-So the abort terminates without a generation-row rollback, and says so:
+So the abort terminates without a `gc_state` rollback, and says so:
 
 ```text
--> perform NO generation-row mutation; DELETING and DELETED are terminal-directed
-   and the delete work row keeps its own retry/escalation lifecycle untouched
--> ABORTING -> REJECTED, recording that the generation rollback was not performed
-   because the delete had already advanced, with the observed gc_state
+-> perform no rollback of gc_state, materialization_state, storage identity, or
+   delete lifecycle metadata; DELETING and DELETED are terminal-directed and the
+   delete work row keeps its own retry/escalation lifecycle untouched
+-> the abort's monotonic resolution_epoch fence from step 2b may already have
+   advanced and is retained; that bump is a fence, not a lifecycle rollback
+-> ABORTING -> REJECTED, recording abort_outcome = DELETE_ALREADY_ADVANCED and
+   abort_observed_gc_state = the settled DELETING or DELETED value
 -> leave the pointer fenced at RETIRED/QUARANTINE and raise a distinct alert and
    audit event
 ```
 
 Leaving the pointer fenced is the fail-closed choice and it is deliberate: the operator
-has just confirmed a contradiction they can no longer record on the generation row, so
-whether this logical block may ever have a G2 is exactly the judgement the quarantine
-workflow exists to route to a human. The ordinary forward path remains available to
-them later — a **new** audited recertification to `RETIRED/GC_RETIRE` — but no
-automated path may take it on their behalf, and none may infer from `DELETING` that the
-contradiction was resolved. Nothing here is unsafe: G1 reached `RETIRED`, no writer can
-reacquire authority on it, and deleting `K1` was correct independently of how the
-quarantine ended. See correction 176.
+has just confirmed a contradiction they can no longer record as `QUARANTINED` on the
+generation row, so whether this logical block may ever have a G2 is exactly the
+judgement the quarantine workflow exists to route to a human. The ordinary forward
+path remains available later as a **pointer-only** audited recertification: it does
+**not** require `QUARANTINED -> null`, because that precondition is unreachable under
+`DELETING`/`DELETED`; it reuses the prospective evidence / handoff / `RETIRED/QUARANTINE
+-> RETIRED/GC_RETIRE` pointer CAS under a fresh `RESOLVING` authorization while leaving
+the generation's delete lifecycle untouched. No automated path may take that step on
+the operator's behalf, and none may infer from `DELETING` that the contradiction was
+resolved. Nothing here is unsafe: G1 reached `RETIRED`, no writer can reacquire
+authority on it, and deleting `K1` was correct independently of how the quarantine
+ended. See corrections 176 and 179.
 
 Step 4's path depends on where the pointer actually is, and naming only the `ACTIVE`
 form — as an earlier revision did — leaves a recertified generation unfenced while
@@ -4076,6 +4122,11 @@ resolution_state/resolution identity:
     abort_actor
     abort_reason
     abort_started_at
+    abort_outcome          -- set with REJECTED/RESOLVED from ABORTING; e.g.
+                              NOTHING_TO_UNDO, RESTORED_QUARANTINED,
+                              DELETE_ALREADY_ADVANCED, POINTER_ALREADY_COMMITTED
+    abort_observed_gc_state -- set with REJECTED when DELETE_ALREADY_ADVANCED;
+                              the settled DELETING or DELETED value
     resolved_by
     resolved_at
 ```
@@ -4092,8 +4143,9 @@ An `OPEN` row means no resolution was authorized, so the scanner completes the
 **quarantine**; a `RESOLVING` row means the scanner resumes exactly the recorded
 authorized resolution, reusing `resolution_id` and — for a `RETIRED` recertification —
 the `prospective_claim_id`/`prospective_claim_epoch` fixed at that moment; an
-`ABORTING` row means the scanner resumes **only** the abort — settle, fence both
-partitions, restore, `REJECTED` — and never continues the resolution. A DDL that
+`ABORTING` row means the scanner resumes **only** the abort — settle, fence the
+pointer first then the generation, restore, `REJECTED` — and never continues the
+resolution. A DDL that
 omits any of the three, or their identities, cannot recover an interrupted resolution
 unambiguously, whatever the prose says. `ABORTING` in particular is what stops a
 resumed scanner from re-reading the live pointer claim and treating an abort's own
@@ -4559,7 +4611,9 @@ state and either loops or, worse, resolves it differently. A quarantined generat
   `RESOLVED`, or `REJECTED`, with the resolving operation, actor, and timestamp.
   `RESOLVING` additionally carries `resolution_id`, `decision`, `verification_digest`,
   `started_at`, and the `observed_resolution_epoch`; `ABORTING` carries `abort_id`,
-  actor, reason, and `abort_started_at`. Scanners must confirm this state before
+  actor, reason, and `abort_started_at`. Terminal abort outcomes additionally carry
+  `abort_outcome` and, when the delete already advanced, `abort_observed_gc_state`.
+  Scanners must confirm this state before
   retrying, must resume an `ABORTING` row only as an abort, and must never reopen
   `RESOLVED` or `REJECTED` work;
 - is never transitioned out of `QUARANTINED` by any automated path, only by explicit
@@ -4584,7 +4638,11 @@ state and either loops or, worse, resolves it differently. A quarantined generat
   unresolvable, an `IF` clause that can never apply on exactly the class the workflow
   exists for. Where the re-verified object proves the generation out, repair
   `materialization_state = VERIFIED` in its own write **before** clearing `gc_state`,
-  exactly as `VERIFIED` Lag Is Not A Contradiction already prescribes for recovery;
+  with the same `resolution_epoch = Rr` condition the clear uses — every
+  post-`RESOLVING` resolver mutation of `block_generations` must name that epoch, or
+  an abort's bump would revoke only the last statement and leave a stalled repair
+  able to fire after `REJECTED`. Exactly as `VERIFIED` Lag Is Not A Contradiction
+  already prescribes for recovery;
   where it does not, the contradiction is confirmed and the work is rejected rather
   than resolved. Then complete
   the pointer step for the state the pointer is actually in. If the pointer carries a
@@ -4610,8 +4668,9 @@ state and either loops or, worse, resolves it differently. A quarantined generat
   work reached `RESOLVING`, record `RESOLVING -> ABORTING` first and then follow the
   state-aware abort contract in Resolution Needs Its Own Durable State rather than
   completing the false-positive resolution. The abort's own authorization is durable
-  before it acts, for the same reason the resolution's is, and it fences **both** the
-  generation partition and the pointer partition before rolling anything back. If any
+  before it acts, for the same reason the resolution's is, and it fences the **pointer
+  first** (its linearization point) and the generation partition second before rolling
+  anything back. If any
   identity or condition does not match, retain quarantine and
   require a new audited resolution; no operator action may authorize deletion
   implicitly. The scanner must see a terminal work state before retiring the work
@@ -5155,20 +5214,23 @@ already been got wrong once:
   behaviour; leaving them in prose would let PR-6 invent a DLQ that dequeues the work
   row. See When The Physical Delete Keeps Failing and correction 172;
 - the operator `QUARANTINED -> null` clear matches generation/key plus quarantine
-  operation/evidence identity and **must not** condition on `materialization_state`,
-  since a `MATERIALIZING` generation is quarantinable. See correction 171;
+  operation/evidence identity **and `resolution_epoch = Rr`**, and **must not**
+  condition on `materialization_state`, since a `MATERIALIZING` generation is
+  quarantinable. The preceding `MATERIALIZING -> VERIFIED` repair, when required,
+  names the same `resolution_epoch = Rr`. See corrections 171 and 180;
 - `block_generations` carries a monotonic `resolution_epoch`, initialized to 0 by the
   `MATERIALIZING` intent that creates the row — **not** by the quarantine transition,
-  which must not write it at all — named by the `QUARANTINED -> null` clear, and
-  bumped only by an abort. It is the generation partition's fence; without it an abort
-  can only fence the pointer, and a stalled resolver clears the quarantine afterwards.
-  Initializing it at quarantine instead would leave `Rr` null on the first cycle and
-  reset the counter on a second, reintroducing an ABA on the fence. See corrections
-  174 and 175;
+  which must not write it at all — named by every post-`RESOLVING` resolver mutation
+  of the generation row, and bumped only by an abort after the pointer fence has
+  linearized. Without it an abort can only fence the pointer, and a stalled resolver
+  clears the quarantine afterwards. Initializing it at quarantine instead would leave
+  `Rr` null on the first cycle and reset the counter on a second, reintroducing an ABA
+  on the fence. An ambiguous abort bump settles the generation partition serially and
+  classifies `Rr` versus `Rr + 1`. See corrections 174, 175, 177, and 178;
 - `gc_generation_quarantines_by_day` carries `ABORTING` in `resolution_state`, plus
-  `abort_id`/`abort_actor`/`abort_reason`/`abort_started_at` and the
-  `observed_resolution_epoch` the clear and the abort fence both name. See
-  correction 173.
+  `abort_id`/`abort_actor`/`abort_reason`/`abort_started_at`,
+  `abort_outcome`/`abort_observed_gc_state`, and the `observed_resolution_epoch` the
+  clear, the repair, and the abort fence all name. See corrections 173 and 179.
 
 ### PR-2: Explicit Consistency Helpers
 
@@ -5311,17 +5373,22 @@ PR-6 also owns the operator resolution workflow and its abort. An abort records
 point is resumed as an abort rather than as the resolution it is undoing. It then
 serially settles the `blocks` partition — walking the predecessor/evidence
 lineage for a recertification — and applies **both** fences at `SERIAL + ALL` before
-restoring `gc_state` or writing `REJECTED`: the generation's `resolution_epoch` bump,
-which invalidates a stalled `QUARANTINED -> null`, and the quarantine claim takeover,
-which invalidates a stalled or replayed pointer CAS. Neither substitutes for the other,
-and the generation fence runs even in the "nothing to undo" branch. A
-non-applied fence is classified from the returned row, never assumed to be failure; an
-unsettleable partition or ambiguous fence leaves the work `ABORTING` and fenced. Where
-the pointer step has already committed the abort is forbidden: the resolution finishes
-`RESOLVED` and a new quarantine is raised through the form matching the pointer's
-current state — `ACTIVE -> RETIRING/QUARANTINE`,
+restoring `gc_state` or writing `REJECTED`, in this order: the quarantine claim
+takeover first (the abort's linearization point, which invalidates a stalled or
+replayed pointer CAS), then the generation's `resolution_epoch` bump (which
+invalidates a stalled `QUARANTINED -> null` or `MATERIALIZING -> VERIFIED` repair).
+Neither substitutes for the other. An ambiguous generation fence settles the generation
+partition serially and treats settled `Rr + 1` with matching identity as already
+applied; settled `Rr` retries the exact fence; any other settled identity or an
+unsettleable partition leaves the work `ABORTING` with no rollback. The generation
+fence runs even in the "nothing to undo" and `DELETING`/`DELETED` branches. A
+non-applied pointer fence is classified from the returned row, never assumed to be
+failure; an unsettleable partition or ambiguous fence leaves the work `ABORTING` and
+fenced. Where the pointer step has already committed the abort is forbidden: the
+resolution finishes `RESOLVED` and a new quarantine is raised through the form matching
+the pointer's current state — `ACTIVE -> RETIRING/QUARANTINE`,
 `RETIRED/GC_RETIRE -> RETIRED/QUARANTINE`, or the generation-row form when a successor
-already owns the pointer. See corrections 168 and 170.
+already owns the pointer. See corrections 168, 170, 177, and 178.
 PR-6 must also implement bounded worker concurrency and a measured queue-throughput
 target; a serial queue is not an adequate capacity plan for the global cold path.
 
@@ -5766,7 +5833,7 @@ Required cases include:
   where recovery initially observes the old state, is discovered by serial settlement
   (and, for a recertification, by the predecessor/evidence lineage walk) and ends
   `RESOLVED`, never `REJECTED`;
-- **an abort fences the resolver before it rolls anything back, on both partitions.**
+- **an abort fences the resolver before it rolls anything back, pointer first.**
   A test keeps a live resolver paused between the `gc_state` clear and its pointer CAS,
   runs the complete abort, then releases the resolver; it asserts the resolver's CAS
   does not apply because the takeover installed `(Cf, Nf)`, and that the end state
@@ -5780,6 +5847,22 @@ Required cases include:
   "gc_state still `QUARANTINED`, nothing to undo" branch too, and a fourth that `Nf`
   is strictly greater than any prospective epoch fixed by the `RESOLVING` row, so no
   evidence row ever pairs a matching epoch with a different claim ID;
+- **pointer fence is the abort's linearization point and runs before the generation
+  fence.** A test clears `gc_state` under the live resolver, lets the abort settle
+  `blocks` and apply the pointer takeover, then releases the resolver between the two
+  abort fences; it asserts the resolver's pointer CAS does not apply and the pointer
+  never becomes `ACTIVE`. A negative test that fences the generation first and then
+  releases the resolver before the pointer takeover must fail: that order permits a
+  known-suspect generation to return to service before the abort linearizes;
+- **the generation fence has the same settlement/idempotence contract as the pointer
+  fence.** A test applies `Rr -> Rr + 1`, drops the response, crashes, and resumes
+  `ABORTING`; recovery must SERIAL-settle the generation partition, treat settled
+  `Rr + 1` with matching identity as already applied, and continue without retrying a
+  conflicting payload. A second test leaves the generation fence accepted but
+  unlearned, asserts that an ordinary read still seeing `Rr` does **not** authorize
+  advancing to rollback, and that only serial settlement plus the exact retry or the
+  settled `Rr + 1` proof does. A third test asserts that only this abort may produce
+  exactly `Rr + 1` from the `Rr` frozen by its work row;
 - **`resolution_epoch` is never null and never resets.** A test asserts the
   `MATERIALIZING` intent writes `resolution_epoch = 0`, that the `null -> QUARANTINED`
   statement does not write the column at all, and that a generation quarantined,
@@ -5788,16 +5871,26 @@ Required cases include:
   failures appear: `RESOLVING` captures `Rr = null` so the abort cannot compute
   `Rr + 1`, and a stale first-cycle `QUARANTINED -> null` naming `Rr = 0` applies
   against the reset counter;
-- **an abort whose delete already advanced performs no generation-row mutation.** A
+- **an abort whose delete already advanced performs no `gc_state` rollback.** A
   test drives the legal ordering — delete proof obtained, pointer converted to
   `RETIRED/QUARANTINE`, false-positive resolution clears `gc_state`, the stalled delete
   worker's CAS applies as `DELETING` — and then requests the abort. It asserts the
   abort reaches `ABORTING -> REJECTED` without restoring `QUARANTINED` and without any
-  other `gc_state` write, that the delete work row and its retry/escalation state are
+  other `gc_state`, materialization, storage-identity, or delete-lifecycle write, that
+  the abort's `resolution_epoch` fence may still have advanced and is retained, that
+  `abort_outcome = DELETE_ALREADY_ADVANCED` and `abort_observed_gc_state` record the
+  settled value, that the delete work row and its retry/escalation state are
   untouched, that the pointer stays fenced at `RETIRED/QUARANTINE`, and that a distinct
   alert and audit event are raised. A test that leaves recovery stuck in `ABORTING`
   with no matching branch, or that regresses `gc_state` out of `DELETING`, must fail.
-  The same assertions run with `gc_state = DELETED`;
+  The same assertions run with `gc_state = DELETED`. A further test asserts the later
+  human recovery path is a **pointer-only** audited recertification that does not
+  require `QUARANTINED -> null`;
+- **every post-`RESOLVING` resolver mutation of `block_generations` names
+  `resolution_epoch = Rr`.** A test pauses a resolver before its
+  `MATERIALIZING -> VERIFIED` repair, completes the abort, then releases the resolver;
+  the repair must not apply. A negative test that conditions only the clear and not
+  the repair must fail: the generation partition would not be fully fenced;
 - **the abort's own authorization is durable before it acts.** A test asserts no
   settlement, no fence, and no rollback occurs while the work still reads `RESOLVING`,
   and injects a crash after both fences but before `REJECTED`: recovery must observe
@@ -5822,8 +5915,9 @@ Required cases include:
   path leaves a live pointer over a quarantined generation. This criterion previously
   read "reachable only from `OPEN`", which contradicted the abort contract it sits
   beside and made the normative suite unsatisfiable; see correction 169;
-- the quarantine projection DDL carries `ABORTING`, the abort identity, and
-  `observed_resolution_epoch`, and `block_generations` carries `resolution_epoch`; a
+- the quarantine projection DDL carries `ABORTING`, the abort identity,
+  `abort_outcome`/`abort_observed_gc_state`, and `observed_resolution_epoch`, and
+  `block_generations` carries `resolution_epoch`; a
   test drives an interrupted abort through a schema without them and asserts recovery
   is ambiguous, so neither column set can be dropped as cosmetic;
 - the quarantine projection DDL carries `RESOLVING` and the full resolution identity;
@@ -6385,21 +6479,26 @@ X2 is closed only when:
   abort;
 - aborting a resolution records `RESOLVING -> ABORTING` **before** it acts, then
   serially settles the `blocks` partition and fences **both** partitions — the
-  generation's `resolution_epoch` and the pointer's quarantine claim — before any
-  rollback. One fence is not enough: the pointer takeover cannot invalidate the
-  `QUARANTINED -> null` clear, which conditions on no pointer column and, by correction
-  68, may not. An ordinary read of the pointer never authorizes an abort; a non-applied
-  fence is classified rather than assumed to be failure; and an unsettleable partition
-  or ambiguous fence leaves the work `ABORTING` and fenced. No path produces a live
+  pointer's quarantine claim **first** as the abort's linearization point, then the
+  generation's `resolution_epoch` — before any rollback. One fence is not enough: the
+  pointer takeover cannot invalidate the `QUARANTINED -> null` clear or the
+  `MATERIALIZING -> VERIFIED` repair, which condition on no pointer column and, by
+  correction 68, may not. An ordinary read of either partition never authorizes an
+  abort fence to be treated as applied; a non-applied or ambiguous generation fence
+  settles serially and classifies `Rr` versus `Rr + 1` before continuing; and an
+  unsettleable partition leaves the work `ABORTING` and fenced. No path produces a live
   pointer over a `QUARANTINED` generation with terminal work, and none produces a
   fenced pointer over a cleared generation with terminal work;
 - the abort classifies **all four** reachable values of `gc_state`, not two. Where an
   authorized delete has already advanced the generation to `DELETING` or `DELETED` —
   a legal ordering, since a pre-quarantine delete authorization survives quarantine
-  and recertification — the abort performs no generation-row mutation, never regresses
-  `gc_state`, leaves the delete work row and the pointer fence untouched, terminates as
-  `REJECTED` recording that the rollback was not performed, and raises a distinct
-  alert. Recovery is never left in `ABORTING` with no matching branch;
+  and recertification — the abort performs no rollback of `gc_state`, materialization,
+  storage identity, or delete lifecycle metadata; the abort's monotonic
+  `resolution_epoch` fence may already have advanced and is retained; the work
+  terminates as `REJECTED` recording `abort_outcome` /
+  `abort_observed_gc_state`, leaves the delete work row and the pointer fence
+  untouched, and raises a distinct alert. Recovery is never left in `ABORTING` with no
+  matching branch;
 - `resolution_epoch` is initialized by the `MATERIALIZING` intent, is never written by
   a quarantine transition, and never resets across quarantine cycles, so `Rr` is never
   null and no stale clear can match a reset counter;
@@ -7701,23 +7800,64 @@ reintroduce rejected designs:
      creates the row, written by nothing but an abort, and monotonic for the life of
      the generation.
 176. **The abort must classify every reachable `gc_state`, and one of them forbids
-     rollback.** The abort enumerated `QUARANTINED` and `null` only, while this design
-     deliberately allows a delete authorization obtained under a pre-quarantine claim
-     to survive both quarantine and recertification — so `QUARANTINED -> null` followed
-     by a stalled worker's `DELETING` CAS is a legal ordering, and an abort requested
-     afterwards fell through every branch and stranded recovery in `ABORTING` forever.
-     Neither existing branch is usable: restoring `QUARANTINED` would regress an
-     authorized, irrevocable delete against a possibly half-removed object, which is
-     one of the three shortcuts When The Physical Delete Keeps Failing forbids; and
-     taking the "nothing to undo" branch would report a retained quarantine that does
-     not exist. The abort therefore performs no generation-row mutation, terminates as
-     `REJECTED` recording why, leaves the pointer fenced and the delete work running,
-     and alerts. Nothing unsafe has happened — G1 reached `RETIRED`, authority can
-     never be reacquired, and the delete was correct independently of the resolution —
-     but whether the logical block may have a G2 is now a fresh human decision, which
-     is what the quarantine workflow exists to route. Only the recertification form can
+     `gc_state` rollback.** The abort enumerated `QUARANTINED` and `null` only, while
+     this design deliberately allows a delete authorization obtained under a
+     pre-quarantine claim to survive both quarantine and recertification — so
+     `QUARANTINED -> null` followed by a stalled worker's `DELETING` CAS is a legal
+     ordering, and an abort requested afterwards fell through every branch and
+     stranded recovery in `ABORTING` forever. Neither existing branch is usable:
+     restoring `QUARANTINED` would regress an authorized, irrevocable delete against a
+     possibly half-removed object, which is one of the three shortcuts When The
+     Physical Delete Keeps Failing forbids; and taking the "nothing to undo" branch
+     would report a retained quarantine that does not exist. The abort therefore
+     performs no rollback of `gc_state`, materialization, storage identity, or delete
+     lifecycle metadata, terminates as `REJECTED` recording `abort_outcome` /
+     `abort_observed_gc_state`, leaves the pointer fenced and the delete work running,
+     and alerts. The monotonic `resolution_epoch` fence may already have advanced and
+     is retained — that bump is a fence, not a lifecycle rollback (see correction 179).
+     Nothing unsafe has happened — G1 reached `RETIRED`, authority can never be
+     reacquired, and the delete was correct independently of the resolution — but
+     whether the logical block may have a G2 is now a fresh human decision, which is
+     what the quarantine workflow exists to route. Only the recertification form can
      reach this state; a `RETIRING/QUARANTINE` pointer never held a delete
-     authorization.
+     authorization. The later human recovery path is a **pointer-only** audited
+     recertification that does not require `QUARANTINED -> null`.
+177. **The generation fence is a LWT; treat it like one.** The abort sequence issued
+     `Rr -> Rr + 1` and then continued as if "applied" were the only outcome. A lost
+     response after Cassandra applied the LWT leaves recovery looking at
+     `work=ABORTING` and `resolution_epoch=Rr+1`, and a blind retry of
+     `IF resolution_epoch = Rr` returns `not applied` with no contract for reading that
+     as success. Worse, an accepted-but-unlearned fence can still leave an ordinary
+     read at `Rr`, so advancing to rollback would leave a stalled
+     `QUARANTINED -> null` able to fire. The generation partition therefore gets the
+     same settlement rule `blocks` already has: ambiguous or uncertain results
+     `SELECT ... CONSISTENCY SERIAL`; settled `Rr + 1` with matching identity means
+     this abort's fence already applied; settled `Rr` retries the exact same fence;
+     any other settled identity or an unsettleable partition remains `ABORTING` with
+     no rollback. The load-bearing property — only this abort produces exactly
+     `Rr + 1` from the `Rr` frozen by its work row — is stated and tested, not inferred.
+178. **Fence the pointer before the generation.** The first r3 abort ordered the
+     generation bump first. That widens the race unnecessarily: a resolver that has
+     already cleared `QUARANTINED -> null` can still win its pointer CAS between the
+     two fences and return a known-suspect generation to `ACTIVE` before the abort
+     takes over the claim — precisely the fail-open window the abort exists to forbid.
+     A clear that sneaks in *after* the pointer takeover is reversible under a still-
+     fenced pointer; an `ACTIVE` window is not. The pointer takeover is therefore the
+     abort's linearization point and runs first; the generation fence follows.
+179. **"`DELETING`/`DELETED` = no generation-row mutation" contradicted the fence.**
+     The same section that required `resolution_epoch Rr -> Rr + 1` on every abort also
+     said the delete-advanced branch must perform no generation-row mutation at all.
+     Both cannot be literal. The corrected rule forbids rollback of `gc_state`,
+     materialization, storage identity, and delete lifecycle metadata; the monotonic
+     fence counter may already have advanced and is retained.
+180. **Fence the whole abandoned resolution, not only its last statement.** The
+     false-positive path repairs `MATERIALIZING -> VERIFIED` in its own write before
+     `QUARANTINED -> null`, but only the clear named `resolution_epoch = Rr`. A
+     resolver stalled before the repair could therefore still flip the marker after
+     `REJECTED`. That does not reopen writer usability while `gc_state` remains
+     `QUARANTINED`, but it falsifies the claim that the generation partition is fenced
+     against the abandoned resolution. Every post-`RESOLVING` resolver mutation of
+     `block_generations` therefore conditions on `resolution_epoch = Rr`.
 
 ## Related Documents
 
