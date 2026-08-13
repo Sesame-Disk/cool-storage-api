@@ -485,6 +485,46 @@ Index and decision-record entries link the new document as analysis only.
 
 ---
 
+## 2026-08-13 - X1/X2 alternatives: R12, and the real price of dropping the orphan TTL
+
+Documentation-only follow-up to the analysis above, from a further review pass.
+Still no runtime code; X1/X2 open; `GC_ENABLED=false` mandatory; r3 not superseded.
+
+- **R12 — one serial domain on `blocks`.** The previous pass prescribed `SERIAL`
+  for two statements. There are **six** conditional statements on that partition
+  (`ClaimBlockDelete`, `ReleaseBlockClaim`, `FinalizeBlockDelete`,
+  `UpsertBlockMetadata`, the stub repair claim and its conditional delete) and all
+  six inherit the session serial level. Mixing `LOCAL_SERIAL` and `SERIAL` on one
+  partition breaks linearizability — they are different quorum domains, so one
+  straggler invalidates every other statement's guarantee. This is r3's own
+  one-serial-domain rule, and it survives any subsetting of r3.
+- **The orphan TTL: right conclusion, wrong reason.** The draft said expiry would
+  make the writer re-PUT K1. It would not — with no `blocks` row the writer probes
+  `NeedsPut` and mints a fresh key, so X1 stays closed. What expiry actually
+  destroys is the durable record that K1 must still be deleted (bytes leak with
+  nothing pointing at them) and, under (c), the sequential-lives property that made
+  R11 unreachable.
+- **Removing the TTL is four coupled changes.** `gcS3OrphanInitialScanLookbackDays
+  = 90` is pinned to it by design — its comment says to match the TTL "so the first
+  pass can still see every live orphan row". Drop one without the other and any
+  orphan older than 90 days is undiscoverable after a cursor loss. The package:
+  canonical TTL, `_by_day` TTL, cold-start horizon, cursor semantics.
+- **R9 promised more than `SERIAL` delivers.** It makes one incarnation canonical;
+  it does not stop the losing writer's PUT, which already happened. That stray
+  object is an X3-class leak and a worse one than today's: a derived key is
+  recomputable from the `block_id`, so reconciling costs one HEAD, while a minted
+  key that lost the LWT is recorded nowhere and needs a bucket inventory that does
+  not exist. Key minting turns physical reconciliation from a point lookup into a
+  scan, and that is part of Option 1's price.
+- **Branch (c) vs (d) leaked across step 3.** "Writers that observe the fence mint
+  P2 and PUT P2" is (d) behaviour; under (c) the writer waits and mints nothing
+  while the fence stands. Corrected in step 3 and in rows R2, R3 and R10.
+- **"Always the full backoff budget" was wrong.** `resolveFence` being inert means
+  the writer cannot shorten the wait, but each retry re-probes, so the upload
+  proceeds on the first attempt after GC clears the orphan.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: recertification win-proof after takeover (corr 192)
 
 The r3 protocol delta in this slice is documentation-only. No runtime GC protocol
