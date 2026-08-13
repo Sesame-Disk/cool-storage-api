@@ -2,7 +2,7 @@
 
 **Status:** Design accepted for review; r3 not frozen for implementation
 
-**Date:** 2026-08-07 · **Last updated:** 2026-08-12
+**Date:** 2026-08-07 · **Last updated:** 2026-08-13
 
 **Protocol revision:** r3 (2026-08-12). r1 (2026-08-11) was the first freeze. r2
 (2026-08-12) added the `retire_claim_kind` column with the `RETIRING/QUARANTINE` and
@@ -75,7 +75,12 @@ replaces it; successful `QUARANTINE_ABORT -> GC_RETIRE` clears it. Correction 19
 is the freeze-pass over the takeover×CAS matrix: linearization proof for a
 recertification attempt is the installed target **kind/state** (and successor
 lineage), not the exact prospective `(Cr, Nr)` after a later ordinary takeover —
-the same class of mistake correction 190 closed for abort `(Cf, Nf)`. r3 also removes a
+the same class of mistake correction 190 closed for abort `(Cf, Nf)`. Corrections 191
+and 192 are the close-out of the two correction-190 review findings — the
+`retire_abort_id` mutation-set contradiction and the prospective-claim supersession
+under an ordinary takeover during `RESOLVING` — and the verification plan carries
+their regression tests: the `QUARANTINE_ABORT -> GC_RETIRE` clear, the
+cancel-after-prospective-evidence case, and the takeover×CAS matrix. r3 also removes a
 verification and X2-closure requirement that contradicted the abort contract and made
 the normative suite unsatisfiable (correction 169), gives the post-commit branch the
 right quarantine path for a recertified or superseded pointer (correction 170), allows
@@ -317,9 +322,10 @@ The Cassandra 5.0.9 source used to resolve the read-level question is:
 
 `https://raw.githubusercontent.com/apache/cassandra/cassandra-5.0.9/src/java/org/apache/cassandra/db/ConsistencyLevel.java`
 
-Older Cassandra 3.0 documentation says `EACH_QUORUM` is not supported for reads.
-That documentation is not the target contract for this repository; the engine
-version must still be asserted by integration tests.
+`EACH_QUORUM` reads were added in Cassandra 3.0 (CASSANDRA-9602); documentation
+older than 3.0 says the level is not supported for reads. That documentation is not
+the target contract for this repository; the engine version must still be asserted
+by integration tests.
 
 ## Consistency Contract
 
@@ -748,12 +754,14 @@ requires this explicit procedure:
 Generation-fence LWTs never use commit consistency `ANY` or `LOCAL_QUORUM`; the
 consistency helper and inventory test reject both, using `QUORUM`, `EACH_QUORUM`, or
 `ALL` as specified. `paxos_state_purging=repaired` is therefore not a prerequisite for
-this ADR: upstream ties it to recurring Paxos repair and to permitting optimized
-`ANY`/`LOCAL_QUORUM` commit behavior, not to selecting v2 itself. Phase 0 records the
-value on every joined Cassandra node. Once a cluster moves from `legacy` to either
-`gc_grace` or `repaired`, returning to `legacy` is forbidden. If operators choose
-`repaired`, recurring Paxos repair is mandatory even after a `v2 -> v1` rollback;
-use the upstream `gc_grace` fallback instead if repaired purging must be disabled.
+this ADR: upstream ties it to recurring Paxos repair and, only in the `repaired`
+mode, to permitting optimized `ANY`/`LOCAL_QUORUM` commit behavior (`gc_grace` is
+functionally similar to `legacy` and enables neither), not to selecting v2 itself.
+Phase 0 records the value on every joined Cassandra node. Once a cluster moves from
+`legacy` to either `gc_grace` or `repaired`, returning to `legacy` is forbidden. If
+operators choose `repaired`, recurring Paxos repair is mandatory even after a
+`v2 -> v1` rollback; use the upstream `gc_grace` fallback instead if repaired purging
+must be disabled.
 
 Every assertion in the first block binds from the **first generation-aware write**,
 not from `gc.enabled=true`. The reason is concrete: a materializer can crash between
@@ -8350,8 +8358,9 @@ reintroduce rejected designs:
      the conservative intersection: if v1 LWT history exists, repair every primary
      range on every node before v2; if the cluster is greenfield, select the uniform
      target before its first LWT. `paxos_state_purging=repaired` is a separate choice
-     tied to recurring Paxos repair and weaker commit optimization, not a prerequisite
-     for this `QUORUM`-or-stronger LWT protocol.
+     tied to recurring Paxos repair and, only in the `repaired` mode, to weaker-commit
+     optimization (`ANY`/`LOCAL_QUORUM`); it is not a prerequisite for this
+     `QUORUM`-or-stronger LWT protocol.
 153. **Acceptance is a four-cell matrix, not the phrase “under both variants.”** RF1
      and RF3 run under uniform v1 and v2, every DC is omitted in turn, and every
      surviving DC coordinates. RF3/v2 must demonstrate that activation at requested
