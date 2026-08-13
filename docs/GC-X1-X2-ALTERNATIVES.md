@@ -472,6 +472,52 @@ R3 and R8 decide whether the option is viable; R9, R10, R11 and R12 decide wheth
 
 ---
 
+## X2 can close on its own, before any X1 design is chosen
+
+This is the most actionable conclusion of the whole analysis, and it does not depend on which R8 branch wins.
+
+X1 and X2 are independent defects. X2 is a Cassandra visibility property; X1 is a physical-identity property. Nothing in closing X2 requires generations, physical incarnations, minted keys, a globally visible fence, or any writer hot-path change. It requires the read that **authorizes destruction** to be global.
+
+**X2 does not need `SERIAL+ALL`.** That fence exists for the publication TOCTOU — GC reads zero and a writer publishes afterwards — which is explicitly not X2. Keeping the fence redesign out of an X2 closure keeps that PR small and auditable.
+
+**But "close X2" is not one line.** The property to establish is not "one query uses `EACH_QUORUM`"; it is:
+
+> Every physical delete is authorized by a liveness read that intersects every DC able to acknowledge a `LOCAL_QUORUM` reference write.
+
+That phrasing matters, because today there are **four** `BlockHasReferences` callers and **two** code paths that delete bytes:
+
+| Caller | Role | Needs `EACH_QUORUM`? |
+|---|---|---|
+| `processBlock` pre-claim | Discovery/short-circuit | No — a local positive is proof enough to abort; a local zero authorizes nothing |
+| `processBlock` claim-then-verify | **Authorizes the delete** | **Yes** |
+| `scanner.go` | Candidate discovery | No — enqueues, never deletes |
+| `enqueueZeroRefBlocks` | Candidate discovery | No — enqueues, never deletes |
+
+| Delete path | Authorization |
+|---|---|
+| `processBlock` → `deleteS3WithRetry` | Direct, from its own claim-then-verify read |
+| `RecoverS3Orphans` → `DeleteBlock` | **Transitive**, from the orphan row that `processBlock` wrote after its verify |
+
+The transitive path is the one that makes this an invariant rather than an edit. `RecoverS3Orphans` never re-checks references; it trusts that the orphan row could only exist downstream of an authorized verify. That is true today and must stay true — a future destructive path that does not descend from an `EACH_QUORUM` verify would reopen X2 silently, with no failing test.
+
+**Scope of a standalone X2 closure:**
+
+1. Claim-then-verify read at explicit per-query `EACH_QUORUM` — never inherited from the session default.
+2. The authorization invariant stated where the code enforces it, covering the transitive `RecoverS3Orphans` path.
+3. A topology gate for the destructive path. The argument is per-DC, so it presumes `NetworkTopologyStrategy` with the expected DC/RF map. Today `logCassandraRuntimeConfig` only *warns* on replication mismatch and on `LOCAL_SERIAL` under multi-region NTS; the machinery to detect it exists (`isMultiRegionNetworkTopology`, `sameReplicationSettings`, live keyspace metadata) but nothing gates on it. Under `SimpleStrategy` the per-DC argument does not hold at all.
+4. Multi-DC tests, both directions: a reference written at `LOCAL_QUORUM` in one DC is visible to an `EACH_QUORUM` read in another; and with a DC unavailable the read fails and no delete is authorized. RF1 at minimum.
+5. Observability for the fail-closed state. `EACH_QUORUM` couples GC availability to every DC, and with RF1 the tolerance is zero — one unreachable node stops collection fleet-wide. That is correct under "when in doubt, do not delete", but a silent stall is not: it defers the user/library/org purge SLAs and leaves reclaimed space uncollected.
+
+**What stays open.** Tombstone reconciliation can make an `EACH_QUORUM` read report a reference that was already deleted in another DC — conservative, and it only delays collection. And X2 closing does not make destructive GC safe:
+
+```text
+X2  cross-DC reference visibility   →  closable now, independently
+X1  physical-delete ABA             →  open
+GC_ENABLED                          →  stays false, on X1 alone
+```
+
+Recording that distinction is the point: **X2 closed ≠ GC enableable.**
+
 ## Recommended next step
 
 Do **not** implement r3 yet.
@@ -481,6 +527,8 @@ Treat **Option 1** as the design to stress-test:
 1. X1 = DB-owned never-reuse physical incarnation (exact key on GC work).
 2. X2 = GC-only `EACH_QUORUM`/`ALL` liveness reads; writers stay `LOCAL_QUORUM`. This is the same X2 mechanism r3 uses; it is not where the two designs differ.
 3. Publication = existing write-ref-then-check-fence, with a globally visible claim/orphan fence and P2 rematerialization, extended to the `pub:` stage.
+
+**Close X2 first, on its own branch** (previous section). It is independent, small, testable, and it removes cross-DC reference visibility from every subsequent X1 discussion. Everything below then concerns X1 alone.
 
 Gates, in the order that makes the cheapest ones decide first:
 

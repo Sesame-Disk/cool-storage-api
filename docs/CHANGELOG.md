@@ -523,6 +523,22 @@ Still no runtime code; X1/X2 open; `GC_ENABLED=false` mandatory; r3 not supersed
   the writer cannot shorten the wait, but each retry re-probes, so the upload
   proceeds on the first attempt after GC clears the orphan.
 
+**Actionable conclusion recorded: X2 can close on its own**, before any X1 design is
+chosen, and without `SERIAL+ALL` (that fence serves the publication TOCTOU, not X2).
+The property to establish is not "one query uses `EACH_QUORUM`" but "every physical
+delete is authorized by a liveness read that intersects every DC able to acknowledge
+a `LOCAL_QUORUM` reference write" — which matters because there are four
+`BlockHasReferences` callers (only the claim-then-verify one authorizes destruction)
+and two delete paths, of which `RecoverS3Orphans` is authorized **transitively** by
+the orphan row rather than by its own read. A standalone closure is therefore: the
+verify read at explicit per-query `EACH_QUORUM`; the authorization invariant stated
+and enforced across the transitive path; a topology gate for the destructive path
+(today `logCassandraRuntimeConfig` only warns, and under `SimpleStrategy` the per-DC
+argument does not hold); multi-DC tests in both directions including DC-unavailable
+fail-closed; and observability for the fail-closed stall, since `EACH_QUORUM` at RF1
+gives zero tolerance and a silent stall defers the purge SLAs. **X2 closed is not GC
+enableable** — `GC_ENABLED=false` would then rest on X1 alone.
+
 ---
 
 ## 2026-08-12 - X1/X2 fence ADR r3: recertification win-proof after takeover (corr 192)
