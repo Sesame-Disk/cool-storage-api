@@ -104,9 +104,17 @@ X2_EXPECT_DC_DOWN=1 go test -tags integration ./internal/integration/ \
   -run TestX2_EachQuorumFailsClosed -v
 docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-asia
 
-# 7. Topology gate accepts a valid 3-DC keyspace.
+# 7. Topology gate: accepts the declared 3-DC keyspace, and refuses a session whose
+#    declared map is smaller than the live one (the shape a shrunk ALTER leaves).
 go test -tags integration ./internal/integration/ -run TestX2_TopologyGate -v
 
+# 8. Tear down. `down -v` discards the nodes, so the handoff setting goes with them.
+#    If you abort the run and keep the stack, re-enable handoff first — otherwise the
+#    fixture silently stays in a state where any later test builds divergence it did
+#    not ask for.
+for n in na eu asia; do
+  docker exec sesamefs-cassandra-$n nodetool enablehandoff
+done
 docker compose -f docker-compose.cassandra-3dc.yaml down -v
 ```
 
@@ -124,13 +132,20 @@ would need its own 9-node stack and is hardening, not closure.
 
 `internal/gc/x2_cross_dc_liveness_test.go` runs in the normal suite and pins what a
 single process can observe: which read authorizes a delete, that an erroring read
-fails closed, that the topology gate guards both destructive paths, and that a
-remote-only reference aborts the delete. The authorization canary is
-mutation-verified — reverting that one call makes the suite delete a live block
-under an unavailable DC.
+fails closed on both destructive paths, that recovery refuses a referenced block, that
+the topology gate is armed without explicit wiring, that a stale claim is released but
+a live one is not, that a failed release does not consume the candidate, that failing
+closed does not consume the retry budget, and that a remote-only reference aborts the
+delete.
 
-It cannot observe a consistency level. Everything about per-DC quorum intersection
-is the integration suite's job.
+Every one of those is mutation-verified — each assertion was confirmed to fail against
+a deliberately reverted implementation. An assertion that cannot fail is not evidence.
+`internal/db/destructive_gc_topology_test.go` does the same for the gate's decision
+logic against synthetic replication maps, including the case that motivates comparing
+maps at all: a shrunk map that passes every structural check.
+
+The unit suite cannot observe a consistency level. Everything about per-DC quorum
+intersection is the integration suite's job.
 
 ---
 
@@ -157,10 +172,10 @@ correct; a local zero proves nothing and authorizes nothing. Raising the discove
 reads would be correct but would pay WAN to learn something the verify has to
 re-establish anyway.
 
-### 2. Two delete paths, one of them authorized transitively
+### 2. Two delete paths, and the second one now authorizes itself
 
 `processBlock` deletes under its own verify. `RecoverS3Orphans` deletes bytes
-**without reading references at all** — it is authorized by the existence of a
+**without reading references at all** — it was authorized by the existence of a
 `gc_s3_orphans` row, which cannot exist unless `processBlock` already passed its
 verify (`StartBlockDeleteOrphan` runs strictly after it).
 
@@ -168,7 +183,8 @@ That makes the closure an *invariant to enforce*, not an edit to make. A future
 destructive path that does not descend from that verify reopens X2 with no failing
 test. The invariant is stated at both sites for that reason.
 
-**The transitive link depends on a deployment precondition, and it is worth naming:**
+**The transitive link depended on a deployment precondition, and naming it is what
+killed it:**
 
 > **Greenfield invariant.** On first production activation, `blocks`,
 > `gc_s3_orphans` and the GC work tables contain no rows written by a pre-X2
@@ -177,16 +193,16 @@ test. The invariant is stated at both sites for that reason.
 "An orphan row implies an `EACH_QUORUM` verify" is true *going forward*, not
 *backwards*. A row written by the previous code was authorized by a `LOCAL_QUORUM`
 verify, and `RecoverS3Orphans` would happily finish that delete after an upgrade —
-without any global read ever having happened. SesameFS deploys clean, with no legacy
-state, so the chain holds from day one and no extra `EACH_QUORUM` is needed inside
-recovery.
+without any global read ever having happened. SesameFS deploys clean, so the chain
+does hold from day one.
 
-This is an operational precondition rather than a code check, and it is only sound
-while the greenfield assumption holds. Were SesameFS ever to be upgraded in place
-over a cluster where destructive GC had run — including a local stack, where
-`.env` ships `GC_ENABLED=true` — the honest options are to drain `gc_s3_orphans`
-before activation, or to give `RecoverS3Orphans` its own `BlockHasReferencesGlobal`
-check. It is cheap: recovery is already the cold path.
+It was still the wrong thing to rest a data-loss guarantee on: an operational
+precondition that is true today, unenforceable in code, and — this is the part that
+decided it — **silent** at the moment it stops being true. Nothing would fail. So
+recovery now performs its own `BlockHasReferencesGlobal` before destroying bytes, and
+refuses when the block still has references or when the read cannot be established.
+The greenfield assumption remains true; nothing depends on it any more. Recovery is
+the cold path, so the extra WAN read costs nothing that matters.
 
 ### 3. The topology argument had nothing enforcing it
 
@@ -201,6 +217,36 @@ because the real map comes from `CASSANDRA_REPLICATION_DCS` and the checked-in
 profiles are the local harness) and is re-evaluated per destructive attempt, since
 replication can be altered at runtime.
 
+**Structural validity is not enough, and this is subtle.** The quorum-intersection
+proof is about the replica set that *accepted* each reference write, not the one in
+effect when GC reads. Consider:
+
+```text
+t0   NTS {dc-na:1, dc-eu:1, dc-asia:1}
+     dc-eu writer acknowledges reference ABC at LOCAL_QUORUM
+t1   ALTER KEYSPACE ... NTS {dc-na:1}
+t2   NetworkTopologyStrategy ✅   positive RF ✅   local DC present ✅
+     EACH_QUORUM now means "a quorum of dc-na" and never contacts dc-eu
+```
+
+Every structural check passes while the guarantee is gone, and Cassandra does not
+relocate historical data on `ALTER` — reference ABC is simply unreachable by the read
+that authorizes deleting its block. So the gate additionally requires the **live map
+to equal the declared one**, which makes the topology immutable for as long as
+destructive GC is enabled. Changing topology is then an explicit procedure:
+
+```text
+GC_ENABLED=false everywhere
+ALTER KEYSPACE
+repair / reconcile the new replica set
+update CASSANDRA_REPLICATION_DCS
+re-enable GC
+```
+
+The gate is part of `GCStore` rather than an optional capability discovered by type
+assertion, so a store that does not carry it fails to compile. A data-loss guard that
+can be disarmed by wrapping a struct is not a guard.
+
 ### 4. Fail-closed couples GC availability to every DC
 
 `EACH_QUORUM` fails if any DC is unreachable, and at RF 1 the tolerance is **zero** —
@@ -211,6 +257,43 @@ space uncollected. Hence
 `GCErrorsTotal{reason="liveness_verify_unavailable"|"destructive_topology_gate"}`
 and `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. **Alert on a
 stalled GC, not only on a slow one.**
+
+**A stall was worse than a stall, and this needed a code change.** The failure is
+systematic, not per-item: every block in flight fails on the same tick for the same
+reason. Under the ordinary error path each would burn one of five retries per pass and
+land in the DLQ within a few minutes of an outage — and from there:
+
+- the DLQ auto-recovery classifier only rescues `commit`/`fs_object` rows blocked on a
+  library hard delete, so `ItemBlock` never returns on its own;
+- DLQ rows expire on their own schedule;
+- the scanner's block-candidate day cursor advances to `today-1` after a clean
+  enumeration pass regardless of what the worker later did with those items, so the
+  surviving `gc_block_candidates_by_day` rows sit in a bucket that is never revisited.
+
+A few minutes of DC unavailability would therefore convert deferred collection into
+**permanently uncollectable storage**, silently. Fail-closed errors now carry
+`GCFailureCodeDestructiveFailClosed` and take the existing postpone path — the same
+one lock contention uses — so they cost latency instead of the work item. Pinned by
+`TestX2_FailClosedDoesNotBurnTheRetryBudget`, which rides out more passes than the
+retry budget would have survived.
+
+### 4b. One claim id, possibly two workers
+
+`DequeueBatch` takes no lease, so two GC workers hand themselves the same queue row,
+and `blockDeleteClaimID` derives from the candidate timestamp — deliberately, so
+retries of one logical candidate stay its owner. The consequence is that *concurrent*
+attempts share a claim id too, and `ClaimBlockDelete` reports `applied=true` to both.
+
+That makes an unconditional "release the claim" call dangerous in the one path that
+does not own a delete: the pre-check branch that settles a candidate on a live
+reference. Worker B observing a reference could hand back the claim that worker A is
+mid-delete under, dropping the upload fence inside the window between A's verify and
+its orphan row — the exact window the fence exists to cover. `ReleaseStaleBlockClaim`
+therefore releases only a claim older than `blockDeleteClaimStaleAfter` (15 minutes,
+far beyond any single walk), leaves anything younger untouched, and reports "nothing
+to release" as success rather than as a failed CAS. And when the release genuinely
+fails, the candidate is **not** consumed: it is the only work item that can retry
+lifting that fence.
 
 ### 5. Tombstones bias safely
 
@@ -255,17 +338,23 @@ count out of `configs/`.
 X2 moves to Closed in `KNOWN_ISSUES.md` when:
 
 - [x] Destructive verify reads at explicit per-query `EACH_QUORUM`
-- [x] Authorization invariant stated and enforced across both delete paths
-- [x] Topology gate on the destructive path, from live keyspace metadata
-- [x] Fail-closed is observable
-- [x] Unit regressions, authorization canary mutation-verified
-- [x] A failed verify does not wedge the block (claim released on both paths,
-      mutation-verified)
+- [x] Authorization invariant enforced on both delete paths — recovery performs its
+      own global verify rather than inheriting one from an orphan row
+- [x] Topology gate on the destructive path, from live keyspace metadata, requiring
+      the live map to equal the declared one
+- [x] Topology gate is part of `GCStore`, so it cannot be dropped without a compile
+      error
+- [x] Fail-closed is observable, and does not consume the item's retry budget
+- [x] A failed verify does not wedge the block (claim released on both paths); a
+      stale claim is released, a live one is not, and a failed release does not
+      consume the candidate
+- [x] Every unit regression mutation-verified
 - [ ] **Divergent-state visibility leg green** (runbook step 5) — and confirmed to
       FAIL when the destructive read is downgraded to `LOCAL_QUORUM`. A green run on
       a non-divergent cluster does not count.
 - [ ] **Fail-closed leg green** (runbook step 6)
-- [ ] **Topology gate leg green** (runbook step 7)
+- [ ] **Topology gate leg green, both halves** (runbook step 7): accepts the declared
+      3-DC map, refuses an under-declared one
 
 RF 3 is not on this list: it needs a 9-node stack and is hardening, not closure.
 

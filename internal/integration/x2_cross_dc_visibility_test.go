@@ -83,8 +83,21 @@ func x2Endpoint(t *testing.T, endpoints map[string]string, dc string) string {
 
 // x2ConnectToDC opens a session pinned to one datacenter, so a write issued here is
 // acknowledged by that DC's quorum and read locally from that DC's replica.
-func x2ConnectToDC(t *testing.T, dc, host string) *dbpkg.DB {
+//
+// The declared replication map is every DC in X2_DC_HOSTS at RF 1, matching what the
+// fixture's keyspace is created with. That is not decoration: the destructive
+// topology gate requires the live map to equal the declared one, so a session that
+// under-declares its topology is refused — which is the intended behaviour, since a
+// process that does not know about dc-eu has no business authorizing deletes of
+// blocks dc-eu may still reference.
+func x2ConnectToDC(t *testing.T, dc string, endpoints map[string]string) *dbpkg.DB {
 	t.Helper()
+
+	host := x2Endpoint(t, endpoints, dc)
+	replicationDCs := make(map[string]int, len(endpoints))
+	for name := range endpoints {
+		replicationDCs[name] = 1
+	}
 
 	database, err := dbpkg.New(config.DatabaseConfig{
 		Hosts:             []string{host},
@@ -93,6 +106,7 @@ func x2ConnectToDC(t *testing.T, dc, host string) *dbpkg.DB {
 		SerialConsistency: "SERIAL",
 		LocalDC:           dc,
 		ReplicationClass:  "NetworkTopologyStrategy",
+		ReplicationDCs:    replicationDCs,
 		Username:          os.Getenv("CASSANDRA_USERNAME"),
 		Password:          os.Getenv("CASSANDRA_PASSWORD"),
 	})
@@ -119,7 +133,7 @@ func TestX2_DivergentReferenceIsInvisibleLocallyAndVisibleGlobally(t *testing.T)
 		t.Skip("X2_DIVERGENT_BLOCK/X2_DIVERGENT_ORG not set; skipping (the divergent state must be built first — see docs/GC-X2-MULTIDC-VALIDATION.md)")
 	}
 
-	reader := x2ConnectToDC(t, "dc-na", x2Endpoint(t, endpoints, "dc-na"))
+	reader := x2ConnectToDC(t, "dc-na", endpoints)
 
 	// Half one — the defect. dc-na must NOT see the reference locally. If it does,
 	// the divergent state was not built correctly (hints replayed, read repair ran,
@@ -157,7 +171,7 @@ func TestX2_EachQuorumFailsClosedWhenADatacenterIsDown(t *testing.T) {
 		t.Skip("X2_EXPECT_DC_DOWN not set; skipping the DC-unavailable leg (stop one DC first)")
 	}
 
-	reader := x2ConnectToDC(t, "dc-na", x2Endpoint(t, endpoints, "dc-na"))
+	reader := x2ConnectToDC(t, "dc-na", endpoints)
 
 	orgID := uuid.NewString()
 	blockID := "x2-down-" + uuid.NewString()
@@ -180,10 +194,45 @@ func TestX2_EachQuorumFailsClosedWhenADatacenterIsDown(t *testing.T) {
 // gate is too strict and would refuse to collect in production.
 func TestX2_TopologyGateAcceptsThreeDCNetworkTopology(t *testing.T) {
 	endpoints := x2DCEndpoints(t)
-	database := x2ConnectToDC(t, "dc-na", x2Endpoint(t, endpoints, "dc-na"))
+	database := x2ConnectToDC(t, "dc-na", endpoints)
 
 	if err := database.ValidateDestructiveGCTopology(); err != nil {
 		t.Fatalf("destructive topology gate rejected a valid 3-DC NetworkTopologyStrategy keyspace: %v", err)
+	}
+}
+
+// TestX2_TopologyGateRejectsAnUnderDeclaredMap is the other half of the gate leg.
+// Accepting a correct topology proves the gate is not too strict; this proves it is
+// not too lax, against a real keyspace rather than a synthetic map.
+//
+// A process that declares only dc-na while the keyspace replicates to three DCs is
+// exactly the shape a shrunk `ALTER KEYSPACE` leaves behind: structurally valid
+// NetworkTopologyStrategy, positive RF, local DC present — and an EACH_QUORUM read
+// that is no longer obliged to contact the DCs whose acknowledged references it would
+// be authorizing the deletion of.
+func TestX2_TopologyGateRejectsAnUnderDeclaredMap(t *testing.T) {
+	endpoints := x2DCEndpoints(t)
+
+	database, err := dbpkg.New(config.DatabaseConfig{
+		Hosts:             []string{x2Endpoint(t, endpoints, "dc-na")},
+		Keyspace:          envOrDefault("CASSANDRA_KEYSPACE", "sesamefs"),
+		Consistency:       "LOCAL_QUORUM",
+		SerialConsistency: "SERIAL",
+		LocalDC:           "dc-na",
+		ReplicationClass:  "NetworkTopologyStrategy",
+		ReplicationDCs:    map[string]int{"dc-na": 1},
+		Username:          os.Getenv("CASSANDRA_USERNAME"),
+		Password:          os.Getenv("CASSANDRA_PASSWORD"),
+	})
+	if err != nil {
+		t.Fatalf("connect to dc-na: %v", err)
+	}
+	t.Cleanup(database.Close)
+
+	if err := database.ValidateDestructiveGCTopology(); err == nil {
+		t.Fatal("X2 REGRESSION: the topology gate accepted a session declaring only dc-na against a three-DC keyspace; a shrunk replication map would silently invalidate the per-datacenter EACH_QUORUM argument")
+	} else {
+		t.Logf("topology gate correctly refused an under-declared map: %v", err)
 	}
 }
 
@@ -198,7 +247,7 @@ func TestX2_WriteReferenceForDivergence(t *testing.T) {
 		t.Skip("X2_WRITE_DIVERGENT not set; skipping the divergent-state writer")
 	}
 
-	writer := x2ConnectToDC(t, "dc-eu", x2Endpoint(t, endpoints, "dc-eu"))
+	writer := x2ConnectToDC(t, "dc-eu", endpoints)
 
 	orgID := uuid.NewString()
 	blockID := "x2-" + uuid.NewString()

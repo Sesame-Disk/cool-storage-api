@@ -10,10 +10,11 @@ Session-by-session development history for SesameFS.
 
 ## 2026-08-13 - X2 cross-DC reference visibility: EACH_QUORUM destructive liveness
 
-First runtime change of the X1/X2 series. Closes the cross-DC half without r3: no
+First runtime change of the X1/X2 series. Implements the cross-DC half without r3: no
 generations, no physical incarnations, no writer hot-path change, and no `SERIAL+ALL`
 fence — that fence serves the publication TOCTOU, a different property. Destructive
-GC stays disabled; `GC_ENABLED=false` now rests on X1 alone.
+GC stays disabled. X1 is the runtime activation blocker; X2's fix still owes its
+formal closure evidence.
 
 The invariant now enforced:
 
@@ -21,24 +22,40 @@ The invariant now enforced:
 > able to acknowledge a `LOCAL_QUORUM` reference write.
 
 - `db.BlockHasReferencesGlobal` pins `EACH_QUORUM` per query and backs
-  `processBlock`'s claim-then-verify, the only read that may authorize destruction.
-  The pre-claim check, the scanner and `enqueueZeroRefBlocks` stay at session
+  `processBlock`'s claim-then-verify, the only read that may authorize destruction
+  there. The pre-claim check, the scanner and `enqueueZeroRefBlocks` stay at session
   consistency on purpose: the zero-check is asymmetric, so a local positive is proof
   enough to abort while a local zero authorizes nothing.
-- `RecoverS3Orphans` deletes bytes without reading references and is authorized
-  transitively by an orphan row that cannot exist unless that verify passed. Stated
-  where it is enforced, so a new destructive path cannot bypass it silently.
+- `RecoverS3Orphans` performs its own global verify rather than inheriting one
+  transitively from the orphan row. The transitive argument is sound going forward but
+  rests on a greenfield precondition that code cannot enforce and that fails silently;
+  recovery is the cold path, so it establishes the zero itself.
 - `ValidateDestructiveGCTopology` gates both destructive paths on live keyspace
-  replication being `NetworkTopologyStrategy` with a positive RF per mapped DC and the
-  local DC among them; under `SimpleStrategy` the per-DC argument is vacuous and the
-  path fails closed. Re-evaluated per attempt, since replication can change at runtime.
-- Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
-  `{reason="destructive_topology_gate"}`, and
-  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`.
+  replication being `NetworkTopologyStrategy`, with a positive RF per mapped DC, the
+  local DC among them, and **the live map exactly equal to the declared one**. The
+  proof concerns the replica set that accepted each write, so a shrunk map passes every
+  structural check while `EACH_QUORUM` stops being obliged to reach the DCs holding
+  those references — topology is therefore immutable while GC is enabled. The gate is
+  part of `GCStore`, so dropping it is a compile error rather than a silent disarm, and
+  it is re-evaluated per attempt since replication can change at runtime.
+- Failing closed no longer wedges or discards work. A failed verify hands its claim
+  back; the pre-check releases only claims old enough to be abandoned, so it cannot
+  drop the fence under a concurrent attempt sharing the same candidate-derived claim
+  id; a failed release keeps the candidate rather than consuming the only item that
+  could retry it; and fail-closed errors postpone instead of burning the retry budget,
+  which would otherwise DLQ every in-flight block within minutes of a DC outage — from
+  where block items never auto-recover and the scanner's day cursor has already moved
+  past their candidates.
+- Observability: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
+  `{reason="destructive_topology_gate"}`, and `GCAuditEventsTotal` events
+  `gc_block_delete_failed_closed`, `gc_block_stale_claim_released`,
+  `gc_s3_orphan_referenced_deferred`.
 
-Five regressions in `internal/gc/x2_cross_dc_liveness_test.go`. The authorization
-canary is mutation-verified: reverting that single call makes the suite delete a live
-block under an unavailable DC.
+Twelve regressions in `internal/gc/x2_cross_dc_liveness_test.go` plus the gate's
+decision logic in `internal/db/destructive_gc_topology_test.go`. Every assertion is
+mutation-verified against a deliberately reverted implementation — including the
+canary that reverting the single `BlockHasReferencesGlobal` call makes the suite delete
+a live block under an unavailable DC.
 
 **Not yet marked Closed.** A unit test cannot observe a consistency level, so what is
 pinned here is which read authorizes and that errors fail closed. Formal closure owes

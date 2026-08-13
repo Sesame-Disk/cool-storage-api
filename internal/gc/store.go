@@ -14,6 +14,12 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.S
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+	// GCFailureCodeDestructiveFailClosed marks a delete refused because the
+	// environment could not authorize it — an unreachable datacenter, or a
+	// replication map that no longer carries the per-DC EACH_QUORUM argument. These
+	// are postponed rather than retried, so the code exists mainly to make the
+	// refusal legible; it should not normally reach the DLQ.
+	GCFailureCodeDestructiveFailClosed = "destructive_fail_closed"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -75,18 +81,41 @@ type GCStore interface {
 	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). An unreachable DC makes it fail;
 	// callers must fail closed rather than treat the error as "no references".
 	BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error)
+	// ValidateDestructiveGCTopology reports whether the live keyspace replication
+	// still supports the per-datacenter EACH_QUORUM argument that authorizes
+	// physical deletes. It is part of this interface rather than an optional
+	// capability so the guarantee cannot be lost by wrapping the store: dropping it
+	// is a compile error, not a silently disarmed safety gate.
+	ValidateDestructiveGCTopology() error
 	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error)
 	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
 	// and records the deterministic claimID for the logical delete attempt.
-	// Callers MUST re-check BlockHasReferences after a successful claim before
-	// deleting from S3 (claim-then-verify).
+	// Callers MUST re-check BlockHasReferencesGlobal — the EACH_QUORUM form, never
+	// the session-consistency one — after a successful claim before deleting from S3
+	// (claim-then-verify). Verifying with the local read reopens
+	// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01.
 	ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error)
 	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
 	// row. This prevents another attempt from releasing a claim it did not win.
+	// It returns an error when the conditional update does not apply, so callers
+	// that must observe the release use it rather than ReleaseStaleBlockClaim.
 	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// ReleaseStaleBlockClaim clears gc_state only when claimID owns the row AND the
+	// claim was taken at or before staleBefore. It exists because claimID is derived
+	// from the candidate timestamp, so it is shared by every attempt on the same
+	// logical candidate — including two workers running concurrently. An
+	// unconditional release would therefore let one worker drop the fence out from
+	// under another worker's in-flight delete, which is the one thing the claim is
+	// there to prevent.
+	//
+	// Returns (false, nil) when there is nothing to release: no claim, a claim owned
+	// by a different candidate, or a claim too recent to be anything but live. That
+	// is the common case and is not an error. A real failure returns an error, and
+	// callers must not treat the block as settled until the fence is confirmed gone.
+	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error)
 	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
@@ -593,16 +622,6 @@ type AuditLogEntry struct {
 	ActorID    string // user who triggered it, or "gc_worker"/"gc_scanner"
 	Details    string // JSON or free-text with extra context
 	Timestamp  time.Time
-}
-
-// DestructiveTopologyValidator is implemented by stores that can check the live
-// keyspace replication. The EACH_QUORUM liveness argument that closes
-// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 is stated per datacenter and only holds
-// under NetworkTopologyStrategy with every replica-holding DC in the map, so the
-// destructive path consults this before deleting bytes. Stores that cannot answer
-// (mocks, single-DC fakes) simply do not implement it.
-type DestructiveTopologyValidator interface {
-	ValidateDestructiveGCTopology() error
 }
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.

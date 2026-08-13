@@ -177,6 +177,8 @@ type MockStore struct {
 	blockHasReferencesGlobalErr    error
 	blockHasReferencesLocalCalls   int
 	blockHasReferencesGlobalCalls  int
+	releaseStaleBlockClaimErr      error
+	validateDestructiveTopologyErr error
 	blockReferenceExistsErr        error
 	ensureBlockGCCandidateErr      error
 	deleteProvisionalProjectionErr error
@@ -1884,6 +1886,59 @@ func (m *MockStore) SetBlockHasReferencesGlobalErrForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.blockHasReferencesGlobalErr = err
+}
+
+// ValidateDestructiveGCTopology always passes for the mock: an in-memory store has
+// no keyspace whose replication could invalidate the per-DC EACH_QUORUM argument.
+// It is implemented because the gate is part of GCStore, so a store that forgets it
+// fails to compile rather than silently disarming the destructive gate.
+func (m *MockStore) ValidateDestructiveGCTopology() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.validateDestructiveTopologyErr
+}
+
+// SetValidateDestructiveGCTopologyErrForTest makes the mock's gate reject, so tests
+// can drive the fail-closed path through the real wiring instead of overriding the
+// worker's gate function.
+func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.validateDestructiveTopologyErr = err
+}
+
+// ReleaseStaleBlockClaim mirrors the Cassandra semantics: silent no-op when there is
+// nothing stale to release, so the common "referenced block, never claimed" path
+// neither errors nor warns; a real failure is injectable to prove that callers
+// refuse to settle a candidate whose fence they could not confirm gone.
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.releaseStaleBlockClaimErr != nil {
+		return false, m.releaseStaleBlockClaimErr
+	}
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return false, nil
+	}
+	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
+		return false, nil
+	}
+	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
+		return false, nil
+	}
+	b.GCState = ""
+	b.GCClaimID = ""
+	b.GCClaimedAt = nil
+	return true, nil
+}
+
+// SetReleaseStaleBlockClaimErrForTest injects a failure into the stale-claim release.
+func (m *MockStore) SetReleaseStaleBlockClaimErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseStaleBlockClaimErr = err
 }
 
 // BlockHasReferencesCallCountsForTest reports how many liveness reads of each kind

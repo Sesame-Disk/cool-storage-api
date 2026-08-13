@@ -2055,40 +2055,54 @@ another need not intersect, so GC could read "zero references" for a block whose
 reference was already acknowledged elsewhere. The one-hour grace period mitigates
 normal lag but is not a correctness bound.
 
-**The fix (2026-08-13).** Closed without r3: no generations, no physical incarnations,
-no writer hot-path change, and no `SERIAL+ALL` fence — that fence serves the
-publication TOCTOU, which is a different property. The invariant now enforced is:
+**The fix (2026-08-13).** Implemented without r3: no generations, no physical
+incarnations, no writer hot-path change, and no `SERIAL+ALL` fence — that fence serves
+the publication TOCTOU, which is a different property. The invariant now enforced is:
 
 > Every physical delete is authorized by a liveness read that intersects every DC
 > able to acknowledge a `LOCAL_QUORUM` reference write.
 
 - `BlockHasReferencesGlobal` pins `EACH_QUORUM` per query (never inherited from the
   session) and backs `processBlock`'s claim-then-verify — the only read that may
-  authorize destruction. An unreachable DC makes it error, and the error aborts the
-  delete with the claim still held.
+  authorize destruction there. An unreachable DC makes it error; the error aborts the
+  delete and hands the claim back, so failing closed does not also fence the block.
 - The pre-claim check, the scanner and `enqueueZeroRefBlocks` deliberately stay at
   session consistency. The zero-check is asymmetric: a locally visible row is proof
   the block is alive, so aborting early is always correct, while a local zero proves
   nothing and authorizes nothing.
-- `RecoverS3Orphans` deletes bytes without reading references at all; it is
-  authorized **transitively** by an orphan row that cannot exist unless that verify
-  already passed. The invariant is stated where it is enforced so a future
-  destructive path cannot bypass it without a failing test.
+- `RecoverS3Orphans` performs its **own** `BlockHasReferencesGlobal` before destroying
+  bytes. It could have inherited authorization transitively — an orphan row cannot
+  exist unless `processBlock`'s verify already passed — but that implication only runs
+  forward in time, so it rested on a greenfield precondition that is unenforceable in
+  code and *silent* if it ever stops holding. Recovery is the cold path; the read is
+  cheap and the guarantee is now self-contained.
 - A destructive topology gate (`ValidateDestructiveGCTopology`) refuses to delete
   unless live keyspace replication is `NetworkTopologyStrategy` with a positive RF in
-  every mapped DC and the local DC among them. Under `SimpleStrategy` the per-DC
-  argument is vacuous, so the path fails closed rather than deleting under a proof
-  that does not apply. It guards both destructive paths and is re-evaluated per
-  attempt, because replication can be altered at runtime.
+  every mapped DC, the local DC among them, **and the live map exactly equal to the
+  declared one**. The last clause is the one with teeth: the quorum-intersection proof
+  is about the replica set that *accepted* each write, so shrinking the map after
+  references were acknowledged elsewhere passes every structural check while
+  `EACH_QUORUM` quietly stops being obliged to contact those DCs — and Cassandra does
+  not relocate historical data on `ALTER`. Topology is therefore immutable while
+  destructive GC is enabled; changing it means `GC_ENABLED=false`, alter, repair,
+  update the declared map, re-enable. The gate is part of `GCStore`, so a store that
+  drops it fails to compile rather than silently disarming, it guards both destructive
+  paths, and it is re-evaluated per attempt because replication can change at runtime.
 - Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`
   and `{reason="destructive_topology_gate"}`, plus
-  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`.
+  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. It also does not consume
+  the item's retry budget: the failure is systematic, so the ordinary five-retry path
+  would DLQ every in-flight block within minutes of an outage, and block items are not
+  auto-recoverable from the DLQ while the scanner's day cursor has already moved past
+  their candidates. Fail-closed postpones instead, costing latency rather than the work.
 
-**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` — five regressions: the
-verify uses the global read (mutation-verified — reverting that one call makes the
-suite delete a live block under an unavailable DC), unavailable-DC fail-closed, the
-topology gate on both destructive paths, and a remote-only reference aborting the
-delete.
+**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (twelve regressions) and
+`internal/db/destructive_gc_topology_test.go` (the gate's decision logic against
+synthetic replication maps, including a shrunk map that passes every structural
+check). Every assertion is mutation-verified — each was confirmed to fail against a
+deliberately reverted implementation, including the canary that reverting the single
+`BlockHasReferencesGlobal` call makes the suite delete a live block under an
+unavailable DC.
 
 **Still owed before this is marked Closed.** The three-DC regression must run green at
 RF 1: a reference that dc-na genuinely cannot see locally must still be visible to its
@@ -2112,10 +2126,13 @@ integration tests skip when fewer than three DCs are configured, so a two-DC
 environment cannot report a false pass.
 
 **This does not enable destructive GC.** `GC_ENABLED=false` remains mandatory on every
-replica in every DC, now resting on `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1)
-alone. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2; the analysis that
-established X2's independence from X1 is in `GC-X1-X2-ALTERNATIVES.md`. r3 remains the
-accepted-for-review design for X1 and is not superseded by this fix.
+replica in every DC. X1 (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) is the runtime
+activation blocker; X2's implemented fix still owes its formal closure evidence, so
+activation is not gated on X2 alone being believed — it is gated on X1 being fixed and
+X2's three legs being green. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
+the analysis that established X2's independence from X1 is in
+`GC-X1-X2-ALTERNATIVES.md`. r3 remains the accepted-for-review design for X1 and is not
+superseded by this fix.
 
 ---
 

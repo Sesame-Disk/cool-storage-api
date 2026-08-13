@@ -1853,9 +1853,48 @@ func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID strin
 	return s.db.BlockHasReferencesGlobal(orgID.String(), blockID)
 }
 
-// ValidateDestructiveGCTopology satisfies DestructiveTopologyValidator so the worker
-// can gate deletes on the live keyspace replication actually supporting EACH_QUORUM's
-// per-datacenter semantics.
+// ReleaseStaleBlockClaim hands back a delete claim left behind by an attempt that
+// died between claiming and releasing. It reads the claim first so the common case —
+// no claim at all — costs one point read and reports "nothing to do" instead of a
+// failed conditional update, and so a claim young enough to belong to a concurrent
+// in-flight attempt is left strictly alone.
+//
+// The conditional update pins gc_claimed_at as well as the claim id, so a claim that
+// gets refreshed between the read and the write is not released by this call.
+func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error) {
+	var gcState, gcClaimID string
+	var gcClaimedAt time.Time
+	err := s.db.Session().Query(`
+		SELECT gc_state, gc_claim_id, gc_claimed_at FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&gcState, &gcClaimID, &gcClaimedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if gcState != db.BlockGCStateDeleting || gcClaimID != claimID {
+		return false, nil
+	}
+	if gcClaimedAt.IsZero() || gcClaimedAt.After(staleBefore) {
+		// Recent enough that another worker may still be walking this candidate.
+		// Releasing here would drop the fence mid-delete.
+		return false, nil
+	}
+
+	applied, err := s.db.Session().Query(`
+		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
+		WHERE org_id = ? AND block_id = ?
+		IF gc_state = ? AND gc_claim_id = ? AND gc_claimed_at = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+// ValidateDestructiveGCTopology gates every physical delete on the live keyspace
+// replication still supporting EACH_QUORUM's per-datacenter semantics.
 func (s *CassandraStore) ValidateDestructiveGCTopology() error {
 	return s.db.ValidateDestructiveGCTopology()
 }

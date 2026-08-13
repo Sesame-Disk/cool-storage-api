@@ -30,7 +30,7 @@
 2. **Backend API**: ~98% complete - OIDC ✅, GC implementation present; destructive activation blocked by X1 (X2 fix landed, awaiting three-DC closure evidence), Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
-5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2's fix has landed (pending its multi-DC regression) and X1 remains open, so the activation gate now rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
+5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X1 remains open and is the runtime activation blocker; X2's implemented fix still owes its formal closure evidence (the three-DC regression), so it is not a gate that has been cleared — it is one whose fix has not yet been proven on real hardware. The upload-fence PR series addresses separate writer/GC races and closes neither.
 
 ### Inter-session Update (2026-05-21)
 

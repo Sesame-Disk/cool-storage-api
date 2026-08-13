@@ -284,7 +284,10 @@ func isMultiRegionNetworkTopology(replication cassandraReplicationSettings) bool
 //
 // This reads live keyspace metadata rather than configuration, because the
 // deployment map comes from the environment (CASSANDRA_REPLICATION_DCS) and the
-// checked-in profiles are not the source of truth about the fleet.
+// checked-in profiles are not the source of truth about the fleet. It then requires
+// the live map to equal the declared one, which makes the topology immutable while
+// destructive GC is enabled — see the comment on the comparison below for why a
+// structurally valid map is not sufficient.
 //
 // A single-DC NetworkTopologyStrategy map passes deliberately. There, EACH_QUORUM
 // and LOCAL_QUORUM denote the same quorum, so the cross-DC argument is vacuous — but
@@ -299,23 +302,30 @@ func (db *DB) ValidateDestructiveGCTopology() error {
 	if !meta.Exists {
 		return missingKeyspaceError(db.config.Keyspace)
 	}
+	return validateDestructiveGCTopology(meta.Replication, db.config)
+}
 
-	if normalizeReplicationClass(meta.Replication.Class) != "NetworkTopologyStrategy" {
+// validateDestructiveGCTopology holds the gate's decision logic, separated from the
+// session read so it can be exercised directly against synthetic replication maps.
+func validateDestructiveGCTopology(live cassandraReplicationSettings, cfg config.DatabaseConfig) error {
+	keyspace := cfg.Keyspace
+
+	if normalizeReplicationClass(live.Class) != "NetworkTopologyStrategy" {
 		return fmt.Errorf(
 			"destructive GC requires NetworkTopologyStrategy so EACH_QUORUM carries a per-datacenter quorum; keyspace %s uses %s",
-			db.config.Keyspace, meta.Replication.Class,
+			keyspace, live.Class,
 		)
 	}
 
 	dcs := map[string]string{}
-	for dc, rf := range meta.Replication.Options {
+	for dc, rf := range live.Options {
 		if strings.EqualFold(strings.TrimSpace(dc), "replication_factor") {
 			continue
 		}
 		dcs[strings.TrimSpace(dc)] = strings.TrimSpace(rf)
 	}
 	if len(dcs) == 0 {
-		return fmt.Errorf("destructive GC requires at least one datacenter in the replication map for keyspace %s", db.config.Keyspace)
+		return fmt.Errorf("destructive GC requires at least one datacenter in the replication map for keyspace %s", keyspace)
 	}
 	for dc, rf := range dcs {
 		factor, convErr := strconv.Atoi(rf)
@@ -326,14 +336,35 @@ func (db *DB) ValidateDestructiveGCTopology() error {
 
 	// The coordinator's own DC must hold replicas, otherwise "every DC" as this node
 	// understands it is not the same set the writers acknowledge into.
-	localDC := strings.TrimSpace(db.config.LocalDC)
+	localDC := strings.TrimSpace(cfg.LocalDC)
 	if localDC != "" {
 		if _, ok := dcs[localDC]; !ok {
 			return fmt.Errorf(
 				"destructive GC requires local_dc %q to hold replicas; keyspace %s replicates to %s",
-				localDC, db.config.Keyspace, formatReplicationOptions(meta.Replication.Options),
+				localDC, keyspace, formatReplicationOptions(live.Options),
 			)
 		}
+	}
+
+	// The live map must be EXACTLY the declared one. A structurally valid map is not
+	// enough, because the quorum-intersection proof is about the replica set that
+	// ACCEPTED each reference write, not the one in effect at read time. Shrinking
+	// the map — `ALTER KEYSPACE ... {dc-na:1}` after references were acknowledged in
+	// dc-eu — leaves every structural check above satisfied while EACH_QUORUM quietly
+	// stops being obliged to contact dc-eu at all, and Cassandra does not move
+	// historical data into the new replica set on its own. Pinning the live map to
+	// the declared one makes the topology immutable for as long as destructive GC is
+	// enabled, which is the property the proof actually needs.
+	declared := configuredReplicationSettings(cfg)
+	if !sameReplicationSettings(declared, live) {
+		return fmt.Errorf(
+			"destructive GC requires the live keyspace replication to match the declared topology exactly; keyspace %s is %s %s but CASSANDRA_REPLICATION_DCS declares %s %s. "+
+				"A replication map that changed after references were written invalidates the per-datacenter EACH_QUORUM argument. "+
+				"To change topology: set GC_ENABLED=false everywhere, ALTER the keyspace, run the corresponding repair, update the declared map, then re-enable GC",
+			keyspace,
+			live.Class, formatReplicationOptions(live.Options),
+			declared.Class, formatReplicationOptions(declared.Options),
+		)
 	}
 
 	return nil

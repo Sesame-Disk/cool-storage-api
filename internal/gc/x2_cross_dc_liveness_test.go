@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -133,9 +134,11 @@ func TestX2_FailedVerifyDoesNotWedgeTheBlock(t *testing.T) {
 }
 
 // TestX2_ReferencedBlockReleasesAStaleClaim covers the same wedge from the other
-// side: if some earlier attempt did leave a claim behind, the pre-check path that
-// settles the item on a live reference must hand it back rather than clear the
-// candidate and walk away from a block stuck in 'deleting'.
+// side. The verify's own error path hands its claim back, so the only claim that can
+// outlive an attempt is one whose process died between claiming and releasing. This
+// is the last pass that will ever look at the candidate, so it must hand that claim
+// back rather than clear the candidate and walk away from a block stuck in
+// 'deleting' — which would fence every future upload of the content forever.
 func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -148,19 +151,19 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
-	// Attempt 1 claims and then loses the verify to an unreachable DC.
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
-	if _, err := w.ProcessOnce(context.Background()); err != nil {
-		t.Fatalf("first ProcessOnce returned a fatal error: %v", err)
+	// An earlier attempt claimed the row and its process died before releasing.
+	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
+	if err != nil || !applied {
+		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
 	}
-
-	// A writer republishes the content before the retry.
+	// A writer republishes the content afterwards.
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
-	store.SetBlockHasReferencesGlobalErrForTest(nil)
 
-	// Attempt 2 settles through the pre-check, which must also clear any claim.
+	// Run far enough past the claim that it cannot belong to a live attempt.
+	w.clock = func() time.Time { return time.Now().Add(2 * blockDeleteClaimStaleAfter) }
+
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
-		t.Fatalf("second ProcessOnce returned a fatal error: %v", err)
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
 
 	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
@@ -170,6 +173,165 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	}
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Errorf("deleted a referenced block: %+v", deletes)
+	}
+}
+
+// TestX2_ReferencedBlockLeavesAFreshClaimAlone is the counterweight to the test
+// above, and the reason the release is conditional on age at all.
+//
+// claimID is derived from the candidate timestamp, so every attempt on one candidate
+// shares it — including two workers running at once, since DequeueBatch hands the
+// same row to both. An unconditional release would therefore let the worker that
+// merely OBSERVES a reference hand back the claim of a worker that is mid-delete,
+// dropping the upload fence in precisely the window it exists to cover. A claim young
+// enough to be live must be left exactly where it is.
+func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// Another worker is walking this same candidate right now and holds the claim.
+	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
+	if err != nil || !applied {
+		t.Fatalf("seed concurrent claim: applied=%v err=%v", applied, err)
+	}
+	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+
+	blk := store.GetBlock(orgID, "block-1")
+	if blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	}
+	if blk.GCState != db.BlockGCStateDeleting {
+		t.Errorf("released a claim that a concurrent attempt still owns (gc_state=%q); that attempt would delete the bytes with the upload fence already down", blk.GCState)
+	}
+}
+
+// TestX2_StaleClaimReleaseFailureKeepsTheCandidate pins the availability rule that
+// makes the release safe to require. If the release itself fails, the candidate must
+// NOT be cleared: it is the only work item that can retry the release, and consuming
+// it would strand a live block behind a permanent fence with nothing left to lift it.
+func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
+
+	store.SetReleaseStaleBlockClaimErrForTest(errors.New("cassandra unavailable"))
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Fatalf("candidate rows = %d, want the candidate preserved so a later pass can retry the release", len(got))
+	}
+
+	// Once the store recovers, the same candidate settles normally.
+	store.SetReleaseStaleBlockClaimErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("second ProcessOnce returned a fatal error: %v", err)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 0 {
+		t.Errorf("candidate rows = %d after recovery, want the item settled", len(got))
+	}
+}
+
+// TestX2_TopologyGateIsArmedWithoutExplicitWiring proves the gate cannot be lost by
+// omission. The worker here is built exactly as production builds it — NewWorker,
+// no SetDestructiveTopologyGate call — and a store whose topology check rejects must
+// still stop the delete. Before the gate moved into GCStore this was an optional
+// capability resolved by type assertion, so wrapping the store silently disarmed a
+// data-loss guard.
+func TestX2_TopologyGateIsArmedWithoutExplicitWiring(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	store.SetValidateDestructiveGCTopologyErrForTest(errors.New("live replication map no longer matches the declared topology"))
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Errorf("deleted bytes with the store's own topology gate rejecting: %+v", deletes)
+	}
+	if store.GetBlock(orgID, "block-1") == nil {
+		t.Error("canonical blocks row removed despite the store's topology gate rejecting")
+	}
+}
+
+// TestX2_FailClosedDoesNotBurnTheRetryBudget covers the second-order cost of making
+// the destructive verify global.
+//
+// An unreachable DC is no longer a rare per-item error: every block in flight fails
+// on the same tick for the same reason. At five retries and one retry burned per
+// pass, a short outage would push the whole in-flight set into the DLQ — where
+// ItemBlock is not auto-recoverable, and where the scanner's day cursor has already
+// moved past the candidates that would otherwise rediscover them. A stall would
+// quietly become permanently uncollectable storage. So these failures postpone
+// instead: the item stays live and un-incremented until the environment recovers.
+func TestX2_FailClosedDoesNotBurnTheRetryBudget(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+
+	// Ride out an outage longer than the five-retry budget would survive.
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	failed, err := store.GetTotalFailedItems()
+	if err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	}
+	if failed != 0 {
+		t.Errorf("%d item(s) reached the DLQ during a fail-closed outage; block items are not auto-recoverable from there and the scanner cursor has moved past their candidates", failed)
+	}
+
+	// When the datacenter comes back the same item still collects, with no operator
+	// intervention and no rediscovery needed.
+	store.SetBlockHasReferencesGlobalErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce after recovery returned a fatal error: %v", err)
+	}
+	if got := len(sp.ScopedBlockDeletes()); got != 1 {
+		t.Errorf("block deletes after recovery = %d, want 1; the work item did not survive the outage", got)
 	}
 }
 
@@ -229,6 +391,76 @@ func TestX2_TopologyGateAlsoGuardsOrphanRecovery(t *testing.T) {
 	}
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Errorf("orphan recovery deleted bytes despite the topology gate: %+v", deletes)
+	}
+}
+
+// TestX2_OrphanRecoveryRefusesAReferencedBlock covers the second destructive path's
+// own authorization. Recovery used to delete bytes purely on the existence of a
+// gc_s3_orphans row, which is only sound while every such row descends from an
+// EACH_QUORUM verify — true forward in time, but not for a row written by an older
+// binary. It now establishes the global zero itself, so a block that still has
+// references keeps its bytes no matter who wrote the orphan row.
+func TestX2_OrphanRecoveryRefusesAReferencedBlock(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = func() time.Time { return now }
+
+	orgID := uuid.New()
+	if _, err := store.RecordS3Orphan(orgID, "orph-referenced", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	// The canonical row is gone (that is why there is an orphan row at all), but a
+	// reference to the content exists somewhere in the fleet.
+	store.AddBlockReferenceForTest(orgID, "orph-referenced", "fs:lib:obj")
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("expected RecoverS3Orphans to refuse a referenced block")
+	}
+	if recovered != 0 {
+		t.Errorf("recovered = %d, want 0", recovered)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Errorf("orphan recovery destroyed the bytes of a still-referenced block: %+v", deletes)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Error("orphan row discarded; it must survive for an operator to inspect")
+	}
+}
+
+// TestX2_OrphanRecoveryFailsClosedOnAnUnavailableDatacenter is the same policy as
+// processBlock's: recovery's liveness read is EACH_QUORUM, so an unreachable DC makes
+// it error, and that error must stop the delete rather than read as "no references".
+func TestX2_OrphanRecoveryFailsClosedOnAnUnavailableDatacenter(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = func() time.Time { return now }
+
+	orgID := uuid.New()
+	if _, err := store.RecordS3Orphan(orgID, "orph-dc-down", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("expected RecoverS3Orphans to fail closed when the global verify cannot be established")
+	}
+	if recovered != 0 {
+		t.Errorf("recovered = %d, want 0", recovered)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Errorf("orphan recovery deleted bytes on an uncertain liveness read: %+v", deletes)
 	}
 }
 
