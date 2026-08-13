@@ -185,6 +185,14 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 // merely OBSERVES a reference hand back the claim of a worker that is mid-delete,
 // dropping the upload fence in precisely the window it exists to cover. A claim young
 // enough to be live must be left exactly where it is.
+//
+// But leaving the claim alone is only half the requirement, and the other half is
+// what makes this test worth having. Declining to release must NOT be treated as
+// "nothing to do here". The claim may equally belong to an attempt that died seconds
+// ago, and this candidate is the only work item that will ever revisit the block, so
+// settling it now would leave gc_state='deleting' with nothing left to clear it —
+// fencing every future upload of that content forever. The candidate has to survive
+// until the claim ages out, and then the fence has to actually come off.
 func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -195,6 +203,7 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// Another worker is walking this same candidate right now and holds the claim.
@@ -214,6 +223,50 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	}
 	if blk.GCState != db.BlockGCStateDeleting {
 		t.Errorf("released a claim that a concurrent attempt still owns (gc_state=%q); that attempt would delete the bytes with the upload fence already down", blk.GCState)
+	}
+	// The candidate must still be there. Without this assertion the fence could be
+	// left held with no work item able to lift it, and every other check here would
+	// still pass.
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Fatalf("candidate rows = %d, want 1: declining to release a fresh claim must not settle the item, or nothing is left to lift the fence when it goes stale", len(got))
+	}
+
+	// Surviving one pass is not enough, and this is the part that dictates HOW the
+	// item is requeued. The claim needs the full staleness threshold to age out —
+	// minutes, not seconds — which is many more passes than the five-retry budget
+	// allows. If waiting burned a retry the item would reach the DLQ long before the
+	// fence could be lifted, where block items never auto-recover: the same permanent
+	// wedge, arrived at from the other side. Waiting must postpone, not retry.
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed != 0 {
+		t.Fatalf("%d item(s) reached the DLQ while waiting for a claim to go stale; block items do not auto-recover from there, so the block would stay fenced forever", failed)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Fatalf("candidate rows = %d after waiting, want 1", len(got))
+	}
+
+	// Once the claim is old enough to be certainly abandoned, the next pass must
+	// actually release it and only then settle the candidate.
+	w.clock = func() time.Time { return time.Now().Add(2 * blockDeleteClaimStaleAfter) }
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("second ProcessOnce returned a fatal error: %v", err)
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != "" {
+		t.Errorf("block still fenced (gc_state=%q) after its claim went stale; uploads of this content would stay blocked forever", blk.GCState)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 0 {
+		t.Errorf("candidate rows = %d after the fence was lifted, want 0", len(got))
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Errorf("deleted a referenced block: %+v", deletes)
 	}
 }
 

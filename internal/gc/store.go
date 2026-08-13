@@ -14,6 +14,10 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.S
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+	// GCFailureCodeBlockClaimNotYetStale marks a candidate that cannot be settled
+	// yet because a delete claim on its block is too young to hand back safely. The
+	// item is postponed, not retried and not failed.
+	GCFailureCodeBlockClaimNotYetStale = "block_claim_not_yet_stale"
 	// GCFailureCodeDestructiveFailClosed marks a delete refused because the
 	// environment could not authorize it — an unreachable datacenter, or a
 	// replication map that no longer carries the per-DC EACH_QUORUM argument. These
@@ -111,11 +115,13 @@ type GCStore interface {
 	// under another worker's in-flight delete, which is the one thing the claim is
 	// there to prevent.
 	//
-	// Returns (false, nil) when there is nothing to release: no claim, a claim owned
-	// by a different candidate, or a claim too recent to be anything but live. That
-	// is the common case and is not an error. A real failure returns an error, and
-	// callers must not treat the block as settled until the fence is confirmed gone.
-	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error)
+	// The outcome is three-valued on purpose. "Nothing to release" and "there IS a
+	// claim, but it is too young to touch" demand opposite things from the caller:
+	// the first means the item is settled, the second means it emphatically is not,
+	// because that fence still has to come off later and this candidate is what will
+	// do it. Collapsing them into a single false is how a live block ends up fenced
+	// forever — see BlockClaimTooFresh.
+	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
 	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
@@ -623,6 +629,32 @@ type AuditLogEntry struct {
 	Details    string // JSON or free-text with extra context
 	Timestamp  time.Time
 }
+
+// BlockClaimReleaseOutcome is what ReleaseStaleBlockClaim observed about a block's
+// delete claim. The distinction between "absent" and "too fresh" is load-bearing:
+// only the first means the caller may settle its candidate.
+type BlockClaimReleaseOutcome int
+
+const (
+	// BlockClaimAbsent: nothing this candidate needs to release. Either no claim at
+	// all, or a claim carrying a different claimID — which belongs to a different
+	// candidate, whose own pass is responsible for lifting it. Safe to settle.
+	BlockClaimAbsent BlockClaimReleaseOutcome = iota
+	// BlockClaimReleased: a stale claim was handed back. Safe to settle.
+	BlockClaimReleased
+	// BlockClaimTooFresh: this candidate's claim exists but was taken too recently to
+	// distinguish from a live in-flight attempt, so it was left alone.
+	//
+	// The caller must NOT settle. A claim younger than the staleness threshold may
+	// belong to a worker still deleting — releasing it drops the upload fence
+	// mid-delete — but it may equally belong to a worker that died seconds ago, in
+	// which case the fence still has to come off eventually. This candidate is the
+	// only work item that will ever look at that block again, so consuming it now
+	// leaves gc_state='deleting' with nothing left to clear it: the block is fenced
+	// against every future upload of its content, permanently. Postpone instead and
+	// let a later pass release the claim once it has aged out.
+	BlockClaimTooFresh
+)
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.
 // Allows mocking the storage layer in tests.

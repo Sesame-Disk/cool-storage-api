@@ -144,6 +144,16 @@ a live one is not, that a failed release does not consume the candidate, that fa
 closed does not consume the retry budget, and that a remote-only reference aborts the
 delete.
 
+One of those deserves calling out because the obvious version of the test misses the
+bug entirely. "A fresh claim is left alone" is only half the requirement: declining to
+release must also **keep the candidate**, and must postpone rather than retry. A
+candidate settled while a claim is still young leaves `gc_state='deleting'` with no
+work item left to clear it once the claim ages out — the block is fenced against every
+future upload of its content, permanently — and an item that burns retries while
+waiting reaches the DLQ, where block items never auto-recover, arriving at the same
+wedge from the other side. Both are asserted, and both mutations were confirmed to go
+red.
+
 Every one of those is mutation-verified — each assertion was confirmed to fail against
 a deliberately reverted implementation. An assertion that cannot fail is not evidence.
 `internal/db/destructive_gc_topology_test.go` does the same for the gate's decision
@@ -252,6 +262,50 @@ re-enable GC
 The gate is part of `GCStore` rather than an optional capability discovered by type
 assertion, so a store that does not carry it fails to compile. A data-loss guard that
 can be disarmed by wrapping a struct is not a guard.
+
+**What the gate proves, exactly — it is narrower than it first reads.** The comparison
+is *today's live topology vs. today's declared config*. That catches the realistic
+accident in both directions: the keyspace altered without the deployment config, or the
+config changed without the keyspace. It is **not** proof that the map is unchanged
+since the references were written. An operator who changes both together — `ALTER
+KEYSPACE`, then `CASSANDRA_REPLICATION_DCS`, then restart — passes the gate cleanly
+while historical references still live in the datacenters that were dropped.
+
+So the honest statement is: **"topology does not change while destructive GC is
+enabled" is an operational precondition, not an invariant this code enforces.** The
+gate is a strong detector of accidental drift and nothing more.
+
+> **Follow-up (not built): certified topology fingerprint.** Persist the replication
+> map at first destructive activation, compare every subsequent destructive attempt
+> against that persisted value, and require an explicit recertification step after a
+> topology change and its repair. That upgrades the check from
+> `today == today's config` to `today == the certified topology`, which is the property
+> the proof actually wants. Deliberately deferred: it is new persisted protocol with a
+> trust-on-first-use step of its own, and the gap it closes is reachable only through a
+> deliberate multi-step administrative change — precisely what the documented procedure
+> covers. Revisit if destructive GC is ever activated on a fleet whose topology is
+> expected to evolve.
+
+### 3b. One claim id, two workers — carried to X1
+
+`blockDeleteClaimID` derives from the candidate timestamp so retries of one logical
+candidate stay its owner. The side effect is that *concurrent* attempts share it too,
+and `ClaimBlockDelete` answers `applied=true` to both. "Our claim" is therefore not
+exclusive.
+
+The pre-check release is stale-only for that reason (see 4b). The three post-claim
+releases — failed global verify, re-referenced after claim, malformed metadata — are
+deliberately **not**: worker A releasing after its own verify failed can drop the fence
+while worker B deletes under the same claim id. B's delete stays authorized by its own
+`EACH_QUORUM` verify, so this is not an X2 hole; it narrows the upload fence inside a
+window X1 already owns, and only if A's release lands between B's verify and B's
+`StartBlockDeleteOrphan`.
+
+Making them stale-only would be worse: a failed global verify is *systematic*, so an
+unreachable DC would fence every in-flight block for the full staleness threshold on
+every outage. The real fix is per-attempt claim identity with staleness-based takeover
+— a redesign of the claim protocol, which belongs to X1's r3 rather than here. Recorded
+so that design inherits it instead of rediscovering it.
 
 ### 4. Fail-closed couples GC availability to every DC
 

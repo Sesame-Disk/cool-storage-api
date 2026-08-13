@@ -91,8 +91,35 @@ func (e failedClosedError) FailureCode() string {
 	return GCFailureCodeDestructiveFailClosed
 }
 
-func isFailedClosedError(err error) bool {
-	return failureCodeForError(err) == GCFailureCodeDestructiveFailClosed
+// blockClaimNotYetStaleError says the candidate cannot be settled yet because the
+// block still carries a delete claim too young to hand back. Nothing is wrong; the
+// item simply must not be consumed until the fence can be lifted. See
+// BlockClaimTooFresh.
+type blockClaimNotYetStaleError struct {
+	ItemID string
+}
+
+func (e blockClaimNotYetStaleError) Error() string {
+	return fmt.Sprintf("block %s carries a delete claim that is not yet stale enough to release", e.ItemID)
+}
+
+func (e blockClaimNotYetStaleError) FailureCode() string {
+	return GCFailureCodeBlockClaimNotYetStale
+}
+
+// shouldPostponeWithoutRetry covers every refusal that says nothing about the item
+// and everything about timing or the environment. All of them requeue the work
+// untouched rather than spending a retry on it: burning the budget on a condition the
+// item cannot influence is how transient trouble turns into lost work.
+func shouldPostponeWithoutRetry(err error) bool {
+	switch failureCodeForError(err) {
+	case GCFailureCodeLibraryHardDeleteInProgress,
+		GCFailureCodeDestructiveFailClosed,
+		GCFailureCodeBlockClaimNotYetStale:
+		return true
+	default:
+		return false
+	}
 }
 
 func isBlockNotFound(err error) bool {
@@ -220,6 +247,38 @@ type Worker struct {
 // 10s driver timeout — so a wide margin costs nothing: it delays unwedging a genuinely
 // abandoned claim, and never races a live one.
 const blockDeleteClaimStaleAfter = 15 * time.Minute
+
+// WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL WHILE THE PRE-CHECK ONE IS NOT
+//
+// processBlock releases a claim in four places, and they deliberately do not use the
+// same rule. The pre-check path (before this attempt has claimed anything) releases
+// only a STALE claim, because there it would be handing back a claim it never took.
+// The three post-claim paths — failed global verify, re-referenced after claim, and
+// malformed canonical metadata — release unconditionally.
+//
+// That asymmetry is a choice, not an oversight, and it is not free. Because claimID
+// derives from the candidate timestamp, ClaimBlockDelete answers applied=true to two
+// concurrent workers on the same candidate, so "our claim" is not exclusive: worker A
+// releasing after ITS verify failed can drop the fence while worker B is still
+// deleting under the same claim id. B's delete stays authorized — it has its own
+// EACH_QUORUM verify — so this does not reopen
+// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01. What it does is narrow the upload fence
+// inside a window that ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01 (X1) already owns.
+//
+// The exposure is bounded: B's gc_s3_orphans row is itself a fence, so A's release
+// only matters if it lands between B's verify and B's StartBlockDeleteOrphan — a
+// couple of statements.
+//
+// Making these stale-only instead would cost far more than it buys. A failed global
+// verify is systematic, not incidental: when a datacenter is unreachable EVERY block
+// in flight fails at once, and holding their claims would fence all of that content
+// for the full staleness threshold on every outage. Trading a millisecond-wide window
+// inside a known-open X1 region for minutes of fleet-wide upload fencing is a bad
+// trade.
+//
+// The real fix is per-attempt claim identity with a staleness-based takeover, which
+// is a redesign of the claim protocol rather than an edit here. It belongs to X1;
+// recorded against it so the r3 design owns it rather than rediscovering it.
 
 // NewWorker creates a new GC worker.
 func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize int, gracePeriod time.Duration, dryRun bool, stats *Stats) *Worker {
@@ -363,10 +422,9 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
 
-			// Both of these postpone without burning a retry: the item is fine, the
-			// environment is not. See failedClosedError for why a fail-closed delete
-			// must not consume the retry budget.
-			if isHardDeleteInProgressError(err) || isFailedClosedError(err) {
+			// These postpone without burning a retry: the item is fine, the timing or
+			// the environment is not. See shouldPostponeWithoutRetry.
+			if shouldPostponeWithoutRetry(err) {
 				if postponeErr := w.postponeItem(item); postponeErr != nil {
 					log.Printf("[GC Worker] Failed to postpone item %s/%s without retry increment: %v",
 						item.OrgID, item.ItemID, postponeErr)
@@ -535,16 +593,28 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// candidate, so an unconditional release could hand back a claim that a
 		// concurrent worker is still deleting under — dropping the fence in exactly
 		// the window it exists to cover.
-		released, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, claimID, w.clock().Add(-blockDeleteClaimStaleAfter))
+		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, claimID, w.clock().Add(-blockDeleteClaimStaleAfter))
 		if relErr != nil {
 			// Do NOT clear the candidate: that would consume the only work item that
 			// can retry this release, stranding a live block behind a permanent fence.
 			// Requeue instead and let a later pass confirm the fence is gone.
 			return fmt.Errorf("failed to release a stale delete claim on referenced block %s: %w", item.ItemID, relErr)
 		}
-		if released {
+		switch outcome {
+		case BlockClaimReleased:
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_stale_claim_released").Inc()
 			log.Printf("[GC Worker] Block %s: released a stale delete claim left by an earlier attempt", item.ItemID)
+		case BlockClaimTooFresh:
+			// Same reasoning as the error above, for the case that looks like success.
+			// The claim is too young to hand back — it may belong to a worker still
+			// deleting — but it may equally belong to one that just died, and this
+			// candidate is the only thing that will ever revisit the block. Settling
+			// now would leave gc_state='deleting' with nothing left to clear it.
+			// Postpone: no retry burned, no DLQ, and the next pass finds the claim
+			// old enough to release.
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_claim_not_yet_stale").Inc()
+			log.Printf("[GC Worker] Block %s is referenced but still carries a recent delete claim; postponing until it ages out", item.ItemID)
+			return blockClaimNotYetStaleError{ItemID: item.ItemID}
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
@@ -625,6 +695,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// systematic rather than rare, and every writer of this content would see
 		// BlockDeleteFenceActive until some later attempt happened to clear it.
 		// Failing closed must not mean fencing the block indefinitely.
+		// Unconditional on purpose — see "WHY THE POST-CLAIM RELEASES ARE
+		// UNCONDITIONAL" above; this is the site whose systematic failure mode
+		// decides that trade.
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a failed global verify: %v", item.ItemID, relErr)
 		}
@@ -660,6 +733,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			metrics.GCItemsSkippedTotal.Inc()
 			return nil
 		}
+		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			return fmt.Errorf("failed to release claim on re-referenced block %s: %w", item.ItemID, relErr)
 		}
@@ -701,6 +775,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			metrics.GCItemsSkippedTotal.Inc()
 			return nil
 		}
+		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			return fmt.Errorf("failed to release claim on malformed block %s: %w", item.ItemID, relErr)
 		}

@@ -1861,7 +1861,7 @@ func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID strin
 //
 // The conditional update pins gc_claimed_at as well as the claim id, so a claim that
 // gets refreshed between the read and the write is not released by this call.
-func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error) {
+func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	var gcState, gcClaimID string
 	var gcClaimedAt time.Time
 	err := s.db.Session().Query(`
@@ -1869,17 +1869,15 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimI
 	`, orgID.String(), blockID).Scan(&gcState, &gcClaimID, &gcClaimedAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
+			return BlockClaimAbsent, nil
 		}
-		return false, err
+		return BlockClaimAbsent, err
 	}
 	if gcState != db.BlockGCStateDeleting || gcClaimID != claimID {
-		return false, nil
+		return BlockClaimAbsent, nil
 	}
 	if gcClaimedAt.IsZero() || gcClaimedAt.After(staleBefore) {
-		// Recent enough that another worker may still be walking this candidate.
-		// Releasing here would drop the fence mid-delete.
-		return false, nil
+		return BlockClaimTooFresh, nil
 	}
 
 	applied, err := s.db.Session().Query(`
@@ -1888,9 +1886,14 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimI
 		IF gc_state = ? AND gc_claim_id = ? AND gc_claimed_at = ?
 	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
 	if err != nil {
-		return false, err
+		return BlockClaimAbsent, err
 	}
-	return applied, nil
+	if !applied {
+		// The row changed between the read and the conditional write — someone
+		// re-claimed it. Treat that as a live claim rather than as nothing to do.
+		return BlockClaimTooFresh, nil
+	}
+	return BlockClaimReleased, nil
 }
 
 // ValidateDestructiveGCTopology gates every physical delete on the live keyspace

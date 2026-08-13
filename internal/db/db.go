@@ -285,9 +285,9 @@ func isMultiRegionNetworkTopology(replication cassandraReplicationSettings) bool
 // This reads live keyspace metadata rather than configuration, because the
 // deployment map comes from the environment (CASSANDRA_REPLICATION_DCS) and the
 // checked-in profiles are not the source of truth about the fleet. It then requires
-// the live map to equal the declared one, which makes the topology immutable while
-// destructive GC is enabled — see the comment on the comparison below for why a
-// structurally valid map is not sufficient.
+// the live map to equal the declared one — see the comment on that comparison for
+// what it does and does not prove, which is narrower than "the topology cannot
+// change".
 //
 // A single-DC NetworkTopologyStrategy map passes deliberately. There, EACH_QUORUM
 // and LOCAL_QUORUM denote the same quorum, so the cross-DC argument is vacuous — but
@@ -352,9 +352,26 @@ func validateDestructiveGCTopology(live cassandraReplicationSettings, cfg config
 	// the map — `ALTER KEYSPACE ... {dc-na:1}` after references were acknowledged in
 	// dc-eu — leaves every structural check above satisfied while EACH_QUORUM quietly
 	// stops being obliged to contact dc-eu at all, and Cassandra does not move
-	// historical data into the new replica set on its own. Pinning the live map to
-	// the declared one makes the topology immutable for as long as destructive GC is
-	// enabled, which is the property the proof actually needs.
+	// historical data into the new replica set on its own.
+	//
+	// BE PRECISE ABOUT WHAT THIS PROVES. It compares the topology in effect NOW
+	// against the topology this process was configured with NOW. That catches the
+	// realistic accident — someone alters the keyspace and forgets the deployment
+	// config, or vice versa — but it is NOT proof that the map is unchanged since the
+	// references were written. An operator who changes both together
+	// (ALTER KEYSPACE, then CASSANDRA_REPLICATION_DCS, then restart) passes this gate
+	// while historical references still live in the dropped datacenters.
+	//
+	// Closing that hole in code would take a certified fingerprint: persist the
+	// replication map at first destructive activation and require an explicit
+	// recertification step after any topology change, so the check becomes
+	// "today's topology == the certified one" rather than "today's topology ==
+	// today's config". Deliberately not built here — it is a new piece of persisted
+	// protocol, and the gap it closes is only reachable through a deliberate,
+	// multi-step administrative change, which is precisely what the documented
+	// procedure covers. Until then the remaining guarantee is operational, and stated
+	// as such in the error below and in KNOWN_ISSUES: topology changes require GC off,
+	// alter, repair, reconfigure, re-enable.
 	declared := configuredReplicationSettings(cfg)
 	if !sameReplicationSettings(declared, live) {
 		return fmt.Errorf(

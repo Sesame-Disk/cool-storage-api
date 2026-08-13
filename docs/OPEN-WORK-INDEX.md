@@ -186,12 +186,14 @@ rests on X1 alone.
 
 Not findings — things nobody has proven either way.
 
-- **No multi-DC test exists.** X6 and the cross-DC line of reasoning are derived
-  from the production consistency contract, never reproduced. X2's fix shipped with
-  same-process regressions that pin which read authorizes a delete and that an
-  unavailable DC fails closed, but a unit test cannot observe a consistency level —
-  the wire-level per-DC behaviour on `docker-compose.cassandra-3dc.yaml` (RF 1, three DCs) is exactly what
-  X2 still owes before it can be marked Closed.
+- **A multi-DC harness now exists, and only X2 uses it.**
+  `docker-compose.cassandra-3dc.yaml` (three DCs, RF 1) plus
+  `scripts/x2-multidc-validation.sh` reproduce cross-DC consistency behaviour at the
+  wire level, and X2 is closed on that evidence — divergent-state visibility,
+  fail-closed with a DC down, both topology-gate halves, and the visibility leg
+  mutation-verified. **X6 and the remaining cross-DC assumptions are still derived
+  from the production consistency contract and have never been reproduced**, even
+  though the instrument to do it is now checked in.
 - **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.

@@ -1911,27 +1911,27 @@ func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
 // nothing stale to release, so the common "referenced block, never claimed" path
 // neither errors nor warns; a real failure is injectable to prove that callers
 // refuse to settle a candidate whose fence they could not confirm gone.
-func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (bool, error) {
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.releaseStaleBlockClaimErr != nil {
-		return false, m.releaseStaleBlockClaimErr
+		return BlockClaimAbsent, m.releaseStaleBlockClaimErr
 	}
 	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if !ok {
-		return false, nil
+		return BlockClaimAbsent, nil
 	}
 	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
-		return false, nil
+		return BlockClaimAbsent, nil
 	}
 	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
-		return false, nil
+		return BlockClaimTooFresh, nil
 	}
 	b.GCState = ""
 	b.GCClaimID = ""
 	b.GCClaimedAt = nil
-	return true, nil
+	return BlockClaimReleased, nil
 }
 
 // SetReleaseStaleBlockClaimErrForTest injects a failure into the stale-claim release.

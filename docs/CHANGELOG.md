@@ -35,9 +35,13 @@ The invariant now enforced:
   local DC among them, and **the live map exactly equal to the declared one**. The
   proof concerns the replica set that accepted each write, so a shrunk map passes every
   structural check while `EACH_QUORUM` stops being obliged to reach the DCs holding
-  those references — topology is therefore immutable while GC is enabled. The gate is
-  part of `GCStore`, so dropping it is a compile error rather than a silent disarm, and
-  it is re-evaluated per attempt since replication can change at runtime.
+  those references. The gate is part of `GCStore`, so dropping it is a compile error
+  rather than a silent disarm, and it is re-evaluated per attempt since replication can
+  change at runtime. It compares today's topology against today's config, which catches
+  the realistic accident but is **not** proof the map is unchanged since the references
+  were written — an operator changing both together still passes. Enforcing that needs
+  a certified fingerprint; until then it is an operational precondition, and the docs
+  now say so rather than claiming immutability.
 - Failing closed no longer wedges or discards work. A failed verify hands its claim
   back; the pre-check releases only claims old enough to be abandoned, so it cannot
   drop the fence under a concurrent attempt sharing the same candidate-derived claim
@@ -57,10 +61,16 @@ mutation-verified against a deliberately reverted implementation — including t
 canary that reverting the single `BlockHasReferencesGlobal` call makes the suite delete
 a live block under an unavailable DC.
 
-**Closed — proven on real hardware.** A unit test cannot observe a consistency level,
-so the closure required the three-DC regression, and it ran green on
-`docker-compose.cassandra-3dc.yaml` (Cassandra 5.0.9, three DCs, RF 1 each) via the
-new `scripts/x2-multidc-validation.sh`:
+**Closed — proven against a real three-datacenter Cassandra topology.** A unit test
+cannot observe a consistency level, so the closure required the three-DC regression,
+and it ran green on `docker-compose.cassandra-3dc.yaml` (Cassandra 5.0.9, three DCs,
+RF 1 each) via the new `scripts/x2-multidc-validation.sh`. To be exact about what that
+is: three real Cassandra processes under `GossipingPropertyFileSnitch` forming three
+logical datacenters — genuine NTS replication, genuine per-DC quorums, a genuinely
+unavailable DC — on one Docker host. That is what the property needs; it is not three
+physical regions, and the distinction is worth keeping straight.
+
+Legs:
 
 - **Visibility** — against a deliberately divergent cluster (hinted handoff disabled,
   the other DCs stopped during the write), `LOCAL_QUORUM` from dc-na is blind to the

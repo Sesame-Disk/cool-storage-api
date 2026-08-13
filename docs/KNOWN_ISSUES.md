@@ -2088,6 +2088,19 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   update the declared map, re-enable. The gate is part of `GCStore`, so a store that
   drops it fails to compile rather than silently disarming, it guards both destructive
   paths, and it is re-evaluated per attempt because replication can change at runtime.
+
+  **Scope of that check, precisely.** It compares the topology in effect now against
+  the topology this process is configured with now. That catches the realistic
+  accident — the keyspace altered without the deployment config, or the reverse — but
+  it is not proof that the map is unchanged *since the references were written*: an
+  operator who changes both together and restarts passes the gate while historical
+  references still live in the dropped datacenters. Closing that in code needs a
+  certified fingerprint (persist the map at first destructive activation; require
+  explicit recertification after any change), which is deliberately not built — the
+  gap is reachable only through a deliberate multi-step administrative change, which
+  is exactly what the procedure above covers. **Until that exists, "topology does not
+  change under destructive GC" is an operational precondition, not an enforced
+  invariant.** Tracked as follow-up in `GC-X2-MULTIDC-VALIDATION.md`.
 - Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`
   and `{reason="destructive_topology_gate"}`, plus
   `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. It also does not consume
@@ -2139,11 +2152,9 @@ DCs does `QUORUM` become 2 of 3 and able to miss the replica holding the referen
 integration tests skip when fewer than three DCs are configured, so a two-DC
 environment cannot report a false pass.
 
-**This does not enable destructive GC.** `GC_ENABLED=false` remains mandatory on every
-replica in every DC. X1 (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) is the runtime
-activation blocker; X2's implemented fix still owes its formal closure evidence, so
-activation is not gated on X2 alone being believed — it is gated on X1 being fixed and
-X2's three legs being green. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
+**Closing X2 does not enable destructive GC.** `GC_ENABLED=false` remains mandatory on
+every replica in every DC. `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) is now the
+sole runtime activation blocker. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
 the analysis that established X2's independence from X1 is in
 `GC-X1-X2-ALTERNATIVES.md`. r3 remains the accepted-for-review design for X1 and is not
 superseded by this fix.
