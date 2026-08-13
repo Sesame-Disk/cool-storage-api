@@ -62,6 +62,12 @@ mis-built state cannot be mistaken for a passing fix.
 
 ## Runbook
 
+Automated as [`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh)
+— `--keep` leaves the stack up, `--no-up` reuses a running one, `--mutate` re-proves
+that leg 1 can fail. Prefer it: a multi-step manual procedure that cannot be run in
+one command is a procedure that quietly stops being run. The steps below are what it
+does, and why each one is load-bearing.
+
 ```bash
 # 1. Stand up three real datacenters. Nodes join one at a time, so first formation
 #    takes a few minutes; the bootstrap waits for all three in gossip before
@@ -349,12 +355,36 @@ X2 moves to Closed in `KNOWN_ISSUES.md` when:
       stale claim is released, a live one is not, and a failed release does not
       consume the candidate
 - [x] Every unit regression mutation-verified
-- [ ] **Divergent-state visibility leg green** (runbook step 5) — and confirmed to
+- [x] **Divergent-state visibility leg green** (runbook step 5) — and confirmed to
       FAIL when the destructive read is downgraded to `LOCAL_QUORUM`. A green run on
       a non-divergent cluster does not count.
-- [ ] **Fail-closed leg green** (runbook step 6)
-- [ ] **Topology gate leg green, both halves** (runbook step 7): accepts the declared
+- [x] **Fail-closed leg green** (runbook step 6)
+- [x] **Topology gate leg green, both halves** (runbook step 7): accepts the declared
       3-DC map, refuses an under-declared one
+
+**All legs ran green on 2026-08-13** against `docker-compose.cassandra-3dc.yaml`
+(Cassandra 5.0.9, three DCs, RF 1 each), via
+[`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh):
+
+```text
+LEG 1  divergent state confirmed: LOCAL_QUORUM from dc-na is blind,
+       EACH_QUORUM sees the dc-eu reference
+LEG 2  EACH_QUORUM correctly failed closed with a datacenter down:
+       Cannot achieve consistency level EACH_QUORUM in DC dc-asia
+LEG 3a gate accepted the declared 3-DC map
+LEG 3b gate refused a session declaring only dc-na against the 3-DC keyspace
+
+MUTATION (scripts/x2-multidc-validation.sh --mutate)
+       with .Consistency(gocql.EachQuorum) → LocalQuorum, against a FRESH
+       divergent state, leg 1 goes red:
+       "X2 REGRESSION: reference acknowledged at LOCAL_QUORUM in dc-eu is
+        invisible to the EACH_QUORUM read from dc-na; GC would authorize
+        deleting a live block"
+```
+
+The mutation is the load-bearing half. Leg 1 passing means nothing on its own — it
+had to be shown to go red against the very defect it exists to catch, on a cluster
+divergent enough for the two consistency levels to disagree.
 
 RF 3 is not on this list: it needs a 9-node stack and is hardening, not closure.
 

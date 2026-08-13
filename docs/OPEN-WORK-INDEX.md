@@ -127,14 +127,14 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-X1 is open with no closed design. X2's fix landed 2026-08-13 and awaits only its
-multi-DC regression. `gc.enabled: false` remains required on every replica in every
-DC — it now rests on X1 alone.
+X1 is open with no closed design. X2 closed 2026-08-13, proven on a real three-DC
+cluster. `gc.enabled: false` remains required on every replica in every DC — it now
+rests on X1 alone.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA: an authorized S3 delete can land after a byte-identical re-upload | Registry X1 |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Fix landed; closure pending regression | Destructive liveness now reads at `EACH_QUORUM` behind a topology gate; owes the multi-DC test | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-13 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; three-DC regression green and mutation-verified | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
 
 ## High / Medium — open (audit follow-ups)
 

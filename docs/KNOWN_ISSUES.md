@@ -25,7 +25,7 @@ is right about why.
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) had its fix land 2026-08-13 — destructive liveness now reads at `EACH_QUORUM` behind a topology gate, with formal closure pending the multi-DC regression. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
+| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-13** — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an unauthorized cross-library block write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -2043,7 +2043,7 @@ Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
 
 ### ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01: GC can miss a live reference in another DC
 
-**Status**: 🟡 Fix implemented 2026-08-13; **formal closure pending the multi-DC regression**
+**Status**: ✅ **Closed 2026-08-13** — fix implemented and proven on a real three-datacenter cluster
 **Discovered**: 2026-07-21
 **Priority**: Blocker — potential deletion of a live block
 **Affected**: `block_references`, GC claim-then-verify, RF 1 per DC deployments
@@ -2104,19 +2104,33 @@ deliberately reverted implementation, including the canary that reverting the si
 `BlockHasReferencesGlobal` call makes the suite delete a live block under an
 unavailable DC.
 
-**Still owed before this is marked Closed.** The three-DC regression must run green at
-RF 1: a reference that dc-na genuinely cannot see locally must still be visible to its
-`EACH_QUORUM` read, and with a DC stopped that read must fail rather than report zero.
-The visibility leg requires a **deliberately divergent** cluster state with hinted
-handoff disabled — a naive write-then-read proves nothing, because Cassandra sends
-mutations to every replica regardless of consistency level, so the remote replica
-usually already has the row and the assertion would pass on the unfixed code too.
-RF 3 is out of scope for closure: under `NetworkTopologyStrategy` the factor is per
-DC, so it needs nine nodes, and it is hardening rather than closure.
-Stack, runbook and closing checklist are in
-[GC-X2-MULTIDC-VALIDATION.md](./GC-X2-MULTIDC-VALIDATION.md);
-`docker-compose.cassandra-3dc.yaml` stands up the three datacenters and
-`internal/integration/x2_cross_dc_visibility_test.go` holds the regressions.
+**Closure evidence (2026-08-13).** All three legs ran green on
+`docker-compose.cassandra-3dc.yaml` — Cassandra 5.0.9, three datacenters, RF 1 each,
+the production shape — driven by
+[`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh):
+
+1. **Visibility.** Against a deliberately divergent cluster (hinted handoff disabled,
+   the other two DCs stopped during the write), `LOCAL_QUORUM` from dc-na is blind to
+   the reference while `EACH_QUORUM` from dc-na sees it. Both halves asserted against
+   the same state; the first is what makes the second mean anything.
+2. **Fail closed.** With dc-asia stopped the destructive read errors —
+   *Cannot achieve consistency level EACH_QUORUM in DC dc-asia* — rather than
+   reporting zero. A false zero here is data loss.
+3. **Topology gate.** Accepts the declared three-DC map; refuses a session declaring
+   only dc-na against that same keyspace.
+
+**And the leg was proven able to fail.** With `.Consistency(gocql.EachQuorum)`
+downgraded to `LocalQuorum`, against a *fresh* divergent state, leg 1 goes red with
+"X2 REGRESSION: reference acknowledged at LOCAL_QUORUM in dc-eu is invisible to the
+EACH_QUORUM read from dc-na". A regression that cannot fail is not evidence, and this
+one demonstrably can.
+
+Two notes for anyone re-running it. The visibility leg is **single-use per block id**:
+the `EACH_QUORUM` read performs blocking read repair to satisfy its own consistency
+level, so it propagates the row to dc-na as a side effect of reading it — the script
+mints fresh ids each run. And **RF 3 is out of scope**: under
+`NetworkTopologyStrategy` the factor is per DC, so it would need nine nodes, and it is
+hardening rather than closure.
 
 **Two DCs cannot prove this**, which is why `docker-compose.mr-cluster.yaml` is not the
 instrument: at two DCs with RF 1 a non-local `QUORUM` is 2 of 2 and intersects

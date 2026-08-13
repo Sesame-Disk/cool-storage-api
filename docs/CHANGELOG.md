@@ -57,15 +57,30 @@ mutation-verified against a deliberately reverted implementation — including t
 canary that reverting the single `BlockHasReferencesGlobal` call makes the suite delete
 a live block under an unavailable DC.
 
-**Not yet marked Closed.** A unit test cannot observe a consistency level, so what is
-pinned here is which read authorizes and that errors fail closed. Formal closure owes
-the three-DC regression on `docker-compose.cassandra-3dc.yaml` at RF 1: a
-`LOCAL_QUORUM` write that dc-na genuinely cannot see locally must still be visible
-to its `EACH_QUORUM` read, and no delete may be authorized with a DC stopped. Two
-DCs cannot prove it (a non-local `QUORUM` is 2 of 2 there and intersects by
-accident), and neither can a naive same-state read, since Cassandra replicates to
-every replica regardless of consistency level — the harness has to build a
-genuinely divergent state with hinted handoff disabled.
+**Closed — proven on real hardware.** A unit test cannot observe a consistency level,
+so the closure required the three-DC regression, and it ran green on
+`docker-compose.cassandra-3dc.yaml` (Cassandra 5.0.9, three DCs, RF 1 each) via the
+new `scripts/x2-multidc-validation.sh`:
+
+- **Visibility** — against a deliberately divergent cluster (hinted handoff disabled,
+  the other DCs stopped during the write), `LOCAL_QUORUM` from dc-na is blind to the
+  reference while `EACH_QUORUM` from dc-na sees it. Both halves against the same state.
+- **Fail closed** — with dc-asia stopped the destructive read errors
+  (*Cannot achieve consistency level EACH_QUORUM in DC dc-asia*) instead of reporting
+  zero.
+- **Topology gate** — accepts the declared three-DC map, refuses a session declaring
+  only dc-na against that keyspace.
+- **Mutation** — with the `EACH_QUORUM` pin downgraded to `LOCAL_QUORUM`, against a
+  fresh divergent state, the visibility leg goes red. That half is load-bearing: a
+  regression that cannot fail is not evidence.
+
+Two DCs could not have proven any of it — a non-local `QUORUM` is 2 of 2 there and
+intersects by accident — and neither could a naive write-then-read, since Cassandra
+replicates to every replica regardless of consistency level. Hence the divergent-state
+harness, now a script rather than prose, because a manual procedure nobody can run in
+one command is one that quietly stops being run.
+
+`GC_ENABLED=false` still stands fleet-wide: X1 is now the sole activation blocker.
 
 ---
 
