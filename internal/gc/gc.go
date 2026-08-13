@@ -173,6 +173,12 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 	stats := &Stats{}
 
 	worker := NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats)
+	if gate, ok := store.(DestructiveTopologyValidator); ok {
+		// Only a store backed by real Cassandra can answer this. Mocks and
+		// single-DC setups leave the gate open, where the cross-DC argument is
+		// vacuous anyway.
+		worker.SetDestructiveTopologyGate(gate.ValidateDestructiveGCTopology)
+	}
 	scanner := NewScanner(store, queue, stats, cfg)
 	scanner.SetOrphanRecoverer(worker)
 

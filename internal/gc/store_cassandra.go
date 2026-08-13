@@ -1841,9 +1841,23 @@ func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, err
 	return true, nil
 }
 
-// BlockHasReferences reports whether any block_references row still exists.
+// BlockHasReferences reports whether any block_references row still exists, at the
+// session consistency. Discovery and abort-early only — see the interface contract.
 func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
 	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+// BlockHasReferencesGlobal is the EACH_QUORUM liveness read that authorizes physical
+// deletion. Errors (including an unreachable DC) propagate so the caller fails closed.
+func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error) {
+	return s.db.BlockHasReferencesGlobal(orgID.String(), blockID)
+}
+
+// ValidateDestructiveGCTopology satisfies DestructiveTopologyValidator so the worker
+// can gate deletes on the live keyspace replication actually supporting EACH_QUORUM's
+// per-datacenter semantics.
+func (s *CassandraStore) ValidateDestructiveGCTopology() error {
+	return s.db.ValidateDestructiveGCTopology()
 }
 
 func (s *CassandraStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {

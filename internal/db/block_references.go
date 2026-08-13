@@ -963,12 +963,44 @@ func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 
 // BlockHasReferences reports whether any reference row still exists for the block.
 // This single-partition point read replaces reading the mutable blocks.ref_count.
+//
+// It runs at the session consistency (LOCAL_QUORUM in every shipped profile), so a
+// TRUE answer is proof — a row visible locally is a real reference — while a FALSE
+// answer proves only that the local DC has not seen one. That asymmetry is why this
+// call is safe for discovery and short-circuit aborts but MUST NOT authorize a
+// physical delete. Use BlockHasReferencesGlobal for that
+// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
 func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
-	var referrer string
-	err := db.Session().Query(`
+	return scanBlockHasReferences(db.Session().Query(`
 		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&referrer)
-	if err != nil {
+	`, orgID, blockID))
+}
+
+// BlockHasReferencesGlobal is the destructive-authorization liveness read: the only
+// form whose FALSE answer may authorize deleting physical bytes.
+//
+// It pins EACH_QUORUM per query rather than inheriting the session default, so the
+// read must obtain a quorum in EVERY datacenter. A reference write acknowledged at
+// LOCAL_QUORUM in any DC therefore intersects this read's quorum in that same DC,
+// and GC cannot conclude "zero references" while one exists somewhere else. If any
+// DC is unreachable the read fails and the caller must fail closed — deleting on an
+// uncertain read is exactly the defect this closes.
+//
+// The per-DC argument presumes NetworkTopologyStrategy with every replica-holding DC
+// in the keyspace map; under SimpleStrategy EACH_QUORUM does not carry it. The
+// destructive path gates on that separately.
+func (db *DB) BlockHasReferencesGlobal(orgID, blockID string) (bool, error) {
+	return scanBlockHasReferences(db.Session().Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Consistency(gocql.EachQuorum))
+}
+
+// scanBlockHasReferences turns the shared LIMIT 1 probe into a boolean. Absence is
+// reported as "no references"; every other error propagates, so an unreachable DC
+// under EACH_QUORUM surfaces as an error rather than as a false zero.
+func scanBlockHasReferences(query *gocql.Query) (bool, error) {
+	var referrer string
+	if err := query.Scan(&referrer); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
 		}

@@ -127,13 +127,14 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-Both are open, neither has a closed design, and `gc.enabled: false` is required
-on every replica in every DC until both close.
+X1 is open with no closed design. X2's fix landed 2026-08-13 and awaits only its
+multi-DC regression. `gc.enabled: false` remains required on every replica in every
+DC — it now rests on X1 alone.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA: an authorized S3 delete can land after a byte-identical re-upload | Registry X1 |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Blocker (multi-DC) | `LOCAL_QUORUM` references can be invisible to GC in another DC | Registry X2 |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Fix landed; closure pending regression | Destructive liveness now reads at `EACH_QUORUM` behind a topology gate; owes the multi-DC test | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
 
 ## High / Medium — open (audit follow-ups)
 
@@ -185,8 +186,12 @@ on every replica in every DC until both close.
 
 Not findings — things nobody has proven either way.
 
-- **No multi-DC test exists.** X2, X6 and the whole cross-DC line of reasoning
-  are derived from the production consistency contract, never reproduced.
+- **No multi-DC test exists.** X6 and the cross-DC line of reasoning are derived
+  from the production consistency contract, never reproduced. X2's fix shipped with
+  same-process regressions that pin which read authorizes a delete and that an
+  unavailable DC fails closed, but a unit test cannot observe a consistency level —
+  the wire-level per-DC behaviour on `docker-compose.cassandra-3dc.yaml` (RF 1, three DCs) is exactly what
+  X2 still owes before it can be marked Closed.
 - **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.

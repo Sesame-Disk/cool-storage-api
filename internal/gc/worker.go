@@ -167,6 +167,10 @@ type Worker struct {
 	dryRun      bool
 	stats       *Stats
 	clock       func() time.Time
+
+	// destructiveTopologyGate guards every physical delete. See
+	// SetDestructiveTopologyGate; nil means no constraint.
+	destructiveTopologyGate func() error
 }
 
 // NewWorker creates a new GC worker.
@@ -181,6 +185,32 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 		stats:       stats,
 		clock:       time.Now,
 	}
+}
+
+// SetDestructiveTopologyGate installs the check that must pass before this worker
+// may delete physical bytes. It is evaluated per destructive attempt (results are
+// not cached) because keyspace replication can be altered at runtime, and a
+// topology that stops supporting the per-DC EACH_QUORUM argument must stop deletes
+// immediately rather than at the next restart.
+//
+// A nil gate means "no topology constraint" and is intended for tests and
+// single-DC deployments where the cross-DC argument is vacuous.
+func (w *Worker) SetDestructiveTopologyGate(gate func() error) {
+	w.destructiveTopologyGate = gate
+}
+
+// checkDestructiveTopology fails closed: any error, including an unreachable
+// Cassandra, prevents the delete rather than being treated as a passing gate.
+func (w *Worker) checkDestructiveTopology() error {
+	if w.destructiveTopologyGate == nil {
+		return nil
+	}
+	if err := w.destructiveTopologyGate(); err != nil {
+		metrics.GCErrorsTotal.WithLabelValues("destructive_topology_gate").Inc()
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+		return err
+	}
+	return nil
 }
 
 // ProcessOnce runs a single pass of the worker: find orgs with queued items,
@@ -411,17 +441,50 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// Pre-check: a block is alive iff it still has reference rows. This single-
 	// partition point read replaces the old per-org full scan of live fs_objects.
+	//
+	// Deliberately the LOCAL_QUORUM form. The zero-check is asymmetric: a locally
+	// visible row is proof that the block is alive, so aborting here is always
+	// correct, while a local zero proves nothing and authorizes nothing — it only
+	// lets the walk continue to the claim and the global verify below. Raising this
+	// read would be correct too, but it would pay WAN on every candidate to learn
+	// something the verify has to re-establish anyway.
+	//
+	// This runs BEFORE the topology gate on purpose: a locally visible reference
+	// settles the item without any destructive step, so it should not need schema
+	// metadata, and the worker keeps draining discardable candidates even while the
+	// gate would fail.
 	hasRefs, err := w.store.BlockHasReferences(item.OrgID, item.ItemID)
 	if err != nil {
 		return fmt.Errorf("failed to check block references for %s: %w", item.ItemID, err)
 	}
 	if hasRefs {
 		log.Printf("[GC Worker] Block %s still referenced, skipping deletion", item.ItemID)
+		// A previous attempt on this same candidate may have claimed the row and
+		// then failed before reaching the verify (an unavailable DC does exactly
+		// that). Releasing our own claim here keeps that failure from wedging the
+		// block: gc_state would otherwise stay 'deleting' forever, and
+		// BlockDeleteFenceActive would refuse every future upload of this content.
+		// The release is conditional on owning claimID, so it cannot disturb
+		// another attempt, and it is best effort because the reference is what
+		// actually settles the item.
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			log.Printf("[GC Worker] WARNING: block %s is referenced but releasing a stale claim failed: %v", item.ItemID, relErr)
+		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
 		}
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
+	}
+
+	// Topology gate: from here the walk can reach a physical delete. The
+	// EACH_QUORUM verify below only closes X2 if the keyspace actually gives
+	// EACH_QUORUM a per-datacenter meaning; under an unsupported replication class
+	// the argument is vacuous, so refuse rather than delete under a proof that does
+	// not apply.
+	if err := w.checkDestructiveTopology(); err != nil {
+		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete; failing closed: %v", item.ItemID, err)
+		return fmt.Errorf("destructive topology gate rejected block %s: %w", item.ItemID, err)
 	}
 
 	exists, err := w.store.BlockExists(item.OrgID, item.ItemID)
@@ -462,8 +525,33 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// 2. Claim-then-verify: re-check references AFTER claiming. If a concurrent
 	// upload registered a reference, abandon the claim so the block stays alive.
-	hasRefs, err = w.store.BlockHasReferences(item.OrgID, item.ItemID)
+	//
+	// THIS IS THE READ THAT AUTHORIZES DESTRUCTION, and it is the only one allowed
+	// to. It must be the EACH_QUORUM form: a reference acknowledged at LOCAL_QUORUM
+	// in any DC intersects this read's quorum in that same DC, so a zero here means
+	// zero fleet-wide rather than zero locally
+	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). Everything downstream of this
+	// point — the orphan row, the S3 delete, and RecoverS3Orphans, which never
+	// re-checks references and is authorized transitively by that row — inherits its
+	// authority from this single call. Downgrading it to the local form silently
+	// reopens X2 across every one of those paths.
+	//
+	// An unreachable DC makes this read fail rather than return zero, and the error
+	// aborts the delete with the claim still held: fail closed, never delete on an
+	// uncertain read.
+	hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
 	if err != nil {
+		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
+		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+		// Hand the claim back before giving up. Holding it would leave
+		// gc_state='deleting' behind an error that an unavailable DC makes
+		// systematic rather than rare, and every writer of this content would see
+		// BlockDeleteFenceActive until some later attempt happened to clear it.
+		// Failing closed must not mean fencing the block indefinitely.
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a failed global verify: %v", item.ItemID, relErr)
+		}
+		log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
 		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 	}
 	if hasRefs {
@@ -646,6 +734,18 @@ func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDel
 // horizon so old orphan rows cannot get stranded forever. `perBucketLimit`
 // caps the rows pulled per (day, bucket) so a single misbehaving bucket cannot
 // starve the worker.
+// RecoverS3Orphans finishes physical deletes that processBlock started but could not
+// complete (S3 error, crash, restart).
+//
+// AUTHORIZATION INVARIANT: this function deletes bytes without ever reading
+// block_references. It is safe only because a gc_s3_orphans row cannot exist unless
+// processBlock already passed its EACH_QUORUM claim-then-verify for that block —
+// StartBlockDeleteOrphan runs strictly after that verify. Every physical delete in
+// this codebase must trace back to that one global read, either directly
+// (processBlock) or transitively (here). A new destructive path that does not
+// descend from it reopens ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 with no failing
+// test, so route new deletes through the orphan row rather than adding a second
+// authorization source.
 func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int, error) {
 	if w.storage == nil {
 		return 0, nil
@@ -653,6 +753,12 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	if w.dryRun {
 		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
 		return 0, nil
+	}
+	// Same gate as processBlock: this path deletes bytes too, and it inherits its
+	// authorization from an orphan row rather than from its own liveness read.
+	if err := w.checkDestructiveTopology(); err != nil {
+		log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected the sweep; failing closed: %v", err)
+		return 0, fmt.Errorf("destructive topology gate rejected S3 orphan recovery: %w", err)
 	}
 	if perBucketLimit <= 0 {
 		perBucketLimit = 100

@@ -270,6 +270,75 @@ func isMultiRegionNetworkTopology(replication cassandraReplicationSettings) bool
 	return dcs > 1
 }
 
+// ValidateDestructiveGCTopology reports whether the live keyspace replication makes
+// the per-DC EACH_QUORUM liveness argument sound.
+//
+// Closing ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 rests on a quorum-intersection
+// argument that is stated PER DATACENTER: an EACH_QUORUM read must obtain a quorum
+// in every DC, so it intersects the quorum that acknowledged a LOCAL_QUORUM
+// reference write in whichever DC accepted it. That argument presumes
+// NetworkTopologyStrategy with every replica-holding DC in the keyspace map. Under
+// SimpleStrategy there are no per-DC quorums for EACH_QUORUM to intersect, and the
+// closure does not hold — so the destructive path must refuse to run rather than
+// delete under an argument that does not apply.
+//
+// This reads live keyspace metadata rather than configuration, because the
+// deployment map comes from the environment (CASSANDRA_REPLICATION_DCS) and the
+// checked-in profiles are not the source of truth about the fleet.
+//
+// A single-DC NetworkTopologyStrategy map passes deliberately. There, EACH_QUORUM
+// and LOCAL_QUORUM denote the same quorum, so the cross-DC argument is vacuous — but
+// it is vacuously TRUE, not violated: there is no second DC whose acknowledged write
+// could be missed. The gate exists to reject topologies where EACH_QUORUM carries no
+// per-DC meaning at all, not to require multi-DC.
+func (db *DB) ValidateDestructiveGCTopology() error {
+	meta, err := loadKeyspaceMetadata(db.session, db.config.Keyspace)
+	if err != nil {
+		return fmt.Errorf("read keyspace replication for destructive GC gate: %w", err)
+	}
+	if !meta.Exists {
+		return missingKeyspaceError(db.config.Keyspace)
+	}
+
+	if normalizeReplicationClass(meta.Replication.Class) != "NetworkTopologyStrategy" {
+		return fmt.Errorf(
+			"destructive GC requires NetworkTopologyStrategy so EACH_QUORUM carries a per-datacenter quorum; keyspace %s uses %s",
+			db.config.Keyspace, meta.Replication.Class,
+		)
+	}
+
+	dcs := map[string]string{}
+	for dc, rf := range meta.Replication.Options {
+		if strings.EqualFold(strings.TrimSpace(dc), "replication_factor") {
+			continue
+		}
+		dcs[strings.TrimSpace(dc)] = strings.TrimSpace(rf)
+	}
+	if len(dcs) == 0 {
+		return fmt.Errorf("destructive GC requires at least one datacenter in the replication map for keyspace %s", db.config.Keyspace)
+	}
+	for dc, rf := range dcs {
+		factor, convErr := strconv.Atoi(rf)
+		if convErr != nil || factor < 1 {
+			return fmt.Errorf("destructive GC requires a positive replication factor in every datacenter; %s has %q", dc, rf)
+		}
+	}
+
+	// The coordinator's own DC must hold replicas, otherwise "every DC" as this node
+	// understands it is not the same set the writers acknowledge into.
+	localDC := strings.TrimSpace(db.config.LocalDC)
+	if localDC != "" {
+		if _, ok := dcs[localDC]; !ok {
+			return fmt.Errorf(
+				"destructive GC requires local_dc %q to hold replicas; keyspace %s replicates to %s",
+				localDC, db.config.Keyspace, formatReplicationOptions(meta.Replication.Options),
+			)
+		}
+	}
+
+	return nil
+}
+
 // Close closes the database connection.
 func (db *DB) Close() {
 	if db.session != nil {

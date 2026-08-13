@@ -174,6 +174,9 @@ type MockStore struct {
 	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 	blockHasReferencesErr          error
+	blockHasReferencesGlobalErr    error
+	blockHasReferencesLocalCalls   int
+	blockHasReferencesGlobalCalls  int
 	blockReferenceExistsErr        error
 	ensureBlockGCCandidateErr      error
 	deleteProvisionalProjectionErr error
@@ -1839,6 +1842,28 @@ func (m *MockStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
 }
 
 func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	m.mu.Lock()
+	m.blockHasReferencesLocalCalls++
+	m.mu.Unlock()
+	return m.blockHasReferencesShared(orgID, blockID)
+}
+
+// BlockHasReferencesGlobal mirrors the EACH_QUORUM read. It shares the reference
+// state and the concurrency hook with BlockHasReferences so tests that inject a
+// mid-claim reference still exercise claim-then-verify, but it counts separately and
+// honours its own error injection, which is how the fail-closed path is driven.
+func (m *MockStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error) {
+	m.mu.Lock()
+	m.blockHasReferencesGlobalCalls++
+	globalErr := m.blockHasReferencesGlobalErr
+	m.mu.Unlock()
+	if globalErr != nil {
+		return false, globalErr
+	}
+	return m.blockHasReferencesShared(orgID, blockID)
+}
+
+func (m *MockStore) blockHasReferencesShared(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.RLock()
 	current := len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0
 	hook := m.blockHasReferencesHook
@@ -1851,6 +1876,22 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 		return hook(orgID, blockID, current)
 	}
 	return current, nil
+}
+
+// SetBlockHasReferencesGlobalErrForTest drives the fail-closed path: an unreachable
+// DC makes the EACH_QUORUM read fail, and GC must not delete on that uncertainty.
+func (m *MockStore) SetBlockHasReferencesGlobalErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockHasReferencesGlobalErr = err
+}
+
+// BlockHasReferencesCallCountsForTest reports how many liveness reads of each kind
+// were issued, so a test can assert which one authorized a delete.
+func (m *MockStore) BlockHasReferencesCallCountsForTest() (local, global int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.blockHasReferencesLocalCalls, m.blockHasReferencesGlobalCalls
 }
 
 func (m *MockStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {

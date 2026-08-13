@@ -25,7 +25,7 @@ is right about why.
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`), and `LOCAL_QUORUM` references can be invisible across RF-1 DCs (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). Keep destructive GC disabled until both close. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
+| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) had its fix land 2026-08-13 — destructive liveness now reads at `EACH_QUORUM` behind a topology gate, with formal closure pending the multi-DC regression. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an unauthorized cross-library block write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -2043,18 +2043,79 @@ Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
 
 ### ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01: GC can miss a live reference in another DC
 
-**Status**: 🔴 Open — independently blocks destructive GC in multi-DC
+**Status**: 🟡 Fix implemented 2026-08-13; **formal closure pending the multi-DC regression**
 **Discovered**: 2026-07-21
 **Priority**: Blocker — potential deletion of a live block
 **Affected**: `block_references`, GC claim-then-verify, RF 1 per DC deployments
 
-Reference writes and GC liveness reads use `LOCAL_QUORUM`; `SERIAL` applies to the
-conditional `blocks` transition, not to those ordinary reference rows. With RF 1 per
-DC, the write quorum in one DC and read quorum in another need not intersect. The
-one-hour grace period mitigates normal lag but is not a correctness bound. The local
-multi-region test profiles use `LOCAL_SERIAL` and do not reproduce production's
-`SERIAL` contract; they are not production configuration. Design evidence:
-`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2.
+**The defect.** Reference writes and GC liveness reads both used `LOCAL_QUORUM`;
+`SERIAL` applies to the conditional `blocks` transition, not to those ordinary
+reference rows. With RF 1 per DC, the write quorum in one DC and the read quorum in
+another need not intersect, so GC could read "zero references" for a block whose only
+reference was already acknowledged elsewhere. The one-hour grace period mitigates
+normal lag but is not a correctness bound.
+
+**The fix (2026-08-13).** Closed without r3: no generations, no physical incarnations,
+no writer hot-path change, and no `SERIAL+ALL` fence — that fence serves the
+publication TOCTOU, which is a different property. The invariant now enforced is:
+
+> Every physical delete is authorized by a liveness read that intersects every DC
+> able to acknowledge a `LOCAL_QUORUM` reference write.
+
+- `BlockHasReferencesGlobal` pins `EACH_QUORUM` per query (never inherited from the
+  session) and backs `processBlock`'s claim-then-verify — the only read that may
+  authorize destruction. An unreachable DC makes it error, and the error aborts the
+  delete with the claim still held.
+- The pre-claim check, the scanner and `enqueueZeroRefBlocks` deliberately stay at
+  session consistency. The zero-check is asymmetric: a locally visible row is proof
+  the block is alive, so aborting early is always correct, while a local zero proves
+  nothing and authorizes nothing.
+- `RecoverS3Orphans` deletes bytes without reading references at all; it is
+  authorized **transitively** by an orphan row that cannot exist unless that verify
+  already passed. The invariant is stated where it is enforced so a future
+  destructive path cannot bypass it without a failing test.
+- A destructive topology gate (`ValidateDestructiveGCTopology`) refuses to delete
+  unless live keyspace replication is `NetworkTopologyStrategy` with a positive RF in
+  every mapped DC and the local DC among them. Under `SimpleStrategy` the per-DC
+  argument is vacuous, so the path fails closed rather than deleting under a proof
+  that does not apply. It guards both destructive paths and is re-evaluated per
+  attempt, because replication can be altered at runtime.
+- Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`
+  and `{reason="destructive_topology_gate"}`, plus
+  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`.
+
+**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` — five regressions: the
+verify uses the global read (mutation-verified — reverting that one call makes the
+suite delete a live block under an unavailable DC), unavailable-DC fail-closed, the
+topology gate on both destructive paths, and a remote-only reference aborting the
+delete.
+
+**Still owed before this is marked Closed.** The three-DC regression must run green at
+RF 1: a reference that dc-na genuinely cannot see locally must still be visible to its
+`EACH_QUORUM` read, and with a DC stopped that read must fail rather than report zero.
+The visibility leg requires a **deliberately divergent** cluster state with hinted
+handoff disabled — a naive write-then-read proves nothing, because Cassandra sends
+mutations to every replica regardless of consistency level, so the remote replica
+usually already has the row and the assertion would pass on the unfixed code too.
+RF 3 is out of scope for closure: under `NetworkTopologyStrategy` the factor is per
+DC, so it needs nine nodes, and it is hardening rather than closure.
+Stack, runbook and closing checklist are in
+[GC-X2-MULTIDC-VALIDATION.md](./GC-X2-MULTIDC-VALIDATION.md);
+`docker-compose.cassandra-3dc.yaml` stands up the three datacenters and
+`internal/integration/x2_cross_dc_visibility_test.go` holds the regressions.
+
+**Two DCs cannot prove this**, which is why `docker-compose.mr-cluster.yaml` is not the
+instrument: at two DCs with RF 1 a non-local `QUORUM` is 2 of 2 and intersects
+everything by accident, so the suite would pass with or without the fix. Only at three
+DCs does `QUORUM` become 2 of 3 and able to miss the replica holding the reference. The
+integration tests skip when fewer than three DCs are configured, so a two-DC
+environment cannot report a false pass.
+
+**This does not enable destructive GC.** `GC_ENABLED=false` remains mandatory on every
+replica in every DC, now resting on `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1)
+alone. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2; the analysis that
+established X2's independence from X1 is in `GC-X1-X2-ALTERNATIVES.md`. r3 remains the
+accepted-for-review design for X1 and is not superseded by this fix.
 
 ---
 

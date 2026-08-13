@@ -8,6 +8,50 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-13 - X2 cross-DC reference visibility: EACH_QUORUM destructive liveness
+
+First runtime change of the X1/X2 series. Closes the cross-DC half without r3: no
+generations, no physical incarnations, no writer hot-path change, and no `SERIAL+ALL`
+fence — that fence serves the publication TOCTOU, a different property. Destructive
+GC stays disabled; `GC_ENABLED=false` now rests on X1 alone.
+
+The invariant now enforced:
+
+> Every physical delete is authorized by a liveness read that intersects every DC
+> able to acknowledge a `LOCAL_QUORUM` reference write.
+
+- `db.BlockHasReferencesGlobal` pins `EACH_QUORUM` per query and backs
+  `processBlock`'s claim-then-verify, the only read that may authorize destruction.
+  The pre-claim check, the scanner and `enqueueZeroRefBlocks` stay at session
+  consistency on purpose: the zero-check is asymmetric, so a local positive is proof
+  enough to abort while a local zero authorizes nothing.
+- `RecoverS3Orphans` deletes bytes without reading references and is authorized
+  transitively by an orphan row that cannot exist unless that verify passed. Stated
+  where it is enforced, so a new destructive path cannot bypass it silently.
+- `ValidateDestructiveGCTopology` gates both destructive paths on live keyspace
+  replication being `NetworkTopologyStrategy` with a positive RF per mapped DC and the
+  local DC among them; under `SimpleStrategy` the per-DC argument is vacuous and the
+  path fails closed. Re-evaluated per attempt, since replication can change at runtime.
+- Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
+  `{reason="destructive_topology_gate"}`, and
+  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`.
+
+Five regressions in `internal/gc/x2_cross_dc_liveness_test.go`. The authorization
+canary is mutation-verified: reverting that single call makes the suite delete a live
+block under an unavailable DC.
+
+**Not yet marked Closed.** A unit test cannot observe a consistency level, so what is
+pinned here is which read authorizes and that errors fail closed. Formal closure owes
+the three-DC regression on `docker-compose.cassandra-3dc.yaml` at RF 1: a
+`LOCAL_QUORUM` write that dc-na genuinely cannot see locally must still be visible
+to its `EACH_QUORUM` read, and no delete may be authorized with a DC stopped. Two
+DCs cannot prove it (a non-local `QUORUM` is 2 of 2 there and intersects by
+accident), and neither can a naive same-state read, since Cassandra replicates to
+every replica regardless of consistency level — the harness has to build a
+genuinely divergent state with hinted handoff disabled.
+
+---
+
 ## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
 
 Auditing the caps above surfaced three follow-up findings on the same handlers: **two

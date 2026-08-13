@@ -65,8 +65,16 @@ type GCStore interface {
 	// already removed (absent → proceed with S3 cleanup).
 	BlockExists(orgID uuid.UUID, blockID string) (bool, error)
 	// BlockHasReferences reports whether any block_references row still exists for
-	// the block. This is the liveness check that replaces reading ref_count.
+	// the block, at the session consistency. TRUE is proof and may abort a delete;
+	// FALSE proves only local absence, so it may drive discovery but MUST NOT
+	// authorize destroying bytes. Use BlockHasReferencesGlobal for that.
 	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	// BlockHasReferencesGlobal is the same liveness check pinned to EACH_QUORUM, so
+	// it intersects every DC that can acknowledge a LOCAL_QUORUM reference write.
+	// Its FALSE answer is the ONLY one that may authorize a physical delete
+	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). An unreachable DC makes it fail;
+	// callers must fail closed rather than treat the error as "no references".
+	BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error)
 	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
@@ -585,6 +593,16 @@ type AuditLogEntry struct {
 	ActorID    string // user who triggered it, or "gc_worker"/"gc_scanner"
 	Details    string // JSON or free-text with extra context
 	Timestamp  time.Time
+}
+
+// DestructiveTopologyValidator is implemented by stores that can check the live
+// keyspace replication. The EACH_QUORUM liveness argument that closes
+// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 is stated per datacenter and only holds
+// under NetworkTopologyStrategy with every replica-holding DC in the map, so the
+// destructive path consults this before deleting bytes. Stores that cannot answer
+// (mocks, single-DC fakes) simply do not implement it.
+type DestructiveTopologyValidator interface {
+	ValidateDestructiveGCTopology() error
 }
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.

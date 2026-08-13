@@ -1,0 +1,180 @@
+# Cassandra-only 3-DC stack for cross-DC consistency regressions.
+#
+# WHY THIS EXISTS
+# ---------------
+# ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 (X2) is closed by an argument stated
+# per datacenter: an EACH_QUORUM read must obtain a quorum in EVERY DC, so it
+# intersects the quorum that acknowledged a LOCAL_QUORUM reference write in
+# whichever DC accepted it. Unit tests cannot observe a consistency level, so that
+# argument can only be proven against a real multi-DC cluster.
+#
+# Two DCs are NOT enough to prove it. At two DCs with RF 1, QUORUM is 2 of 2 and
+# therefore intersects everything by accident — the very confusion the analysis
+# warns about. The defect and the fix only separate at three or more DCs, where
+# QUORUM is 2 of 3 and can miss the one replica holding the reference. This stack
+# uses the production DC names (see .env.prod.example) for that reason.
+#
+# WHY NOT docker-compose.mr-cluster.yaml
+# --------------------------------------
+# That stack is the right shape but the wrong weight: it also stands up two MinIO
+# instances, two SesameFS servers, nginx and a frontend, and it is pinned to two
+# DCs ({usa:1, eu:1}) because it exists to prove regional app behaviour. X2 is a
+# pure Cassandra property, so this stack drops everything but the database. It is
+# a test fixture, not a deployment topology — production is
+# docker-compose.prod.yml, which takes its DC map from CASSANDRA_REPLICATION_DCS.
+#
+# USAGE
+# -----
+#   docker compose -f docker-compose.cassandra-3dc.yaml up -d
+#   # First formation takes a few minutes: each node joins only after the
+#   # previous one is healthy, so gossip converges cleanly.
+#   docker compose -f docker-compose.cassandra-3dc.yaml logs -f cassandra-3dc-bootstrap
+#
+# The full procedure is in docs/GC-X2-MULTIDC-VALIDATION.md. Follow it rather than
+# improvising, because the obvious shortcut does not test anything: writing in one
+# DC and immediately reading from another proves nothing. Cassandra sends every
+# mutation to all replicas regardless of consistency level — the level only decides
+# how many acknowledgements the coordinator waits for — so the remote replica has
+# usually already received the row, and the read succeeds whether or not it is
+# EACH_QUORUM. The visibility test therefore requires a deliberately DIVERGENT
+# cluster state, built by stopping the other DCs during the write with hinted
+# handoff disabled.
+#
+# REPLICATION FACTOR
+# ------------------
+# RF 1 per DC, matching production and the topology X2 was reported against: a
+# single replica per DC is exactly what makes a LOCAL_QUORUM write in one DC and a
+# LOCAL_QUORUM read in another non-intersecting.
+#
+# RF is NOT configurable here on purpose. Under NetworkTopologyStrategy the factor
+# is per datacenter, so RF 3 would mean three replicas in EVERY DC — nine nodes,
+# not three. Setting RF 3 on this fixture produces a keyspace whose EACH_QUORUM
+# reads can never be satisfied, which looks like a failing fix rather than a
+# misconfigured harness. RF 3 needs its own 9-node stack; RF 1 is what X2 closure
+# requires.
+#
+# RESOURCES
+# ---------
+# Three JVMs. Heaps are deliberately small (512M) because these nodes hold a
+# handful of rows; raise CASSANDRA_3DC_MAX_HEAP_SIZE if a node OOMs under a
+# heavier suite. Ports are offset into the 92xx range so this stack can run
+# alongside docker-compose.yaml (9042) and mr-cluster (9142/9143).
+
+name: sesamefs-cassandra-3dc
+
+x-cassandra-node: &cassandra-node
+  # Pinned rather than floating. This fixture produces the closure evidence for a
+  # data-loss blocker, so the engine version must be reproducible; `cassandra:5.0`
+  # is a moving alias. Override deliberately, not by accident.
+  image: cassandra:${CASSANDRA_3DC_IMAGE_TAG:-5.0.9}
+  environment: &cassandra-env
+    CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-sesamefs-3dc}
+    CASSANDRA_RACK: rack1
+    # GossipingPropertyFileSnitch is what makes CASSANDRA_DC meaningful and is
+    # therefore a precondition for NetworkTopologyStrategy and EACH_QUORUM.
+    CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    CASSANDRA_SEEDS: cassandra-na
+    MAX_HEAP_SIZE: ${CASSANDRA_3DC_MAX_HEAP_SIZE:-512M}
+    HEAP_NEWSIZE: ${CASSANDRA_3DC_HEAP_NEWSIZE:-128M}
+  healthcheck:
+    test: ["CMD-SHELL", "nodetool status | grep -q '^UN' && cqlsh -e 'describe keyspaces'"]
+    interval: 15s
+    timeout: 10s
+    retries: 20
+    start_period: 90s
+  restart: unless-stopped
+
+services:
+  # The seed. Every other node joins through it, one at a time, so the cluster
+  # forms deterministically instead of racing into a split view.
+  cassandra-na:
+    <<: *cassandra-node
+    container_name: sesamefs-cassandra-na
+    ports:
+      - "${CASSANDRA_NA_HOST_PORT:-9242}:9042"
+    environment:
+      <<: *cassandra-env
+      CASSANDRA_DC: dc-na
+    volumes:
+      - cassandra_na_data:/var/lib/cassandra
+
+  cassandra-eu:
+    <<: *cassandra-node
+    container_name: sesamefs-cassandra-eu
+    ports:
+      - "${CASSANDRA_EU_HOST_PORT:-9243}:9042"
+    environment:
+      <<: *cassandra-env
+      CASSANDRA_DC: dc-eu
+    volumes:
+      - cassandra_eu_data:/var/lib/cassandra
+    depends_on:
+      cassandra-na:
+        condition: service_healthy
+
+  cassandra-asia:
+    <<: *cassandra-node
+    container_name: sesamefs-cassandra-asia
+    ports:
+      - "${CASSANDRA_ASIA_HOST_PORT:-9244}:9042"
+    environment:
+      <<: *cassandra-env
+      CASSANDRA_DC: dc-asia
+    volumes:
+      - cassandra_asia_data:/var/lib/cassandra
+    depends_on:
+      cassandra-eu:
+        condition: service_healthy
+
+  # Creates the keyspace only after all three DCs are visible in gossip. A
+  # CREATE KEYSPACE naming a datacenter the cluster cannot see is rejected, so
+  # this wait is load-bearing rather than cosmetic.
+  cassandra-3dc-bootstrap:
+    image: cassandra:${CASSANDRA_3DC_IMAGE_TAG:-5.0.9}
+    container_name: sesamefs-cassandra-3dc-bootstrap
+    depends_on:
+      cassandra-na:
+        condition: service_healthy
+      cassandra-eu:
+        condition: service_healthy
+      cassandra-asia:
+        condition: service_healthy
+    environment:
+      CASSANDRA_KEYSPACE: ${CASSANDRA_KEYSPACE:-sesamefs}
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        set -euo pipefail
+        keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        case "$${keyspace}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid keyspace: $${keyspace}" >&2; exit 1 ;;
+        esac
+        echo "Waiting for all three datacenters (dc-na, dc-eu, dc-asia) to register ..."
+        for i in $$(seq 1 60); do
+          dcs="$$(cqlsh cassandra-na -e "SELECT data_center FROM system.local; SELECT data_center FROM system.peers;" 2>/dev/null || true)"
+          if echo "$$dcs" | grep -q dc-na && echo "$$dcs" | grep -q dc-eu && echo "$$dcs" | grep -q dc-asia; then
+            echo "All three datacenters present."; break
+          fi
+          if [ "$$i" = "60" ]; then
+            echo "Timed out waiting for three datacenters; saw: $$(echo $$dcs | tr -s ' ')" >&2
+            exit 1
+          fi
+          echo "  ... not yet (attempt $$i); seen: $$(echo $$dcs | tr -s ' ')"
+          sleep 5
+        done
+
+        # RF 1 per DC — see the header note on why this is not parameterised.
+        replication="{'class': 'NetworkTopologyStrategy', 'dc-na': 1, 'dc-eu': 1, 'dc-asia': 1}"
+        cqlsh cassandra-na -e "CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = $${replication};"
+        cqlsh cassandra-na -e "ALTER KEYSPACE $${keyspace} WITH replication = $${replication};"
+        echo "Keyspace $${keyspace} ready with replication $${replication}"
+        cqlsh cassandra-na -e "DESCRIBE KEYSPACE $${keyspace};" | head -5 || true
+    restart: "no"
+
+volumes:
+  cassandra_na_data:
+  cassandra_eu_data:
+  cassandra_asia_data:
