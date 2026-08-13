@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -107,10 +108,98 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 	return GCFailureCodeBlockClaimNotYetStale
 }
 
+// isClusterUnavailableError reports whether an error means "the cluster could not
+// serve this right now" rather than anything about the item.
+//
+// It exists because the fail-closed reasoning is not specific to the EACH_QUORUM
+// verify. That read is merely the FIRST call in the destructive walk that a
+// datacenter outage breaks — but ClaimBlockDelete, BlockExists, GetBlockInfo and
+// StartBlockDeleteOrphan break on the same outage for the same reason, and every one
+// of them used to surface as a plain error: retry incremented, five passes, DLQ. And
+// ItemBlock never leaves the DLQ (isAutoRecoverableFailedItem rescues only
+// commit/fs_object rows blocked on a library hard delete) while the scanner's day
+// cursor has already moved past the candidate. Protecting only the verify would have
+// left the exact loss the protection exists to prevent reachable through the
+// statement immediately before it.
+//
+// Whether an outage actually reaches those other calls depends on consistency
+// settings — the shipped multi-DC profiles use LOCAL_QUORUM/LOCAL_SERIAL, so a
+// remote DC dying leaves them working — but that is a property of configuration, not
+// something the worker can rely on. See the SERIAL advisory in
+// ValidateDestructiveGCTopology.
+//
+// Scope is deliberately narrow: availability failures only. A malformed statement, an
+// unknown column or a serialization bug must still consume its retry budget and reach
+// the DLQ, because those DO say something about the item and a human needs to see
+// them.
+func isClusterUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Server said it could not reach the consistency level.
+	var reqErr gocql.RequestError
+	if errors.As(err, &reqErr) {
+		switch reqErr.Code() {
+		case gocql.ErrCodeUnavailable, gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
+			return true
+		}
+	}
+	// Driver never got an answer at all.
+	for _, sentinel := range []error{
+		gocql.ErrTimeoutNoResponse,
+		gocql.ErrConnectionClosed,
+		gocql.ErrNoConnections,
+		gocql.ErrNoStreams,
+		gocql.ErrNoHosts,
+		gocql.ErrCannotFindHost,
+		gocql.ErrHostQueryFailed,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// failClosedIfUnavailable converts a cluster-availability failure anywhere in the
+// destructive walk into the same postpone-without-retry treatment the EACH_QUORUM
+// verify gets, and leaves every other error alone. reason names the step so the log
+// still says which statement failed.
+func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if !isClusterUnavailableError(err) {
+		return fmt.Errorf("%s for %s: %w", reason, itemID, err)
+	}
+	metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
+	w.recordDestructiveBlocked()
+	log.Printf("[GC Worker] Block %s: %s failed because the cluster was unavailable; postponing without burning a retry: %v", itemID, reason, err)
+	return failedClosedError{Reason: reason, ItemID: itemID, Err: err}
+}
+
+// recordDestructiveBlocked marks that this worker refused a delete because the
+// environment could not authorize it, both as a counter and as pass-scoped state.
+//
+// The pass scope is what makes the gauge honest. Clearing it only on a successful
+// authorizing read leaves it stuck at 1 whenever an outage is followed by a quiet
+// period with no candidates — alerting forever on a condition that has already
+// passed. Clearing it at the end of any pass that refused nothing ties the signal to
+// "GC tried and could not" rather than to "GC once could not".
+func (w *Worker) recordDestructiveBlocked() {
+	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+	metrics.GCDestructiveDeletesBlocked.Set(1)
+	w.destructiveBlockedThisPass.Store(true)
+}
+
 // shouldPostponeWithoutRetry covers every refusal that says nothing about the item
 // and everything about timing or the environment. All of them requeue the work
 // untouched rather than spending a retry on it: burning the budget on a condition the
 // item cannot influence is how transient trouble turns into lost work.
+//
+// Postponed items are not re-read immediately: RequeueItem stamps queued_at=now and
+// DequeueBatch only sees rows older than the grace period, so a postpone costs a full
+// grace period of latency rather than spinning each tick.
 func shouldPostponeWithoutRetry(err error) bool {
 	switch failureCodeForError(err) {
 	case GCFailureCodeLibraryHardDeleteInProgress,
@@ -234,27 +323,55 @@ type Worker struct {
 	// destructiveTopologyGate guards every physical delete. Armed from the store in
 	// NewWorker so it can never be absent by accident; see SetDestructiveTopologyGate.
 	destructiveTopologyGate func() error
+
+	// topologyGateMu protects the short-lived cache of a PASSING gate result.
+	topologyGateMu      sync.Mutex
+	topologyGateOKUntil time.Time
+
+	// destructiveBlockedThisPass records whether the current ProcessOnce pass refused
+	// a delete for environmental reasons. See recordDestructiveBlocked.
+	destructiveBlockedThisPass atomic.Bool
 }
+
+// destructiveTopologyGateTTL is how long a PASSING topology gate result may be
+// reused before the keyspace metadata is read again.
+//
+// The gate must stay a runtime check — replication can be altered while the process
+// runs, and a topology that stops supporting the per-DC EACH_QUORUM argument has to
+// stop deletes then, not at the next restart. But "runtime" does not require "once
+// per candidate": without a cache, a batch of N blocks issues N identical
+// system_schema.keyspaces reads, and schema metadata does not change N times per
+// batch.
+//
+// Only successes are cached. A failing gate is re-evaluated every single time, so
+// recovery is immediate and the cache can never extend a refusal — the direction that
+// would cost availability. A change to a bad topology is caught within one TTL, which
+// is the same tick in practice.
+const destructiveTopologyGateTTL = 30 * time.Second
 
 // blockDeleteClaimStaleAfter is how long a gc_state='deleting' claim must have been
 // held before another attempt may hand it back on the owner's behalf.
 //
-// It exists because claimID is derived from the candidate timestamp and is therefore
-// shared by every attempt on the same logical candidate, concurrent ones included.
-// Releasing a claim that a live attempt still owns would drop the upload fence in the
-// middle of that attempt's delete. The threshold only has to exceed the longest
-// possible single processBlock walk — a handful of statements, each bounded by the
-// 10s driver timeout — so a wide margin costs nothing: it delays unwedging a genuinely
-// abandoned claim, and never races a live one.
+// Age is the only thing that distinguishes an abandoned claim from a live one here.
+// claimID is derived from the candidate timestamp, so it identifies a candidate, not
+// an attempt: it is shared by every attempt on the same candidate (concurrent ones
+// included) and differs across candidates on the same block. Releasing by identity
+// therefore fails in both directions — it can drop the fence under a live attempt
+// that shares the id, and it cannot lift a claim from a candidate that no longer
+// exists. The threshold only has to exceed the longest possible single processBlock
+// walk — a handful of statements, each bounded by the driver timeout — so a wide
+// margin costs nothing: it delays unwedging a genuinely abandoned claim, and never
+// races a live one.
 const blockDeleteClaimStaleAfter = 15 * time.Minute
 
 // WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL WHILE THE PRE-CHECK ONE IS NOT
 //
-// processBlock releases a claim in four places, and they deliberately do not use the
+// processBlock releases a claim in five places, and they deliberately do not use the
 // same rule. The pre-check path (before this attempt has claimed anything) releases
-// only a STALE claim, because there it would be handing back a claim it never took.
-// The three post-claim paths — failed global verify, re-referenced after claim, and
-// malformed canonical metadata — release unconditionally.
+// only a claim old enough to be provably abandoned, because there it would be handing
+// back a claim it never took. The four post-claim paths — failed global verify,
+// re-referenced after claim, malformed canonical metadata, and a topology gate that
+// rejects at the commit point — release unconditionally.
 //
 // That asymmetry is a choice, not an oversight, and it is not free. Because claimID
 // derives from the candidate timestamp, ClaimBlockDelete answers applied=true to two
@@ -299,39 +416,82 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 }
 
 // SetDestructiveTopologyGate overrides the check that must pass before this worker
-// may delete physical bytes. It is evaluated per destructive attempt (results are
-// not cached) because keyspace replication can be altered at runtime, and a
-// topology that stops supporting the per-DC EACH_QUORUM argument must stop deletes
-// immediately rather than at the next restart.
+// may delete physical bytes. It stays a runtime check — keyspace replication can be
+// altered while the process runs, and a topology that stops supporting the per-DC
+// EACH_QUORUM argument must stop deletes then, not at the next restart. A passing
+// result is reused for at most destructiveTopologyGateTTL; a failing one never is.
 //
 // The gate is already armed from the store by NewWorker; this exists so a test can
 // substitute a specific rejection. Passing nil restores the store's own gate rather
 // than removing the constraint — an unguarded destructive path is not a state this
-// type offers.
+// type offers. Swapping the gate drops any cached pass, so a test that installs a
+// rejection sees it on the very next call.
 func (w *Worker) SetDestructiveTopologyGate(gate func() error) {
 	if gate == nil {
 		gate = w.store.ValidateDestructiveGCTopology
 	}
+	w.topologyGateMu.Lock()
+	defer w.topologyGateMu.Unlock()
 	w.destructiveTopologyGate = gate
+	w.topologyGateOKUntil = time.Time{}
 }
 
-// checkDestructiveTopology fails closed: any error, including an unreachable
-// Cassandra, prevents the delete rather than being treated as a passing gate.
+// checkDestructiveTopology is the CHEAP form, used to filter candidates: it may reuse
+// a passing result for up to destructiveTopologyGateTTL. Callers about to destroy
+// bytes must use checkDestructiveTopologyFresh instead.
 func (w *Worker) checkDestructiveTopology() error {
+	return w.evaluateDestructiveTopology(false)
+}
+
+// checkDestructiveTopologyFresh is the AUTHORITATIVE form: it ignores the cache and
+// re-reads the live replication map.
+//
+// The distinction is the whole value of the second check. A processBlock walk takes
+// milliseconds, so a commit-point check sharing the cheap form's 30s cache would
+// almost always return the result the walk's OWN first check just stored — asserting
+// nothing while looking like defence in depth. The only honest way to narrow the
+// window between "topology approved" and "bytes destroyed" is to actually look again.
+//
+// The cost lands where it belongs. The cheap form runs per candidate, including the
+// many that turn out to be still referenced and never reach a delete; this one runs
+// only for blocks that are truly about to be destroyed, which is a far smaller set.
+func (w *Worker) checkDestructiveTopologyFresh() error {
+	return w.evaluateDestructiveTopology(true)
+}
+
+// evaluateDestructiveTopology fails closed: any error, including an unreachable
+// Cassandra, prevents the delete rather than being treated as a passing gate.
+func (w *Worker) evaluateDestructiveTopology(fresh bool) error {
+	w.topologyGateMu.Lock()
+	defer w.topologyGateMu.Unlock()
+
 	if w.destructiveTopologyGate == nil {
 		// Unreachable through NewWorker, which always arms it. Refusing rather than
 		// passing keeps "no gate" from ever meaning "no constraint" — the shape this
 		// whole guard exists to rule out.
-		metrics.GCErrorsTotal.WithLabelValues("destructive_topology_gate").Inc()
-		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+		w.recordTopologyGateRejectionLocked()
 		return fmt.Errorf("destructive topology gate is not armed on this worker")
 	}
+	now := w.clock()
+	if !fresh && !w.topologyGateOKUntil.IsZero() && now.Before(w.topologyGateOKUntil) {
+		return nil
+	}
 	if err := w.destructiveTopologyGate(); err != nil {
-		metrics.GCErrorsTotal.WithLabelValues("destructive_topology_gate").Inc()
-		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+		// Not cached: a refusal is re-evaluated every time so recovery is immediate.
+		w.topologyGateOKUntil = time.Time{}
+		w.recordTopologyGateRejectionLocked()
 		return err
 	}
+	w.topologyGateOKUntil = now.Add(destructiveTopologyGateTTL)
+	// Deliberately not clearing GCDestructiveDeletesBlocked here: a passing gate means
+	// the topology permits a delete, not that one can be authorized. Only a successful
+	// global liveness read proves that, so that is where the gauge clears.
 	return nil
+}
+
+func (w *Worker) recordTopologyGateRejectionLocked() {
+	metrics.GCErrorsTotal.WithLabelValues("destructive_topology_gate").Inc()
+	w.recordDestructiveBlocked()
 }
 
 // ProcessOnce runs a single pass of the worker: find orgs with queued items,
@@ -341,6 +501,8 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to list orgs: %w", err)
 	}
+
+	w.destructiveBlockedThisPass.Store(false)
 
 	totalProcessed := 0
 	for _, orgID := range orgs {
@@ -356,6 +518,12 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		totalProcessed += n
+	}
+
+	// A full pass that refused nothing is the evidence that GC can authorize deletes
+	// again. Anything narrower leaves the gauge asserting an outage that ended.
+	if !w.destructiveBlockedThisPass.Load() {
+		metrics.GCDestructiveDeletesBlocked.Set(0)
 	}
 
 	return totalProcessed, nil
@@ -578,7 +746,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// gate would fail.
 	hasRefs, err := w.store.BlockHasReferences(item.OrgID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to check block references for %s: %w", item.ItemID, err)
+		return w.failClosedIfUnavailable("failed to check block references", item.ItemID, err)
 	}
 	if hasRefs {
 		log.Printf("[GC Worker] Block %s still referenced, skipping deletion", item.ItemID)
@@ -589,16 +757,17 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// otherwise stay 'deleting' forever and BlockDeleteFenceActive would refuse
 		// every future upload of this content.
 		//
-		// Only a STALE claim, though. claimID is shared by every attempt on this
-		// candidate, so an unconditional release could hand back a claim that a
-		// concurrent worker is still deleting under — dropping the fence in exactly
-		// the window it exists to cover.
-		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, claimID, w.clock().Add(-blockDeleteClaimStaleAfter))
+		// Only a STALE claim, though — but any owner's. An unconditional release could
+		// hand back a claim a concurrent worker is still deleting under, dropping the
+		// fence in exactly the window it exists to cover; an owner-only release would
+		// leave a claim from an abandoned candidate up forever. Age separates the two
+		// cleanly, because nothing live survives blockDeleteClaimStaleAfter.
+		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, w.clock().Add(-blockDeleteClaimStaleAfter))
 		if relErr != nil {
 			// Do NOT clear the candidate: that would consume the only work item that
 			// can retry this release, stranding a live block behind a permanent fence.
 			// Requeue instead and let a later pass confirm the fence is gone.
-			return fmt.Errorf("failed to release a stale delete claim on referenced block %s: %w", item.ItemID, relErr)
+			return w.failClosedIfUnavailable("failed to release a stale delete claim", item.ItemID, relErr)
 		}
 		switch outcome {
 		case BlockClaimReleased:
@@ -617,7 +786,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return blockClaimNotYetStaleError{ItemID: item.ItemID}
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+			return w.failClosedIfUnavailable("failed to clear stale block GC candidate", item.ItemID, err)
 		}
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
@@ -635,7 +804,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	exists, err := w.store.BlockExists(item.OrgID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to check canonical block row for %s: %w", item.ItemID, err)
+		return w.failClosedIfUnavailable("failed to check canonical block row", item.ItemID, err)
 	}
 	if !exists {
 		// Canonical blocks row is already gone, so blocks.sha1 is unavailable; the
@@ -645,7 +814,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return err
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+			return w.failClosedIfUnavailable("failed to clear stale block GC candidate", item.ItemID, err)
 		}
 		log.Printf("[GC Worker] Block %s missing canonical row, skipping deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
@@ -657,12 +826,16 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// different attempt cannot release or finalize another attempt's claim.
 	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID, claimID)
 	if err != nil {
-		return fmt.Errorf("failed to claim block record for deletion: %w", err)
+		// An LWT is the call in this walk most likely to break on a partial outage:
+		// under SERIAL it needs a quorum across every DC, so a remote DC dying takes
+		// it down even though the local reads keep working. That is precisely the
+		// systematic, fleet-wide failure the retry budget must not absorb.
+		return w.failClosedIfUnavailable("failed to claim block record for deletion", item.ItemID, err)
 	}
 	if !applied {
 		// Row missing or could not be claimed; nothing to delete from S3.
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+			return w.failClosedIfUnavailable("failed to clear stale block GC candidate", item.ItemID, err)
 		}
 		log.Printf("[GC Worker] Block %s claim not applied (row gone), skipping S3 deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
@@ -689,7 +862,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
 	if err != nil {
 		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+		w.recordDestructiveBlocked()
 		// Hand the claim back before giving up. Holding it would leave
 		// gc_state='deleting' behind an error that an unavailable DC makes
 		// systematic rather than rare, and every writer of this content would see
@@ -707,7 +880,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if hasRefs {
 		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 		if infoErr != nil {
-			return fmt.Errorf("failed to load re-referenced block info for %s: %w", item.ItemID, infoErr)
+			return w.failClosedIfUnavailable("failed to load re-referenced block info", item.ItemID, infoErr)
 		}
 		if blockInfo.CreatedAt == nil {
 			if strings.TrimSpace(blockInfo.StorageClass) != "" {
@@ -721,13 +894,13 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			}
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
 			if deleteErr != nil {
-				return fmt.Errorf("failed to delete re-referenced claimed stub %s: %w", item.ItemID, deleteErr)
+				return w.failClosedIfUnavailable("failed to delete re-referenced claimed stub", item.ItemID, deleteErr)
 			}
 			if !deleted {
 				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
 			}
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-				return fmt.Errorf("failed to clear block GC candidate after re-referenced stub cleanup: %w", err)
+				return w.failClosedIfUnavailable("failed to clear block GC candidate after re-referenced stub cleanup", item.ItemID, err)
 			}
 			log.Printf("[GC Worker] Block %s re-referenced after a stub claim; removed the owned stub", item.ItemID)
 			metrics.GCItemsSkippedTotal.Inc()
@@ -735,10 +908,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			return fmt.Errorf("failed to release claim on re-referenced block %s: %w", item.ItemID, relErr)
+			return w.failClosedIfUnavailable("failed to release claim on re-referenced block", item.ItemID, relErr)
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-			return fmt.Errorf("failed to clear block GC candidate after re-reference: %w", err)
+			return w.failClosedIfUnavailable("failed to clear block GC candidate after re-reference", item.ItemID, err)
 		}
 		log.Printf("[GC Worker] Block %s re-referenced after claim, skipping deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
@@ -750,7 +923,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// before recording recovery metadata for the later S3 delete.
 	blockInfo, err := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to load canonical block info for %s: %w", item.ItemID, err)
+		return w.failClosedIfUnavailable("failed to load canonical block info", item.ItemID, err)
 	}
 	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
@@ -760,7 +933,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			}
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
 			if deleteErr != nil {
-				return fmt.Errorf("failed to remove stub block row for %s: %w", item.ItemID, deleteErr)
+				return w.failClosedIfUnavailable("failed to remove stub block row", item.ItemID, deleteErr)
 			}
 			if !deleted {
 				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
@@ -769,7 +942,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			// before deletion and is normally empty, but may have been backfilled by
 			// an interrupted materialization attempt.
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-				return fmt.Errorf("failed to clear block GC candidate after stub cleanup: %w", err)
+				return w.failClosedIfUnavailable("failed to clear block GC candidate after stub cleanup", item.ItemID, err)
 			}
 			log.Printf("[GC Worker] Block %s missing canonical metadata after claim; removed stub row and skipped deletion", item.ItemID)
 			metrics.GCItemsSkippedTotal.Inc()
@@ -777,22 +950,46 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			return fmt.Errorf("failed to release claim on malformed block %s: %w", item.ItemID, relErr)
+			return w.failClosedIfUnavailable("failed to release claim on malformed block", item.ItemID, relErr)
 		}
 		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
 	}
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
+
+	// Re-check the gate on the way out of the authorization phase and into the
+	// destructive one, ignoring the cache. The first check ran several statements
+	// ago, and a keyspace can be ALTERed at any moment, so passing it once does not
+	// mean the EACH_QUORUM argument still holds now — the gate detects drift, it does
+	// not prevent a concurrent ALTER. This does not close that window (nothing here
+	// can; topology changes under enabled destructive GC are outside the supported
+	// procedure), it narrows it from "the whole walk" to "these two statements".
+	//
+	// It must be the FRESH form. A walk takes milliseconds, so a cached check here
+	// would return the pass this same walk stored moments ago and assert nothing at
+	// all — defence in depth in appearance only. The read is paid once per block that
+	// is actually about to be destroyed, not once per candidate.
+	if err := w.checkDestructiveTopologyFresh(); err != nil {
+		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete at the commit point; failing closed: %v", item.ItemID, err)
+		// Hand the claim back: the block is provably unreferenced, so the fence buys
+		// nothing here, and holding it under a systematic rejection would fence this
+		// content for as long as the topology stays wrong.
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a late topology rejection: %v", item.ItemID, relErr)
+		}
+		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
+	}
+
 	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.RepresentationID, blockInfo.Sha1, w.clock().UTC())
 	if err != nil {
-		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
+		return w.failClosedIfUnavailable("failed to record pending S3 delete", item.ItemID, err)
 	}
 
 	// 4. Now remove the claimed DB row. If this fails, the row stays claimed and
 	// the queue item will retry; the pending S3 row already preserves recovery state.
 	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
-		return fmt.Errorf("failed to finalize claimed block delete for %s: %w", item.ItemID, err)
+		return w.failClosedIfUnavailable("failed to finalize claimed block delete", item.ItemID, err)
 	}
 
 	// With no storage provider (degenerate/no-storage-manager config) there is no S3
@@ -837,7 +1034,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 
 	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
-		return fmt.Errorf("failed to clear block GC candidate: %w", err)
+		return w.failClosedIfUnavailable("failed to clear block GC candidate", item.ItemID, err)
 	}
 
 	w.stats.IncrBlocksDeleted()
@@ -912,6 +1109,10 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	}
 	// Same gate as processBlock: this path deletes bytes too, and it inherits its
 	// authorization from an orphan row rather than from its own liveness read.
+	// Checked once here to refuse the sweep cheaply, and again immediately before
+	// each delete — a sweep can run long, and the gate is a runtime check precisely
+	// because replication may be altered while it runs. The per-delete check is
+	// nearly free: a passing result is cached for destructiveTopologyGateTTL.
 	if err := w.checkDestructiveTopology(); err != nil {
 		log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected the sweep; failing closed: %v", err)
 		return 0, fmt.Errorf("destructive topology gate rejected S3 orphan recovery: %w", err)
@@ -1025,7 +1226,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// zero itself. An error here defers the sweep rather than deleting.
 				if hasRefs, err := w.store.BlockHasReferencesGlobal(orph.OrgID, orph.BlockID); err != nil {
 					metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-					metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
+					w.recordDestructiveBlocked()
 					log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s; failing closed: %v", orph.OrgID, orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("global liveness verify for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
@@ -1035,10 +1236,30 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					// Something references this block even though its canonical row is
 					// gone. Recovery must not destroy the bytes those references point
 					// at; leave the row for an operator rather than guessing.
+					//
+					// Reported through the metric and the log ONLY — deliberately not
+					// through phaseErr. This condition is permanent by construction:
+					// the row stays, so every subsequent sweep rediscovers it and would
+					// fail the phase again. A phase error suppresses SetLastScanSuccess,
+					// so one such row would freeze the scanner's success timestamp
+					// forever and make a healthy fleet indistinguishable from a broken
+					// one — losing a signal that matters far more than restating an
+					// anomaly the counter already exposes. There is also no way to
+					// acknowledge it: unlike the DLQ, gc_s3_orphans has no resolved
+					// state. Alert on gc_audit_events_total{event=
+					// "gc_s3_orphan_referenced_deferred"} instead.
 					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_referenced_deferred").Inc()
-					log.Printf("[GC Worker] S3 orphan recovery: block %s (org=%s) still has references; refusing to delete its bytes", orph.BlockID, orph.OrgID)
+					log.Printf("[GC Worker] S3 orphan recovery: block %s (org=%s) still has references; refusing to delete its bytes (operator action required)", orph.BlockID, orph.OrgID)
+					continue
+				}
+
+				// Re-check the gate immediately before destroying bytes, ignoring the
+				// cache: a sweep can run long, and a cached pass from the top of it
+				// would assert nothing about the topology in effect right now.
+				if err := w.checkDestructiveTopologyFresh(); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected block %s mid-sweep; failing closed: %v", orph.BlockID, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("S3 orphan recovery refused for org=%s block=%s: block still has references", orph.OrgID, orph.BlockID)
+						phaseErr = fmt.Errorf("destructive topology gate rejected S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
 					}
 					continue
 				}

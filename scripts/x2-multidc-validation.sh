@@ -74,7 +74,15 @@ point_harness_at() {
 run_leg() {
   local label="$1" pattern="$2"; shift 2
   local out rc
-  out="$(go test -tags integration -count=1 ./internal/integration/ -run "$pattern" -v 2>&1)"; rc=$?
+  # `set -e` aborts on a failing assignment, which would kill the script here before
+  # rc is ever read — losing the diagnosis below and reporting a bare non-zero exit
+  # instead of WHICH leg failed and why. Suspend it around the run, exactly as the
+  # mutation leg does. This cannot manufacture a green: the PASS-line check below is
+  # what decides, and it runs under set -e again.
+  set +e
+  out="$(go test -tags integration -count=1 ./internal/integration/ -run "$pattern" -v 2>&1)"
+  rc=$?
+  set -e
   echo "$out"
   grep -qE "^--- PASS: ${pattern}" <<<"$out" \
     || fail "$label — no '--- PASS: ${pattern}...' in the output (skipped, or never ran)"

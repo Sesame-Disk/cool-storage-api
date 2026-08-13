@@ -2083,11 +2083,20 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   is about the replica set that *accepted* each write, so shrinking the map after
   references were acknowledged elsewhere passes every structural check while
   `EACH_QUORUM` quietly stops being obliged to contact those DCs — and Cassandra does
-  not relocate historical data on `ALTER`. Topology is therefore immutable while
-  destructive GC is enabled; changing it means `GC_ENABLED=false`, alter, repair,
-  update the declared map, re-enable. The gate is part of `GCStore`, so a store that
-  drops it fails to compile rather than silently disarming, it guards both destructive
-  paths, and it is re-evaluated per attempt because replication can change at runtime.
+  not relocate historical data on `ALTER`.
+
+  **Changing topology under enabled destructive GC is therefore unsupported, not
+  prevented** — the distinction matters and the earlier wording ("topology is
+  immutable") overstated it. The gate *detects live/config drift*; it does not
+  certify history and it cannot block a concurrent `ALTER`. The supported procedure
+  is: fleet-wide `GC_ENABLED=false`, alter the keyspace, run the corresponding repair,
+  update the declared map, validate, re-enable. The gate is part of `GCStore`, so a
+  store that drops it fails to compile rather than silently disarming; it guards both
+  destructive paths; and it is re-evaluated per attempt — including once more at the
+  commit point, immediately before the first destructive statement, which narrows the
+  window between "gate passed" and "bytes destroyed" from the whole walk to two
+  statements. That narrows a race the operational rule already forbids; it does not
+  close it, and nothing in the code can.
 
   **Scope of that check, precisely.** It compares the topology in effect now against
   the topology this process is configured with now. That catches the realistic
@@ -2101,15 +2110,52 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   is exactly what the procedure above covers. **Until that exists, "topology does not
   change under destructive GC" is an operational precondition, not an enforced
   invariant.** Tracked as follow-up in `GC-X2-MULTIDC-VALIDATION.md`.
-- Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`
-  and `{reason="destructive_topology_gate"}`, plus
-  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. It also does not consume
-  the item's retry budget: the failure is systematic, so the ordinary five-retry path
-  would DLQ every in-flight block within minutes of an outage, and block items are not
-  auto-recoverable from the DLQ while the scanner's day cursor has already moved past
-  their candidates. Fail-closed postpones instead, costing latency rather than the work.
+- Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
+  `{reason="destructive_topology_gate"}` and `{reason="cluster_unavailable"}`, plus
+  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. Those are counters, and
+  a counter cannot express *duration* — which is the whole signal, because failing
+  closed is silent by design: nothing errors, nothing reaches the DLQ, and a
+  permanently rejecting gate looks exactly like a fleet with nothing to collect. The
+  gauge `gc_destructive_deletes_blocked` closes that: alert on
+  `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
+- Fail-closed also does not consume the item's retry budget: the failure is systematic,
+  so the ordinary five-retry path would DLQ every in-flight block within minutes of an
+  outage, and block items are not auto-recoverable from the DLQ while the scanner's day
+  cursor has already moved past their candidates. Fail-closed postpones instead,
+  costing latency rather than the work — one grace period per postpone, since
+  `RequeueItem` stamps `queued_at=now` and `DequeueBatch` only sees rows older than the
+  grace period.
 
-**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (twelve regressions) and
+  **This follows the reason, not the statement.** The EACH_QUORUM verify is merely the
+  first call in the destructive walk that an outage breaks; `ClaimBlockDelete` (an LWT,
+  which under `SERIAL` needs a quorum in *every* DC), `BlockExists`, `GetBlockInfo` and
+  `StartBlockDeleteOrphan` break on the same outage for the same reason, and one of
+  them runs *before* the verify. Protecting only the verify would have left the exact
+  loss the protection exists to prevent reachable through the statement immediately
+  preceding it. Every availability failure in the walk now postpones
+  (`isClusterUnavailableError`: server-reported Unavailable/ReadTimeout/WriteTimeout,
+  plus the driver's no-response/no-connection sentinels). Scope is deliberately narrow —
+  a malformed statement or an unknown column still spends its retries and reaches the
+  DLQ, because those *do* say something about the item and a human needs to see them.
+- A multi-DC keyspace running `serial_consistency: SERIAL` is warned about once at the
+  gate rather than rejected. SERIAL is not unsound — it is strictly stronger than
+  LOCAL_SERIAL — but it needs a quorum in every DC, so one unreachable DC stalls block
+  claims while the LOCAL_QUORUM reads around them keep working. With the retry rule
+  above that is a throughput cost, not a loss, and therefore an operator's call. The
+  shipped `config-*.cluster.yaml` profiles already use LOCAL_SERIAL.
+- A `gc_s3_orphans` row whose block still has references is refused, logged, and
+  counted (`GCAuditEventsTotal{event="gc_s3_orphan_referenced_deferred"}`) — but it
+  does **not** fail the scanner phase. The condition is permanent by construction (the
+  row survives for an operator, and `gc_s3_orphans` has no resolved state), so a phase
+  error would recur on every pass, and a failed phase suppresses `last_scan_success`.
+  One such row would freeze that timestamp forever and make a healthy fleet
+  indistinguishable from a broken one. Alert on the counter.
+
+**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (twelve regressions),
+`internal/gc/x2_audit_followups_test.go` (five more, from the post-implementation
+audit: cross-candidate stale-claim release and its fresh-claim boundary, availability
+failures at the claim not burning retries, non-availability errors still reaching the
+DLQ, and the topology gate never caching a rejection) and
 `internal/db/destructive_gc_topology_test.go` (the gate's decision logic against
 synthetic replication maps, including a shrunk map that passes every structural
 check). Every assertion is mutation-verified — each was confirmed to fail against a

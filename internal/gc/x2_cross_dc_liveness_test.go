@@ -288,6 +288,20 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
+	// There must be a REAL stale claim on the row, not just an injected error. The
+	// mock short-circuits on the injected error before it inspects any claim, so
+	// without this the test would pass against a block that has no fence on it at
+	// all — proving "an error preserves the candidate" while claiming to prove
+	// "a failed release of an actual fence preserves the candidate". Those differ
+	// exactly where it matters: the second is the case where consuming the candidate
+	// strands the block.
+	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
+	if err != nil || !applied {
+		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
+	}
+	// Run past the staleness threshold so the release is one that WOULD succeed.
+	w.clock = func() time.Time { return time.Now().Add(2 * blockDeleteClaimStaleAfter) }
+
 	store.SetReleaseStaleBlockClaimErrForTest(errors.New("cassandra unavailable"))
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -297,11 +311,21 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	if got := store.AllBlockGCCandidates(); len(got) != 1 {
 		t.Fatalf("candidate rows = %d, want the candidate preserved so a later pass can retry the release", len(got))
 	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != db.BlockGCStateDeleting {
+		t.Fatalf("test no longer models a failed release of a real fence: gc_state=%q", blk.GCState)
+	}
 
-	// Once the store recovers, the same candidate settles normally.
+	// Once the store recovers, the same candidate lifts the fence and settles.
 	store.SetReleaseStaleBlockClaimErrForTest(nil)
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("second ProcessOnce returned a fatal error: %v", err)
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != "" {
+		t.Errorf("fence still up (gc_state=%q) after the release succeeded", blk.GCState)
 	}
 	if got := store.AllBlockGCCandidates(); len(got) != 0 {
 		t.Errorf("candidate rows = %d after recovery, want the item settled", len(got))
@@ -472,9 +496,6 @@ func TestX2_OrphanRecoveryRefusesAReferencedBlock(t *testing.T) {
 	store.AddBlockReferenceForTest(orgID, "orph-referenced", "fs:lib:obj")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
-	if err == nil {
-		t.Fatal("expected RecoverS3Orphans to refuse a referenced block")
-	}
 	if recovered != 0 {
 		t.Errorf("recovered = %d, want 0", recovered)
 	}
@@ -483,6 +504,14 @@ func TestX2_OrphanRecoveryRefusesAReferencedBlock(t *testing.T) {
 	}
 	if store.S3OrphanCount() != 1 {
 		t.Error("orphan row discarded; it must survive for an operator to inspect")
+	}
+	// The refusal must NOT surface as a sweep error. The orphan row is permanent
+	// until an operator acts, so a returned error would fail this scanner phase on
+	// every pass, and a failed phase suppresses the scanner's last_scan_success
+	// timestamp — one such row would permanently mask the health of everything else.
+	// The refusal is reported through its audit counter and the log instead.
+	if err != nil {
+		t.Errorf("refusing a referenced orphan must not fail the sweep (it would freeze last_scan_success forever); got %v", err)
 	}
 }
 

@@ -1859,9 +1859,19 @@ func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID strin
 // failed conditional update, and so a claim young enough to belong to a concurrent
 // in-flight attempt is left strictly alone.
 //
-// The conditional update pins gc_claimed_at as well as the claim id, so a claim that
-// gets refreshed between the read and the write is not released by this call.
-func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+// Age is the whole test; the owning claim id is read but never compared against the
+// caller's. See the interface contract for why an owner-only release strands blocks
+// behind a permanent fence.
+//
+// A claim with no gc_claimed_at is treated as too fresh rather than as releasable.
+// That is the fail-safe direction: the timestamp is written in the same statement as
+// the claim, so its absence means an unexpected row shape, and guessing "old enough"
+// there would drop a fence on no evidence.
+//
+// The conditional update pins gc_claimed_at as well as the claim id it observed, so a
+// claim that gets released and re-taken between the read and the write is not the one
+// this call hands back.
+func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	var gcState, gcClaimID string
 	var gcClaimedAt time.Time
 	err := s.db.Session().Query(`
@@ -1873,7 +1883,7 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimI
 		}
 		return BlockClaimAbsent, err
 	}
-	if gcState != db.BlockGCStateDeleting || gcClaimID != claimID {
+	if gcState != db.BlockGCStateDeleting {
 		return BlockClaimAbsent, nil
 	}
 	if gcClaimedAt.IsZero() || gcClaimedAt.After(staleBefore) {
@@ -1884,7 +1894,7 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimI
 		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state = ? AND gc_claim_id = ? AND gc_claimed_at = ?
-	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, gcClaimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return BlockClaimAbsent, err
 	}

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -302,7 +303,57 @@ func (db *DB) ValidateDestructiveGCTopology() error {
 	if !meta.Exists {
 		return missingKeyspaceError(db.config.Keyspace)
 	}
-	return validateDestructiveGCTopology(meta.Replication, db.config)
+	if err := validateDestructiveGCTopology(meta.Replication, db.config); err != nil {
+		return err
+	}
+	warnOnceAboutGlobalSerialConsistency(meta.Replication, db.config)
+	return nil
+}
+
+// destructiveGCSerialWarning makes the advisory below fire once per process rather
+// than once per candidate.
+var destructiveGCSerialWarning sync.Once
+
+// warnOnceAboutGlobalSerialConsistency flags a multi-DC deployment that serializes
+// LWTs at SERIAL rather than LOCAL_SERIAL.
+//
+// This ADVISES, it does not reject, and the distinction is the point. SERIAL is not
+// unsound — it is strictly stronger than LOCAL_SERIAL — so refusing to run under it
+// would disable destructive GC over a configuration that is merely expensive. What it
+// costs is availability: SERIAL needs a quorum across every DC, so a single remote DC
+// going down takes ClaimBlockDelete with it while the LOCAL_QUORUM reads around it
+// keep working. GC then stalls on an outage instead of degrading.
+//
+// The worker no longer turns that stall into loss — availability failures anywhere in
+// the destructive walk postpone without consuming the retry budget (see
+// isClusterUnavailableError) — so the remaining cost is throughput, which is an
+// operator's call to make with the facts in front of them. Hence a warning at the
+// place that already knows the datacenter map.
+//
+// The shipped multi-DC profiles (config-*.cluster.yaml) already use LOCAL_SERIAL; the
+// single-DC ones declare SERIAL, where the two are the same quorum and this stays
+// quiet.
+//
+// This does not contradict the LOCAL_SERIAL warning in logCassandraRuntimeConfig.
+// That one states the cost of LOCAL_SERIAL (CAS serializes only within the local DC);
+// this one states the cost of SERIAL (CAS needs every DC up). Both are real, they
+// point opposite ways, and the choice between them is a deployment decision — which is
+// exactly why neither one refuses to start.
+func warnOnceAboutGlobalSerialConsistency(live cassandraReplicationSettings, cfg config.DatabaseConfig) {
+	if !isMultiRegionNetworkTopology(live) {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.SerialConsistency), "SERIAL") {
+		return
+	}
+	destructiveGCSerialWarning.Do(func() {
+		log.Printf(
+			"[DB] WARNING: destructive GC is running against a multi-datacenter keyspace (%s) with serial_consistency=SERIAL. "+
+				"Lightweight transactions then require a quorum in every datacenter, so one unreachable DC stalls GC's block claims "+
+				"even though ordinary reads still succeed. LOCAL_SERIAL is the multi-DC standard; see configs/config-*.cluster.yaml",
+			formatReplicationOptions(live.Options),
+		)
+	})
 }
 
 // validateDestructiveGCTopology holds the gate's decision logic, separated from the

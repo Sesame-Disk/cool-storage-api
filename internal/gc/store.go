@@ -107,13 +107,20 @@ type GCStore interface {
 	// It returns an error when the conditional update does not apply, so callers
 	// that must observe the release use it rather than ReleaseStaleBlockClaim.
 	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
-	// ReleaseStaleBlockClaim clears gc_state only when claimID owns the row AND the
-	// claim was taken at or before staleBefore. It exists because claimID is derived
-	// from the candidate timestamp, so it is shared by every attempt on the same
-	// logical candidate — including two workers running concurrently. An
-	// unconditional release would therefore let one worker drop the fence out from
-	// under another worker's in-flight delete, which is the one thing the claim is
-	// there to prevent.
+	// ReleaseStaleBlockClaim clears gc_state on a block whose delete claim was taken
+	// at or before staleBefore, WHICHEVER attempt owns it. Age is the only criterion,
+	// and that is the point: an unconditional release would let one worker drop the
+	// fence out from under another worker's in-flight delete, while an owner-only
+	// release cannot lift a claim whose owner will never come back.
+	//
+	// The owner-only form was the earlier design and it leaks. claimID derives from
+	// the candidate timestamp, so a claim left behind by candidate C1 carries C1's id;
+	// a later candidate C2 finds an id that is not its own, concludes "someone else's
+	// pass will lift it", and settles. If C1's queue item is gone — DLQ'd, and block
+	// items never auto-recover from there — nothing ever lifts it, and
+	// BlockDeleteFenceActive refuses every future upload of that content forever.
+	// Releasing by age closes that: the only claim this can touch is one older than
+	// any possible live attempt.
 	//
 	// The outcome is three-valued on purpose. "Nothing to release" and "there IS a
 	// claim, but it is too young to touch" demand opposite things from the caller:
@@ -121,7 +128,7 @@ type GCStore interface {
 	// because that fence still has to come off later and this candidate is what will
 	// do it. Collapsing them into a single false is how a live block ends up fenced
 	// forever — see BlockClaimTooFresh.
-	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
+	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
 	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
@@ -636,14 +643,14 @@ type AuditLogEntry struct {
 type BlockClaimReleaseOutcome int
 
 const (
-	// BlockClaimAbsent: nothing this candidate needs to release. Either no claim at
-	// all, or a claim carrying a different claimID — which belongs to a different
-	// candidate, whose own pass is responsible for lifting it. Safe to settle.
+	// BlockClaimAbsent: the block carries no delete claim at all. Safe to settle.
 	BlockClaimAbsent BlockClaimReleaseOutcome = iota
 	// BlockClaimReleased: a stale claim was handed back. Safe to settle.
 	BlockClaimReleased
-	// BlockClaimTooFresh: this candidate's claim exists but was taken too recently to
-	// distinguish from a live in-flight attempt, so it was left alone.
+	// BlockClaimTooFresh: a claim exists but was taken too recently to distinguish
+	// from a live in-flight attempt, so it was left alone. Its owner is irrelevant —
+	// a fresh claim belonging to another candidate is exactly as unsafe to lift as a
+	// fresh claim belonging to this one.
 	//
 	// The caller must NOT settle. A claim younger than the staleness threshold may
 	// belong to a worker still deleting — releasing it drops the upload fence

@@ -110,6 +110,24 @@ var (
 		[]string{"source"},
 	)
 
+	// GCDestructiveDeletesBlocked is 1 while GC is refusing to delete physical bytes
+	// because the environment cannot authorize it — an unreachable datacenter, or a
+	// replication map that no longer carries the per-DC EACH_QUORUM argument
+	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
+	//
+	// It exists because the counters alone cannot express DURATION, and duration is
+	// the whole signal here. Failing closed postpones without burning a retry, so a
+	// permanently rejecting gate is silent by design: nothing errors, nothing reaches
+	// the DLQ, and the queue simply stops draining while candidates keep arriving.
+	// A counter that stops incrementing looks identical to a fleet with nothing to
+	// collect. Alert on `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
+	GCDestructiveDeletesBlocked = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_destructive_deletes_blocked",
+			Help: "1 while GC cannot authorize physical deletes (unreachable DC or unsupported replication topology), 0 otherwise.",
+		},
+	)
+
 	// GCLastWorkerRun records the Unix timestamp of the last worker pass.
 	GCLastWorkerRun = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -971,6 +989,7 @@ func Register() {
 		GCItemsSkippedTotal,
 		GCZeroRefEnqueueFailuresTotal,
 		GCBlockCandidateDiscoveryDegradedTotal,
+		GCDestructiveDeletesBlocked,
 		GCLastWorkerRun,
 		GCLastScannerRun,
 		GCScannerLastPhaseRun,

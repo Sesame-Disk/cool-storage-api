@@ -178,6 +178,7 @@ type MockStore struct {
 	blockHasReferencesLocalCalls   int
 	blockHasReferencesGlobalCalls  int
 	releaseStaleBlockClaimErr      error
+	claimBlockDeleteErr            error
 	validateDestructiveTopologyErr error
 	blockReferenceExistsErr        error
 	ensureBlockGCCandidateErr      error
@@ -1908,10 +1909,11 @@ func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
 }
 
 // ReleaseStaleBlockClaim mirrors the Cassandra semantics: silent no-op when there is
-// nothing stale to release, so the common "referenced block, never claimed" path
-// neither errors nor warns; a real failure is injectable to prove that callers
-// refuse to settle a candidate whose fence they could not confirm gone.
-func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+// nothing to release, so the common "referenced block, never claimed" path neither
+// errors nor warns; a stale claim is released regardless of which attempt owns it;
+// and a real failure is injectable to prove that callers refuse to settle a candidate
+// whose fence they could not confirm gone.
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1922,7 +1924,7 @@ func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID, claimID str
 	if !ok {
 		return BlockClaimAbsent, nil
 	}
-	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
+	if b.GCState != db.BlockGCStateDeleting {
 		return BlockClaimAbsent, nil
 	}
 	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
@@ -1939,6 +1941,16 @@ func (m *MockStore) SetReleaseStaleBlockClaimErrForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.releaseStaleBlockClaimErr = err
+}
+
+// SetClaimBlockDeleteErrForTest injects a failure into the LWT claim. The claim is
+// the statement in the destructive walk most sensitive to a partial outage — under
+// SERIAL it needs a quorum in every DC — so it is the natural place to drive the
+// distinction between an availability failure (postpone) and a real one (DLQ).
+func (m *MockStore) SetClaimBlockDeleteErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimBlockDeleteErr = err
 }
 
 // BlockHasReferencesCallCountsForTest reports how many liveness reads of each kind
@@ -2197,6 +2209,9 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.claimBlockDeleteErr != nil {
+		return false, m.claimBlockDeleteErr
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
 	if !ok {

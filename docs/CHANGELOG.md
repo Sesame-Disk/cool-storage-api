@@ -13,8 +13,8 @@ Session-by-session development history for SesameFS.
 First runtime change of the X1/X2 series. Implements the cross-DC half without r3: no
 generations, no physical incarnations, no writer hot-path change, and no `SERIAL+ALL`
 fence — that fence serves the publication TOCTOU, a different property. Destructive
-GC stays disabled. X1 is the runtime activation blocker; X2's fix still owes its
-formal closure evidence.
+GC stays disabled. X2 is closed on the three-DC evidence below; X1 is the sole runtime
+activation blocker.
 
 The invariant now enforced:
 
@@ -91,6 +91,63 @@ harness, now a script rather than prose, because a manual procedure nobody can r
 one command is one that quietly stops being run.
 
 `GC_ENABLED=false` still stands fleet-wide: X1 is now the sole activation blocker.
+
+### Post-implementation audit follow-ups
+
+An audit of the above found no defect in what it claimed, and five places where the
+claim did not reach as far as its own reasoning did. Each is a case of the rule being
+applied to the statement where the defect was observed rather than to every statement
+the reason covers.
+
+- **Fail-closed now follows the reason, not the statement.** The EACH_QUORUM verify is
+  only the first call in the destructive walk a DC outage breaks; `ClaimBlockDelete`
+  (an LWT — under `SERIAL` it needs a quorum in every DC) runs *before* it and broke
+  the same way, straight into the retry budget and the DLQ that block items never
+  leave. `isClusterUnavailableError` now classifies availability failures anywhere in
+  the walk as fail-closed, scoped narrowly: server-reported
+  Unavailable/ReadTimeout/WriteTimeout plus the driver's no-response/no-connection
+  sentinels. A malformed statement still spends its retries and reaches the DLQ, where
+  a human sees it.
+- **Stale claims are released by age, not by ownership.** `claimID` identifies a
+  candidate, not an attempt, so an owner-only release failed in both directions: a
+  claim abandoned by candidate C1 carries C1's id, and a later candidate concluded
+  "someone else's pass will lift it" and settled — but if C1's item had been DLQ'd,
+  no such pass existed and the block stayed fenced against every future upload of that
+  content, permanently. `ReleaseStaleBlockClaim` no longer takes a claim id; age is
+  the only criterion, and nothing live survives `blockDeleteClaimStaleAfter`.
+- **A referenced S3 orphan no longer fails the scanner phase.** Refusing to delete it
+  is correct, but the row is permanent by construction, so the phase error recurred
+  every pass — and a failed phase suppresses `last_scan_success`, meaning one such row
+  would freeze that timestamp forever and mask the health of everything else. Now
+  logged and counted only.
+- **`gc_destructive_deletes_blocked` (new gauge).** Failing closed is silent by design:
+  nothing errors, nothing DLQs, the queue just stops draining. Counters cannot express
+  that duration. Alert on `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
+- **The topology gate has two forms, and the split is load-bearing.** The cheap form
+  caches a pass for 30s and never a rejection: per-candidate `system_schema` reads
+  bought nothing (schema does not change between two blocks of a batch) while caching a
+  refusal would keep deletes blocked after the topology was repaired. The
+  authoritative form ignores the cache, and is what runs at every commit point — once
+  in `processBlock` immediately before the first destructive statement, and once per
+  orphan in recovery rather than once per sweep.
+
+  A commit-point check sharing the cheap form's cache would be theatre: a walk takes
+  milliseconds, so it would return the pass that same walk stored moments earlier and
+  assert nothing at all. That is exactly how it was first written, and the test only
+  passed because it advanced the clock past the TTL to force a re-read — an assertion
+  written around the defect instead of at it. The cost now lands where it belongs: the
+  extra read is paid once per block actually about to be destroyed, not once per
+  candidate. `TestX2_TopologyGateIsRecheckedAtTheCommitPoint` holds the clock frozen,
+  so downgrading that call back to the cached form turns it red.
+- **Advisory, not a rejection:** a multi-DC keyspace on `serial_consistency: SERIAL`
+  now warns once. SERIAL is stronger than LOCAL_SERIAL, not unsound; what it costs is
+  availability during an outage, which with the retry rule above is throughput rather
+  than loss — an operator's call, so the gate states it instead of refusing to run.
+
+Five regressions in `internal/gc/x2_audit_followups_test.go`, each mutation-verified:
+reverting the release to owner-only, disabling and over-applying the availability
+classifier, caching gate rejections, and dropping the referenced-orphan refusal were
+all confirmed to turn the suite red.
 
 ---
 
