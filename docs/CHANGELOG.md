@@ -417,29 +417,69 @@ r3, code-backed at every claim. Its two load-bearing conclusions:
 - **r3 does not close X2 by making reference writes global.** Its consistency table
   keeps provisional/permanent reference insert/delete at `LOCAL_QUORUM`; what is
   `EACH_QUORUM` is the final generation-reference check and the use drain. So r3 and
-  every smaller option share the same X2 mechanism — a global GC-side liveness read.
-  What r3 buys with its extra machinery is the publication frontier, a different
-  property.
+  Option 1 share one X2 mechanism — a global GC-side liveness read — and what r3
+  buys with its extra machinery is the publication frontier, a different property.
+  Option 2 is the deliberate exception: it closes X2 from the writer side instead.
 - **The recommended option (DB-owned physical incarnation + GC-only `EACH_QUORUM`
-  liveness) has one unresolved question, filed as race-matrix row R8.** `blocks` is
-  one row per logical block and `UpsertBlockMetadata` is `INSERT … IF NOT EXISTS`,
-  so first-writer-wins cannot install P2 over a live P1 row. Either a new
-  conditional `P1 → P2` transition on `blocks`, or a globally visible table keyed by
-  `(block_id, physical_id)` — both are r3 components under other names. R8 gates the
-  invasiveness estimate and must be answered before anything else.
+  liveness) has one open question, filed as race-matrix row R8.** `blocks` is one
+  row per logical block and `UpsertBlockMetadata` is `INSERT … IF NOT EXISTS`, so
+  first-writer-wins cannot install P2 over a live P1 row. Four branches: (a) keep
+  the P1 row and add a conditional `P1 → P2` CAS; (b) drop-first with many pending
+  deletes, needing a `(block_id, physical_id)` table — `block_generations` renamed;
+  (c) drop-first with the writer still waiting on the fence, so the two lives are
+  **sequential** and never coexist — today's protocol plus an identity, no new CAS
+  and no new table; or (d) drop-first with the writer installing P2 while P1 is
+  still deleting, which buys upload availability and costs the orphan
+  reinterpretation, an explicit single-outstanding-delete invariant and R11. (c) is
+  the branch to price first, so R8 is an open question rather than proof that the
+  option has already converged on r3.
+
+Three further race rows are filed, each verified against code:
+
+- **R9 — cross-DC P2 install.** `UpsertBlockMetadata` inherits `LOCAL_SERIAL` on the
+  cluster profiles. Harmless only while keys are derived; once each DC mints its own
+  `physical_id`, two DCs install different incarnations and one set of bytes is
+  orphaned. The installing statement needs a `SERIAL` serial phase — which is why r3
+  raises the first-writer LWT to `SERIAL` + `QUORUM`.
+- **R10 — stalled `Reusable` repair PUT.** `EnsureReusableBlockPresent` repair-PUTs
+  the derived key, so a writer stalled after a `Reusable` probe can re-PUT a key
+  under an authorized delete. That is X1 through a second door.
+- **R11 — mapping cleanup after resurrection.** `cleanupBlockMapping` is keyed by the
+  logical SHA-1. `RecoverS3Orphans` already guards it with `BlockExists`;
+  `processBlock` does not, and is safe today only because the orphan fence blocks
+  resurrection outright — exactly what branch (d) gives up. Load-bearing under (d),
+  preventive under (c).
+
+Corrections to the earlier draft: the upload-fence makes writers **wait** rather
+than fail (`ErrBlockDeleteInProgress` is retryable, 8 attempts with backoff; 409
+only after all eight), and the orphan row is deleted on delete-confirmation, so its
+90-day TTL is a worst-case ceiling rather than the fence duration. The `resolveFence`
+fast-clear hook exists but is inert in production — `clearSeafHTTPS3OrphanFence`
+returns `(false, nil)` on every path — so the wait is always the full backoff budget.
+Waiting still does not close X1, though the mechanism is not attempt overlap:
+`deleteS3WithRetry` is strictly sequential, and the residual case is a request that
+timed out client-side and is still applied server-side after a later attempt
+reported success and cleared the orphan.
+
+Also added: the zero-check is asymmetric. Proving "a reference exists" needs one
+positive answer; proving "zero references" needs all of them. So only the
+claim-then-verify read must be `EACH_QUORUM` — the pre-claim check can stay
+`LOCAL_QUORUM` without weakening fail-closed, since a local zero authorizes nothing.
 
 Also recorded: GC drain capacity is a shared cost of every globally-fencing option
 (the worker loop is strictly serial at `batch_size=100` on a 30 s tick).
 
-One documentation defect surfaced while writing this up and is flagged in the new
-document rather than fixed here: the versioned cluster profiles declare
-`replication_dcs: {usa: 1, eu: 1}`, but the deployment topology is three DCs — NA,
-EU and Asia. `replication_dcs` is overridable via `CASSANDRA_REPLICATION_DCS`, so
-the profiles are a starting point rather than the source of truth, but anyone
-sizing a quorum argument from them gets 2 of 2 (where non-local `QUORUM` looks
-sufficient) instead of 2 of 3 (where it is not, which is why GC liveness must be
-`EACH_QUORUM`/`ALL`). Either the profiles should carry the real three-DC map or
-they should say in a comment that they do not.
+One documentation gap is flagged in the new document rather than fixed here. The
+versioned cluster profiles declare `replication_dcs: {usa: 1, eu: 1}` and are
+**correct as they stand**: they belong to the `docker-compose.mr-cluster.yaml`
+harness, which pins `usa:1,eu:1` on both nodes, so rewriting them to the production
+map would break it. Production is `docker-compose.prod.yml`, which pins no DC map and
+takes it from the environment; `.env.prod.example` sets
+`CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`. All the profiles lack is a
+pointer saying production lives elsewhere. The operative warning, and the one that
+matters for X2, is not to size a quorum argument from `configs/`: 2 of 2 makes
+non-local `QUORUM` look sufficient, while the real 2 of 3 is why GC liveness must be
+`EACH_QUORUM`/`ALL`.
 
 Index and decision-record entries link the new document as analysis only.
 

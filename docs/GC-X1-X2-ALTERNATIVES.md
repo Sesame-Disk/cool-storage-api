@@ -57,7 +57,13 @@ Cassandra claim state cannot revoke an S3 request already in flight. Because blo
 
 `blocks.storage_key` already exists, but it is **not** the locator. Three production sites derive the key and **reject** a persisted key that differs: `canonical_block_reader.go`, and — in `upload_reuse.go` — both `ResolveNeedsPutBlockStore` and the `Reusable` branch of `StoreUploadedBlockForProbe`. That last one matters on its own: when the probe says `Reusable` but the object is missing, it issues a **repair PUT at the derived key**, which is a second X1 exposure distinct from rematerialization.
 
-GC recovery is keyed by logical `block_id`: `gc_s3_orphans` primary key is `((org_id, block_id))`, and `BlockStoreDeleter` is `DeleteBlock(ctx, blockID)`. After `FinalizeBlockDelete` drops the `blocks` row, the remaining writer fence is that orphan row, whose `default_time_to_live` is 7776000 s (90 days). While it exists, `ProbeBlockReuse` answers `BlockedByGC` — the upload **fails**, it does not wait. When the orphan clears, a rematerialized PUT at the same derived key can still lose to a delayed DELETE.
+GC recovery is keyed by logical `block_id`: `gc_s3_orphans` primary key is `((org_id, block_id))`, and `BlockStoreDeleter` is `DeleteBlock(ctx, blockID)`. After `FinalizeBlockDelete` drops the `blocks` row, the remaining writer fence is that orphan row.
+
+**The fence makes writers wait, and it clears on confirmation.** While the row exists `ProbeBlockReuse` answers `BlockedByGC`, but that is a *retryable* signal, not a failure: `retryUploadedBlockMaterialization` treats `ErrBlockDeleteInProgress` as retryable and retries up to `libraryHeadMutationRetryAttempts` (8) with backoff. Only an upload that still sees the fence after all eight attempts returns 409. The wrapper also accepts a `resolveFence` hook that could end the wait early, but it is inert in production: the only implementation, `clearSeafHTTPS3OrphanFence`, returns `(false, nil)` on every path and logs that the writer will back off and leave S3 cleanup to GC recovery. Today the wait is always the full backoff budget.
+
+On the GC side the row is deleted as soon as the S3 delete is confirmed (`DeleteS3Orphan`, from both `processBlock` and `RecoverS3Orphans`); the 7776000 s (90 day) `default_time_to_live` is the worst-case ceiling for a delete that never succeeds, not the duration of the fence.
+
+**That waiting narrows the X1 window but does not close it.** `deleteS3WithRetry` is strictly sequential, so there is no overlap between its own attempts. The residual case is the object store's, not the loop's: an attempt that **timed out client-side** can still be applied server-side, after a later attempt reported success and the orphan was cleared. The writer then resumes against a key that an already-accepted request will still delete. This is exactly the case the registry ruled on: waiting, locking, or re-reading Cassandra after the DELETE has been sent does not establish the property.
 
 **Minimum property:**
 
@@ -123,7 +129,9 @@ B4 (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`) is a closed rate-limit umbrella. It i
 
 r3 keeps writer pins, uses, and ordinary references at `LOCAL_QUORUM` — its consistency table is explicit that "provisional/permanent reference insert/delete" stays `LOCAL_QUORUM` and that "ordinary non-LWT pins, references, and writer reads/writes remain `LOCAL_QUORUM`". It therefore has to **prove** that after GC’s global zero-check no new reference can appear against the generation being retired. That proof is the publication frontier: `SERIAL+ALL` `ACTIVE→RETIRING`, `EACH_QUORUM` use drain, `EACH_QUORUM` retirement evidence, then the `EACH_QUORUM` final generation-reference check. It also refuses backend versioning, so it invents UUID generations and immutable keys. Crash recovery, ambiguous Paxos, quarantine, and abort each added tables and CAS shapes.
 
-**This is worth stating precisely, because it is the load-bearing similarity between r3 and the options below: r3 does not close X2 by making reference writes global.** It closes X2 the same way any smaller design would — a global (`EACH_QUORUM`) liveness read on the GC side, with writers left local. What r3 buys with its extra machinery is not X2; it is the publication frontier, which is a different property (see *What is not X2*).
+**This is worth stating precisely, because it is the load-bearing similarity between r3 and Option 1: r3 does not close X2 by making reference writes global.** It closes X2 with a global (`EACH_QUORUM`) liveness read on the GC side, writers left local — the same mechanism Option 1 uses, and the same one Options 3 and 4 would need. What r3 buys with its extra machinery is not X2; it is the publication frontier, which is a different property (see *What is not X2*).
+
+Option 2 is the exception and the reason not to write "every smaller option": it closes X2 from the writer side instead, by making reference writes themselves `EACH_QUORUM`, at which point a `LOCAL_QUORUM` GC read would already intersect. That is a genuinely different mechanism with a different cost profile, evaluated on its own below.
 
 Two load-bearing choices drive most of the page count:
 
@@ -147,7 +155,16 @@ With writers remaining `LOCAL_QUORUM`:
 - A completed EU write at RF=1 is on the EU replica.
 - A later GC read at `EACH_QUORUM` or `ALL` must obtain a quorum in **every** DC, including EU.
 - The replica sets intersect ⇒ GC cannot conclude `refs=0` if any DC has already accepted the write.
-- If a DC is unavailable, the read fails. GC must fail closed (no DELETE). That is acceptable on **latency** grounds — GC is not the hot path. It is not automatically acceptable on **throughput** grounds; see the drain-capacity point under Option 1.
+- If a DC is unavailable, the read fails. GC must fail closed (no DELETE) — the standing policy the ADR states as *"when in doubt, do not delete"* and *"never orphan and never delete on an uncertain read"*. That is acceptable on **latency** grounds — GC is not the hot path. It is not automatically acceptable on **throughput** grounds; see the drain-capacity point under Option 1.
+
+### The zero-check is asymmetric, and only one direction needs WAN
+
+Proving **"at least one reference exists"** takes a single positive answer from any replica. Proving **"zero references exist"** takes an answer from all of them. That asymmetry is a direct consequence of the fail-closed policy, and it means the two `BlockHasReferences` calls in `processBlock` do not need the same level:
+
+- **Pre-claim check:** `LOCAL_QUORUM` suffices. A row seen locally is a real reference, so aborting is correct and no delete is authorized. A local zero proves nothing and simply does not stop the walk.
+- **Claim-then-verify:** must be `EACH_QUORUM`. This is the read that authorizes destruction, and it is the one X2 is about.
+
+This never weakens fail-closed — a local zero authorizes nothing at either step. It has two practical effects: it halves the WAN reads for candidates that turn out to be re-referenced (a case `processBlock` handles explicitly), and it lets the worker keep classifying and deferring work while a DC is unreachable instead of stalling on the first read. Whether that is worth specifying depends on the re-reference rate, which is unmeasured.
 
 ```text
 EU writer: INSERT ref @ LOCAL_QUORUM     (durable on EU)
@@ -162,7 +179,7 @@ This is the X2 mechanism of choice for a small design. It does **not** put WAN o
 
 The deployment topology is **three** DCs — NA, EU and Asia — at RF=1 each. Writer `LOCAL_QUORUM` in EU: only the EU replica holds the row. A `QUORUM` read needs 2 of 3 replicas and may be satisfied by NA+Asia. X2 remains open. **GC liveness must be `EACH_QUORUM` or `ALL`, not `QUORUM`.**
 
-> **Do not read the DC count out of `configs/`.** The versioned cluster profiles declare `replication_dcs: {usa: 1, eu: 1}` — two DCs, no Asia. That is not the deployed topology: `replication_dcs` is overridable at deploy time via `CASSANDRA_REPLICATION_DCS`, so the checked-in profiles are a starting point, not the source of truth. Anyone sizing a quorum argument from those files will get 2 of 2 (where `QUORUM` looks sufficient) instead of 2 of 3 (where it is not). Worth reconciling separately: either the profiles should carry the real three-DC map, or they should say in a comment that they do not.
+> **Do not read the DC count out of `configs/`.** The versioned cluster profiles declare `replication_dcs: {usa: 1, eu: 1}` — two DCs, no Asia — and they are **correct as they stand**: they belong to the `docker-compose.mr-cluster.yaml` harness, which pins `CASSANDRA_REPLICATION_DCS=usa:1,eu:1` for both nodes. Rewriting them to the production map would break that harness. Production is `docker-compose.prod.yml`, which pins no DC map at all and takes it from the environment; `.env.prod.example` sets `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`. What the profiles lack is only a pointer saying production lives elsewhere. The operative warning is the one that matters for X2: anyone sizing a quorum argument from `configs/` gets 2 of 2, where `QUORUM` looks sufficient, instead of the real 2 of 3, where it is not.
 
 Raising RF while keeping LQ writes and LQ reads also fails: `LOCAL_QUORUM` is still per-DC. RF=3 in NA does not make an EU write visible to an NA read.
 
@@ -187,7 +204,7 @@ Measuring that latency is reasonable. It should not be the leading X2 design.
 | Option | X1 | X2 (completed refs) | Publication TOCTOU | Invasiveness | Verdict |
 |---|---|---|---|---|---|
 | 0. ADR r3 complete | Closed (generational keys) | Closed (`EACH_QUORUM` final generation-reference check; refs themselves stay `LOCAL_QUORUM`) | Closed (uses + frontier) | Very high | Correct, expensive |
-| 1. DB physical incarnation + GC-only global liveness + reuse upload-fence | Closed if keys never reused and GC deletes the exact key | Closed if both claim-then-verify reads are `EACH_QUORUM`/`ALL` | Closed only if the fence is globally visible and the `pub:` stage grows a post-insert fence check | Medium **if** the P1→P2 handover needs no new CAS — unresolved, see R8 | **Recommended investigation** |
+| 1. DB physical incarnation + GC-only global liveness + reuse upload-fence | Closed if keys never reused and GC deletes the exact key | Closed if the claim-then-verify read is `EACH_QUORUM`/`ALL` | Closed only if the fence is globally visible and the `pub:` stage grows a post-insert fence check | Medium under R8 (c), still well below r3 under (d), higher under (a)/(b) | **Recommended investigation** |
 | 2. Writer refs also `EACH_QUORUM` | Unchanged | Closed for completed writes | Open | Low for X2, WAN on hot path | Optional extra, not the X2 mechanism |
 | 3. S3 object versioning | Closed only if every delete is version-id-specific | Unchanged | Unchanged | Backend + interface | Discussable; not preferred |
 | 4. Reduced fence, keep hash keys | **Open** | Closable with EQ reads + ALL fence | Closable with ALL fence | Medium | X2/publication half of Option 1; cannot close X1 |
@@ -234,47 +251,77 @@ References can stay logical (`ABC → fs:…`). They mean “content ABC is live
 
 **X2.** Do not change writer reference consistency. Change **only** GC liveness:
 
-- `BlockHasReferences` used by `processBlock` (both pre-claim and claim-then-verify) at `EACH_QUORUM` (or `ALL`).
+- `BlockHasReferences` at `EACH_QUORUM` (or `ALL`) on the **claim-then-verify** read, which is the one that authorizes destruction. The pre-claim check may stay `LOCAL_QUORUM` (see the asymmetry above); raising both is simpler and also correct.
 - Fail closed if any DC is unavailable.
 - Session default stays `LOCAL_QUORUM`. Set the level per query, the same rule r3 already states for global operations.
 
 **Publication TOCTOU.** EQ reads do not close “writer publishes after GC observed 0.” Reuse upload-fence ordering, and make the **fence** visible to every later LQ writer read:
 
 1. Claim at serial phase `SERIAL`, regular commit `ALL` (so `gc_state='deleting'` is on every replica). Today `ClaimBlockDelete` sets neither level: it inherits the session regular level (LQ) *and* the session serial level, which the shipped multi-DC profiles set to `LOCAL_SERIAL`. Both have to be set per statement.
-2. Do not drop the `blocks` row before the exact-key DELETE succeeds, **or** persist the orphan/fence at a global level and key it by `physical_id` + exact key. Today `FinalizeBlockDelete` removes the row first; `gc_s3_orphans` is LQ and logical. **These two branches are not interchangeable — see the P1→P2 handover below.**
+2. Either do not drop the `blocks` row before the exact-key DELETE succeeds, **or** keep today's drop-first ordering and make the orphan/fence globally visible and keyed by `physical_id` + exact key. Today `FinalizeBlockDelete` removes the row first; `gc_s3_orphans` is LQ and logical. **These branches are not interchangeable and they are what the P1→P2 handover below has to choose between.**
 3. Writers that observe the fence **mint P2** and PUT P2; they must not add a logical ref that pins doomed P1 without a new incarnation.
 4. The `pub:` stage follows write-then-check-fence, as `RegisterUploadedBlock` already does. `RegisterFSObjectBlockReferences` does **not** need its own check: it only ever runs inside `PromotePublishAttemptReferences` (all three call sites — `seafhttp.go`, `sync.go`, `fs_helpers.go`), i.e. after the HEAD CAS and while this attempt's `pub:` rows are still live, so `fs:` inherits liveness from a `pub:` row that was itself fence-checked. The gap is one function, not two.
 
-**The unresolved question: who moves `blocks` from P1 to P2, and with what CAS.**
+**The open question: who moves `blocks` from P1 to P2, and with what CAS.**
 
-This is the part that decides whether Option 1 is actually smaller than r3, and it is not yet answered.
+This is the part that decides whether Option 1 is actually smaller than r3.
 
 - `blocks` has primary key `((org_id, block_id))` — **one row per logical block**. P1 and P2 cannot coexist in it.
 - `UpsertBlockMetadata` is `INSERT ... IF NOT EXISTS`, deliberately first-writer-wins.
 - Today a writer can re-insert *only because* `FinalizeBlockDelete` deleted the row first.
-- Step 2 above proposes not deleting the row until the exact-key DELETE succeeds — which forbids exactly the ordering the current re-insert depends on.
+- Step 2's first branch proposes not deleting the row until the exact-key DELETE succeeds — which forbids exactly the ordering the current re-insert depends on.
 
-So one of two things must be true, and the option has to pick:
+Three resolutions, not two:
 
-**(a) GC keeps the P1 row.** Then the writer minting P2 needs a *conditional update* `P1 → P2` on a row GC has claimed, gated on the delete's authority. That is a new CAS on `blocks` with a predecessor condition — structurally the same object as r3's `RETIRED/GC_RETIRE → ACTIVE` activation.
+**(a) GC keeps the P1 row.** The writer minting P2 needs a *conditional update* `P1 → P2` on a row GC has claimed, gated on the delete's authority. That is a new CAS on `blocks` with a predecessor condition — structurally the same object as r3's `RETIRED/GC_RETIRE → ACTIVE` activation.
 
-**(b) GC drops the row first** (today's ordering). Then the durable exact-key fence has to live somewhere else, globally visible, keyed by `(block_id, physical_id)` and holding the exact key. A table with that key and that content **is `block_generations` under another name**, which contradicts the "deliberately does not add" list below.
+**(b) GC drops the row first, and the fence becomes a general multi-generation record.** If arbitrarily many physical lives of one logical block may be pending delete at once, the durable exact-key fence needs its own table keyed by `(block_id, physical_id)`. That **is `block_generations` under another name**.
 
-The phrase "(or equivalent durable exact-key fence)" in the inventory below is carrying this entire question. Until it is answered, "Medium invasiveness" is an estimate, not a finding. **R8 in the race matrix is the test that settles it.**
+**(c) Sequential lives: GC drops the row first, and the writer keeps waiting.** This is today's protocol plus an identity, and it is the smallest branch:
 
-**What this deliberately does not add** (subject to the P1→P2 answer above). `block_generations`, `block_generation_uses`, generation-bound refs, retirement evidence, publication-frontier protocol, quarantine/abort workflows.
+```text
+orphan(P1, K1) durable  →  drop blocks row  →  DELETE K1  →  clear orphan
+                                                                  ↓
+                                            writer wakes, mints P2, INSERT IF NOT EXISTS
+```
+
+P1 and P2 **never coexist**. The writer already waits on the fence (see X1 above), and by the time it wakes there is no `blocks` row and no orphan row, so a plain first-writer-wins `INSERT` installs P2 with no conditional transition and no second table. `gc_s3_orphans` grows `physical_id` and the exact key, which the inventory below already lists.
+
+Because the lives are serialized, most of the machinery people expect here is simply not needed: `ProbeBlockReuse` keeps its current meaning (an orphan blocks the logical block, because there is no live successor to distinguish it from), no "one outstanding delete" invariant has to be stated (it is structural), and R11 cannot fire, since P1's mapping cleanup runs while the writer is still fenced.
+
+**(d) Overlapped lives: the writer installs P2 while P1 is still being deleted.** Same drop-first ordering, but the writer stops waiting. This buys upload availability — no user-visible stall behind a slow S3 delete — and it is a genuinely different design with a real price:
+
+- **The orphan row changes meaning**, from "logical block ABC is blocked" to "physical incarnation P1 is being deleted". `ProbeBlockReuse` must compare `physical_id` and stop answering `BlockedByGC` for a live P2.
+- **"At most one outstanding physical delete per logical block" becomes a stated invariant**, not a structural fact, because `gc_s3_orphans` is still one row per logical block. While P1 pends, P2 is live and usable but **not GC-eligible**.
+- **R11 becomes load-bearing.** P1's `cleanupBlockMapping` can now run while P2 owns the logical mapping, and `processBlock` has no resurrection guard.
+
+(d) is still far short of r3 — one previous life, not a lineage — but it is no longer "the current protocol plus a column".
+
+**What both branches share:**
+
+- **The orphan TTL has to go.** `default_time_to_live = 7776000` means a persistently failing delete has its fence expire silently after 90 days. Under (c) the writer then wakes and re-PUTs K1 with the delete still unresolved; under (d) the bytes are leaked with no record. Either way the row must not expire on its own: no TTL, or expiry that raises an alert instead of deleting the row.
+- **Neither removes the need for never-reused keys.** They settle the handover question, not X1. A DELETE that timed out client-side can still complete on the object store after a later attempt reported success and the orphan was cleared, which is why P2 needs its own key.
+
+So R8 is an open question, **not** a demonstration that the option has converged on r3: (c) keeps it Medium, (d) keeps it well below r3, and only (a)/(b) push it up. **R8 in the race matrix is the test that settles it, and (c) is the branch to price first.**
+
+**Whichever branch wins, P2 selection needs a global serial domain.** `UpsertBlockMetadata` sets no serial level, so like `ClaimBlockDelete` it inherits `LOCAL_SERIAL` on the shipped multi-DC profiles. Today that is harmless *only because the key is derived*: two DCs that each win their own local Paxos round write the identical key. Mint a UUID `physical_id` and that stops being true — EU installs `ABC.uuid-eu`, NA installs `ABC.uuid-na`, one wins the row and the other's bytes are orphaned with no record pointing at them. Every resolution of R8 must therefore raise the P2-installing statement to a `SERIAL` serial phase, which is precisely why r3 raises the existing first-writer LWT to `SERIAL` + regular `QUORUM` "when it can touch a generation-managed `blocks` partition". This is **R9**.
+
+**What this deliberately does not add** (holds under (c) and (d); (a) adds one CAS, (b) forfeits the claim). `block_generations`, `block_generation_uses`, generation-bound refs, retirement evidence, publication-frontier protocol, quarantine/abort workflows.
 
 **Pros.**
 
 - X1 by construction (old DELETE cannot name new key).
 - X2 for completed refs without hot-path WAN.
 - Reuses `up:` / `pub:` / `fs:`, claim-then-verify, rematerialize wrapper.
-- Bounded schema **if** the P1→P2 handover resolves as branch (a): `physical_id` + exact key on `blocks`, `gc_s3_orphans` (and its by-day projection). `gc_block_candidates` probably does not need it — `processBlock` reads `GetBlockInfo` at claim time, after the candidate was enqueued.
+- Bounded schema under (c) or (d): `physical_id` + exact key on `blocks`, `gc_s3_orphans` and its by-day projection — no new table, no new CAS. `gc_block_candidates` probably does not need it either, since `processBlock` reads `GetBlockInfo` at claim time, after the candidate was enqueued.
 - Canonical reader change is real but local: persisted key becomes authoritative, with validation (org, hash, format) instead of “derived key or reject.”
 
 **Cons / residual holes (these decide whether the option stays small).**
 
-- **The P1→P2 handover is unresolved** (above). This is the largest one; everything below is secondary to it.
+- **The P1→P2 handover is unresolved** (above). This is the largest one; everything below is secondary to it. Branch (c) is the one that keeps the option small, and it carries its own conditions — reinterpreted orphan semantics, the single-outstanding-delete invariant, and removing the orphan TTL.
+- **P2 selection must linearize globally** (R9). Inheriting `LOCAL_SERIAL` on `UpsertBlockMetadata` is survivable only while keys are derived; with minted `physical_id` it lets two DCs install different incarnations.
+- **The `Reusable` repair PUT is a second X1 surface** (R10), not just the rematerialization path. A writer stalled after a `Reusable` probe can resume into `EnsureReusableBlockPresent` and repair-PUT the old key under an authorized delete.
+- **Logical mapping cleanup can outlive the incarnation that owned it** (R11). `cleanupBlockMapping` is keyed by the logical SHA-1, so a P1 cleanup running after P2 exists deletes a mapping P2 now owns. `RecoverS3Orphans` already guards this with a `BlockExists` check before cleanup; `processBlock` does not — safe today only because the orphan fence prevents resurrection outright, which is what branch (d) gives up. Under (c) the guard is worth adding defensively, not because the race is reachable.
 - If the `pub:` stage cannot grow a post-insert fence check, a commit can pin a logical SHA whose only bytes GC is deleting. That is data loss, and fixing it starts to look like generation-bound refs.
 - `SERIAL+ALL` on every block claim is a real multi-DC cost **on GC**, and a topology availability constraint (cannot fence if any replica is down). Fail closed is correct; GC stalls until the cluster is whole.
 - **“GC is not the hot path” is a latency argument, not a throughput one.** The ADR already worked this out for the same class of cost: `gc.batch_size = 100`, `gc.worker_interval = 30s`, and the queue loop in `internal/gc/worker.go` is strictly serial, so its synthetic sensitivity scenarios land at ~200 s and ~440–550 s per batch against a 30 s tick. Option 1 adds a `SERIAL+ALL` claim plus two `EACH_QUORUM` reads per block, so it inherits that drain problem in full. Whatever GC concurrency work r3 implies, Option 1 implies it too. (Those ADR figures are explicitly illustrative, not bounds — the point is the shape, and that Phase 0 has to measure it either way.)
@@ -289,11 +336,13 @@ The phrase "(or equivalent durable exact-key fence)" in the inventory below is c
 | `hashToKey` / `StorageKeyForHash` | Deterministic locator | First-life helper only; live locator is persisted `storage_key` |
 | `DeleteBlock(hash)` / `BlockStoreDeleter` | Derive key from hash | Delete exact key captured in GC work |
 | `GetBlock` / `BlockExists` / `PutBlock` / `PutBlockData` / `PutBlockAuto` / `PutBlockAutoDirect` | All derive via `hashToKey` | Take an exact key, or resolve one first |
-| `CheckBlocks` / `CheckBlocksParallel` | Per-hash derived HEAD | Dedup oracle must resolve the live incarnation from the DB, not from a derived key |
+| `CheckBlocksExist` (canonical reader, primary `/check-blocks` path) and `CheckBlocks` / `CheckBlocksParallel` (legacy fallback) | Both HEAD a key derived from the hash | Dedup oracle must resolve the live incarnation from the DB, not from a derived key |
 | `S3Store.Put(ctx, blockID, …)` | Second derivation layer: `s.key(blockID)` on what callers already pass as a key | Make the key parameter mean a key |
 | `canonical_block_reader.go` | Rejects persisted ≠ derived | Use persisted key; validate org/hash/format |
 | `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Mint `physical_id` on `NeedsPut` / `RepairableStub` / fence; PUT that key |
-| `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS`, stores `storage_key` that must match derived | Store `physical_id` + exact key — and see the P1→P2 handover: first-writer-wins cannot install P2 over a live P1 row |
+| `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` inheriting session serial (`LOCAL_SERIAL` in the cluster profiles) | Store `physical_id` + exact key; raise the serial phase to `SERIAL` so one incarnation wins globally (R9); and see the P1→P2 handover — first-writer-wins cannot install P2 over a live P1 row |
+| `cleanupBlockMapping` | Deletes the logical SHA-1 mapping unconditionally; only `RecoverS3Orphans` guards with `BlockExists` | `processBlock` needs the same resurrection guard once an orphan no longer blocks the whole logical block (R11) |
+| `EnsureReusableBlockPresent` | Repair-PUTs the derived key when a `Reusable` object is missing | Revalidate the fence immediately before the repair, or mint P2 instead of repairing P1 (R10) |
 | `ClaimBlockDelete` | LWT inheriting session regular (LQ) and session serial (`LOCAL_SERIAL` in the cluster profiles) | Set both per statement: `SERIAL` + regular `ALL` |
 | `BlockHasReferences` (GC) | Session LQ | Per-query `EACH_QUORUM` |
 | `FinalizeBlockDelete` | **Already** a conditional LWT: `DELETE … IF gc_state = ? AND gc_claim_id = ?` | Add `physical_id = P1` to the existing `IF`; and either order it after the exact-key DELETE or provide the equivalent durable exact-key fence (unresolved) |
@@ -388,13 +437,16 @@ Assume writers stay `LOCAL_QUORUM`, GC reads refs at `EACH_QUORUM`, claim commit
 | R1 | EU `up:` acked, then NA GC EQ read | GC sees the ref; no DELETE |
 | R2 | NA GC EQ sees 0, then EU `up:` acked, then writer fence check | Writer sees ALL fence, returns fence error, outer wrapper mints P2; GC DELETE names P1 only; `blocks` cleanup `IF physical_id=P1` |
 | R3 | Writer stalled after Probe=`Reusable` (LQ, no fence yet), GC ALL-fences, EQ sees 0, DELETE P1, writer then stages `pub:` | Must not succeed as “pin P1.” The post-insert fence check on the `pub:` stage must fail closed and rematerialize P2, or the insert must be refused. `fs:` needs no separate check — it runs inside the promote, under a still-live fence-checked `pub:` row |
-| R4 | GC EQ sees 0, claims, verify still 0, row dropped, delayed S3 DELETE, writer PUTs | P2 key ≠ P1 key; delayed DELETE cannot hit P2; orphan recovery must DELETE stored P1 key, never `hashToKey(block_id)`. **Note this row assumes the drop-row-first ordering — branch (b) of R8, not step 2's branch (a)** |
+| R4 | GC EQ sees 0, claims, verify still 0, row dropped, delayed S3 DELETE, writer PUTs | P2 key ≠ P1 key; delayed DELETE cannot hit P2; orphan recovery must DELETE stored P1 key, never `hashToKey(block_id)`. **Note this row assumes the drop-row-first ordering — R8 branches (b), (c) or (d), not (a)** |
 | R5 | Writer Probe misses a remote claim because claim still commits at LQ | **Fails Option 1.** Claim commit must be `ALL` (or equivalent global visibility) |
 | R6 | `QUORUM` GC read (2 of 3), writer LQ in the DC not contacted | **Fails X2.** Forbidden |
 | R7 | One DC down during GC EQ read | Fail closed; no DELETE |
-| R8 | **GC keeps the P1 `blocks` row until the exact-key DELETE succeeds (step 2), and a concurrent writer must install P2** | `blocks` is one row per logical block and `UpsertBlockMetadata` is `INSERT … IF NOT EXISTS`, so first-writer-wins cannot install P2 over the live P1 row. Either specify the conditional `P1 → P2` update and what authorizes it, or move the exact-key fence out of `blocks`. **This is the decisive test:** answer (a) means a new `blocks` CAS with a predecessor condition; answer (b) means a table keyed by `(block_id, physical_id)`. Both are r3 components under other names, and either one moves this option out of “Medium” |
+| R8 | **P1→P2 handover: who installs P2, and with what CAS** | `blocks` is one row per logical block and `UpsertBlockMetadata` is `INSERT … IF NOT EXISTS`, so first-writer-wins cannot install P2 over a live P1 row. Pick a branch: **(a)** keep the P1 row → new conditional `P1 → P2` CAS; **(b)** drop-first with many concurrent pending deletes → a `(block_id, physical_id)` table, i.e. `block_generations`; **(c)** drop-first, writer keeps waiting → lives are sequential, plain `INSERT` after the wait, no new CAS and no new table; **(d)** drop-first, writer installs P2 while P1 is deleting → buys upload availability, costs the orphan reinterpretation, the single-outstanding-delete invariant and R11. Price (c) first |
+| R9 | Writers in EU and NA both leave the fence wait and both mint a `physical_id` for the same logical block | Exactly one incarnation may be installed. `UpsertBlockMetadata` inherits `LOCAL_SERIAL`, so both local Paxos rounds can apply — harmless while keys are derived, **not** harmless once each DC mints its own key. The P2-installing statement must use a `SERIAL` serial phase; the loser must not leave unreferenced bytes behind |
+| R10 | Writer stalls after Probe=`Reusable(P1)`; GC fences, EQ sees 0, authorizes DELETE K1; writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT K1 under an authorized delete — that is X1 again through `EnsureReusableBlockPresent` rather than through rematerialization. Either revalidate the fence immediately before the repair PUT, or never repair a fenced incarnation and mint P2 instead |
+| R11 | P1 delete completes, P2 is created and live, then P1's `cleanupBlockMapping` runs | The logical SHA-1→SHA-256 mapping now belongs to P2 and must survive. `RecoverS3Orphans` already guards this with `BlockExists` before cleanup; `processBlock` has no equivalent check and is safe today only because the orphan fence blocks resurrection entirely. **Load-bearing under R8 branch (d), which removes that protection; preventive under (c), where the lives never overlap** |
 
-R3 and R8 are what decide the option. If R3 cannot be made true for `StagePublishAttemptReferences` without inventing use-rows, or R8 resolves into a new CAS or a second identity table, Option 1 is no longer smaller than a documented r3 subset.
+R3 and R8 decide whether the option is viable; R9, R10 and R11 decide whether it is correct once it is. If R3 cannot be made true for `StagePublishAttemptReferences` without inventing use-rows, or R8 falls to branch (a) or (b), Option 1 is no longer meaningfully smaller than a documented r3 subset.
 
 ---
 
@@ -408,9 +460,16 @@ Treat **Option 1** as the design to stress-test:
 2. X2 = GC-only `EACH_QUORUM`/`ALL` liveness reads; writers stay `LOCAL_QUORUM`. This is the same X2 mechanism r3 uses; it is not where the two designs differ.
 3. Publication = existing write-ref-then-check-fence, with a globally visible claim/orphan fence and P2 rematerialization, extended to the `pub:` stage.
 
-**Answer R8 first.** It is cheap to answer on paper, it gates the invasiveness estimate, and if it resolves into a new `blocks` CAS or a `(block_id, physical_id)` table then the rest of the audit is moot — the option has already converged on r3's components and the real question becomes which documented r3 subset to take.
+Gates, in the order that makes the cheapest ones decide first:
 
-If R8 and R3 both hold, the implementation is a handful of schema/locator/GC/writer PRs on the current model, not a new distributed lifecycle. If they do not, the missing proof is the publication frontier, and r3 is the document that already contains it.
+1. **R8 — P1→P2 handover.** Price branch (c) first: drop-row-first as today, exact key on the orphan, writer keeps waiting, lives stay sequential. It needs no new CAS and no new table, and its only real price is removing the orphan TTL. Take (d) — overlapped lives — only if the upload stall behind a slow delete proves unacceptable, and price the orphan reinterpretation, the single-outstanding-delete invariant and R11 with it.
+2. **R9 — cross-DC P2 install.** One incarnation must win globally; `SERIAL` serial phase on the installing statement.
+3. **R10 — stalled `Reusable` repair PUT.** Never re-PUT a fenced key.
+4. **R11 — mapping cleanup after resurrection.** P1 cleanup must not destroy P2's logical mapping.
+5. **R3 — `pub:` write-then-check-fence.** A commit must not pin doomed bytes.
+6. Then measure GC drain (below).
+
+If R8 lands on (c) and R3 holds, the implementation is a handful of schema/locator/GC/writer PRs on the current model, not a new distributed lifecycle. If R8 falls to (a) or (b), the missing proof is the publication frontier, and r3 is the document that already contains it — do not invent a third protocol.
 
 Two things are true regardless of which option wins, and can be scheduled independently:
 
