@@ -762,6 +762,11 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 **Decision record:** [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md)
 
+Smaller-closure options, including GC-only `EACH_QUORUM` liveness and DB-owned
+physical incarnation, are compared in
+[GC-X1-X2-ALTERNATIVES.md](./GC-X1-X2-ALTERNATIVES.md). That document is analysis
+only; it does not replace r3 or authorize implementation.
+
 The accepted greenfield design keeps writer pins and ordinary references at
 `LOCAL_QUORUM`, reuses the existing first-writer LWT for initial activation with
 regular commit at least `QUORUM` on generation-managed `blocks`, and uses

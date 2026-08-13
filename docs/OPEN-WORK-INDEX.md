@@ -318,6 +318,8 @@ runbook; invite/create via Accounts is DONE operationally).
   and [UPLOAD-FENCE-FINDINGS-REGISTRY.md](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
   for the findings themselves. The accepted greenfield X1/X2 contract is in
   [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md).
+  Smaller-closure options (not an implementation decision) are compared in
+  [GC-X1-X2-ALTERNATIVES.md](./GC-X1-X2-ALTERNATIVES.md).
   **Defect status lives in `KNOWN_ISSUES.md`.**
 - **Org-scoped block deletion (P10)**, PR-1..PR-3 (#134–#136): block keys are
   org-scoped end to end; cross-org delete isolation closed.

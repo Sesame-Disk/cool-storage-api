@@ -405,6 +405,46 @@ their evidence. All four are closed here; none of them reopened X2.
   worse failure in all of them — but E1 has stopped being a corner case and is now the
   block path's default failure mode under a degraded cluster. Whoever builds the
   postpone bound should size it for that.
+## 2026-08-13 - X1/X2 smaller-closure alternatives analysis (not an ADR)
+
+Documentation-only. No runtime code changed; X1/X2 remain open; `GC_ENABLED=false`
+stays mandatory on every replica in every DC; r3 is **not** superseded and **not**
+frozen.
+
+New `docs/GC-X1-X2-ALTERNATIVES.md` compares four smaller-closure options against
+r3, code-backed at every claim. Its two load-bearing conclusions:
+
+- **r3 does not close X2 by making reference writes global.** Its consistency table
+  keeps provisional/permanent reference insert/delete at `LOCAL_QUORUM`; what is
+  `EACH_QUORUM` is the final generation-reference check and the use drain. So r3 and
+  every smaller option share the same X2 mechanism — a global GC-side liveness read.
+  What r3 buys with its extra machinery is the publication frontier, a different
+  property.
+- **The recommended option (DB-owned physical incarnation + GC-only `EACH_QUORUM`
+  liveness) has one unresolved question, filed as race-matrix row R8.** `blocks` is
+  one row per logical block and `UpsertBlockMetadata` is `INSERT … IF NOT EXISTS`,
+  so first-writer-wins cannot install P2 over a live P1 row. Either a new
+  conditional `P1 → P2` transition on `blocks`, or a globally visible table keyed by
+  `(block_id, physical_id)` — both are r3 components under other names. R8 gates the
+  invasiveness estimate and must be answered before anything else.
+
+Also recorded: GC drain capacity is a shared cost of every globally-fencing option
+(the worker loop is strictly serial at `batch_size=100` on a 30 s tick).
+
+One documentation defect surfaced while writing this up and is flagged in the new
+document rather than fixed here: the versioned cluster profiles declare
+`replication_dcs: {usa: 1, eu: 1}`, but the deployment topology is three DCs — NA,
+EU and Asia. `replication_dcs` is overridable via `CASSANDRA_REPLICATION_DCS`, so
+the profiles are a starting point rather than the source of truth, but anyone
+sizing a quorum argument from them gets 2 of 2 (where non-local `QUORUM` looks
+sufficient) instead of 2 of 3 (where it is not, which is why GC liveness must be
+`EACH_QUORUM`/`ALL`). Either the profiles should carry the real three-DC map or
+they should say in a comment that they do not.
+
+Index and decision-record entries link the new document as analysis only.
+
+---
+
 ## 2026-08-12 - X1/X2 fence ADR r3: recertification win-proof after takeover (corr 192)
 
 The r3 protocol delta in this slice is documentation-only. No runtime GC protocol
