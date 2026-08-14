@@ -131,12 +131,16 @@ func TestX2_FreshClaimFromAnotherCandidateIsLeftAlone(t *testing.T) {
 // TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries extends the fail-closed retry
 // rule past the EACH_QUORUM verify.
 //
-// That verify is merely the first statement in the destructive walk an outage breaks.
-// ClaimBlockDelete breaks on the same outage — an LWT under SERIAL needs a quorum in
-// every DC — and it runs BEFORE the verify. If that failure consumed the retry budget,
-// a short outage would DLQ every in-flight block through the statement immediately
-// preceding the one the protection covers, and block items never leave the DLQ. The
-// protection has to follow the reason, not the statement.
+// The property is simply: an availability failure at ClaimBlockDelete must not consume
+// the item's permanent retry budget. ClaimBlockDelete runs BEFORE the verify, so
+// protecting only the verify would leave the loss reachable through the statement
+// immediately preceding the one the protection covers — and block items never leave
+// the DLQ.
+//
+// Note what this does NOT claim. An LWT is more exposed than a plain read, but no
+// simple "a remote DC is down, therefore the claim fails" rule holds: SERIAL takes a
+// global quorum over all replicas, not one per datacenter. The trigger here is an
+// injected availability error, not a modelled datacenter outage.
 func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -243,7 +247,7 @@ func TestX2_TopologyGateRejectionIsNeverCached(t *testing.T) {
 	})
 
 	for i := 0; i < 3; i++ {
-		if err := w.checkDestructiveTopology(); err == nil {
+		if err := w.checkDestructiveTopology(destructivePathBlock); err == nil {
 			t.Fatalf("call %d: gate passed while rejecting", i)
 		}
 	}
@@ -253,13 +257,13 @@ func TestX2_TopologyGateRejectionIsNeverCached(t *testing.T) {
 
 	// Repaired: the very next call must see it, with no TTL to wait out.
 	gateErr = nil
-	if err := w.checkDestructiveTopology(); err != nil {
+	if err := w.checkDestructiveTopology(destructivePathBlock); err != nil {
 		t.Fatalf("gate still rejecting after the topology was repaired: %v", err)
 	}
 
 	// Now that it passes, it may be reused within the TTL.
 	callsAfterPass := gateCalls
-	if err := w.checkDestructiveTopology(); err != nil {
+	if err := w.checkDestructiveTopology(destructivePathBlock); err != nil {
 		t.Fatalf("unexpected rejection: %v", err)
 	}
 	if gateCalls != callsAfterPass {
@@ -270,7 +274,7 @@ func TestX2_TopologyGateRejectionIsNeverCached(t *testing.T) {
 	// keyspace can be altered while the process runs, which is why this is a runtime
 	// check and not a startup one.
 	now = now.Add(destructiveTopologyGateTTL + time.Second)
-	if err := w.checkDestructiveTopology(); err != nil {
+	if err := w.checkDestructiveTopology(destructivePathBlock); err != nil {
 		t.Fatalf("unexpected rejection after the TTL: %v", err)
 	}
 	if gateCalls != callsAfterPass+1 {
@@ -295,7 +299,7 @@ func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
 	q := NewQueue(store)
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
-	metrics.GCDestructiveDeletesBlocked.Set(0)
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
@@ -307,7 +311,7 @@ func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked); got != 1 {
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 1 {
 		t.Fatalf("gc_destructive_deletes_blocked = %v after a fail-closed pass, want 1: with no error, no retry and no DLQ entry, this gauge is the only thing that says GC cannot delete", got)
 	}
 
@@ -318,7 +322,7 @@ func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce after recovery returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked); got != 0 {
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
 		t.Errorf("gc_destructive_deletes_blocked = %v after recovery, want 0: a gauge that never comes back down is one operators learn to ignore", got)
 	}
 
@@ -326,7 +330,7 @@ func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("idle ProcessOnce returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked); got != 0 {
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
 		t.Errorf("gc_destructive_deletes_blocked = %v on an idle pass, want 0", got)
 	}
 }
@@ -358,6 +362,7 @@ func TestX2_ClusterUnavailableClassifierCoversServerErrorFrames(t *testing.T) {
 		want bool
 	}{
 		{"unavailable frame", fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"}, true},
+		{"overloaded frame", fakeRequestError{code: gocql.ErrCodeOverloaded, msg: "Coordinator overloaded"}, true},
 		{"read timeout frame", fakeRequestError{code: gocql.ErrCodeReadTimeout, msg: "Operation timed out"}, true},
 		{"write timeout frame", fakeRequestError{code: gocql.ErrCodeWriteTimeout, msg: "Operation timed out"}, true},
 		{"wrapped unavailable frame", fmt.Errorf("failed to claim block record for deletion: %w", fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "unavailable"}), true},
@@ -445,5 +450,112 @@ func TestX2_TopologyGateIsRecheckedAtTheCommitPoint(t *testing.T) {
 	}
 	if got := store.AllBlockGCCandidates(); len(got) != 1 {
 		t.Errorf("candidate rows = %d, want 1: failing closed must not consume the work", len(got))
+	}
+}
+
+// TestX2_DestructiveBlockedGaugeIsPerPath pins why the gauge carries a path label.
+//
+// The two destructive paths fail independently: the worker drains gc_queue, the
+// scanner sweeps gc_s3_orphans, and one can be refusing every delete while the other
+// has nothing to do. Under a single shared gauge, a clean worker pass would reset the
+// alarm that orphan recovery had just raised — silencing a path that is still
+// completely blocked, which is the exact condition the gauge exists to surface.
+func TestX2_DestructiveBlockedGaugeIsPerPath(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = func() time.Time { return now }
+
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
+
+	// Orphan recovery cannot authorize anything: its liveness read fails.
+	orgID := uuid.New()
+	if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
+		t.Fatalf("orphan path gauge = %v after a fail-closed sweep, want 1", got)
+	}
+
+	// Now a worker pass with no work at all. It must not speak for the orphan path.
+	store.SetBlockHasReferencesGlobalErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
+		t.Errorf("block path gauge = %v after a clean pass, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
+		t.Errorf("block path cleared the ORPHAN path's alarm (gauge = %v, want 1); orphan recovery is still refusing every delete and nothing would say so", got)
+	}
+
+	// The orphan path clears its own alarm once its own sweep refuses nothing.
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err != nil {
+		t.Fatalf("clean sweep returned an error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 0 {
+		t.Errorf("orphan path gauge = %v after a clean sweep, want 0", got)
+	}
+}
+
+// TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass covers the guard inside
+// recordDestructiveBlocked, which mutation testing showed nothing else did.
+//
+// The worker's gauge is cleared at the end of a pass that refused nothing, and the
+// decision rests on pass-scoped state. Orphan recovery runs from the scanner, on its
+// own schedule, and can therefore refuse a delete WHILE a worker pass is in flight. If
+// that refusal marked the worker's flag, the worker would report itself blocked
+// because a different path was — a false positive on the series operators page from.
+//
+// The guard is one line and looks redundant right up until the two paths overlap in
+// time, which is why it is pinned here rather than trusted.
+func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	// The block gauge starts at 1 — a previous pass was blocked — so that CLEARING it
+	// is the observable event. Starting from 0 would make the test pass even if the
+	// clear never happened, which is exactly the hole mutation testing found in an
+	// earlier version of it.
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(1)
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// Orphan recovery refuses a delete from the middle of the worker's pass — the
+	// interleaving that actually happens when the scanner and the worker overlap.
+	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, current bool) (bool, error) {
+		w.recordDestructiveBlocked(destructivePathOrphan)
+		return current, nil
+	})
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
+		t.Errorf("orphan path gauge = %v, want 1: its own refusal must still be recorded", got)
+	}
+	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
+		t.Errorf("block path gauge = %v after a pass that refused nothing, want 0: an orphan-path refusal marked the worker's pass, so the worker stayed latched as blocked because a different path is", got)
+	}
+	if stats.BlocksDeleted() != 1 {
+		t.Errorf("BlocksDeleted = %d, want 1: the worker pass itself was never blocked", stats.BlocksDeleted())
 	}
 }

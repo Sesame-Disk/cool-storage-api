@@ -84,11 +84,13 @@ Legs:
   fresh divergent state, the visibility leg goes red. That half is load-bearing: a
   regression that cannot fail is not evidence.
 
-Two DCs could not have proven any of it — a non-local `QUORUM` is 2 of 2 there and
-intersects by accident — and neither could a naive write-then-read, since Cassandra
-replicates to every replica regardless of consistency level. Hence the divergent-state
-harness, now a script rather than prose, because a manual procedure nobody can run in
-one command is one that quietly stops being run.
+Two DCs would have reproduced the defect but could not have ruled out the wrong fix: a
+non-local `QUORUM` is 2 of 2 there and intersects by accident, so the suite would have
+blessed plain `QUORUM` as readily as `EACH_QUORUM`. Nor could a naive write-then-read
+have shown anything, since Cassandra replicates to every replica regardless of
+consistency level. Hence the divergent-state harness, now a script rather than prose,
+because a manual procedure nobody can run in one command is one that quietly stops
+being run.
 
 `GC_ENABLED=false` still stands fleet-wide: X1 is now the sole activation blocker.
 
@@ -100,14 +102,17 @@ applied to the statement where the defect was observed rather than to every stat
 the reason covers.
 
 - **Fail-closed now follows the reason, not the statement.** The EACH_QUORUM verify is
-  only the first call in the destructive walk a DC outage breaks; `ClaimBlockDelete`
-  (an LWT — under `SERIAL` it needs a quorum in every DC) runs *before* it and broke
-  the same way, straight into the retry budget and the DLQ that block items never
-  leave. `isClusterUnavailableError` now classifies availability failures anywhere in
-  the walk as fail-closed, scoped narrowly: server-reported
-  Unavailable/ReadTimeout/WriteTimeout plus the driver's no-response/no-connection
-  sentinels. A malformed statement still spends its retries and reaches the DLQ, where
-  a human sees it.
+  the call a datacenter outage breaks first and most reliably — it is the only level
+  demanding a quorum in every DC — but `ClaimBlockDelete` runs *before* it and can fail
+  on the same degraded cluster, straight into the retry budget and the DLQ that block
+  items never leave. `isClusterUnavailableError` now classifies availability failures
+  anywhere in the walk as fail-closed, scoped narrowly: server-reported
+  Unavailable/Overloaded/ReadTimeout/WriteTimeout plus the driver's
+  no-response/no-connection sentinels (`ErrHostQueryFailed` is excluded — the driver
+  documents it as never returned). A malformed statement still spends its retries and
+  reaches the DLQ, where a human sees it. The timeout codes are ambiguous by nature and
+  the limitation is recorded in KNOWN_ISSUES: bounding environmental postpones per item
+  needs a counter distinct from `retry_count`, which is X1's to add.
 - **Stale claims are released by age, not by ownership.** `claimID` identifies a
   candidate, not an attempt, so an owner-only release failed in both directions: a
   claim abandoned by candidate C1 carries C1's id, and a later candidate concluded
@@ -120,9 +125,14 @@ the reason covers.
   every pass — and a failed phase suppresses `last_scan_success`, meaning one such row
   would freeze that timestamp forever and mask the health of everything else. Now
   logged and counted only.
-- **`gc_destructive_deletes_blocked` (new gauge).** Failing closed is silent by design:
-  nothing errors, nothing DLQs, the queue just stops draining. Counters cannot express
-  that duration. Alert on `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
+- **`gc_destructive_deletes_blocked{path}` (new gauge).** Failing closed is silent by
+  design: nothing errors, nothing DLQs, the queue just stops draining. Counters cannot
+  express that duration. Alert with `expr: gc_destructive_deletes_blocked == 1` and
+  `for: 1h` — not `max_over_time(...[1h]) == 1`, which stays true for an hour after a
+  single blocked attempt and therefore means "was blocked once recently", not "has been
+  blocked for an hour". The `path` label separates the worker from orphan recovery,
+  which fail independently; sharing one series let a clean worker pass clear an alarm
+  the orphan sweep had just raised.
 - **The topology gate has two forms, and the split is load-bearing.** The cheap form
   caches a pass for 30s and never a rejection: per-candidate `system_schema` reads
   bought nothing (schema does not change between two blocks of a batch) while caching a
@@ -139,15 +149,20 @@ the reason covers.
   extra read is paid once per block actually about to be destroyed, not once per
   candidate. `TestX2_TopologyGateIsRecheckedAtTheCommitPoint` holds the clock frozen,
   so downgrading that call back to the cached form turns it red.
-- **Advisory, not a rejection:** a multi-DC keyspace on `serial_consistency: SERIAL`
-  now warns once. SERIAL is stronger than LOCAL_SERIAL, not unsound; what it costs is
-  availability during an outage, which with the retry rule above is throughput rather
-  than loss — an operator's call, so the gate states it instead of refusing to run.
+- **A serial-consistency advisory was added and then removed, because its premise was
+  false.** It warned that multi-DC deployments on `SERIAL` would stall block claims
+  during an outage, and pointed at `LOCAL_SERIAL`. But `SERIAL` takes a **global**
+  quorum over the token range's replicas (2 of 3 with RF 1 in three DCs — which one
+  unreachable DC does not defeat), not a quorum per datacenter; `EACH_QUORUM` is the
+  per-DC level. Beyond being wrong, the recommendation was pointed at the wrong
+  question: narrowing the Paxos domain on `blocks` is the linearization decision X1 has
+  open, and a topology gate for X2 has no business nudging a deployment either way.
 
-Five regressions in `internal/gc/x2_audit_followups_test.go`, each mutation-verified:
+Regressions in `internal/gc/x2_audit_followups_test.go`, each mutation-verified:
 reverting the release to owner-only, disabling and over-applying the availability
-classifier, caching gate rejections, and dropping the referenced-orphan refusal were
-all confirmed to turn the suite red.
+classifier, caching gate rejections, downgrading the commit-point gate to the cached
+form, letting the blocked gauge latch, letting one path's gauge speak for the other,
+and dropping the referenced-orphan refusal were all confirmed to turn the suite red.
 
 ---
 

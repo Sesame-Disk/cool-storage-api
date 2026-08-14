@@ -110,22 +110,37 @@ var (
 		[]string{"source"},
 	)
 
-	// GCDestructiveDeletesBlocked is 1 while GC is refusing to delete physical bytes
-	// because the environment cannot authorize it — an unreachable datacenter, or a
-	// replication map that no longer carries the per-DC EACH_QUORUM argument
-	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
+	// GCDestructiveDeletesBlocked is 1 when the last destructive attempt on a path was
+	// refused because the environment could not authorize it — an unreachable
+	// datacenter, or a replication map that no longer carries the per-DC EACH_QUORUM
+	// argument (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
 	//
 	// It exists because the counters alone cannot express DURATION, and duration is
 	// the whole signal here. Failing closed postpones without burning a retry, so a
 	// permanently rejecting gate is silent by design: nothing errors, nothing reaches
 	// the DLQ, and the queue simply stops draining while candidates keep arriving.
 	// A counter that stops incrementing looks identical to a fleet with nothing to
-	// collect. Alert on `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
-	GCDestructiveDeletesBlocked = prometheus.NewGauge(
+	// collect.
+	//
+	// The `path` label is not decoration. The two destructive paths fail
+	// independently — the worker drains gc_queue, the scanner sweeps gc_s3_orphans —
+	// so a single global gauge let a clean worker pass report 0 while orphan recovery
+	// was still refusing every delete. Each path reports its own state.
+	//
+	// Read it as "the last destructive attempt on this path was refused", not "GC is
+	// blocked right now": a path with no work does not re-evaluate, so its value is
+	// the last thing that path actually observed.
+	//
+	// Alert with `expr: gc_destructive_deletes_blocked == 1` plus `for: 1h`, which is
+	// what "has been blocked for an hour" means. Do NOT use
+	// `max_over_time(...[1h]) == 1` — that fires for a full hour after a single
+	// blocked attempt, however long ago it recovered.
+	GCDestructiveDeletesBlocked = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "gc_destructive_deletes_blocked",
-			Help: "1 while GC cannot authorize physical deletes (unreachable DC or unsupported replication topology), 0 otherwise.",
+			Help: "1 when the last destructive attempt on this path was refused because the environment could not authorize it (unreachable DC or unsupported replication topology), 0 otherwise.",
 		},
+		[]string{"path"},
 	)
 
 	// GCLastWorkerRun records the Unix timestamp of the last worker pass.

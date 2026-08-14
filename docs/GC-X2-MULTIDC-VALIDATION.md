@@ -19,18 +19,25 @@ still the accepted-for-review design for **X1**, untouched by this fix).
 that acknowledged the write in whichever DC accepted it. Writers stay `LOCAL_QUORUM`;
 no WAN is added to the upload path.
 
-## Why two datacenters cannot prove it
+## Why the fixture needs three datacenters
 
-This is the single most important thing to know before trusting a green run.
+This is the single most important thing to know before trusting a green run — and it
+is a narrower claim than "two DCs prove nothing", which is what an earlier draft of
+this document said and is not true.
 
-At **two** DCs with RF 1 there are two replicas total, so a non-local `QUORUM` is 2
-of 2 — it contacts every replica and intersects everything **by accident**. A test
-suite on a two-DC cluster passes whether or not the fix is present, and would also
-pass with plain `QUORUM`, which is *not* a valid closure.
+**Two DCs are enough to reproduce the original defect.** With `{dc-na:1, dc-eu:1}`
+and a reference acknowledged only in dc-eu, a `LOCAL_QUORUM` read from dc-na does not
+see it while an `EACH_QUORUM` read from dc-na must obtain a quorum in *each* DC and
+therefore does. The bug and its fix are distinguishable at two DCs.
+
+**What two DCs cannot do is rule out the wrong fix.** With two replicas total, a
+non-local `QUORUM` is 2 of 2: it contacts every replica and intersects everything
+**by accident**. So a two-DC suite passes with `EACH_QUORUM` and passes just as
+happily with plain `QUORUM` — and plain `QUORUM` is *not* a valid closure.
 
 At **three** DCs with RF 1, `QUORUM` is 2 of 3 and can be satisfied by the two DCs
-that do not hold the reference. Only here do the correct and incorrect designs
-separate. Production is three DCs (`.env.prod.example`:
+that do not hold the reference. Only here do `EACH_QUORUM` and `QUORUM` separate, and
+only here does the fixture match production (`.env.prod.example`:
 `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`).
 
 `docker-compose.mr-cluster.yaml` is pinned to two DCs (`{usa:1, eu:1}`) because it
@@ -248,8 +255,13 @@ t2   NetworkTopologyStrategy ✅   positive RF ✅   local DC present ✅
 Every structural check passes while the guarantee is gone, and Cassandra does not
 relocate historical data on `ALTER` — reference ABC is simply unreachable by the read
 that authorizes deleting its block. So the gate additionally requires the **live map
-to equal the declared one**, which makes the topology immutable for as long as
-destructive GC is enabled. Changing topology is then an explicit procedure:
+to equal the declared one**, which *detects drift between the live topology and the
+topology the running process was configured with*. It does not make topology
+immutable — nothing here can block a concurrent `ALTER`, and the comparison is
+against today's config rather than against the map that accepted the historical
+references (see the fingerprint discussion below). Changing topology is therefore an
+explicit procedure, and an operational precondition rather than an enforced
+invariant:
 
 ```text
 GC_ENABLED=false everywhere

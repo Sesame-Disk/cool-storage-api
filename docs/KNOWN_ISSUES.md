@@ -2116,8 +2116,15 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   a counter cannot express *duration* — which is the whole signal, because failing
   closed is silent by design: nothing errors, nothing reaches the DLQ, and a
   permanently rejecting gate looks exactly like a fleet with nothing to collect. The
-  gauge `gc_destructive_deletes_blocked` closes that: alert on
-  `max_over_time(gc_destructive_deletes_blocked[1h]) == 1`.
+  gauge `gc_destructive_deletes_blocked{path="block"|"orphan"}` closes that. Alert with
+  `expr: gc_destructive_deletes_blocked == 1` plus `for: 1h` — **not**
+  `max_over_time(...[1h]) == 1`, which fires for a full hour after a single blocked
+  attempt however long ago it recovered, and so says "was blocked at least once
+  recently" rather than "has been blocked for an hour". The `path` label is required
+  because the two destructive paths fail independently: without it, a clean worker pass
+  would clear an alarm raised by an orphan sweep that is still refusing every delete.
+  Read each series as "the last destructive attempt on this path was refused" — a path
+  with no work does not re-evaluate.
 - Fail-closed also does not consume the item's retry budget: the failure is systematic,
   so the ordinary five-retry path would DLQ every in-flight block within minutes of an
   outage, and block items are not auto-recoverable from the DLQ while the scanner's day
@@ -2126,23 +2133,39 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   `RequeueItem` stamps `queued_at=now` and `DequeueBatch` only sees rows older than the
   grace period.
 
-  **This follows the reason, not the statement.** The EACH_QUORUM verify is merely the
-  first call in the destructive walk that an outage breaks; `ClaimBlockDelete` (an LWT,
-  which under `SERIAL` needs a quorum in *every* DC), `BlockExists`, `GetBlockInfo` and
-  `StartBlockDeleteOrphan` break on the same outage for the same reason, and one of
-  them runs *before* the verify. Protecting only the verify would have left the exact
-  loss the protection exists to prevent reachable through the statement immediately
-  preceding it. Every availability failure in the walk now postpones
-  (`isClusterUnavailableError`: server-reported Unavailable/ReadTimeout/WriteTimeout,
-  plus the driver's no-response/no-connection sentinels). Scope is deliberately narrow —
-  a malformed statement or an unknown column still spends its retries and reaches the
-  DLQ, because those *do* say something about the item and a human needs to see them.
-- A multi-DC keyspace running `serial_consistency: SERIAL` is warned about once at the
-  gate rather than rejected. SERIAL is not unsound — it is strictly stronger than
-  LOCAL_SERIAL — but it needs a quorum in every DC, so one unreachable DC stalls block
-  claims while the LOCAL_QUORUM reads around them keep working. With the retry rule
-  above that is a throughput cost, not a loss, and therefore an operator's call. The
-  shipped `config-*.cluster.yaml` profiles already use LOCAL_SERIAL.
+  **This follows the reason, not the statement.** The EACH_QUORUM verify is the call in
+  the destructive walk that a datacenter outage breaks first and most reliably — it is
+  the only level that demands a quorum in *every* DC. But `ClaimBlockDelete`,
+  `BlockExists`, `GetBlockInfo` and `StartBlockDeleteOrphan` can fail on the same
+  degraded cluster, and one of them runs *before* the verify. Protecting only the verify
+  would have left the exact loss the protection exists to prevent reachable through the
+  statement immediately preceding it. Every availability failure in the walk now
+  postpones (`isClusterUnavailableError`: server-reported
+  Unavailable/Overloaded/ReadTimeout/WriteTimeout, plus the driver's
+  no-response/no-connection sentinels). Scope is deliberately narrow — a malformed
+  statement or an unknown column still spends its retries and reaches the DLQ, because
+  those *do* say something about the item and a human needs to see them.
+
+  **Do not infer a rule about serial consistency from this.** An earlier draft claimed
+  that `SERIAL` "needs a quorum in every DC", so a single remote DC outage would take
+  `ClaimBlockDelete` down. That is wrong, and it was wrong in a direction that mattered:
+  `SERIAL` takes a **global** quorum over all replicas of the token range (2 of 3 with
+  RF 1 in each of three DCs — which one unreachable DC does not defeat), while
+  `LOCAL_SERIAL` takes a quorum among the local DC's replicas. `EACH_QUORUM` is the
+  per-DC level. The advisory built on that mistaken reasoning recommended moving
+  multi-DC deployments to `LOCAL_SERIAL`; it has been **removed**, because narrowing the
+  Paxos domain on the `blocks` partition is exactly the linearization question X1 still
+  has open, and this gate has no business pushing a deployment either way.
+
+  **Known limitation of the classifier.** The timeout codes are ambiguous: a read or
+  write timeout can mean a degraded cluster, but also a hot partition, LWT contention on
+  one row, or too tight a deadline. Treating them as environmental means a pathological
+  item postpones indefinitely rather than surfacing in the DLQ. They are included anyway
+  because a partial outage does produce timeouts and losing work there is the worse
+  failure, and the condition stays visible through
+  `gc_destructive_deletes_blocked{path="block"}`. Bounding environmental postpones per
+  item needs a counter distinct from `retry_count` — a queue-protocol change, and X1's
+  to make.
 - A `gc_s3_orphans` row whose block still has references is refused, logged, and
   counted (`GCAuditEventsTotal{event="gc_s3_orphan_referenced_deferred"}`) — but it
   does **not** fail the scanner phase. The condition is permanent by construction (the
@@ -2191,10 +2214,14 @@ mints fresh ids each run. And **RF 3 is out of scope**: under
 `NetworkTopologyStrategy` the factor is per DC, so it would need nine nodes, and it is
 hardening rather than closure.
 
-**Two DCs cannot prove this**, which is why `docker-compose.mr-cluster.yaml` is not the
-instrument: at two DCs with RF 1 a non-local `QUORUM` is 2 of 2 and intersects
-everything by accident, so the suite would pass with or without the fix. Only at three
-DCs does `QUORUM` become 2 of 3 and able to miss the replica holding the reference. The
+**Two DCs reproduce the defect but cannot rule out the wrong fix**, which is why
+`docker-compose.mr-cluster.yaml` is not the instrument. At two DCs with RF 1 a
+`LOCAL_QUORUM` read from dc-na is still blind to a reference acknowledged in dc-eu
+while `EACH_QUORUM` still sees it, so the bug and its fix *are* distinguishable there.
+What is not distinguishable is `EACH_QUORUM` from plain `QUORUM`: with two replicas
+total a non-local `QUORUM` is 2 of 2 and intersects everything by accident, so a
+two-DC suite would bless `QUORUM` — which is not a valid closure. Only at three DCs
+does `QUORUM` become 2 of 3 and able to miss the replica holding the reference. The
 integration tests skip when fewer than three DCs are configured, so a two-DC
 environment cannot report a false pass.
 

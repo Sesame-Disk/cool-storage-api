@@ -122,29 +122,49 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 // left the exact loss the protection exists to prevent reachable through the
 // statement immediately before it.
 //
-// Whether an outage actually reaches those other calls depends on consistency
-// settings — the shipped multi-DC profiles use LOCAL_QUORUM/LOCAL_SERIAL, so a
-// remote DC dying leaves them working — but that is a property of configuration, not
-// something the worker can rely on. See the SERIAL advisory in
-// ValidateDestructiveGCTopology.
+// WHICH calls an outage actually breaks depends on the consistency each one uses,
+// and that is a property of deployment configuration rather than something the worker
+// can reason about. Do NOT read this as "a remote DC is down, therefore the claim
+// fails": the serial consistency levels do not work that way. LOCAL_SERIAL takes a
+// quorum among the local DC's replicas; SERIAL takes a GLOBAL quorum over all
+// replicas of the token range — with RF 1 in each of three DCs that is 2 of 3, which
+// one unreachable DC does not defeat. EACH_QUORUM is the level that requires a quorum
+// in *every* DC, which is exactly why the destructive liveness read is the call that
+// reliably fails first. This function's job is only to recognise the failure when it
+// arrives, from whichever statement it arrives at.
 //
 // Scope is deliberately narrow: availability failures only. A malformed statement, an
 // unknown column or a serialization bug must still consume its retry budget and reach
 // the DLQ, because those DO say something about the item and a human needs to see
 // them.
+//
+// KNOWN LIMITATION — the timeout codes are ambiguous. Unavailable and the
+// connection-level sentinels genuinely mean "the cluster cannot serve this"; a read or
+// write timeout can also mean a hot partition, LWT contention on one row, or a
+// deadline that is simply too tight. Those are per-item conditions, and treating them
+// as environmental means such an item postpones indefinitely instead of surfacing in
+// the DLQ. They are included anyway because a partial outage does produce timeouts and
+// losing work there is the worse failure, and because the item stays visible: any
+// fail-closed refusal holds gc_destructive_deletes_blocked at 1. Bounding the
+// environmental postpones per item (after N, fall back to the ordinary retry path)
+// needs a counter distinct from retry_count, which is a queue-protocol change and
+// belongs to X1 rather than here.
 func isClusterUnavailableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Server said it could not reach the consistency level.
+	// Server answered, saying it could not serve the request.
 	var reqErr gocql.RequestError
 	if errors.As(err, &reqErr) {
 		switch reqErr.Code() {
-		case gocql.ErrCodeUnavailable, gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
+		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded,
+			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
 			return true
 		}
 	}
-	// Driver never got an answer at all.
+	// Driver never got an answer at all. (gocql.ErrHostQueryFailed is deliberately
+	// absent: the driver documents it as deprecated and never returned, so listing it
+	// would only suggest a case that cannot occur.)
 	for _, sentinel := range []error{
 		gocql.ErrTimeoutNoResponse,
 		gocql.ErrConnectionClosed,
@@ -152,7 +172,6 @@ func isClusterUnavailableError(err error) bool {
 		gocql.ErrNoStreams,
 		gocql.ErrNoHosts,
 		gocql.ErrCannotFindHost,
-		gocql.ErrHostQueryFailed,
 	} {
 		if errors.Is(err, sentinel) {
 			return true
@@ -173,23 +192,30 @@ func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error
 		return fmt.Errorf("%s for %s: %w", reason, itemID, err)
 	}
 	metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
-	w.recordDestructiveBlocked()
+	w.recordDestructiveBlocked(destructivePathBlock)
 	log.Printf("[GC Worker] Block %s: %s failed because the cluster was unavailable; postponing without burning a retry: %v", itemID, reason, err)
 	return failedClosedError{Reason: reason, ItemID: itemID, Err: err}
 }
 
-// recordDestructiveBlocked marks that this worker refused a delete because the
+// recordDestructiveBlocked marks that a destructive path refused a delete because the
 // environment could not authorize it, both as a counter and as pass-scoped state.
 //
 // The pass scope is what makes the gauge honest. Clearing it only on a successful
 // authorizing read leaves it stuck at 1 whenever an outage is followed by a quiet
 // period with no candidates — alerting forever on a condition that has already
 // passed. Clearing it at the end of any pass that refused nothing ties the signal to
-// "GC tried and could not" rather than to "GC once could not".
-func (w *Worker) recordDestructiveBlocked() {
+// "this path tried and could not" rather than to "it once could not".
+//
+// path must be one of the destructivePath* constants. The two paths report
+// separately because they fail independently: a clean worker pass says nothing about
+// whether orphan recovery can delete, and a single shared gauge let one clear the
+// other's alarm.
+func (w *Worker) recordDestructiveBlocked(path string) {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
-	metrics.GCDestructiveDeletesBlocked.Set(1)
-	w.destructiveBlockedThisPass.Store(true)
+	metrics.GCDestructiveDeletesBlocked.WithLabelValues(path).Set(1)
+	if path == destructivePathBlock {
+		w.destructiveBlockedThisPass.Store(true)
+	}
 }
 
 // shouldPostponeWithoutRetry covers every refusal that says nothing about the item
@@ -349,6 +375,15 @@ type Worker struct {
 // is the same tick in practice.
 const destructiveTopologyGateTTL = 30 * time.Second
 
+// The two destructive paths, as reported by gc_destructive_deletes_blocked. They fail
+// independently — the worker drains gc_queue, the scanner sweeps gc_s3_orphans — so
+// each reports its own state rather than sharing one gauge where a clean pass on one
+// would clear the other's alarm.
+const (
+	destructivePathBlock  = "block"
+	destructivePathOrphan = "orphan"
+)
+
 // blockDeleteClaimStaleAfter is how long a gc_state='deleting' claim must have been
 // held before another attempt may hand it back on the owner's behalf.
 //
@@ -362,6 +397,22 @@ const destructiveTopologyGateTTL = 30 * time.Second
 // walk — a handful of statements, each bounded by the driver timeout — so a wide
 // margin costs nothing: it delays unwedging a genuinely abandoned claim, and never
 // races a live one.
+//
+// TWO PRECONDITIONS, stated because the safety of releasing another attempt's claim
+// rests on them rather than on anything this file can check:
+//
+//  1. No legitimate processBlock attempt can still be running under a claim this old.
+//     The walk is a handful of statements, each bounded by the driver timeout, so the
+//     margin here is three orders of magnitude — but a future change that adds a long
+//     or unbounded operation between the claim and its release would invalidate it.
+//  2. Application clocks are reasonably synchronised. gc_claimed_at is written from
+//     the CLAIMING process's clock (ClaimBlockDelete) and compared against the
+//     RELEASING process's clock, so a node running far ahead could judge a live claim
+//     stale. NTP across application nodes is already an operational requirement for
+//     Cassandra's own timestamps; this simply inherits it, with 15 minutes of slack.
+//
+// Both belong to the claim protocol, which X1 owns. They are recorded here so a
+// redesign inherits the constraints instead of rediscovering them.
 const blockDeleteClaimStaleAfter = 15 * time.Minute
 
 // WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL WHILE THE PRE-CHECK ONE IS NOT
@@ -439,8 +490,8 @@ func (w *Worker) SetDestructiveTopologyGate(gate func() error) {
 // checkDestructiveTopology is the CHEAP form, used to filter candidates: it may reuse
 // a passing result for up to destructiveTopologyGateTTL. Callers about to destroy
 // bytes must use checkDestructiveTopologyFresh instead.
-func (w *Worker) checkDestructiveTopology() error {
-	return w.evaluateDestructiveTopology(false)
+func (w *Worker) checkDestructiveTopology(path string) error {
+	return w.evaluateDestructiveTopology(path, false)
 }
 
 // checkDestructiveTopologyFresh is the AUTHORITATIVE form: it ignores the cache and
@@ -455,13 +506,13 @@ func (w *Worker) checkDestructiveTopology() error {
 // The cost lands where it belongs. The cheap form runs per candidate, including the
 // many that turn out to be still referenced and never reach a delete; this one runs
 // only for blocks that are truly about to be destroyed, which is a far smaller set.
-func (w *Worker) checkDestructiveTopologyFresh() error {
-	return w.evaluateDestructiveTopology(true)
+func (w *Worker) checkDestructiveTopologyFresh(path string) error {
+	return w.evaluateDestructiveTopology(path, true)
 }
 
 // evaluateDestructiveTopology fails closed: any error, including an unreachable
 // Cassandra, prevents the delete rather than being treated as a passing gate.
-func (w *Worker) evaluateDestructiveTopology(fresh bool) error {
+func (w *Worker) evaluateDestructiveTopology(path string, fresh bool) error {
 	w.topologyGateMu.Lock()
 	defer w.topologyGateMu.Unlock()
 
@@ -469,7 +520,7 @@ func (w *Worker) evaluateDestructiveTopology(fresh bool) error {
 		// Unreachable through NewWorker, which always arms it. Refusing rather than
 		// passing keeps "no gate" from ever meaning "no constraint" — the shape this
 		// whole guard exists to rule out.
-		w.recordTopologyGateRejectionLocked()
+		w.recordTopologyGateRejectionLocked(path)
 		return fmt.Errorf("destructive topology gate is not armed on this worker")
 	}
 	now := w.clock()
@@ -479,7 +530,7 @@ func (w *Worker) evaluateDestructiveTopology(fresh bool) error {
 	if err := w.destructiveTopologyGate(); err != nil {
 		// Not cached: a refusal is re-evaluated every time so recovery is immediate.
 		w.topologyGateOKUntil = time.Time{}
-		w.recordTopologyGateRejectionLocked()
+		w.recordTopologyGateRejectionLocked(path)
 		return err
 	}
 	w.topologyGateOKUntil = now.Add(destructiveTopologyGateTTL)
@@ -489,9 +540,9 @@ func (w *Worker) evaluateDestructiveTopology(fresh bool) error {
 	return nil
 }
 
-func (w *Worker) recordTopologyGateRejectionLocked() {
+func (w *Worker) recordTopologyGateRejectionLocked(path string) {
 	metrics.GCErrorsTotal.WithLabelValues("destructive_topology_gate").Inc()
-	w.recordDestructiveBlocked()
+	w.recordDestructiveBlocked(path)
 }
 
 // ProcessOnce runs a single pass of the worker: find orgs with queued items,
@@ -523,7 +574,7 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 	// A full pass that refused nothing is the evidence that GC can authorize deletes
 	// again. Anything narrower leaves the gauge asserting an outage that ended.
 	if !w.destructiveBlockedThisPass.Load() {
-		metrics.GCDestructiveDeletesBlocked.Set(0)
+		metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
 	}
 
 	return totalProcessed, nil
@@ -797,7 +848,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// EACH_QUORUM a per-datacenter meaning; under an unsupported replication class
 	// the argument is vacuous, so refuse rather than delete under a proof that does
 	// not apply.
-	if err := w.checkDestructiveTopology(); err != nil {
+	if err := w.checkDestructiveTopology(destructivePathBlock); err != nil {
 		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete; failing closed: %v", item.ItemID, err)
 		return failedClosedError{Reason: "destructive topology gate rejected block", ItemID: item.ItemID, Err: err}
 	}
@@ -826,10 +877,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// different attempt cannot release or finalize another attempt's claim.
 	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID, claimID)
 	if err != nil {
-		// An LWT is the call in this walk most likely to break on a partial outage:
-		// under SERIAL it needs a quorum across every DC, so a remote DC dying takes
-		// it down even though the local reads keep working. That is precisely the
-		// systematic, fleet-wide failure the retry budget must not absorb.
+		// An LWT is more exposed than a plain read — Paxos needs its serial quorum on
+		// top of the ordinary one, and contention or a degraded cluster shows up here
+		// first. Whether a given outage defeats it depends on the serial consistency
+		// and the replica count, not on any simple "a DC is down" rule (see
+		// isClusterUnavailableError). Either way an availability failure here says
+		// nothing about the item, so it must not spend the item's retry budget.
 		return w.failClosedIfUnavailable("failed to claim block record for deletion", item.ItemID, err)
 	}
 	if !applied {
@@ -862,7 +915,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
 	if err != nil {
 		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-		w.recordDestructiveBlocked()
+		w.recordDestructiveBlocked(destructivePathBlock)
 		// Hand the claim back before giving up. Holding it would leave
 		// gc_state='deleting' behind an error that an unavailable DC makes
 		// systematic rather than rare, and every writer of this content would see
@@ -970,7 +1023,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// would return the pass this same walk stored moments ago and assert nothing at
 	// all — defence in depth in appearance only. The read is paid once per block that
 	// is actually about to be destroyed, not once per candidate.
-	if err := w.checkDestructiveTopologyFresh(); err != nil {
+	if err := w.checkDestructiveTopologyFresh(destructivePathBlock); err != nil {
 		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete at the commit point; failing closed: %v", item.ItemID, err)
 		// Hand the claim back: the block is provably unreferenced, so the fence buys
 		// nothing here, and holding it under a systematic rejection would fence this
@@ -1109,11 +1162,14 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	}
 	// Same gate as processBlock: this path deletes bytes too, and it inherits its
 	// authorization from an orphan row rather than from its own liveness read.
-	// Checked once here to refuse the sweep cheaply, and again immediately before
-	// each delete — a sweep can run long, and the gate is a runtime check precisely
-	// because replication may be altered while it runs. The per-delete check is
-	// nearly free: a passing result is cached for destructiveTopologyGateTTL.
-	if err := w.checkDestructiveTopology(); err != nil {
+	// Checked once here — cached form — to refuse the whole sweep cheaply, and again
+	// immediately before each delete in the FRESH form, which deliberately re-reads
+	// the live replication map. A sweep can run long, so a cached pass taken at its
+	// start would say nothing about the topology in effect by the time a given orphan
+	// is destroyed. That costs one metadata read per orphan actually deleted; this is
+	// the cold path, and the read is cheap next to destroying bytes irreversibly.
+	orphanSweepBlocked := false
+	if err := w.checkDestructiveTopology(destructivePathOrphan); err != nil {
 		log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected the sweep; failing closed: %v", err)
 		return 0, fmt.Errorf("destructive topology gate rejected S3 orphan recovery: %w", err)
 	}
@@ -1226,7 +1282,8 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// zero itself. An error here defers the sweep rather than deleting.
 				if hasRefs, err := w.store.BlockHasReferencesGlobal(orph.OrgID, orph.BlockID); err != nil {
 					metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-					w.recordDestructiveBlocked()
+					orphanSweepBlocked = true
+					w.recordDestructiveBlocked(destructivePathOrphan)
 					log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s; failing closed: %v", orph.OrgID, orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("global liveness verify for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
@@ -1256,7 +1313,8 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// Re-check the gate immediately before destroying bytes, ignoring the
 				// cache: a sweep can run long, and a cached pass from the top of it
 				// would assert nothing about the topology in effect right now.
-				if err := w.checkDestructiveTopologyFresh(); err != nil {
+				if err := w.checkDestructiveTopologyFresh(destructivePathOrphan); err != nil {
+					orphanSweepBlocked = true
 					log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected block %s mid-sweep; failing closed: %v", orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("destructive topology gate rejected S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
@@ -1317,6 +1375,13 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
 			}
 		}
+	}
+
+	// A sweep that refused nothing is this path's evidence that it can still delete.
+	// Reported separately from the worker's: the two fail independently, and a clean
+	// worker pass says nothing about whether recovery is blocked.
+	if !orphanSweepBlocked {
+		metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
 	}
 
 	if phaseErr == nil {

@@ -12,7 +12,11 @@
 #   ./scripts/x2-multidc-validation.sh --keep     # leave the stack up afterwards
 #   ./scripts/x2-multidc-validation.sh --no-up    # reuse an already-running stack
 #   ./scripts/x2-multidc-validation.sh --mutate   # prove leg 1 goes RED when the
-#                                                 # destructive read is downgraded
+#                                                 # destructive read is downgraded.
+#                                                 # Implies --no-up and --keep, so it
+#                                                 # needs a stack that is ALREADY up
+#                                                 # (run --keep first); it is not a
+#                                                 # standalone entry point.
 #
 # THE ONE THING TO UNDERSTAND BEFORE TRUSTING A GREEN RUN
 # -------------------------------------------------------
@@ -134,8 +138,13 @@ build_divergence() {
   "${COMPOSE[@]}" stop cassandra-na cassandra-asia
   point_harness_at "${CASSANDRA_EU_HOST_PORT:-9243}" dc-eu
   local out
+  # Same reason as run_leg: under `set -e` a failing assignment aborts the script
+  # before the diagnosis below can run, turning "the divergent write failed" into a
+  # bare non-zero exit. The PASS check that follows is what decides.
+  set +e
   out="$(X2_WRITE_DIVERGENT=1 go test -tags integration -count=1 ./internal/integration/ \
     -run TestX2_WriteReferenceForDivergence -v 2>&1)"
+  set -e
   echo "$out" | grep -E 'X2_DIVERGENT_(ORG|BLOCK)|--- (PASS|FAIL)' || true
   grep -q '^--- PASS: TestX2_WriteReferenceForDivergence' <<<"$out" \
     || { echo "$out"; fail "divergent write did not run"; }
