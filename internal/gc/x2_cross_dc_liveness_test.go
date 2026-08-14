@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -76,7 +77,7 @@ func TestX2_UnavailableDatacenterFailsClosed(t *testing.T) {
 	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// A datacenter is unreachable: the global read errors instead of answering.
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
 	// ProcessOnce reports the item as attempted; the error is logged and requeued.
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -117,7 +118,7 @@ func TestX2_FailedVerifyDoesNotWedgeTheBlock(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// Attempt 1: a datacenter is unreachable, so the verify fails after the claim.
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
@@ -384,7 +385,7 @@ func TestX2_FailClosedDoesNotBurnTheRetryBudget(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
 	// Ride out an outage longer than the five-retry budget would survive.
 	for i := 0; i < 8; i++ {
@@ -446,9 +447,11 @@ func TestX2_UnsupportedTopologyBlocksDelete(t *testing.T) {
 	}
 }
 
-// TestX2_TopologyGateAlsoGuardsOrphanRecovery covers the transitive delete path.
-// RecoverS3Orphans deletes bytes without reading references at all, so it needs the
-// same gate or the guarantee has a hole that no processBlock test would catch.
+// TestX2_TopologyGateAlsoGuardsOrphanRecovery covers the second destructive path.
+// RecoverS3Orphans does its own BlockHasReferencesGlobal before destroying bytes, but
+// that read only closes X2 if the keyspace gives EACH_QUORUM a per-datacenter meaning.
+// Without the same gate, a SimpleStrategy / shrunk-map cluster would still delete
+// under a proof that does not apply — a hole no processBlock test would catch.
 func TestX2_TopologyGateAlsoGuardsOrphanRecovery(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -532,7 +535,7 @@ func TestX2_OrphanRecoveryFailsClosedOnAnUnavailableDatacenter(t *testing.T) {
 	if _, err := store.RecordS3Orphan(orgID, "orph-dc-down", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {

@@ -166,10 +166,13 @@ services:
       - |
         set -euo pipefail
         keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
-        case "$${keyspace}" in
-          [A-Za-z][A-Za-z0-9_]*) ;;
-          *) echo "Invalid keyspace: $${keyspace}" >&2; exit 1 ;;
-        esac
+        # `case` is glob matching, not a regex: in `[A-Za-z][A-Za-z0-9_]*` the trailing
+        # `*` means "anything at all", so the pattern only ever checked the first two
+        # characters and `ab-whatever;` sailed through into the CREATE KEYSPACE below.
+        # It also rejected single-character names. `expr` gives a real anchored match.
+        if ! expr "$${keyspace}" : '[A-Za-z][A-Za-z0-9_]*$$' >/dev/null; then
+          echo "Invalid keyspace: $${keyspace}" >&2; exit 1
+        fi
         echo "Waiting for all three datacenters (dc-na, dc-eu, dc-asia) to register ..."
         for i in $$(seq 1 60); do
           dcs="$$(cqlsh cassandra-na -e "SELECT data_center FROM system.local; SELECT data_center FROM system.peers;" 2>/dev/null || true)"

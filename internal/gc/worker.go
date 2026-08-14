@@ -143,12 +143,20 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 // deadline that is simply too tight. Those are per-item conditions, and treating them
 // as environmental means such an item postpones indefinitely instead of surfacing in
 // the DLQ. They are included anyway because a partial outage does produce timeouts and
-// losing work there is the worse failure, and because the item stays visible: any
-// fail-closed refusal advances gc_destructive_last_blocked_timestamp_seconds past its
-// liveness-success counterpart, and nothing but a later successful read moves it back.
+// losing work there is the worse failure.
+//
+// SUCH AN ITEM IS NOT INDIVIDUALLY VISIBLE, and an earlier version of this comment
+// claimed otherwise. gc_destructive_last_blocked_timestamp_seconds is per PATH: one
+// block timing out on a hot partition advances it, and the very next block's successful
+// verify advances the liveness-success half past it again, so the alert reads healthy
+// while that one item postpones forever. The pair reports whether a PATH can authorize
+// deletes, which is what it was built for; it is not per-item observability and cannot
+// substitute for it.
+//
 // Bounding the environmental postpones per item (after N, fall back to the ordinary
 // retry path) needs a counter distinct from retry_count, which is a queue-protocol
-// change and belongs to X1 rather than here.
+// change and belongs to X1 rather than here. Until then the honest statement is that a
+// persistently timing-out item stalls silently.
 func isClusterUnavailableError(err error) bool {
 	if err == nil {
 		return false
@@ -938,8 +946,6 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// the block.
 	hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
 	if err != nil {
-		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-		w.recordDestructiveBlocked(destructivePathBlock)
 		// Hand the claim back before giving up. Holding it would leave
 		// gc_state='deleting' behind an error that an unavailable DC makes
 		// systematic rather than rare, and every writer of this content would see
@@ -951,6 +957,28 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a failed global verify: %v", item.ItemID, relErr)
 		}
+
+		// The delete is abandoned either way — an error here never authorizes
+		// destruction. What is decided below is only the QUEUE policy, and the same
+		// classifier rule applies here as at every other statement in the walk:
+		// postpone what the environment caused, spend retries on what it did not.
+		//
+		// This branch is easy to get wrong in the safe-looking direction. Treating
+		// every failure here as environmental keeps the fail-closed guarantee intact,
+		// which is why it survived a while — but it makes an item-specific, permanent
+		// error postpone for eternity: no retry spent, no DLQ entry, nobody told. A
+		// ReadFailure from a tombstone-heavy block_references partition is exactly
+		// that shape, and it would be invisible, because the blocked/liveness pair is
+		// per PATH: any other block's successful verify moves the recovery half
+		// forward and clears the alert while this item stays stuck.
+		if !isClusterUnavailableError(err) {
+			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
+			log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
+			return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
+		}
+
+		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
+		w.recordDestructiveBlocked(destructivePathBlock)
 		log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
 		return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
 	}
@@ -1190,14 +1218,15 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
 		return 0, nil
 	}
-	// Same gate as processBlock: this path deletes bytes too, and it inherits its
-	// authorization from an orphan row rather than from its own liveness read.
-	// Checked once here — cached form — to refuse the whole sweep cheaply, and again
-	// immediately before each delete in the FRESH form, which deliberately re-reads
-	// the live replication map. A sweep can run long, so a cached pass taken at its
-	// start would say nothing about the topology in effect by the time a given orphan
-	// is destroyed. That costs one metadata read per orphan actually deleted; this is
-	// the cold path, and the read is cheap next to destroying bytes irreversibly.
+	// Same gate as processBlock: this path deletes bytes too. Authorization comes from
+	// the BlockHasReferencesGlobal below, not from the orphan row; the gate is what
+	// makes that read mean anything. Checked once here — cached form — to refuse the
+	// whole sweep cheaply, and again immediately before each delete in the FRESH form,
+	// which deliberately re-reads the live replication map. A sweep can run long, so a
+	// cached pass taken at its start would say nothing about the topology in effect by
+	// the time a given orphan is destroyed. That costs one metadata read per orphan
+	// actually deleted; this is the cold path, and the read is cheap next to destroying
+	// bytes irreversibly.
 	if err := w.checkDestructiveTopology(destructivePathOrphan); err != nil {
 		log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected the sweep; failing closed: %v", err)
 		return 0, fmt.Errorf("destructive topology gate rejected S3 orphan recovery: %w", err)
@@ -1329,16 +1358,31 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					// at; leave the row for an operator rather than guessing.
 					//
 					// Reported through the metric and the log ONLY — deliberately not
-					// through phaseErr. This condition is permanent by construction:
-					// the row stays, so every subsequent sweep rediscovers it and would
-					// fail the phase again. A phase error suppresses SetLastScanSuccess,
-					// so one such row would freeze the scanner's success timestamp
+					// through phaseErr. A phase error suppresses SetLastScanSuccess, so
+					// one anomalous row would freeze the scanner's success timestamp
 					// forever and make a healthy fleet indistinguishable from a broken
 					// one — losing a signal that matters far more than restating an
 					// anomaly the counter already exposes. There is also no way to
 					// acknowledge it: unlike the DLQ, gc_s3_orphans has no resolved
 					// state. Alert on gc_audit_events_total{event=
-					// "gc_s3_orphan_referenced_deferred"} instead.
+					// "gc_s3_orphan_referenced_deferred"}.
+					//
+					// KNOWN GAP — this row now falls out of the working set, and an
+					// earlier version of this comment wrongly claimed the opposite ("the
+					// row stays, so every subsequent sweep rediscovers it"). It does not:
+					// a sweep that ends without a phase error advances the day cursor, and
+					// the next one starts only gcScanOverlapDays back, so once the cursor
+					// passes this row's bucket nothing revisits it. If the anomalous
+					// reference later goes away the bytes are never collected, and the row
+					// itself TTLs out at 90 days, taking the recovery metadata with it.
+					// The counter goes quiet at the same moment, so the alert above stops
+					// firing while the condition persists.
+					//
+					// Storage leak, not a delete of live data — recovery refuses, it does
+					// not guess. Fixing it needs a lifecycle of its own (a durable
+					// deferred/quarantine state, or re-projection into a future bucket)
+					// rather than a phaseErr, which is the thing that froze the scanner.
+					// Tracked as ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01.
 					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_referenced_deferred").Inc()
 					log.Printf("[GC Worker] S3 orphan recovery: block %s (org=%s) still has references; refusing to delete its bytes (operator action required)", orph.BlockID, orph.OrgID)
 					continue

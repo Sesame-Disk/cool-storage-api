@@ -166,6 +166,23 @@ var (
 	// Both are process-local: a restart resets them to 0 and restarts the `for:`
 	// window. Surviving restarts would need external persistence, which is not worth
 	// it for a condition that resolves in minutes or persists for hours.
+	//
+	// TWO LIMITS WORTH KNOWING BEFORE TRUSTING THIS PAIR:
+	//
+	// It is per PATH, not per item. One block failing permanently — a hot partition, a
+	// read that always times out — advances the blocked half, and the next healthy
+	// block's verify advances the success half straight past it. The alert reads clear
+	// while that item postpones forever. Detecting a single stuck item needs a
+	// per-item environmental-postpone counter, which is X1's to add.
+	//
+	// A candidate whose references are already visible LOCALLY settles without ever
+	// issuing the global read, so it does not advance the success half. After an
+	// outage, a run of such candidates leaves the alert firing even though the cluster
+	// recovered. That is not a lie by this pair's own terms — no destructive
+	// authorization has been demonstrated since the refusal — but it will read as a
+	// false page. It cannot be fixed by advancing on the local read: LOCAL_QUORUM
+	// succeeding proves nothing about cross-DC reachability, which is the whole
+	// property being reported.
 	GCDestructiveLastBlockedTimestamp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "gc_destructive_last_blocked_timestamp_seconds",

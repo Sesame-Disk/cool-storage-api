@@ -150,3 +150,53 @@ func TestValidateDestructiveGCTopologyRejectsAnEmptyMap(t *testing.T) {
 		t.Fatal("gate accepted a NetworkTopologyStrategy keyspace with no datacenters in its map")
 	}
 }
+
+// TestValidateDestructiveGCTopologyRejectsAWriteConsistencyThatCannotIntersect pins a
+// precondition the gate used to leave unchecked.
+//
+// The closure argument is an intersection argument: a reference write acknowledged at
+// LOCAL_QUORUM in some datacenter intersects an EACH_QUORUM read's quorum in that same
+// datacenter. That holds only if the WRITE reached a quorum somewhere. Reference rows
+// are written at the session consistency, and ONE is an accepted value — under which a
+// write can be acknowledged by a single replica while a later per-DC read quorum of
+// 2-of-3 misses it entirely. The replication map would still look perfect.
+//
+// The gate exists to refuse destructive deletes whenever the EACH_QUORUM argument does
+// not apply, and this is one of the ways it does not apply, so it belongs here rather
+// than in a comment. Every shipped profile already uses LOCAL_QUORUM.
+func TestValidateDestructiveGCTopologyRejectsAWriteConsistencyThatCannotIntersect(t *testing.T) {
+	cfg := prodLikeConfig()
+	cfg.Consistency = "ONE"
+
+	err := validateDestructiveGCTopology(
+		ntsLive(map[string]string{"dc-na": "1", "dc-eu": "1", "dc-asia": "1"}),
+		cfg,
+	)
+	if err == nil {
+		t.Fatal("gate accepted consistency=ONE: reference writes could be acknowledged by a single replica, and the EACH_QUORUM read that authorizes deletes has nothing it is guaranteed to intersect")
+	}
+	if !strings.Contains(err.Error(), "ONE") {
+		t.Errorf("error does not name the offending consistency, so an operator cannot act on it: %v", err)
+	}
+}
+
+// TestValidateDestructiveGCTopologyAcceptsQuorumWriteConsistencies is the other half:
+// the check must not be so eager that it refuses levels which DO intersect.
+//
+// LOCAL_QUORUM intersects in the accepting DC. Global QUORUM guarantees, by pigeonhole,
+// that some datacenter holds a quorum of the write. EACH_QUORUM and ALL are strictly
+// stronger. The empty string is the unset default, which config validation normalizes
+// to LOCAL_QUORUM before any real session exists.
+func TestValidateDestructiveGCTopologyAcceptsQuorumWriteConsistencies(t *testing.T) {
+	for _, consistency := range []string{"", "LOCAL_QUORUM", "local_quorum", "QUORUM", "EACH_QUORUM", "ALL"} {
+		cfg := prodLikeConfig()
+		cfg.Consistency = consistency
+
+		if err := validateDestructiveGCTopology(
+			ntsLive(map[string]string{"dc-na": "1", "dc-eu": "1", "dc-asia": "1"}),
+			cfg,
+		); err != nil {
+			t.Errorf("gate rejected consistency=%q, which does intersect an EACH_QUORUM read: %v", consistency, err)
+		}
+	}
+}

@@ -310,6 +310,28 @@ func (db *DB) ValidateDestructiveGCTopology() error {
 func validateDestructiveGCTopology(live cassandraReplicationSettings, cfg config.DatabaseConfig) error {
 	keyspace := cfg.Keyspace
 
+	// The intersection argument has a precondition on the WRITE side that no
+	// replication map can express. `block_references` rows are written at the session
+	// consistency, and the proof is "a reference acknowledged at LOCAL_QUORUM in some
+	// datacenter intersects the EACH_QUORUM read's quorum in that same datacenter" —
+	// which presumes the write reached a quorum at all. Under ONE it need not: a single
+	// replica can acknowledge while a later per-DC read quorum of 2-of-3 misses the row
+	// entirely, and every structural check below would still pass.
+	//
+	// A whitelist rather than a blacklist, because this is a safety gate: a consistency
+	// level added to the config validator later should have to be reasoned about here
+	// before destructive GC accepts it, not inherited silently. The empty string is the
+	// unset default, which config validation normalizes to LOCAL_QUORUM before any real
+	// session exists.
+	switch normalized := strings.ToUpper(strings.TrimSpace(cfg.Consistency)); normalized {
+	case "", "LOCAL_QUORUM", "QUORUM", "EACH_QUORUM", "ALL":
+	default:
+		return fmt.Errorf(
+			"destructive GC requires reference writes to reach a quorum so the EACH_QUORUM liveness read has something to intersect; database consistency is %s. Use LOCAL_QUORUM (every shipped profile does) or stronger",
+			normalized,
+		)
+	}
+
 	if normalizeReplicationClass(live.Class) != "NetworkTopologyStrategy" {
 		return fmt.Errorf(
 			"destructive GC requires NetworkTopologyStrategy so EACH_QUORUM carries a per-datacenter quorum; keyspace %s uses %s",

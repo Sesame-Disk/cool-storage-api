@@ -224,6 +224,57 @@ func TestX2_NonAvailabilityErrorStillReachesTheDLQ(t *testing.T) {
 	}
 }
 
+// TestX2_NonAvailabilityErrorDuringGlobalVerifyStillReachesTheDLQ closes the gap the
+// test above leaves open.
+//
+// That one injects at ClaimBlockDelete, which routes through failClosedIfUnavailable
+// and therefore consults the classifier. The global liveness verify does not go through
+// that helper — it builds its own failedClosedError — so for a while EVERY error there
+// was treated as environmental, including ones that never resolve on their own. The
+// most plausible instance is not a typo in the CQL: it is a ReadFailure from a
+// tombstone-heavy block_references partition, which is specific to one block and
+// permanent until someone looks at it.
+//
+// That combination was invisible. The item postpones without spending a retry, so it
+// never reaches the DLQ; and the blocked/liveness pair is per PATH, so any other
+// block's successful verify moves the recovery half forward and clears the alert while
+// this one stays stuck forever.
+//
+// Failing closed is not what changes here: an error still aborts the delete either way.
+// What the classifier decides is the QUEUE policy afterwards.
+func TestX2_NonAvailabilityErrorDuringGlobalVerifyStillReachesTheDLQ(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	store.SetBlockHasReferencesGlobalErrForTest(errors.New("Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING"))
+
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("destroyed bytes after a failed liveness verify: %+v", deletes)
+	}
+	failed, err := store.GetTotalFailedItems()
+	if err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	}
+	if failed == 0 {
+		t.Fatal("a permanent, item-specific error at the global verify never reached the DLQ; it postpones forever, and because the blocked/liveness pair is per-path another block's success clears the alert while this item stays stuck with nobody notified")
+	}
+}
+
 // TestX2_TopologyGateRejectionIsNeverCached pins the asymmetry in the gate's cache.
 //
 // A passing result may be reused briefly — schema metadata does not change between two
@@ -353,7 +404,7 @@ func TestX2_BlockedStateSurvivesAPassThatAttemptsNothing(t *testing.T) {
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
@@ -424,7 +475,7 @@ func TestX2_DestructiveTimestampsTrackTheLastEvidence(t *testing.T) {
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
@@ -701,7 +752,7 @@ func TestX2_DestructiveTimestampsArePerPath(t *testing.T) {
 	if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
 		t.Fatalf("seed orphan: %v", err)
 	}
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("expected the sweep to fail closed")
 	}

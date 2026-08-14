@@ -25,7 +25,7 @@ is right about why.
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Destructive GC disabled; upload-fence blockers open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-13** — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
+| Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-13** — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an unauthorized cross-library block write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -2188,24 +2188,38 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   one row, or too tight a deadline. Treating them as environmental means a pathological
   item postpones indefinitely rather than surfacing in the DLQ. They are included anyway
   because a partial outage does produce timeouts and losing work there is the worse
-  failure, and the condition stays visible through
-  `gc_destructive_last_blocked_timestamp_seconds{path="block"}` outranking its
-  liveness-success counterpart. Bounding environmental postpones per
-  item needs a counter distinct from `retry_count` — a queue-protocol change, and X1's
-  to make.
+  failure. **Such an item is not individually visible.** The blocked/liveness pair is
+  per *path*: one block timing out advances the blocked half and the next healthy
+  block's verify advances the success half straight past it, so the alert reads clear
+  while that item postpones forever. Bounding environmental postpones per item needs a
+  counter distinct from `retry_count` — a queue-protocol change, and X1's to make.
+  Until then, a persistently timing-out item stalls silently.
 - A `gc_s3_orphans` row whose block still has references is refused, logged, and
   counted (`GCAuditEventsTotal{event="gc_s3_orphan_referenced_deferred"}`) — but it
-  does **not** fail the scanner phase. The condition is permanent by construction (the
-  row survives for an operator, and `gc_s3_orphans` has no resolved state), so a phase
-  error would recur on every pass, and a failed phase suppresses `last_scan_success`.
-  One such row would freeze that timestamp forever and make a healthy fleet
-  indistinguishable from a broken one. Alert on the counter.
+  does **not** fail the scanner phase. A failed phase suppresses `last_scan_success`,
+  so one anomalous row would freeze that timestamp forever and make a healthy fleet
+  indistinguishable from a broken one; `gc_s3_orphans` also has no resolved state to
+  acknowledge. Alert on the counter.
+- **`ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` (open, storage leak).** The bullet above
+  used to justify itself with "the condition is permanent by construction — the row
+  survives and every sweep rediscovers it". That is false. A sweep ending without a
+  phase error advances the day cursor, and the next starts only `gcScanOverlapDays`
+  back, so once the cursor passes the row's bucket nothing revisits it; the row then
+  TTLs out at 90 days, taking the recovery metadata with it. If the anomalous reference
+  later goes away, the bytes are never collected — and the counter above goes quiet at
+  the same moment, so the alert stops firing while the condition persists. No live data
+  is deleted: recovery refuses, it does not guess. The fix is a lifecycle of its own —
+  a durable deferred/quarantine state, or re-projection into a future bucket — not a
+  `phaseErr`, which is the thing that froze the scanner in the first place.
 
 **Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (twelve regressions),
-`internal/gc/x2_audit_followups_test.go` (five more, from the post-implementation
-audit: cross-candidate stale-claim release and its fresh-claim boundary, availability
-failures at the claim not burning retries, non-availability errors still reaching the
-DLQ, and the topology gate never caching a rejection) and
+`internal/gc/x2_audit_followups_test.go` (the post-implementation audits: the
+cross-candidate stale-claim release and its fresh-claim boundary, availability failures
+at the claim not burning retries, non-availability errors still reaching the DLQ from
+both the claim and the global verify, the topology gate never caching a rejection and
+being re-checked at the commit point, and the blocked/liveness pair — surviving a pass
+that attempts nothing, clearing only on a real read, staying per-path, and ordering a
+commit-point refusal after a success in the same walk) and
 `internal/db/destructive_gc_topology_test.go` (the gate's decision logic against
 synthetic replication maps, including a shrunk map that passes every structural
 check). Every assertion is mutation-verified — each was confirmed to fail against a

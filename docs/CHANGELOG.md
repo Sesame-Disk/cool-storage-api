@@ -96,8 +96,8 @@ being run.
 
 ### Post-implementation audit follow-ups
 
-An audit of the above found no defect in what it claimed, and five places where the
-claim did not reach as far as its own reasoning did. Each is a case of the rule being
+Successive audits of the above found no defect in what it claimed, and a series of
+places where the claim did not reach as far as its own reasoning did. Each is a case of the rule being
 applied to the statement where the defect was observed rather than to every statement
 the reason covers.
 
@@ -121,10 +121,13 @@ the reason covers.
   content, permanently. `ReleaseStaleBlockClaim` no longer takes a claim id; age is
   the only criterion, and nothing live survives `blockDeleteClaimStaleAfter`.
 - **A referenced S3 orphan no longer fails the scanner phase.** Refusing to delete it
-  is correct, but the row is permanent by construction, so the phase error recurred
-  every pass — and a failed phase suppresses `last_scan_success`, meaning one such row
-  would freeze that timestamp forever and mask the health of everything else. Now
-  logged and counted only.
+  is correct, but the phase error recurred on every pass that saw the row — and a
+  failed phase suppresses `last_scan_success`, meaning one such row would freeze that
+  timestamp forever and mask the health of everything else. Now logged and counted
+  only. The original justification claimed the row was "permanent by construction" and
+  would be rediscovered by every later sweep; that is **false** — the day cursor
+  advances past it — and the resulting storage leak is tracked as
+  `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`.
 - **`gc_destructive_last_blocked_timestamp_seconds{path}` and
   `gc_destructive_last_liveness_success_timestamp_seconds{path}` (new pair).** Failing
   closed is silent by design: nothing errors, nothing DLQs, the queue just stops
