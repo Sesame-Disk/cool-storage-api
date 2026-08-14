@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-14
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -61,8 +61,7 @@ of them updated.
 which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
 2026-08-04; the object-storage posture issue and the sync public-link token auth
 gap both closed 2026-08-07. This is not the same as "nothing is left": X1
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and X2
-(`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) remain open and still block
+(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) remains open and still blocks
 *enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
 B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
@@ -127,18 +126,28 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-Both are open, neither has a closed design, and `gc.enabled: false` is required
-on every replica in every DC until both close.
+X1 is open with no closed design. X2 closed 2026-08-14 (implemented 2026-08-13), proven on a real three-DC
+cluster. `gc.enabled: false` remains required on every replica in every DC — it now
+rests on X1 alone.
+
+**Read X1 as the whole fence-and-physical-identity workstream, not just the stale
+DELETE.** Never-reused physical keys are necessary but not sufficient: a shared
+per-candidate claim id lets one worker drop the publication fence while another is
+still deleting under it, and the reuse probe can then hand a writer back the very
+incarnation being destroyed — which generational keys cannot prevent, because no new
+incarnation is created. Closure criteria are in Registry X1.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA: an authorized S3 delete can land after a byte-identical re-upload | Registry X1 |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | Blocker (multi-DC) | `LOCAL_QUORUM` references can be invisible to GC in another DC | Registry X2 |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
 
 ## High / Medium — open (audit follow-ups)
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
+| `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
 | `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
@@ -185,8 +194,14 @@ on every replica in every DC until both close.
 
 Not findings — things nobody has proven either way.
 
-- **No multi-DC test exists.** X2, X6 and the whole cross-DC line of reasoning
-  are derived from the production consistency contract, never reproduced.
+- **A multi-DC harness now exists, and only X2 uses it.**
+  `docker-compose.cassandra-3dc.yaml` (three DCs, RF 1) plus
+  `scripts/x2-multidc-validation.sh` reproduce cross-DC consistency behaviour at the
+  wire level, and X2 is closed on that evidence — divergent-state visibility,
+  fail-closed with a DC down, reference-DC-down with the `QUORUM` mutation, both
+  topology-gate halves, and both consistency mutations. **X6 and the remaining cross-DC assumptions are still derived
+  from the production consistency contract and have never been reproduced**, even
+  though the instrument to do it is now checked in.
 - **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.

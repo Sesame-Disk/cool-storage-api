@@ -1,6 +1,6 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-07-21
+**Last Updated**: 2026-08-14
 **Session**: Upload-fence / GC safety PR series
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
@@ -17,7 +17,7 @@
 
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA and X2 cross-DC reference visibility. Keep `GC_ENABLED=false` everywhere; the implementation and lease exist but are not permission to activate deletion.
+2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA, now the sole blocker: X2 cross-DC reference visibility closed 2026-08-14 (destructive liveness at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster). Keep `GC_ENABLED=false` on every replica in every DC; the implementation and lease exist but are not permission to activate deletion.
 3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
 
 **Then review**:
@@ -27,10 +27,10 @@
 
 ### Quick Context
 1. **Sync Protocol**: Baseline-verified for the current desktop sync hardening scope. Do not treat it as frozen; compatibility-sensitive follow-up coverage still exists.
-2. **Backend API**: ~98% complete - OIDC ✅, GC implementation present but destructive activation blocked by X1/X2, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
+2. **Backend API**: ~98% complete - OIDC ✅, GC implementation present; destructive activation blocked by X1 alone (X2 closed 2026-08-14), Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
-5. **Current risk shape**: destructive GC has two confirmed live-data safety blockers (X1/X2) and must remain disabled fleet-wide. The upload-fence PR series addresses separate writer/GC races but does not close those activation gates.
+5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the activation gate now genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
 
 ### Inter-session Update (2026-05-21)
 
@@ -397,11 +397,11 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 
 ### 📊 Current State (Updated 2026-03-05)
 - **Sync Protocol**: 100% working, desktop clients fully compatible 🔒 FROZEN
-- **Backend API**: ~98% implemented — OIDC ✅, GC implementation present but destructive activation blocked by X1/X2, Library Settings ✅, OnlyOffice ✅, Tags cascade ✅, Org Admin Panel ✅, Superadmin Departments ✅
+- **Backend API**: ~98% implemented — OIDC ✅, GC implementation present; destructive activation blocked by X1 alone (X2 closed 2026-08-14), Library Settings ✅, OnlyOffice ✅, Tags cascade ✅, Org Admin Panel ✅, Superadmin Departments ✅
 - **Frontend UI**: ~83% functional (all modals migrated, folder icons ✅, ~51 ModalPortal wrappers to clean up)
-- **Production Ready**: blocked for destructive GC until X1/X2 close; keep `GC_ENABLED=false` on every replica/DC
+- **Production Ready**: blocked for destructive GC until X1 closes (X2 closed 2026-08-14); keep `GC_ENABLED=false` on every replica/DC
 - **Admin Panels**: Both superadmin and org admin at feature parity
-- **Active Bugs**: tracked canonically in `docs/KNOWN_ISSUES.md`; X1/X2 are current GC blockers
+- **Active Bugs**: tracked canonically in `docs/KNOWN_ISSUES.md`; X1 is the sole remaining GC blocker (X2 closed)
 
 ### Critical Facts to Remember
 

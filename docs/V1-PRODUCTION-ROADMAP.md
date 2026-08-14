@@ -1,7 +1,7 @@
 # SesameFS v1.0 — Production Readiness Roadmap
 
-**Last updated:** 2026-07-21
-**Current status:** GC production activation is blocked by X1/X2; see `IMPLEMENTATION_STATUS.md`
+**Last updated:** 2026-08-14
+**Current status:** GC production activation is blocked by X1 (X2 closed 2026-08-14); see `IMPLEMENTATION_STATUS.md`
 
 This document identifies every blocker, high-priority item, and fast-follow task required before
 the v1.0 production launch. Items are classified by priority and include current state analysis,
@@ -95,7 +95,7 @@ not a functional blocker. Important **pre-operational follow-ups** (not
 go/no-go blockers equivalent to readiness NF-1 / B4) include Accounts M2M
 hygiene and its runbook (`ISSUE-ACCOUNTS-M2M-PATH-01`,
 `ISSUE-ACCOUNTS-PROVISIONING-RUNBOOK-01` — the admin API-key channel itself
-already works). X1/X2 constrain **enabling destructive GC** but do not block
+already works). X1 constrains **enabling destructive GC** but does not block
 deployment while `GC_ENABLED=false` remains fleet-wide. The actual
 go/no-go security blockers are tracked in `KNOWN_ISSUES.md` Production Blockers
 (share-link password bypass, seafhttp abuse-control umbrella, plus multi-instance
@@ -554,7 +554,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 | **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Accounts can reuse the same API key system through a dedicated platform service account; the remaining work belongs to item #1.** | — |
-| **15** | **GC destructive-delete safety and activation** | **P0** | **The LWT lease (`gc_leases`) is implemented, but X1 physical-delete ABA and X2 cross-DC reference visibility remain open. Keep `GC_ENABLED=false` on every replica in every DC. Only after both close may designated replicas in one DC participate under the lease; all other DCs remain disabled. `SERIAL` does not make ordinary `LOCAL_QUORUM` reference writes globally visible.** | **blockers: X1/X2; then observability / crash drills** |
+| **15** | **GC destructive-delete safety and activation** | **P0** | **The LWT lease (`gc_leases`) is implemented. X2 cross-DC reference visibility is closed under the stable-topology contract; X1 physical-delete ABA remains open. Keep `GC_ENABLED=false` on every replica in every DC. Only after X1 closes may designated replicas in one DC participate under the lease; all other DCs remain disabled. A replication DC-set or RF change with existing reference state requires a separately certified migration. `SERIAL` does not make ordinary `LOCAL_QUORUM` reference writes globally visible.** | **blocker: X1; then observability / crash drills** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---
@@ -567,7 +567,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 - [#7] ✅ Enforcement Phase 2 wire-up — DONE (2026-03-28)
 
 ### Sprint 2 — Hard Blockers (CURRENT)
-- [#15] GC destructive-delete safety — lease coordination is implemented, but keep `GC_ENABLED=false` fleet-wide until X1/X2 both close; then activate designated replicas in one DC under the lease
+- [#15] GC destructive-delete safety — lease coordination is implemented, but keep `GC_ENABLED=false` fleet-wide until X1 closes; then activate designated replicas in one DC under the lease
 - [#9] Security hardening — small effort, high impact
 - [#1] Remaining Accounts integration — formalize service-account API key auth, provisioning endpoint, idempotency/audit
 

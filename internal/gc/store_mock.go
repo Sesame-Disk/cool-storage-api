@@ -174,6 +174,13 @@ type MockStore struct {
 	findOrgForLibraryErr           error
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 	blockHasReferencesErr          error
+	blockHasReferencesGlobalErr    error
+	blockHasReferencesLocalCalls   int
+	blockHasReferencesGlobalCalls  int
+	releaseStaleBlockClaimErr      error
+	releaseBlockClaimErr           error
+	claimBlockDeleteErr            error
+	validateDestructiveTopologyErr error
 	blockReferenceExistsErr        error
 	ensureBlockGCCandidateErr      error
 	deleteProvisionalProjectionErr error
@@ -1839,6 +1846,28 @@ func (m *MockStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
 }
 
 func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	m.mu.Lock()
+	m.blockHasReferencesLocalCalls++
+	m.mu.Unlock()
+	return m.blockHasReferencesShared(orgID, blockID)
+}
+
+// BlockHasReferencesGlobal mirrors the EACH_QUORUM read. It shares the reference
+// state and the concurrency hook with BlockHasReferences so tests that inject a
+// mid-claim reference still exercise claim-then-verify, but it counts separately and
+// honours its own error injection, which is how the fail-closed path is driven.
+func (m *MockStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error) {
+	m.mu.Lock()
+	m.blockHasReferencesGlobalCalls++
+	globalErr := m.blockHasReferencesGlobalErr
+	m.mu.Unlock()
+	if globalErr != nil {
+		return false, globalErr
+	}
+	return m.blockHasReferencesShared(orgID, blockID)
+}
+
+func (m *MockStore) blockHasReferencesShared(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.RLock()
 	current := len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0
 	hook := m.blockHasReferencesHook
@@ -1851,6 +1880,114 @@ func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, e
 		return hook(orgID, blockID, current)
 	}
 	return current, nil
+}
+
+// SetBlockHasReferencesGlobalErrForTest drives the fail-closed path: an unreachable
+// DC makes the EACH_QUORUM read fail, and GC must not delete on that uncertainty.
+func (m *MockStore) SetBlockHasReferencesGlobalErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockHasReferencesGlobalErr = err
+}
+
+// ValidateDestructiveGCTopology always passes for the mock: an in-memory store has
+// no keyspace whose replication could invalidate the per-DC EACH_QUORUM argument.
+// It is implemented because the gate is part of GCStore, so a store that forgets it
+// fails to compile rather than silently disarming the destructive gate.
+func (m *MockStore) ValidateDestructiveGCTopology() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.validateDestructiveTopologyErr
+}
+
+// SetValidateDestructiveGCTopologyErrForTest makes the mock's gate reject, so tests
+// can drive the fail-closed path through the real wiring instead of overriding the
+// worker's gate function.
+func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.validateDestructiveTopologyErr = err
+}
+
+// ReleaseStaleBlockClaim mirrors the Cassandra semantics: silent no-op when there is
+// nothing to release, so the common "referenced block, never claimed" path neither
+// errors nor warns; a stale claim is released regardless of which attempt owns it;
+// and a real failure is injectable to prove that callers refuse to settle a candidate
+// whose fence they could not confirm gone.
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.releaseStaleBlockClaimErr != nil {
+		return BlockClaimAbsent, m.releaseStaleBlockClaimErr
+	}
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockClaimAbsent, nil
+	}
+	if b.GCState != db.BlockGCStateDeleting {
+		return BlockClaimAbsent, nil
+	}
+	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
+		return BlockClaimTooFresh, nil
+	}
+	b.GCState = ""
+	b.GCClaimID = ""
+	b.GCClaimedAt = nil
+	return BlockClaimReleased, nil
+}
+
+// SetReleaseStaleBlockClaimErrForTest injects a failure into the stale-claim release.
+func (m *MockStore) SetReleaseStaleBlockClaimErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseStaleBlockClaimErr = err
+}
+
+// BackdateBlockClaimForTest ages an existing delete claim, so a test can model an
+// abandoned fence while leaving the worker on the real clock.
+//
+// The alternative — seeding a fresh claim and pushing w.clock() forward past
+// blockDeleteClaimStaleAfter — has a trap that has already produced a misleading
+// green. postponeItem stamps the requeued row with w.clock(), while
+// Queue.DequeueBatch derives its cutoff from time.Now(); those are the same instant in
+// production and only diverge under a test clock. A worker driven 15 minutes into the
+// future therefore requeues postponed items into the future, where no later pass can
+// dequeue them — so a multi-pass assertion would be testing an empty queue rather than
+// repeated refusals. Backdating the claim instead keeps both clocks agreeing.
+func (m *MockStore) BackdateBlockClaimForTest(orgID uuid.UUID, blockID string, claimedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return
+	}
+	at := claimedAt.UTC()
+	b.GCClaimedAt = &at
+}
+
+// SetClaimBlockDeleteErrForTest injects a failure into the LWT claim.
+//
+// An LWT can fail for availability reasons depending on its serial and regular
+// consistency levels and on which replicas are reachable — Paxos needs its serial
+// quorum on top of the ordinary one, so contention and a degraded cluster surface here
+// first. This hook drives the worker's TREATMENT of such a failure (postpone, not DLQ);
+// it deliberately does not model any rule of the form "one DC down implies the claim
+// fails". SERIAL and LOCAL_SERIAL are consistencies of the Paxos phase; EACH_QUORUM,
+// the level X2 turns on, is a per-datacenter requirement of an ordinary read. Conflating
+// the two is what produced an incorrect advisory once already.
+func (m *MockStore) SetClaimBlockDeleteErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimBlockDeleteErr = err
+}
+
+// BlockHasReferencesCallCountsForTest reports how many liveness reads of each kind
+// were issued, so a test can assert which one authorized a delete.
+func (m *MockStore) BlockHasReferencesCallCountsForTest() (local, global int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.blockHasReferencesLocalCalls, m.blockHasReferencesGlobalCalls
 }
 
 func (m *MockStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {
@@ -2101,6 +2238,9 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.claimBlockDeleteErr != nil {
+		return false, m.claimBlockDeleteErr
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
 	if !ok {
@@ -2124,10 +2264,25 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (
 	return true, nil
 }
 
+// SetReleaseBlockClaimErrForTest injects a failure into the post-claim release.
+//
+// The interesting injection is a NON-availability error. Those used to surface as
+// ordinary failures, spend the item's retry budget and reach the DLQ while
+// gc_state='deleting' stayed on the row — a permanent upload fence on a block the
+// walk may have just proven to be still referenced. See Worker.releaseBlockClaim.
+func (m *MockStore) SetReleaseBlockClaimErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseBlockClaimErr = err
+}
+
 func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.releaseBlockClaimErr != nil {
+		return m.releaseBlockClaimErr
+	}
 	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
 		if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
 			return fmt.Errorf("block delete claim release not applied for %s", blockID)

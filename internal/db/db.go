@@ -270,6 +270,156 @@ func isMultiRegionNetworkTopology(replication cassandraReplicationSettings) bool
 	return dcs > 1
 }
 
+// ValidateDestructiveGCTopology reports whether the live keyspace replication makes
+// the per-DC EACH_QUORUM liveness argument sound.
+//
+// Closing ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 rests on a quorum-intersection
+// argument that is stated PER DATACENTER: an EACH_QUORUM read must obtain a quorum
+// in every DC, so it intersects the quorum that acknowledged a LOCAL_QUORUM
+// reference write in whichever DC accepted it. That argument presumes
+// NetworkTopologyStrategy with every replica-holding DC in the keyspace map. Under
+// SimpleStrategy there are no per-DC quorums for EACH_QUORUM to intersect, and the
+// closure does not hold — so the destructive path must refuse to run rather than
+// delete under an argument that does not apply.
+//
+// This reads live keyspace metadata rather than configuration, because the
+// deployment map comes from the environment (CASSANDRA_REPLICATION_DCS) and the
+// checked-in profiles are not the source of truth about the fleet. It then requires
+// the live map to equal the declared one — see the comment on that comparison for
+// what it does and does not prove, which is narrower than "the topology cannot
+// change".
+//
+// A single-DC NetworkTopologyStrategy map passes deliberately. There, EACH_QUORUM
+// and LOCAL_QUORUM denote the same quorum, so the cross-DC argument is vacuous — but
+// it is vacuously TRUE, not violated: there is no second DC whose acknowledged write
+// could be missed. The gate exists to reject topologies where EACH_QUORUM carries no
+// per-DC meaning at all, not to require multi-DC.
+func (db *DB) ValidateDestructiveGCTopology() error {
+	meta, err := loadKeyspaceMetadata(db.session, db.config.Keyspace)
+	if err != nil {
+		return fmt.Errorf("read keyspace replication for destructive GC gate: %w", err)
+	}
+	if !meta.Exists {
+		return missingKeyspaceError(db.config.Keyspace)
+	}
+	return validateDestructiveGCTopology(meta.Replication, db.config)
+}
+
+// validateDestructiveGCTopology holds the gate's decision logic, separated from the
+// session read so it can be exercised directly against synthetic replication maps.
+func validateDestructiveGCTopology(live cassandraReplicationSettings, cfg config.DatabaseConfig) error {
+	keyspace := cfg.Keyspace
+
+	// The intersection argument has a precondition on the WRITE side that no
+	// replication map can express. The proof is "a reference acknowledged at
+	// LOCAL_QUORUM in some datacenter intersects the EACH_QUORUM read's quorum in that
+	// same datacenter", which presumes the write reached a quorum at all. Under ONE it
+	// need not: a single replica can acknowledge while a later per-DC read quorum of
+	// 2-of-3 misses the row entirely, and every structural check below would still pass.
+	//
+	// THE PRIMARY ENFORCEMENT IS NOT HERE. Every producer now pins the write per
+	// statement (BlockReferenceWriteConsistency), because references are written by API
+	// nodes — other processes, with their own configuration, that no check this worker
+	// runs can see. Reading cfg.Consistency proves something about the GC process, and
+	// the GC process is not the writer.
+	//
+	// It stays as a second line for the writers this binary cannot speak for: an older
+	// or rebuilt binary in the fleet whose producers predate the pin, or a future one
+	// that adds a producer and misses it. A deployment that configures ONE at all is
+	// telling us which of those is likely, and destructive GC is not the place to give
+	// it the benefit of the doubt.
+	//
+	// A whitelist rather than a blacklist, because this is a safety gate: a consistency
+	// level added to the config validator later should have to be reasoned about here
+	// before destructive GC accepts it, not inherited silently. The empty string is the
+	// unset default, which config validation normalizes to LOCAL_QUORUM before any real
+	// session exists.
+	switch normalized := strings.ToUpper(strings.TrimSpace(cfg.Consistency)); normalized {
+	case "", "LOCAL_QUORUM", "QUORUM", "EACH_QUORUM", "ALL":
+	default:
+		return fmt.Errorf(
+			"destructive GC requires reference writes to reach a quorum so the EACH_QUORUM liveness read has something to intersect; database consistency is %s. Use LOCAL_QUORUM (every shipped profile does) or stronger",
+			normalized,
+		)
+	}
+
+	if normalizeReplicationClass(live.Class) != "NetworkTopologyStrategy" {
+		return fmt.Errorf(
+			"destructive GC requires NetworkTopologyStrategy so EACH_QUORUM carries a per-datacenter quorum; keyspace %s uses %s",
+			keyspace, live.Class,
+		)
+	}
+
+	dcs := map[string]string{}
+	for dc, rf := range live.Options {
+		if strings.EqualFold(strings.TrimSpace(dc), "replication_factor") {
+			continue
+		}
+		dcs[strings.TrimSpace(dc)] = strings.TrimSpace(rf)
+	}
+	if len(dcs) == 0 {
+		return fmt.Errorf("destructive GC requires at least one datacenter in the replication map for keyspace %s", keyspace)
+	}
+	for dc, rf := range dcs {
+		factor, convErr := strconv.Atoi(rf)
+		if convErr != nil || factor < 1 {
+			return fmt.Errorf("destructive GC requires a positive replication factor in every datacenter; %s has %q", dc, rf)
+		}
+	}
+
+	// The coordinator's own DC must hold replicas, otherwise "every DC" as this node
+	// understands it is not the same set the writers acknowledge into.
+	localDC := strings.TrimSpace(cfg.LocalDC)
+	if localDC != "" {
+		if _, ok := dcs[localDC]; !ok {
+			return fmt.Errorf(
+				"destructive GC requires local_dc %q to hold replicas; keyspace %s replicates to %s",
+				localDC, keyspace, formatReplicationOptions(live.Options),
+			)
+		}
+	}
+
+	// The live map must be EXACTLY the declared one. A structurally valid map is not
+	// enough, because the quorum-intersection proof is about the replica set that
+	// ACCEPTED each reference write, not the one in effect at read time. Shrinking
+	// the map — `ALTER KEYSPACE ... {dc-na:1}` after references were acknowledged in
+	// dc-eu — leaves every structural check above satisfied while EACH_QUORUM quietly
+	// stops being obliged to contact dc-eu at all, and Cassandra does not move
+	// historical data into the new replica set on its own.
+	//
+	// BE PRECISE ABOUT WHAT THIS PROVES. It compares the topology in effect NOW
+	// against the topology this process was configured with NOW. That catches the
+	// realistic accident — someone alters the keyspace and forgets the deployment
+	// config, or vice versa — but it is NOT proof that the map is unchanged since the
+	// references were written. An operator who changes both together
+	// (ALTER KEYSPACE, then CASSANDRA_REPLICATION_DCS, then restart) passes this gate
+	// while historical references still live in the dropped datacenters.
+	//
+	// Closing that hole in code would take a certified fingerprint: persist the
+	// replication map at first destructive activation and require an explicit
+	// recertification step after any topology change, so the check becomes
+	// "today's topology == the certified one" rather than "today's topology ==
+	// today's config". Deliberately not built here — it is a new piece of persisted
+	// protocol, and the gap it closes is only reachable through a deliberate,
+	// multi-step administrative change, which is precisely what the documented
+	// procedure covers. Until then the remaining guarantee is operational, and stated
+	// as such in the error below and in KNOWN_ISSUES: topology changes require GC off,
+	// alter, repair, reconfigure, re-enable.
+	declared := configuredReplicationSettings(cfg)
+	if !sameReplicationSettings(declared, live) {
+		return fmt.Errorf(
+			"destructive GC requires the live keyspace replication to match the declared topology exactly; keyspace %s is %s %s but CASSANDRA_REPLICATION_DCS declares %s %s. "+
+				"A replication map that changed after references were written invalidates the per-datacenter EACH_QUORUM argument. "+
+				"To change topology: set GC_ENABLED=false everywhere, ALTER the keyspace, run the corresponding repair, update the declared map, then re-enable GC",
+			keyspace,
+			live.Class, formatReplicationOptions(live.Options),
+			declared.Class, formatReplicationOptions(declared.Options),
+		)
+	}
+
+	return nil
+}
+
 // Close closes the database connection.
 func (db *DB) Close() {
 	if db.session != nil {

@@ -14,6 +14,38 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.S
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+	// GCFailureCodeBlockClaimNotYetStale marks a candidate that cannot be settled
+	// yet because a delete claim on its block is too young to hand back safely. The
+	// item is postponed, not retried and not failed.
+	GCFailureCodeBlockClaimNotYetStale = "block_claim_not_yet_stale"
+	// GCFailureCodeDestructiveFailClosed marks a delete refused because the
+	// environment could not authorize it — an unreachable datacenter, or a
+	// replication map that no longer carries the per-DC EACH_QUORUM argument. These
+	// are postponed rather than retried, so the code exists mainly to make the
+	// refusal legible; it should not normally reach the DLQ.
+	GCFailureCodeDestructiveFailClosed = "destructive_fail_closed"
+	// GCFailureCodeBlockClaimReleaseUnconfirmed marks a candidate whose block still
+	// carries a stale delete claim that this pass tried and failed to hand back.
+	//
+	// It postpones for ANY failure reason, not only an availability one, and that
+	// breadth is the whole point. This queue item is the only work that will ever
+	// lift that fence: block items do not auto-recover from the DLQ, and the
+	// scanner's day cursor has already moved past the candidate, so spending the
+	// retry budget here strands a LIVE block behind gc_state='deleting' forever and
+	// BlockDeleteFenceActive then refuses every future upload of that content. An
+	// unknown column or a CQL bug in the release statement is exactly as fatal to
+	// that fence as an unreachable datacenter is.
+	//
+	// The cost of that breadth is a permanently failing release postponing forever
+	// instead of surfacing in the DLQ, which is the same trade documented on
+	// isClusterUnavailableError's timeout codes. It is paid deliberately, and the
+	// visibility it gives up is bought back by a dedicated
+	// gc_errors_total{type="stale_claim_release_failed"} counter rather than left
+	// silent. That counter is deliberately NOT seeded at registration: unlike the
+	// destructive blocked/liveness gauge pair — where an absent series silently drops
+	// out of a comparison — a counter that has never fired is simply absent, and
+	// `increase(...) > 0` reads absence as "did not happen", which is true.
+	GCFailureCodeBlockClaimReleaseUnconfirmed = "block_claim_release_unconfirmed"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -65,20 +97,60 @@ type GCStore interface {
 	// already removed (absent → proceed with S3 cleanup).
 	BlockExists(orgID uuid.UUID, blockID string) (bool, error)
 	// BlockHasReferences reports whether any block_references row still exists for
-	// the block. This is the liveness check that replaces reading ref_count.
+	// the block, at the session consistency. TRUE is proof and may abort a delete;
+	// FALSE proves only local absence, so it may drive discovery but MUST NOT
+	// authorize destroying bytes. Use BlockHasReferencesGlobal for that.
 	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	// BlockHasReferencesGlobal is the same liveness check pinned to EACH_QUORUM, so
+	// it intersects every DC that can acknowledge a LOCAL_QUORUM reference write.
+	// Its FALSE answer is the ONLY one that may authorize a physical delete
+	// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). An unreachable DC makes it fail;
+	// callers must fail closed rather than treat the error as "no references".
+	BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error)
+	// ValidateDestructiveGCTopology reports whether the live keyspace replication
+	// still supports the per-datacenter EACH_QUORUM argument that authorizes
+	// physical deletes. It is part of this interface rather than an optional
+	// capability so the guarantee cannot be lost by wrapping the store: dropping it
+	// is a compile error, not a silently disarmed safety gate.
+	ValidateDestructiveGCTopology() error
 	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error)
 	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
 	// and records the deterministic claimID for the logical delete attempt.
-	// Callers MUST re-check BlockHasReferences after a successful claim before
-	// deleting from S3 (claim-then-verify).
+	// Callers MUST re-check BlockHasReferencesGlobal — the EACH_QUORUM form, never
+	// the session-consistency one — after a successful claim before deleting from S3
+	// (claim-then-verify). Verifying with the local read reopens
+	// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01.
 	ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error)
 	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
 	// row. This prevents another attempt from releasing a claim it did not win.
+	// It returns an error when the conditional update does not apply, so callers
+	// that must observe the release use it rather than ReleaseStaleBlockClaim.
 	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// ReleaseStaleBlockClaim clears gc_state on a block whose delete claim was taken
+	// at or before staleBefore, WHICHEVER attempt owns it. Age is the only criterion,
+	// and that is the point: an unconditional release would let one worker drop the
+	// fence out from under another worker's in-flight delete, while an owner-only
+	// release cannot lift a claim whose owner will never come back.
+	//
+	// The owner-only form was the earlier design and it leaks. claimID derives from
+	// the candidate timestamp, so a claim left behind by candidate C1 carries C1's id;
+	// a later candidate C2 finds an id that is not its own, concludes "someone else's
+	// pass will lift it", and settles. If C1's queue item is gone — DLQ'd, and block
+	// items never auto-recover from there — nothing ever lifts it, and
+	// BlockDeleteFenceActive refuses every future upload of that content forever.
+	// Releasing by age closes that: the only claim this can touch is one older than
+	// any possible live attempt.
+	//
+	// The outcome is three-valued on purpose. "Nothing to release" and "there IS a
+	// claim, but it is too young to touch" demand opposite things from the caller:
+	// the first means the item is settled, the second means it emphatically is not,
+	// because that fence still has to come off later and this candidate is what will
+	// do it. Collapsing them into a single false is how a live block ends up fenced
+	// forever — see BlockClaimTooFresh.
+	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
 	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
@@ -586,6 +658,32 @@ type AuditLogEntry struct {
 	Details    string // JSON or free-text with extra context
 	Timestamp  time.Time
 }
+
+// BlockClaimReleaseOutcome is what ReleaseStaleBlockClaim observed about a block's
+// delete claim. The distinction between "absent" and "too fresh" is load-bearing:
+// only the first means the caller may settle its candidate.
+type BlockClaimReleaseOutcome int
+
+const (
+	// BlockClaimAbsent: the block carries no delete claim at all. Safe to settle.
+	BlockClaimAbsent BlockClaimReleaseOutcome = iota
+	// BlockClaimReleased: a stale claim was handed back. Safe to settle.
+	BlockClaimReleased
+	// BlockClaimTooFresh: a claim exists but was taken too recently to distinguish
+	// from a live in-flight attempt, so it was left alone. Its owner is irrelevant —
+	// a fresh claim belonging to another candidate is exactly as unsafe to lift as a
+	// fresh claim belonging to this one.
+	//
+	// The caller must NOT settle. A claim younger than the staleness threshold may
+	// belong to a worker still deleting — releasing it drops the upload fence
+	// mid-delete — but it may equally belong to a worker that died seconds ago, in
+	// which case the fence still has to come off eventually. This candidate is the
+	// only work item that will ever look at that block again, so consuming it now
+	// leaves gc_state='deleting' with nothing left to clear it: the block is fenced
+	// against every future upload of its content, permanently. Postpone instead and
+	// let a later pass release the claim once it has aged out.
+	BlockClaimTooFresh
+)
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.
 // Allows mocking the storage layer in tests.

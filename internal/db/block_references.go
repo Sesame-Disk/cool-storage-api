@@ -935,6 +935,42 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 	return probe, nil
 }
 
+// BlockReferenceWriteConsistency is the consistency level EVERY write to
+// block_references must reach, pinned per statement rather than inherited from the
+// session.
+//
+// It is the write half of the destructive-GC liveness argument
+// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). BlockHasReferencesGlobal reads at
+// EACH_QUORUM so a FALSE answer may authorize destroying bytes, and that answer is
+// only trustworthy because a reference acknowledged at LOCAL_QUORUM in some
+// datacenter necessarily intersects the read's quorum in that same datacenter. Under
+// ONE a single replica can acknowledge a reference that a later per-DC read quorum of
+// 2-of-3 never sees — and `ONE` is an accepted `database.consistency`, so inheriting
+// the session made that a deployment typo away.
+//
+// PINNED HERE BECAUSE THE READER CANNOT ENFORCE IT. ValidateDestructiveGCTopology
+// checks the consistency of the process running GC; references are written by API
+// nodes, which are different processes with their own configuration, and no gate the
+// worker runs can see them. The invariant is a property of the writers, so it belongs
+// at the writers.
+//
+// THE FLOOR IS ALSO THE CEILING, which is a real trade and not a detail. A deployment
+// configured for EACH_QUORUM or ALL now writes references at LOCAL_QUORUM — this pin
+// LOWERS a stronger configured level, and it is worth being explicit that it does. The
+// reason is that a pin varying with configuration gives back the exact property the
+// constant exists to establish: "references reached a quorum" would once again mean
+// "whatever that process was configured with", which is unverifiable from the reader's
+// side and is how ONE got in. What is given up is only cross-DC promptness, never
+// safety: the destructive read is EACH_QUORUM regardless, so it still intersects; every
+// other reader of block_references is a local check whose false zero costs a redundant
+// re-upload or an enqueued candidate that the global verify then declines to delete.
+// Every shipped profile already runs LOCAL_QUORUM, so no deployment changes behaviour.
+//
+// TestBlockReferenceProducersPinWriteConsistency enumerates the statements this
+// applies to; a new producer fails that test until it is pinned or exempted with a
+// reason.
+const BlockReferenceWriteConsistency = gocql.LocalQuorum
+
 // AddBlockReference registers a reference to a block. Idempotent: re-adding the
 // same (block, referrer) overwrites a row with identical key. ttlSeconds > 0 makes
 // the row expire (for example publish-attempt references); 0 means permanent.
@@ -944,17 +980,46 @@ func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlS
 		return db.Session().Query(`
 			INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
 			VALUES (?, ?, ?, ?, ?) USING TTL ?
-		`, orgID, blockID, referrer, libraryID, now, ttlSeconds).Exec()
+		`, orgID, blockID, referrer, libraryID, now, ttlSeconds).Consistency(BlockReferenceWriteConsistency).Exec()
 	}
 	return db.Session().Query(`
 		INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
 		VALUES (?, ?, ?, ?, ?)
-	`, orgID, blockID, referrer, libraryID, now).Exec()
+	`, orgID, blockID, referrer, libraryID, now).Consistency(BlockReferenceWriteConsistency).Exec()
 }
 
 // RemoveBlockReference deletes a single (block, referrer) reference. Idempotent:
 // deleting a non-existent row is a no-op, so a retried GC pass or publish-attempt
 // cleanup is always safe. Upload up: references are not removed through this API.
+//
+// DELIBERATELY NOT PINNED to BlockReferenceWriteConsistency, and the asymmetry is the
+// point — but NOT for the reason an earlier version of this comment gave. It claimed
+// an under-replicated DELETE "leaves the row visible, so GC declines to collect and
+// the bytes survive one more pass", i.e. that a weak delete biases toward keeping
+// data. That is not a property of Cassandra. A DELETE writes a timestamped tombstone,
+// the mutation is sent to every replica regardless of consistency level, and
+// reconciliation is last-write-wins — so a quorum read that touches the tombstone
+// resolves to "absent" and repairs the others with it. A delete acknowledged by one
+// replica can absolutely make the row invisible to a later per-DC read quorum. There
+// is no structural bias toward keeping data here to lean on.
+//
+// What actually makes the exemption safe is the PROTOCOL, not the consistency level.
+// The X2 premise concerns CREATING a live reference: that write must reach a quorum,
+// because the destructive read's zero is only trustworthy if it intersects whatever
+// acknowledged it. Removing a reference creates no such obligation — its safety rests
+// on this call only ever being made once the referrer has lost authority over the
+// block. Both callers satisfy that by construction: the publish-attempt cleanup
+// retires a TTL'd provisional reference, and the GC cascade removes an fs_object's
+// reference as that fs_object is being deleted. The window between publishing a new
+// reference and removing an old one is the publication fence, which belongs to X1
+// (ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01), not to the consistency of this
+// statement.
+//
+// Pinning the delete to LOCAL_QUORUM as well would be harmless — it is already the
+// effective level in every shipped profile — and would remove the need to explain the
+// asymmetry at all. It is left inheriting the session because the pin is a safety
+// mechanism with a specific justification, and applying it where that justification
+// does not hold would blur what it means everywhere else.
 func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 	return db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?
@@ -963,12 +1028,44 @@ func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 
 // BlockHasReferences reports whether any reference row still exists for the block.
 // This single-partition point read replaces reading the mutable blocks.ref_count.
+//
+// It runs at the session consistency (LOCAL_QUORUM in every shipped profile), so a
+// TRUE answer is proof — a row visible locally is a real reference — while a FALSE
+// answer proves only that the local DC has not seen one. That asymmetry is why this
+// call is safe for discovery and short-circuit aborts but MUST NOT authorize a
+// physical delete. Use BlockHasReferencesGlobal for that
+// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
 func (db *DB) BlockHasReferences(orgID, blockID string) (bool, error) {
-	var referrer string
-	err := db.Session().Query(`
+	return scanBlockHasReferences(db.Session().Query(`
 		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&referrer)
-	if err != nil {
+	`, orgID, blockID))
+}
+
+// BlockHasReferencesGlobal is the destructive-authorization liveness read: the only
+// form whose FALSE answer may authorize deleting physical bytes.
+//
+// It pins EACH_QUORUM per query rather than inheriting the session default, so the
+// read must obtain a quorum in EVERY datacenter. A reference write acknowledged at
+// LOCAL_QUORUM in any DC therefore intersects this read's quorum in that same DC,
+// and GC cannot conclude "zero references" while one exists somewhere else. If any
+// DC is unreachable the read fails and the caller must fail closed — deleting on an
+// uncertain read is exactly the defect this closes.
+//
+// The per-DC argument presumes NetworkTopologyStrategy with every replica-holding DC
+// in the keyspace map; under SimpleStrategy EACH_QUORUM does not carry it. The
+// destructive path gates on that separately.
+func (db *DB) BlockHasReferencesGlobal(orgID, blockID string) (bool, error) {
+	return scanBlockHasReferences(db.Session().Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Consistency(gocql.EachQuorum))
+}
+
+// scanBlockHasReferences turns the shared LIMIT 1 probe into a boolean. Absence is
+// reported as "no references"; every other error propagates, so an unreachable DC
+// under EACH_QUORUM surfaces as an error rather than as a false zero.
+func scanBlockHasReferences(query *gocql.Query) (bool, error) {
+	var referrer string
+	if err := query.Scan(&referrer); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
 		}

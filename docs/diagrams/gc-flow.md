@@ -10,9 +10,9 @@
 > [../GC-DELETE-CLEANUP-INVESTIGATION.md](../GC-DELETE-CLEANUP-INVESTIGATION.md).
 >
 > **Operator gate:** keep `GC_ENABLED=false` on every replica in every DC while X1
-> physical-delete ABA or X2 cross-DC reference visibility remains open. The lease
-> does not close either blocker. Only after both close may designated replicas in
-> one DC participate under the lease.
+> physical-delete ABA remains open. X2 cross-DC reference visibility is closed under
+> its stable-topology operational contract. The lease does not close X1. Only after
+> X1 closes may designated replicas in one DC participate under the lease.
 
 ## 1. Worker loop
 

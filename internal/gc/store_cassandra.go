@@ -1841,9 +1841,112 @@ func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, err
 	return true, nil
 }
 
-// BlockHasReferences reports whether any block_references row still exists.
+// BlockHasReferences reports whether any block_references row still exists, at the
+// session consistency. Discovery and abort-early only — see the interface contract.
 func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
 	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+// BlockHasReferencesGlobal is the EACH_QUORUM liveness read that authorizes physical
+// deletion. Errors (including an unreachable DC) propagate so the caller fails closed.
+func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID string) (bool, error) {
+	return s.db.BlockHasReferencesGlobal(orgID.String(), blockID)
+}
+
+// ReleaseStaleBlockClaim hands back a delete claim left behind by an attempt that
+// died between claiming and releasing. It reads the claim first so the common case —
+// no claim at all — costs one point read and reports "nothing to do" instead of a
+// failed conditional update, and so a claim young enough to belong to a concurrent
+// in-flight attempt is left strictly alone.
+//
+// Age is the whole test; the owning claim id is read but never compared against the
+// caller's. See the interface contract for why an owner-only release strands blocks
+// behind a permanent fence.
+//
+// A claim with no gc_claimed_at is treated as too fresh rather than as releasable.
+// That is the fail-safe direction: the timestamp is written in the same statement as
+// the claim, so its absence means an unexpected row shape, and guessing "old enough"
+// there would drop a fence on no evidence.
+//
+// The conditional update pins gc_claimed_at as well as the claim id it observed, so a
+// claim that gets released and re-taken between the read and the write is not the one
+// this call hands back.
+//
+// KNOWN RESIDUAL — THIS READ IS AT SESSION CONSISTENCY, AND A FALSE "ABSENT" COSTS THE
+// CANDIDATE. Every other read in this file was audited for the X2 asymmetry ("a local
+// positive is proof, a local zero authorizes nothing"), and this one does not fit that
+// shape: its zero DOES authorize something. BlockClaimAbsent makes processBlock fall
+// through to DeleteBlockGCCandidate, consuming the only work item that could ever lift
+// the fence — so a read that misses an existing claim strands the block behind
+// gc_state='deleting' exactly as consuming the item on an error would.
+//
+// Two ways it can miss one, neither of which is data loss (nothing here authorizes a
+// delete; the cost is a permanent upload refusal on that content):
+//
+//   - CROSS-DATACENTER. ClaimBlockDelete's LWT commits at the regular consistency of
+//     the writing process, so a claim taken by a worker in another DC is acknowledged
+//     by a quorum THERE. With RF 1 per DC those replica sets do not intersect, and this
+//     LOCAL_QUORUM read can legitimately see no claim. Same geometry as X2 itself,
+//     which is why it is worth naming rather than assuming away.
+//   - THE PAXOS WINDOW, same DC. A LWT accepted but not yet committed when its proposer
+//     died is materialized by a SERIAL read and may be missed by an ordinary one.
+//
+// WHY IT IS NOT FIXED HERE, rather than fixed badly. Both candidate fixes cost more
+// than the residual:
+//
+//   - EACH_QUORUM on this read closes the cross-DC case, but this is the DISCARD path —
+//     it runs for every candidate that turns out to be still referenced — so it would
+//     couple ordinary queue drain to every datacenter being reachable. A single DC
+//     outage would stop referenced-block candidates settling at all. It also does
+//     nothing for the Paxos window.
+//   - A SERIAL read is the linearizable read for LWT-written state, but SERIAL takes a
+//     GLOBAL quorum (2 of 3 at RF 1 in three DCs), which need not intersect a claim
+//     committed under LOCAL_SERIAL in one DC — and mixing the two levels on the blocks
+//     partition is precisely the one-serial-domain violation R12 tracks.
+//
+// So the clean fix depends on the serial-domain decision X1 has to make anyway, and is
+// recorded with it (ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01) rather than half-made
+// here. Until then: the exposure is a stale claim taken by a GC worker in a DIFFERENT
+// datacenter and then abandoned, and destructive GC runs nowhere.
+func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+	var gcState, gcClaimID string
+	var gcClaimedAt time.Time
+	err := s.db.Session().Query(`
+		SELECT gc_state, gc_claim_id, gc_claimed_at FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&gcState, &gcClaimID, &gcClaimedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return BlockClaimAbsent, nil
+		}
+		return BlockClaimAbsent, err
+	}
+	if gcState != db.BlockGCStateDeleting {
+		return BlockClaimAbsent, nil
+	}
+	if gcClaimedAt.IsZero() || gcClaimedAt.After(staleBefore) {
+		return BlockClaimTooFresh, nil
+	}
+
+	applied, err := s.db.Session().Query(`
+		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
+		WHERE org_id = ? AND block_id = ?
+		IF gc_state = ? AND gc_claim_id = ? AND gc_claimed_at = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, gcClaimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return BlockClaimAbsent, err
+	}
+	if !applied {
+		// The row changed between the read and the conditional write — someone
+		// re-claimed it. Treat that as a live claim rather than as nothing to do.
+		return BlockClaimTooFresh, nil
+	}
+	return BlockClaimReleased, nil
+}
+
+// ValidateDestructiveGCTopology gates every physical delete on the live keyspace
+// replication still supporting EACH_QUORUM's per-datacenter semantics.
+func (s *CassandraStore) ValidateDestructiveGCTopology() error {
+	return s.db.ValidateDestructiveGCTopology()
 }
 
 func (s *CassandraStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error) {

@@ -34,10 +34,12 @@ plan integration tests for long-running monitoring.
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 >
-> **Production activation gate (2026-07-21):** X1 physical-delete ABA and X2
-> cross-DC reference visibility remain open. Keep `GC_ENABLED=false` on every
-> replica in every DC. The leader lease does not close either blocker. Only after
-> both close may designated replicas in one DC participate under the lease.
+> **Production activation gate (updated 2026-08-14):** X1 physical-delete ABA
+> remains open; X2 cross-DC reference visibility is closed under its stable-topology
+> operational contract. Keep `GC_ENABLED=false` on every replica in every DC. The
+> leader lease does not close X1. Only after X1 closes may designated replicas in one
+> DC participate under the lease, and a replication DC-set or RF change with existing
+> reference state requires a separately certified migration.
 
 ---
 
@@ -182,10 +184,11 @@ batch, so deleting N block items does not rescan every `fs_object` N times.
 These are deliberate safety mechanisms that are correctly implemented and tested:
 
 1. **Claim-then-verify block deletion** — Cassandra lightweight transactions only guard
-   the delete claim, and the worker re-checks live `block_references` before S3
-   deletion before authorization. It does not close X1: Cassandra claims/generations cannot
-   revoke an S3 DELETE already in flight; only never-reused generational physical keys close
-   that ABA. This mechanism must not be treated as production-safe activation while X1/X2 are open.
+   the delete claim, and the worker re-checks live `block_references` at `EACH_QUORUM`
+   (`BlockHasReferencesGlobal`) before authorizing the S3 delete. It does not close X1:
+   Cassandra claims/generations cannot revoke an S3 DELETE already in flight; only
+   never-reused generational physical keys close that ABA. This mechanism must not be
+   treated as production-safe activation while X1 is open.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to finish registering or promoting references.
 3. **Idempotent cleanup by liveness rows** — keyed `block_references` rows replace the
@@ -563,8 +566,10 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 **Scaling recommendations:**
 - Increase `batch_size` (e.g., 500) for faster processing
 - Reduce `worker_interval` (e.g., 10s) for more frequent ticks
-- Production: keep GC disabled on every node/DC while X1/X2 remain open. After both
-  close, designated replicas in one DC may participate under the existing LWT lease.
+- Production: keep GC disabled on every node/DC while X1 remains open. X2 is closed
+  under the stable-topology operational contract. After X1 closes, designated replicas
+  in one DC may participate under the existing LWT lease; a replication DC-set or RF
+  change with existing reference state requires a separately certified migration.
 
 ---
 
@@ -572,7 +577,7 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1/X2 still block destructive GC |
+| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1 still blocks destructive GC |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
 | **Test coverage** | Good | Unit, race, and Docker integration suites cover the GC lifecycle; failure and concurrency coverage should continue expanding |
 | **Error handling** | Adequate | Retries with cap; S3 orphan is the main gap |

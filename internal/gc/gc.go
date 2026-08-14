@@ -172,6 +172,9 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 	queue := NewQueue(store)
 	stats := &Stats{}
 
+	// NewWorker arms the destructive topology gate from the store itself:
+	// ValidateDestructiveGCTopology is part of GCStore, so there is no wiring here to
+	// forget and no store shape that can end up ungated.
 	worker := NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats)
 	scanner := NewScanner(store, queue, stats, cfg)
 	scanner.SetOrphanRecoverer(worker)

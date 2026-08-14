@@ -8,6 +8,406 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-13 - X2 cross-DC reference visibility: EACH_QUORUM destructive liveness
+
+First runtime change of the X1/X2 series. Implements the cross-DC half without r3: no
+generations, no physical incarnations, no extra writer round trip, and no `SERIAL+ALL`
+fence — that fence serves the publication TOCTOU, a different property. Destructive
+GC stays disabled. X2 is closed on the three-DC evidence below; X1 is the sole runtime
+activation blocker.
+
+**The writer path did change**, and an earlier draft of this entry claimed it had not.
+Reference writes now pin `LOCAL_QUORUM` explicitly instead of inheriting the session
+(`db.BlockReferenceWriteConsistency`). The accurate statement is: *no additional writer
+round trip, and no WAN consistency added to the shipped upload path* — `EACH_QUORUM`
+stays on the GC read alone. Every shipped profile already ran `LOCAL_QUORUM`, so no
+deployment changes behaviour; a deployment that had configured `EACH_QUORUM` or `ALL`
+for reference writes would be lowered to `LOCAL_QUORUM` by the pin.
+
+The invariant now enforced:
+
+> Every physical delete is authorized by a liveness read that intersects every DC
+> able to acknowledge a `LOCAL_QUORUM` reference write.
+
+- `db.BlockHasReferencesGlobal` pins `EACH_QUORUM` per query and backs
+  `processBlock`'s claim-then-verify, the only read that may authorize destruction
+  there. The pre-claim check, the scanner and `enqueueZeroRefBlocks` stay at session
+  consistency on purpose: the zero-check is asymmetric, so a local positive is proof
+  enough to abort while a local zero authorizes nothing.
+- `RecoverS3Orphans` performs its own global verify rather than inheriting one
+  transitively from the orphan row. The transitive argument is sound going forward but
+  rests on a greenfield precondition that code cannot enforce and that fails silently;
+  recovery is the cold path, so it establishes the zero itself.
+- `ValidateDestructiveGCTopology` gates both destructive paths on live keyspace
+  replication being `NetworkTopologyStrategy`, with a positive RF per mapped DC, the
+  local DC among them, and **the live map exactly equal to the declared one**. The
+  proof concerns the replica set that accepted each write, so a shrunk map passes every
+  structural check while `EACH_QUORUM` stops being obliged to reach the DCs holding
+  those references. The gate is part of `GCStore`, so dropping it is a compile error
+  rather than a silent disarm, and it is re-evaluated per attempt since replication can
+  change at runtime. It compares today's topology against today's config, which catches
+  the realistic accident but is **not** proof the map is unchanged since the references
+  were written — an operator changing both together still passes. Enforcing that needs
+  a certified fingerprint; until then it is an operational precondition, and the docs
+  now say so rather than claiming immutability.
+- Failing closed no longer wedges or discards work. A failed verify hands its claim
+  back; the pre-check releases only claims old enough to be abandoned, so it cannot
+  drop the fence under a concurrent attempt sharing the same candidate-derived claim
+  id; a failed release keeps the candidate rather than consuming the only item that
+  could retry it; and fail-closed errors postpone instead of burning the retry budget,
+  which would otherwise DLQ every in-flight block within minutes of a DC outage — from
+  where block items never auto-recover and the scanner's day cursor has already moved
+  past their candidates.
+- Observability: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
+  `{reason="destructive_topology_gate"}`, and `GCAuditEventsTotal` events
+  `gc_block_delete_failed_closed`, `gc_block_stale_claim_released`,
+  `gc_s3_orphan_referenced_deferred`.
+
+Regressions in `internal/gc/x2_cross_dc_liveness_test.go` (sixteen by the end of
+this series; derive the count rather than restating it) plus the gate's
+decision logic in `internal/db/destructive_gc_topology_test.go`. Every assertion is
+mutation-verified against a deliberately reverted implementation — including the
+canary that reverting the single `BlockHasReferencesGlobal` call makes the suite delete
+a live block under an unavailable DC.
+
+**Closed — proven against a real three-datacenter Cassandra topology.** A unit test
+cannot observe a consistency level, so the closure required the three-DC regression,
+and it ran green on `docker-compose.cassandra-3dc.yaml` (Cassandra 5.0.9, three DCs,
+RF 1 each) via the new `scripts/x2-multidc-validation.sh`. To be exact about what that
+is: three real Cassandra processes under `GossipingPropertyFileSnitch` forming three
+logical datacenters — genuine NTS replication, genuine per-DC quorums, a genuinely
+unavailable DC — on one Docker host. That is what the property needs; it is not three
+physical regions, and the distinction is worth keeping straight.
+
+Legs:
+
+- **Visibility** — against a deliberately divergent cluster (hinted handoff disabled,
+  the other DCs stopped during the write), `LOCAL_QUORUM` from dc-na is blind to the
+  reference while `EACH_QUORUM` from dc-na sees it. Both halves against the same state.
+- **Fail closed** — with dc-asia stopped the destructive read errors
+  (*Cannot achieve consistency level EACH_QUORUM in DC dc-asia*) instead of reporting
+  zero.
+- **Topology gate** — accepts the declared three-DC map, refuses a session declaring
+  only dc-na against that keyspace.
+- **Mutation** — with the `EACH_QUORUM` pin downgraded to `LOCAL_QUORUM`, against a
+  fresh divergent state, the visibility leg goes red. That half is load-bearing: a
+  regression that cannot fail is not evidence.
+
+Two DCs would have reproduced the defect but could not have ruled out the wrong fix: a
+non-local `QUORUM` is 2 of 2 there and intersects by accident, so the suite would have
+blessed plain `QUORUM` as readily as `EACH_QUORUM`. Nor could a naive write-then-read
+have shown anything, since Cassandra replicates to every replica regardless of
+consistency level. Hence the divergent-state harness, now a script rather than prose,
+because a manual procedure nobody can run in one command is one that quietly stops
+being run.
+
+`GC_ENABLED=false` still stands fleet-wide: X1 is now the sole activation blocker.
+
+### Post-implementation audit follow-ups
+
+Successive audits of the above found no defect in what it claimed, and a series of
+places where the claim did not reach as far as its own reasoning did. Each is a case of the rule being
+applied to the statement where the defect was observed rather than to every statement
+the reason covers.
+
+- **Fail-closed now follows the reason, not the statement.** The EACH_QUORUM verify is
+  the call a datacenter outage breaks first and most reliably — it is the only level
+  demanding a quorum in every DC — but `ClaimBlockDelete` runs *before* it and can fail
+  on the same degraded cluster, straight into the retry budget and the DLQ that block
+  items never leave. `isClusterUnavailableError` now classifies availability failures
+  anywhere in the walk as fail-closed, scoped narrowly: server-reported
+  Unavailable/Overloaded/ReadTimeout/WriteTimeout plus the driver's
+  no-response/no-connection sentinels (`ErrHostQueryFailed` is excluded — the driver
+  documents it as never returned). A malformed statement still spends its retries and
+  reaches the DLQ, where a human sees it. The timeout codes are ambiguous by nature and
+  the limitation is recorded in KNOWN_ISSUES: bounding environmental postpones per item
+  needs a counter distinct from `retry_count`, which is X1's to add.
+- **Stale claims are released by age, not by ownership.** `claimID` identifies a
+  candidate, not an attempt, so an owner-only release failed in both directions: a
+  claim abandoned by candidate C1 carries C1's id, and a later candidate concluded
+  "someone else's pass will lift it" and settled — but if C1's item had been DLQ'd,
+  no such pass existed and the block stayed fenced against every future upload of that
+  content, permanently. `ReleaseStaleBlockClaim` no longer takes a claim id; age is
+  the only criterion, and nothing live survives `blockDeleteClaimStaleAfter`.
+- **A referenced S3 orphan no longer fails the scanner phase.** Refusing to delete it
+  is correct, but the phase error recurred on every pass that saw the row — and a
+  failed phase suppresses `last_scan_success`, meaning one such row would freeze that
+  timestamp forever and mask the health of everything else. Now logged and counted
+  only. The original justification claimed the row was "permanent by construction" and
+  would be rediscovered by every later sweep; that is **false** — the day cursor
+  advances past it — and the resulting storage leak is tracked as
+  `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`.
+- **`gc_destructive_last_blocked_timestamp_seconds{path}` and
+  `gc_destructive_last_liveness_success_timestamp_seconds{path}` (new pair).** Failing
+  closed is silent by design: nothing errors, nothing DLQs, the queue just stops
+  draining. Counters cannot express that duration. Alert on
+  `blocked > liveness_success` with `for: 1h`, which reads as "the last evidence was a
+  refusal, and an hour has passed without evidence to the contrary" — not
+  `time() - liveness_success > 3600` (fires an hour after the last success, which can
+  be seconds after a refusal starts) and not `max_over_time(...)` (means "was blocked
+  once recently"). The `path` label separates the worker from orphan recovery, which
+  fail independently.
+
+  These replace a `gc_destructive_deletes_blocked` boolean gauge from earlier in this
+  same series, which was cleared at the end of any pass that refused nothing. A
+  boolean has two states and the system has three — refused, succeeded, and *not
+  looked since* — so it had to lie about the third, and it lied in the direction that
+  defeated its own alert: a postponed candidate waits out a full grace period, so an
+  ongoing outage produces runs of passes that attempt nothing, each of which cleared
+  the gauge and restarted the `for: 1h` window. An outage that never ended never
+  alerted. The recovery half now advances only when the global read returns —
+  including when it finds the block still referenced, since that read is proof the
+  environment can authorize — and never on a merely passing topology gate, which
+  proves the map is right rather than that a quorum is reachable. Timestamps are
+  fractional because a walk can record a success and then a commit-point refusal
+  milliseconds apart, and at second resolution those tie. Both series are seeded to 0
+  for both paths at registration so a never-exercised path reads as not blocked rather
+  than dropping out of the alert's comparison. Removing the gauge cost no migration:
+  it never left this branch.
+- **The topology gate has two forms, and the split is load-bearing.** The cheap form
+  caches a pass for 30s and never a rejection: per-candidate `system_schema` reads
+  bought nothing (schema does not change between two blocks of a batch) while caching a
+  refusal would keep deletes blocked after the topology was repaired. The
+  authoritative form ignores the cache, and is what runs at every commit point — once
+  in `processBlock` immediately before the first destructive statement, and once per
+  orphan in recovery rather than once per sweep.
+
+  A commit-point check sharing the cheap form's cache would be theatre: a walk takes
+  milliseconds, so it would return the pass that same walk stored moments earlier and
+  assert nothing at all. That is exactly how it was first written, and the test only
+  passed because it advanced the clock past the TTL to force a re-read — an assertion
+  written around the defect instead of at it. The cost now lands where it belongs: the
+  extra read is paid once per block actually about to be destroyed, not once per
+  candidate. `TestX2_TopologyGateIsRecheckedAtTheCommitPoint` holds the clock frozen,
+  so downgrading that call back to the cached form turns it red.
+- **A serial-consistency advisory was added and then removed, because its premise was
+  false.** It warned that multi-DC deployments on `SERIAL` would stall block claims
+  during an outage, and pointed at `LOCAL_SERIAL`. But `SERIAL` takes a **global**
+  quorum over the token range's replicas (2 of 3 with RF 1 in three DCs — which one
+  unreachable DC does not defeat), not a quorum per datacenter; `EACH_QUORUM` is the
+  per-DC level. Beyond being wrong, the recommendation was pointed at the wrong
+  question: narrowing the Paxos domain on `blocks` is the linearization decision X1 has
+  open, and a topology gate for X2 has no business nudging a deployment either way.
+
+- **The write half of the intersection is now pinned at the writers.** The closure
+  argument is "a reference acknowledged at `LOCAL_QUORUM` in some DC intersects the
+  `EACH_QUORUM` read's quorum in that same DC", which presumes the write reached a
+  quorum at all — and reference writes inherited the session, where `ONE` is an
+  accepted `database.consistency`. The topology gate had been extended to refuse
+  destructive GC under a non-quorum level, but a gate can only read the consistency of
+  the process running GC, and **the GC process is not the writer**: references come
+  from API nodes, separate processes with their own configuration. Both producers now
+  pin `db.BlockReferenceWriteConsistency` per statement — `AddBlockReference` and the
+  logged batch in `AddProvisionalBlockReferenceWithExpiry`, the second of which no
+  audit had noticed was a producer at all. The gate's check stays as a second line for
+  writers this binary cannot speak for (an older binary in the fleet, a future producer
+  that forgets), and `TestBlockReferenceProducersPinWriteConsistency` walks the AST of
+  every non-test file in the module so a new producer fails until it is pinned.
+  It counts identifiers and string literals rather than file text, which is not a
+  detail: the first draft counted text, and the comment *explaining* the batch's pin
+  satisfied the count — removing the batch's real pin left it green.
+  `RemoveBlockReference` is deliberately exempt — see the closing round below for the
+  correct reason, which is about the protocol rather than about tombstones. The
+  pin is a fixed level rather than a floor, so it also *lowers* a deployment configured
+  for `EACH_QUORUM` or `ALL` — stated plainly because it is a real trade: a level that
+  varies with configuration hands back the very property being established, and what is
+  given up is cross-DC promptness, not safety. The destructive read intersects
+  regardless, and every other reader of `block_references` is a local check whose false
+  zero costs a redundant re-upload or a candidate the global verify then declines.
+- **Orphan recovery classifies its own verify failure.** `processBlock`'s verify had
+  learned to tell an unreachable cluster from a poisoned partition; the second
+  destructive path still reported every failure as `liveness_verify_unavailable` and
+  moved the blocked mark with it. There is no queue policy at stake here — the sweep
+  defers either way, holding the day cursor — so what the misreport cost was the
+  diagnosis: a permanent `ReadFailure` from a tombstone-heavy `block_references`
+  partition read as a datacenter outage, and the blocked-vs-liveness pair, whose only
+  question is whether the path can still authorize deletes at all, answered that the
+  environment had failed when it had not.
+- **The `ReadFailure` frame is pinned in the tests that exist for it.** The DLQ
+  regression for the previous item injected `errors.New` carrying tombstone text, and
+  the classifier table covered `Unavailable`/`Overloaded`/`ReadTimeout`/`WriteTimeout`
+  but neither failure code. Adding `ErrCodeReadFailure` to the classifier's switch —
+  the plausible mistake, since it reads as a sibling of the timeout codes — left both
+  green while restoring the exact defect the fix was written for. Both now inject and
+  assert the frame the driver actually returns.
+- **The harness re-enables hints in an order that works.** `cleanup()` ran
+  `nodetool enablehandoff` and *then* `docker start`, in one loop, so an abort during
+  `build_divergence` — where two of three nodes are deliberately stopped, and by far
+  the likeliest place to abort — sent the command to a stopped container. The fixture
+  did come back with hints on, because `disablehandoff` is runtime state a restart
+  discards, but that is the restart being lucky rather than the function working, while
+  the script asserted "hints re-enabled" either way. It now separates the two cases,
+  which is also what keeps it quick: a node still RUNNING holds the disabled state and
+  only `nodetool` can undo it, so it is retried for 30s and reported by name if it
+  never answers; a node that is STOPPED is restored by being started, since booting
+  discards the runtime state in favour of the enabled default, so nothing waits out its
+  several-minute boot to watch it confirm what the restart guarantees. The report says
+  which nodes fell in which case, warns loudly by name when a live node never answers,
+  and never overwrites the run's exit code. No effect on the evidence: this is the state a *later* run inherits,
+  and a silently weakened leg 1 is the failure it prevents. The manual runbook in
+  `GC-X2-MULTIDC-VALIDATION.md` had the same ordering hazard in prose and is corrected
+  with it.
+
+Regressions in `internal/gc/x2_audit_followups_test.go` and
+`internal/db/block_reference_write_consistency_test.go`, each mutation-verified:
+reverting the release to owner-only, disabling and over-applying the availability
+classifier, caching gate rejections, downgrading the commit-point gate to the cached
+form, letting the blocked gauge latch, letting one path's gauge speak for the other,
+dropping the referenced-orphan refusal, unpinning either reference producer,
+removing a producer so the scan's floor is breached, forcing orphan recovery back
+to a single error class, and admitting `ReadFailure` to the availability classifier
+were all confirmed to turn the suite red.
+
+### Closing round — the last four gaps between what was claimed and what held
+
+A final review of the above found one live defect and three statements that outran
+their evidence. All four are closed here; none of them reopened X2.
+
+- **A failed stale-claim release no longer consumes the work item.** The audit entry
+  above said "the candidate is not consumed", and the candidate *row* indeed survived —
+  but only availability failures postponed. Any other error (an unknown column, a CQL
+  bug, an unexpected CAS result) took the ordinary path: five retries, then the DLQ,
+  which `ItemBlock` never leaves, past a scanner day cursor that has already moved on.
+  The fence would then stand on a block the same pass had just proven **still
+  referenced**, with nothing left able to lift it — every future upload of that content
+  refused, permanently, by the branch whose whole purpose is removing such fences.
+  `GCFailureCodeBlockClaimReleaseUnconfirmed` now postpones on *any* release failure.
+  The cost is stated rather than hidden: a permanent fault postpones forever instead of
+  reaching the DLQ, so it gets a dedicated
+  `gc_errors_total{type="stale_claim_release_failed"}` counter — **alert on it**, it
+  means a live block is fenced and nothing automatic will clear it.
+  `TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget` rides out more passes than
+  the budget would have survived; routing the branch back through
+  `failClosedIfUnavailable` turns it red. The existing single-pass test was also
+  injecting `errors.New("cassandra unavailable")` — a string the classifier does not
+  recognise, so it was already exercising the ordinary-error path while reading as if
+  it exercised the availability one.
+- **The producer scan can no longer be blinded by whitespace.** It matched the fixed
+  substring `INSERT INTO block_references`, so a producer written with a line break
+  after `INSERT` was invisible — and because `knownProducerCount` is a floor that the
+  three existing producers keep satisfying, a fourth unpinned producer in that shape
+  changed nothing and the suite stayed green. Verified by adding exactly that function:
+  green before, red after. The pattern is now `INSERT\s+INTO\s+block_references`
+  applied to *unquoted* literals (so raw and interpreted strings compare equal), and
+  the walk covers the whole module rather than `internal/` alone, since `DB.Session()`
+  is exported. What it still cannot see is recorded rather than glossed: a statement
+  assembled at runtime via `fmt.Sprintf` or const concatenation needs data-flow
+  analysis this test does not attempt.
+- **`RemoveBlockReference`'s exemption had the wrong justification.** It read: an
+  under-replicated DELETE leaves the row visible, GC declines to collect, so the delete
+  errs toward keeping data. That is not how Cassandra behaves — a DELETE writes a
+  timestamped tombstone, the mutation reaches every replica regardless of consistency
+  level, and last-write-wins means a quorum read that touches the tombstone resolves to
+  absent and repairs the rest. There is no structural bias toward keeping data. The
+  exemption is still correct, for a different reason: X2's premise is about *creating*
+  a live reference, and removal is only ever issued once the referrer has lost
+  authority (a TTL'd publish attempt, or an `fs_object` being deleted). Publish/remove
+  races belong to the publication fence, which is X1. Behaviour unchanged; only the
+  reasoning was wrong, and a wrong reason is what lets the next person apply it
+  somewhere it does not hold.
+- **The `blocks` LWT inventory was an undercount, and X1 is going to build on it.**
+  `GC-X2-MULTIDC-VALIDATION.md` listed "six conditional statements"; an audit by grep
+  finds **eleven**, one of which (`ReleaseStaleBlockClaim`) this branch added. The
+  omissions were the two identity backfills, the unused `DB.ReleaseBlockDeleteClaim`,
+  and a stub-repair pair that is actually three statements. The full table is now in
+  that document, with a note to re-derive rather than trust it: the invariant is "every
+  conditional statement on `blocks`", not "these eleven". R12's one-serial-domain rule
+  is X1's to satisfy, and it cannot satisfy it for statements it does not know exist.
+- **"No writer hot-path change" was not true once the producer pin landed** and is
+  corrected wherever it appeared, to "no additional writer round trip, and no WAN
+  consistency added to the shipped upload path".
+- **The three-datacenter fixture now proves the claim it was built for.** Its stated
+  purpose was ruling out plain `QUORUM` as an equally good fix — at two DCs with RF 1,
+  `QUORUM` is 2 of 2 and intersects everything by accident, while at three it is 2 of 3
+  and free to miss the single replica holding a reference. That argument lived only in
+  prose: the only mutation run was `EACH_QUORUM → LOCAL_QUORUM`. Leg 2b
+  (`TestX2_FailsClosedWhenTheReferenceDatacenterIsDown`) makes it executable — the
+  divergent state with **dc-eu stopped**, where `EACH_QUORUM` must error while `QUORUM`
+  is satisfied by the two blind datacenters and answers "no references", which is an
+  authorization to delete live data. `--mutate-quorum` ran that proof and it went red:
+
+  ```text
+  X2 REGRESSION: the destructive read returned zero references while dc-eu — the
+  only datacenter holding one — was unreachable. GC would authorize deleting a
+  live block.
+  ```
+
+  Leg 2 (a DC down that does *not* hold the reference) *would* also go red under
+  `QUORUM` — by inference from the semantics, not by a run the harness performs — but
+  only because the read succeeds where it must error; leg 2b is the one that
+  exhibits the false zero itself. Leg 1 cannot carry this mutation at all: with three
+  DCs up, a `QUORUM` read's answer depends on which two replicas the coordinator
+  reaches, so it would pass or fail by chance.
+- **The harness now asserts the stopped datacenter stayed stopped.** Leg 2b's claim is
+  "the DC holding the only reference was unreachable when the read happened", and a
+  `docker compose stop` at the top of the leg does not establish that for the minutes
+  the test then runs. An ABORTED run leaves an EXIT trap that restarts every stopped
+  node, so a leg beginning moments later watches dc-eu boot underneath it. That is not
+  hypothetical — it happened during this branch's own validation, and cost two
+  results: a leg 2b that passed because `EACH_QUORUM` could not reach a node that was
+  mid-*boot* rather than stopped, and then a `QUORUM` read that found the row through
+  a recovered dc-eu and read-repaired it to every replica, ending the divergence.
+  Nothing false was published: the test refuses to report either PASS or REGRESSION
+  when it can see the row, and said so. `require_stopped` now checks before and after
+  each of the two legs that take a DC away, so the harness names the cause instead of
+  leaving an unexplained rebuild. The manual runbook carries the same check.
+- **The claim-release rule now covers EVERY release, not just the stale one.** The
+  round above fixed `ReleaseStaleBlockClaim` in the pre-check branch and stopped there,
+  which left the same wedge open at the three POST-claim releases. The reachable one is
+  the re-referenced branch: the `EACH_QUORUM` verify has just proven the block is
+  **alive**, and if handing the claim back fails for a non-availability reason the item
+  spends its five retries and reaches the DLQ with `gc_state='deleting'` standing on
+  live data. The next pass cannot be relied on to settle it through the pre-check's safe
+  path either, because that pre-check is the LOCAL read and keeps answering false for as
+  long as the cross-datacenter divergence lasts — which is exactly the condition X2 is
+  about. A second site had the same shape: after a failed global verify the release
+  error was only logged, and queue policy was decided from the verify's error, so a
+  `ReadFailure` plus a failing release marched to the DLQ with the fence up.
+  `Worker.releaseBlockClaim` now centralises the rule — *if a branch needs to leave the
+  block usable and cannot confirm the fence came off, the item must not reach the DLQ*
+  — and the release error dominates the original one until the fence is confirmed gone,
+  at which point the original error resumes its own (correct) march to the DLQ.
+  `gc_errors_total{type="block_claim_release_failed"}` is its counter. Two regressions,
+  both mutation-verified against the previous code.
+- **The producer scan's pre-filter could blind it, and the pre-filter is gone.** The
+  hardened pattern is whitespace-tolerant, but the file was pre-filtered by running that
+  pattern over the RAW SOURCE — and in the source bytes of an ordinary interpreted
+  literal, `"INSERT\nINTO block_references"`, the separator is the two characters `\`
+  and `n`, which `\s+` does not match. The file was skipped before it was ever parsed. The previous
+  round's mutation used a raw backtick literal, whose newlines are real, so it verified
+  the pattern and never touched the pre-filter: an almost-true guarantee that the
+  comment stated as absolute. Every non-test `.go` file in the module is now parsed,
+  which costs under a second and needs no reasoning about escaping. Verified with an
+  unpinned producer in interpreted form: green on the committed version, red now.
+- **The fail-closed legs no longer accept any error as proof.** Both accepted `err !=
+  nil`, so a broken query, a dropped table or an auth failure produced the same green as
+  "EACH_QUORUM could not reach that datacenter". They now require an availability
+  failure and, when the driver returns an `Unavailable` frame, that its `Consistency` is
+  `EACH_QUORUM`. Connection-level shapes are accepted with a note rather than a pass.
+- **The mutation harness now checks three things instead of one.** It grepped for the
+  `X2 REGRESSION` string, which happens to be sufficient only because that string comes
+  solely from `t.Fatalf` today. It now also requires a non-zero exit and an anchored
+  `--- FAIL: <target leg>` line, so a build failure or a broken fixture cannot pass as
+  evidence that a data-loss guard detects its own defect.
+- **The canonical registry was carrying two claims this series had already refuted** —
+  the `RemoveBlockReference` tombstone justification and "no writer hot-path change" —
+  and its closure evidence predated legs 2b and mutation B. Registry is the document X1
+  will be designed from, so it is corrected there too, not only where the reasoning was
+  first fixed.
+- **X2's closing date moved to the day the evidence actually ran.** The closure criteria
+  are the five-leg run and both mutations; those ran on 2026-08-14, so dating the
+  closure 2026-08-13 (when the code landed) claimed the issue was closed before its own
+  criteria were met. Implemented 2026-08-13, closed 2026-08-14.
+- **The unbounded-postpone residual (E1) grew and is recorded as having grown.** Before
+  this series one condition postponed without spending a retry; there are now four, and
+  the availability classifier applies one of them at *every* statement of the
+  destructive walk. Each addition is individually right — losing the work item is the
+  worse failure in all of them — but E1 has stopped being a corner case and is now the
+  block path's default failure mode under a degraded cluster. Whoever builds the
+  postpone bound should size it for that.
+
+---
+
 ## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
 
 Auditing the caps above surfaced three follow-up findings on the same handlers: **two

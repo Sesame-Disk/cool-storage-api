@@ -357,7 +357,7 @@ PUT /api2/repos/:id/file/?p=/path
 **GC Configuration:**
 ```yaml
 gc:
-  enabled: false  # Required on every replica/DC while GC safety blockers X1/X2 remain open
+  enabled: false  # Required on every replica/DC while X1 remains open
   interval: 24h
   grace_period: 24h
   batch_size: 1000
@@ -366,9 +366,11 @@ gc:
 ```
 
 The lease is not an activation signal. Keep `GC_ENABLED=false` everywhere until
-both `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) and
-`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` (X2) close. Only then may designated
-replicas in one DC participate under the lease; every other DC remains disabled.
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) closes. X2 is closed under the
+stable-topology operational contract; a replication DC-set or RF change with existing
+reference state requires a separately certified migration before GC can be reconsidered.
+Only then may designated replicas in one DC participate under the lease; every other DC
+remains disabled.
 
 ---
 
