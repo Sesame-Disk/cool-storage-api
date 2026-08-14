@@ -460,6 +460,19 @@ MUTATION (scripts/x2-multidc-validation.sh --mutate)
         deleting a live block"
 ```
 
+**Re-run green on 2026-08-13 after the harness itself changed** (per-node healthcheck,
+explicit `wait_bootstrap`, explicit `CASSANDRA_REPLICATION_DCS` on the migrate step,
+exit-code check in `build_divergence`). Those are the parts that produce the evidence,
+so changing them invalidates a green run taken before them; the five tests above went
+green again unchanged, and the keyspace was confirmed to carry all three datacenters:
+
+```text
+sesamefs | {'class': 'NetworkTopologyStrategy', 'dc-asia': '1', 'dc-eu': '1', 'dc-na': '1'}
+```
+
+The mutation leg was not repeated — nothing in that change touches the destructive read,
+its consistency level, or the gate.
+
 The mutation is the load-bearing half. Leg 1 passing means nothing on its own — it
 had to be shown to go red against the very defect it exists to catch, on a cluster
 divergent enough for the two consistency levels to disagree.
