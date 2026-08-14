@@ -4,9 +4,10 @@
 `KNOWN_ISSUES.md`; this document holds the reproduction, the runbook, and the
 findings turned up while implementing the fix.
 
-**Related:** `GC-X1-X2-ALTERNATIVES.md` (why X2 is separable from X1),
-`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2, `GC-X1-X2-GENERATION-FENCE-ADR.md` (r3,
-still the accepted-for-review design for **X1**, untouched by this fix).
+**Related:** [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (why X2 is separable
+from X1, and the closure options for X1 itself),
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2. **X1 has no accepted design**; this fix is
+untouched by that decision either way.
 
 ---
 
@@ -491,8 +492,10 @@ count out of `configs/`.
   inherit the session serial level, which the cluster profiles set to `LOCAL_SERIAL`.
   Mixing `LOCAL_SERIAL` and `SERIAL` on one partition breaks linearizability: they are
   different quorum domains, and one straggler invalidates every other statement's
-  guarantee. r3 calls this the **one-serial-domain rule**. X2 does not depend on it, but
-  any X1 design does. Tracked as R12 in `GC-X1-X2-ALTERNATIVES.md`.
+  guarantee. This is the **one-serial-domain rule**. X2 does not depend on it, but
+  any X1 design does. Tracked as R12 in
+  [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md), where the statement inventory
+  is **eleven** conditional statements on `blocks`, not the six an earlier count named.
 
   An earlier version of this bullet also said "this fix changes no LWT". That is no
   longer true — `ReleaseStaleBlockClaim` is one — and it did not matter for X2, since

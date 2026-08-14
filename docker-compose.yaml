@@ -8,6 +8,13 @@ services:
     env_file:
       - ${ENV_FILE:-.env}           # All secrets from the selected env file
     environment:
+      # GC_ENABLED is deliberately NOT pinned here: this is the single local node
+      # allowed to run the GC worker/scanner so the suites can exercise them, and it
+      # takes the value from the env file. Nodes 2 and 3 pin it to false so the
+      # multi-instance lease has exactly one candidate. The fleet-wide
+      # "GC_ENABLED=false on every replica in every DC" rule while X1/X2 are open is a
+      # PRODUCTION rule and is enforced in docker-compose.prod.yml and
+      # .env.prod.example, not here.
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}
       - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
@@ -255,7 +262,7 @@ services:
       - test
 
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     ports:
       - "${CASSANDRA_HOST_PORT:-9042}:9042"
     env_file:
@@ -287,7 +294,7 @@ services:
     restart: unless-stopped
 
   cassandra-bootstrap:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     depends_on:
       cassandra:
         condition: service_healthy

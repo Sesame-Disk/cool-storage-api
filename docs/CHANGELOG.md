@@ -408,6 +408,80 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ---
 
+## 2026-08-14 - X1: r3 generational fence abandoned; closure options documented; prod `GC_ENABLED=false` pinned
+
+Documentation and Compose only. No runtime code changed. X1 stays open, no design is
+accepted, and `GC_ENABLED=false` remains mandatory on every replica in every DC.
+
+**The r3 generational-fence ADR is abandoned.** PR #166 closed unmerged; the branch
+`docs/gc-x1-x2-generation-fence-final` is retained as investigative reference only, and
+nothing in it is a decision of record. The reasoning is recorded in `DECISIONS.md`: r3's
+bulk was the publication frontier, which existed to prove that no new reference could
+appear against a retiring generation *while reference writes stayed local* — and X2
+closed on 2026-08-14 with a global GC-side liveness read instead, needing none of it.
+
+**New `docs/GC-X1-CLOSURE-OPTIONS.md`** carries the X1 half of the withdrawn alternatives
+analysis forward, corrected and extended, with every claim checked against code. What is
+new relative to the withdrawn document:
+
+- **The wait behind a physical delete is measured, not estimated.** The writer's retry
+  budget is ~1.95 s (`fs_helpers.go:680-684`); the GC inline S3 delete retries for ~2.6 s
+  (`worker.go:352`); and if that delete fails the orphan row is only revisited by scanner
+  **Phase 16 on the 24 h ticker** (`gc.go:690-706`, `config.prod.yaml:386`), with a
+  90-day TTL ceiling. So a failed physical delete blocks every upload of that content for
+  up to a day. The `resolveFence` escape hatch is inert: the two SeafHTTP paths wire it to
+  `clearSeafHTTPS3OrphanFence`, which returns `(false, nil)` on every path
+  (`seafhttp.go:2664-2681`), and the three v2 paths pass `nil`.
+- **The one-serial-domain inventory was undercounted.** There are **eleven** conditional
+  statements on the `blocks` partition, not six; the five that were missing are listed
+  with locations. The rule also has to cover `gc_s3_orphans`, which is where the fence
+  lives for most of the destructive window and carries five more conditional statements
+  plus one *unconditional* fence-clearing DELETE.
+- **A recommended option ("d-lite"): overlapped physical lives.** The writer stops waiting
+  on the physical delete and waits only for GC to release the metadata row. Its price is
+  named exactly: every destructive authorization in the code today is keyed by the
+  *logical* block id, and once two lives can coexist `BlockExists(L)` freezes the orphan
+  cursor permanently, `BlockHasReferencesGlobal(L)` can never authorize the older key, and
+  `StartBlockDeleteOrphan` overwrites the older key's only durable record.
+- **A new data-loss race, R13.** If the orphan insert succeeds and the `blocks` row delete
+  fails persistently, the row survives pointing at a key already authorized dead. Today
+  `ProbeBlockReuse` refuses it only because `hasOrphan` outranks everything
+  (`block_references.go:927`) — so a design that stops fencing on the logical block must
+  fence on the *key* instead, or an upload reports success while the canonical row still
+  names bytes that recovery will delete.
+- **`storage_key` is sufficient as the physical identity**; a separate `physical_id` or
+  `delete_id` column is not needed. And the SHA-1→SHA-256 mapping belongs to the logical
+  block, not to any incarnation, so its lifecycle should be decoupled from the physical
+  object's — the code already calls a leftover mapping "a harmless dangling pointer".
+- **The premise everything rests on is verified:** `L = sha256(storedContent)` is taken
+  over the bytes actually written, *after* encryption (`seafhttp.go:2468-2482`), so two
+  incarnations of one logical block are byte-identical by construction. That is why
+  references never need to become generation-aware.
+
+**Four broken documentation links on `main` are fixed.** `KNOWN_ISSUES.md`,
+`OPEN-WORK-INDEX.md` and `GC-X2-MULTIDC-VALIDATION.md` pointed at `GC-X1-X2-ALTERNATIVES.md`
+and `GC-X1-X2-GENERATION-FENCE-ADR.md`, neither of which ever existed on `main` — X2's fix
+merged before the branch that carried them.
+
+**Compose and versions, independent of any X1 design:**
+
+- `docker-compose.prod.yml` now sets `GC_ENABLED=false` explicitly rather than relying on
+  the environment, with the reason inline. `docker-compose.yaml` documents why the local
+  single-node stack deliberately does *not* pin it.
+- Cassandra pinned from `5.0` to `5.0.9` across all five Compose files; `VERSIONS.md`
+  corrected (it still claimed Go 1.21, Echo, and Cassandra 4.1 — the project uses Gin).
+
+**X4 / UP-2 / P-4 scope correction (2026-08-11), carried over:** the per-block Paxos round
+is paid per block invocation that *reaches* metadata registration, not by every logical
+block of every upload — browser and sync preflight can classify a fully deduplicated block
+before `RegisterUploadedBlock`. The ~128 rounds/1 GiB figure is a new-content sensitivity
+at 8 MiB blocks, not a universal per-file charge. Recorded with a consequence for X1: if a
+future design mints storage keys, P-4's proposed fix (drop the first-writer LWT) stops
+being available, because that LWT becomes the only thing choosing one canonical
+incarnation across DCs.
+
+---
+
 ## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
 
 Auditing the caps above surfaced three follow-up findings on the same handlers: **two

@@ -183,7 +183,7 @@ services:
   # DATABASE - Cassandra (Shared)
   # ==========================================================================
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     ports:
       - "${CASSANDRA_HOST_PORT:-9042}:9042"
     environment:
@@ -205,7 +205,7 @@ services:
   # Initialize the shared keyspace before either region server boots. The app
   # runs migrations on startup, but it still requires the keyspace to exist.
   cassandra-bootstrap:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     depends_on:
       cassandra:
         condition: service_healthy

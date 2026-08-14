@@ -69,12 +69,18 @@ Accepted-but-track for this release: **GC stays disabled** on every replica/DC (
 | ID | Finding | Sev | Status as of 2026-07-25 | Issue id | Code ref |
 |----|---------|-----|-------------------------|----------|----------|
 | UP-1 | Chunk-upload state node-local → multi-region blocker without sticky-by-token — **B1** | HIGH | OPEN | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | `seafhttp.go` `var chunkManager` |
-| UP-2 | 1 global Paxos LWT **per block** under multi-DC `SERIAL` (~128 cross-region rounds / 1 GB). Pre-existing, both governed upload modes pay it. Latency cost, not a blocker. **Same finding as X4 / P-4** — deferred PR-11. | HIGH (perf) | OPEN | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4) | `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` P-4 |
+| UP-2 | 1 global Paxos LWT per metadata-registering block invocation under multi-DC `SERIAL` (~128 cross-region rounds / 1 GB for new content/full registration). Browser/sync preflight may bypass fully deduplicated blocks. Pre-existing, both governed upload modes pay it when they register. Latency cost, not a blocker. **Same finding as X4 / P-4** — deferred PR-11. | HIGH (perf) | OPEN | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4) | `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` P-4 |
 | UP-3 | TOCTOU quota check across concurrent same-org uploads to different repos | MEDIUM | OPEN | `ISSUE-QUOTA-RESERVATION-01` | UPLOAD-… S-4 |
 | UP-4 | `/tmp` staging admission budget (`chunked_staging_max_bytes`) defaults to `0` = disabled. ⚠️ **Sharpened 2026-07-25:** *every* shipped config sets it to `0`, `config.prod.yaml` included, **and this field has no `.env` override** — unlike most prod settings it can only be changed by editing the YAML. | MEDIUM | GUARD ADDED, **YAML EDIT REQUIRED IN ALL PROFILES** | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | `configs/*.yaml`; `config.go` `applyEnvOverrides()` (absent) + `Validate()` |
 | UP-5 | Permission not re-checked during long chunked uploads (authorized at session start only) | MEDIUM | OPEN | `ISSUE-MID-OPERATION-REVOCATION-01` | UPLOAD-DOWNLOAD-ANALYSIS |
 | UP-6 | `max_upload_mb` now enforced on chunked uploads (413 fail-closed) — **config-dependent**, see NF-7 | MEDIUM | ✅ FIXED (with caveat) | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | UPLOAD-… S-2 |
 | UP-7 | Resumable `file-uploaded-bytes` is a safe stub (`0`); true resume not wired. Safe, not a blocker. | LOW | BY DESIGN | — (accepted stub) | UPLOAD-RESUME-ANALYSIS-20260619 |
+
+**2026-08-11 scope correction for UP-2:** the LWT is paid per block invocation that
+reaches metadata materialization. Browser/sync preflight can bypass fully deduplicated
+blocks; first content and other blocks reaching `RegisterUploadedBlock` still pay it.
+The ~128 rounds/1 GiB figure is a new-content/full-registration sensitivity, not a
+universal per-file cost.
 
 ---
 
@@ -329,6 +335,13 @@ conditions.
 > No single-node **go-live** blocker remains under the current production
 > posture, which keeps destructive GC disabled. X1 and X2 stay open and still
 > block *enabling* destructive GC; B1 and B5 still gate multi-instance.
+>
+> **Superseded 2026-08-14 for the GC half.** X2
+> (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) closed on that date, proven on a real
+> three-DC cluster. **X1 alone** now blocks enabling destructive GC, and
+> `docker-compose.prod.yml` pins `GC_ENABLED=false` explicitly. X1 has no accepted
+> design; options are compared in
+> [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). B1 and B5 are unaffected.
 
 **A taxonomy wrinkle worth naming rather than silently fixing.** The summary
 table lists SH-1 under *High* for Sharing while listing B4 as a *blocker* under

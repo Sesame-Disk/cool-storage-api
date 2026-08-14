@@ -30,7 +30,7 @@ services:
   # Cassandra — REAL 2-DC cluster (one node per region/DC)
   # ==========================================================================
   cassandra-usa:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     ports:
       - "${CASSANDRA_USA_HOST_PORT:-9142}:9042"
     environment:
@@ -53,7 +53,7 @@ services:
     restart: unless-stopped
 
   cassandra-eu:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     ports:
       - "${CASSANDRA_EU_HOST_PORT:-9143}:9042"
     environment:
@@ -80,7 +80,7 @@ services:
 
   # Create the multi-DC keyspace AFTER both DCs have joined the cluster.
   cassandra-bootstrap:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     depends_on:
       cassandra-usa:
         condition: service_healthy

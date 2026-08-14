@@ -2037,7 +2037,9 @@ physical-delete ABA. Cassandra authorization generations or claim generations al
 cannot revoke an S3 DELETE already in flight. X1 closes only when new bytes use
 never-reused generational physical keys, so a stale delete can target only the old
 key. Keep destructive GC disabled until that physical-key invariant is implemented.
-Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
+and the recommended design in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).
 
 ---
 
@@ -2403,8 +2405,10 @@ environment cannot report a false pass.
 every replica in every DC. `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) is now the
 sole runtime activation blocker. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
 the analysis that established X2's independence from X1 is in
-`GC-X1-X2-ALTERNATIVES.md`. r3 remains the accepted-for-review design for X1 and is not
-superseded by this fix.
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). **X1 has no accepted design yet.**
+The generational-fence protocol explored on `docs/gc-x1-x2-generation-fence-final` was
+abandoned 2026-08-14 in favour of a much smaller physical-identity design; the options
+and the evidence for that decision live in the document above.
 
 ---
 
@@ -7537,8 +7541,11 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 #### Problem
 
-Each block pays one global Paxos round under multi-DC `SERIAL` (~128
-cross-region rounds per GB at 8 MB). Shared cost of governed upload paths.
+Each block invocation that reaches metadata registration pays one global Paxos round
+under multi-DC `SERIAL`. New content/full registration is ~128 cross-region rounds
+per GiB at 8 MiB blocks; browser/sync preflight may bypass fully deduplicated blocks.
+This is a shared cost of governed upload paths when they reach registration, not a
+universal per-file cost.
 
 #### Fix Direction
 

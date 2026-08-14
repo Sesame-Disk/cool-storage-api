@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-14
-**Session**: Upload-fence / GC safety PR series
+**Session**: X1 closure options — r3 generational fence abandoned; production `GC_ENABLED=false` pinned
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -31,6 +31,7 @@
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
 5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the activation gate now genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
+6. **X1 design state**: **no accepted design.** The r3 generational fence was abandoned 2026-08-14 (PR #166 closed unmerged; branch `docs/gc-x1-x2-generation-fence-final` kept as investigative reference only). Closure options, race matrix and open questions are in [`docs/GC-X1-CLOSURE-OPTIONS.md`](docs/GC-X1-CLOSURE-OPTIONS.md) — analysis, not a decision. `GC_ENABLED=false` is now pinned explicitly in `docker-compose.prod.yml`.
 
 ### Inter-session Update (2026-05-21)
 
