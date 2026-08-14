@@ -123,6 +123,11 @@ The table preserves each finding's discovery-time wording. X10's row is
 historical and is superseded by the dated 2026-07-30 closure note immediately
 below the table.
 
+The historical X1 wording below uses "generational physical keys" to mean
+never-reused physical identity. It does not adopt r3's generation lifecycle, references,
+quarantine or abort protocol; those were abandoned and are retained only on the reference
+branch.
+
 | # | Severity | Finding | Tracked as |
 |---|---|---|---|
 | X1 | Blocker | **Physical delete ABA.** A previously authorized key-only S3 delete can still run after the visible orphan fence clears and after a re-upload has stored new bytes. Rematerialization does not fence it. Cassandra authorization/claim generations alone cannot revoke a DELETE already in flight, so never-reused generational physical keys are **necessary** — stale deletes can then target only old keys. They are **not sufficient**, and the closure criteria must not be read as that one item: `blockDeleteClaimID` derives from the candidate, so `ClaimBlockDelete` answers `applied=true` to two concurrent workers and the post-claim releases are deliberately unconditional. Worker A releasing after its own verify failed can drop the fence while worker B is still deleting under the same claim id; a writer that then sees the fence clear can have the reuse probe hand it back the **same** incarnation B is about to destroy, which generational keys do not prevent because no new incarnation is ever created. X1 therefore closes only with all of: never-reused physical identity; delete authorization bound to a specific incarnation; per-attempt (not per-candidate) claim identity with staleness-based takeover; and a publication fence that cannot disappear while another authorized delete is still in flight. Analysis in `GC-X2-MULTIDC-VALIDATION.md` §3b/§4b. | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` |
@@ -312,9 +317,9 @@ Candidate directions, none yet designed:
    `canonical_block_reader.go` reads `storage_key` from metadata but then *derives*
    the key with `store.StorageKeyForHash(blockID)` and **rejects** any persisted key
    that differs, so `blocks/<org>/<hash>.<generation>` would be refused outright.
-   Adopting generational keys means changing that contract: the persisted key becomes
+   Adopting never-reused physical keys means changing that contract: the persisted key becomes
    authoritative, and the reader must instead validate that it belongs to the right
-   org, matches the expected hash, and conforms to the generational format — the
+   org, matches the expected hash, and conforms to the physical-key format — the
    validation currently provided for free by deriving the key. Dedup also has to key
    on hash while the physical key carries the generation. This is real design work,
    not a config change.
@@ -322,7 +327,7 @@ Candidate directions, none yet designed:
    two recoverers acting on the same lifecycle. Necessary regardless of what else is
    chosen and probably the first increment, but it does **not** close the in-flight
    case and therefore cannot close X1: Cassandra cannot revoke an S3 request already
-   on the wire. Only never-reused generational physical keys close that ABA.
+   on the wire. Only never-reused physical keys close that ABA component.
 3. **Fencing token with a bounded authorization window.** The recoverer's delete is
    valid only while its claim is unexpired, and writers refuse to publish until any
    outstanding claim has expired. Bounds the window rather than eliminating it; only

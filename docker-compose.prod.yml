@@ -38,7 +38,8 @@ services:
       - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL}
       - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL}
       - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-true}
-      # Destructive GC remains blocked until X1/X2 acceptance is complete.
+      # Destructive GC remains blocked until X1 acceptance is complete; X2 is closed
+      # under the stable-topology operational contract.
       - GC_ENABLED=false
 
       # Cassandra — defaults work for single-region; override in .env for multi-region

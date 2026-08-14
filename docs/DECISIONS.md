@@ -768,9 +768,12 @@ PR #166 was closed unmerged; the branch is retained as investigative reference o
 generation being retired *while ordinary reference writes stayed local*. That proof — the
 publication frontier — was the bulk of its complexity. `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`
 (X2) then closed on 2026-08-14 with a global GC-side liveness read at `EACH_QUORUM`
-behind a topology gate, needing no generations, no physical incarnations and no writer
-hot-path round trip. What is left to buy for X1 is physical identity, which is a schema
-and locator change rather than a distributed lifecycle.
+behind a topology gate, without generations, physical incarnations or a writer hot-path
+round trip for the cross-DC liveness half. X2 is therefore separable from X1, but it did
+not eliminate the publication TOCTOU that the frontier addressed. The smaller closure
+option in the companion document attempts to replace that frontier with globally visible
+claims, post-write validation of an active canonical incarnation, and never-reused
+physical keys. That remains an X1 design question, not an accepted result.
 
 A second reason is cost of correctness: the r3 specification ran to roughly 8.9k lines
 and was still not frozen after three revisions, with each review round closing a wedge in
@@ -783,10 +786,11 @@ storage keys while keeping the logical SHA-256 as the deduplication identity. It
 analysis, **not** an accepted design: no option is chosen, nothing is implemented, and
 `GC_ENABLED=false` remains mandatory on every replica in every DC.
 
-**What is preserved from r3.** Three findings, carried into that document: X1 closes only
-when new bytes use never-reused physical keys; the one-serial-domain rule for conditional
-statements on the `blocks` partition; and the requirement that orphan recovery delete an
-exact recorded key rather than one derived from the hash.
+**What is preserved from r3.** Three findings, carried into that document: never-reused
+physical keys are necessary for the physical-delete ABA but are not sufficient for all of
+X1; the one-serial-domain discipline for relevant conditional statements; and the
+requirement that orphan recovery delete an exact recorded key rather than one derived from
+the hash.
 
 ---
 

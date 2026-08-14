@@ -1212,7 +1212,7 @@ Dekker-style mutual flagging — not from the S3 PUT. The `gc_s3_orphans` fence 
 written before the S3 `DeleteObject`, so probes can observe the normal in-flight
 delete window. This does **not** close X1: after a recoverer clears Cassandra state,
 an already-issued S3 DELETE can still arrive late, and Cassandra claim generations
-cannot revoke it. Only never-reused generational physical keys close that ABA. The
+cannot revoke it. Only never-reused physical keys close that ABA component. The
 canonical verify/repair on the reuse path is an additional check, not permission to
 enable destructive GC.
 
@@ -2034,9 +2034,10 @@ visible Cassandra fence clears and after a writer stores byte-identical content 
 the same key. Content addressing makes ETag/value comparison unable to distinguish
 the old lifecycle from the new one. Claim-stub repair does not close this in-flight
 physical-delete ABA. Cassandra authorization generations or claim generations alone
-cannot revoke an S3 DELETE already in flight. X1 closes only when new bytes use
-never-reused generational physical keys, so a stale delete can target only the old
-key. Keep destructive GC disabled until that physical-key invariant is implemented.
+cannot revoke an S3 DELETE already in flight. Never-reused physical keys close only the
+stale-delete component of X1: a stale delete can then target only the old key. Publication,
+claim ownership and recovery liveness must also be implemented and verified. Keep
+destructive GC disabled until the complete X1 criteria pass.
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
 and the recommended design in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).

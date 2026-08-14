@@ -12,7 +12,7 @@ services:
       # allowed to run the GC worker/scanner so the suites can exercise them, and it
       # takes the value from the env file. Nodes 2 and 3 pin it to false so the
       # multi-instance lease has exactly one candidate. The fleet-wide
-      # "GC_ENABLED=false on every replica in every DC" rule while X1/X2 are open is a
+      # "GC_ENABLED=false on every replica in every DC" rule while X1 remains open is a
       # PRODUCTION rule and is enforced in docker-compose.prod.yml and
       # .env.prod.example, not here.
       - PORT=${PORT:-8080}

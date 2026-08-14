@@ -56,7 +56,7 @@ flowchart TD
     Mapping --> Clear[Clear orphan + candidate]
 ```
 
-The sequence above is conservative **up to S3 delete authorization**, given correct upstream classification/reference ownership. It does not close X1: Cassandra authorization/claim generations cannot revoke an S3 DELETE already in flight; only never-reused generational physical keys prevent a stale delete from targeting re-uploaded bytes. The P6
+The sequence above is conservative **up to S3 delete authorization**, given correct upstream classification/reference ownership. It does not close X1: Cassandra authorization/claim generations cannot revoke an S3 DELETE already in flight; only never-reused physical keys prevent a stale delete from targeting re-uploaded bytes. That closes only the physical-delete ABA component of X1. The P6
 fail-open path that could enqueue live fs_objects (causing GC itself to remove legitimate `fs:`
 refs before this block protocol runs) is now fixed: existence reads fail closed (1D).
 

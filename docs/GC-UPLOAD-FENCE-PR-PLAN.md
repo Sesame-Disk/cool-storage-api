@@ -26,7 +26,8 @@ status tracker.
 **What is left:** the X list in
 [UPLOAD-FENCE-FINDINGS-REGISTRY.md](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) —
 items this series never scoped, deferred, or knowingly accepted.
-**X1/X2 remain open and keep destructive GC disabled fleet-wide.**
+**X1 remains open and keeps destructive GC disabled fleet-wide. X2 closed on
+2026-08-14 under the stable-topology operational contract.**
 
 Per-PR sections below are kept as the design and verification record of what
 landed. They are history, not a plan; the PR merge table above is authoritative
@@ -217,7 +218,7 @@ unreachable behind the probe.
 8. Run focused unit tests, `go test -race` for affected packages in Docker, build,
    vet, integration-tag vet, and focused Cassandra integration regressions. Record
    exact commands/results in the PR, but move only F2 and X7 to closed after PR-2
-   merges. X1/X2 remain open, later-PR behavior stays excluded and destructive GC
+   merges. X1 remains open, later-PR behavior stays excluded and destructive GC
    remains disabled.
 
 Verification completed 2026-07-21 (the full integration service retains its built-in
@@ -931,12 +932,12 @@ introduce the LWT.
 **Correction worth carrying:** an earlier revision of this plan said the legacy
 resumable path "does not pay" this. That is false. `finalizeUploadStreaming` splits a
 resumable upload into 8 MB blocks and calls `RegisterUploadedBlock` per block, so it
-pays the same ~128 LWTs per GB. The cost is **shared by both governed upload modes**,
-which makes this a general optimization rather than something block upload has to
-fix to justify itself — and it means the win, if taken, applies to every
-metadata-registering upload surface. F8's no-session branch was the exception because
-it skipped metadata registration — but PR-7 removed that branch, so every remaining
-upload path registers metadata and pays this cost.
+pays the same ~128 LWTs per GB when it reaches metadata registration. The cost is
+shared by governed upload modes, but browser and sync dedup preflight can classify a
+fully deduplicated block before `RegisterUploadedBlock`. The ~128 rounds/GB figure is
+therefore new-content sensitivity, not a universal per-file charge. The correction is
+also relevant to X1: if future code mints physical keys, the first-writer LWT remains
+the canonical-winner decision and cannot be dropped casually.
 
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
@@ -950,10 +951,16 @@ These stay open and keep destructive GC disabled:
 
 - **Physical delete ABA** — an already-authorized key-only S3 delete can run after
   the visible fence clears. Cassandra authorization/claim generations cannot revoke
-  a DELETE already in flight; only never-reused generational physical keys close X1.
-- **Cross-DC reference visibility** — `block_references` are ordinary `LOCAL_QUORUM`
-  writes that `SERIAL` does not cover; with RF 1 per DC the write and read quorums
-  need not intersect (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`).
+  a DELETE already in flight; only never-reused physical keys close the stale
+  physical-delete ABA component of X1. Publication and claim races remain separate X1
+  criteria.
+- **Cross-DC reference visibility** — out of scope for this series, and **closed
+  separately on 2026-08-14** (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`). The defect
+  was that `block_references` are ordinary `LOCAL_QUORUM` writes that `SERIAL` does not
+  cover, so with RF 1 per DC the write and read quorums need not intersect. Closed by
+  pinning the *authorizing* read to `EACH_QUORUM` behind a topology gate, under the
+  stable-topology operational contract. It no longer keeps destructive GC disabled;
+  X1 does that alone.
 - **`ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`** — the physical PUT still precedes
   materialization, so a crash between them leaves an undiscoverable S3 object.
 - **Canonical read fan-out at scale** — one Cassandra point read per unique block
@@ -969,7 +976,11 @@ These stay open and keep destructive GC disabled:
   part of its merge verification.
 - No multi-DC test exercises any of the cross-DC reasoning; it is derived from the
   production consistency contract, not from a reproduction. PR-6 therefore never
-  converts a local absence observation into 404. The dedicated
+  converts a local absence observation into 404. **Superseded 2026-08-14 for X2 only:**
+  `docker-compose.cassandra-3dc.yaml` plus `scripts/x2-multidc-validation.sh` now
+  reproduce cross-DC visibility at the wire level, and X2 closed on that evidence. The
+  rest of this bullet still stands — the remaining cross-DC assumptions in this series
+  have never been reproduced, even though the instrument now exists. The dedicated
   `config-usa.cluster.yaml` / `config-eu.cluster.yaml` test profiles use
   `LOCAL_SERIAL`; their inline "multi-DC standard" wording describes the harness,
   not production. That harness specifically does not reproduce production's

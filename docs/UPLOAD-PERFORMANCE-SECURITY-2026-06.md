@@ -114,9 +114,10 @@ Dekker-style mutual flagging. The `gc_s3_orphans` fence is written *before* the 
 lifecycle are visible to both the probe and materialize step. The probe fails
 closed when ownership cannot be established (BlockedByGC → retry, UnknownError →
 error, NeedsPut → direct PUT). This does not close X1: a delayed same-key S3 delete
-can outlive its Cassandra authorization state. Keep GC disabled fleet-wide until
-generational physical keys close X1. See the audit thread for the full interleaving
-analysis.
+can outlive its Cassandra authorization state. Never-reused physical keys close that
+physical-delete ABA component, but the publication, claim-ownership and recovery criteria
+remain. Keep GC disabled fleet-wide until the complete X1 workstream closes. See the
+audit thread for the full interleaving analysis.
 
 **Retry loop change:** `retrySeafHTTPBlockMaterialization`, the shared
 `v2.RetryUploadedBlockMaterialization`, and the template-CreateFile wrapper treat a GC

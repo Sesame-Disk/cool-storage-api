@@ -37,7 +37,10 @@
 |---|----------------|-----------|----------|-------|
 | B2 | Cross-library block read (BOLA) | **MEDIUM security gap** (still fix, not a hard go/no-go) | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | ✅ Reproduced cross-user: attacker (plain user) is 403-denied on the victim's library directly, but read the victim's block **byte-for-byte** through their *own* library. Gated by knowing the block's 256-bit hash → Medium, not High. Doc's surface list is **stale**: the standalone bare-SHA v2 GET was removed and `CheckBlocks` is now upload-session-gated; the live surface is `SyncHandler.GetBlock`, which calls `checkSyncPermission` on the **URL's** repo and then resolves the block by `(org_id, representation_id, block_id)` with no library-membership check — re-confirmed in code 2026-07-25. The existing `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` Medium rating is the accurate one. |
 
-Accepted-but-track for this release: **GC stays disabled** on every replica/DC (X1 physical-delete ABA, X2 cross-DC reference visibility) — `gc.enabled` / related flags in `configs/config.prod.yaml`.
+Accepted-but-track for this release: **GC stays disabled** on every replica/DC because
+X1 physical-delete ABA and its remaining publication/claim/recovery criteria are open;
+X2 cross-DC reference visibility is closed under its stable-topology contract —
+`gc.enabled` / related flags in `configs/config.prod.yaml`.
 
 ---
 

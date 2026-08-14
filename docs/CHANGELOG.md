@@ -410,15 +410,19 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ## 2026-08-14 - X1: r3 generational fence abandoned; closure options documented; prod `GC_ENABLED=false` pinned
 
-Documentation and Compose only. No runtime code changed. X1 stays open, no design is
-accepted, and `GC_ENABLED=false` remains mandatory on every replica in every DC.
+No Go runtime implementation changed; documentation and deployment configuration did.
+X1 stays open, no design is accepted, and `GC_ENABLED=false` remains mandatory on every
+replica in every DC.
 
 **The r3 generational-fence ADR is abandoned.** PR #166 closed unmerged; the branch
 `docs/gc-x1-x2-generation-fence-final` is retained as investigative reference only, and
 nothing in it is a decision of record. The reasoning is recorded in `DECISIONS.md`: r3's
 bulk was the publication frontier, which existed to prove that no new reference could
-appear against a retiring generation *while reference writes stayed local* — and X2
-closed on 2026-08-14 with a global GC-side liveness read instead, needing none of it.
+appear against a retiring generation *while reference writes stayed local*. X2 closed on
+2026-08-14 with a global GC-side liveness read instead, so the cross-DC visibility half
+needs none of that machinery. The publication TOCTOU remains an X1 problem; the new
+options document evaluates whether a smaller claim/key/post-check protocol can replace
+the frontier.
 
 **New `docs/GC-X1-CLOSURE-OPTIONS.md`** carries the X1 half of the withdrawn alternatives
 analysis forward, corrected and extended, with every claim checked against code. What is
@@ -434,9 +438,11 @@ new relative to the withdrawn document:
   (`seafhttp.go:2664-2681`), and the three v2 paths pass `nil`.
 - **The one-serial-domain inventory was undercounted.** There are **eleven** conditional
   statements on the `blocks` partition, not six; the five that were missing are listed
-  with locations. The rule also has to cover `gc_s3_orphans`, which is where the fence
-  lives for most of the destructive window and carries five more conditional statements
-  plus one *unconditional* fence-clearing DELETE.
+  with locations. The same global `SERIAL` discipline applies to the relevant
+  `gc_s3_orphans` LWTs, but the two partitions do not share a Paxos log and the protocol
+  assumes no cross-table atomicity. Once the canonical row is gone, an orphan is a
+  durable physical-delete record, not a logical writer fence; a later incarnation may
+  proceed while the old key is recovered.
 - **A recommended option ("d-lite"): overlapped physical lives.** The writer stops waiting
   on the physical delete and waits only for GC to release the metadata row. Its price is
   named exactly: every destructive authorization in the code today is keyed by the
