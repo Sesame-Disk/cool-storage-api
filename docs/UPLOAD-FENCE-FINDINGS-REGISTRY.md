@@ -20,8 +20,8 @@ F6, F14 and the observed-fence half of F1. PR-4 as
 
 **Every F row is now closed.** What remains is the X list — items the series
 never scoped, deferred, or knowingly accepted. PR-11 (remove the per-block Paxos,
-X4) is deferred pending a production latency measurement. **X1/X2 remain open and
-destructive GC stays disabled fleet-wide.**
+X4) is deferred pending a production latency measurement. X2 closed 2026-08-14.
+**X1 remains open and destructive GC stays disabled fleet-wide.**
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping
@@ -100,9 +100,10 @@ Rows move here only once the PR that fixes them **merges**.
 
 ## Open, deferred, or constraining the series
 
-X1-X3, X5, X6 and X9-X11 are not closed by the immediate code PRs; X4 is deferred to PR-11;
-X7 was closed by PR-2 (see **## Closed**); X8 is a cost PR-6 accepts knowingly rather
-than a defect to fix. Destructive GC stays disabled until X1 and X2 are resolved.
+X1, X3, X5, X6 and X9-X11 are not closed by the immediate code PRs; X4 is deferred to PR-11;
+X7 was closed by PR-2 (see **## Closed**) and X2 closed 2026-08-14 (see its row above); X8 is a
+cost PR-6 accepts knowingly rather than a defect to fix. Destructive GC stays disabled until X1
+is resolved.
 
 PR-2 also removed writer-side active-claim release from `internal/api/v2/fs_helpers.go`.
 Only the GC owner may release or delete an active claim; writers must wait/retry or

@@ -1,6 +1,6 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-07-21
+**Last Updated**: 2026-08-14
 **Session**: Upload-fence / GC safety PR series
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:

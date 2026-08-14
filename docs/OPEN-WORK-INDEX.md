@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-14
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -61,8 +61,7 @@ of them updated.
 which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
 2026-08-04; the object-storage posture issue and the sync public-link token auth
 gap both closed 2026-08-07. This is not the same as "nothing is left": X1
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and X2
-(`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) remain open and still block
+(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) remains open and still blocks
 *enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
 B5. See
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
@@ -199,8 +198,8 @@ Not findings — things nobody has proven either way.
   `docker-compose.cassandra-3dc.yaml` (three DCs, RF 1) plus
   `scripts/x2-multidc-validation.sh` reproduce cross-DC consistency behaviour at the
   wire level, and X2 is closed on that evidence — divergent-state visibility,
-  fail-closed with a DC down, both topology-gate halves, and the visibility leg
-  mutation-verified. **X6 and the remaining cross-DC assumptions are still derived
+  fail-closed with a DC down, reference-DC-down with the `QUORUM` mutation, both
+  topology-gate halves, and both consistency mutations. **X6 and the remaining cross-DC assumptions are still derived
   from the production consistency contract and have never been reproduced**, even
   though the instrument to do it is now checked in.
 - **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).

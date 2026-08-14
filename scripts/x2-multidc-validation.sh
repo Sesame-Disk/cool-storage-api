@@ -2,7 +2,7 @@
 #
 # X2 closure evidence, automated.
 #
-# Runs the three legs that ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 needs before it
+# Runs the five closure legs that ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 needs before it
 # can be marked Closed, against the real three-datacenter Cassandra fixture. The prose
 # runbook in docs/GC-X2-MULTIDC-VALIDATION.md remains the explanation; this is the
 # executable form, because a multi-step manual procedure that nobody can run in one

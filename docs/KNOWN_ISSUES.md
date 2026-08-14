@@ -2137,18 +2137,25 @@ The invariant now enforced is:
   `EACH_QUORUM` quietly stops being obliged to contact those DCs — and Cassandra does
   not relocate historical data on `ALTER`.
 
-  **Changing topology under enabled destructive GC is therefore unsupported, not
-  prevented** — the distinction matters and the earlier wording ("topology is
-  immutable") overstated it. The gate *detects live/config drift*; it does not
-  certify history and it cannot block a concurrent `ALTER`. The supported procedure
-  is: fleet-wide `GC_ENABLED=false`, alter the keyspace, run the corresponding repair,
-  update the declared map, validate, re-enable. The gate is part of `GCStore`, so a
-  store that drops it fails to compile rather than silently disarming; it guards both
-  destructive paths; and it is re-evaluated per attempt — including once more at the
-  commit point, immediately before the first destructive statement, which narrows the
-  window between "gate passed" and "bytes destroyed" from the whole walk to two
-  statements. That narrows a race the operational rule already forbids; it does not
-  close it, and nothing in the code can.
+  **Changing topology while reference state exists is an operational migration, not a
+  safe consequence of setting `GC_ENABLED=false`** — the distinction matters. The gate
+  *detects live/config drift*; it does not certify history and it cannot block a
+  concurrent `ALTER`. The supported baseline is that the replication DC set and RF
+  remain immutable while existing `block_references` may have been acknowledged under
+  that topology. If a topology change is required, destructive GC stays disabled and
+  all block-reference producers are quiesced while operators run a separately
+  certified migration: reconcile the old replica set, apply the new map and its data
+  movement/repair, verify that historical reference state is present in the new
+  authorizing replica set, update the declared map, validate, and only then resume
+  producers. `GC_ENABLED=false` alone is not that certification.
+
+  The gate is part of `GCStore`, so a store that drops it fails to compile rather than
+  silently disarming; it guards both destructive paths; and it is re-evaluated per
+  attempt — including once more at the commit point, immediately before the first
+  destructive statement, which narrows the window between "gate passed" and "bytes
+  destroyed" from the whole walk to two statements. That narrows a race the
+  operational rule already forbids; it does not certify topology history, and nothing
+  in the code can.
 
   **Scope of that check, precisely.** It compares the topology in effect now against
   the topology this process is configured with now. That catches the realistic
@@ -2157,11 +2164,10 @@ The invariant now enforced is:
   operator who changes both together and restarts passes the gate while historical
   references still live in the dropped datacenters. Closing that in code needs a
   certified fingerprint (persist the map at first destructive activation; require
-  explicit recertification after any change), which is deliberately not built — the
-  gap is reachable only through a deliberate multi-step administrative change, which
-  is exactly what the procedure above covers. **Until that exists, "topology does not
-  change under destructive GC" is an operational precondition, not an enforced
-  invariant.** Tracked as follow-up in `GC-X2-MULTIDC-VALIDATION.md`.
+  explicit recertification after any change), which is deliberately not built. Until
+  that exists, **topology/RF immutability or a separately certified migration is an
+  operational precondition, not an enforced invariant**. Tracked as follow-up in
+  `GC-X2-MULTIDC-VALIDATION.md`.
 - Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
   `{reason="destructive_topology_gate"}` and `{reason="cluster_unavailable"}`, plus
   `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. Its counterpart
@@ -2421,7 +2427,7 @@ PUT or a sweeper with a safe ownership proof. Tracking:
 
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
-**Status**: 🟡 Lease implemented; destructive activation blocked independently by X1/X2
+**Status**: 🟡 Lease implemented; destructive activation blocked independently by X1
 **Discovered**: 2026-03-17
 **Priority**: 🟡 High — required before scaling to multiple replicas
 **Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
@@ -2444,10 +2450,11 @@ the independent physical-delete ABA and cross-DC visibility blockers above:
 incorrect admin counters. This statement does not close or downgrade the independent
 destructive-GC blockers above.
 
-**Current operational decision (updated 2026-07-21):**
-- Keep `gc.enabled=false` and `GC_ENABLED=false` on every replica in every DC while X1 or X2 remains open.
-- The Cassandra LWT lease (`gc_leases`) coordinates participants but does not close either blocker and is not permission to enable GC.
-- Only after both X1 and X2 close may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease. Every replica in every other DC remains false.
+**Current operational decision (updated 2026-08-14):**
+- Keep `gc.enabled=false` and `GC_ENABLED=false` on every replica in every DC while X1 remains open.
+- X2 is closed under the stable-topology operational contract. A replication DC-set or RF change with existing reference state requires a separately certified migration before GC can be reconsidered.
+- The Cassandra LWT lease (`gc_leases`) coordinates participants but does not close X1 and is not permission to enable GC.
+- Only after X1 closes may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease. Every replica in every other DC remains false.
 
 **Leader Election via LWT:**
 - Implemented with `gc_leases` and TTL-backed heartbeats.
@@ -2455,16 +2462,16 @@ destructive-GC blockers above.
 - If the leader dies or loses its lease, another enabled replica can take over automatically after lease expiry.
 
 **Recommended future direction:**
-- After X1/X2 close, keep the explicit `GC_ENABLED=true` activation model so only designated replicas in one DC opt in.
+- After X1 closes, keep the explicit `GC_ENABLED=true` activation model so only designated replicas in one DC opt in.
 - Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
-**Multi-region deployment note (updated 2026-07-21):**
-While X1/X2 remain open, running GC in even one DC is unsafe: keep it disabled in all DCs. After both close, restricting participants to a single DC is **critical**. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
+**Multi-region deployment note (updated 2026-08-14):**
+While X1 remains open, running GC in even one DC is unsafe: keep it disabled in all DCs. After X1 closes, restricting participants to a single DC is **critical**. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
 - `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
 - Scanner in both DCs enqueueing duplicate orphans
 - Unnecessary cross-DC Paxos contention on every LWT
 
-Post-X1/X2 topology is `GC_ENABLED=true` only on designated replicas in one DC and `GC_ENABLED=false` everywhere else. Until both close, the topology is `GC_ENABLED=false` everywhere. The lease provides failover only among designated replicas in that one DC.
+Post-X1 topology is `GC_ENABLED=true` only on designated replicas in one DC and `GC_ENABLED=false` everywhere else. Until X1 closes, the topology is `GC_ENABLED=false` everywhere. The lease provides failover only among designated replicas in that one DC.
 
 Block-level conditional operations include first-writer metadata creation, GC claim,
 claim release/finalize, and orphan lifecycle transitions; production defaults these
@@ -4690,11 +4697,11 @@ canonical presence is expected.
 Per project posture (pre-production, empty server, no legacy-data preservation) there is no
 production orphan backlog to inherit, and the stop-the-world GC upgrade (see `docs/DEPLOY.md`)
 plus a queue/DLQ drain removes any transient rows. Re-enabling remains prohibited
-while X1/X2 are open; after both close, the backlog preflight is an additional gate.
+while X1 is open; after it closes, the backlog preflight is an additional gate.
 
 #### Options if a real backlog ever exists
 
-- After X1/X2 close, a fail-closed preflight that also refuses activation while commit/fs_object rows exist with
+- After X1 closes, a fail-closed preflight that also refuses activation while commit/fs_object rows exist with
   `library_guard_mode IS NULL AND requires_library_deleted_check=false`.
 - A `legacy_unclassified` mode that is quarantined (never auto-executed) for operator triage.
 - A `work_source` / `queue_protocol_version` column so this ambiguity cannot recur.

@@ -360,7 +360,7 @@ seafhttp:
   upload_link_max_inflight_per_node: 128
 
 gc:
-  enabled: false                   # Required everywhere while GC blockers X1/X2 remain open; only after closure may one DC designate participants under the lease
+  enabled: false                   # Required everywhere while X1 remains open (X2 closed under the stable-topology contract); only after closure may one DC designate participants under the lease
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100
