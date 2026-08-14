@@ -40,6 +40,31 @@ that do not hold the reference. Only here do `EACH_QUORUM` and `QUORUM` separate
 only here does the fixture match production (`.env.prod.example`:
 `CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1`).
 
+**And that separation is now executable, not just argued.** For a long time this
+section was the only thing ruling `QUORUM` out — the harness's single mutation
+downgraded the destructive read to `LOCAL_QUORUM`, which demonstrates the original
+defect and says nothing about `QUORUM`. Leg 2b closes that: it runs the divergent
+state with **dc-eu itself stopped**, so the datacenter holding the only reference is
+unreachable.
+
+```text
+                          dc-na (blind)   dc-eu (has ref)   dc-asia (blind)
+                                │              STOPPED             │
+EACH_QUORUM  needs a quorum in EVERY DC ──────► cannot ────► ERROR ─► fail closed ✅
+QUORUM       needs 2 of 3 ─► dc-na + dc-asia answer ───────► FALSE ─► delete live data ❌
+LOCAL_QUORUM needs dc-na alone ───────────────────────────► FALSE ─► delete live data ❌
+```
+
+`scripts/x2-multidc-validation.sh --mutate-quorum` runs exactly that. Note that leg 2
+(stopping dc-asia, which holds nothing) *would* also go red under `QUORUM` — 2 of 3 is
+satisfiable without dc-asia, so the read succeeds where the leg requires it to error.
+That is an inference from the consistency semantics, **not** a run: the harness never
+executes that combination, and it is the weaker evidence anyway, since succeeding is
+not the same as returning the false zero. And leg 1 cannot carry this mutation at all: with
+all three DCs up, a `QUORUM` read is satisfied by whichever two replicas the
+coordinator reaches first, so it would pass or fail by chance rather than by
+construction.
+
 `docker-compose.mr-cluster.yaml` is pinned to two DCs (`{usa:1, eu:1}`) because it
 exists to prove regional *application* behaviour. It is the wrong instrument here,
 which is why `docker-compose.cassandra-3dc.yaml` was added: same cluster shape,
@@ -128,6 +153,35 @@ docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-asia
 X2_EXPECT_DC_DOWN=1 go test -tags integration ./internal/integration/ \
   -run TestX2_EachQuorumFailsClosed -v
 docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-asia
+
+# 6b. Reference-DC-down leg: same shape, but the stopped DC is the one holding the
+#     ONLY reference. This is the leg that separates EACH_QUORUM from plain QUORUM —
+#     see "Why the fixture needs three datacenters".
+#
+#     REBUILD THE DIVERGENCE FIRST. Step 5's EACH_QUORUM read performed blocking read
+#     repair to satisfy its own consistency level, so its block now exists in dc-na;
+#     against that healed row this leg passes for the wrong reason. Repeat step 4 with
+#     the fresh ids it prints.
+docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-eu
+X2_EXPECT_REFERENCE_DC_DOWN=1 X2_DIVERGENT_ORG=<fresh> X2_DIVERGENT_BLOCK=<fresh> \
+  go test -tags integration ./internal/integration/ \
+  -run TestX2_FailsClosedWhenTheReferenceDatacenterIsDown -v
+docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-eu
+
+#     CHECK dc-eu IS STILL STOPPED AFTERWARDS. The leg takes minutes, and an ABORTED
+#     earlier run leaves an EXIT trap that restarts every stopped node — so dc-eu can
+#     boot underneath a leg that has already started. This is not hypothetical; it
+#     happened during this branch's own validation and produced both a leg 2b that
+#     passed for the wrong reason (EACH_QUORUM could not reach a node that was
+#     mid-BOOT, not one that was stopped) and, minutes later, a QUORUM read that found
+#     the row through a recovered dc-eu and read-repaired it to every replica, ending
+#     the divergence. The script now calls require_stopped before and after; do the
+#     same by hand.
+docker inspect -f '{{.State.Running}}' sesamefs-cassandra-eu   # must print false
+#
+#     Mutation check for this leg: point BlockHasReferencesGlobal at QUORUM and confirm
+#     it FAILS — that is the executable form of "QUORUM is not an acceptable fix".
+#     `scripts/x2-multidc-validation.sh --mutate-quorum` does the whole sequence.
 
 # 7. Topology gate: accepts the declared 3-DC keyspace, and refuses a session whose
 #    declared map is smaller than the live one (the shape a shrunk ALTER leaves).
@@ -387,9 +441,28 @@ mid-delete under, dropping the upload fence inside the window between A's verify
 its orphan row — the exact window the fence exists to cover. `ReleaseStaleBlockClaim`
 therefore releases only a claim older than `blockDeleteClaimStaleAfter` (15 minutes,
 far beyond any single walk), leaves anything younger untouched, and reports "nothing
-to release" as success rather than as a failed CAS. And when the release genuinely
-fails, the candidate is **not** consumed: it is the only work item that can retry
-lifting that fence.
+to release" as success rather than as a failed CAS.
+
+And when the release genuinely fails, the work is **not** consumed — for *any* failure
+reason, which is a stronger rule than the rest of the walk follows and is the second
+correction this section has needed. Preserving the candidate ROW is not enough, and an
+earlier version of this paragraph stopped there. The row survives an ordinary error
+too; what does not survive is the queue item, and five failures retire that to the DLQ,
+where `ItemBlock` never auto-recovers and the scanner's day cursor has already stepped
+past the candidate's bucket. The fence would then stand on a block that is *provably
+still referenced*, with nothing left able to lift it — a permanent upload refusal on
+live content, produced by the branch that exists to remove such fences. An unknown
+column in the release statement is exactly as fatal to that fence as an unreachable
+datacenter is, so `GCFailureCodeBlockClaimReleaseUnconfirmed` postpones both.
+
+The price is stated rather than hidden: a permanently failing release now postpones
+forever instead of surfacing in the DLQ. That is the same trade the ambiguous timeout
+codes make in § 4 above, and the visibility it gives up is bought back with a dedicated
+`gc_errors_total{type="stale_claim_release_failed"}` counter. **Alert on it** — it
+means a live block is fenced and no automatic process will clear it.
+Pinned by `TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget`, which rides out more
+passes than the budget would have survived and then proves the same item still lifts
+the fence once the fault is fixed.
 
 ### 5. Tombstones bias safely
 
@@ -414,14 +487,48 @@ count out of `configs/`.
   `clearSeafHTTPS3OrphanFence`, returns `(false, nil)` on every path. Writers cannot
   shorten a fence wait; they re-probe each retry and proceed on the first attempt
   after GC clears the orphan.
-- **Six conditional statements touch the `blocks` partition** — `ClaimBlockDelete`,
-  `ReleaseBlockClaim`, `FinalizeBlockDelete`, `UpsertBlockMetadata`, the stub repair
-  claim and its conditional delete — and all six inherit the session serial level,
-  which the cluster profiles set to `LOCAL_SERIAL`. Mixing `LOCAL_SERIAL` and
-  `SERIAL` on one partition breaks linearizability: they are different quorum
-  domains, and one straggler invalidates every other statement's guarantee. r3 calls
-  this the **one-serial-domain rule**. X2 does not depend on it — this fix changes no
-  LWT — but any X1 design does. Tracked as R12 in `GC-X1-X2-ALTERNATIVES.md`.
+- **Eleven conditional statements touch the `blocks` partition**, and all of them
+  inherit the session serial level, which the cluster profiles set to `LOCAL_SERIAL`.
+  Mixing `LOCAL_SERIAL` and `SERIAL` on one partition breaks linearizability: they are
+  different quorum domains, and one straggler invalidates every other statement's
+  guarantee. r3 calls this the **one-serial-domain rule**. X2 does not depend on it, but
+  any X1 design does. Tracked as R12 in `GC-X1-X2-ALTERNATIVES.md`.
+
+  An earlier version of this bullet also said "this fix changes no LWT". That is no
+  longer true — `ReleaseStaleBlockClaim` is one — and it did not matter for X2, since
+  the new statement inherits the same serial level as its ten neighbours and so changes
+  nothing about the domain. It matters for X1, which has one more statement to bring
+  into whatever domain it settles on.
+
+  This list previously said "six" and named only the obvious half. It was already an
+  undercount before this branch, which then added a seventh; the count below is the
+  audited one, from `grep` over every conditional statement naming `blocks`. An X1
+  design built on the short list would have started from an inventory that was wrong in
+  the direction that matters — statements it did not know it had to bring into the
+  single serial domain.
+
+  | # | Statement | Where | New in this branch |
+  |---|---|---|---|
+  | 1 | `ClaimBlockDelete` (`IF gc_state != ?`) | `gc/store_cassandra.go` | |
+  | 2 | `ReleaseBlockClaim` (`IF gc_state = ? AND gc_claim_id = ?`) | `gc/store_cassandra.go` | |
+  | 3 | `FinalizeBlockDelete` (conditional `DELETE`) | `gc/store_cassandra.go` | |
+  | 4 | `ReleaseStaleBlockClaim` (`IF gc_state/claim_id/claimed_at`) | `gc/store_cassandra.go` | ✅ |
+  | 5 | `UpsertBlockMetadata` (`INSERT ... IF NOT EXISTS`) | `db/block_references.go` | |
+  | 6 | stub repair claim (`IF created_at = null AND ...`) | `db/block_references.go` | |
+  | 7 | repair-claimed stub delete | `db/block_references.go` | |
+  | 8 | GC-claimed stub delete | `db/block_references.go` | |
+  | 9 | `backfillBlockSHA1` (`IF sha1 = ?`) | `db/block_references.go` | |
+  | 10 | `backfillBlockRepresentationID` (`IF representation_id = ?`) | `db/block_references.go` | |
+  | 11 | `DB.ReleaseBlockDeleteClaim` (`IF gc_state = ? AND gc_claim_id = ?`) | `db/block_references.go` | |
+
+  Rows 9–11 are the ones the old list silently omitted; rows 6–8 were collapsed into
+  "the stub repair claim and its conditional delete", which is three statements, not
+  two. Row 11 currently has **no caller** — it duplicates row 2 on the `db` side — and
+  is listed anyway rather than quietly dropped: an inventory that omits reachable-only
+  statements is one that stops matching the schema the moment someone wires it up.
+  Deleting it is a reasonable X1 cleanup; deleting it from the *list* while it exists in
+  the code is not. Re-derive this table rather than trusting it if the schema moves —
+  the honest invariant is "every conditional statement on `blocks`", not "these eleven".
 - **`gcS3OrphanInitialScanLookbackDays = 90` is pinned to the orphan TTL** by design;
   its comment says so. Any X1 design that removes that TTL must redefine the
   cold-start horizon in the same change, or orphans older than 90 days become
@@ -443,51 +550,82 @@ X2 moves to Closed in `KNOWN_ISSUES.md` when:
 - [x] Fail-closed is observable, and does not consume the item's retry budget
 - [x] A failed verify does not wedge the block (claim released on both paths); a
       stale claim is released, a live one is not, and a failed release does not
-      consume the candidate
+      consume the **work item** — for any failure reason, not only an availability
+      one, and proven across more passes than the retry budget would survive
 - [x] Every unit regression mutation-verified
 - [x] **Divergent-state visibility leg green** (runbook step 5) — and confirmed to
       FAIL when the destructive read is downgraded to `LOCAL_QUORUM`. A green run on
       a non-divergent cluster does not count.
 - [x] **Fail-closed leg green** (runbook step 6)
+- [x] **Reference-datacenter-down leg green** (runbook step 6b) — and confirmed to
+      FAIL when the destructive read is downgraded to `QUORUM`. This is the leg that
+      makes the three-datacenter fixture load-bearing rather than decorative: it is
+      the only one that shows the *wrong* fix returning a false zero on live data.
 - [x] **Topology gate leg green, both halves** (runbook step 7): accepts the declared
       3-DC map, refuses an under-declared one
 
-**All legs ran green on 2026-08-13** against `docker-compose.cassandra-3dc.yaml`
-(Cassandra 5.0.9, three DCs, RF 1 each), via
-[`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh):
+**All five legs ran green on 2026-08-14**, in one pass, against
+`docker-compose.cassandra-3dc.yaml` (Cassandra 5.0.9, three DCs, RF 1 each), via
+[`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh). These are
+the messages the run actually printed:
 
 ```text
 LEG 1  divergent state confirmed: LOCAL_QUORUM from dc-na is blind,
        EACH_QUORUM sees the dc-eu reference
 LEG 2  EACH_QUORUM correctly failed closed with a datacenter down:
        Cannot achieve consistency level EACH_QUORUM in DC dc-asia
+LEG 2b destructive read correctly failed closed with the reference datacenter
+       down: Cannot achieve consistency level EACH_QUORUM in DC dc-eu
 LEG 3a gate accepted the declared 3-DC map
-LEG 3b gate refused a session declaring only dc-na against the 3-DC keyspace
+LEG 3b topology gate correctly refused an under-declared map: ... keyspace
+       sesamefs is NetworkTopologyStrategy dc-asia:1,dc-eu:1,dc-na:1 but
+       CASSANDRA_REPLICATION_DCS declares NetworkTopologyStrategy dc-na:1
+```
 
-MUTATION (scripts/x2-multidc-validation.sh --mutate)
-       with .Consistency(gocql.EachQuorum) → LocalQuorum, against a FRESH
-       divergent state, leg 1 goes red:
+Keyspace confirmed to carry all three datacenters during the run:
+
+```text
+CREATE KEYSPACE sesamefs WITH replication = {'class': 'NetworkTopologyStrategy',
+  'dc-eu': '1', 'dc-asia': '1', 'dc-na': '1'} AND durable_writes = true;
+```
+
+**Both mutations were re-run on 2026-08-14**, because the harness's mutation machinery
+itself changed in this round (the level is now a parameter, and `require_stopped`
+guards were added). That is the part producing the evidence, and this document's own
+standard is that changing it invalidates an earlier green:
+
+```text
+MUTATION A (--mutate)          .Consistency(gocql.EachQuorum) → LocalQuorum
+       against a FRESH divergent state, leg 1 goes red:
        "X2 REGRESSION: reference acknowledged at LOCAL_QUORUM in dc-eu is
         invisible to the EACH_QUORUM read from dc-na; GC would authorize
         deleting a live block"
+
+MUTATION B (--mutate-quorum)   .Consistency(gocql.EachQuorum) → Quorum
+       against a FRESH divergent state with dc-eu STOPPED, leg 2b goes red:
+       "X2 REGRESSION: the destructive read returned zero references while
+        dc-eu — the only datacenter holding one — was unreachable. GC would
+        authorize deleting a live block. A read that can be satisfied without
+        every datacenter (QUORUM, LOCAL_QUORUM) is not an acceptable
+        authorization for a physical delete"
 ```
 
-**Re-run green on 2026-08-13 after the harness itself changed** (per-node healthcheck,
-explicit `wait_bootstrap`, explicit `CASSANDRA_REPLICATION_DCS` on the migrate step,
-exit-code check in `build_divergence`). Those are the parts that produce the evidence,
-so changing them invalidates a green run taken before them; the five tests above went
-green again unchanged, and the keyspace was confirmed to carry all three datacenters:
+The mutations are the load-bearing half. A green leg means nothing on its own — it has
+to be shown to go red against the defect it exists to catch, on a cluster divergent
+enough for the consistency levels to disagree. Mutation B is the one that took this
+document's central claim — that three datacenters rule `QUORUM` out — from an argument
+in prose to a test that fails if someone implements exactly that wrong fix.
 
-```text
-sesamefs | {'class': 'NetworkTopologyStrategy', 'dc-asia': '1', 'dc-eu': '1', 'dc-na': '1'}
-```
-
-The mutation leg was not repeated — nothing in that change touches the destructive read,
-its consistency level, or the gate.
-
-The mutation is the load-bearing half. Leg 1 passing means nothing on its own — it
-had to be shown to go red against the very defect it exists to catch, on a cluster
-divergent enough for the two consistency levels to disagree.
+**A note on how easily this evidence can be faked, learned the hard way in this same
+round.** An earlier attempt at leg 2b ran moments after an aborted run, whose EXIT trap
+restarts stopped nodes. `EACH_QUORUM` failed — because dc-eu was mid-BOOT, not because
+it was stopped — and the leg went green for the wrong reason; minutes later a `QUORUM`
+read found the row through the recovered dc-eu and read-repaired it to every replica,
+ending the divergence. The test refused to report either PASS or REGRESSION once it
+could see the row, so nothing false was published, and `require_stopped` now checks
+before and after. Both results above were taken after that guard was in place. If a
+leg 2b run ever reports "the cluster is not divergent any more", that is the guard
+working: rebuild, do not re-interpret.
 
 RF 3 is not on this list: it needs a 9-node stack and is hardening, not closure.
 

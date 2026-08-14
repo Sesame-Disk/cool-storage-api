@@ -993,12 +993,33 @@ func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlS
 // cleanup is always safe. Upload up: references are not removed through this API.
 //
 // DELIBERATELY NOT PINNED to BlockReferenceWriteConsistency, and the asymmetry is the
-// point. An under-replicated INSERT can hide a live reference from the destructive
-// read, which is a delete of referenced data. An under-replicated DELETE fails the
-// other way: the EACH_QUORUM read may still see the row, GC declines to collect the
-// block, and the bytes survive one more pass — the tombstone reaches the rest of the
-// replicas through ordinary repair. Errs toward keeping data, so it inherits the
-// session like every other statement.
+// point — but NOT for the reason an earlier version of this comment gave. It claimed
+// an under-replicated DELETE "leaves the row visible, so GC declines to collect and
+// the bytes survive one more pass", i.e. that a weak delete biases toward keeping
+// data. That is not a property of Cassandra. A DELETE writes a timestamped tombstone,
+// the mutation is sent to every replica regardless of consistency level, and
+// reconciliation is last-write-wins — so a quorum read that touches the tombstone
+// resolves to "absent" and repairs the others with it. A delete acknowledged by one
+// replica can absolutely make the row invisible to a later per-DC read quorum. There
+// is no structural bias toward keeping data here to lean on.
+//
+// What actually makes the exemption safe is the PROTOCOL, not the consistency level.
+// The X2 premise concerns CREATING a live reference: that write must reach a quorum,
+// because the destructive read's zero is only trustworthy if it intersects whatever
+// acknowledged it. Removing a reference creates no such obligation — its safety rests
+// on this call only ever being made once the referrer has lost authority over the
+// block. Both callers satisfy that by construction: the publish-attempt cleanup
+// retires a TTL'd provisional reference, and the GC cascade removes an fs_object's
+// reference as that fs_object is being deleted. The window between publishing a new
+// reference and removing an old one is the publication fence, which belongs to X1
+// (ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01), not to the consistency of this
+// statement.
+//
+// Pinning the delete to LOCAL_QUORUM as well would be harmless — it is already the
+// effective level in every shipped profile — and would remove the need to explain the
+// asymmetry at all. It is left inheriting the session because the pin is a safety
+// mechanism with a specific justification, and applying it where that justification
+// does not hold would blur what it means everywhere else.
 func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 	return db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?

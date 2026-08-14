@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // These tests pin ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01 (X2).
@@ -271,10 +273,105 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	}
 }
 
-// TestX2_StaleClaimReleaseFailureKeepsTheCandidate pins the availability rule that
-// makes the release safe to require. If the release itself fails, the candidate must
-// NOT be cleared: it is the only work item that can retry the release, and consuming
-// it would strand a live block behind a permanent fence with nothing left to lift it.
+// TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget is the strong form of the
+// rule below, and the one that actually holds the guarantee up.
+//
+// Preserving the candidate ROW for one pass is not the property. The row survives an
+// ordinary error too; what does not survive is the QUEUE ITEM, and the item is the
+// part that does the work. Five failures retire it to the DLQ, block items never
+// auto-recover from there, and the scanner's day cursor has already stepped past this
+// candidate's bucket — so the fence stands on a live, still-referenced block with
+// nothing left in the system able to lift it, and every future upload of that content
+// is refused by BlockDeleteFenceActive.
+//
+// The injected error is deliberately one that isClusterUnavailableError does NOT
+// recognise. Routing this branch through failClosedIfUnavailable would postpone the
+// availability case and let exactly this case burn the budget, so a test that injects
+// an availability failure proves nothing about the branch that matters.
+func TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
+
+	// A real fence on a real live block: the state the release exists to clear. Aged
+	// via the store rather than by moving the worker's clock forward — see
+	// BackdateBlockClaimForTest for why a future clock would make the multi-pass
+	// assertion below vacuous.
+	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
+	if err != nil || !applied {
+		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
+	}
+	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
+
+	// Permanent and item-specific — the shape of an unknown column or a serialization
+	// bug in the release statement, not of a datacenter outage.
+	store.SetReleaseStaleBlockClaimErrForTest(errors.New("undefined column gc_claimed_at in table blocks"))
+
+	// The counter is the only thing that will ever surface this item, since it now
+	// postpones forever instead of reaching the DLQ. Asserting on it also rules out the
+	// wrong way to make this test pass: broadening isClusterUnavailableError until it
+	// swallows permanent errors would keep the item out of the DLQ here while silently
+	// suppressing genuinely DLQ-worthy failures at every other statement in the walk.
+	before := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("stale_claim_release_failed"))
+
+	// More passes than the five-retry budget would have survived. Under the old
+	// behaviour the sixth would have moved the item to the DLQ.
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("stale_claim_release_failed")) - before; got != 8 {
+		t.Errorf("gc_errors_total{type=\"stale_claim_release_failed\"} rose by %v over 8 refused passes, want 8 — this counter is the only signal a human gets for a fence that will never lift on its own", got)
+	}
+
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed != 0 {
+		t.Fatalf("%d item(s) reached the DLQ after a permanently failing stale-claim release; block items do not auto-recover from there and the scanner cursor has moved on, so the live block would stay fenced forever", failed)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Fatalf("candidate rows = %d after %d failed releases, want the candidate preserved", len(got), 8)
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != db.BlockGCStateDeleting {
+		t.Fatalf("test no longer models a failed release of a real fence: gc_state=%q", blk.GCState)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted a referenced block: %+v", deletes)
+	}
+
+	// And the work is still live: once the underlying fault is fixed, the same item
+	// lifts the fence and settles. This is what "the candidate was not consumed" has
+	// to mean to be worth anything.
+	store.SetReleaseStaleBlockClaimErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("recovery ProcessOnce returned a fatal error: %v", err)
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != "" {
+		t.Errorf("fence still up (gc_state=%q) after the release recovered", blk.GCState)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 0 {
+		t.Errorf("candidate rows = %d after recovery, want the item settled", len(got))
+	}
+}
+
+// TestX2_StaleClaimReleaseFailureKeepsTheCandidate pins the single-pass half: a failed
+// release must not clear the candidate. The retry-budget test above is what proves
+// that preservation is durable; this one localises a regression to the branch itself.
 func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -300,10 +397,13 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
 	}
-	// Run past the staleness threshold so the release is one that WOULD succeed.
-	w.clock = func() time.Time { return time.Now().Add(2 * blockDeleteClaimStaleAfter) }
+	// Age the claim past the staleness threshold so the release is one that WOULD
+	// succeed. Done on the row rather than by moving w.clock() forward: a future
+	// worker clock requeues postponed items past DequeueBatch's time.Now() cutoff, so
+	// the recovery pass below would find an empty queue and assert nothing.
+	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
 
-	store.SetReleaseStaleBlockClaimErrForTest(errors.New("cassandra unavailable"))
+	store.SetReleaseStaleBlockClaimErrForTest(errors.New("undefined column gc_claimed_at in table blocks"))
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)

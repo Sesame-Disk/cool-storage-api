@@ -11,10 +11,18 @@ Session-by-session development history for SesameFS.
 ## 2026-08-13 - X2 cross-DC reference visibility: EACH_QUORUM destructive liveness
 
 First runtime change of the X1/X2 series. Implements the cross-DC half without r3: no
-generations, no physical incarnations, no writer hot-path change, and no `SERIAL+ALL`
+generations, no physical incarnations, no extra writer round trip, and no `SERIAL+ALL`
 fence — that fence serves the publication TOCTOU, a different property. Destructive
 GC stays disabled. X2 is closed on the three-DC evidence below; X1 is the sole runtime
 activation blocker.
+
+**The writer path did change**, and an earlier draft of this entry claimed it had not.
+Reference writes now pin `LOCAL_QUORUM` explicitly instead of inheriting the session
+(`db.BlockReferenceWriteConsistency`). The accurate statement is: *no additional writer
+round trip, and no WAN consistency added to the shipped upload path* — `EACH_QUORUM`
+stays on the GC read alone. Every shipped profile already ran `LOCAL_QUORUM`, so no
+deployment changes behaviour; a deployment that had configured `EACH_QUORUM` or `ALL`
+for reference writes would be lowered to `LOCAL_QUORUM` by the pin.
 
 The invariant now enforced:
 
@@ -193,12 +201,12 @@ the reason covers.
   audit had noticed was a producer at all. The gate's check stays as a second line for
   writers this binary cannot speak for (an older binary in the fleet, a future producer
   that forgets), and `TestBlockReferenceProducersPinWriteConsistency` walks the AST of
-  every non-test file under `internal/` so a third producer fails until it is pinned.
+  every non-test file in the module so a new producer fails until it is pinned.
   It counts identifiers and string literals rather than file text, which is not a
   detail: the first draft counted text, and the comment *explaining* the batch's pin
   satisfied the count — removing the batch's real pin left it green.
-  `RemoveBlockReference` is deliberately exempt, since an under-replicated DELETE
-  leaves the row visible and GC declines to collect, erring toward keeping data. The
+  `RemoveBlockReference` is deliberately exempt — see the closing round below for the
+  correct reason, which is about the protocol rather than about tombstones. The
   pin is a fixed level rather than a floor, so it also *lowers* a deployment configured
   for `EACH_QUORUM` or `ALL` — stated plainly because it is a real trade: a level that
   varies with configuration hands back the very property being established, and what is
@@ -245,9 +253,110 @@ reverting the release to owner-only, disabling and over-applying the availabilit
 classifier, caching gate rejections, downgrading the commit-point gate to the cached
 form, letting the blocked gauge latch, letting one path's gauge speak for the other,
 dropping the referenced-orphan refusal, unpinning either reference producer,
-reformatting the INSERT so the producer scan goes blind, forcing orphan recovery back
+removing a producer so the scan's floor is breached, forcing orphan recovery back
 to a single error class, and admitting `ReadFailure` to the availability classifier
 were all confirmed to turn the suite red.
+
+### Closing round — the last four gaps between what was claimed and what held
+
+A final review of the above found one live defect and three statements that outran
+their evidence. All four are closed here; none of them reopened X2.
+
+- **A failed stale-claim release no longer consumes the work item.** The audit entry
+  above said "the candidate is not consumed", and the candidate *row* indeed survived —
+  but only availability failures postponed. Any other error (an unknown column, a CQL
+  bug, an unexpected CAS result) took the ordinary path: five retries, then the DLQ,
+  which `ItemBlock` never leaves, past a scanner day cursor that has already moved on.
+  The fence would then stand on a block the same pass had just proven **still
+  referenced**, with nothing left able to lift it — every future upload of that content
+  refused, permanently, by the branch whose whole purpose is removing such fences.
+  `GCFailureCodeBlockClaimReleaseUnconfirmed` now postpones on *any* release failure.
+  The cost is stated rather than hidden: a permanent fault postpones forever instead of
+  reaching the DLQ, so it gets a dedicated
+  `gc_errors_total{type="stale_claim_release_failed"}` counter — **alert on it**, it
+  means a live block is fenced and nothing automatic will clear it.
+  `TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget` rides out more passes than
+  the budget would have survived; routing the branch back through
+  `failClosedIfUnavailable` turns it red. The existing single-pass test was also
+  injecting `errors.New("cassandra unavailable")` — a string the classifier does not
+  recognise, so it was already exercising the ordinary-error path while reading as if
+  it exercised the availability one.
+- **The producer scan can no longer be blinded by whitespace.** It matched the fixed
+  substring `INSERT INTO block_references`, so a producer written with a line break
+  after `INSERT` was invisible — and because `knownProducerCount` is a floor that the
+  three existing producers keep satisfying, a fourth unpinned producer in that shape
+  changed nothing and the suite stayed green. Verified by adding exactly that function:
+  green before, red after. The pattern is now `INSERT\s+INTO\s+block_references`
+  applied to *unquoted* literals (so raw and interpreted strings compare equal), and
+  the walk covers the whole module rather than `internal/` alone, since `DB.Session()`
+  is exported. What it still cannot see is recorded rather than glossed: a statement
+  assembled at runtime via `fmt.Sprintf` or const concatenation needs data-flow
+  analysis this test does not attempt.
+- **`RemoveBlockReference`'s exemption had the wrong justification.** It read: an
+  under-replicated DELETE leaves the row visible, GC declines to collect, so the delete
+  errs toward keeping data. That is not how Cassandra behaves — a DELETE writes a
+  timestamped tombstone, the mutation reaches every replica regardless of consistency
+  level, and last-write-wins means a quorum read that touches the tombstone resolves to
+  absent and repairs the rest. There is no structural bias toward keeping data. The
+  exemption is still correct, for a different reason: X2's premise is about *creating*
+  a live reference, and removal is only ever issued once the referrer has lost
+  authority (a TTL'd publish attempt, or an `fs_object` being deleted). Publish/remove
+  races belong to the publication fence, which is X1. Behaviour unchanged; only the
+  reasoning was wrong, and a wrong reason is what lets the next person apply it
+  somewhere it does not hold.
+- **The `blocks` LWT inventory was an undercount, and X1 is going to build on it.**
+  `GC-X2-MULTIDC-VALIDATION.md` listed "six conditional statements"; an audit by grep
+  finds **eleven**, one of which (`ReleaseStaleBlockClaim`) this branch added. The
+  omissions were the two identity backfills, the unused `DB.ReleaseBlockDeleteClaim`,
+  and a stub-repair pair that is actually three statements. The full table is now in
+  that document, with a note to re-derive rather than trust it: the invariant is "every
+  conditional statement on `blocks`", not "these eleven". R12's one-serial-domain rule
+  is X1's to satisfy, and it cannot satisfy it for statements it does not know exist.
+- **"No writer hot-path change" was not true once the producer pin landed** and is
+  corrected wherever it appeared, to "no additional writer round trip, and no WAN
+  consistency added to the shipped upload path".
+- **The three-datacenter fixture now proves the claim it was built for.** Its stated
+  purpose was ruling out plain `QUORUM` as an equally good fix — at two DCs with RF 1,
+  `QUORUM` is 2 of 2 and intersects everything by accident, while at three it is 2 of 3
+  and free to miss the single replica holding a reference. That argument lived only in
+  prose: the only mutation run was `EACH_QUORUM → LOCAL_QUORUM`. Leg 2b
+  (`TestX2_FailsClosedWhenTheReferenceDatacenterIsDown`) makes it executable — the
+  divergent state with **dc-eu stopped**, where `EACH_QUORUM` must error while `QUORUM`
+  is satisfied by the two blind datacenters and answers "no references", which is an
+  authorization to delete live data. `--mutate-quorum` ran that proof and it went red:
+
+  ```text
+  X2 REGRESSION: the destructive read returned zero references while dc-eu — the
+  only datacenter holding one — was unreachable. GC would authorize deleting a
+  live block.
+  ```
+
+  Leg 2 (a DC down that does *not* hold the reference) *would* also go red under
+  `QUORUM` — by inference from the semantics, not by a run the harness performs — but
+  only because the read succeeds where it must error; leg 2b is the one that
+  exhibits the false zero itself. Leg 1 cannot carry this mutation at all: with three
+  DCs up, a `QUORUM` read's answer depends on which two replicas the coordinator
+  reaches, so it would pass or fail by chance.
+- **The harness now asserts the stopped datacenter stayed stopped.** Leg 2b's claim is
+  "the DC holding the only reference was unreachable when the read happened", and a
+  `docker compose stop` at the top of the leg does not establish that for the minutes
+  the test then runs. An ABORTED run leaves an EXIT trap that restarts every stopped
+  node, so a leg beginning moments later watches dc-eu boot underneath it. That is not
+  hypothetical — it happened during this branch's own validation, and cost two
+  results: a leg 2b that passed because `EACH_QUORUM` could not reach a node that was
+  mid-*boot* rather than stopped, and then a `QUORUM` read that found the row through
+  a recovered dc-eu and read-repaired it to every replica, ending the divergence.
+  Nothing false was published: the test refuses to report either PASS or REGRESSION
+  when it can see the row, and said so. `require_stopped` now checks before and after
+  each of the two legs that take a DC away, so the harness names the cause instead of
+  leaving an unexplained rebuild. The manual runbook carries the same check.
+- **The unbounded-postpone residual (E1) grew and is recorded as having grown.** Before
+  this series one condition postponed without spending a retry; there are now four, and
+  the availability classifier applies one of them at *every* statement of the
+  destructive walk. Each addition is individually right — losing the work item is the
+  worse failure in all of them — but E1 has stopped being a corner case and is now the
+  block path's default failure mode under a degraded cluster. Whoever builds the
+  postpone bound should size it for that.
 
 ---
 

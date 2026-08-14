@@ -6,9 +6,27 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// producerStatementPattern matches an INSERT into block_references across any
+// formatting a Go string literal can carry.
+//
+// Whitespace-tolerant on purpose, and that is the whole difference between a tripwire
+// and a decoration. The earlier version matched the fixed substring
+// "INSERT INTO block_references", so a producer written as
+//
+//	`INSERT
+//	 INTO block_references (...)`
+//
+// was invisible to it — and because knownProducerCount below is a FLOOR, the three
+// existing producers kept satisfying it, so a fourth unpinned producer in that shape
+// changed nothing and the suite stayed green. \s+ closes that: any run of spaces,
+// tabs or newlines between the keywords still matches.
+var producerStatementPattern = regexp.MustCompile(`(?i)\bINSERT\s+INTO\s+block_references\b`)
 
 // TestBlockReferenceProducersPinWriteConsistency is a tripwire on the WRITE half of
 // the destructive-GC liveness argument (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
@@ -37,20 +55,31 @@ import (
 // comment explaining why the batch is pinned did exactly that — removing the batch's
 // real pin left this test green.
 //
-// Deletes are deliberately out of scope; RemoveBlockReference documents why an
-// under-replicated DELETE fails toward keeping data.
+// STILL OUT OF REACH, stated so nobody mistakes this for a proof. The scan reads
+// string literals, so a statement assembled at runtime — fmt.Sprintf, a const
+// concatenation, a table name substituted from a variable — is invisible to it no
+// matter how the whitespace is normalised. Catching that needs data-flow analysis this
+// test does not attempt. A producer built that way must be reviewed by hand; the
+// convention is to write reference INSERTs as plain literals so this scan can see them.
+//
+// Deletes are deliberately out of scope; RemoveBlockReference documents why the
+// destructive read's own level, not the delete's, is what keeps that safe.
 func TestBlockReferenceProducersPinWriteConsistency(t *testing.T) {
 	const (
-		producerNeedle = "INSERT INTO block_references"
-		pinNeedle      = "BlockReferenceWriteConsistency"
+		pinNeedle = "BlockReferenceWriteConsistency"
 		// The three producers that exist today: two in AddBlockReference (TTL and
 		// permanent) and one in AddProvisionalBlockReferenceWithExpiry's batch.
 		knownProducerCount = 3
 	)
 
-	// Every CQL statement in the tree lives under internal/, and DB.Session() is
-	// exported, so a producer can legitimately appear outside this package.
-	root := filepath.Join("..", "..", "internal")
+	// Scanned from the repository root, not internal/. DB.Session() is exported, so a
+	// producer can be written anywhere in the module — cmd/, a future package — and a
+	// scan rooted at internal/ would simply not look there. Vendored and non-Go trees
+	// are skipped for speed, not for correctness.
+	root := filepath.Join("..", "..")
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true, "frontend": true,
+	}
 
 	totalProducers := 0
 	fset := token.NewFileSet()
@@ -59,15 +88,22 @@ func TestBlockReferenceProducersPinWriteConsistency(t *testing.T) {
 		if walkErr != nil {
 			return walkErr
 		}
-		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		if info.IsDir() {
+			if skipDirs[info.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		src, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
 		}
-		text := string(src)
-		if !strings.Contains(text, producerNeedle) {
+		// Cheap pre-filter only. It uses the SAME pattern as the per-literal check
+		// below, so it can never skip a file the real scan would have flagged.
+		if !producerStatementPattern.Match(src) {
 			return nil
 		}
 
@@ -85,7 +121,19 @@ func TestBlockReferenceProducersPinWriteConsistency(t *testing.T) {
 			ast.Inspect(node, func(n ast.Node) bool {
 				switch typed := n.(type) {
 				case *ast.BasicLit:
-					if typed.Kind == token.STRING && strings.Contains(typed.Value, producerNeedle) {
+					if typed.Kind != token.STRING {
+						return true
+					}
+					// Unquote so the pattern sees the STATEMENT rather than its Go
+					// source form. A raw literal spans real newlines, an interpreted
+					// one carries them as the two characters `\` and `n`; unquoting
+					// turns both into the same text, so a producer written either way
+					// is counted the same.
+					value, unquoteErr := strconv.Unquote(typed.Value)
+					if unquoteErr != nil {
+						value = typed.Value
+					}
+					if producerStatementPattern.MatchString(value) {
 						producers++
 					}
 				case *ast.Ident:
@@ -136,13 +184,14 @@ func TestBlockReferenceProducersPinWriteConsistency(t *testing.T) {
 		t.Fatalf("scan %s: %v", root, err)
 	}
 
-	// A scan that matches nothing passes for the wrong reason. If the statements are
-	// ever reformatted so the needle stops matching inside the literal (a line break
-	// after INSERT INTO, say), this is the assertion that says so instead of going
-	// quietly green. A floor, not an equality: adding a PINNED producer is fine.
+	// A scan that matches nothing passes for the wrong reason. With the pattern now
+	// whitespace-tolerant this is a much weaker signal than it was — reformatting can
+	// no longer blind the scan — but it still catches the case where the table is
+	// renamed or the statements move behind a builder the AST walk cannot see. A
+	// floor, not an equality: adding a PINNED producer is fine.
 	if totalProducers < knownProducerCount {
 		t.Fatalf(
-			"found %d block_references producers, expected at least %d: either the scan has gone blind — a reformatted statement the needle no longer matches, and the write consistency is unguarded — or a producer was legitimately removed, in which case lower knownProducerCount deliberately",
+			"found %d block_references producers, expected at least %d: either the scan has gone blind — the table was renamed, or the statements are no longer plain string literals, and the write consistency is unguarded — or a producer was legitimately removed, in which case lower knownProducerCount deliberately",
 			totalProducers, knownProducerCount,
 		)
 	}

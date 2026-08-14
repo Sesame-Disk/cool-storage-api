@@ -24,6 +24,28 @@ const (
 	// are postponed rather than retried, so the code exists mainly to make the
 	// refusal legible; it should not normally reach the DLQ.
 	GCFailureCodeDestructiveFailClosed = "destructive_fail_closed"
+	// GCFailureCodeBlockClaimReleaseUnconfirmed marks a candidate whose block still
+	// carries a stale delete claim that this pass tried and failed to hand back.
+	//
+	// It postpones for ANY failure reason, not only an availability one, and that
+	// breadth is the whole point. This queue item is the only work that will ever
+	// lift that fence: block items do not auto-recover from the DLQ, and the
+	// scanner's day cursor has already moved past the candidate, so spending the
+	// retry budget here strands a LIVE block behind gc_state='deleting' forever and
+	// BlockDeleteFenceActive then refuses every future upload of that content. An
+	// unknown column or a CQL bug in the release statement is exactly as fatal to
+	// that fence as an unreachable datacenter is.
+	//
+	// The cost of that breadth is a permanently failing release postponing forever
+	// instead of surfacing in the DLQ, which is the same trade documented on
+	// isClusterUnavailableError's timeout codes. It is paid deliberately, and the
+	// visibility it gives up is bought back by a dedicated
+	// gc_errors_total{type="stale_claim_release_failed"} counter rather than left
+	// silent. That counter is deliberately NOT seeded at registration: unlike the
+	// destructive blocked/liveness gauge pair — where an absent series silently drops
+	// out of a comparison — a counter that has never fired is simply absent, and
+	// `increase(...) > 0` reads absence as "did not happen", which is true.
+	GCFailureCodeBlockClaimReleaseUnconfirmed = "block_claim_release_unconfirmed"
 )
 
 // GCStore abstracts all database operations used by the GC system.

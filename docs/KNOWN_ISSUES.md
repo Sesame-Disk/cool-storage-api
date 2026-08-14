@@ -2056,8 +2056,20 @@ reference was already acknowledged elsewhere. The one-hour grace period mitigate
 normal lag but is not a correctness bound.
 
 **The fix (2026-08-13).** Implemented without r3: no generations, no physical
-incarnations, no writer hot-path change, and no `SERIAL+ALL` fence — that fence serves
-the publication TOCTOU, which is a different property. The invariant now enforced is:
+incarnations, no extra writer round trip, and no `SERIAL+ALL` fence — that fence serves
+the publication TOCTOU, which is a different property.
+
+An earlier draft of this line said "no writer hot-path change", which was wrong once the
+producer pin below landed: reference writes now name their consistency explicitly rather
+than inheriting it. The precise claim is *no additional round trip and no WAN
+consistency on the upload path* — `EACH_QUORUM` is confined to the GC read. The pin is
+also a **ceiling**, not just a floor: a deployment that had configured `EACH_QUORUM` or
+`ALL` for reference writes is lowered to `LOCAL_QUORUM`, giving up the remote
+acknowledgement that operator was asking for. Safe under X2 (the destructive read is
+`EACH_QUORUM` regardless, so it still intersects) and inert in every shipped profile,
+which already ran `LOCAL_QUORUM` — but it is a real reduction and is recorded as one.
+
+The invariant now enforced is:
 
 > Every physical delete is authorized by a liveness read that intersects every DC
 > able to acknowledge a `LOCAL_QUORUM` reference write.
@@ -2079,13 +2091,27 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   replication map that still looks perfect. It is pinned at the writers because it
   cannot be enforced at the reader: references are written by API nodes, separate
   processes with their own configuration that no check the GC worker runs can observe.
-  The two producers today are `AddBlockReference` and the logged batch in
-  `AddProvisionalBlockReferenceWithExpiry`;
-  `TestBlockReferenceProducersPinWriteConsistency` scans the tree and fails on a third
-  that forgets. `RemoveBlockReference` is deliberately *not* pinned: an
-  under-replicated DELETE leaves the row visible to the global read, so GC declines to
-  collect and the bytes survive a pass — it errs toward keeping data, which is the
-  direction that needs no enforcement.
+  The three statements today are the two in `AddBlockReference` (TTL and permanent) and
+  the one in `AddProvisionalBlockReferenceWithExpiry`'s logged batch;
+  `TestBlockReferenceProducersPinWriteConsistency` scans the module and fails on a new
+  one that forgets. That scan is **syntactic and its limits are worth knowing**: it
+  matches `INSERT\s+INTO\s+block_references` inside unquoted string literals, so
+  reformatting can no longer blind it (the original fixed-substring form was blind to a
+  line break, and because the count is a floor, a fourth producer in that shape passed
+  silently — verified by adding one). It still cannot see a statement assembled at
+  runtime via `fmt.Sprintf` or const concatenation; such a producer must be reviewed by
+  hand, and the convention is to keep reference `INSERT`s as plain literals.
+
+  `RemoveBlockReference` is deliberately *not* pinned, but **not** for the reason stated
+  here previously. The old justification — "an under-replicated DELETE leaves the row
+  visible, so GC declines to collect and the bytes survive a pass" — is not a property
+  of Cassandra: a DELETE writes a timestamped tombstone, the mutation goes to every
+  replica regardless of level, and last-write-wins reconciliation means a quorum read
+  touching that tombstone resolves to absent and repairs the rest. There is no
+  structural bias toward keeping data. What makes the exemption safe is the protocol:
+  the X2 premise is about *creating* a live reference, while removal is only ever issued
+  once the referrer has lost authority (a TTL'd publish attempt, or an `fs_object` being
+  deleted). Publish/remove races are the publication fence, which is X1.
 
   **What the pin cannot reach is references already written.** It binds this binary
   forward; a row acknowledged by an older one carries whatever level that process was
@@ -2229,6 +2255,30 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   while that item postpones forever. Bounding environmental postpones per item needs a
   counter distinct from `retry_count` — a queue-protocol change, and X1's to make.
   Until then, a persistently timing-out item stalls silently.
+
+  **This change WIDENED that residual, deliberately.** Before it, exactly one condition
+  postponed without spending a retry: `library_hard_delete_in_progress` (tracked as E1
+  in `ISSUE-GC-ENGINE-ROBUSTNESS-01`, "no postpone bound"). There are now four —
+  `destructive_fail_closed`, `block_claim_not_yet_stale` and
+  `block_claim_release_unconfirmed` join it — and `failClosedIfUnavailable` applies the
+  first at *every* statement of the destructive walk rather than at one call site. The
+  unbounded-postpone surface therefore grew from one narrow condition to most of the
+  block path. Each addition is individually correct (losing the work item is the worse
+  failure in every one of these cases), but the aggregate is that E1 stopped being a
+  corner case and became the block path's default failure mode under a degraded
+  cluster. Whoever builds the postpone bound should size it for that, not for E1 as
+  originally written.
+
+  `block_claim_release_unconfirmed` is the one that postpones on **non**-environmental
+  errors too, and it is the sharpest instance of this trade: a permanently failing
+  stale-claim release will postpone forever instead of reaching the DLQ. It is accepted
+  because the alternative is worse — spending the budget strands a *live, still
+  referenced* block behind `gc_state='deleting'` with no work item left to lift it, and
+  `BlockDeleteFenceActive` then refuses every future upload of that content. The
+  visibility is bought back explicitly: alert on
+  `gc_errors_total{type="stale_claim_release_failed"}`, which fires only in that case
+  and means a human has to intervene. Pinned by
+  `TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget`.
 - A `gc_s3_orphans` row whose block still has references is refused, logged, and
   counted (`GCAuditEventsTotal{event="gc_s3_orphan_referenced_deferred"}`) — but it
   does **not** fail the scanner phase. A failed phase suppresses `last_scan_success`,
@@ -2247,8 +2297,11 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   a durable deferred/quarantine state, or re-projection into a future bucket — not a
   `phaseErr`, which is the thing that froze the scanner in the first place.
 
-**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (twelve regressions),
-`internal/gc/x2_audit_followups_test.go` (the post-implementation audits: the
+**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (fourteen regressions — the
+count said "twelve" while the file held thirteen, which is the kind of number worth
+either deriving or not stating; derive it with
+`grep -c '^func Test' internal/gc/x2_cross_dc_liveness_test.go`),
+`internal/gc/x2_audit_followups_test.go` (fifteen; the post-implementation audits: the
 cross-candidate stale-claim release and its fresh-claim boundary, availability failures
 at the claim not burning retries, non-availability errors still reaching the DLQ from
 both the claim and the global verify, the topology gate never caching a rejection and
@@ -2261,6 +2314,16 @@ check). Every assertion is mutation-verified — each was confirmed to fail agai
 deliberately reverted implementation, including the canary that reverting the single
 `BlockHasReferencesGlobal` call makes the suite delete a live block under an
 unavailable DC.
+
+The closing round added three of those and mutation-verified each independently:
+`TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget` (red when the branch is routed
+back through `failClosedIfUnavailable`, and separately red when the dedicated counter
+is mislabelled), the hardened
+`TestBlockReferenceProducersPinWriteConsistency` (a fourth unpinned producer written
+with a line break after `INSERT` was added to `block_references.go`: the previous
+fixed-substring scan stayed **green**, the whitespace-tolerant one goes red), and the
+three-DC `TestX2_FailsClosedWhenTheReferenceDatacenterIsDown` (red under a `QUORUM`
+destructive read, via `scripts/x2-multidc-validation.sh --mutate-quorum`).
 
 **Closure evidence (2026-08-13).** All three legs ran green on
 `docker-compose.cassandra-3dc.yaml` — Cassandra 5.0.9, three datacenters, RF 1 each,
@@ -4892,6 +4955,20 @@ incorrectly described as fail-safe: the Cassandra store swallows the error, maki
 P6 issue above.
 
 - **E1 — no postpone bound.** `postponeItem` re-queues a lock-contended (`hard_delete_in_progress`) item with `RetryCount` unchanged ([worker.go:361-376](../internal/gc/worker.go#L361)). Intentional (lock contention should not push toward the DLQ), but with no bound and no metric a permanently stuck hard-delete lock loops forever with no DLQ/alert.
+
+  **Rescoped 2026-08-14 — E1 is no longer a corner case.** The X2 series added three
+  more unbounded-postpone conditions to the original one (`destructive_fail_closed`,
+  `block_claim_not_yet_stale`, `block_claim_release_unconfirmed`), and
+  `failClosedIfUnavailable` applies the first at *every* statement of the destructive
+  block walk rather than at a single call site. So the surface grew from one narrow
+  lock-contention path to most of the block path under a degraded cluster. Each
+  addition is individually correct — losing the work item is the worse failure in all
+  of them — but a postpone bound now has to be sized for the block path, not for hard
+  delete locks, and it needs a counter distinct from `retry_count`, which is a queue
+  protocol change. Detail and the per-condition reasoning are under
+  `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`. `block_claim_release_unconfirmed` is the
+  only one that postpones on non-environmental errors, and it carries a dedicated
+  `gc_errors_total{type="stale_claim_release_failed"}` counter for exactly that reason.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
   without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.

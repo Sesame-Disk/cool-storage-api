@@ -107,6 +107,33 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 	return GCFailureCodeBlockClaimNotYetStale
 }
 
+// blockClaimReleaseUnconfirmedError says a stale delete claim was found on a live
+// block and could not be handed back. The candidate must survive: it is the only work
+// item that will ever lift that fence.
+//
+// Deliberately NOT routed through failClosedIfUnavailable. That helper postpones only
+// what isClusterUnavailableError recognises and lets everything else spend the retry
+// budget, which is the correct default everywhere in the walk EXCEPT here. Everywhere
+// else, exhausting the budget parks an item in the DLQ where a human can see it, and
+// the block is left untouched. Here it also leaves gc_state='deleting' standing on a
+// block that is provably still referenced, with no work item left to clear it — a
+// permanent upload fence on live content, produced by the very branch that exists to
+// remove such fences. See GCFailureCodeBlockClaimReleaseUnconfirmed.
+type blockClaimReleaseUnconfirmedError struct {
+	ItemID string
+	Err    error
+}
+
+func (e blockClaimReleaseUnconfirmedError) Error() string {
+	return fmt.Sprintf("failed to release a stale delete claim for %s: %v", e.ItemID, e.Err)
+}
+
+func (e blockClaimReleaseUnconfirmedError) Unwrap() error { return e.Err }
+
+func (e blockClaimReleaseUnconfirmedError) FailureCode() string {
+	return GCFailureCodeBlockClaimReleaseUnconfirmed
+}
+
 // isClusterUnavailableError reports whether an error means "the cluster could not
 // serve this right now" rather than anything about the item.
 //
@@ -263,7 +290,8 @@ func shouldPostponeWithoutRetry(err error) bool {
 	switch failureCodeForError(err) {
 	case GCFailureCodeLibraryHardDeleteInProgress,
 		GCFailureCodeDestructiveFailClosed,
-		GCFailureCodeBlockClaimNotYetStale:
+		GCFailureCodeBlockClaimNotYetStale,
+		GCFailureCodeBlockClaimReleaseUnconfirmed:
 		return true
 	default:
 		return false
@@ -847,10 +875,30 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// cleanly, because nothing live survives blockDeleteClaimStaleAfter.
 		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, w.clock().Add(-blockDeleteClaimStaleAfter))
 		if relErr != nil {
-			// Do NOT clear the candidate: that would consume the only work item that
-			// can retry this release, stranding a live block behind a permanent fence.
-			// Requeue instead and let a later pass confirm the fence is gone.
-			return w.failClosedIfUnavailable("failed to release a stale delete claim", item.ItemID, relErr)
+			// Postpone for EVERY failure reason, not just the ones
+			// isClusterUnavailableError recognises. "Do not clear the candidate" is
+			// necessary but nowhere near sufficient: the candidate ROW survives an
+			// ordinary error too, and it still ends up unreachable, because the queue
+			// item burns its five retries into the DLQ, ItemBlock never auto-recovers
+			// from there, and the scanner's day cursor has already stepped past this
+			// candidate's bucket. The fence would then stand on a live block with
+			// nothing left in the system able to lift it.
+			//
+			// So the classifier is used for the SIGNAL, not for the queue policy —
+			// those come apart here, uniquely in this walk. An availability failure
+			// keeps the existing cluster_unavailable accounting and moves this path's
+			// blocked mark; a permanent one gets its own reason label and leaves the
+			// blocked mark alone, because one broken row does not answer "can this path
+			// still authorize deletes" (the same rule RecoverS3Orphans applies).
+			if isClusterUnavailableError(relErr) {
+				metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
+				w.recordDestructiveBlocked(destructivePathBlock)
+				log.Printf("[GC Worker] Block %s: releasing a stale delete claim failed because the cluster was unavailable; postponing with the fence still up: %v", item.ItemID, relErr)
+			} else {
+				metrics.GCErrorsTotal.WithLabelValues("stale_claim_release_failed").Inc()
+				log.Printf("[GC Worker] Block %s: releasing a stale delete claim failed for a non-availability reason; postponing rather than spending the retry that would strand this live block behind the fence — this will NOT self-heal and needs a human: %v", item.ItemID, relErr)
+			}
+			return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: relErr}
 		}
 		switch outcome {
 		case BlockClaimReleased:

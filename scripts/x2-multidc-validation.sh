@@ -12,11 +12,27 @@
 #   ./scripts/x2-multidc-validation.sh --keep     # leave the stack up afterwards
 #   ./scripts/x2-multidc-validation.sh --no-up    # reuse an already-running stack
 #   ./scripts/x2-multidc-validation.sh --mutate   # prove leg 1 goes RED when the
-#                                                 # destructive read is downgraded.
-#                                                 # Implies --no-up and --keep, so it
-#                                                 # needs a stack that is ALREADY up
-#                                                 # (run --keep first); it is not a
-#                                                 # standalone entry point.
+#                                                 # destructive read is downgraded to
+#                                                 # LOCAL_QUORUM (the original defect).
+#   ./scripts/x2-multidc-validation.sh --mutate-quorum
+#                                                 # prove leg 2b goes RED when it is
+#                                                 # downgraded to QUORUM (the plausible
+#                                                 # WRONG fix).
+#                                                 # Both mutations imply --no-up and
+#                                                 # --keep, so they need a stack that is
+#                                                 # ALREADY up (run --keep first); they
+#                                                 # are not standalone entry points.
+#
+# WHY TWO MUTATIONS, AND WHY NEITHER IS REDUNDANT
+# -----------------------------------------------
+# They refute different claims. --mutate refutes "the fix is unnecessary": it shows the
+# test detects the ORIGINAL defect, a destructive read at LOCAL_QUORUM. --mutate-quorum
+# refutes "a simpler fix would do": it shows a destructive read at plain QUORUM returns
+# a false zero on live data. That second one is the entire reason this fixture has three
+# datacenters rather than two — at two DCs with RF 1, QUORUM is 2 of 2 and intersects
+# everything by accident, so a two-DC fixture cannot tell the right fix from the wrong
+# one. Without it, "three DCs rule QUORUM out" is an argument in a document; with it, it
+# is a test that fails if someone implements the wrong fix.
 #
 # THE ONE THING TO UNDERSTAND BEFORE TRUSTING A GREEN RUN
 # -------------------------------------------------------
@@ -47,11 +63,13 @@ export X2_DC_HOSTS="dc-na=127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242},dc-eu=127.0.
 DO_UP=1
 DO_DOWN=1
 DO_MUTATE=0
+MUTATE_TO=""
 for arg in "$@"; do
   case "$arg" in
     --keep)   DO_DOWN=0 ;;
     --no-up)  DO_UP=0 ;;
-    --mutate) DO_MUTATE=1; DO_UP=0; DO_DOWN=0 ;;
+    --mutate)        DO_MUTATE=1; MUTATE_TO=LocalQuorum; DO_UP=0; DO_DOWN=0 ;;
+    --mutate-quorum) DO_MUTATE=1; MUTATE_TO=Quorum;      DO_UP=0; DO_DOWN=0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -256,32 +274,84 @@ build_divergence() {
   point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
 }
 
-# --mutate: prove leg 1 CAN fail.
+LEG2B=TestX2_FailsClosedWhenTheReferenceDatacenterIsDown
+
+# Assert a node is DOWN, and stay asserting it for the length of a leg.
 #
-# The checklist demands this and it is the whole reason the leg is worth running. A
-# green visibility test only means something if the same test goes red when the
-# destructive read is downgraded to the consistency level that caused the defect. Run
-# against a freshly divergent cluster, because read repair already healed the last one.
+# Leg 2b's whole claim is "the datacenter holding the only reference was unreachable
+# when the read happened". A `docker compose stop` at the top of the leg does not
+# establish that for the ~1-5 minutes the go test then takes, and this is not
+# hypothetical: an ABORTED earlier run leaves an EXIT trap that restarts every stopped
+# node, so a leg starting moments later can watch dc-eu boot underneath it. That
+# produced a leg 2b that passed for the wrong reason (EACH_QUORUM could not reach a
+# node that was mid-boot rather than one that was stopped) and, minutes later, a
+# QUORUM read that found the row through a recovered dc-eu and read-repaired it to
+# every replica — destroying the fixture.
+#
+# The test itself refuses to report either PASS or REGRESSION when it sees the row, so
+# nothing false was published. This is the other half: check before and after, so the
+# harness names the cause instead of leaving a confusing rebuild.
+require_stopped() {
+  local n="$1" when="$2"
+  local state
+  state="$(docker inspect -f '{{.State.Running}}' "sesamefs-cassandra-$n" 2>/dev/null || echo missing)"
+  [ "$state" = false ] || fail "cassandra-$n must be stopped $when for this leg to mean anything, but docker reports Running=$state. An aborted run's cleanup restarts stopped nodes — make sure no other x2-multidc-validation.sh is running against this fixture, then retry."
+}
+
+# --mutate / --mutate-quorum: prove the legs CAN fail.
+#
+# The checklist demands this and it is the whole reason the legs are worth running. A
+# green test only means something if it goes red against the very defect it exists to
+# catch. Each mutation targets the leg that discriminates it:
+#
+#   LocalQuorum → leg 1  (the original defect: a local read that is blind to dc-eu)
+#   Quorum      → leg 2b (the wrong fix: 2 of 3 satisfied by the two blind DCs)
+#
+# Leg 1 cannot carry the QUORUM mutation. With all three DCs up, a QUORUM read from
+# dc-na is satisfied by any two replicas, so whether it sees the dc-eu row depends on
+# which two the coordinator happens to reach — it would pass or fail by chance. Leg 2b
+# removes that freedom by taking dc-eu away entirely: QUORUM then has exactly one
+# possible answer, and it is the wrong one.
+#
+# Both run against a freshly divergent cluster, because read repair healed the last one.
 if [ "${DO_MUTATE:-0}" = "1" ]; then
   for n in "${NODES[@]}"; do wait_healthy "$n"; done
-  step "MUTATION — downgrade the destructive read to LOCAL_QUORUM; leg 1 must FAIL"
+  case "$MUTATE_TO" in
+    LocalQuorum) MUTATE_LEG=$LEG1;  MUTATE_DESC="leg 1" ;;
+    Quorum)      MUTATE_LEG=$LEG2B; MUTATE_DESC="leg 2b" ;;
+    *) fail "internal: unknown mutation target '$MUTATE_TO'" ;;
+  esac
+  step "MUTATION — downgrade the destructive read to ${MUTATE_TO}; ${MUTATE_DESC} must FAIL"
   src=internal/db/block_references.go
   cp "$src" "$src.x2bak"
   restore_src() { [ -f "$src.x2bak" ] && mv "$src.x2bak" "$src"; }
   trap 'restore_src; cleanup' EXIT
-  perl -0pi -e 's/\Q.Consistency(gocql.EachQuorum)\E/.Consistency(gocql.LocalQuorum)/' "$src"
+  perl -0pi -e "s/\Q.Consistency(gocql.EachQuorum)\E/.Consistency(gocql.${MUTATE_TO})/" "$src"
   cmp -s "$src" "$src.x2bak" && fail "mutation did not apply — the EACH_QUORUM pin moved?"
 
   build_divergence
   set +e
-  out="$(go test -tags integration -count=1 ./internal/integration/ -run "$LEG1" -v 2>&1)"
+  if [ "$MUTATE_TO" = "Quorum" ]; then
+    # Take away the ONLY datacenter holding the reference. EACH_QUORUM must error
+    # here; QUORUM is satisfied by the two blind DCs and answers "no references".
+    "${COMPOSE[@]}" stop cassandra-eu
+    require_stopped eu "before the mutated read"
+    out="$(X2_EXPECT_REFERENCE_DC_DOWN=1 go test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
+    rc=$?
+    require_stopped eu "for the whole mutated read"
+    "${COMPOSE[@]}" start cassandra-eu
+    wait_healthy eu
+  else
+    out="$(go test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
+    rc=$?
+  fi
   set -e
   echo "$out" | grep -E '^--- (PASS|FAIL)|X2 REGRESSION' || true
   restore_src
   trap cleanup EXIT
   grep -q 'X2 REGRESSION' <<<"$out" \
-    || fail "leg 1 did NOT fail under a LOCAL_QUORUM destructive read — the test cannot detect the defect it exists for"
-  printf '\n\033[32mMutation confirmed: leg 1 goes red when the destructive read is downgraded.\033[0m\n'
+    || fail "${MUTATE_DESC} did NOT fail under a ${MUTATE_TO} destructive read — the test cannot detect the defect it exists for"
+  printf '\n\033[32mMutation confirmed: %s goes red when the destructive read is downgraded to %s.\033[0m\n' "$MUTATE_DESC" "$MUTATE_TO"
   exit 0
 fi
 
@@ -326,9 +396,24 @@ X2_EXPECT_DC_DOWN=1 run_leg "leg 2 (fail closed with a DC down)" TestX2_EachQuor
 "${COMPOSE[@]}" start cassandra-asia
 wait_healthy asia
 
+step "6b. LEG 2b — the DC holding the ONLY reference is down; the read must ERROR, never zero"
+# A FRESH divergence is mandatory. Leg 1's EACH_QUORUM read performed blocking read
+# repair to satisfy its own consistency level, so the row it was testing now exists in
+# dc-na — and against a healed cluster this leg would pass for the wrong reason,
+# proving nothing about which consistency level was used.
+build_divergence
+"${COMPOSE[@]}" stop cassandra-eu
+require_stopped eu "before the leg 2b read"
+X2_EXPECT_REFERENCE_DC_DOWN=1 run_leg "leg 2b (fail closed with the reference DC down)" "$LEG2B"
+require_stopped eu "for the whole leg 2b read"
+"${COMPOSE[@]}" start cassandra-eu
+wait_healthy eu
+point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
+
 step "7. LEG 3 — topology gate: accepts the declared map, refuses an under-declared one"
 run_leg "leg 3a (gate accepts the declared 3-DC map)" TestX2_TopologyGateAcceptsThreeDCNetworkTopology
 run_leg "leg 3b (gate refuses an under-declared map)" TestX2_TopologyGateRejectsAnUnderDeclaredMap
 
-printf '\n\033[32mAll three X2 closure legs green.\033[0m\n'
+printf '\n\033[32mAll X2 closure legs green (1, 2, 2b, 3a, 3b).\033[0m\n'
+printf 'Mutation legs are separate entry points: --mutate (leg 1 vs LOCAL_QUORUM), --mutate-quorum (leg 2b vs QUORUM).\n'
 printf 'divergent org=%s block=%s\n' "$X2_DIVERGENT_ORG" "$X2_DIVERGENT_BLOCK"

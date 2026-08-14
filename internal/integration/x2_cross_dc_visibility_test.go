@@ -191,6 +191,61 @@ func TestX2_EachQuorumFailsClosedWhenADatacenterIsDown(t *testing.T) {
 	}
 }
 
+// TestX2_FailsClosedWhenTheReferenceDatacenterIsDown is the leg that makes the
+// three-datacenter fixture worth building, and the only one that discriminates the
+// plausible WRONG fix from the right one.
+//
+// The documentation has always argued that `QUORUM` is not an acceptable substitute
+// for `EACH_QUORUM`: at three DCs with RF 1 it is 2 of 3, so it can be satisfied
+// entirely by datacenters that never saw the reference. Until this test that argument
+// lived only in prose. It is now executable.
+//
+// The fixture is the divergent state (reference acknowledged in dc-eu alone) with
+// **dc-eu stopped** — the datacenter holding the only copy:
+//
+//	EACH_QUORUM  needs a quorum in dc-eu     → cannot be reached → ERROR → fail closed
+//	QUORUM       needs 2 of 3, and dc-na + dc-asia answer → both blind → FALSE
+//	LOCAL_QUORUM needs dc-na alone, blind                              → FALSE
+//
+// A FALSE here is not a missed optimisation, it is the authorization to destroy a
+// block that is still referenced. So this test asserts the read ERRORS, and it goes
+// red under either downgrade. `scripts/x2-multidc-validation.sh --mutate-quorum` runs
+// exactly that proof.
+//
+// Note what leg 2 (a DC down that does NOT hold the reference) can and cannot do. It
+// also goes red under QUORUM, because QUORUM succeeds where EACH_QUORUM must error —
+// but succeeding is not the same as authorizing a delete of live data, and only this
+// leg shows the false zero itself. The divergent state must be FRESH: leg 1's
+// EACH_QUORUM read performs blocking read repair, which propagates the row to dc-na
+// and would make QUORUM answer true for the right reason by accident.
+func TestX2_FailsClosedWhenTheReferenceDatacenterIsDown(t *testing.T) {
+	endpoints := x2DCEndpoints(t)
+	if strings.TrimSpace(os.Getenv("X2_EXPECT_REFERENCE_DC_DOWN")) == "" {
+		t.Skip("X2_EXPECT_REFERENCE_DC_DOWN not set; skipping (stop dc-eu against a freshly divergent cluster first)")
+	}
+
+	blockID := strings.TrimSpace(os.Getenv("X2_DIVERGENT_BLOCK"))
+	orgID := strings.TrimSpace(os.Getenv("X2_DIVERGENT_ORG"))
+	if blockID == "" || orgID == "" {
+		t.Skip("X2_DIVERGENT_BLOCK/X2_DIVERGENT_ORG not set; skipping (the divergent state must be built first — see docs/GC-X2-MULTIDC-VALIDATION.md)")
+	}
+
+	reader := x2ConnectToDC(t, "dc-na", endpoints)
+
+	hasRefs, err := reader.BlockHasReferencesGlobal(orgID, blockID)
+	if err != nil {
+		t.Logf("destructive read correctly failed closed with the reference datacenter down: %v", err)
+		return
+	}
+	if hasRefs {
+		// Not the failure this leg is built to catch, but not a pass either: the row
+		// reached dc-na or dc-asia, so the fixture is no longer divergent and a green
+		// result here would mean nothing. Read repair from an earlier leg does this.
+		t.Fatalf("the cluster is not divergent any more: the read from dc-na found the reference with dc-eu down, so this run cannot distinguish EACH_QUORUM from QUORUM. Rebuild the divergent state before trusting a result")
+	}
+	t.Fatalf("X2 REGRESSION: the destructive read returned zero references while dc-eu — the only datacenter holding one — was unreachable. GC would authorize deleting a live block. A read that can be satisfied without every datacenter (QUORUM, LOCAL_QUORUM) is not an acceptable authorization for a physical delete")
+}
+
 // TestX2_TopologyGateAcceptsThreeDCNetworkTopology checks the gate agrees the
 // cluster can carry the per-DC argument. If this fails on a correct 3-DC stack the
 // gate is too strict and would refuse to collect in production.

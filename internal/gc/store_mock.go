@@ -1943,6 +1943,28 @@ func (m *MockStore) SetReleaseStaleBlockClaimErrForTest(err error) {
 	m.releaseStaleBlockClaimErr = err
 }
 
+// BackdateBlockClaimForTest ages an existing delete claim, so a test can model an
+// abandoned fence while leaving the worker on the real clock.
+//
+// The alternative — seeding a fresh claim and pushing w.clock() forward past
+// blockDeleteClaimStaleAfter — has a trap that has already produced a misleading
+// green. postponeItem stamps the requeued row with w.clock(), while
+// Queue.DequeueBatch derives its cutoff from time.Now(); those are the same instant in
+// production and only diverge under a test clock. A worker driven 15 minutes into the
+// future therefore requeues postponed items into the future, where no later pass can
+// dequeue them — so a multi-pass assertion would be testing an empty queue rather than
+// repeated refusals. Backdating the claim instead keeps both clocks agreeing.
+func (m *MockStore) BackdateBlockClaimForTest(orgID uuid.UUID, blockID string, claimedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return
+	}
+	at := claimedAt.UTC()
+	b.GCClaimedAt = &at
+}
+
 // SetClaimBlockDeleteErrForTest injects a failure into the LWT claim.
 //
 // An LWT can fail for availability reasons depending on its serial and regular
