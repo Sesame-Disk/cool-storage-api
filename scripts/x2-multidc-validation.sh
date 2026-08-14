@@ -93,21 +93,85 @@ run_leg() {
   [ $rc -eq 0 ] || fail "$label — the test passed but the package run failed; see above"
 }
 
+# Re-enable hints on a node that is UP. Retries briefly rather than once: nodetool
+# talks to JMX, which can be busy mid-drain, and a single miss here would report a node
+# as unconfirmed for no reason. Not a boot wait — see cleanup for why nothing waits for
+# a node to come up.
+enable_hints() {
+  local name="sesamefs-cassandra-$1" deadline=$((SECONDS + 30))
+  while :; do
+    if docker exec "$name" nodetool enablehandoff >/dev/null 2>&1; then
+      return 0
+    fi
+    [ $SECONDS -lt $deadline ] || return 1
+    sleep 2
+  done
+}
+
 # Re-enable hints on the way out however we exit. Without this an aborted run leaves
 # the fixture in a state where any later test builds divergence it did not ask for —
 # which is far more confusing than a stack that is simply gone.
+#
+# WHICH NODES NEED WHAT, because an earlier version treated them alike and got the
+# order backwards: it ran enablehandoff and THEN docker start, in one loop, so an abort
+# during build_divergence — where two of three nodes are deliberately stopped, and by
+# far the likeliest place to abort — sent the command to a stopped container, straight
+# into `|| true`. The fixture did come back with hints on, but by luck rather than by
+# this function working, while the message claimed otherwise either way.
+#
+# The two cases are genuinely different, and separating them is what keeps this fast:
+#
+#   still running — it still holds the disabled state this script set, and only
+#                   nodetool can undo it. It answers immediately, so we wait 30s and
+#                   report a node that does not.
+#   stopped       — disablehandoff is runtime state; booting discards it in favour of
+#                   the cassandra.yaml default, which is enabled. Starting the node IS
+#                   the restore. Waiting out its several-minute boot to watch it
+#                   confirm what the restart already guarantees would turn every
+#                   aborted run into a long hang.
 cleanup() {
   local rc=$?
   step "Cleanup"
-  for n in "${NODES[@]}"; do
-    docker exec "sesamefs-cassandra-$n" nodetool enablehandoff >/dev/null 2>&1 || true
-    docker start "sesamefs-cassandra-$n" >/dev/null 2>&1 || true
-  done
+
+  # Nothing to restore on a stack that is about to be destroyed.
   if [ "$DO_DOWN" = "1" ]; then
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
     echo "stack torn down"
-  else
-    echo "stack left running (--keep); hints re-enabled"
+    exit $rc
+  fi
+
+  local live=() booting=() missing=() unconfirmed=()
+  for n in "${NODES[@]}"; do
+    # `missing` is its own case rather than folded into `stopped`: reporting a restart
+    # of a container that does not exist would be exactly the kind of unverified claim
+    # this function was rewritten to stop making. Reachable via --no-up/--mutate
+    # against a stack that was never brought up.
+    case "$(docker inspect -f '{{.State.Running}}' "sesamefs-cassandra-$n" 2>/dev/null || echo missing)" in
+      true)
+        if enable_hints "$n"; then live+=("$n"); else unconfirmed+=("$n"); fi
+        ;;
+      false)
+        docker start "sesamefs-cassandra-$n" >/dev/null 2>&1 || true
+        booting+=("$n")
+        ;;
+      *)
+        missing+=("$n")
+        ;;
+    esac
+  done
+
+  echo "stack left running (--keep)"
+  [ ${#live[@]} -eq 0 ]    || echo "  hints confirmed back on: ${live[*]}"
+  [ ${#booting[@]} -eq 0 ] || echo "  restarted (hints return enabled from cassandra.yaml): ${booting[*]}"
+  [ ${#missing[@]} -eq 0 ] || echo "  no such container, nothing to restore: ${missing[*]}"
+  if [ ${#unconfirmed[@]} -gt 0 ]; then
+    # Deliberately not a failure: it does not invalidate a run that already finished,
+    # and overwriting rc would hide the result this script exists to report. It IS
+    # loud, because the next run against this fixture would build a divergence that
+    # hints can quietly heal, and a silently weakened leg 1 is the worst outcome here.
+    printf '\033[31m  WARNING: hints NOT confirmed back on: %s\033[0m\n' "${unconfirmed[*]}" >&2
+    printf '\033[31m  Check with: docker exec sesamefs-cassandra-<node> nodetool statushandoff\033[0m\n' >&2
+    printf '\033[31m  Do not trust a leg-1 run against this stack until it reports running.\033[0m\n' >&2
   fi
   exit $rc
 }

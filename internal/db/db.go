@@ -311,12 +311,23 @@ func validateDestructiveGCTopology(live cassandraReplicationSettings, cfg config
 	keyspace := cfg.Keyspace
 
 	// The intersection argument has a precondition on the WRITE side that no
-	// replication map can express. `block_references` rows are written at the session
-	// consistency, and the proof is "a reference acknowledged at LOCAL_QUORUM in some
-	// datacenter intersects the EACH_QUORUM read's quorum in that same datacenter" —
-	// which presumes the write reached a quorum at all. Under ONE it need not: a single
-	// replica can acknowledge while a later per-DC read quorum of 2-of-3 misses the row
-	// entirely, and every structural check below would still pass.
+	// replication map can express. The proof is "a reference acknowledged at
+	// LOCAL_QUORUM in some datacenter intersects the EACH_QUORUM read's quorum in that
+	// same datacenter", which presumes the write reached a quorum at all. Under ONE it
+	// need not: a single replica can acknowledge while a later per-DC read quorum of
+	// 2-of-3 misses the row entirely, and every structural check below would still pass.
+	//
+	// THE PRIMARY ENFORCEMENT IS NOT HERE. Every producer now pins the write per
+	// statement (BlockReferenceWriteConsistency), because references are written by API
+	// nodes — other processes, with their own configuration, that no check this worker
+	// runs can see. Reading cfg.Consistency proves something about the GC process, and
+	// the GC process is not the writer.
+	//
+	// It stays as a second line for the writers this binary cannot speak for: an older
+	// or rebuilt binary in the fleet whose producers predate the pin, or a future one
+	// that adds a producer and misses it. A deployment that configures ONE at all is
+	// telling us which of those is likely, and destructive GC is not the place to give
+	// it the benefit of the doubt.
 	//
 	// A whitelist rather than a blacklist, because this is a safety gate: a consistency
 	// level added to the config validator later should have to be reasoned about here

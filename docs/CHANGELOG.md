@@ -180,11 +180,74 @@ the reason covers.
   question: narrowing the Paxos domain on `blocks` is the linearization decision X1 has
   open, and a topology gate for X2 has no business nudging a deployment either way.
 
-Regressions in `internal/gc/x2_audit_followups_test.go`, each mutation-verified:
+- **The write half of the intersection is now pinned at the writers.** The closure
+  argument is "a reference acknowledged at `LOCAL_QUORUM` in some DC intersects the
+  `EACH_QUORUM` read's quorum in that same DC", which presumes the write reached a
+  quorum at all — and reference writes inherited the session, where `ONE` is an
+  accepted `database.consistency`. The topology gate had been extended to refuse
+  destructive GC under a non-quorum level, but a gate can only read the consistency of
+  the process running GC, and **the GC process is not the writer**: references come
+  from API nodes, separate processes with their own configuration. Both producers now
+  pin `db.BlockReferenceWriteConsistency` per statement — `AddBlockReference` and the
+  logged batch in `AddProvisionalBlockReferenceWithExpiry`, the second of which no
+  audit had noticed was a producer at all. The gate's check stays as a second line for
+  writers this binary cannot speak for (an older binary in the fleet, a future producer
+  that forgets), and `TestBlockReferenceProducersPinWriteConsistency` walks the AST of
+  every non-test file under `internal/` so a third producer fails until it is pinned.
+  It counts identifiers and string literals rather than file text, which is not a
+  detail: the first draft counted text, and the comment *explaining* the batch's pin
+  satisfied the count — removing the batch's real pin left it green.
+  `RemoveBlockReference` is deliberately exempt, since an under-replicated DELETE
+  leaves the row visible and GC declines to collect, erring toward keeping data. The
+  pin is a fixed level rather than a floor, so it also *lowers* a deployment configured
+  for `EACH_QUORUM` or `ALL` — stated plainly because it is a real trade: a level that
+  varies with configuration hands back the very property being established, and what is
+  given up is cross-DC promptness, not safety. The destructive read intersects
+  regardless, and every other reader of `block_references` is a local check whose false
+  zero costs a redundant re-upload or a candidate the global verify then declines.
+- **Orphan recovery classifies its own verify failure.** `processBlock`'s verify had
+  learned to tell an unreachable cluster from a poisoned partition; the second
+  destructive path still reported every failure as `liveness_verify_unavailable` and
+  moved the blocked mark with it. There is no queue policy at stake here — the sweep
+  defers either way, holding the day cursor — so what the misreport cost was the
+  diagnosis: a permanent `ReadFailure` from a tombstone-heavy `block_references`
+  partition read as a datacenter outage, and the blocked-vs-liveness pair, whose only
+  question is whether the path can still authorize deletes at all, answered that the
+  environment had failed when it had not.
+- **The `ReadFailure` frame is pinned in the tests that exist for it.** The DLQ
+  regression for the previous item injected `errors.New` carrying tombstone text, and
+  the classifier table covered `Unavailable`/`Overloaded`/`ReadTimeout`/`WriteTimeout`
+  but neither failure code. Adding `ErrCodeReadFailure` to the classifier's switch —
+  the plausible mistake, since it reads as a sibling of the timeout codes — left both
+  green while restoring the exact defect the fix was written for. Both now inject and
+  assert the frame the driver actually returns.
+- **The harness re-enables hints in an order that works.** `cleanup()` ran
+  `nodetool enablehandoff` and *then* `docker start`, in one loop, so an abort during
+  `build_divergence` — where two of three nodes are deliberately stopped, and by far
+  the likeliest place to abort — sent the command to a stopped container. The fixture
+  did come back with hints on, because `disablehandoff` is runtime state a restart
+  discards, but that is the restart being lucky rather than the function working, while
+  the script asserted "hints re-enabled" either way. It now separates the two cases,
+  which is also what keeps it quick: a node still RUNNING holds the disabled state and
+  only `nodetool` can undo it, so it is retried for 30s and reported by name if it
+  never answers; a node that is STOPPED is restored by being started, since booting
+  discards the runtime state in favour of the enabled default, so nothing waits out its
+  several-minute boot to watch it confirm what the restart guarantees. The report says
+  which nodes fell in which case, warns loudly by name when a live node never answers,
+  and never overwrites the run's exit code. No effect on the evidence: this is the state a *later* run inherits,
+  and a silently weakened leg 1 is the failure it prevents. The manual runbook in
+  `GC-X2-MULTIDC-VALIDATION.md` had the same ordering hazard in prose and is corrected
+  with it.
+
+Regressions in `internal/gc/x2_audit_followups_test.go` and
+`internal/db/block_reference_write_consistency_test.go`, each mutation-verified:
 reverting the release to owner-only, disabling and over-applying the availability
 classifier, caching gate rejections, downgrading the commit-point gate to the cached
 form, letting the blocked gauge latch, letting one path's gauge speak for the other,
-and dropping the referenced-orphan refusal were all confirmed to turn the suite red.
+dropping the referenced-orphan refusal, unpinning either reference producer,
+reformatting the INSERT so the producer scan goes blind, forcing orphan recovery back
+to a single error class, and admitting `ReadFailure` to the availability classifier
+were all confirmed to turn the suite red.
 
 ---
 

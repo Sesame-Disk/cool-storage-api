@@ -935,6 +935,42 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 	return probe, nil
 }
 
+// BlockReferenceWriteConsistency is the consistency level EVERY write to
+// block_references must reach, pinned per statement rather than inherited from the
+// session.
+//
+// It is the write half of the destructive-GC liveness argument
+// (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01). BlockHasReferencesGlobal reads at
+// EACH_QUORUM so a FALSE answer may authorize destroying bytes, and that answer is
+// only trustworthy because a reference acknowledged at LOCAL_QUORUM in some
+// datacenter necessarily intersects the read's quorum in that same datacenter. Under
+// ONE a single replica can acknowledge a reference that a later per-DC read quorum of
+// 2-of-3 never sees — and `ONE` is an accepted `database.consistency`, so inheriting
+// the session made that a deployment typo away.
+//
+// PINNED HERE BECAUSE THE READER CANNOT ENFORCE IT. ValidateDestructiveGCTopology
+// checks the consistency of the process running GC; references are written by API
+// nodes, which are different processes with their own configuration, and no gate the
+// worker runs can see them. The invariant is a property of the writers, so it belongs
+// at the writers.
+//
+// THE FLOOR IS ALSO THE CEILING, which is a real trade and not a detail. A deployment
+// configured for EACH_QUORUM or ALL now writes references at LOCAL_QUORUM — this pin
+// LOWERS a stronger configured level, and it is worth being explicit that it does. The
+// reason is that a pin varying with configuration gives back the exact property the
+// constant exists to establish: "references reached a quorum" would once again mean
+// "whatever that process was configured with", which is unverifiable from the reader's
+// side and is how ONE got in. What is given up is only cross-DC promptness, never
+// safety: the destructive read is EACH_QUORUM regardless, so it still intersects; every
+// other reader of block_references is a local check whose false zero costs a redundant
+// re-upload or an enqueued candidate that the global verify then declines to delete.
+// Every shipped profile already runs LOCAL_QUORUM, so no deployment changes behaviour.
+//
+// TestBlockReferenceProducersPinWriteConsistency enumerates the statements this
+// applies to; a new producer fails that test until it is pinned or exempted with a
+// reason.
+const BlockReferenceWriteConsistency = gocql.LocalQuorum
+
 // AddBlockReference registers a reference to a block. Idempotent: re-adding the
 // same (block, referrer) overwrites a row with identical key. ttlSeconds > 0 makes
 // the row expire (for example publish-attempt references); 0 means permanent.
@@ -944,17 +980,25 @@ func (db *DB) AddBlockReference(orgID, blockID, referrer, libraryID string, ttlS
 		return db.Session().Query(`
 			INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
 			VALUES (?, ?, ?, ?, ?) USING TTL ?
-		`, orgID, blockID, referrer, libraryID, now, ttlSeconds).Exec()
+		`, orgID, blockID, referrer, libraryID, now, ttlSeconds).Consistency(BlockReferenceWriteConsistency).Exec()
 	}
 	return db.Session().Query(`
 		INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
 		VALUES (?, ?, ?, ?, ?)
-	`, orgID, blockID, referrer, libraryID, now).Exec()
+	`, orgID, blockID, referrer, libraryID, now).Consistency(BlockReferenceWriteConsistency).Exec()
 }
 
 // RemoveBlockReference deletes a single (block, referrer) reference. Idempotent:
 // deleting a non-existent row is a no-op, so a retried GC pass or publish-attempt
 // cleanup is always safe. Upload up: references are not removed through this API.
+//
+// DELIBERATELY NOT PINNED to BlockReferenceWriteConsistency, and the asymmetry is the
+// point. An under-replicated INSERT can hide a live reference from the destructive
+// read, which is a delete of referenced data. An under-replicated DELETE fails the
+// other way: the EACH_QUORUM read may still see the row, GC declines to collect the
+// block, and the bytes survive one more pass — the tombstone reaches the rest of the
+// replicas through ordinary repair. Errs toward keeping data, so it inherits the
+// session like every other statement.
 func (db *DB) RemoveBlockReference(orgID, blockID, referrer string) error {
 	return db.Session().Query(`
 		DELETE FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?

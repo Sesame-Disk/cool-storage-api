@@ -133,14 +133,26 @@ docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-asia
 #    declared map is smaller than the live one (the shape a shrunk ALTER leaves).
 go test -tags integration ./internal/integration/ -run TestX2_TopologyGate -v
 
-# 8. Tear down. `down -v` discards the nodes, so the handoff setting goes with them.
-#    If you abort the run and keep the stack, re-enable handoff first — otherwise the
-#    fixture silently stays in a state where any later test builds divergence it did
-#    not ask for.
-for n in na eu asia; do
-  docker exec sesamefs-cassandra-$n nodetool enablehandoff
-done
+# 8. Tear down. `down -v` discards the nodes, so the handoff setting goes with them
+#    and nothing needs restoring first.
 docker compose -f docker-compose.cassandra-3dc.yaml down -v
+
+# 8b. ONLY if you abort and KEEP the stack: restore handoff before anyone runs anything
+#     else against it, or the fixture silently stays in a state where a later run builds
+#     divergence it did not ask for and leg 1 weakens without saying so. The two cases
+#     differ: a node still RUNNING holds the disabled state and only nodetool can undo
+#     it, while a node that is STOPPED is restored by being started, since booting
+#     discards runtime state in favour of the cassandra.yaml default (enabled). Step 4
+#     leaves two of the three stopped, and nodetool cannot reach a stopped container.
+for n in na eu asia; do
+  if [ "$(docker inspect -f '{{.State.Running}}' sesamefs-cassandra-$n)" = true ]; then
+    docker exec sesamefs-cassandra-$n nodetool enablehandoff
+  else
+    docker start sesamefs-cassandra-$n   # comes back with hints enabled
+  fi
+done
+# Confirm, once the restarted ones have finished booting:
+for n in na eu asia; do docker exec sesamefs-cassandra-$n nodetool statushandoff; done
 ```
 
 The tests **skip** without `X2_DC_HOSTS`, and skip if it names fewer than three

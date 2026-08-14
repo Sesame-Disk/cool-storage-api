@@ -2070,6 +2070,32 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   session consistency. The zero-check is asymmetric: a locally visible row is proof
   the block is alive, so aborting early is always correct, while a local zero proves
   nothing and authorizes nothing.
+- **Every producer pins the write** at `db.BlockReferenceWriteConsistency`
+  (`LOCAL_QUORUM`) per statement, rather than inheriting the session. This is the
+  write half of the same intersection: the `EACH_QUORUM` read is only trustworthy
+  because the write it must intersect reached a quorum in the DC that acknowledged it,
+  and `ONE` is an accepted `database.consistency` under which one replica can
+  acknowledge a reference a later 2-of-3 per-DC read quorum never sees — with a
+  replication map that still looks perfect. It is pinned at the writers because it
+  cannot be enforced at the reader: references are written by API nodes, separate
+  processes with their own configuration that no check the GC worker runs can observe.
+  The two producers today are `AddBlockReference` and the logged batch in
+  `AddProvisionalBlockReferenceWithExpiry`;
+  `TestBlockReferenceProducersPinWriteConsistency` scans the tree and fails on a third
+  that forgets. `RemoveBlockReference` is deliberately *not* pinned: an
+  under-replicated DELETE leaves the row visible to the global read, so GC declines to
+  collect and the bytes survive a pass — it errs toward keeping data, which is the
+  direction that needs no enforcement.
+
+  **What the pin cannot reach is references already written.** It binds this binary
+  forward; a row acknowledged by an older one carries whatever level that process was
+  configured with, and no read can tell them apart afterwards. In practice there is
+  nothing to reach: every shipped profile has always been `LOCAL_QUORUM`, destructive
+  GC has never been enabled in any environment, and the gate refuses to start deleting
+  under a non-quorum configuration anyway. Stated because it is the kind of gap that
+  should be written down rather than assumed away — and if a deployment ever *did* run
+  `ONE`, the remedy is a repair of `block_references` before destructive GC is ever
+  turned on, not a code change.
 - `RecoverS3Orphans` performs its **own** `BlockHasReferencesGlobal` before destroying
   bytes. It could have inherited authorization transitively — an orphan row cannot
   exist unless `processBlock`'s verify already passed — but that implication only runs
@@ -2112,7 +2138,16 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   invariant.** Tracked as follow-up in `GC-X2-MULTIDC-VALIDATION.md`.
 - Fail-closed is observable: `GCErrorsTotal{reason="liveness_verify_unavailable"}`,
   `{reason="destructive_topology_gate"}` and `{reason="cluster_unavailable"}`, plus
-  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. Those are counters, and
+  `GCAuditEventsTotal{event="gc_block_delete_failed_closed"}`. Its counterpart
+  `{reason="liveness_verify_failed"}` means the opposite condition and both destructive
+  paths emit it: the global verify failed for a reason the cluster's availability does
+  not explain — a `ReadFailure` from a tombstone-heavy `block_references` partition
+  being the realistic one — which is specific to that block and does not resolve on its
+  own. Neither deletes anything. They differ in what happens next and in who should
+  look: the block path spends a retry on it so it reaches the DLQ and a human, the
+  orphan sweep defers and holds its day cursor, and neither moves the blocked mark
+  below, because one poisoned partition says nothing about whether the path can
+  authorize deletes at all. Those are counters, and
   a counter cannot express *duration* — which is the whole signal, because failing
   closed is silent by design: nothing errors, nothing reaches the DLQ, and a
   permanently rejecting gate looks exactly like a fleet with nothing to collect. The

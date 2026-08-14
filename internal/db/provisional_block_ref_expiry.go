@@ -103,7 +103,14 @@ func (db *DB) AddProvisionalBlockReferenceWithExpiry(orgID, blockID, referrer, l
 		return err
 	}
 
-	batch := db.Session().Batch(gocql.LoggedBatch)
+	// The reference statement below is a block_references producer, so it carries the
+	// same pin AddBlockReference does — see BlockReferenceWriteConsistency for why
+	// inheriting the session is not good enough. Consistency on a batch is a property
+	// of the batch, not of each statement, so the tracker and its projection are
+	// written at the same level. That is the right side to err on anyway: they are the
+	// only way Phase 0 ever finds this reference, and a tracker acknowledged by one
+	// replica while the reference it retires is durable at quorum is its own leak.
+	batch := db.Session().Batch(gocql.LoggedBatch).Consistency(BlockReferenceWriteConsistency)
 	batch.Query(`
 		INSERT INTO block_references (org_id, block_id, referrer, library_id, created_at)
 		VALUES (?, ?, ?, ?, ?) USING TTL ?

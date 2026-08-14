@@ -255,7 +255,14 @@ func TestX2_NonAvailabilityErrorDuringGlobalVerifyStillReachesTheDLQ(t *testing.
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
-	store.SetBlockHasReferencesGlobalErrForTest(errors.New("Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING"))
+	// The FRAME, not a plain error carrying its text. A plain error can never be
+	// classified as environmental whatever the classifier does, so injecting one would
+	// pass this test on a classifier that swallows ReadFailure — the exact regression
+	// it exists to catch, and the case the fix was written for.
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{
+		code: gocql.ErrCodeReadFailure,
+		msg:  "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING",
+	})
 
 	for i := 0; i < 8; i++ {
 		if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -646,6 +653,18 @@ func TestX2_ClusterUnavailableClassifierCoversServerErrorFrames(t *testing.T) {
 
 		// These say something about the request, not the cluster. Swallowing them
 		// would postpone a real bug forever with nobody notified.
+		//
+		// ReadFailure is the load-bearing one, and the reason the destructive verify
+		// consults this classifier at all. It is a coordinator reporting that replicas
+		// FAILED the read — the tombstone-overwhelming case on a block_references
+		// partition — not that they were unreachable. It looks adjacent to the timeout
+		// codes above and would be waved in by anyone extending that switch from the
+		// names alone, and the item it belongs to would then postpone forever: no retry
+		// spent, no DLQ entry, and nothing to see, because the blocked/liveness pair is
+		// per path and the next healthy block clears the alert. WriteFailure is its
+		// counterpart and sits here for the same reason.
+		{"read failure frame", fakeRequestError{code: gocql.ErrCodeReadFailure, msg: "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING"}, false},
+		{"write failure frame", fakeRequestError{code: gocql.ErrCodeWriteFailure, msg: "Operation failed - received 0 responses and 1 failures"}, false},
 		{"invalid query", fakeRequestError{code: gocql.ErrCodeInvalid, msg: "undefined column name gc_claim_id"}, false},
 		{"syntax error", fakeRequestError{code: gocql.ErrCodeSyntax, msg: "line 1:0 no viable alternative"}, false},
 		{"not found", gocql.ErrNotFound, false},
@@ -827,4 +846,96 @@ func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted = %d, want 1: the worker pass itself was never blocked", stats.BlocksDeleted())
 	}
+}
+
+// TestX2_OrphanRecoveryClassifiesItsGlobalVerifyFailure pins the classifier on the
+// second destructive path.
+//
+// processBlock's verify learned to tell an unreachable cluster from a poisoned
+// partition; orphan recovery ran the same read and reported every failure as
+// "liveness_verify_unavailable", moving the blocked mark with it. Unlike the worker
+// there is no retry budget to misspend here — the sweep defers either way — so what
+// the misreport costs is the diagnosis: a permanent ReadFailure from a tombstone-heavy
+// block_references partition reads as a datacenter outage, and the blocked-vs-liveness
+// pair, whose whole question is whether this path can still authorize deletes at all,
+// says the environment failed when it did not.
+//
+// Both halves are asserted because only checking the counter would pass on a change
+// that fixed the label and left the mark, which is the half an alert actually watches.
+func TestX2_OrphanRecoveryClassifiesItsGlobalVerifyFailure(t *testing.T) {
+	seedRefusedOrphan := func(t *testing.T, w *Worker, store *MockStore, sp *MockStorageProvider, at time.Time, livenessErr error) {
+		t.Helper()
+		orgID := uuid.New()
+		if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", at.AddDate(0, 0, -1)); err != nil {
+			t.Fatalf("seed orphan: %v", err)
+		}
+		store.SetBlockHasReferencesGlobalErrForTest(livenessErr)
+		if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+			t.Fatal("the sweep must defer when its global verify fails, whatever the error was")
+		}
+		if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+			t.Fatalf("destroyed bytes after a failed liveness verify: %+v", deletes)
+		}
+		if store.S3OrphanCount() != 1 {
+			t.Fatalf("orphan row = %d, want 1: a failed verify must leave the row for the next sweep", store.S3OrphanCount())
+		}
+	}
+
+	t.Run("a real outage is reported as one and moves the blocked mark", func(t *testing.T) {
+		store := NewMockStore()
+		sp := &MockStorageProvider{}
+		w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+		now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+		w.clock = advancingClock(now)
+		resetDestructivePairForTest(destructivePathOrphan)
+
+		beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable"))
+		beforeFailed := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed"))
+
+		seedRefusedOrphan(t, w, store, sp, now, fakeRequestError{
+			code: gocql.ErrCodeUnavailable,
+			msg:  "Cannot achieve consistency level EACH_QUORUM in DC dc-asia",
+		})
+
+		if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable")); got != beforeUnavailable+1 {
+			t.Errorf("liveness_verify_unavailable = %v, want %v: a DC that cannot be reached is exactly what this label is for", got, beforeUnavailable+1)
+		}
+		if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed")); got != beforeFailed {
+			t.Errorf("liveness_verify_failed moved on an availability failure: %v -> %v", beforeFailed, got)
+		}
+		if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked <= livenessSuccess {
+			t.Errorf("last_blocked=%v last_liveness_success=%v, want blocked later: an unreachable DC is the environment refusing to authorize deletes, which is what the pair reports", blocked, livenessSuccess)
+		}
+	})
+
+	t.Run("a poisoned partition is not reported as an outage", func(t *testing.T) {
+		store := NewMockStore()
+		sp := &MockStorageProvider{}
+		w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+		now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+		w.clock = advancingClock(now)
+		resetDestructivePairForTest(destructivePathOrphan)
+		// A liveness success first, so "blocked is not later than success" below is a
+		// statement about this sweep rather than about two zero-valued gauges.
+		w.recordDestructiveLivenessSuccess(destructivePathOrphan)
+		_, baselineSuccess := destructivePairForTest(t, destructivePathOrphan)
+
+		beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable"))
+		beforeFailed := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed"))
+
+		seedRefusedOrphan(t, w, store, sp, now, fakeRequestError{
+			code: gocql.ErrCodeReadFailure,
+			msg:  "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING",
+		})
+
+		if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed")); got != beforeFailed+1 {
+			t.Errorf("liveness_verify_failed = %v, want %v: a ReadFailure is specific to this partition and permanent until someone looks at it", got, beforeFailed+1)
+		}
+		if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable")); got != beforeUnavailable {
+			t.Errorf("liveness_verify_unavailable moved on a non-availability failure: %v -> %v; this pages whoever is on call to inspect datacenter health for a condition that survives every DC being up", beforeUnavailable, got)
+		}
+		if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked > livenessSuccess {
+			t.Errorf("last_blocked=%v last_liveness_success=%v (baseline success %v), want the mark unmoved: one poisoned partition does not answer whether this path can authorize deletes, which is the pair's only question", blocked, livenessSuccess, baselineSuccess)
+		}
+	})
 }

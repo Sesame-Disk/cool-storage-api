@@ -1340,9 +1340,31 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// zero itself. An error here defers the sweep rather than deleting.
 				hasRefs, livenessErr := w.store.BlockHasReferencesGlobal(orph.OrgID, orph.BlockID)
 				if livenessErr != nil {
-					metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-					w.recordDestructiveBlocked(destructivePathOrphan)
-					log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s; failing closed: %v", orph.OrgID, orph.BlockID, livenessErr)
+					// Classified the same way processBlock's verify is, for a different
+					// reason. There is no queue policy to decide here — this sweep has
+					// no retry budget and no DLQ, and the deferral below is identical
+					// either way — so what the split buys is an honest signal. Calling a
+					// permanent ReadFailure from a tombstone-heavy block_references
+					// partition an availability failure pages whoever is on call to go
+					// look at datacenter health for a condition that will still be there
+					// when every DC is up.
+					//
+					// The blocked mark is availability-only for the same reason. It is
+					// half of the pair that answers "can this path still authorize
+					// deletes at all", and one poisoned partition does not answer it;
+					// moving the mark would report an environment failure that did not
+					// happen. Left unmoved, the row's own error metric and the frozen
+					// scan-success timestamp are what surface it.
+					if isClusterUnavailableError(livenessErr) {
+						metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
+						w.recordDestructiveBlocked(destructivePathOrphan)
+						log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s because the cluster was unavailable; failing closed: %v", orph.OrgID, orph.BlockID, livenessErr)
+					} else {
+						metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
+						log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s for a non-availability reason (this row will not recover on its own); failing closed: %v", orph.OrgID, orph.BlockID, livenessErr)
+					}
+					// Unchanged by the classification: the sweep defers either way, which
+					// holds the day cursor and keeps the row in the working set.
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("global liveness verify for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, livenessErr)
 					}
