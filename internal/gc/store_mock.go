@@ -178,6 +178,7 @@ type MockStore struct {
 	blockHasReferencesLocalCalls   int
 	blockHasReferencesGlobalCalls  int
 	releaseStaleBlockClaimErr      error
+	releaseBlockClaimErr           error
 	claimBlockDeleteErr            error
 	validateDestructiveTopologyErr error
 	blockReferenceExistsErr        error
@@ -2263,10 +2264,25 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (
 	return true, nil
 }
 
+// SetReleaseBlockClaimErrForTest injects a failure into the post-claim release.
+//
+// The interesting injection is a NON-availability error. Those used to surface as
+// ordinary failures, spend the item's retry budget and reach the DLQ while
+// gc_state='deleting' stayed on the row — a permanent upload fence on a block the
+// walk may have just proven to be still referenced. See Worker.releaseBlockClaim.
+func (m *MockStore) SetReleaseBlockClaimErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseBlockClaimErr = err
+}
+
 func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.releaseBlockClaimErr != nil {
+		return m.releaseBlockClaimErr
+	}
 	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
 		if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
 			return fmt.Errorf("block delete claim release not applied for %s", blockID)

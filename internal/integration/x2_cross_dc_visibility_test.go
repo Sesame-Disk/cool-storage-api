@@ -3,12 +3,14 @@
 package integration
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -72,6 +74,47 @@ func x2DCEndpoints(t *testing.T) map[string]string {
 		t.Skipf("X2 closure evidence needs three datacenters (two reproduce the defect but cannot show QUORUM is the wrong fix); X2_DC_HOSTS has %d", len(endpoints))
 	}
 	return endpoints
+}
+
+// requireEachQuorumUnavailable checks that a fail-closed leg failed for the RIGHT
+// reason.
+//
+// Both fail-closed legs used to accept ANY non-nil error as proof. That is far too
+// weak for evidence that closes a data-loss blocker: a typo in the CQL, a dropped
+// table, an auth failure or an unreachable coordinator all produce the same green,
+// and the leg would keep passing long after it stopped testing consistency levels at
+// all. What the leg claims is specifically "EACH_QUORUM could not obtain a quorum in
+// some datacenter", and the driver says so precisely — RequestErrUnavailable carries
+// the Consistency the request was made at, so the assertion can name it.
+//
+// Non-Unavailable availability failures are tolerated with a warning rather than a
+// pass: stopping a container can surface as a connection-level error depending on
+// where the coordinator is in its own detection cycle, and failing the leg for that
+// would make the harness flaky in a direction that teaches nothing. What is rejected
+// outright is an error that is not about availability at all.
+func requireEachQuorumUnavailable(t *testing.T, err error) {
+	t.Helper()
+
+	var unavailable *gocql.RequestErrUnavailable
+	if errors.As(err, &unavailable) {
+		if unavailable.Consistency != gocql.EachQuorum {
+			t.Fatalf("the read failed as Unavailable but at consistency %v, not EACH_QUORUM — this leg is no longer testing the level it claims to: %v", unavailable.Consistency, err)
+		}
+		return
+	}
+
+	// Connection-level shapes that legitimately mean "that datacenter is gone".
+	for _, sentinel := range []error{
+		gocql.ErrTimeoutNoResponse, gocql.ErrConnectionClosed, gocql.ErrNoConnections,
+		gocql.ErrNoHosts, gocql.ErrCannotFindHost,
+	} {
+		if errors.Is(err, sentinel) {
+			t.Logf("note: failed closed on a connection-level error rather than an Unavailable frame (%v); acceptable, but the Unavailable frame is the stronger evidence", err)
+			return
+		}
+	}
+
+	t.Fatalf("the destructive read failed, but NOT for an availability reason: %v. A leg that accepts any error would go green on a broken query or a missing table while proving nothing about EACH_QUORUM", err)
 }
 
 func x2Endpoint(t *testing.T, endpoints map[string]string, dc string) string {
@@ -182,6 +225,7 @@ func TestX2_EachQuorumFailsClosedWhenADatacenterIsDown(t *testing.T) {
 	if err == nil {
 		t.Fatalf("X2 REGRESSION: EACH_QUORUM read succeeded (hasRefs=%v) with a datacenter down; it must fail so GC fails closed", hasRefs)
 	}
+	requireEachQuorumUnavailable(t, err)
 	t.Logf("EACH_QUORUM correctly failed closed with a datacenter down: %v", err)
 
 	// The local read should still work — which is precisely why it must never be
@@ -234,6 +278,7 @@ func TestX2_FailsClosedWhenTheReferenceDatacenterIsDown(t *testing.T) {
 
 	hasRefs, err := reader.BlockHasReferencesGlobal(orgID, blockID)
 	if err != nil {
+		requireEachQuorumUnavailable(t, err)
 		t.Logf("destructive read correctly failed closed with the reference datacenter down: %v", err)
 		return
 	}

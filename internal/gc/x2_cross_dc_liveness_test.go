@@ -369,6 +369,157 @@ func TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget(t *testing.T) {
 	}
 }
 
+// TestX2_ReReferencedBlockSurvivesAFailedClaimRelease is the same rule as the stale
+// test above, at the site where it bites hardest and where it was missed the first
+// time: the POST-claim release on a block the EACH_QUORUM verify just proved alive.
+//
+// The fixture is the X2 divergence itself, which is what makes this reachable rather
+// than theoretical. The local pre-check answers FALSE (the reference lives in another
+// datacenter), so the walk claims the block and proceeds; the global verify then
+// answers TRUE. The branch must hand the claim back — and if it cannot, the fence is
+// standing on LIVE data.
+//
+// Why the next pass cannot be relied on to clean up: the pre-check is the LOCAL read,
+// and it keeps answering false for as long as the divergence lasts, so every pass
+// returns to this same branch instead of settling through the pre-check's safe path.
+// Spending the budget here therefore ends in the DLQ, which ItemBlock never leaves,
+// with gc_state='deleting' left on a referenced block forever.
+func TestX2_ReReferencedBlockSurvivesAFailedClaimRelease(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// The divergence, held for EVERY pass: local reads blind, global reads see the
+	// reference. The hook is shared by both readers, so it tells them apart by which
+	// counter just moved — the mock increments before dispatching. A cumulative test
+	// like "global > 0" would make the LOCAL read start answering true from pass two
+	// onward, the walk would settle through the pre-check's safe path, and the wedge
+	// this test exists to catch would never be reached again.
+	lastGlobal := 0
+	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
+		_, global := store.BlockHasReferencesCallCountsForTest()
+		isGlobalRead := global > lastGlobal
+		lastGlobal = global
+		return isGlobalRead, nil
+	})
+
+	// Permanent and item-specific — not something isClusterUnavailableError knows.
+	store.SetReleaseBlockClaimErrForTest(errors.New("undefined column gc_claim_id in table blocks"))
+
+	before := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed"))
+
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed != 0 {
+		t.Fatalf("%d item(s) reached the DLQ after a permanently failing post-claim release; block items do not auto-recover from there, so this still-referenced block would stay fenced forever", failed)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Fatalf("candidate rows = %d, want the candidate preserved so a later pass can retry the release", len(got))
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted a block the global verify reported as referenced: %+v", deletes)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed")) - before; got != 8 {
+		t.Errorf("gc_errors_total{type=\"block_claim_release_failed\"} rose by %v over 8 refused passes, want 8", got)
+	}
+
+	// Once the store recovers, the same item lifts the fence and settles.
+	store.SetReleaseBlockClaimErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("recovery ProcessOnce returned a fatal error: %v", err)
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared for a referenced block")
+	} else if blk.GCState != "" {
+		t.Errorf("fence still up (gc_state=%q) after the release recovered", blk.GCState)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 0 {
+		t.Errorf("candidate rows = %d after recovery, want the item settled", len(got))
+	}
+}
+
+// TestX2_FailedVerifyPlusFailedReleaseDoesNotBurnTheBudget covers the other post-claim
+// site: the global verify fails for a NON-availability reason (a ReadFailure from a
+// tombstone-heavy partition), which by itself is correctly DLQ-bound — and the claim
+// release fails too.
+//
+// The queue policy used to be decided from the verify's error while the release error
+// was only logged, so this combination spent five retries and parked the item in the
+// DLQ with gc_state='deleting' still set. The release error must dominate until the
+// fence is confirmed gone; the ReadFailure is re-reached, and reaches the DLQ as it
+// should, once the release succeeds.
+func TestX2_FailedVerifyPlusFailedReleaseDoesNotBurnTheBudget(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// The FRAME the driver actually returns for a poisoned partition, not a plain
+	// error carrying its text — a plain error can never classify as environmental
+	// whatever the classifier does, so it would pass even against a classifier that
+	// wrongly swallows ReadFailure. Deliberately NOT an availability failure, so on
+	// its own this error must spend retries and reach the DLQ.
+	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{
+		code: gocql.ErrCodeReadFailure,
+		msg:  "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING",
+	})
+	store.SetReleaseBlockClaimErrForTest(errors.New("undefined column gc_claim_id in table blocks"))
+
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed != 0 {
+		t.Fatalf("%d item(s) reached the DLQ while the fence could not be confirmed gone; the ReadFailure belongs in the DLQ, but only after the claim is off the row", failed)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted a block whose liveness could not be established: %+v", deletes)
+	}
+
+	// Release recovers; the ReadFailure resumes its own (correct) march to the DLQ.
+	store.SetReleaseBlockClaimErrForTest(nil)
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("post-recovery ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed == 0 {
+		t.Error("a persistent non-availability verify failure never reached the DLQ once the fence was confirmed off; it must still be visible to a human")
+	}
+	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
+		t.Fatal("canonical block row disappeared")
+	} else if blk.GCState != "" {
+		t.Errorf("fence still up (gc_state=%q) after the release recovered", blk.GCState)
+	}
+}
+
 // TestX2_StaleClaimReleaseFailureKeepsTheCandidate pins the single-pass half: a failed
 // release must not clear the candidate. The retry-budget test above is what proves
 // that preservation is durable; this one localises a regression to the branch itself.

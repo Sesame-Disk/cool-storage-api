@@ -127,7 +127,7 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-X1 is open with no closed design. X2 closed 2026-08-13, proven on a real three-DC
+X1 is open with no closed design. X2 closed 2026-08-14 (implemented 2026-08-13), proven on a real three-DC
 cluster. `gc.enabled: false` remains required on every replica in every DC — it now
 rests on X1 alone.
 
@@ -141,12 +141,13 @@ incarnation is created. Closure criteria are in Registry X1.
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-13 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; three-DC regression green and mutation-verified | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
 
 ## High / Medium — open (audit follow-ups)
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |

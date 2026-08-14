@@ -55,6 +55,18 @@ var producerStatementPattern = regexp.MustCompile(`(?i)\bINSERT\s+INTO\s+block_r
 // comment explaining why the batch is pinned did exactly that — removing the batch's
 // real pin left this test green.
 //
+// MUTATION-VERIFIED against three shapes of unpinned producer, because the first two
+// rounds of this test each passed against a shape they claimed to cover:
+//
+//	raw backtick literal, newline after INSERT   (broke the fixed-substring needle)
+//	interpreted literal, "INSERT\nINTO ..."      (broke the raw-source pre-filter)
+//	ordinary single-line literal                 (the baseline)
+//
+// The second one is the instructive failure: the pattern was whitespace-tolerant and
+// would have matched, but the file was skipped before parsing because the raw bytes
+// hold `\` and `n` rather than a newline. A guard is only as good as its narrowest
+// stage.
+//
 // STILL OUT OF REACH, stated so nobody mistakes this for a proof. The scan reads
 // string literals, so a statement assembled at runtime — fmt.Sprintf, a const
 // concatenation, a table name substituted from a variable — is invisible to it no
@@ -101,12 +113,27 @@ func TestBlockReferenceProducersPinWriteConsistency(t *testing.T) {
 		if readErr != nil {
 			return readErr
 		}
-		// Cheap pre-filter only. It uses the SAME pattern as the per-literal check
-		// below, so it can never skip a file the real scan would have flagged.
-		if !producerStatementPattern.Match(src) {
-			return nil
-		}
-
+		// EVERY file is parsed. There used to be a cheap pre-filter here that ran the
+		// producer pattern over the raw source and skipped the file on no match,
+		// claiming it "can never skip a file the real scan would have flagged". That
+		// claim was FALSE, and the counterexample is the most ordinary Go string there
+		// is:
+		//
+		//	"INSERT\nINTO block_references (...)"
+		//
+		// In the SOURCE BYTES the separator is the two characters `\` and `n`, which
+		// `\s+` does not match — so the pre-filter skipped the file, while the AST walk
+		// unquotes the literal first, turning it into a real newline the same pattern
+		// does match. The guard's one job is catching a producer nobody noticed, and it
+		// was blind to one written the most ordinary way possible. (The mutation that
+		// "verified" the hardened pattern used a raw backtick literal, whose newlines
+		// are real, so it never exercised this path — see the interpreted-string case
+		// in the mutation list below.)
+		//
+		// No pre-filter at all is a guarantee instead of another almost-true one: any
+		// narrower filter has to reason about escaping again, and reasoning about
+		// escaping is precisely what went wrong. Parsing the module's non-test .go
+		// files costs well under a second.
 		file, parseErr := parser.ParseFile(fset, path, src, 0)
 		if parseErr != nil {
 			t.Errorf("%s: parse: %v", path, parseErr)

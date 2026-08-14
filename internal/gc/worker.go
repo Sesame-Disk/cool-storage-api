@@ -232,6 +232,50 @@ func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error
 	return failedClosedError{Reason: reason, ItemID: itemID, Err: err}
 }
 
+// releaseBlockClaim hands a delete claim back and, when it cannot confirm the claim is
+// gone, refuses to let the caller spend the item's retry budget.
+//
+// THE RULE, which applies to every release in this walk and not just the stale one:
+//
+//	if a branch needs to leave the block usable and cannot confirm the fence came
+//	off, the queue item must not be allowed to reach the DLQ.
+//
+// The reason is the same one that produced GCFailureCodeBlockClaimReleaseUnconfirmed
+// for the pre-check branch, and it was a mistake to apply it only there. A release
+// that fails for a non-availability reason used to surface as an ordinary error:
+// retry, five passes, DLQ — which ItemBlock never leaves, past a scanner day cursor
+// that has already moved on. What is left behind is gc_state='deleting' on a block
+// this very walk may have just PROVEN to be still referenced, and
+// BlockDeleteFenceActive then refuses every future upload of that content, forever.
+//
+// The site that made this reachable in practice is the re-referenced branch: the
+// EACH_QUORUM verify says the block is alive, so the fence is standing on live data,
+// and the local pre-check on the next pass can keep returning false — which is exactly
+// the cross-datacenter divergence X2 is about — so the walk comes back here and burns
+// the budget again rather than settling through the pre-check's safe path.
+//
+// THE RELEASE ERROR DOMINATES THE ORIGINAL ONE. Callers that were going to return some
+// other failure (a ReadFailure from the verify, a malformed canonical row) must return
+// this instead while it applies. Nothing is lost: the item is postponed rather than
+// consumed, and once a later pass confirms the fence is off, the original error is
+// reached again and spends its retries normally. Deciding queue policy from the
+// original error while the fence is still up is what strands the block.
+func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
+	relErr := w.store.ReleaseBlockClaim(orgID, blockID, claimID)
+	if relErr == nil {
+		return nil
+	}
+	if isClusterUnavailableError(relErr) {
+		metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
+		w.recordDestructiveBlocked(destructivePathBlock)
+		log.Printf("[GC Worker] Block %s: releasing the delete claim failed because the cluster was unavailable; postponing with the fence still up: %v", blockID, relErr)
+	} else {
+		metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed").Inc()
+		log.Printf("[GC Worker] Block %s: releasing the delete claim failed for a non-availability reason; postponing rather than spending the retry that would strand this block behind the fence — this will NOT self-heal and needs a human: %v", blockID, relErr)
+	}
+	return blockClaimReleaseUnconfirmedError{ItemID: blockID, Err: relErr}
+}
+
 // recordDestructiveBlocked marks that a destructive path refused a delete because the
 // environment could not authorize it.
 //
@@ -1002,8 +1046,17 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// Unconditional on purpose — see "WHY THE POST-CLAIM RELEASES ARE
 		// UNCONDITIONAL" above; this is the site whose systematic failure mode
 		// decides that trade.
-		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a failed global verify: %v", item.ItemID, relErr)
+		//
+		// A failed release RETURNS here rather than warning and falling through to the
+		// classifier below. It used to only log, which meant the queue policy was
+		// decided from the verify's error while the fence was still up: a ReadFailure
+		// verify plus a failing release spent five retries and reached the DLQ with
+		// gc_state='deleting' left standing. See releaseBlockClaim — the release error
+		// dominates until the fence is confirmed gone, and the verify's own error is
+		// reached again on a later pass.
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			log.Printf("[GC Worker] Block %s: global liveness verify failed (%v) AND the claim could not be handed back; postponing on the release, the verify error will be re-reached once the fence is off", item.ItemID, err)
+			return relErr
 		}
 
 		// The delete is abandoned either way — an error here never authorizes
@@ -1066,8 +1119,16 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return nil
 		}
 		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
-		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			return w.failClosedIfUnavailable("failed to release claim on re-referenced block", item.ItemID, relErr)
+		//
+		// THE most load-bearing release in the walk: the EACH_QUORUM verify just proved
+		// this block is still referenced, so a fence left standing here is standing on
+		// live data. Routed through releaseBlockClaim, which postpones on ANY failure —
+		// failClosedIfUnavailable would let a non-availability error spend the budget,
+		// and the next pass cannot be relied on to settle it through the safe pre-check
+		// path, because that pre-check is the LOCAL read and may keep answering false
+		// while the reference lives in another datacenter.
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return relErr
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return w.failClosedIfUnavailable("failed to clear block GC candidate after re-reference", item.ItemID, err)
@@ -1108,8 +1169,14 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return nil
 		}
 		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
-		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			return w.failClosedIfUnavailable("failed to release claim on malformed block", item.ItemID, relErr)
+		//
+		// The malformed-row error below is deliberately DLQ-bound — a canonical row
+		// with a creation timestamp and no storage class needs a human. But it must not
+		// travel while the fence is unconfirmed, or the human inherits a fenced block
+		// as well as a malformed one. releaseBlockClaim's error dominates; the
+		// malformed-row error is re-reached on the pass that confirms the release.
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return relErr
 		}
 		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
 	}
@@ -1134,8 +1201,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// Hand the claim back: the block is provably unreferenced, so the fence buys
 		// nothing here, and holding it under a systematic rejection would fence this
 		// content for as long as the topology stays wrong.
-		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
-			log.Printf("[GC Worker] WARNING: block %s stayed claimed after a late topology rejection: %v", item.ItemID, relErr)
+		//
+		// Both outcomes postpone, so unlike the sites above this one was never able to
+		// strand the item — it is routed through releaseBlockClaim for the accounting
+		// and the log, not to change the queue policy.
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return relErr
 		}
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
 	}

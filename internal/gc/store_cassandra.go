@@ -1871,6 +1871,43 @@ func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID strin
 // The conditional update pins gc_claimed_at as well as the claim id it observed, so a
 // claim that gets released and re-taken between the read and the write is not the one
 // this call hands back.
+//
+// KNOWN RESIDUAL — THIS READ IS AT SESSION CONSISTENCY, AND A FALSE "ABSENT" COSTS THE
+// CANDIDATE. Every other read in this file was audited for the X2 asymmetry ("a local
+// positive is proof, a local zero authorizes nothing"), and this one does not fit that
+// shape: its zero DOES authorize something. BlockClaimAbsent makes processBlock fall
+// through to DeleteBlockGCCandidate, consuming the only work item that could ever lift
+// the fence — so a read that misses an existing claim strands the block behind
+// gc_state='deleting' exactly as consuming the item on an error would.
+//
+// Two ways it can miss one, neither of which is data loss (nothing here authorizes a
+// delete; the cost is a permanent upload refusal on that content):
+//
+//   - CROSS-DATACENTER. ClaimBlockDelete's LWT commits at the regular consistency of
+//     the writing process, so a claim taken by a worker in another DC is acknowledged
+//     by a quorum THERE. With RF 1 per DC those replica sets do not intersect, and this
+//     LOCAL_QUORUM read can legitimately see no claim. Same geometry as X2 itself,
+//     which is why it is worth naming rather than assuming away.
+//   - THE PAXOS WINDOW, same DC. A LWT accepted but not yet committed when its proposer
+//     died is materialized by a SERIAL read and may be missed by an ordinary one.
+//
+// WHY IT IS NOT FIXED HERE, rather than fixed badly. Both candidate fixes cost more
+// than the residual:
+//
+//   - EACH_QUORUM on this read closes the cross-DC case, but this is the DISCARD path —
+//     it runs for every candidate that turns out to be still referenced — so it would
+//     couple ordinary queue drain to every datacenter being reachable. A single DC
+//     outage would stop referenced-block candidates settling at all. It also does
+//     nothing for the Paxos window.
+//   - A SERIAL read is the linearizable read for LWT-written state, but SERIAL takes a
+//     GLOBAL quorum (2 of 3 at RF 1 in three DCs), which need not intersect a claim
+//     committed under LOCAL_SERIAL in one DC — and mixing the two levels on the blocks
+//     partition is precisely the one-serial-domain violation R12 tracks.
+//
+// So the clean fix depends on the serial-domain decision X1 has to make anyway, and is
+// recorded with it (ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01) rather than half-made
+// here. Until then: the exposure is a stale claim taken by a GC worker in a DIFFERENT
+// datacenter and then abandoned, and destructive GC runs nowhere.
 func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	var gcState, gcClaimID string
 	var gcClaimedAt time.Time

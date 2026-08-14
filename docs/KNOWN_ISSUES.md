@@ -25,7 +25,7 @@ is right about why.
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-13** — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
+| Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an unauthorized cross-library block write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -2043,7 +2043,7 @@ Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1.
 
 ### ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01: GC can miss a live reference in another DC
 
-**Status**: ✅ **Closed 2026-08-13** — fix implemented and proven on a real three-datacenter cluster
+**Status**: ✅ **Closed 2026-08-14** (implemented 2026-08-13) — formally closed on the date the five-leg evidence and both mutations actually ran, not the date the code landed
 **Discovered**: 2026-07-21
 **Priority**: Blocker — potential deletion of a live block
 **Affected**: `block_references`, GC claim-then-verify, RF 1 per DC deployments
@@ -2285,6 +2285,25 @@ The invariant now enforced is:
   so one anomalous row would freeze that timestamp forever and make a healthy fleet
   indistinguishable from a broken one; `gc_s3_orphans` also has no resolved state to
   acknowledge. Alert on the counter.
+- **`ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` (open, liveness).** `ReleaseStaleBlockClaim`
+  reads the claim at session consistency before its conditional release, and that read is
+  the one deciding `BlockClaimAbsent` — which makes `processBlock` fall through and
+  DELETE the candidate. So unlike every other local read on this path, its zero is not
+  harmless: it authorizes consuming the only work item that can lift a fence. A claim
+  taken by a GC worker in a DIFFERENT datacenter is acknowledged by a quorum there, and
+  at RF 1 per DC those replica sets do not intersect, so this read can legitimately miss
+  it — the same geometry as X2 itself. A narrower same-DC case exists too: a LWT
+  accepted but not committed when its proposer died is materialized by a SERIAL read and
+  can be missed by an ordinary one. **No data loss** (nothing here authorizes a delete);
+  the cost is a permanent upload refusal on that content. Not fixed in this branch
+  because both candidate fixes cost more than the residual: `EACH_QUORUM` on this read
+  would couple the ordinary discard path — it runs for every candidate that turns out
+  to be still referenced — to every datacenter being reachable, and does nothing for the
+  Paxos window; a `SERIAL` read takes a *global* quorum that need not intersect a
+  `LOCAL_SERIAL`-committed claim, and mixing the two on the `blocks` partition is exactly
+  the one-serial-domain violation R12 tracks. The clean fix therefore depends on the
+  serial-domain decision X1 has to make anyway. Exposure today is nil: destructive GC
+  runs nowhere.
 - **`ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` (open, storage leak).** The bullet above
   used to justify itself with "the condition is permanent by construction — the row
   survives and every sweep rediscovers it". That is false. A sweep ending without a
@@ -2297,9 +2316,10 @@ The invariant now enforced is:
   a durable deferred/quarantine state, or re-projection into a future bucket — not a
   `phaseErr`, which is the thing that froze the scanner in the first place.
 
-**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (fourteen regressions — the
-count said "twelve" while the file held thirteen, which is the kind of number worth
-either deriving or not stating; derive it with
+**Evidence.** `internal/gc/x2_cross_dc_liveness_test.go` (sixteen regressions — this
+count has now been wrong twice, first stating twelve against a file of thirteen and
+then fourteen against a file that grew to sixteen, which is why the instruction below
+matters more than the number; derive it with
 `grep -c '^func Test' internal/gc/x2_cross_dc_liveness_test.go`),
 `internal/gc/x2_audit_followups_test.go` (fifteen; the post-implementation audits: the
 cross-candidate stale-claim release and its fresh-claim boundary, availability failures
@@ -2325,7 +2345,7 @@ fixed-substring scan stayed **green**, the whitespace-tolerant one goes red), an
 three-DC `TestX2_FailsClosedWhenTheReferenceDatacenterIsDown` (red under a `QUORUM`
 destructive read, via `scripts/x2-multidc-validation.sh --mutate-quorum`).
 
-**Closure evidence (2026-08-13).** All three legs ran green on
+**Closure evidence (2026-08-14).** All five legs ran green on
 `docker-compose.cassandra-3dc.yaml` — Cassandra 5.0.9, three datacenters, RF 1 each,
 the production shape — driven by
 [`scripts/x2-multidc-validation.sh`](../scripts/x2-multidc-validation.sh):
@@ -2337,14 +2357,23 @@ the production shape — driven by
 2. **Fail closed.** With dc-asia stopped the destructive read errors —
    *Cannot achieve consistency level EACH_QUORUM in DC dc-asia* — rather than
    reporting zero. A false zero here is data loss.
-3. **Topology gate.** Accepts the declared three-DC map; refuses a session declaring
+3. **Fail closed with the DC holding the ONLY reference down.** Against a *fresh*
+   divergent state with dc-eu stopped, the destructive read errors — *Cannot achieve
+   consistency level EACH_QUORUM in DC dc-eu*. This is the leg that separates
+   `EACH_QUORUM` from plain `QUORUM`, which would be satisfied by the two blind
+   datacenters and answer zero.
+4. **Topology gate.** Accepts the declared three-DC map; refuses a session declaring
    only dc-na against that same keyspace.
 
-**And the leg was proven able to fail.** With `.Consistency(gocql.EachQuorum)`
-downgraded to `LocalQuorum`, against a *fresh* divergent state, leg 1 goes red with
-"X2 REGRESSION: reference acknowledged at LOCAL_QUORUM in dc-eu is invisible to the
-EACH_QUORUM read from dc-na". A regression that cannot fail is not evidence, and this
-one demonstrably can.
+**And the legs were proven able to fail — both of them.** With
+`.Consistency(gocql.EachQuorum)` downgraded to `LocalQuorum`, against a *fresh*
+divergent state, leg 1 goes red with "X2 REGRESSION: reference acknowledged at
+LOCAL_QUORUM in dc-eu is invisible to the EACH_QUORUM read from dc-na". Downgraded
+instead to `Quorum`, with dc-eu stopped, leg 2b goes red with "X2 REGRESSION: the
+destructive read returned zero references while dc-eu — the only datacenter holding
+one — was unreachable". A regression that cannot fail is not evidence; the second
+mutation is the one that rules out the plausible WRONG fix rather than the original
+defect.
 
 Two notes for anyone re-running it. The visibility leg is **single-use per block id**:
 the `EACH_QUORUM` read performs blocking read repair to satisfy its own consistency

@@ -549,9 +549,13 @@ X2 moves to Closed in `KNOWN_ISSUES.md` when:
       error
 - [x] Fail-closed is observable, and does not consume the item's retry budget
 - [x] A failed verify does not wedge the block (claim released on both paths); a
-      stale claim is released, a live one is not, and a failed release does not
-      consume the **work item** — for any failure reason, not only an availability
-      one, and proven across more passes than the retry budget would survive
+      stale claim is released, a live one is not, and **no release anywhere in the
+      walk** — the stale one in the pre-check, or any of the three post-claim ones —
+      lets the work item reach the DLQ while the fence is unconfirmed. For any failure
+      reason, not only an availability one, and proven across more passes than the
+      retry budget would survive. The re-referenced branch is the one that matters
+      most: the global verify has just proven the block alive there, so a fence left
+      standing is standing on live data.
 - [x] Every unit regression mutation-verified
 - [x] **Divergent-state visibility leg green** (runbook step 5) — and confirmed to
       FAIL when the destructive read is downgraded to `LOCAL_QUORUM`. A green run on

@@ -349,8 +349,22 @@ if [ "${DO_MUTATE:-0}" = "1" ]; then
   echo "$out" | grep -E '^--- (PASS|FAIL)|X2 REGRESSION' || true
   restore_src
   trap cleanup EXIT
+
+  # Three separate things have to be true, and grepping for the message alone proves
+  # only the third. A mutation run is the formal evidence that a data-loss guard can
+  # detect its own defect, so it should not rest on "the string appeared somewhere in
+  # the output" — today X2 REGRESSION comes only from t.Fatalf, but that is a property
+  # of the current tests, not something this script checks.
+  #
+  #   1. the package run FAILED           (not: skipped, not: built and passed)
+  #   2. the TARGET leg failed            (not: some other test in the package)
+  #   3. it failed for the X2 reason      (not: a compile error or a broken fixture)
+  [ "$rc" -ne 0 ] \
+    || fail "${MUTATE_DESC} exited ZERO under a ${MUTATE_TO} destructive read — the mutation did not take effect, or the test never ran"
+  grep -qE "^--- FAIL: ${MUTATE_LEG}( |$)" <<<"$out" \
+    || fail "the package failed under a ${MUTATE_TO} destructive read, but not at ${MUTATE_LEG} — check the output above for a build or fixture failure masquerading as evidence"
   grep -q 'X2 REGRESSION' <<<"$out" \
-    || fail "${MUTATE_DESC} did NOT fail under a ${MUTATE_TO} destructive read — the test cannot detect the defect it exists for"
+    || fail "${MUTATE_LEG} failed under a ${MUTATE_TO} destructive read, but NOT with an X2 REGRESSION assertion — it failed for some other reason and proves nothing"
   printf '\n\033[32mMutation confirmed: %s goes red when the destructive read is downgraded to %s.\033[0m\n' "$MUTATE_DESC" "$MUTATE_TO"
   exit 0
 fi

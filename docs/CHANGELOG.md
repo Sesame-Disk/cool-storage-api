@@ -63,7 +63,8 @@ The invariant now enforced:
   `gc_block_delete_failed_closed`, `gc_block_stale_claim_released`,
   `gc_s3_orphan_referenced_deferred`.
 
-Twelve regressions in `internal/gc/x2_cross_dc_liveness_test.go` plus the gate's
+Regressions in `internal/gc/x2_cross_dc_liveness_test.go` (sixteen by the end of
+this series; derive the count rather than restating it) plus the gate's
 decision logic in `internal/db/destructive_gc_topology_test.go`. Every assertion is
 mutation-verified against a deliberately reverted implementation — including the
 canary that reverting the single `BlockHasReferencesGlobal` call makes the suite delete
@@ -350,6 +351,53 @@ their evidence. All four are closed here; none of them reopened X2.
   when it can see the row, and said so. `require_stopped` now checks before and after
   each of the two legs that take a DC away, so the harness names the cause instead of
   leaving an unexplained rebuild. The manual runbook carries the same check.
+- **The claim-release rule now covers EVERY release, not just the stale one.** The
+  round above fixed `ReleaseStaleBlockClaim` in the pre-check branch and stopped there,
+  which left the same wedge open at the three POST-claim releases. The reachable one is
+  the re-referenced branch: the `EACH_QUORUM` verify has just proven the block is
+  **alive**, and if handing the claim back fails for a non-availability reason the item
+  spends its five retries and reaches the DLQ with `gc_state='deleting'` standing on
+  live data. The next pass cannot be relied on to settle it through the pre-check's safe
+  path either, because that pre-check is the LOCAL read and keeps answering false for as
+  long as the cross-datacenter divergence lasts — which is exactly the condition X2 is
+  about. A second site had the same shape: after a failed global verify the release
+  error was only logged, and queue policy was decided from the verify's error, so a
+  `ReadFailure` plus a failing release marched to the DLQ with the fence up.
+  `Worker.releaseBlockClaim` now centralises the rule — *if a branch needs to leave the
+  block usable and cannot confirm the fence came off, the item must not reach the DLQ*
+  — and the release error dominates the original one until the fence is confirmed gone,
+  at which point the original error resumes its own (correct) march to the DLQ.
+  `gc_errors_total{type="block_claim_release_failed"}` is its counter. Two regressions,
+  both mutation-verified against the previous code.
+- **The producer scan's pre-filter could blind it, and the pre-filter is gone.** The
+  hardened pattern is whitespace-tolerant, but the file was pre-filtered by running that
+  pattern over the RAW SOURCE — and in the source bytes of an ordinary interpreted
+  literal, `"INSERT\nINTO block_references"`, the separator is the two characters `\`
+  and `n`, which `\s+` does not match. The file was skipped before it was ever parsed. The previous
+  round's mutation used a raw backtick literal, whose newlines are real, so it verified
+  the pattern and never touched the pre-filter: an almost-true guarantee that the
+  comment stated as absolute. Every non-test `.go` file in the module is now parsed,
+  which costs under a second and needs no reasoning about escaping. Verified with an
+  unpinned producer in interpreted form: green on the committed version, red now.
+- **The fail-closed legs no longer accept any error as proof.** Both accepted `err !=
+  nil`, so a broken query, a dropped table or an auth failure produced the same green as
+  "EACH_QUORUM could not reach that datacenter". They now require an availability
+  failure and, when the driver returns an `Unavailable` frame, that its `Consistency` is
+  `EACH_QUORUM`. Connection-level shapes are accepted with a note rather than a pass.
+- **The mutation harness now checks three things instead of one.** It grepped for the
+  `X2 REGRESSION` string, which happens to be sufficient only because that string comes
+  solely from `t.Fatalf` today. It now also requires a non-zero exit and an anchored
+  `--- FAIL: <target leg>` line, so a build failure or a broken fixture cannot pass as
+  evidence that a data-loss guard detects its own defect.
+- **The canonical registry was carrying two claims this series had already refuted** —
+  the `RemoveBlockReference` tombstone justification and "no writer hot-path change" —
+  and its closure evidence predated legs 2b and mutation B. Registry is the document X1
+  will be designed from, so it is corrected there too, not only where the reasoning was
+  first fixed.
+- **X2's closing date moved to the day the evidence actually ran.** The closure criteria
+  are the five-leg run and both mutations; those ran on 2026-08-14, so dating the
+  closure 2026-08-13 (when the code landed) claimed the issue was closed before its own
+  criteria were met. Implemented 2026-08-13, closed 2026-08-14.
 - **The unbounded-postpone residual (E1) grew and is recorded as having grown.** Before
   this series one condition postponed without spending a retry; there are now four, and
   the availability classifier applies one of them at *every* statement of the
