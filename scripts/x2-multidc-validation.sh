@@ -124,6 +124,36 @@ wait_healthy() {
   fail "$name did not become healthy in time"
 }
 
+# Wait for the keyspace-creating container to FINISH, and require exit 0.
+#
+# Three nodes going healthy does not mean the keyspace exists: the bootstrap container
+# only starts once all three are healthy and then polls until all three datacenters are
+# visible in gossip. Without this wait the script races it, and whichever side wins
+# creates the keyspace — migrate would create it from CASSANDRA_REPLICATION_DCS (now
+# passed explicitly for exactly that reason, so both orderings produce the same 3-DC
+# map) and the bootstrap's ALTER would arrive afterwards. The race never produced a
+# false green, because a keyspace replicated anywhere but all three DCs makes the
+# divergent write fail loudly, but "correct because one side happens to win" is not a
+# reproducible fixture.
+#
+# Polls docker inspect rather than `docker compose wait`, which is a recent subcommand;
+# the container name is fixed in the compose file.
+wait_bootstrap() {
+  local name=sesamefs-cassandra-3dc-bootstrap deadline=$((SECONDS + 420)) state
+  while [ $SECONDS -lt $deadline ]; do
+    state="$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$name" 2>/dev/null || echo missing:)"
+    case "$state" in
+      exited:0) return 0 ;;
+      exited:*)
+        docker logs "$name" 2>&1 | tail -30
+        fail "the keyspace bootstrap container exited ${state#exited:}; see its log above"
+        ;;
+    esac
+    sleep 5
+  done
+  fail "$name did not finish in time"
+}
+
 LEG1=TestX2_DivergentReferenceIsInvisibleLocallyAndVisibleGlobally
 
 # Build a cluster state where dc-na genuinely does not have the reference: disable
@@ -137,17 +167,22 @@ build_divergence() {
   for n in "${NODES[@]}"; do docker exec "sesamefs-cassandra-$n" nodetool disablehandoff >/dev/null; done
   "${COMPOSE[@]}" stop cassandra-na cassandra-asia
   point_harness_at "${CASSANDRA_EU_HOST_PORT:-9243}" dc-eu
-  local out
+  local out rc
   # Same reason as run_leg: under `set -e` a failing assignment aborts the script
   # before the diagnosis below can run, turning "the divergent write failed" into a
   # bare non-zero exit. The PASS check that follows is what decides.
   set +e
   out="$(X2_WRITE_DIVERGENT=1 go test -tags integration -count=1 ./internal/integration/ \
     -run TestX2_WriteReferenceForDivergence -v 2>&1)"
+  rc=$?
   set -e
   echo "$out" | grep -E 'X2_DIVERGENT_(ORG|BLOCK)|--- (PASS|FAIL)' || true
   grep -q '^--- PASS: TestX2_WriteReferenceForDivergence' <<<"$out" \
     || { echo "$out"; fail "divergent write did not run"; }
+  # Named PASS but non-zero package exit: TestMain's own cleanup failed, so the fixture
+  # is in an unknown state and the ids below would be built on it. Same check run_leg
+  # makes, for the same reason.
+  [ $rc -eq 0 ] || { echo "$out"; fail "divergent write passed but the package run failed; see above"; }
   X2_DIVERGENT_ORG="$(sed -n 's/.*X2_DIVERGENT_ORG=\([0-9a-f-]*\).*/\1/p'    <<<"$out" | tail -1)"
   X2_DIVERGENT_BLOCK="$(sed -n 's/.*X2_DIVERGENT_BLOCK=\(x2-[0-9a-f-]*\).*/\1/p' <<<"$out" | tail -1)"
   [ -n "$X2_DIVERGENT_ORG" ] && [ -n "$X2_DIVERGENT_BLOCK" ] || fail "could not capture the divergent ids"
@@ -191,9 +226,21 @@ if [ "$DO_UP" = "1" ]; then
   "${COMPOSE[@]}" up -d
 fi
 for n in "${NODES[@]}"; do wait_healthy "$n"; done
+if [ "$DO_UP" = "1" ]; then
+  step "1b. Wait for the keyspace bootstrap to finish"
+  wait_bootstrap
+fi
 
+# The replication map is passed explicitly rather than left to the config defaults.
+# `migrate` creates the keyspace itself when it is missing, and with only
+# CASSANDRA_LOCAL_DC set it would fall back to {dc-na: 1} — an under-declared map, which
+# is precisely the topology leg 3b asserts the destructive gate must REFUSE. Stating the
+# full map here makes both creators produce the same keyspace, so the outcome no longer
+# depends on who wins.
 step "2. Apply the schema through the local DC"
 CASSANDRA_HOSTS="127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242}" CASSANDRA_LOCAL_DC=dc-na \
+  CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
+  CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   go run ./cmd/sesamefs migrate
 
 step "3. Disable hinted handoff (load-bearing: hints would erase the divergence)"

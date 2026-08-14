@@ -82,8 +82,20 @@ does, and why each one is load-bearing.
 docker compose -f docker-compose.cassandra-3dc.yaml up -d
 docker compose -f docker-compose.cassandra-3dc.yaml logs -f cassandra-3dc-bootstrap
 
+# 1b. WAIT for that container to exit 0 before continuing. Three healthy nodes do not
+#     mean the keyspace exists — the bootstrap starts only once they are healthy and
+#     then polls gossip. Skipping this races it against step 2.
+docker compose -f docker-compose.cassandra-3dc.yaml wait cassandra-3dc-bootstrap
+
 # 2. Apply the schema through the local DC.
-CASSANDRA_HOSTS=127.0.0.1:9242 CASSANDRA_LOCAL_DC=dc-na go run ./cmd/sesamefs migrate
+#    The replication map is stated explicitly and is NOT optional: migrate creates the
+#    keyspace itself when it is missing, and with only CASSANDRA_LOCAL_DC set it falls
+#    back to {dc-na: 1} — the under-declared map leg 3b asserts the gate must refuse.
+#    Stating it makes both possible creators produce the same keyspace.
+CASSANDRA_HOSTS=127.0.0.1:9242 CASSANDRA_LOCAL_DC=dc-na \
+  CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
+  CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
+  go run ./cmd/sesamefs migrate
 
 export X2_DC_HOSTS="dc-na=127.0.0.1:9242,dc-eu=127.0.0.1:9243,dc-asia=127.0.0.1:9244"
 

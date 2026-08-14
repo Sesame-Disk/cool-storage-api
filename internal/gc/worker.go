@@ -7,7 +7,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -145,10 +144,11 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 // as environmental means such an item postpones indefinitely instead of surfacing in
 // the DLQ. They are included anyway because a partial outage does produce timeouts and
 // losing work there is the worse failure, and because the item stays visible: any
-// fail-closed refusal holds gc_destructive_deletes_blocked at 1. Bounding the
-// environmental postpones per item (after N, fall back to the ordinary retry path)
-// needs a counter distinct from retry_count, which is a queue-protocol change and
-// belongs to X1 rather than here.
+// fail-closed refusal advances gc_destructive_last_blocked_timestamp_seconds past its
+// liveness-success counterpart, and nothing but a later successful read moves it back.
+// Bounding the environmental postpones per item (after N, fall back to the ordinary
+// retry path) needs a counter distinct from retry_count, which is a queue-protocol
+// change and belongs to X1 rather than here.
 func isClusterUnavailableError(err error) bool {
 	if err == nil {
 		return false
@@ -198,24 +198,49 @@ func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error
 }
 
 // recordDestructiveBlocked marks that a destructive path refused a delete because the
-// environment could not authorize it, both as a counter and as pass-scoped state.
+// environment could not authorize it.
 //
-// The pass scope is what makes the gauge honest. Clearing it only on a successful
-// authorizing read leaves it stuck at 1 whenever an outage is followed by a quiet
-// period with no candidates — alerting forever on a condition that has already
-// passed. Clearing it at the end of any pass that refused nothing ties the signal to
-// "this path tried and could not" rather than to "it once could not".
+// It only ever moves this path's "last refused" mark forward. Nothing here clears
+// anything, and no state is scoped to a pass: the recovery half of the signal is
+// recordDestructiveLivenessSuccess, and the two are compared by timestamp. See
+// metrics.GCDestructiveLastBlockedTimestamp for why a single boolean cannot carry
+// this and why a pass-scoped clear made an ongoing outage unalertable.
 //
-// path must be one of the destructivePath* constants. The two paths report
-// separately because they fail independently: a clean worker pass says nothing about
-// whether orphan recovery can delete, and a single shared gauge let one clear the
-// other's alarm.
+// path must be one of the destructivePath* constants.
 func (w *Worker) recordDestructiveBlocked(path string) {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_delete_failed_closed").Inc()
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(path).Set(1)
-	if path == destructivePathBlock {
-		w.destructiveBlockedThisPass.Store(true)
-	}
+	metrics.GCDestructiveLastBlockedTimestamp.WithLabelValues(path).Set(prometheusTimestamp(w.clock()))
+}
+
+// recordDestructiveLivenessSuccess marks that this path completed the global
+// EACH_QUORUM liveness read — the only statement whose success proves the environment
+// can still authorize a destructive delete.
+//
+// Call it whenever that read RETURNS, before looking at what it found: a block that
+// turns out to be still referenced is not a delete, but the read that established
+// that is exactly the evidence this records. Gating it on a completed delete would
+// leave a fleet whose candidates all turn out to be live permanently reading as
+// blocked.
+func (w *Worker) recordDestructiveLivenessSuccess(path string) {
+	metrics.GCDestructiveLastLivenessSuccessTimestamp.WithLabelValues(path).Set(prometheusTimestamp(w.clock()))
+}
+
+// prometheusTimestamp renders an instant as a Prometheus timestamp gauge value.
+//
+// Fractional on purpose, and load-bearing. The block path can record a liveness
+// success and then a topology refusal inside the SAME processBlock walk — the
+// commit-point gate runs a few statements after the global read — and the alert
+// compares the two by value. At whole-second resolution those two events tie,
+// `blocked > liveness_success` is false, and the alert misses precisely the failure
+// mode where the global read works but the gate refuses. Worse, a systematic gate
+// rejection ties on every single walk, so it would never alert at all.
+//
+// float64 holds about microsecond resolution at present epoch values, which orders
+// events milliseconds apart comfortably. Tests asserting on this ordering must drive
+// the worker with a clock that ADVANCES; the frozen `func() time.Time { return now }`
+// idiom used elsewhere in this package makes every event in a walk tie regardless.
+func prometheusTimestamp(t time.Time) float64 {
+	return float64(t.UnixNano()) / 1e9
 }
 
 // shouldPostponeWithoutRetry covers every refusal that says nothing about the item
@@ -353,10 +378,6 @@ type Worker struct {
 	// topologyGateMu protects the short-lived cache of a PASSING gate result.
 	topologyGateMu      sync.Mutex
 	topologyGateOKUntil time.Time
-
-	// destructiveBlockedThisPass records whether the current ProcessOnce pass refused
-	// a delete for environmental reasons. See recordDestructiveBlocked.
-	destructiveBlockedThisPass atomic.Bool
 }
 
 // destructiveTopologyGateTTL is how long a PASSING topology gate result may be
@@ -375,13 +396,18 @@ type Worker struct {
 // is the same tick in practice.
 const destructiveTopologyGateTTL = 30 * time.Second
 
-// The two destructive paths, as reported by gc_destructive_deletes_blocked. They fail
-// independently — the worker drains gc_queue, the scanner sweeps gc_s3_orphans — so
-// each reports its own state rather than sharing one gauge where a clean pass on one
-// would clear the other's alarm.
+// The two destructive paths, as reported by the gc_destructive_last_*_timestamp_seconds
+// pair. They fail independently — the worker drains gc_queue, the scanner sweeps
+// gc_s3_orphans — so each reports its own state rather than sharing one series where a
+// clean pass on one would speak for the other.
+//
+// Aliased from the metrics package, which seeds both series for exactly these values
+// at registration: defining them here independently would let the two drift into a
+// path that is written but never seeded, and an unseeded series drops out of the
+// alert's comparison silently.
 const (
-	destructivePathBlock  = "block"
-	destructivePathOrphan = "orphan"
+	destructivePathBlock  = metrics.GCDestructivePathBlock
+	destructivePathOrphan = metrics.GCDestructivePathOrphan
 )
 
 // blockDeleteClaimStaleAfter is how long a gc_state='deleting' claim must have been
@@ -534,9 +560,10 @@ func (w *Worker) evaluateDestructiveTopology(path string, fresh bool) error {
 		return err
 	}
 	w.topologyGateOKUntil = now.Add(destructiveTopologyGateTTL)
-	// Deliberately not clearing GCDestructiveDeletesBlocked here: a passing gate means
-	// the topology permits a delete, not that one can be authorized. Only a successful
-	// global liveness read proves that, so that is where the gauge clears.
+	// Deliberately not touching the liveness-success series here: a passing gate means
+	// the topology still gives EACH_QUORUM its per-datacenter meaning, not that a
+	// quorum is currently reachable in every datacenter. With a DC down the gate passes
+	// and the read still fails, so only the read itself is evidence of recovery.
 	return nil
 }
 
@@ -552,8 +579,6 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to list orgs: %w", err)
 	}
-
-	w.destructiveBlockedThisPass.Store(false)
 
 	totalProcessed := 0
 	for _, orgID := range orgs {
@@ -571,12 +596,11 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 		totalProcessed += n
 	}
 
-	// A full pass that refused nothing is the evidence that GC can authorize deletes
-	// again. Anything narrower leaves the gauge asserting an outage that ended.
-	if !w.destructiveBlockedThisPass.Load() {
-		metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
-	}
-
+	// No end-of-pass verdict on whether this path can delete. A pass that refused
+	// nothing is not evidence of health — the common case during an outage is a pass
+	// that attempted nothing at all, because the postponed candidates are still
+	// waiting out their grace period. Only recordDestructiveLivenessSuccess, from the
+	// read itself, says the environment can authorize again.
 	return totalProcessed, nil
 }
 
@@ -930,6 +954,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
 		return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
 	}
+	// The read returned, which is this path's only proof that the environment can still
+	// authorize a delete. Recorded here, BEFORE looking at what it found: a still
+	// referenced block is not a delete, but the read that established it is evidence
+	// all the same, and waiting for a completed delete would leave a fleet of live
+	// blocks reading as permanently blocked.
+	w.recordDestructiveLivenessSuccess(destructivePathBlock)
 	if hasRefs {
 		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 		if infoErr != nil {
@@ -1168,7 +1198,6 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	// start would say nothing about the topology in effect by the time a given orphan
 	// is destroyed. That costs one metadata read per orphan actually deleted; this is
 	// the cold path, and the read is cheap next to destroying bytes irreversibly.
-	orphanSweepBlocked := false
 	if err := w.checkDestructiveTopology(destructivePathOrphan); err != nil {
 		log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected the sweep; failing closed: %v", err)
 		return 0, fmt.Errorf("destructive topology gate rejected S3 orphan recovery: %w", err)
@@ -1280,16 +1309,21 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// function: the orphan row alone would make recovery inherit whatever
 				// consistency the writing binary used, so it establishes the global
 				// zero itself. An error here defers the sweep rather than deleting.
-				if hasRefs, err := w.store.BlockHasReferencesGlobal(orph.OrgID, orph.BlockID); err != nil {
+				hasRefs, livenessErr := w.store.BlockHasReferencesGlobal(orph.OrgID, orph.BlockID)
+				if livenessErr != nil {
 					metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-					orphanSweepBlocked = true
 					w.recordDestructiveBlocked(destructivePathOrphan)
-					log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s; failing closed: %v", orph.OrgID, orph.BlockID, err)
+					log.Printf("[GC Worker] S3 orphan recovery: global liveness verify failed for org=%s block=%s; failing closed: %v", orph.OrgID, orph.BlockID, livenessErr)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("global liveness verify for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+						phaseErr = fmt.Errorf("global liveness verify for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, livenessErr)
 					}
 					continue
-				} else if hasRefs {
+				}
+				// Same rule as processBlock: the read RETURNING is this path's proof that
+				// the environment can authorize a delete, whatever the read found. Recorded
+				// before the hasRefs branch, never after a completed delete.
+				w.recordDestructiveLivenessSuccess(destructivePathOrphan)
+				if hasRefs {
 					// Something references this block even though its canonical row is
 					// gone. Recovery must not destroy the bytes those references point
 					// at; leave the row for an operator rather than guessing.
@@ -1314,7 +1348,6 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// cache: a sweep can run long, and a cached pass from the top of it
 				// would assert nothing about the topology in effect right now.
 				if err := w.checkDestructiveTopologyFresh(destructivePathOrphan); err != nil {
-					orphanSweepBlocked = true
 					log.Printf("[GC Worker] S3 orphan recovery: destructive topology gate rejected block %s mid-sweep; failing closed: %v", orph.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("destructive topology gate rejected S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
@@ -1377,12 +1410,10 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 		}
 	}
 
-	// A sweep that refused nothing is this path's evidence that it can still delete.
-	// Reported separately from the worker's: the two fail independently, and a clean
-	// worker pass says nothing about whether recovery is blocked.
-	if !orphanSweepBlocked {
-		metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
-	}
+	// No end-of-sweep verdict here either. A sweep that refused nothing is not
+	// evidence this path can delete — the usual shape is a sweep with no orphan rows at
+	// all, which attempts nothing and proves nothing. The sweep's own liveness reads
+	// carry the signal; see the pair on metrics.GCDestructiveLastBlockedTimestamp.
 
 	if phaseErr == nil {
 		newCursor := cutoffDay.AddDate(0, 0, -1)

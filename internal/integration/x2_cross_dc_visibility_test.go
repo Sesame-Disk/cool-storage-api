@@ -40,9 +40,11 @@ import (
 // See docs/GC-X2-MULTIDC-VALIDATION.md for the procedure that builds that state
 // (stop the other DCs, disable hinted handoff, write, bring them back).
 //
-// THREE datacenters are required, not two. At two DCs with RF 1 a non-local QUORUM
-// is 2 of 2 and intersects everything by accident; only at three does QUORUM become
-// 2 of 3 and able to miss the single replica holding the reference.
+// THREE datacenters are required. Two reproduce the defect — LOCAL_QUORUM and
+// EACH_QUORUM already diverge there — but cannot rule out a plain QUORUM as an equally
+// good fix, because at two DCs with RF 1 it is 2 of 2 and intersects everything by
+// accident. Only at three does QUORUM become 2 of 3, free to miss the single replica
+// holding the reference, and only then is EACH_QUORUM demonstrably the right level.
 
 // x2DCEndpoints parses X2_DC_HOSTS ("dc-na=host:port,dc-eu=host:port,...").
 func x2DCEndpoints(t *testing.T) map[string]string {
@@ -67,7 +69,7 @@ func x2DCEndpoints(t *testing.T) map[string]string {
 		endpoints[dc] = host
 	}
 	if len(endpoints) < 3 {
-		t.Skipf("X2 needs at least three datacenters to be meaningful; X2_DC_HOSTS has %d", len(endpoints))
+		t.Skipf("X2 closure evidence needs three datacenters (two reproduce the defect but cannot show QUORUM is the wrong fix); X2_DC_HOSTS has %d", len(endpoints))
 	}
 	return endpoints
 }

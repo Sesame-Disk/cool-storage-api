@@ -8,11 +8,13 @@
 # whichever DC accepted it. Unit tests cannot observe a consistency level, so that
 # argument can only be proven against a real multi-DC cluster.
 #
-# Two DCs are NOT enough to prove it. At two DCs with RF 1, QUORUM is 2 of 2 and
-# therefore intersects everything by accident — the very confusion the analysis
-# warns about. The defect and the fix only separate at three or more DCs, where
-# QUORUM is 2 of 3 and can miss the one replica holding the reference. This stack
-# uses the production DC names (see .env.prod.example) for that reason.
+# Two DCs reproduce the defect but cannot rule out the WRONG FIX. LOCAL_QUORUM and
+# EACH_QUORUM already diverge at two datacenters, so the bug itself is visible there.
+# What two cannot show is that a plain QUORUM is not an equally good remedy: at two DCs
+# with RF 1 a global QUORUM is 2 of 2 and intersects everything by accident. Only at
+# three does it become 2 of 3, free to skip the one replica holding the reference, and
+# only then does EACH_QUORUM stop being interchangeable with it. This stack uses the
+# production DC names (see .env.prod.example) for that reason.
 #
 # WHY NOT docker-compose.mr-cluster.yaml
 # --------------------------------------
@@ -77,7 +79,23 @@ x-cassandra-node: &cassandra-node
     MAX_HEAP_SIZE: ${CASSANDRA_3DC_MAX_HEAP_SIZE:-512M}
     HEAP_NEWSIZE: ${CASSANDRA_3DC_HEAP_NEWSIZE:-128M}
   healthcheck:
-    test: ["CMD-SHELL", "nodetool status | grep -q '^UN' && cqlsh -e 'describe keyspaces'"]
+    # Both halves are needed, and neither is redundant.
+    #
+    # The awk clause requires THIS node to be UN, not merely some node in the ring. A
+    # bare `grep '^UN'` is satisfied by the seed while the local node is still UJ, which
+    # would let the next node start joining before this one finished — the opposite of
+    # the one-at-a-time formation the depends_on chain is built for.
+    #
+    # The cqlsh call then proves the local node actually serves CQL. Cassandra does not
+    # start client transports until bootstrap completes, so this is the half that makes
+    # "healthy" mean "usable", and it is why the loose grep never produced a broken
+    # fixture in practice — only a weaker guarantee than the comments claimed.
+    test:
+      - CMD-SHELL
+      - >-
+        nodetool status | awk -v ip="$$(hostname -i | awk '{print $$1}')"
+        '$$1=="UN" && $$2==ip {found=1} END {exit !found}'
+        && cqlsh -e 'describe keyspaces'
     interval: 15s
     timeout: 10s
     retries: 20

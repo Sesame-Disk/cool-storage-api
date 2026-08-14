@@ -1943,10 +1943,16 @@ func (m *MockStore) SetReleaseStaleBlockClaimErrForTest(err error) {
 	m.releaseStaleBlockClaimErr = err
 }
 
-// SetClaimBlockDeleteErrForTest injects a failure into the LWT claim. The claim is
-// the statement in the destructive walk most sensitive to a partial outage — under
-// SERIAL it needs a quorum in every DC — so it is the natural place to drive the
-// distinction between an availability failure (postpone) and a real one (DLQ).
+// SetClaimBlockDeleteErrForTest injects a failure into the LWT claim.
+//
+// An LWT can fail for availability reasons depending on its serial and regular
+// consistency levels and on which replicas are reachable — Paxos needs its serial
+// quorum on top of the ordinary one, so contention and a degraded cluster surface here
+// first. This hook drives the worker's TREATMENT of such a failure (postpone, not DLQ);
+// it deliberately does not model any rule of the form "one DC down implies the claim
+// fails". SERIAL and LOCAL_SERIAL are consistencies of the Paxos phase; EACH_QUORUM,
+// the level X2 turns on, is a per-datacenter requirement of an ordinary read. Conflating
+// the two is what produced an incorrect advisory once already.
 func (m *MockStore) SetClaimBlockDeleteErrForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

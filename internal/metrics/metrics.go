@@ -110,35 +110,88 @@ var (
 		[]string{"source"},
 	)
 
-	// GCDestructiveDeletesBlocked is 1 when the last destructive attempt on a path was
-	// refused because the environment could not authorize it — an unreachable
-	// datacenter, or a replication map that no longer carries the per-DC EACH_QUORUM
-	// argument (ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01).
+	// GCDestructiveLastBlockedTimestamp and GCDestructiveLastLivenessSuccessTimestamp
+	// are a PAIR, and only mean anything when read together: whichever carries the
+	// later timestamp is the last thing that path actually observed.
 	//
-	// It exists because the counters alone cannot express DURATION, and duration is
+	// They exist because the counters alone cannot express DURATION, and duration is
 	// the whole signal here. Failing closed postpones without burning a retry, so a
-	// permanently rejecting gate is silent by design: nothing errors, nothing reaches
-	// the DLQ, and the queue simply stops draining while candidates keep arriving.
-	// A counter that stops incrementing looks identical to a fleet with nothing to
-	// collect.
+	// permanently rejecting environment is silent by design: nothing errors, nothing
+	// reaches the DLQ, and the queue simply stops draining while candidates keep
+	// arriving. A counter that stops incrementing looks identical to a fleet with
+	// nothing left to collect.
+	//
+	// WHY A PAIR RATHER THAN ONE "IS BLOCKED" GAUGE. The system has three states —
+	// the last attempt was refused, the last attempt succeeded, and nothing has been
+	// attempted since — and a boolean can hold two. Whichever way it resolves the
+	// third it lies, and both lies were tried here before this shape:
+	//
+	//   clear it at the end of a pass that refused nothing → reports health that was
+	//   never observed. Worse, it is precisely self-defeating: a postponed candidate
+	//   is requeued with queued_at=now and waits out a full grace period before it is
+	//   eligible again, so an ongoing outage produces a run of passes that attempt
+	//   NOTHING between refusals. Each one clears the series, restarting any `for:`
+	//   window, and an outage that never ends never alerts.
+	//
+	//   leave it latched until something proves recovery → reports an outage that has
+	//   already ended, whenever the fleet has nothing left to collect. Operators learn
+	//   to ignore it, which is worse than not having it.
+	//
+	// Two timestamps have no third state to mishandle: silence does not move them.
 	//
 	// The `path` label is not decoration. The two destructive paths fail
 	// independently — the worker drains gc_queue, the scanner sweeps gc_s3_orphans —
-	// so a single global gauge let a clean worker pass report 0 while orphan recovery
-	// was still refusing every delete. Each path reports its own state.
+	// so a clean worker pass says nothing about whether orphan recovery can delete.
 	//
-	// Read it as "the last destructive attempt on this path was refused", not "GC is
-	// blocked right now": a path with no work does not re-evaluate, so its value is
-	// the last thing that path actually observed.
+	// ALERT:
 	//
-	// Alert with `expr: gc_destructive_deletes_blocked == 1` plus `for: 1h`, which is
-	// what "has been blocked for an hour" means. Do NOT use
-	// `max_over_time(...[1h]) == 1` — that fires for a full hour after a single
-	// blocked attempt, however long ago it recovered.
-	GCDestructiveDeletesBlocked = prometheus.NewGaugeVec(
+	//	expr: gc_destructive_last_blocked_timestamp_seconds
+	//	        > gc_destructive_last_liveness_success_timestamp_seconds
+	//	for: 1h
+	//
+	// which reads as "the last evidence was a refusal, and an hour has passed without
+	// evidence to the contrary". The comparison is stable across quiet periods, so
+	// `for:` measures the thing it names. Do NOT write it as
+	// `time() - gc_destructive_last_liveness_success_timestamp_seconds > 3600`: that
+	// fires an hour after the last SUCCESS, which can be seconds after a refusal
+	// started. Do NOT use `max_over_time(...[1h])` either — that says "was blocked at
+	// least once recently", not "has been blocked for an hour".
+	//
+	// Both series are seeded to 0 for both paths at registration (see Register). A
+	// path that has never been exercised is then 0 > 0 = false, rather than a missing
+	// series that silently drops the whole comparison out of the alert; and a first
+	// refusal with no prior success reads T > 0 = true, so it alerts correctly without
+	// anyone having to invent a startup success that never happened.
+	//
+	// Both are process-local: a restart resets them to 0 and restarts the `for:`
+	// window. Surviving restarts would need external persistence, which is not worth
+	// it for a condition that resolves in minutes or persists for hours.
+	GCDestructiveLastBlockedTimestamp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "gc_destructive_deletes_blocked",
-			Help: "1 when the last destructive attempt on this path was refused because the environment could not authorize it (unreachable DC or unsupported replication topology), 0 otherwise.",
+			Name: "gc_destructive_last_blocked_timestamp_seconds",
+			Help: "Unix timestamp of the last destructive attempt on this path refused because the environment could not authorize it (unreachable DC or unsupported replication topology). Compare against gc_destructive_last_liveness_success_timestamp_seconds; 0 means never.",
+		},
+		[]string{"path"},
+	)
+
+	// GCDestructiveLastLivenessSuccessTimestamp records the last time this path
+	// completed the global EACH_QUORUM liveness read — the one statement whose success
+	// proves the environment can still authorize a destructive delete.
+	//
+	// It advances whenever that read RETURNS, including when it reports the block is
+	// still referenced. That case is not a delete, but it is proof the read works, and
+	// proof is what this series carries. Waiting for a completed delete instead would
+	// leave a fleet whose candidates all turn out to be live permanently latched as
+	// blocked — the same latch the pair exists to avoid.
+	//
+	// A PASSING TOPOLOGY GATE DOES NOT ADVANCE IT. The gate proves the replication map
+	// still gives EACH_QUORUM its per-datacenter meaning, not that a quorum is
+	// currently reachable in every datacenter: with dc-asia down the gate passes and
+	// the read still fails. Only the read itself is evidence.
+	GCDestructiveLastLivenessSuccessTimestamp = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gc_destructive_last_liveness_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful global (EACH_QUORUM) liveness read on this path, whatever it found. Compare against gc_destructive_last_blocked_timestamp_seconds; 0 means never.",
 		},
 		[]string{"path"},
 	)
@@ -960,8 +1013,27 @@ var (
 	)
 )
 
+// The `path` values of the gc_destructive_last_*_timestamp_seconds pair.
+//
+// Declared here rather than in package gc, which owns the call sites, so that the
+// seeding below provably covers exactly the paths that are written: gc aliases these
+// constants, so a new path cannot be introduced without an unseeded series showing up
+// as a compile-time reference to a constant that Register does not iterate.
+const (
+	GCDestructivePathBlock  = "block"
+	GCDestructivePathOrphan = "orphan"
+)
+
 // Register registers all custom metrics with the default Prometheus registry.
 func Register() {
+	// Seed both halves of the destructive-delete pair, for both paths, to 0. The
+	// alert compares the two series, and a comparison against a series that does not
+	// exist yet matches nothing — so an unseeded path would be silently unalertable
+	// until its first event. See GCDestructiveLastBlockedTimestamp.
+	for _, path := range []string{GCDestructivePathBlock, GCDestructivePathOrphan} {
+		GCDestructiveLastBlockedTimestamp.WithLabelValues(path).Set(0)
+		GCDestructiveLastLivenessSuccessTimestamp.WithLabelValues(path).Set(0)
+	}
 	for _, profile := range []string{"block", "file", "raw", "history", "link_raw", "zip", "link_inline"} {
 		DownloadAdmissionActiveByProfile.WithLabelValues(profile).Set(0)
 	}
@@ -1004,7 +1076,8 @@ func Register() {
 		GCItemsSkippedTotal,
 		GCZeroRefEnqueueFailuresTotal,
 		GCBlockCandidateDiscoveryDegradedTotal,
-		GCDestructiveDeletesBlocked,
+		GCDestructiveLastBlockedTimestamp,
+		GCDestructiveLastLivenessSuccessTimestamp,
 		GCLastWorkerRun,
 		GCLastScannerRun,
 		GCScannerLastPhaseRun,

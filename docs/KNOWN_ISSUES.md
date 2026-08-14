@@ -2116,15 +2116,41 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   a counter cannot express *duration* — which is the whole signal, because failing
   closed is silent by design: nothing errors, nothing reaches the DLQ, and a
   permanently rejecting gate looks exactly like a fleet with nothing to collect. The
-  gauge `gc_destructive_deletes_blocked{path="block"|"orphan"}` closes that. Alert with
-  `expr: gc_destructive_deletes_blocked == 1` plus `for: 1h` — **not**
-  `max_over_time(...[1h]) == 1`, which fires for a full hour after a single blocked
-  attempt however long ago it recovered, and so says "was blocked at least once
-  recently" rather than "has been blocked for an hour". The `path` label is required
-  because the two destructive paths fail independently: without it, a clean worker pass
-  would clear an alarm raised by an orphan sweep that is still refusing every delete.
-  Read each series as "the last destructive attempt on this path was refused" — a path
-  with no work does not re-evaluate.
+  pair `gc_destructive_last_blocked_timestamp_seconds{path}` and
+  `gc_destructive_last_liveness_success_timestamp_seconds{path}` closes that, with
+  `path` being `"block"` or `"orphan"`. Alert on:
+
+  ```yaml
+  expr: gc_destructive_last_blocked_timestamp_seconds
+          > gc_destructive_last_liveness_success_timestamp_seconds
+  for: 1h
+  ```
+
+  read as "the last evidence was a refusal, and an hour has passed without evidence to
+  the contrary". Do **not** reduce it to `time() - ..._liveness_success > 3600`, which
+  fires an hour after the last success — possibly seconds after a refusal began — nor
+  to `max_over_time(...)`, which says "was blocked at least once recently".
+
+  **Why a pair rather than one boolean gauge.** An earlier revision shipped
+  `gc_destructive_deletes_blocked` as 0/1 and cleared it at the end of any worker pass
+  that refused nothing. That is unsound in both directions and was actively harmful in
+  one: because a postponed candidate is requeued with `queued_at=now` and waits out a
+  full grace period, an ongoing outage produces runs of passes that attempt *nothing*
+  between refusals, and each of those cleared the gauge and restarted the `for: 1h`
+  window — so an outage that never ended never alerted. Latching the gauge instead
+  merely inverts the lie, reporting an outage that ended whenever the fleet runs out of
+  work. Two timestamps have no third state to mishandle: silence does not move them.
+  The recovery half advances when the global read RETURNS, including when it finds the
+  block still referenced — that is proof the environment can authorize, and requiring a
+  completed delete would latch any fleet whose candidates are all live. A passing
+  topology gate does not advance it: the gate proves the replication map still gives
+  `EACH_QUORUM` per-DC meaning, not that a quorum is currently reachable. Both series
+  are seeded to 0 at registration for both paths, so a never-exercised path reads as
+  not blocked instead of dropping out of the comparison, and a first refusal after boot
+  alerts without anyone inventing a startup success. Both are process-local: a restart
+  resets the `for:` window. The `path` label is required because the two destructive
+  paths fail independently — without it a clean worker pass would speak for an orphan
+  sweep that is still refusing every delete.
 - Fail-closed also does not consume the item's retry budget: the failure is systematic,
   so the ordinary five-retry path would DLQ every in-flight block within minutes of an
   outage, and block items are not auto-recoverable from the DLQ while the scanner's day
@@ -2163,7 +2189,8 @@ the publication TOCTOU, which is a different property. The invariant now enforce
   item postpones indefinitely rather than surfacing in the DLQ. They are included anyway
   because a partial outage does produce timeouts and losing work there is the worse
   failure, and the condition stays visible through
-  `gc_destructive_deletes_blocked{path="block"}`. Bounding environmental postpones per
+  `gc_destructive_last_blocked_timestamp_seconds{path="block"}` outranking its
+  liveness-success counterpart. Bounding environmental postpones per
   item needs a counter distinct from `retry_count` — a queue-protocol change, and X1's
   to make.
 - A `gc_s3_orphans` row whose block still has references is refused, logged, and

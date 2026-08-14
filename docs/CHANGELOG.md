@@ -125,14 +125,33 @@ the reason covers.
   every pass — and a failed phase suppresses `last_scan_success`, meaning one such row
   would freeze that timestamp forever and mask the health of everything else. Now
   logged and counted only.
-- **`gc_destructive_deletes_blocked{path}` (new gauge).** Failing closed is silent by
-  design: nothing errors, nothing DLQs, the queue just stops draining. Counters cannot
-  express that duration. Alert with `expr: gc_destructive_deletes_blocked == 1` and
-  `for: 1h` — not `max_over_time(...[1h]) == 1`, which stays true for an hour after a
-  single blocked attempt and therefore means "was blocked once recently", not "has been
-  blocked for an hour". The `path` label separates the worker from orphan recovery,
-  which fail independently; sharing one series let a clean worker pass clear an alarm
-  the orphan sweep had just raised.
+- **`gc_destructive_last_blocked_timestamp_seconds{path}` and
+  `gc_destructive_last_liveness_success_timestamp_seconds{path}` (new pair).** Failing
+  closed is silent by design: nothing errors, nothing DLQs, the queue just stops
+  draining. Counters cannot express that duration. Alert on
+  `blocked > liveness_success` with `for: 1h`, which reads as "the last evidence was a
+  refusal, and an hour has passed without evidence to the contrary" — not
+  `time() - liveness_success > 3600` (fires an hour after the last success, which can
+  be seconds after a refusal starts) and not `max_over_time(...)` (means "was blocked
+  once recently"). The `path` label separates the worker from orphan recovery, which
+  fail independently.
+
+  These replace a `gc_destructive_deletes_blocked` boolean gauge from earlier in this
+  same series, which was cleared at the end of any pass that refused nothing. A
+  boolean has two states and the system has three — refused, succeeded, and *not
+  looked since* — so it had to lie about the third, and it lied in the direction that
+  defeated its own alert: a postponed candidate waits out a full grace period, so an
+  ongoing outage produces runs of passes that attempt nothing, each of which cleared
+  the gauge and restarted the `for: 1h` window. An outage that never ended never
+  alerted. The recovery half now advances only when the global read returns —
+  including when it finds the block still referenced, since that read is proof the
+  environment can authorize — and never on a merely passing topology gate, which
+  proves the map is right rather than that a quorum is reachable. Timestamps are
+  fractional because a walk can record a success and then a commit-point refusal
+  milliseconds apart, and at second resolution those tie. Both series are seeded to 0
+  for both paths at registration so a never-exercised path reads as not blocked rather
+  than dropping out of the alert's comparison. Removing the gauge cost no migration:
+  it never left this branch.
 - **The topology gate has two forms, and the split is load-bearing.** The cheap form
   caches a pass for 30s and never a rejection: per-candidate `system_schema` reads
   bought nothing (schema does not change between two blocks of a batch) while caching a

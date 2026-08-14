@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -282,24 +283,69 @@ func TestX2_TopologyGateRejectionIsNeverCached(t *testing.T) {
 	}
 }
 
-// TestX2_DestructiveBlockedGaugeTracksThePass pins the one signal that makes a
-// permanently rejecting environment visible at all.
+// destructivePairForTest reads the two series that together say whether a destructive
+// path can still delete. Returned as a pair because neither means anything alone: the
+// alert compares them, so an assertion on one in isolation asserts nothing.
+func destructivePairForTest(t *testing.T, path string) (blocked, livenessSuccess float64) {
+	t.Helper()
+	return testutil.ToFloat64(metrics.GCDestructiveLastBlockedTimestamp.WithLabelValues(path)),
+		testutil.ToFloat64(metrics.GCDestructiveLastLivenessSuccessTimestamp.WithLabelValues(path))
+}
+
+// resetDestructivePairForTest returns paths to the state metrics.Register seeds them
+// in: never blocked, never succeeded. Tests share a process-wide registry, so without
+// this each one inherits whatever the previous left behind.
+func resetDestructivePairForTest(paths ...string) {
+	for _, path := range paths {
+		metrics.GCDestructiveLastBlockedTimestamp.WithLabelValues(path).Set(0)
+		metrics.GCDestructiveLastLivenessSuccessTimestamp.WithLabelValues(path).Set(0)
+	}
+}
+
+// advancingClock returns a clock that moves forward one millisecond per call.
 //
-// Failing closed is deliberately quiet: it postpones without erroring, without
-// touching the retry budget, and without reaching the DLQ. That is correct for a
-// transient outage and indistinguishable from a healthy idle fleet when the condition
-// is permanent — the counters simply stop moving, exactly as they would if there were
-// nothing to collect. Only a gauge can express "still blocked, right now", and only if
-// it also goes back down: a gauge that latches at 1 after a recovered outage trains
-// operators to ignore it, which is worse than not having it.
-func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
+// The frozen `func() time.Time { return now }` idiom used elsewhere in this package is
+// actively wrong for anything comparing two recorded timestamps: it stamps every event
+// in a walk with the same instant, so `blocked > liveness_success` is false however the
+// code behaves, and the assertion passes or fails for reasons unrelated to it. Any test
+// touching gc_destructive_last_*_timestamp_seconds must drive the worker with this.
+func advancingClock(start time.Time) func() time.Time {
+	var mu sync.Mutex
+	current := start
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		current = current.Add(time.Millisecond)
+		return current
+	}
+}
+
+// TestX2_BlockedStateSurvivesAPassThatAttemptsNothing is the regression test for the
+// defect that replaced a boolean gauge with this pair.
+//
+// The old gauge was cleared at the end of any ProcessOnce that refused nothing, on the
+// reasoning that a clean pass proves the environment recovered. It does not, and the
+// counter-example is not exotic — it is the NORMAL shape of an ongoing outage. Failing
+// closed postpones the item, RequeueItem stamps queued_at=now, and DequeueBatch will
+// not hand it back until it has aged past the grace period. A datacenter that stays
+// down therefore produces one refusing pass, then a run of passes that attempt nothing
+// at all, then another refusal. Every pass in that run cleared the gauge and restarted
+// the `for: 1h` window the runbook depends on, so an outage that never ended never
+// alerted — the gauge neutralised precisely the alert it existed to raise.
+//
+// A pass that attempts nothing must leave the signal exactly as it found it.
+func TestX2_BlockedStateSurvivesAPassThatAttemptsNothing(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
 	q := NewQueue(store)
-	w := NewWorker(store, sp, q, 100, 0, false, stats)
+	// A real grace period is the whole point: without one the postponed candidate is
+	// eligible again on the very next pass, the walk runs again, and the gap this test
+	// exists for never opens.
+	w := NewWorker(store, sp, q, 100, time.Hour, false, stats)
+	w.clock = advancingClock(time.Now())
 
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
+	resetDestructivePairForTest(destructivePathBlock)
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
@@ -311,27 +357,205 @@ func TestX2_DestructiveBlockedGaugeTracksThePass(t *testing.T) {
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 1 {
-		t.Fatalf("gc_destructive_deletes_blocked = %v after a fail-closed pass, want 1: with no error, no retry and no DLQ entry, this gauge is the only thing that says GC cannot delete", got)
+	blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock)
+	if blocked <= livenessSuccess {
+		t.Fatalf("last_blocked=%v last_liveness_success=%v after a fail-closed pass: with no error, no retry and no DLQ entry, this pair is the only thing that says GC cannot delete", blocked, livenessSuccess)
+	}
+	// Also the first-refusal-after-boot case: nothing had ever succeeded, so the success
+	// half is still the seeded 0. That must read as blocked rather than drop out of the
+	// comparison, which is why Register seeds both halves instead of stamping a startup
+	// success nobody observed.
+	if livenessSuccess != 0 {
+		t.Fatalf("last_liveness_success=%v, want 0: nothing has ever succeeded in this test", livenessSuccess)
 	}
 
-	// The datacenter comes back. A pass that refuses nothing must clear the gauge —
-	// including the case where there is simply nothing left to collect, which is what
-	// a recovered fleet usually looks like a few passes later.
+	_, globalBefore := store.BlockHasReferencesCallCountsForTest()
+
+	// The datacenter is still down. The candidate was requeued with queued_at=now, so it
+	// is inside the grace period and this pass attempts nothing whatsoever.
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("second ProcessOnce returned a fatal error: %v", err)
+	}
+	_, globalAfter := store.BlockHasReferencesCallCountsForTest()
+	if globalAfter != globalBefore {
+		t.Fatalf("the second pass issued %d global liveness read(s); this test only means something if it issues none, so the grace period is not holding the candidate back", globalAfter-globalBefore)
+	}
+
+	blockedAfter, successAfter := destructivePairForTest(t, destructivePathBlock)
+	if blockedAfter <= successAfter {
+		t.Errorf("last_blocked=%v last_liveness_success=%v after a pass that attempted nothing: silence was read as recovery, and a run of such passes is exactly what an ongoing outage produces between refusals", blockedAfter, successAfter)
+	}
+	if blockedAfter != blocked {
+		t.Errorf("last_blocked moved from %v to %v without a new refusal", blocked, blockedAfter)
+	}
+}
+
+// TestX2_DestructiveTimestampsTrackTheLastEvidence pins the signal end to end: a
+// refusal raises it, a later successful global read clears it, and a pass with nothing
+// to do moves neither half.
+//
+// Failing closed is deliberately quiet — it postpones without erroring, without
+// touching the retry budget and without reaching the DLQ — so a permanently rejecting
+// environment is indistinguishable from a healthy idle fleet by counters alone. The
+// pair has to come back down too: a signal that latches after a recovered outage is one
+// operators learn to ignore, which is worse than not having it.
+func TestX2_DestructiveTimestampsTrackTheLastEvidence(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+	// Started slightly in the past on purpose. postponeItem stamps queued_at from
+	// w.clock() while the queue's eligibility cutoff comes from the real time.Now(), so
+	// a clock seeded at time.Now() drifts ahead of it and the requeued item never
+	// becomes eligible again — this test needs the second pass to actually walk it.
+	w.clock = advancingClock(time.Now().Add(-time.Minute))
+
+	resetDestructivePairForTest(destructivePathBlock)
+
+	// A path that has never been exercised must not read as blocked.
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock); blocked > livenessSuccess {
+		t.Fatalf("last_blocked=%v last_liveness_success=%v before anything happened: a never-exercised path must read as not blocked", blocked, livenessSuccess)
+	}
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	store.SetBlockHasReferencesGlobalErrForTest(errors.New("cannot achieve consistency level EACH_QUORUM"))
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock); blocked <= livenessSuccess {
+		t.Fatalf("last_blocked=%v last_liveness_success=%v after a fail-closed pass, want blocked later", blocked, livenessSuccess)
+	}
+
+	// The datacenter comes back and a candidate is walked again. The read itself is what
+	// proves recovery, so this is where the signal clears.
 	store.SetBlockHasReferencesGlobalErrForTest(nil)
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce after recovery returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
-		t.Errorf("gc_destructive_deletes_blocked = %v after recovery, want 0: a gauge that never comes back down is one operators learn to ignore", got)
+	blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock)
+	if livenessSuccess <= blocked {
+		t.Fatalf("last_blocked=%v last_liveness_success=%v after a successful global read, want success later: a signal that never comes back down is one operators learn to ignore", blocked, livenessSuccess)
 	}
 
-	// An idle pass with no work at all must also read as "not blocked".
+	// An idle pass is not evidence of anything and must move neither half.
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("idle ProcessOnce returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
-		t.Errorf("gc_destructive_deletes_blocked = %v on an idle pass, want 0", got)
+	if gotBlocked, gotSuccess := destructivePairForTest(t, destructivePathBlock); gotBlocked != blocked || gotSuccess != livenessSuccess {
+		t.Errorf("idle pass moved the pair from (%v, %v) to (%v, %v); silence is not an observation", blocked, livenessSuccess, gotBlocked, gotSuccess)
+	}
+}
+
+// TestX2_LivenessSuccessOnAStillReferencedBlockIsEvidence pins the one call-site detail
+// that decides whether the recovery half can latch.
+//
+// The global read is recorded as evidence when it RETURNS, before its result is
+// examined. A block that turns out to be still referenced produces no delete, but the
+// read that established that proves the environment can authorize one. Gating the
+// record on a completed delete instead would leave any fleet whose candidates all turn
+// out to be live reading as permanently blocked — the exact latch this design exists to
+// avoid, reintroduced through the back door.
+func TestX2_LivenessSuccessOnAStillReferencedBlockIsEvidence(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+	w.clock = advancingClock(time.Now())
+
+	resetDestructivePairForTest(destructivePathBlock)
+	// A previous outage left the path reading as blocked.
+	w.recordDestructiveBlocked(destructivePathBlock)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// A reference appears between the cheap pre-check and the authorizing read, so the
+	// walk reaches the global read and that read reports the block alive. Seeding a
+	// reference up front instead would make the pre-check skip the candidate before any
+	// global read happened, and the test would assert nothing.
+	livenessCalls := 0
+	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
+		livenessCalls++
+		return livenessCalls > 1, nil
+	})
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+
+	if stats.BlocksDeleted() != 0 {
+		t.Fatalf("BlocksDeleted = %d, want 0: this test is only meaningful if nothing was deleted", stats.BlocksDeleted())
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock); livenessSuccess <= blocked {
+		t.Errorf("last_blocked=%v last_liveness_success=%v after a successful read that found the block alive: a fleet of live blocks would stay latched as blocked forever", blocked, livenessSuccess)
+	}
+}
+
+// TestX2_CommitPointRefusalOutranksTheLivenessSuccessInTheSameWalk pins the timestamp
+// resolution, which is load-bearing rather than cosmetic.
+//
+// processBlock records a liveness success and can then record a topology refusal a few
+// statements later, inside the same walk and milliseconds apart. The alert compares the
+// two by value, so at whole-second resolution they tie, `blocked > liveness_success` is
+// false, and the alert misses the failure mode where the global read works but the
+// commit-point gate refuses. That mode is not rare: a gate rejecting systematically ties
+// on every single walk, so the alert would never fire at all.
+func TestX2_CommitPointRefusalOutranksTheLivenessSuccessInTheSameWalk(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+	w.clock = advancingClock(time.Now())
+
+	resetDestructivePairForTest(destructivePathBlock)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+
+	// Passes at the top of the walk, rejects from the commit-point re-check onward: an
+	// ALTER landing after the authorizing read.
+	gateCalls := 0
+	w.SetDestructiveTopologyGate(func() error {
+		gateCalls++
+		if gateCalls == 1 {
+			return nil
+		}
+		return errors.New("live replication map no longer matches the declared topology")
+	})
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+	if gateCalls < 2 {
+		t.Fatalf("gate consulted %d time(s); this test needs the commit-point re-check to run", gateCalls)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("destroyed bytes under a rejected topology: %+v", deletes)
+	}
+
+	blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock)
+	if livenessSuccess == 0 {
+		t.Fatalf("last_liveness_success=0: the walk was supposed to complete its global read before the gate refused")
+	}
+	if blocked == livenessSuccess {
+		t.Fatalf("last_blocked and last_liveness_success are both %v: the two events tied, so the alert cannot see the refusal. Either the timestamps lost sub-second resolution or the test clock is frozen", blocked)
+	}
+	if blocked < livenessSuccess {
+		t.Errorf("last_blocked=%v last_liveness_success=%v: the refusal happened AFTER the read and must outrank it", blocked, livenessSuccess)
 	}
 }
 
@@ -453,14 +677,14 @@ func TestX2_TopologyGateIsRecheckedAtTheCommitPoint(t *testing.T) {
 	}
 }
 
-// TestX2_DestructiveBlockedGaugeIsPerPath pins why the gauge carries a path label.
+// TestX2_DestructiveTimestampsArePerPath pins why the pair carries a path label.
 //
-// The two destructive paths fail independently: the worker drains gc_queue, the
-// scanner sweeps gc_s3_orphans, and one can be refusing every delete while the other
-// has nothing to do. Under a single shared gauge, a clean worker pass would reset the
-// alarm that orphan recovery had just raised — silencing a path that is still
-// completely blocked, which is the exact condition the gauge exists to surface.
-func TestX2_DestructiveBlockedGaugeIsPerPath(t *testing.T) {
+// The two destructive paths fail independently: the worker drains gc_queue, the scanner
+// sweeps gc_s3_orphans, and one can be refusing every delete while the other has nothing
+// to do. Under a single shared series, a clean worker pass would speak for orphan
+// recovery and silence a path that is still completely blocked — the exact condition the
+// signal exists to surface.
+func TestX2_DestructiveTimestampsArePerPath(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -468,10 +692,9 @@ func TestX2_DestructiveBlockedGaugeIsPerPath(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
-	w.clock = func() time.Time { return now }
+	w.clock = advancingClock(now)
 
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(0)
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
+	resetDestructivePairForTest(destructivePathBlock, destructivePathOrphan)
 
 	// Orphan recovery cannot authorize anything: its liveness read fails.
 	orgID := uuid.New()
@@ -482,8 +705,9 @@ func TestX2_DestructiveBlockedGaugeIsPerPath(t *testing.T) {
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("expected the sweep to fail closed")
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
-		t.Fatalf("orphan path gauge = %v after a fail-closed sweep, want 1", got)
+	orphanBlocked, orphanSuccess := destructivePairForTest(t, destructivePathOrphan)
+	if orphanBlocked <= orphanSuccess {
+		t.Fatalf("orphan path: last_blocked=%v last_liveness_success=%v after a fail-closed sweep, want blocked later", orphanBlocked, orphanSuccess)
 	}
 
 	// Now a worker pass with no work at all. It must not speak for the orphan path.
@@ -491,46 +715,40 @@ func TestX2_DestructiveBlockedGaugeIsPerPath(t *testing.T) {
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
-		t.Errorf("block path gauge = %v after a clean pass, want 0", got)
-	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
-		t.Errorf("block path cleared the ORPHAN path's alarm (gauge = %v, want 1); orphan recovery is still refusing every delete and nothing would say so", got)
+	if gotBlocked, gotSuccess := destructivePairForTest(t, destructivePathOrphan); gotBlocked != orphanBlocked || gotSuccess != orphanSuccess {
+		t.Errorf("a worker pass moved the ORPHAN pair from (%v, %v) to (%v, %v); orphan recovery is still refusing every delete and nothing would say so", orphanBlocked, orphanSuccess, gotBlocked, gotSuccess)
 	}
 
-	// The orphan path clears its own alarm once its own sweep refuses nothing.
+	// The orphan path clears its own signal once its own read succeeds. Note this now
+	// requires the sweep to actually REACH that read: there is no end-of-sweep clear to
+	// pass the assertion on an empty sweep.
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err != nil {
 		t.Fatalf("clean sweep returned an error: %v", err)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 0 {
-		t.Errorf("orphan path gauge = %v after a clean sweep, want 0", got)
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); livenessSuccess <= blocked {
+		t.Errorf("orphan path: last_blocked=%v last_liveness_success=%v after a sweep whose global read succeeded, want success later", blocked, livenessSuccess)
 	}
 }
 
-// TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass covers the guard inside
-// recordDestructiveBlocked, which mutation testing showed nothing else did.
+// TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass covers the interleaving the two
+// paths actually produce in a running fleet.
 //
-// The worker's gauge is cleared at the end of a pass that refused nothing, and the
-// decision rests on pass-scoped state. Orphan recovery runs from the scanner, on its
-// own schedule, and can therefore refuse a delete WHILE a worker pass is in flight. If
-// that refusal marked the worker's flag, the worker would report itself blocked
-// because a different path was — a false positive on the series operators page from.
-//
-// The guard is one line and looks redundant right up until the two paths overlap in
-// time, which is why it is pinned here rather than trusted.
+// Orphan recovery runs from the scanner, on its own schedule, so it can refuse a delete
+// WHILE a worker pass is in flight. An earlier design kept pass-scoped state to decide
+// when to clear a shared gauge, and that state was reachable from both paths: an orphan
+// refusal marked the worker's pass, and the worker reported itself blocked because a
+// different path was. Recording per path removes the shared state entirely rather than
+// guarding it, but the interleaving is pinned here so a future refactor cannot quietly
+// reintroduce a cross-path write.
 func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
 	q := NewQueue(store)
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
+	w.clock = advancingClock(time.Now())
 
-	// The block gauge starts at 1 — a previous pass was blocked — so that CLEARING it
-	// is the observable event. Starting from 0 would make the test pass even if the
-	// clear never happened, which is exactly the hole mutation testing found in an
-	// earlier version of it.
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock).Set(1)
-	metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan).Set(0)
+	resetDestructivePairForTest(destructivePathBlock, destructivePathOrphan)
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
@@ -549,11 +767,11 @@ func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
 
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathOrphan)); got != 1 {
-		t.Errorf("orphan path gauge = %v, want 1: its own refusal must still be recorded", got)
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked <= livenessSuccess {
+		t.Errorf("orphan path: last_blocked=%v last_liveness_success=%v, want blocked later: its own refusal must still be recorded", blocked, livenessSuccess)
 	}
-	if got := testutil.ToFloat64(metrics.GCDestructiveDeletesBlocked.WithLabelValues(destructivePathBlock)); got != 0 {
-		t.Errorf("block path gauge = %v after a pass that refused nothing, want 0: an orphan-path refusal marked the worker's pass, so the worker stayed latched as blocked because a different path is", got)
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock); livenessSuccess <= blocked {
+		t.Errorf("block path: last_blocked=%v last_liveness_success=%v, want success later: an orphan-path refusal was written to the worker's series, so the worker reads as blocked because a different path is", blocked, livenessSuccess)
 	}
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted = %d, want 1: the worker pass itself was never blocked", stats.BlocksDeleted())
