@@ -4,6 +4,18 @@
 
 **Date:** 2026-08-13
 
+> **Dated note — 2026-08-14: this document's X2 recommendation was carried out.**
+> The body below is the analysis as written on 2026-08-13 and is left unedited. Since
+> then, `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` **closed** on exactly the route
+> recommended under *Recommended next step* — "close X2 first, on its own branch",
+> GC-only `EACH_QUORUM` liveness with writers left at `LOCAL_QUORUM`, no generations
+> and no r3. Read every "X2 remains open" / "until X1 and X2 close" statement below as
+> the state of play on its date, and note that the section arguing non-local `QUORUM`
+> is insufficient was confirmed empirically: the three-DC harness turns red under a
+> `QUORUM` destructive read. **X1 is now the sole activation blocker, and
+> `GC_ENABLED=false` still stands on every replica in every DC.** Status of record:
+> [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
+
 **Related:**
 
 - [GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md) — accepted-for-review closure design (r3, not frozen, not implemented)

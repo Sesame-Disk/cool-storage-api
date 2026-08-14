@@ -126,9 +126,12 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-X1 is open with no closed design. X2 closed 2026-08-14 (implemented 2026-08-13), proven on a real three-DC
-cluster. `gc.enabled: false` remains required on every replica in every DC — it now
-rests on X1 alone.
+X1 is open. It has an accepted-for-review closure design — r3 in
+[GC-X1-X2-GENERATION-FENCE-ADR.md](./GC-X1-X2-GENERATION-FENCE-ADR.md) — which is
+**not frozen** and not implemented, so it is not a closed design. X2 closed 2026-08-14
+(implemented 2026-08-13), proven on a real three-DC cluster, and it closed **without**
+r3. `gc.enabled: false` remains required on every replica in every DC — it now rests
+on X1 alone.
 
 **Read X1 as the whole fence-and-physical-identity workstream, not just the stale
 DELETE.** Never-reused physical keys are necessary but not sufficient: a shared
@@ -139,7 +142,7 @@ incarnation is created. Closure criteria are in Registry X1.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) · [accepted ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (accepted-for-review, not frozen) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) |
 | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
 
 ## High / Medium — open (audit follow-ups)

@@ -31,7 +31,7 @@
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
 5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the activation gate now genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
-6. **X1 design record**: the accepted/frozen greenfield protocol is documented in [`docs/GC-X1-X2-GENERATION-FENCE-ADR.md`](docs/GC-X1-X2-GENERATION-FENCE-ADR.md); implementation has not started and `GC_ENABLED=false` remains mandatory.
+6. **X1 design record**: the accepted-for-review greenfield protocol is documented in [`docs/GC-X1-X2-GENERATION-FENCE-ADR.md`](docs/GC-X1-X2-GENERATION-FENCE-ADR.md); **r3 is not frozen** for implementation, implementation has not started, and `GC_ENABLED=false` remains mandatory. Smaller-closure options are compared in [`docs/GC-X1-X2-ALTERNATIVES.md`](docs/GC-X1-X2-ALTERNATIVES.md); X2 closed without r3.
 
 ### Inter-session Update (2026-05-21)
 
@@ -79,7 +79,7 @@
 ### Remaining Follow-up Debt
 
 - Complete Phase-0 measurements and the explicit go/no-go, pin the Cassandra 5.0.9 image/digest, and build the three-DC RF1/RF3 harness; then implement PR-1 through PR-8.
-- Keep `GC_ENABLED=false` on every replica/DC until both X1 and X2 acceptance lists pass.
+- Keep `GC_ENABLED=false` on every replica/DC until the X1 acceptance list passes. X2 closed 2026-08-14 without r3.
 - Close the canonical issues only after code, crash tests, clock/storage gates, and RF1/RF3 multi-DC evidence exist.
 - r3 is still not frozen: correction 191 closed the known freeze blockers from the correction-190 reviews; correction 192 closed the post-CAS takeover classifier on the takeover×CAS matrix. Phase 0 and PR-1…PR-8 remain.
 

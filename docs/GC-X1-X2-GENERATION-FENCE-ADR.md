@@ -6959,7 +6959,8 @@ replication script alone is not sufficient evidence.
 Also verify that:
 
 - every internal link resolves;
-- no document says X1 or X2 is closed;
+- no document says X1 is closed (X2 closed 2026-08-14 on its own evidence, not this
+  ADR's — do not read that closure as progress on X1);
 - `GC_ENABLED=false` remains the operational rule;
 - `LOCAL_SERIAL` is not described as final X2 evidence;
 - the ADR does not describe unimplemented code as current behavior;
