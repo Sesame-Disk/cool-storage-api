@@ -485,6 +485,41 @@ new relative to the withdrawn document:
   `storage_class` and, because it never touches the projection, no `_by_day` row — a
   writer fence that recovery cannot enumerate. With the TTL removed as the TTL package
   proposes, it would never expire either.
+- **R25 — a promote path creates `fs:` without ever staging a checked `pub:`.** The
+  highest-severity item after R17, and the one that **invalidates a conclusion this
+  document previously drew** rather than adding a requirement to it. R3 argued that
+  `RegisterFSObjectBlockReferences` needs no check of its own because promotion only
+  happens inside `PromotePublishAttemptReferences`, after a checked stage — "the gap is
+  one function, not two". The structure is real; the inference is not.
+  `PromotePublishAttemptReferences` never verifies a `pub:` row exists
+  (`block_references.go:519-544`), and sync has a fourth entry into finalize that skips
+  staging: an already-published HEAD goes `handleSyncHeadPromotion` →
+  `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) →
+  `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls
+  `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`). Permanent references are
+  written with no handshake at any point, on the ordinary path of a client retrying an
+  applied HEAD. The other three promote sites stage correctly. Fix shape: re-stage on
+  repair, rather than making `fs:` generation-aware.
+- **R26 — the discovery index needs binding in both directions.** R22 constrains how
+  recovery *reads* `_by_day`; nothing constrained writes to it. `DeleteS3Orphan` deletes
+  the projection by timestamp identity and resolves a zero `firstSeenAt` from whatever
+  canonical row is current (`store_cassandra.go:1766-1788`), so making only the canonical
+  clear conditional still lets a delayed `P1` cleanup erase `P2`'s discoverability.
+  Liveness, not data loss — but permanent once the TTL is removed.
+- **R27 — R18(a) had no mechanism behind it.** "Re-project and retry" cannot work on the
+  current projection: `upsertS3OrphanProjection` always derives `first_seen_day` from the
+  original `firstSeenAt` (`store_cassandra.go:1561-1565`), so a re-projection lands in a
+  day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2`
+  back. Retry scheduling needs a mutable `next_retry_at` separate from the immutable
+  `first_seen_at`. Until it exists, A+'s availability cost under the recommended
+  resolution is not long — it is unbounded.
+- **R28 — the 90-day TTL is not a ceiling on the row.** Cassandra expires each written
+  value independently. `UpdateS3OrphanAttempt` refreshes only its three diagnostic columns
+  and leaves `storage_class`/`first_seen_at`/`recovery_phase` on the original schedule, so
+  a late retry leaves a live primary key with no identity columns and no `_by_day` row —
+  R19's partial orphan, produced by ordinary expiry rather than by an upsert. Both fence
+  reads select only `block_id` (`block_references.go:851,1138`), which such a row still
+  returns, so the writer stays fenced. This is why the TTL package is indivisible.
 - **The fence clear was pointing at dead code.** An earlier revision named
   `DeleteBlockS3Orphan` (`block_references.go:1199`) as the unconditional clear that B.1
   must make conditional. That function has **no caller anywhere in the repo**, tests

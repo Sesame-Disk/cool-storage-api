@@ -304,7 +304,7 @@ daily sweep and would need re-examining at 30-second cadence.
 
 | Option | Physical-delete ABA | Publication TOCTOU | Invasiveness | Verdict |
 |---|---|---|---|---|
-| **A+** — sequential lives plus the complete X1 closure package | Closed | Needs the strong `pub:` post-check | Medium | **Recommended safety baseline; normally recovery-cadence-bound, but conservative R18(a) can keep the fence for attempt-reference TTLs, currently up to 35 days; a continuously failing recovery is capped by today's 90-day orphan TTL** |
+| **A+** — sequential lives plus the complete X1 closure package | Closed | Needs the strong `pub:` post-check **on every promote path** (R25) | Medium | **Recommended safety baseline; normally recovery-cadence-bound, but conservative R18(a) can keep the fence for the attempt-reference TTL plus scheduling delay — and per R27 that retry lifecycle does not exist yet** |
 | **B** — overlapped lives ("d-lite"): fresh key for each new life, next life installs as soon as the metadata row is free | Closed | Needs the strong `pub:` post-check, in a stronger form | Medium-high, still far below r3 | **Post-A+ availability optimization** |
 | **C** — writer references at `EACH_QUORUM` | **Open** | Open | Low | Not an X1 mechanism |
 | **D** — S3 object versioning | Closed only if *every* delete is version-id-specific | Unchanged | Backend + interface | Discussable, not preferred |
@@ -459,17 +459,49 @@ For A+, any `gc_s3_orphans(L)` row remains a logical writer fence: after staging
 `storage_key`, has no destructive or repair claim, and no orphan row exists for `L`.
 The check is stronger than merely asking whether a generic fence was observed earlier.
 
+**The linearization points have to be spelled out, or that sentence reads as an impossible
+requirement.** For a *new* install there is a legitimate instant where `up:` exists and
+`blocks(L)` does not — creating it is what `INSTALL` does. The rule is a verdict on
+publication, not an immediate post-stage assertion, and R17's split of `REPAIR` from
+`INSTALL` makes the distinction load-bearing. The ADR must name three separate shapes:
+
+```text
+NEW INSTALL            EXISTING INCARNATION        pub: STAGING
+  prepare P2             (repair of P1)              canonical already exists
+  write up:                write/keep up:            stage pub:
+  PRE-INSTALL CHECK        check canonical == P1     POST-STAGE CHECK
+    no destructive claim   no claim / no orphan        blocks(L) exists, P usable
+    A+: no orphan(L)       repair exact P1             no destructive/repair claim
+  INSTALL(P2) @ SERIAL     no create-capable call      A+: no orphan(L)
+  POST-INSTALL CHECK       final canonical/fence     ─────────────────────────────
+    blocks(L) exists         validation              publication may succeed
+    canonical P usable
+    no claim, A+: no orphan
+```
+
+This is a specification ambiguity, not a race found in the code: the existing
+write-ref-then-check-fence order already matches the `NEW INSTALL` column
+(`RegisterUploadedBlock` writes `up:`, checks the fence, then calls `UpsertBlockMetadata`).
+What R17 adds is that the pre-install check no longer authorizes a *repair* to create the
+row, and what R3 adds is the post-write half.
+
 **Cost.** The writer is blocked for as long as the orphan row lives. Absent a later
 attempt reference, automatic recovery is normally bounded by the current **approximately
 24-hour scanner cadence** unless scheduling changes; that is an operational choice, not a
 protocol bound. Under conservative R18(a), however, the fence can also outlast any
 attempt reference written after the authorizing read: up to **48 h** for `up:` and up to
-**35 days** for `pub:`. State the availability price as recovery cadence plus the
-surviving attempt-reference TTL, currently up to 35 days, rather than as a flat 24-hour
-bound. If physical recovery itself keeps failing, today's orphan TTL is the outer 90-day
-ceiling; the TTL package below must make that policy explicit before acceptance. A+ can
-close X1 only when the complete package above is implemented and evidenced; never-reused
-keys alone close only the stale physical-delete ABA component.
+**35 days** for `pub:`. State the availability price as **the attempt-reference TTL plus
+recovery scheduling delay** — the fence cannot lift the instant the reference expires, only
+at the next sweep that reaches the row — rather than as a flat 24-hour bound or a flat 35
+days. And note the honest form of that claim today: per **R27** the current projection
+cannot reschedule a deferred orphan into a future day at all, so until that lifecycle
+exists the bound is not long, it is **absent**. Quote it as "up to the attempt-reference
+TTL plus recovery scheduling delay, once the deferred-orphan retry lifecycle of R27 is
+implemented". Nor is the 90-day orphan TTL an outer ceiling on the row: per **R28** it
+expires each value independently and retries extend some of them, which is one more reason
+the TTL package below is indivisible. A+ can close X1 only when the complete package above
+is implemented and evidenced; never-reused keys alone close only the stale physical-delete
+ABA component.
 
 The existing `resolveFence` hook can later become a writer-assisted exact-key recovery
 optimization: attempt bounded recovery of the same `K1`, clear it conditionally only
@@ -660,11 +692,15 @@ than succeeding. The rollback must be scoped to this attempt; if it fails, retur
 error/recovery signal rather than leaving a rejected publication live. The existing
 `pub:` TTL (35 days) is a leak bound, not a substitute for this rollback.
 
-`RegisterFSObjectBlockReferences` needs no check of its own: it runs only inside
-`PromotePublishAttemptReferences` (all three call sites — `seafhttp.go`, `sync.go`,
-`fs_helpers.go`), i.e. after the HEAD CAS and while this attempt's `pub:` rows are still
-live, so `fs:` inherits liveness from a `pub:` row that was itself checked. **The gap is
-one function, not two.**
+`RegisterFSObjectBlockReferences` never checks anything itself: it verifies the
+`fs_object` exists and resolves block ids (`fs_helpers.go:1037-1059`), then writes
+permanent `fs:` rows. It runs only inside `PromotePublishAttemptReferences` — all three
+promote sites (`seafhttp.go:3161`, `sync.go:4070`, `fs_helpers.go:1236`) sit inside a
+stage/promote pair. **That structure is real, but the inference drawn from it is not:
+`PromotePublishAttemptReferences` never verifies that a `pub:` row exists**
+(`block_references.go:519-544` calls `registerPermanent()` and then deletes whatever
+`pub:` rows it finds), so "promote implies a checked stage" holds only for callers that
+actually staged. See **R25** — one production path does not.
 
 Availability note: that post-check reads `blocks` at `LOCAL_QUORUM` while `K2` may have
 been installed by an LWT in another DC. It can miss it and retry. That costs latency, not
@@ -806,15 +842,28 @@ an active canonical incarnation preserve its key.
 | R22 | Recovery destroys bytes using data read from the discovery projection, without re-reading the canonical orphan row | The document says `_by_day` is "a discovery index and never a source of authorization", but the code does not honour that: `RecoverS3Orphans` takes its `S3OrphanInfo` straight from `ListS3OrphansByDay` and then uses those fields — `StorageClass` included — to resolve the backend and issue the delete (`worker.go:1376-1560`), never reloading `gc_s3_orphans`. So a stale or diverged projection row can select the wrong backend for a physical delete. **Required flow: `by_day` → load the canonical orphan → require an exact `P` match → only then destroy.** If the canonical row is missing, or `P_projection ≠ P_canonical`, the sweep may repair or drop the projection entry and must **never** issue a physical DELETE. |
 | R23 | `storage_class` is rebound to a different bucket, account or backend namespace | **`P` is only an eternal physical identity when its backend namespace identity is immutable.** `storage_class` is a logical label resolved through `m.backends[className]` (`internal/storage/storage.go:493`), and bucket/endpoint for a class come from configuration (`internal/config/config.go:3526,3532`). Rebind `hot-s3-na` from bucket A to bucket B and every persisted `P` silently renames the object it addresses — a months-old orphan would then issue an exact DELETE into a namespace it never verified. Define `B` as an immutable backend identity: a storage-class name may serve as `B` only when it is append-only and never rebound or reused for another namespace; otherwise persist an immutable `backend_id` and define `P = (backend_id, storage_key)`. Credentials and endpoints may change as long as they keep naming the same namespace. **Removing the orphan TTL makes this contract permanent rather than 90-day-bounded.** |
 | R24 | An ambiguous install outcome is reused or cleaned before its status is settled | **The same ABA as X1, produced by the writer's own cleanup instead of by GC.** R9 has the losing writer best-effort delete its key; R17 forbids a stale *repair* from installing. Neither covers a stale **install**: `W2` loses the CAS to `W1`, schedules cleanup of `P2`, and that DELETE is slow; later GC removes `P1` and `blocks(L)` goes absent; a lingering retry of `W2` re-runs `INSERT … IF NOT EXISTS` with `P2`, which now applies — and the old cleanup DELETE lands on live bytes. **Rule: a minted `P` is a single-use installation identity.** A failed install whose outcome is known lost makes `P` burned and cleanup-eligible; an ambiguous outcome makes `P` **install-uncertain**: it is non-retryable, cannot be reused for another install, and is not cleanup-authorized until serial settlement proves it is not canonical. Settlement proving applied moves `P` to canonical; settlement proving another locator won moves `P` to burned and permits exact-key cleanup. If settlement cannot be established, `P` stays install-uncertain and the safe result is a possible X3 leak, not deletion. |
+| R25 | A promote path creates permanent `fs:` references without ever having staged a checked `pub:` | **Highest-severity item after R17, and it breaks R3's argument as written.** R3 concludes that `fs:` inherits liveness from a `pub:` row that was itself post-checked, because promotion only happens inside `PromotePublishAttemptReferences`. The structure is real; the inference is not. `PromotePublishAttemptReferences` does **not** require a `pub:` row to exist (`block_references.go:519-544`): it calls `registerPermanent()` and then deletes whatever attempt rows it finds. And sync has a **fourth entry into finalize that skips staging**: `handleSyncHeadPromotion` answers an already-published HEAD with `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) → `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls `finalizeSyncCommitBlockDelta` **directly** (`sync.go:4113`), never `stageSyncCommitBlockDelta`. Finalize then promotes and registers `fs:` with no `pub:` handshake at any point, and `RegisterFSObjectBlockReferences` checks only that the `fs_object` exists. The trigger is ordinary: any client retry of an applied HEAD update. The normal sync path, the auto-merge path (`sync.go:4156`), the SeafHTTP path (`seafhttp.go:3143,3161`) and the v2 path (`fs_helpers.go` stage/promote pair) all stage correctly. **Rule: every path that can promote permanent `fs:` references must first establish the same checked `pub:` handshake.** The small fix that matches this design is to re-stage on repair — rebuild, stage `pub:`, run R3's post-write check, then promote — rather than making `fs:` generation-aware. The alternative, requiring `PromotePublishAttemptReferences` to demand durable proof that this attempt's `pub:` rows were validated, adds state for the same property. |
+| R26 | A stale lifecycle's clear removes another lifecycle's discovery row | **Liveness, not data loss — but under a removed TTL it is permanent.** R22 makes recovery *read* the projection non-authoritatively; nothing yet constrains *writes* to it. `DeleteS3Orphan` clears the canonical row and then deletes the projection by timestamp identity — `first_seen_day`/`bucket`/`first_seen_at`/`org`/`block` (`store_cassandra.go:1783-1788`) — and when the caller passes a zero `firstSeenAt` it *resolves that timestamp from whatever canonical row is current* (`store_cassandra.go:1766-1772`), which may already belong to `P2`. Making only the canonical clear conditional on `P` (B.1) therefore leaves the projection half unbound: a delayed `P1` cleanup can still erase `P2`'s discoverability while `P2`'s canonical orphan correctly keeps fencing the writer. The result is a fence recovery cannot enumerate — R19's failure mode reached by a different route. **Rule: every repair or delete of `_by_day` is scoped to the expected `P`, or `P` becomes part of the projection's identity.** `_by_day` is never authorization, but stale lifecycle work must never remove another lifecycle's recovery discoverability. |
+| R27 | R18(a) says "re-project and retry", but the current projection cannot schedule a retry into the future | **R18(a) is the recommended resolution and is not yet implementable.** `gc_s3_orphans_by_day` is partitioned by `(first_seen_day, bucket)` and clustered on `first_seen_at`, and `upsertS3OrphanProjection` always derives the day from the *original* `firstSeenAt` (`store_cassandra.go:1561-1565`). Re-projecting a deferred orphan therefore rewrites it into the same past day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2` days back (`store_cassandra.go:205`). "Re-project and retry until the attempt TTLs expire" has no mechanism behind it. **Separate the two facts the code currently conflates:** `first_seen_at` is an immutable lifecycle fact; retry scheduling needs a mutable `next_retry_at`, in its own projection or as a distinct clustering dimension. Holding the cursor instead is correct but lets one row block a whole day/partition. Until this exists, A+'s availability bound under R18(a) is not merely long — it is **unbounded**, because nothing automatically returns the orphan to the working set after the `pub:` TTL expires. |
+| R28 | A partial orphan appears with no upsert-after-clear, purely from per-value TTL expiry | **R19's failure mode has a second cause, and it explains why the TTL package is indivisible.** Cassandra applies `default_time_to_live` per written value, and an `UPDATE` rewrites only the values it touches, with a fresh expiry. `UpdateS3OrphanAttempt` writes `last_attempt_at`/`retry_count`/`last_error` and leaves `storage_class`, `first_seen_at` and `recovery_phase` untouched. A retry on day 89 therefore pushes the diagnostic values to day 179 while the identity values still expire on day 90, and the `_by_day` projection — never rewritten — expires with them. Between those dates the row has a live primary key, no `storage_class`, no `first_seen_at` and no discovery entry. Both fence reads select only `block_id` (`block_references.go:851`, `1138`), which a partially expired row still returns, so the writer stays fenced while `GetBlockS3OrphanInfo` reads nulls. **Consequence for the wording elsewhere in this document: the 90-day TTL is not a ceiling on the row.** It bounds each value independently, and retries extend the diagnostic ones. **Consequence for R19:** partial orphan state arises both from an unconditional upsert after a clear *and* from per-value TTL skew, so making non-creating mutations conditional and removing the TTL are both required — neither alone closes it. |
 
-R8, R13 and R15 decide whether Option B is viable. R16, R17, R19, R20, R22, R23, R24, R3,
-R9, R10, R11 and R12 are common closure criteria — R16 and R20 become newly load-bearing
-when claim IDs move from candidate identity to per-attempt UUIDs, and R17 is one of the
-direct same-physical-identity paths that reopens X1; R24 is the corresponding stale-install
-form. **R18 is A+-specific and is the one open question A+ does not inherit from X2 for free.
+R8, R13 and R15 decide whether Option B is viable. R16, R17, R19, R20, R22, R23, R24, R25,
+R26, R28, R3, R9, R10, R11 and R12 are common closure criteria — R16 and R20 become newly
+load-bearing when claim IDs move from candidate identity to per-attempt UUIDs, and R17 is one
+of the direct same-physical-identity paths that reopens X1; R24 is the corresponding
+stale-install form. **R25 is the one that invalidates a conclusion this document previously
+drew** rather than adding a new requirement to it: R3's "the gap is one function, not two"
+was wrong, because one production path promotes without ever staging.
+**R18 is A+-specific and is the one open question A+ does not inherit from X2 for free;
+R27 is what makes its recommended resolution implementable at all.**
 R21 gates B and any R18 resolution that treats the orphan as a durable authorization
 certificate, especially option (c). The conservative A+ option (a) does not depend on that
-inference.**
+inference.
+
+Note the shape of the last three: R26 and R28 both reach R19's failure mode — a fence no
+sweep can enumerate — by routes R19 does not cover (a stale clear of another lifecycle's
+discovery row, and per-value TTL expiry). Treat "partial or undiscoverable orphan" as the
+failure class, not `UpdateS3OrphanAttempt` as the single defect.
 
 **The invariant these add up to.** `P` has a monotonic authority lifecycle, and no
 authority transition ever runs backwards. An install outcome can be uncertain without
@@ -909,6 +958,15 @@ The package is: remove the canonical TTL; remove the `_by_day` projection TTL; r
 the cold-start horizon and cursor semantics; and guarantee discovery of an arbitrarily
 old orphan. Expiry, if kept at all, must raise an alert instead of deleting the row.
 
+**And the TTL is not a 90-day lease on the row — see R28.** Cassandra expires each written
+value independently, so `UpdateS3OrphanAttempt` refreshes only the three diagnostic columns
+it writes and leaves `storage_class`, `first_seen_at` and `recovery_phase` on their
+original schedule. A late retry therefore produces exactly R19's partial orphan by ordinary
+expiry: a live primary key that still fences the writer, with no identity columns and no
+`_by_day` row. That is the reason the four changes are indivisible rather than a list to
+pick from — removing the canonical TTL while leaving the projection TTL, or vice versa,
+manufactures the same undiscoverable fence on purpose.
+
 Note the cursor's current shape is itself part of this: the sweep advances the day cursor
 only when the pass had no `phaseErr` (`worker.go:1602`), and the "still referenced"
 branch deliberately does not set one — so that row falls out of the working set and is
@@ -942,7 +1000,10 @@ A conceptual diff, not an implementation list.
 | `UpdateS3OrphanAttempt` | Plain `UPDATE` with no `IF` (`store_cassandra.go:1742-1759`) — an upsert that can recreate a cleared orphan as a partial row with no `storage_class` and no `_by_day` projection | Condition on the expected `P` and fail when the row is gone (**R19**) |
 | `RecordS3Orphan` | A **second** `INSERT … IF NOT EXISTS` creator of `gc_s3_orphans` (`store_cassandra.go:1618-1630`), exposed in the `GCStore` interface (`store.go:196`) with **no production caller** — tests and the mock only — and a stale doc comment | Remove from the interface, or narrow to `RepairExistingS3Orphan` with `IF EXISTS` and no ability to create. `StartBlockDeleteOrphan` must be the sole creator before any design treats the orphan as an authorization certificate (**R21**) |
 | `RecoverS3Orphans` discovery | Takes `S3OrphanInfo` — `StorageClass` included — straight from `ListS3OrphansByDay` and destroys on it, never reloading the canonical row | `by_day` → load canonical orphan → require exact `P` match → destroy. Mismatch or missing canonical row repairs/drops the index entry and never deletes (**R22**) |
-| `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go:1776`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`) | Condition it on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) |
+| `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go:1776`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`); its projection half deletes by timestamp identity and resolves a zero `firstSeenAt` from whatever canonical row is current | Condition the canonical clear on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) — **and bind the projection clear the same way** (**R26**), or the stale lifecycle still erases the newer one's discoverability |
+| `upsertS3OrphanProjection` | Always derives `first_seen_day` from the original `firstSeenAt` (`store_cassandra.go:1561-1565`), so a re-projection lands in the day the cursor already passed | Give retry scheduling its own mutable fact (`next_retry_at`), separate from the immutable `first_seen_at`; without it R18(a)'s "re-project and retry" has no mechanism (**R27**) |
+| `repairPublishedSyncCommitBlockDelta` | Rebuilds the delta and calls `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`), promoting `fs:` without ever calling `stageSyncCommitBlockDelta` | Re-stage before promoting: rebuild → stage `pub:` → R3 post-check → promote. Every promote path must establish the checked handshake (**R25**) |
+| `PromotePublishAttemptReferences` | Calls `registerPermanent()` and deletes whatever attempt rows exist; never requires a `pub:` row to be present (`block_references.go:519-544`) | Either keep it dumb and fix the callers (preferred, see R25), or require durable proof that this attempt's `pub:` rows were validated |
 | `DeleteBlockS3Orphan` | A **second** unconditional orphan `DELETE` (`internal/db/block_references.go:1199`) with **no caller anywhere in the repo**, not even tests | Delete it. It is R21's destructive twin: an exported way to clear a fence that no protocol step authorizes, in a design about to make the orphan load-bearing |
 | `B` → backend | Today this is the logical `storage_class` resolved through `m.backends[className]` (`internal/storage/storage.go:493`); bucket and endpoint come from config (`internal/config/config.go:3526,3532`) | Define `B` as an immutable namespace identity. `storage_class` is acceptable only under R23's append-only/non-reuse contract; otherwise persist an immutable `backend_id` and define `P = (backend_id, storage_key)` |
 
@@ -959,7 +1020,16 @@ decisions come first.
    updates a canonical row that still names `P1` and **may not create an absent row**;
    only `INSTALL(P2)`, on a key minted in this attempt, may `INSERT … IF NOT EXISTS`.
    Settle this before anything else, because "revalidate before the repair PUT" reads
-   like a fix and is not one.
+   like a fix and is not one. Settle the three linearization shapes with it — the
+   pre-install fence check, the post-install success check, and the post-stage `pub:`
+   check are different observations and the ADR must say so.
+0b. **R25 — every promote path must have staged a checked `pub:`.** Ranked with R17
+   because it is the other place where the design's argument, not just its
+   implementation, is currently untrue: `repairPublishedSyncCommitBlockDelta` promotes
+   permanent `fs:` references without staging, and `PromotePublishAttemptReferences`
+   does not require a `pub:` row to exist. Decide the fix shape — re-stage on repair
+   (small, matches this design) versus durable proof of validation carried into
+   promote (more state) — before R3 is treated as settled.
 1. **A+ claim identity.** Replace the candidate-derived claim with a fresh UUID per
    worker attempt; carry `(P, claimID, claimed_at)` through claim, release, finalize,
    stale takeover and candidate cleanup.
@@ -980,10 +1050,17 @@ decisions come first.
    the refusal branch drops the orphan out of the working set. **Take the conservative
    option (a) for a first closure** — keep the re-check, stop dropping referenced orphans,
    re-project and retry — and treat the availability cost as the price. This is the one
-   A+ question X2's closure does not answer.
-5. **R22 — canonical orphan revalidation.** Recovery must reload the canonical orphan and
-   match `P` exactly before any physical delete; a projection mismatch repairs the index
-   and never destroys.
+   A+ question X2's closure does not answer. **It cannot be accepted without R27**, which
+   supplies the mechanism "re-project and retry" currently lacks.
+4b. **R27 — deferred-orphan retry scheduling.** Separate the immutable `first_seen_at`
+   from a mutable `next_retry_at`, in its own projection or as a distinct clustering
+   dimension. Re-projecting on today's key writes the row back into a day the cursor has
+   already passed, so option (a) has no bound at all until this exists.
+5. **R22 / R26 — the discovery index is bound to `P` in both directions.** Recovery must
+   reload the canonical orphan and match `P` exactly before any physical delete; a
+   projection mismatch repairs the index and never destroys. Symmetrically, every repair
+   or delete *of* the index is scoped to the expected `P`, or a stale lifecycle's clear
+   erases a newer lifecycle's discoverability.
 6. **R23 — immutable backend namespace.** Decide and write down whether a storage-class
    name is contractually append-only, or persist a `backend_id` and redefine `P` on it.
    Removing the orphan TTL makes this contract permanent.
@@ -1000,9 +1077,12 @@ decisions come first.
 9. **R10 — never repair a condemned incarnation.** Revalidate the exact canonical key,
    claim state and orphan state immediately before repair PUT. Necessary but not
    sufficient on its own — see R17.
-10. **R19 — orphan mutation resurrection.** After `P` exists, `StartBlockDeleteOrphan` is
-   the only mutation permitted to create orphan state; every update/phase/clear is
-   conditional on the expected `P` and fails when the row is gone.
+10. **R19 / R28 — partial and undiscoverable orphans.** After `P` exists,
+   `StartBlockDeleteOrphan` is the only mutation permitted to create orphan state, and
+   every update/phase/clear is conditional on the expected `P` and fails when the row is
+   gone. Treat the failure class, not the single statement: per-value TTL expiry produces
+   the same partial orphan with no upsert involved, so the conditional mutations and the
+   TTL removal are both required.
 11. **R12 — one serial domain**, across eleven `blocks` statements and the
    `gc_s3_orphans` partition; use `SERIAL` for the serial phase and `EACH_QUORUM` as the
    default regular visibility level for the global fence.
