@@ -36,6 +36,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/aws/smithy-go"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
@@ -46,7 +47,22 @@ var ErrHeadConflict = fmt.Errorf("HEAD was modified concurrently")
 
 var errSyncHeadAutoMergeConflict = errors.New("sync head auto-merge conflict")
 var errSyncHeadRepairPending = errors.New("sync head publish pending background repair")
+var errSyncHeadCASUncertain = errors.New("sync head CAS outcome uncertain")
+var errSyncHeadPostCAS = errors.New("sync head post-CAS repair pending")
 var errSeafileBlockIDsUnavailable = errors.New("seafile sha1 block ids unavailable")
+
+type syncHeadConflictError struct {
+	expectedHead string
+	currentHead  string
+}
+
+func (e *syncHeadConflictError) Error() string {
+	return fmt.Sprintf("%s: expected %s but found %s", ErrHeadConflict, e.expectedHead, e.currentHead)
+}
+
+func (e *syncHeadConflictError) Unwrap() error {
+	return ErrHeadConflict
+}
 
 // SyncTokenCreator interface for creating sync tokens
 type SyncTokenCreator interface {
@@ -421,10 +437,13 @@ var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderW
 // The publication handshake seams. SeafHTTP already routes its stage/promote
 // pair through equivalent vars (stageSeafHTTPPublishAttemptReferencesFn,
 // promoteSeafHTTPPublishAttemptReferencesFn); sync did not, which is why no test
-// could observe that one of its entry points promotes without staging (R25 in
-// docs/GC-X1-CLOSURE-OPTIONS.md). Production wiring is unchanged.
+// could observe that one of its entry points promotes without establishing the
+// handshake (R25 in docs/GC-X1-CLOSURE-OPTIONS.md). The normal stage/promote
+// targets remain unchanged; published-head repair uses the same stage seam with
+// its own attempt ID.
 var stageSyncPublishAttemptReferencesFn = db.StagePublishAttemptReferences
 var promoteSyncPublishAttemptReferencesFn = db.PromotePublishAttemptReferences
+var newSyncPublishAttemptIDFn = uuid.NewString
 
 // buildSyncCommitBlockDeltaFn lets a test supply the delta without a DB session,
 // so the handshake property can be asserted over the real control flow of each
@@ -444,6 +463,7 @@ var resolveSyncBlockIDsFn = func(h *SyncHandler, orgID, repoID string, blockIDs 
 var syncGetBlockIDMappingFn = func(ctx context.Context, database *db.DB, orgID, representationID, externalID string) (string, bool, error) {
 	return database.GetBlockIDMappingContext(ctx, orgID, representationID, externalID)
 }
+
 // syncTouchBlockLastAccessFn runs inside the D5 admission slot, so it takes the
 // caller's context: without it a Cassandra stall would hold the slot for the
 // gocql driver timeout rather than the configured preparation deadline. The
@@ -3425,15 +3445,15 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 		IF head_commit_id = ?
 	`, commitID, now, totalSize, fileCount, orgID, repoID, expectedHead).MapScanCAS(casState)
 	if err != nil {
-		return fmt.Errorf("conditional head update failed: %w", err)
+		return fmt.Errorf("%w: conditional head update failed: %w", errSyncHeadCASUncertain, err)
 	}
 	if !applied {
 		currentHead, _ := casState["head_commit_id"].(string)
-		return fmt.Errorf("%w: expected %s but found %s", ErrHeadConflict, expectedHead, currentHead)
+		return &syncHeadConflictError{expectedHead: expectedHead, currentHead: currentHead}
 	}
 
 	if err := h.applySyncHeadPostCASMutations(orgID, repoID, userID, commitID, now, totalSize, fileCount, totalSize-previousSize, fileCount-previousFileCount); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errSyncHeadPostCAS, err)
 	}
 
 	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
@@ -3821,6 +3841,7 @@ type syncCommitBlockDelta struct {
 	addedFiles            []syncCommitFileReference
 	removedFiles          []syncCommitFileReference
 	resolvedAddedBlockIDs []string
+	publishAttemptID      string // fresh pub: identity; never the target commit ID
 }
 
 func (d syncCommitBlockDelta) addedBlockIDs() []string {
@@ -4059,7 +4080,11 @@ func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID st
 	if err != nil {
 		return syncCommitBlockDelta{}, err
 	}
-	resolved, err := stageSyncPublishAttemptReferencesFn(h.db, orgID, repoID, targetCommitID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
+	delta.publishAttemptID = strings.TrimSpace(newSyncPublishAttemptIDFn())
+	if delta.publishAttemptID == "" {
+		return syncCommitBlockDelta{}, fmt.Errorf("create publish attempt ID for sync commit %s: empty ID", targetCommitID)
+	}
+	resolved, err := stageSyncPublishAttemptReferencesFn(h.db, orgID, repoID, delta.publishAttemptID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
 		return resolveSyncBlockIDsFn(h, orgID, repoID, blockIDs)
 	})
 	if err != nil {
@@ -4077,6 +4102,9 @@ func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, remov
 }
 
 func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID string, delta syncCommitBlockDelta) error {
+	if strings.TrimSpace(delta.publishAttemptID) == "" {
+		return fmt.Errorf("finalize sync commit %s: missing publication attempt ID", targetCommitID)
+	}
 	if len(delta.resolvedAddedBlockIDs) == 0 && len(delta.addedFiles) > 0 {
 		resolved, err := resolveSyncBlockIDsFn(h, orgID, repoID, delta.addedBlockIDs())
 		if err != nil {
@@ -4086,7 +4114,7 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 	}
 
 	fsHelper := v2.NewFSHelper(h.db)
-	if err := promoteSyncPublishAttemptReferencesFn(h.db, orgID, targetCommitID, delta.resolvedAddedBlockIDs, func() error {
+	if err := promoteSyncPublishAttemptReferencesFn(h.db, orgID, delta.publishAttemptID, delta.resolvedAddedBlockIDs, func() error {
 		for _, file := range delta.addedFiles {
 			if err := fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, file.fsID, file.blockIDs); err != nil {
 				return err
@@ -4112,6 +4140,30 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 // part, so skipping it spares every idempotent retry once finalize has succeeded
 // here. A miss (cold process, another instance, evicted entry) safely falls back
 // to the full reconciliation, which is idempotent.
+//
+// It STAGES pub: references before it finalizes, exactly like a first publish,
+// using a fresh attempt ID so a partial rollback can only remove this repair's
+// own rows. This used to build the delta and go straight to finalize, which made
+// it the one production path that wrote permanent fs: references without ever
+// holding this attempt's pub: rows — and PromotePublishAttemptReferences does not
+// require them to exist, so it failed silently rather than erroring. Every
+// publication safety check the X1 work adds (R3's post-write validation of the
+// canonical incarnation) hangs off this handshake, so a path that skips it is a
+// path those checks cannot see.
+// Filed as R25 in docs/GC-X1-CLOSURE-OPTIONS.md.
+//
+// This closes R25 only. It does not add the publication fence check itself —
+// R3's post-stage validation of the canonical incarnation does not exist on any
+// path yet. What it buys is that the check, once written, applies here too
+// instead of being bypassed. R3 and X1 stay open.
+//
+// The extra cost is one staged pub: reference per added block, on a retry that
+// already committed to the full-tree reconciliation. Today that is one statement
+// each: addPublishAttemptReferencesRows writes them in a loop rather than a
+// batch (internal/db/block_references.go:460-473). Stated as an implementation
+// cost on purpose — if that loop ever becomes a batch, this comment is what
+// stops the figure being quoted as a protocol-level per-block round trip. The
+// memo above still absorbs the common warm case before either step runs.
 func (h *SyncHandler) repairPublishedSyncCommitBlockDelta(orgID, repoID, targetCommitID string) error {
 	if h == nil {
 		return nil
@@ -4125,7 +4177,7 @@ func (h *SyncHandler) repairPublishedSyncCommitBlockDelta(orgID, repoID, targetC
 	if h.db == nil {
 		return nil
 	}
-	delta, err := buildSyncCommitBlockDeltaFn(h, repoID, targetCommitID)
+	delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, targetCommitID)
 	if err != nil {
 		return err
 	}
@@ -4181,20 +4233,31 @@ func (h *SyncHandler) tryAutoMergeSyncHeadPromotion(c *gin.Context, orgID, userI
 		if !cleanupStaged {
 			return
 		}
-		if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, mergedCommitID, delta.resolvedAddedBlockIDs); cleanupErr != nil {
+		if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, delta.publishAttemptID, delta.resolvedAddedBlockIDs); cleanupErr != nil {
 			log.Printf("%s: failed to cleanup staged refs for auto-merged commit %s in repo %s: %v", operation, mergedCommitID, repoID, cleanupErr)
 		}
 	}()
 
 	if err := h.updateLibraryHeadWithStats(orgID, repoID, mergedCommitID, userID, currentHead); err != nil {
-		if errors.Is(err, errSyncHeadRepairPending) {
+		if errors.Is(err, errSyncHeadRepairPending) || errors.Is(err, errSyncHeadPostCAS) {
 			cleanupStaged = false
 			if finalizeErr := h.finalizeSyncCommitBlockDelta(orgID, repoID, mergedCommitID, delta); finalizeErr != nil {
 				return false, fmt.Errorf("finalize auto-merged sync commit %s after publish: %w", mergedCommitID, finalizeErr)
 			}
 			go h.updateFullPaths(repoID, mergedRootFSID)
 			c.Header("Retry-After", "1")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+			if errors.Is(err, errSyncHeadRepairPending) {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+			} else {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
+			}
+			return true, nil
+		}
+		if errors.Is(err, errSyncHeadCASUncertain) {
+			cleanupStaged = false
+			log.Printf("%s: auto-merge CAS outcome is uncertain for repo %s targeting %s; retaining publication refs for retry: %v", operation, repoID, mergedCommitID, err)
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish outcome uncertain; retry"})
 			return true, nil
 		}
 		return false, err
@@ -4308,14 +4371,14 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			if !cleanupStaged {
 				return
 			}
-			if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, targetHead, delta.resolvedAddedBlockIDs); cleanupErr != nil {
+			if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, delta.publishAttemptID, delta.resolvedAddedBlockIDs); cleanupErr != nil {
 				log.Printf("%s: failed to cleanup staged refs for repo %s head %s: %v", operation, repoID, targetHead, cleanupErr)
 			}
 		}
 
 		if err := h.updateLibraryHeadWithStats(orgID, repoID, targetHead, userID, currentHead); err != nil {
 			if !errors.Is(err, ErrHeadConflict) {
-				if errors.Is(err, errSyncHeadRepairPending) {
+				if errors.Is(err, errSyncHeadRepairPending) || errors.Is(err, errSyncHeadPostCAS) {
 					cleanupStaged = false
 					if finalizeErr := h.finalizeSyncCommitBlockDelta(orgID, repoID, targetHead, delta); finalizeErr != nil {
 						log.Printf("%s: published repo %s head to %s but block-reference reconciliation failed: %v", operation, repoID, targetHead, finalizeErr)
@@ -4326,12 +4389,27 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 						c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block-reference reconciliation pending; retry"})
 						return
 					}
-					log.Printf("%s: published repo %s head to %s but aggregate storage reconciliation is still pending: %v", operation, repoID, targetHead, err)
+					if errors.Is(err, errSyncHeadRepairPending) {
+						log.Printf("%s: published repo %s head to %s but aggregate storage reconciliation is still pending: %v", operation, repoID, targetHead, err)
+					} else {
+						log.Printf("%s: published repo %s head to %s but derived-state reconciliation is still pending: %v", operation, repoID, targetHead, err)
+					}
 					if rootFSID != "" {
 						go h.updateFullPaths(repoID, rootFSID)
 					}
 					c.Header("Retry-After", "1")
-					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+					if errors.Is(err, errSyncHeadRepairPending) {
+						c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+					} else {
+						c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
+					}
+					return
+				}
+				if errors.Is(err, errSyncHeadCASUncertain) {
+					cleanupStaged = false
+					log.Printf("%s: CAS outcome is uncertain for repo %s targeting %s; retaining publication refs for retry: %v", operation, repoID, targetHead, err)
+					c.Header("Retry-After", "1")
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish outcome uncertain; retry"})
 					return
 				}
 				cleanupAttempt()
@@ -4340,6 +4418,14 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 				return
 			}
 
+			var conflictErr *syncHeadConflictError
+			if errors.As(err, &conflictErr) && conflictErr.currentHead == targetHead {
+				// This request lost to another publisher of the same target. Its
+				// publication attempt ID is unique, so cleanup cannot touch the winner.
+				cleanupAttempt()
+				h.handleSyncHeadIdempotentSuccess(c, orgID, repoID, targetHead, operation)
+				return
+			}
 			cleanupAttempt()
 			log.Printf("%s: CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
 			if attempt == maxAttempts-1 {

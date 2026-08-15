@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -14,16 +15,16 @@ import (
 // pub: rows and (once R3 lands) had them post-checked against the canonical
 // incarnation. Every future publication safety check hangs off that handshake.
 //
-// The structure is real but the inference is not: PromotePublishAttemptReferences
-// never verifies that a pub: row exists, and sync's idempotent-retry path reaches
-// finalize without ever staging one. A check added to staging is therefore
-// unreachable from that path, which is what makes this a design defect rather
-// than a missing validation.
+// The historical defect was that PromotePublishAttemptReferences never verifies
+// that a pub: row exists, while sync's idempotent-retry path reached finalize
+// without staging one. A check added to staging was therefore unreachable from
+// that path. The production fix now establishes pub: first; this test keeps the
+// handshake and its ordering executable.
 //
 // WHAT THESE TESTS DO AND DO NOT PROVE
 // -------------------------------------
-// TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing drives the real
-// entry point and is the reproduction of R25. It is RED today.
+// TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing drives the real
+// entry point and is the executable R25 gate. It must stay green after the fix.
 //
 // TestStagedPublicationShapeSatisfiesTheHandshake pins the intended stage→finalize
 // shape. It is NOT control-flow coverage of the normal and auto-merge production
@@ -38,8 +39,8 @@ import (
 // The safety consequence — a fenced block must not gain a permanent reference —
 // belongs to the integration leg, which cannot go green until R3's post-check
 // exists on any path at all, so it gates X1 closure rather than one PR. The
-// handshake gates the R25 fix on its own: it goes green as soon as the repair
-// path re-stages, with no protocol decision required.
+// handshake gates the R25 fix on its own: it is green as soon as the repair
+// path re-establishes pub:, with no protocol decision required.
 
 const (
 	handshakeOrgID    = "00000000-0000-0000-0000-000000000001"
@@ -55,6 +56,12 @@ const (
 type handshakeRecord struct {
 	staged   map[string][]string
 	promoted map[string][]string
+	events   []handshakeEvent
+}
+
+type handshakeEvent struct {
+	attemptID string
+	phase     string
 }
 
 // installHandshakeSeams swaps in recording seams for the publication primitives
@@ -68,37 +75,44 @@ func installHandshakeSeams(t *testing.T) *handshakeRecord {
 
 	origStage := stageSyncPublishAttemptReferencesFn
 	origPromote := promoteSyncPublishAttemptReferencesFn
+	origAttemptID := newSyncPublishAttemptIDFn
 	origBuild := buildSyncCommitBlockDeltaFn
 	origResolve := resolveSyncBlockIDsFn
 	t.Cleanup(func() {
 		stageSyncPublishAttemptReferencesFn = origStage
 		promoteSyncPublishAttemptReferencesFn = origPromote
+		newSyncPublishAttemptIDFn = origAttemptID
 		buildSyncCommitBlockDeltaFn = origBuild
 		resolveSyncBlockIDsFn = origResolve
 	})
 
-	stageSyncPublishAttemptReferencesFn = func(_ *db.DB, _, _, attemptID string, blockIDs []string, resolve db.BlockIDResolver) ([]string, error) {
-		resolved := blockIDs
-		if resolve != nil {
-			var err error
-			if resolved, err = resolve(blockIDs); err != nil {
-				return nil, err
+	recordPublishAttempt := func(phase string) func(*db.DB, string, string, string, []string, db.BlockIDResolver) ([]string, error) {
+		return func(_ *db.DB, _, _, attemptID string, blockIDs []string, resolve db.BlockIDResolver) ([]string, error) {
+			resolved := blockIDs
+			if resolve != nil {
+				var err error
+				if resolved, err = resolve(blockIDs); err != nil {
+					return nil, err
+				}
 			}
+			rec.staged[attemptID] = append(rec.staged[attemptID], resolved...)
+			rec.events = append(rec.events, handshakeEvent{attemptID: attemptID, phase: phase})
+			return resolved, nil
 		}
-		rec.staged[attemptID] = append(rec.staged[attemptID], resolved...)
-		return resolved, nil
 	}
+	stageSyncPublishAttemptReferencesFn = recordPublishAttempt("stage")
 	promoteSyncPublishAttemptReferencesFn = func(_ *db.DB, _, attemptID string, blockIDs []string, registerPermanent func() error) error {
 		// Deliberately NOT calling registerPermanent: this leg is about the
 		// handshake, and invoking it would drag in a real FSHelper. Note that the
 		// production implementation calls it without checking that any pub: row
 		// for attemptID exists — which is half of the defect.
+		rec.events = append(rec.events, handshakeEvent{attemptID: attemptID, phase: "promote"})
 		rec.promoted[attemptID] = append(rec.promoted[attemptID], blockIDs...)
 		return nil
 	}
 	// The delta every path publishes: one file carrying two blocks.
-	// resolvedAddedBlockIDs is left empty on purpose so finalize behaves exactly
-	// as it does for a caller that did not stage — including its own resolve.
+	// resolvedAddedBlockIDs is left empty on purpose so the stage seam must
+	// supply the resolved IDs before finalize.
 	buildSyncCommitBlockDeltaFn = func(_ *SyncHandler, _, _ string) (syncCommitBlockDelta, error) {
 		return syncCommitBlockDelta{
 			addedFiles: []syncCommitFileReference{{
@@ -107,9 +121,8 @@ func installHandshakeSeams(t *testing.T) *handshakeRecord {
 			}},
 		}, nil
 	}
-	// Resolution would need a DB, and finalize resolves when the delta arrives
-	// unresolved — exactly the repair path's shape. Identity keeps the difference
-	// under test on the handshake.
+	// Resolution would need a DB in production. Identity keeps the difference under
+	// test on the handshake while the stage seam supplies the resolved IDs.
 	resolveSyncBlockIDsFn = func(_ *SyncHandler, _, _ string, blockIDs []string) ([]string, error) {
 		return db.NormalizeBlockIDs(blockIDs), nil
 	}
@@ -125,10 +138,21 @@ func newHandshakeHandler() *SyncHandler {
 	}
 }
 
-// assertPromotedOnlyWhatItStaged fails when any attempt promoted blocks without
-// having staged a pub: for that same attempt.
+// assertPromotedOnlyWhatItStaged fails when any attempt promotes before staging
+// or promotes blocks that were not staged for that same attempt.
 func (rec *handshakeRecord) assertPromotedOnlyWhatItStaged(t *testing.T) {
 	t.Helper()
+	stagedAt := make(map[string]bool)
+	for _, event := range rec.events {
+		switch event.phase {
+		case "stage":
+			stagedAt[event.attemptID] = true
+		case "promote":
+			if !stagedAt[event.attemptID] {
+				t.Fatalf("promoted before staging pub: for attempt %s", event.attemptID)
+			}
+		}
+	}
 	for attemptID, promoted := range rec.promoted {
 		staged := rec.staged[attemptID]
 		if len(staged) == 0 {
@@ -149,20 +173,17 @@ func (rec *handshakeRecord) assertPromotedOnlyWhatItStaged(t *testing.T) {
 	}
 }
 
-// TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing is the R25
+// TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing is the R25
 // reproduction. It drives the real production entry point:
 // handleSyncHeadPromotion answers currentHead == targetHead with
-// handleSyncHeadIdempotentSuccess (sync.go:4221-4224), which calls exactly this
-// helper, which rebuilds the delta and goes straight to finalize.
+// handleSyncHeadIdempotentSuccess, which calls exactly this helper. The helper
+// must rebuild the delta, establish pub:, and then finalize.
 //
-// EXPECTED RESULT TODAY: RED.
+// EXPECTED RESULT AFTER THE R25 FIX: GREEN.
 //
-//	--- FAIL: TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing
-//	    promoted 2 block(s) for attempt head-r25 with no pub: staged for it
-//
-// Routing this helper through stageSyncCommitBlockDelta turns it green. If it
-// goes green without that change, suspect the seams before believing the result.
-func TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing(t *testing.T) {
+// Routing this helper directly to finalize must turn it red. If it goes green
+// without staging, suspect the seams before believing the result.
+func TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing(t *testing.T) {
 	rec := installHandshakeSeams(t)
 	h := newHandshakeHandler()
 
@@ -175,9 +196,58 @@ func TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing(t *testing.T)
 	rec.assertPromotedOnlyWhatItStaged(t)
 }
 
+func TestPublishedSyncRepairPartialStageFailureDoesNotFinalize(t *testing.T) {
+	rec := installHandshakeSeams(t)
+	wantErr := errors.New("stage boom")
+	stageSyncPublishAttemptReferencesFn = func(_ *db.DB, _, _, attemptID string, blockIDs []string, _ db.BlockIDResolver) ([]string, error) {
+		if len(blockIDs) != 2 {
+			t.Fatalf("blockIDs = %#v, want two blocks", blockIDs)
+		}
+		// Model a successful stage for the first block followed by an error for
+		// the next one. The DB-level stage test verifies its rollback is scoped
+		// to this fresh attempt ID.
+		rec.staged[attemptID] = append(rec.staged[attemptID], blockIDs[0])
+		rec.events = append(rec.events, handshakeEvent{attemptID: attemptID, phase: "stage"})
+		return nil, wantErr
+	}
+
+	if err := newHandshakeHandler().repairPublishedSyncCommitBlockDelta(handshakeOrgID, handshakeRepoID, handshakeHeadID); !errors.Is(err, wantErr) {
+		t.Fatalf("repair error = %v, want %v", err, wantErr)
+	}
+	if len(rec.promoted) != 0 {
+		t.Fatalf("repair promoted %d attempt(s) after ensure failed", len(rec.promoted))
+	}
+}
+
+func TestSyncPublicationAttemptsUseDistinctIDsForTheSameTarget(t *testing.T) {
+	installHandshakeSeams(t)
+	ids := []string{"attempt-a", "attempt-b"}
+	newSyncPublishAttemptIDFn = func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	}
+	h := newHandshakeHandler()
+
+	first, err := h.stageSyncCommitBlockDelta(handshakeOrgID, handshakeRepoID, handshakeHeadID)
+	if err != nil {
+		t.Fatalf("first stage returned error: %v", err)
+	}
+	second, err := h.stageSyncCommitBlockDelta(handshakeOrgID, handshakeRepoID, handshakeHeadID)
+	if err != nil {
+		t.Fatalf("second stage returned error: %v", err)
+	}
+	if first.publishAttemptID == second.publishAttemptID {
+		t.Fatalf("same target reused publication attempt ID %q", first.publishAttemptID)
+	}
+	if first.publishAttemptID == handshakeHeadID || second.publishAttemptID == handshakeHeadID {
+		t.Fatalf("target commit ID was used as publication attempt ID: %q/%q", first.publishAttemptID, second.publishAttemptID)
+	}
+}
+
 // TestRepairSkipsEverythingOnceThisProcessFinalized guards the fix's shape rather
 // than the defect: repairPublishedSyncCommitBlockDelta consults a per-process memo
-// first (sync.go:141,158-194), and a fix that simply always re-stages must not
+// first (sync.go:141,158-194), and a fix that simply always re-ensures must not
 // quietly make every idempotent retry pay the full reconciliation. A path that
 // promotes nothing satisfies the handshake trivially.
 //
