@@ -408,14 +408,73 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ---
 
+## 2026-08-15 - R25 fixed structurally: the idempotent sync repair establishes the publication handshake
+
+`repairPublishedSyncCommitBlockDelta` previously built the block delta and went straight
+to `finalizeSyncCommitBlockDelta`, making it the one production path that wrote permanent
+`fs:` references without establishing this attempt's `pub:` rows. It now stages first with
+a fresh attempt ID, exactly like a first publish (`internal/api/sync.go`).
+
+- **Why it mattered.** R3 concluded that `RegisterFSObjectBlockReferences` needs no fence
+  check of its own because permanent references are written only inside
+  `PromotePublishAttemptReferences`, after a checked publication handshake. The promote
+  structure is real; the inference was false for this path, and it failed **silently** —
+  promote calls `registerPermanent()` and then deletes whatever attempt rows it finds,
+  never verifying that any exist (`internal/db/block_references.go — PromotePublishAttemptReferences`). Every publication safety
+  check X1 adds hangs off the handshake, so a path that skips it is a path those checks
+  cannot see.
+- **Repair failure semantics.** Both pre-CAS publication and post-publication repair use
+  `StagePublishAttemptReferences`. A fresh attempt ID means a partial rollback can remove
+  only the current call's rows; it cannot retract another publisher's liveness. A complete
+  stage followed by a lost process still leaves that attempt's `pub:` rows until TTL, which
+  is recorded as R30/R31 below. `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`
+  and the DB stage rollback tests pin this distinction.
+- **Reachability**, narrower than "any retry" and still ordinary: `finalizedBlockDeltas`
+  is a per-process two-generation memo with 4096 entries per generation (up to 8192
+  retained pairs), marked only after a successful finalize, so a warm same-instance retry
+  short-circuits. The repair is reached when the retry lands on another instance, when
+  the original finalize failed, after a restart, or after eviction.
+- **Cost.** One staged `pub:` reference per added block on a retry that already committed
+  to the full-tree reconciliation; today one statement each, since
+  `addPublishAttemptReferencesRows` loops rather than batching
+  (`block_references.go:460-473`). `TestRepairSkipsEverythingOnceThisProcessFinalized` pins
+  that the memo still absorbs the warm case, so this fix cannot quietly make every
+  idempotent retry pay for the walk.
+- **Evidence.** `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` was verified
+  **red** before the fix and is now **green**; reverting the helper to build-then-finalize
+  reproduces the original red result.
+- **Scope.** This closes **R25 structurally only**. R3's post-stage validation of the
+  canonical incarnation still does not exist on any path, so the publication TOCTOU is
+  open exactly as before: between `stage pub:` and `finalize`, GC can still claim
+  and authorize. **R25 fixed, R3 open, X1 open**, `GC_ENABLED=false` unchanged. A structural
+  fix is not evidence toward closing X1.
+- **R29 remains open as a separate ownership criterion.** Before this follow-up, sync used
+  the commit ID as the publication-attempt identity, so concurrent same-target requests
+  could retract each other's `pub:` rows. The implementation now gives each sync delta a
+  fresh attempt ID; that identity shape is unit-tested, while CAS/post-CAS retention and
+  concurrent Cassandra cleanup remain integration evidence.
+- **R30 is a per-attempt retention consequence.** A repair uses a fresh UUID and therefore
+  cannot retire the original crashed publisher's UUID ref; after successful `fs:` repair,
+  that old `pub:` row can remain a liveness pin until its 35-day TTL expires. A complete
+  repair stage followed by another crash/finalize failure can leave the same shape for the
+  repair UUID, and repeated failed repairs can extend aggregate retention. This is not data
+  loss, but it is not evidence that temporary publication state was fully retired.
+- **R31 is the publication-safety blocker.** A CAS that may have applied, or a successful
+  CAS whose block-reference finalize failed, can leave a visible HEAD protected only by a
+  TTL-bound `pub:` row. Sync has no durable background repair independent of a later client
+  request, so X1 cannot close until a durable reconciliation path exists.
+
+---
+
 ## 2026-08-14 - X1: r3 generational fence abandoned; closure options documented; prod `GC_ENABLED=false` pinned
 
-No production behaviour changed, and no X1 safety fix landed. `internal/api/sync.go`
+No X1 runtime safety protocol changed, and no X1 safety fix landed. `internal/api/sync.go`
 gained four test seams for the R25 executable reproduction — `stageSyncPublishAttempt-
 ReferencesFn`, `promoteSyncPublishAttemptReferencesFn`, `buildSyncCommitBlockDeltaFn`,
 `resolveSyncBlockIDsFn` — and the production targets of those seams are the existing
-functions, so the compiled call graph is equivalent. Documentation and deployment
-configuration also changed. X1 stays open, no design is accepted, and `GC_ENABLED=false`
+functions, so the compiled call graph is equivalent. Deployment safety configuration did
+change: `GC_ENABLED=false` was pinned in production configuration and Cassandra image
+settings were made explicit. X1 stays open, no design is accepted, and `GC_ENABLED=false`
 remains mandatory on every replica in every DC.
 
 **The r3 generational-fence ADR is abandoned.** PR #166 closed unmerged; the branch
@@ -492,32 +551,31 @@ new relative to the withdrawn document:
   `storage_class` and, because it never touches the projection, no `_by_day` row — a
   writer fence that recovery cannot enumerate. With the TTL removed as the TTL package
   proposes, it would never expire either.
-- **R25 — a promote path creates `fs:` without ever staging a checked `pub:`.** The
-  highest-severity item after R17, and the one that **invalidates a conclusion this
+- **R25 — a promote path created `fs:` without ever staging a checked `pub:`.** The
+  highest-severity item after R17, and the one that **invalidated a conclusion this
   document previously drew** rather than adding a requirement to it. R3 argued that
   `RegisterFSObjectBlockReferences` needs no check of its own because promotion only
   happens inside `PromotePublishAttemptReferences`, after a checked stage — "the gap is
-  one function, not two". The structure is real; the inference is not.
+  one function, not two". The structure was real; the inference was not.
   `PromotePublishAttemptReferences` never verifies a `pub:` row exists
-  (`block_references.go:519-544`), and sync has a fourth entry into finalize that skips
-  staging: an already-published HEAD goes `handleSyncHeadPromotion` →
-  `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) →
-  `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls
-  `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`). Permanent references are
-  written with no handshake at any point. Reachability is narrower than "any retry" and
-  still ordinary: `finalizedBlockDeltas` is a per-process memo marked only after a
-  successful finalize, so a warm same-instance retry short-circuits, but a retry landing
-  on another instance, a retry after the original finalize failed — the case the repair
-  exists to heal — a process restart or an eviction all reach it. The other three promote
-  sites stage correctly. Fix shape: re-stage on repair, rather than making `fs:`
-  generation-aware. **Now executable:**
-  `TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing`
-  (`internal/api/sync_publish_handshake_test.go`) drives the real helper and is red; the
-  candidate one-line fix turns it green, which is the mutation that makes the red mean
-  something. The companion tests pin the primitive's behaviour and the intended
-  `stage → finalize` shape — they are explicitly **not** control-flow coverage of the
-  normal and auto-merge branches, which need a DB session and belong to the integration
-  leg.
+  (`internal/db/block_references.go — PromotePublishAttemptReferences`), and before the R25 fix sync had a fourth entry into
+  finalize that skipped staging: an already-published HEAD went
+  `handleSyncHeadPromotion` → `handleSyncHeadIdempotentSuccess` →
+  `repairPublishedSyncCommitBlockDelta`, which rebuilt the delta and called
+  `finalizeSyncCommitBlockDelta` directly. Permanent references were written with no
+  handshake at that point. Reachability was narrower than "any retry" and still ordinary:
+  `finalizedBlockDeltas` was a per-process memo marked only after a successful finalize,
+  so a warm same-instance retry short-circuited, but a retry landing on another instance,
+  a retry after the original finalize failed, a process restart or an eviction reached it.
+  The other three promote sites already staged correctly. The fix establishes `pub:` on
+  repair with a fresh attempt ID, rather than making `fs:` generation-aware. **Now executable:**
+  `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` and
+  `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`
+  (`internal/api/sync_publish_handshake_test.go`) drive the real helper; the pre-fix
+  reproducer was verified red and the fixed path is green. The companion tests pin the
+  primitive's behaviour and the intended stage → finalize shape — they are
+  explicitly **not** control-flow coverage of the normal and auto-merge branches, which
+  need a DB session and belong to the integration leg.
 - **R26 — the discovery index needs binding in both directions.** R22 constrains how
   recovery *reads* `_by_day`; nothing constrained writes to it. `DeleteS3Orphan` deletes
   the projection by timestamp identity and resolves a zero `firstSeenAt` from whatever

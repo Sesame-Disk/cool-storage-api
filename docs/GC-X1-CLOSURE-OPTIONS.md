@@ -698,12 +698,13 @@ error/recovery signal rather than leaving a rejected publication live. The exist
 `RegisterFSObjectBlockReferences` never checks anything itself: it verifies the
 `fs_object` exists and resolves block ids (`fs_helpers.go:1037-1059`), then writes
 permanent `fs:` rows. It runs only inside `PromotePublishAttemptReferences` — all three
-promote sites (`seafhttp.go:3161`, `sync.go:4070`, `fs_helpers.go:1236`) sit inside a
+promote sites (`seafhttp.go:3161`, `sync.go — finalizeSyncCommitBlockDelta`, `fs_helpers.go:1236`) sit inside a
 stage/promote pair. **That structure is real, but the inference drawn from it is not:
 `PromotePublishAttemptReferences` never verifies that a `pub:` row exists**
-(`block_references.go:519-544` calls `registerPermanent()` and then deletes whatever
+(`internal/db/block_references.go — PromotePublishAttemptReferences` calls `registerPermanent()` and then deletes whatever
 `pub:` rows it finds), so "promote implies a checked stage" holds only for callers that
-actually staged. See **R25** — one production path does not.
+actually establish the handshake. See **R25**, which recorded the one production path that
+did not.
 
 Availability note: that post-check reads `blocks` at `LOCAL_QUORUM` while `K2` may have
 been installed by an LWT in another DC. It can miss it and retry. That costs latency, not
@@ -845,28 +846,37 @@ an active canonical incarnation preserve its key.
 | R22 | Recovery destroys bytes using data read from the discovery projection, without re-reading the canonical orphan row | The document says `_by_day` is "a discovery index and never a source of authorization", but the code does not honour that: `RecoverS3Orphans` takes its `S3OrphanInfo` straight from `ListS3OrphansByDay` and then uses those fields — `StorageClass` included — to resolve the backend and issue the delete (`worker.go:1376-1560`), never reloading `gc_s3_orphans`. So a stale or diverged projection row can select the wrong backend for a physical delete. **Required flow: `by_day` → load the canonical orphan → require an exact `P` match → only then destroy.** If the canonical row is missing, or `P_projection ≠ P_canonical`, the sweep may repair or drop the projection entry and must **never** issue a physical DELETE. |
 | R23 | `storage_class` is rebound to a different bucket, account or backend namespace | **`P` is only an eternal physical identity when its backend namespace identity is immutable.** `storage_class` is a logical label resolved through `m.backends[className]` (`internal/storage/storage.go:493`), and bucket/endpoint for a class come from configuration (`internal/config/config.go:3526,3532`). Rebind `hot-s3-na` from bucket A to bucket B and every persisted `P` silently renames the object it addresses — a months-old orphan would then issue an exact DELETE into a namespace it never verified. Define `B` as an immutable backend identity: a storage-class name may serve as `B` only when it is append-only and never rebound or reused for another namespace; otherwise persist an immutable `backend_id` and define `P = (backend_id, storage_key)`. Credentials and endpoints may change as long as they keep naming the same namespace. **Removing the orphan TTL makes this contract permanent rather than 90-day-bounded.** |
 | R24 | An ambiguous install outcome is reused or cleaned before its status is settled | **The same ABA as X1, produced by the writer's own cleanup instead of by GC.** R9 has the losing writer best-effort delete its key; R17 forbids a stale *repair* from installing. Neither covers a stale **install**: `W2` loses the CAS to `W1`, schedules cleanup of `P2`, and that DELETE is slow; later GC removes `P1` and `blocks(L)` goes absent; a lingering retry of `W2` re-runs `INSERT … IF NOT EXISTS` with `P2`, which now applies — and the old cleanup DELETE lands on live bytes. **Rule: a minted `P` is a single-use installation identity.** A failed install whose outcome is known lost makes `P` burned and cleanup-eligible; an ambiguous outcome makes `P` **install-uncertain**: it is non-retryable, cannot be reused for another install, and is not cleanup-authorized until serial settlement proves it is not canonical. Settlement proving applied moves `P` to canonical; settlement proving another locator won moves `P` to burned and permits exact-key cleanup. If settlement cannot be established, `P` stays install-uncertain and the safe result is a possible X3 leak, not deletion. |
-| R25 | A promote path creates permanent `fs:` references without ever having staged a checked `pub:` | **Highest-severity item after R17, and it breaks R3's argument as written.** R3 concludes that `fs:` inherits liveness from a `pub:` row that was itself post-checked, because promotion only happens inside `PromotePublishAttemptReferences`. The structure is real; the inference is not. `PromotePublishAttemptReferences` does **not** require a `pub:` row to exist (`block_references.go:519-544`): it calls `registerPermanent()` and then deletes whatever attempt rows it finds. And sync has a **fourth entry into finalize that skips staging**: `handleSyncHeadPromotion` answers an already-published HEAD with `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) → `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls `finalizeSyncCommitBlockDelta` **directly** (`sync.go:4113`), never `stageSyncCommitBlockDelta`. Finalize then promotes and registers `fs:` with no `pub:` handshake at any point, and `RegisterFSObjectBlockReferences` checks only that the `fs_object` exists. **Reachability, stated precisely rather than as "any retry":** `repairPublishedSyncCommitBlockDelta` first consults `finalizedBlockDeltas`, a per-process two-generation set of 4096 entries (`sync.go:141,158-194`) marked only *after* a finalize fully succeeds (`sync.go:4104`). A warm same-instance retry therefore short-circuits. The path runs when the retry lands on **another instance** — the memo is per process and production is multi-node — when **the original finalize failed**, which is the case the repair exists to heal and where the memo was never marked, after a process restart, or after eviction. Ordinary in production topology, not on a single warm node. The normal sync path, the auto-merge path (`sync.go:4156`), the SeafHTTP path (`seafhttp.go:3143,3161`) and the v2 path (`fs_helpers.go` stage/promote pair) all stage correctly. **Rule: every path that can promote permanent `fs:` references must first establish the same checked `pub:` handshake.** The small fix that matches this design is to re-stage on repair — rebuild, stage `pub:`, run R3's post-write check, then promote — rather than making `fs:` generation-aware. The alternative, requiring `PromotePublishAttemptReferences` to demand durable proof that this attempt's `pub:` rows were validated, adds state for the same property. |
+| R25 | A promote path creates permanent `fs:` references without ever having staged a checked `pub:` | **FIXED structurally** — the published-head repair now stages the `pub:` rows with a fresh attempt ID before finalizing, gated by `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` and `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`. Before this fix, `repairPublishedSyncCommitBlockDelta` rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, bypassing the handshake. The repair now uses the same `StagePublishAttemptReferences` operation as first publication; its rollback is scoped to the fresh repair ID, so a partial repair cannot retract another attempt's liveness. The *primitive* half remains unchanged: `PromotePublishAttemptReferences` does not require a staged row, so a future promote caller can reintroduce the bypass. **R25 was the highest-severity item after R17, and it broke R3's argument as written.** R3 itself remains open: the post-stage canonical-incarnation check does not exist yet. **Reachability, stated precisely rather than as "any retry":** `repairPublishedSyncCommitBlockDelta` first consults `finalizedBlockDeltas`, a per-process two-generation set with 4096 entries per generation (up to 8192 retained pairs) (`sync.go:138-194`), marked only *after* a finalize fully succeeds (`sync.go — finalizeSyncCommitBlockDelta`). A warm same-instance retry therefore short-circuits. The path runs when the retry lands on **another instance**, when **the original finalize failed**, after a process restart, or after eviction. The normal sync path, the auto-merge path, the SeafHTTP path and the v2 path already establish the handshake. **Rule: every known path that can promote permanent `fs:` references must execute Stage before Promote; preservation of the established handshake against concurrent cleanup remains R29/R3.** R3's eventual post-stage check must be added to Stage. |
 | R26 | A stale lifecycle's clear removes another lifecycle's discovery row | **Liveness, not data loss — but under a removed TTL it is permanent.** R22 makes recovery *read* the projection non-authoritatively; nothing yet constrains *writes* to it. `DeleteS3Orphan` clears the canonical row and then deletes the projection by timestamp identity — `first_seen_day`/`bucket`/`first_seen_at`/`org`/`block` (`store_cassandra.go:1783-1788`) — and when the caller passes a zero `firstSeenAt` it *resolves that timestamp from whatever canonical row is current* (`store_cassandra.go:1766-1772`), which may already belong to `P2`. Making only the canonical clear conditional on `P` (B.1) therefore leaves the projection half unbound: a delayed `P1` cleanup can still erase `P2`'s discoverability while `P2`'s canonical orphan correctly keeps fencing the writer. The result is a fence recovery cannot enumerate — R19's failure mode reached by a different route. **Rule: every repair or delete of `_by_day` is scoped to the expected `P`, or `P` becomes part of the projection's identity. Prefer the second.** A conditional `DELETE … IF P = P1` buys a Paxos round on a structure that is explicitly *liveness, never authorization* — the wrong place to spend consensus. Fold `P` into the discovery row's identity instead and the problem disappears by construction: a stale `P1` clear simply cannot name `P2`'s row. That is the same reasoning that makes A+ attractive in the first place — an identity that is never reused beats a check that has to be remembered. `_by_day` is never authorization, but stale lifecycle work must never remove another lifecycle's recovery discoverability. |
 | R27 | R18(a) says "re-project and retry", but the current projection cannot schedule a retry into the future | **R18(a) is the recommended resolution and is not yet implementable.** `gc_s3_orphans_by_day` is partitioned by `(first_seen_day, bucket)` and clustered on `first_seen_at`, and `upsertS3OrphanProjection` always derives the day from the *original* `firstSeenAt` (`store_cassandra.go:1561-1565`). Re-projecting a deferred orphan therefore rewrites it into the same past day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2` days back (`store_cassandra.go:205`). "Re-project and retry until the attempt TTLs expire" has no mechanism behind it. **Separate the two facts the code currently conflates:** `first_seen_at` is an immutable lifecycle fact, and retry scheduling needs a mutable `next_retry_at`. **The separation only works if the partition key derives from the mutable fact.** Adding `next_retry_at` as another clustering column under an immutable `first_seen_day` partition does nothing: the row still lives physically in the August partition, and a scanner working September never reads it. What is required is a discovery structure partitioned on `(next_retry_day, bucket)` and clustered on `(next_retry_at, org_id, block_id, …P)`, or a separate durable retry queue queried by retry time — which is arguably cleaner, since it stops overloading a first-seen index with scheduling. Holding the cursor instead is correct but lets one row block a whole day/partition. Until this exists, A+'s availability bound under R18(a) is not merely long — it is **unbounded**, because nothing automatically returns the orphan to the working set after the `pub:` TTL expires. |
 | R28 | A partial orphan appears with no upsert-after-clear, purely from per-value TTL expiry | **R19's failure mode has a second cause, and it explains why the TTL package is indivisible.** Cassandra applies `default_time_to_live` per written value, and an `UPDATE` rewrites only the values it touches, with a fresh expiry. `UpdateS3OrphanAttempt` writes `last_attempt_at`/`retry_count`/`last_error` and leaves `storage_class`, `first_seen_at` and `recovery_phase` untouched. A retry on day 89 therefore pushes the diagnostic values to day 179 while the identity values still expire on day 90, and the `_by_day` projection — never rewritten — expires with them. Between those dates the row has a live primary key, no `storage_class`, no `first_seen_at` and no discovery entry. Both fence reads select only `block_id` (`block_references.go:851`, `1138`), which a partially expired row still returns, so the writer stays fenced while `GetBlockS3OrphanInfo` reads nulls. **Consequence for the wording elsewhere in this document: the 90-day TTL is not a ceiling on the row.** It bounds each value independently, and retries extend the diagnostic ones. **Consequence for R19:** partial orphan state arises both from an unconditional upsert after a clear *and* from per-value TTL skew, so making non-creating mutations conditional and removing the TTL are both required — neither alone closes it. |
+| R29 | A concurrent publisher can retract another publisher's `pub:` handshake | Sync previously used `targetCommitID` as the publication attempt ID, so concurrent requests for the same target shared `pub:<targetCommitID>`. A loser could delete the winner's row during CAS-conflict cleanup, and a partial `StagePublishAttemptReferences` rollback could do the same before CAS. The fix uses a fresh `publishAttemptID` per sync publication delta and retains refs for ambiguous CAS or post-CAS outcomes. **Required outcome:** cleanup may address only the current request's unique attempt; an uncertain CAS result retains its refs for retry, and a confirmed same-target winner enters idempotent repair. R25 remains structurally fixed, but preservation of an established handshake is an open X1/R3 criterion until this identity/outcome contract is evidenced in the integration leg. |
+| R30 | Superseded or abandoned publication attempts retain `pub:` rows until TTL | **Liveness/retention, not data loss.** After a publisher wins HEAD and crashes, a later repair creates `pub:<repair-uuid>` because the original attempt ID is not persisted. Promote removes the repair ref, but cannot identify the crashed publisher's `pub:<original-uuid>`. A complete repair stage followed by another crash/finalize failure leaves the same shape for the repair UUID; partial stages now roll back their own fresh ID. Each row is bounded by the 35-day TTL, but repeated failed repairs can create successive retained attempts and extend aggregate retention. **Required decision:** accept this per-attempt bounded retention as the cost of non-shared identity, or persist publication-attempt lineage so successful repair can retire superseded refs. This is separate from R29's safety fix and must not be described as X1 closure. |
+| R31 | A possibly successful published HEAD has no durable repair path after its `pub:` TTL expires | **Blocker for X1 safety closure.** A CAS timeout or a post-CAS block-reference failure can leave `HEAD = T` while only `pub:<attempt>` protects the blocks. Sync repair currently runs from a later idempotent client request; it is not a durable worker or queue. If no request arrives before the 35-day TTL, the temporary liveness can expire while `fs:` refs are still absent, allowing GC to see zero refs. **Required outcome:** settle the CAS serially and finalize when published, or persist a durable pending-publication/reconciliation record that a background worker can process independently of client retries. |
 
 R8, R13 and R15 decide whether Option B is viable. R16, R17, R19, R20, R22, R23, R24, R25,
-R26, R28, R3, R9, R10, R11 and R12 are common closure criteria — R16 and R20 become newly
+R26, R28, R29, R31, R3, R9, R10, R11 and R12 are common safety-closure criteria — R16 and R20 become newly
 load-bearing when claim IDs move from candidate identity to per-attempt UUIDs, and R17 is one
 of the direct same-physical-identity paths that reopens X1; R24 is the corresponding
-stale-install form. **R25 is the one that invalidates a conclusion this document previously
+stale-install form. **R25 was the one that invalidated a conclusion this document previously
 drew** rather than adding a new requirement to it: R3's "the gap is one function, not two"
-was wrong, because one production path promotes without ever staging.
+was wrong, because one production path promoted without ever staging. It is now fixed and
+gated; R3 itself remains open, and the structural fix is not evidence toward it.
 **R18 is A+-specific and is the one open question A+ does not inherit from X2 for free;
 R27 is what makes its recommended resolution implementable at all.**
 R21 gates B and any R18 resolution that treats the orphan as a durable authorization
 certificate, especially option (c). The conservative A+ option (a) does not depend on that
 inference.
 
-Note the shape of the last three: R26 and R28 both reach R19's failure mode — a fence no
+Note the shape of the last five: R26 and R28 both reach R19's failure mode — a fence no
 sweep can enumerate — by routes R19 does not cover (a stale clear of another lifecycle's
-discovery row, and per-value TTL expiry). Treat "partial or undiscoverable orphan" as the
-failure class, not `UpdateS3OrphanAttempt` as the single defect.
+discovery row, and per-value TTL expiry). R29 is separate but related: it can remove the
+publication fence before permanent `fs:` refs take over. R30 is a bounded
+availability/retention consequence of fixing R29 with fresh identity, not a safety-closure
+criterion. R31 is the safety failure where that temporary fence expires before durable
+`fs:` repair. Treat "partial or undiscoverable orphan", "retractable publication handshake",
+"superseded attempt retention" and "non-durable published repair" as failure classes, not
+single call-site defects.
 
 **The invariant these add up to.** `P` has a monotonic authority lifecycle, and no
 authority transition ever runs backwards. An install outcome can be uncertain without
@@ -1005,8 +1015,8 @@ A conceptual diff, not an implementation list.
 | `RecoverS3Orphans` discovery | Takes `S3OrphanInfo` — `StorageClass` included — straight from `ListS3OrphansByDay` and destroys on it, never reloading the canonical row | `by_day` → load canonical orphan → require exact `P` match → destroy. Mismatch or missing canonical row repairs/drops the index entry and never deletes (**R22**) |
 | `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go:1776`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`); its projection half deletes by timestamp identity and resolves a zero `firstSeenAt` from whatever canonical row is current | Condition the canonical clear on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) — **and bind the projection clear the same way** (**R26**), or the stale lifecycle still erases the newer one's discoverability |
 | `upsertS3OrphanProjection` | Always derives `first_seen_day` from the original `firstSeenAt` (`store_cassandra.go:1561-1565`), so a re-projection lands in the day the cursor already passed | Give retry scheduling its own mutable fact (`next_retry_at`), separate from the immutable `first_seen_at`; without it R18(a)'s "re-project and retry" has no mechanism (**R27**) |
-| `repairPublishedSyncCommitBlockDelta` | Rebuilds the delta and calls `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`), promoting `fs:` without ever calling `stageSyncCommitBlockDelta` | Re-stage before promoting: rebuild → stage `pub:` → R3 post-check → promote. Every promote path must establish the checked handshake (**R25**) |
-| `PromotePublishAttemptReferences` | Calls `registerPermanent()` and deletes whatever attempt rows exist; never requires a `pub:` row to be present (`block_references.go:519-544`) | Either keep it dumb and fix the callers (preferred, see R25), or require durable proof that this attempt's `pub:` rows were validated |
+| `repairPublishedSyncCommitBlockDelta` | Before R25, rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, promoting `fs:` without establishing `pub:` | Rebuild → fresh-ID `StagePublishAttemptReferences` with rollback scoped to that repair → R3 post-check → promote (**R25**) |
+| `PromotePublishAttemptReferences` | Calls `registerPermanent()` and deletes whatever attempt rows exist; never requires a `pub:` row to be present (`internal/db/block_references.go — PromotePublishAttemptReferences`) | Either keep it dumb and fix the callers (preferred, see R25), or require durable proof that this attempt's `pub:` rows were validated |
 | `DeleteBlockS3Orphan` | A **second** unconditional orphan `DELETE` (`internal/db/block_references.go:1199`) with **no caller anywhere in the repo**, not even tests | Delete it. It is R21's destructive twin: an exported way to clear a fence that no protocol step authorizes, in a design about to make the orphan load-bearing |
 | `B` → backend | Today this is the logical `storage_class` resolved through `m.backends[className]` (`internal/storage/storage.go:493`); bucket and endpoint come from config (`internal/config/config.go:3526,3532`) | Define `B` as an immutable namespace identity. `storage_class` is acceptable only under R23's append-only/non-reuse contract; otherwise persist an immutable `backend_id` and define `P = (backend_id, storage_key)` |
 
@@ -1026,15 +1036,34 @@ decisions come first.
    like a fix and is not one. Settle the three linearization shapes with it — the
    pre-install fence check, the post-install success check, and the post-stage `pub:`
    check are different observations and the ADR must say so.
-0b. **R25 — every promote path must have staged a checked `pub:`.** Ranked with R17
-   because it is the other place where the design's argument, not just its
-   implementation, is currently untrue: `repairPublishedSyncCommitBlockDelta` promotes
-   permanent `fs:` references without staging, and `PromotePublishAttemptReferences`
-   does not require a `pub:` row to exist. Decide the fix shape — re-stage on repair
-   (small, matches this design) versus durable proof of validation carried into
-   promote (more state) — before R3 is treated as settled. **This is the one item on
-   the list that already has an executable gate**, so it can be closed by a PR rather
-   than by a decision: `TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing`.
+0b. **R25 — every known promote path must first establish `pub:`. ✅ SETTLED
+   structurally by implementation.** It was the other place where the design's argument,
+   not just its implementation, was untrue. The fix shape chosen was **fresh-ID stage on
+   repair**: a published-head repair uses `StagePublishAttemptReferences`, and any partial
+   rollback is scoped to that repair's unique ID.
+   Gated by `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` and
+   `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`. **What remains open here
+   is deliberate:** `PromotePublishAttemptReferences` still registers without requiring a
+   staged row, so the invariant lives in the callers. If a future promote caller is added,
+   this is the item to re-read. The "checked" half remains R3 — see item 8.
+0c. **R29 — publication attempt identity and CAS outcome.** `targetCommitID` must not be
+   the referrer identity for concurrent requests. Each sync publication needs a fresh
+   attempt ID carried through Stage/Promote/cleanup. A confirmed CAS loser may clean
+   only its own attempt; a same-target winner must enter idempotent repair, and an ambiguous
+   CAS or post-CAS error must retain its refs and return retryable. The unit gate covers the
+   fresh-ID shape; an integration leg still needs to exercise the cleanup policy and two
+   concurrent publishers against Cassandra.
+0d. **R30 — superseded publication-attempt retention.** A repair UUID is intentionally
+   fresh, so it cannot identify and remove a crashed original publisher's UUID ref. The
+   original `pub:` row remains a conservative liveness pin until its 35-day TTL expires.
+   Decide whether that bounded retention is acceptable or whether publication-attempt
+   lineage must become durable; do not treat the repair's successful `fs:` promotion as
+   proof that the old temporary row was retired.
+0e. **R31 — durable repair after a possibly successful publication.** A CAS timeout or a
+   post-CAS finalize failure can leave a visible HEAD protected only by a TTL-bound `pub:`
+   row. The current sync repair runs only when a later client request reaches the
+   idempotent path. X1 cannot close until a durable queue/record or equivalent background
+   reconciliation can converge `pub:` to permanent `fs:` without relying on that retry.
 1. **A+ claim identity.** Replace the candidate-derived claim with a fresh UUID per
    worker attempt; carry `(P, claimID, claimed_at)` through claim, release, finalize,
    stale takeover and candidate cleanup.
@@ -1132,14 +1161,18 @@ All instruments live in `internal/api/sync_publish_handshake_test.go` unless not
 
 | Leg | Property | Status |
 |---|---|---|
-| **R25 reproduction** | The idempotent-repair entry point promotes permanent `fs:` without staging a `pub:` — `TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing` drives the real helper | **RED** |
+| **R25 handshake** | The idempotent-repair entry point establishes `pub:` before promoting permanent `fs:` — `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` drives the real helper | **GREEN** since the R25 fix. **Mutation:** revert `repairPublishedSyncCommitBlockDelta` to build the delta and call `finalizeSyncCommitBlockDelta` directly ⇒ **RED**. `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize` also keeps a failed repair stage from reaching promote. |
 | R25 primitive | `PromotePublishAttemptReferences` registers without requiring a staged row — `TestPromotePublishAttemptReferencesDoesNotRequireAStagedRow` | PASS — pins current behaviour; invert it if promote is made to demand proof |
-| Fix shape | A fix that always re-stages must not make every warm retry pay the full reconciliation — `TestRepairSkipsEverythingOnceThisProcessFinalized` | PASS |
+| Fix shape | A fix that always restages must not make every warm retry pay the full reconciliation — `TestRepairSkipsEverythingOnceThisProcessFinalized` | PASS |
 | Staged shape | `stage → finalize` satisfies the handshake and promotes exactly what it staged — `TestStagedPublicationShapeSatisfiesTheHandshake` | PASS |
+| R29 identity | Two sync publications of the same target receive distinct attempt IDs — `TestSyncPublicationAttemptsUseDistinctIDsForTheSameTarget` | PASS — structural gate; concurrent Cassandra cleanup still needs integration evidence |
+| R29 outcome | A same-target CAS loser and an ambiguous CAS/post-CAS result retain the correct publication liveness | not built — needs a controlled CAS/cleanup integration leg |
+| R30 retention | A successful fresh-UUID repair retires the original crashed publisher's `pub:` refs | not built — availability/retention follow-up; requires durable attempt lineage or an explicit accepted 35-day retention bound |
+| R31 durable repair | A possibly successful published HEAD converges to permanent `fs:` without a later client request | **BLOCKER / not built** — requires a durable reconciliation record or background repair independent of the 35-day TTL |
 | R3 safety | A block under an active delete fence must not gain a permanent `fs:` reference through the retry path | not built — needs a second instance for a cold memo, and cannot go green until R3's post-check exists on any path |
 | Physical ABA | An authorized DELETE landing after a byte-identical rematerialization destroys live bytes | not built — needs deterministic control of the S3 delete between authorization and landing |
 
-**What the unit gate does not cover.** It proves the idempotent-repair bypass directly and
+**What the unit gate does not cover.** It gates the idempotent-repair handshake directly and
 pins the intended `stage → finalize` invariant. It is **not** control-flow coverage of the
 normal and auto-merge production branches: the staged-shape test calls
 `stageSyncCommitBlockDelta` itself, so a refactor that dropped staging from
@@ -1147,9 +1180,15 @@ normal and auto-merge production branches: the staged-shape test calls
 branches run inside the HEAD CAS retry loop and need a DB session, which puts them in the
 integration leg. Do not cite the unit file as proof that every production path stages.
 
-**The mutation is what makes a red meaningful.** The reproduction was verified both ways:
-red as the code stands, green when `repairPublishedSyncCommitBlockDelta` is routed through
-`stageSyncCommitBlockDelta`, with the memoized fast path still passing.
+**What R25's closure does and does not mean.** It restores the structural handshake, so
+every known promote path now establishes `pub:` and R3's post-check — once written — can
+apply to all of them instead of being bypassed by one, subject to R29's ownership and
+outcome-preservation contract. It does **not** add that check. The
+publication TOCTOU is still open exactly as before: between `stage pub:` and `finalize`,
+GC can still claim and authorize. R31 adds the independent requirement that a visible HEAD
+must have durable repair beyond the temporary TTL. Read the status as **R25 fixed, R3/R31
+open, X1 open**, and
+do not let a structural fix be quoted as evidence toward closing X1.
 
 **Why the physical-ABA leg is last rather than first.** Its obligatory mutation — derived
 key instead of minted key must go red — presupposes that minting exists. Today keys are
