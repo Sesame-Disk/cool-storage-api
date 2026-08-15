@@ -487,11 +487,12 @@ count out of `configs/`.
 - **The physical-key option changes the recovery argument, not the X2 result.** The
   current implementation deliberately re-runs `BlockHasReferencesGlobal` during orphan
   recovery, and the X2 closure evidence remains valid for that implementation. A future
-  d-lite implementation may instead inherit authorization from an orphan that records an
-  exact never-reused `storage_key`, but only after verifying that the canonical row is
-  absent or points at a different key. That is an explicit X1 protocol amendment; it is
-  not implied by `EACH_QUORUM` alone and must be reflected in the registry when code
-  changes.
+  exact-physical-key X1 design — **either** of the two under consideration, not only the
+  overlapped-lives one — may instead inherit authorization from an orphan that records an
+  exact never-reused physical locator, but only after verifying that the canonical row is
+  absent or points elsewhere, and only once that orphan cannot be fabricated by any other
+  API. That is an explicit X1 protocol amendment; it is not implied by `EACH_QUORUM` alone
+  and must be reflected in the registry when code changes.
 
 - **The `resolveFence` fast-clear is inert in production.** The only implementation,
   `clearSeafHTTPS3OrphanFence`, returns `(false, nil)` on every path. Writers cannot

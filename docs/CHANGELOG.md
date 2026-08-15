@@ -486,11 +486,47 @@ new relative to the withdrawn document:
   reconcile" in R15/R16 now means settle in the serial domain; a plain read is never
   authority to conclude a claim or orphan does *not* exist. This is the same defect
   already filed as `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, whose code comment
-  explicitly defers the fix to "the serial-domain decision X1 has to make anyway".
-- **`storage_key` is sufficient as the physical identity**; a separate `physical_id` or
-  `delete_id` column is not needed. And the SHA-1→SHA-256 mapping belongs to the logical
-  block, not to any incarnation, so its lifecycle should be decoupled from the physical
-  object's — the code already calls a leftover mapping "a harmless dangling pointer".
+  explicitly defers the fix to "the serial-domain decision X1 has to make anyway". The
+  mechanism is named rather than left open: an idempotent no-op retry of the same LWT is
+  preferred, a `SERIAL`-level read is conditional on matching the write's serial domain
+  and on verified engine behaviour, and if neither settles the state stays ambiguous and
+  the caller fails closed.
+- **R21 — a second API can forge the orphan row.** `RecordS3Orphan` runs its own
+  `INSERT … IF NOT EXISTS` on `gc_s3_orphans` (`store_cassandra.go:1618-1630`) and sits in
+  the `GCStore` interface (`store.go:196`) with **no production caller** — tests and the
+  mock only — behind a doc comment that no longer describes reality. Harmless today,
+  disqualifying the moment the orphan becomes the durable proof that `EACH_QUORUM == 0`
+  happened, which is what B's recovery argument and one of A+'s escapes from R18 both
+  need. Cheap to close now: drop it from the interface or narrow it to `IF EXISTS`.
+- **R22 — recovery destroys on projection data.** The document says `_by_day` is a
+  discovery index and never an authorization source; the code does not honour that.
+  `RecoverS3Orphans` takes its `S3OrphanInfo` — `StorageClass` included — straight from
+  `ListS3OrphansByDay` and resolves the backend from it, never reloading the canonical
+  orphan row. Required flow: `by_day` → canonical row → exact `P` match → destroy.
+- **R23 — `P` is only eternal if the storage-class name is.** `storage_class` is a logical
+  label resolved through `m.backends[className]` (`storage.go:493`) with bucket and
+  endpoint supplied by configuration (`config.go:3526,3532`). Rebinding a class to a
+  different bucket silently renames every persisted `P`, and a months-old orphan would
+  issue an exact DELETE into a namespace it never verified. Either the name is
+  contractually append-only, or an immutable `backend_id` takes over the role. Removing
+  the orphan TTL makes this contract permanent.
+- **R24 — a minted key is single-use, canonical or not.** R9 has the losing writer clean
+  up its own key; nothing stopped that same key from being reused by a later install.
+  `W2` loses the CAS, schedules cleanup of `P2`, GC later removes `P1`, `blocks(L)` goes
+  absent, and a lingering `W2` retry re-inserts `P2` — which now applies, just as the old
+  cleanup DELETE lands. Same ABA as X1, produced by the writer's own cleanup rather than
+  by GC. Once an install loses, becomes unsettleable, or has cleanup authorized, that `P`
+  is burned forever. This also bounds R20: idempotent CAS retry is safe for claim and
+  orphan statements, not for an install whose history is already uncertain.
+- **The physical identity is the tuple `P = (storage_class, storage_key)`**, not the key
+  alone: `storage_class` is what selects the backend, so a CAS or an exact DELETE that
+  omits it does not name an object. A separate `physical_id` or `delete_id` column is not
+  needed once `P` is never reused. **R23** records the precondition that makes `P` an
+  eternal identity — a storage-class name must never be rebound to another bucket,
+  account or namespace, or an immutable `backend_id` must carry that role instead. And
+  the SHA-1→SHA-256 mapping belongs to the logical block, not to any incarnation, so its
+  lifecycle should be decoupled from the physical object's — the code already calls a
+  leftover mapping "a harmless dangling pointer".
 - **The premise everything rests on is verified:** `L = sha256(storedContent)` is taken
   over the bytes actually written, *after* encryption (`seafhttp.go:2468-2482`), so two
   incarnations of one logical block are byte-identical by construction. That is why
@@ -506,7 +542,8 @@ merged before the branch that carried them.
 - `docker-compose.prod.yml` now sets `GC_ENABLED=false` explicitly rather than relying on
   the environment, with the reason inline. `docker-compose.yaml` documents why the local
   single-node stack deliberately does *not* pin it.
-- Cassandra pinned from `5.0` to `5.0.9` across all five Compose files; `VERSIONS.md`
+- Cassandra pinned from `5.0` to `5.0.9` across the five previously-floating Compose
+  files (`docker-compose.cassandra-3dc.yaml` was already pinned); `VERSIONS.md`
   corrected (it still claimed Go 1.21, Echo, and Cassandra 4.1 — the project uses Gin).
 
 **X4 / UP-2 / P-4 scope correction (2026-08-11), carried over:** the per-block Paxos round
