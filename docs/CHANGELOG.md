@@ -410,9 +410,13 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ## 2026-08-14 - X1: r3 generational fence abandoned; closure options documented; prod `GC_ENABLED=false` pinned
 
-No Go runtime implementation changed; documentation and deployment configuration did.
-X1 stays open, no design is accepted, and `GC_ENABLED=false` remains mandatory on every
-replica in every DC.
+No production behaviour changed, and no X1 safety fix landed. `internal/api/sync.go`
+gained four test seams for the R25 executable reproduction — `stageSyncPublishAttempt-
+ReferencesFn`, `promoteSyncPublishAttemptReferencesFn`, `buildSyncCommitBlockDeltaFn`,
+`resolveSyncBlockIDsFn` — and the production targets of those seams are the existing
+functions, so the compiled call graph is equivalent. Documentation and deployment
+configuration also changed. X1 stays open, no design is accepted, and `GC_ENABLED=false`
+remains mandatory on every replica in every DC.
 
 **The r3 generational-fence ADR is abandoned.** PR #166 closed unmerged; the branch
 `docs/gc-x1-x2-generation-fence-final` is retained as investigative reference only, and
@@ -431,11 +435,14 @@ new relative to the withdrawn document:
 - **The wait behind a physical delete is measured, not estimated.** The writer's retry
   budget is ~1.95 s (`fs_helpers.go:680-684`); the GC inline S3 delete retries for ~2.6 s
   (`worker.go:352`); and if that delete fails the orphan row is only revisited by scanner
-  **Phase 16 on the 24 h ticker** (`gc.go:690-706`, `config.prod.yaml:386`), with a
-  90-day TTL ceiling. Absent later attempt references, the automatic retry may therefore
-  wait up to a day; under conservative A+ R18(a), a surviving `up:` or `pub:` reference
-  can keep the fence for its TTL, currently up to 48 h or 35 days. If physical recovery
-  itself keeps failing, today's orphan TTL is the outer 90-day ceiling. The `resolveFence`
+  **Phase 16 on the 24 h ticker** (`gc.go:690-706`, `config.prod.yaml:386`). The schema
+  carries a nominal 90-day default TTL, but that is **not** a row-lifetime recovery bound:
+  later updates refresh the TTL of only the columns they rewrite, which can leave partial
+  orphan state behind (**R28**). Absent later attempt references, the automatic retry may
+  therefore wait up to a day; under conservative A+ R18(a), a surviving `up:` or `pub:`
+  reference can keep the fence for its TTL, currently up to 48 h or 35 days. Persistent
+  recovery failure has **no trustworthy 90-day upper bound** on the fence, for the same
+  per-value reason. The `resolveFence`
   escape hatch is inert: the two SeafHTTP paths wire it to
   `clearSeafHTTPS3OrphanFence`, which returns `(false, nil)` on every path
   (`seafhttp.go:2664-2681`), and the three v2 paths pass `nil`.
@@ -503,23 +510,33 @@ new relative to the withdrawn document:
   on another instance, a retry after the original finalize failed — the case the repair
   exists to heal — a process restart or an eviction all reach it. The other three promote
   sites stage correctly. Fix shape: re-stage on repair, rather than making `fs:`
-  generation-aware. **Now executable:** `TestSyncPublishPathsStageBeforePromoting`
-  (`internal/api/sync_publish_handshake_test.go`) asserts the handshake over all four
-  entry points and is red on the repair case only; the candidate one-line fix turns it
-  green, which is the mutation that makes the red meaningful.
+  generation-aware. **Now executable:**
+  `TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing`
+  (`internal/api/sync_publish_handshake_test.go`) drives the real helper and is red; the
+  candidate one-line fix turns it green, which is the mutation that makes the red mean
+  something. The companion tests pin the primitive's behaviour and the intended
+  `stage → finalize` shape — they are explicitly **not** control-flow coverage of the
+  normal and auto-merge branches, which need a DB session and belong to the integration
+  leg.
 - **R26 — the discovery index needs binding in both directions.** R22 constrains how
   recovery *reads* `_by_day`; nothing constrained writes to it. `DeleteS3Orphan` deletes
   the projection by timestamp identity and resolves a zero `firstSeenAt` from whatever
   canonical row is current (`store_cassandra.go:1766-1788`), so making only the canonical
   clear conditional still lets a delayed `P1` cleanup erase `P2`'s discoverability.
-  Liveness, not data loss — but permanent once the TTL is removed.
+  Liveness, not data loss — but permanent once the TTL is removed. Preferred fix is to
+  fold `P` into the discovery row's identity rather than to add `IF P = P1`: a conditional
+  spends a Paxos round on a structure that is explicitly liveness and never authorization,
+  while an identity that cannot be named by the wrong lifecycle closes it by construction.
 - **R27 — R18(a) had no mechanism behind it.** "Re-project and retry" cannot work on the
   current projection: `upsertS3OrphanProjection` always derives `first_seen_day` from the
   original `firstSeenAt` (`store_cassandra.go:1561-1565`), so a re-projection lands in a
   day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2`
   back. Retry scheduling needs a mutable `next_retry_at` separate from the immutable
-  `first_seen_at`. Until it exists, A+'s availability cost under the recommended
-  resolution is not long — it is unbounded.
+  `first_seen_at` — **and the discovery structure must be partitioned on the mutable one**.
+  Adding `next_retry_at` as a clustering column under an immutable `first_seen_day` leaves
+  the row in the partition the cursor already passed and changes nothing; it needs
+  `(next_retry_day, bucket)` or a separate retry queue read by retry time. Until it exists,
+  A+'s availability cost under the recommended resolution is not long — it is unbounded.
 - **R28 — the 90-day TTL is not a ceiling on the row.** Cassandra expires each written
   value independently. `UpdateS3OrphanAttempt` refreshes only its three diagnostic columns
   and leaves `storage_class`/`first_seen_at`/`recovery_phase` on the original schedule, so
