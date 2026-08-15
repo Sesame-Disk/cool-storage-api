@@ -440,9 +440,10 @@ new relative to the withdrawn document:
   statements on the `blocks` partition, not six; the five that were missing are listed
   with locations. The same global `SERIAL` discipline applies to the relevant
   `gc_s3_orphans` LWTs, but the two partitions do not share a Paxos log and the protocol
-  assumes no cross-table atomicity. Once the canonical row is gone, an orphan is a
-  durable physical-delete record, not a logical writer fence; a later incarnation may
-  proceed while the old key is recovered.
+  assumes no cross-table atomicity. Under **B**, once the canonical row is gone, an orphan
+  is a durable physical-delete record, not a logical writer fence; a later incarnation
+  may proceed while the old key is recovered. **A+** deliberately retains the current
+  logical fence and waits for the orphan to clear.
 - **The option comparison now distinguishes the safety baseline from the availability
   optimization.** A+ keeps physical lives sequential and carries the complete claim,
   exact-key, publication and recovery package. d-lite/B can later stop waiting on the
