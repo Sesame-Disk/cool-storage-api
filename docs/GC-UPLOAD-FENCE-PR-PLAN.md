@@ -55,9 +55,10 @@ safety contracts in this plan, not by material equivalence to that branch.
 3. **No PR may leave `main` in a state that serves wrong bytes or deletes live data.**
    Ordering below is chosen so that every intermediate state is safe, not just the
    final one.
-4. **Destructive GC stays disabled** for the whole series. The two open blockers
-   (physical-delete ABA, cross-DC reference visibility) are out of scope here and
-   gate enabling it, independently of this work.
+4. **Destructive GC stays disabled** for the whole series. Both live-data blockers
+   (physical-delete ABA, cross-DC reference visibility) were out of scope here and gate
+   enabling it independently of this work. Cross-DC reference visibility closed on
+   2026-08-14; the physical-delete ABA (X1) remains open and is now the sole gate.
 5. Every PR states its verification: `go build`, `go vet`, `go vet -tags=integration`,
    unit tests, and — for anything touching concurrency — `go test -race` in Docker,
    which cannot run on the Windows dev box (no gcc).

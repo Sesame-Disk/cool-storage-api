@@ -432,8 +432,11 @@ new relative to the withdrawn document:
   budget is ~1.95 s (`fs_helpers.go:680-684`); the GC inline S3 delete retries for ~2.6 s
   (`worker.go:352`); and if that delete fails the orphan row is only revisited by scanner
   **Phase 16 on the 24 h ticker** (`gc.go:690-706`, `config.prod.yaml:386`), with a
-  90-day TTL ceiling. So a failed physical delete blocks every upload of that content for
-  up to a day. The `resolveFence` escape hatch is inert: the two SeafHTTP paths wire it to
+  90-day TTL ceiling. Absent later attempt references, the automatic retry may therefore
+  wait up to a day; under conservative A+ R18(a), a surviving `up:` or `pub:` reference
+  can keep the fence for its TTL, currently up to 48 h or 35 days. If physical recovery
+  itself keeps failing, today's orphan TTL is the outer 90-day ceiling. The `resolveFence`
+  escape hatch is inert: the two SeafHTTP paths wire it to
   `clearSeafHTTPS3OrphanFence`, which returns `(false, nil)` on every path
   (`seafhttp.go:2664-2681`), and the three v2 paths pass `nil`.
 - **The one-serial-domain inventory was undercounted.** There are **eleven** conditional
@@ -482,48 +485,62 @@ new relative to the withdrawn document:
   `storage_class` and, because it never touches the projection, no `_by_day` row — a
   writer fence that recovery cannot enumerate. With the TTL removed as the TTL package
   proposes, it would never expire either.
-- **R20 — an ordinary read never settles an ambiguous LWT.** Every "read back and
-  reconcile" in R15/R16 now means settle in the serial domain; a plain read is never
-  authority to conclude a claim or orphan does *not* exist. This is the same defect
-  already filed as `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, whose code comment
-  explicitly defers the fix to "the serial-domain decision X1 has to make anyway". The
-  mechanism is named rather than left open: an idempotent no-op retry of the same LWT is
-  preferred, a `SERIAL`-level read is conditional on matching the write's serial domain
-  and on verified engine behaviour, and if neither settles the state stays ambiguous and
-  the caller fails closed.
+- **The fence clear was pointing at dead code.** An earlier revision named
+  `DeleteBlockS3Orphan` (`block_references.go:1199`) as the unconditional clear that B.1
+  must make conditional. That function has **no caller anywhere in the repo**, tests
+  included. The clear GC actually runs is `DeleteS3Orphan`
+  (`store_cassandra.go:1776`), reached from `processBlock` and all three recovery exits
+  (`worker.go:1261, 1411, 1429, 1584`); that is the statement the requirement attaches to.
+  `DeleteBlockS3Orphan` is R21's destructive twin — an exported way to clear a fence that
+  no protocol step authorizes — and should simply be removed.
+- **R20 — an ordinary consistency read never settles an ambiguous LWT.** Every "read
+  back and reconcile" in R15/R16 now means settle in the serial domain; a normal
+  `LOCAL_QUORUM`/`QUORUM` read is never authority to conclude that a claim or orphan does
+  *not* exist. This is the same defect already filed as
+  `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, whose code comment explicitly defers the
+  fix to "the serial-domain decision X1 has to make anyway". Prefer an idempotent no-op
+  retry of the same LWT; otherwise use a `SELECT` with query consistency `SERIAL` in the
+  same Paxos domain. In gocql, `Query.SerialConsistency(...)` configures the serial phase
+  of conditional mutations and is ignored for ordinary `SELECT`s. If neither settles,
+  the state stays ambiguous and the caller fails closed.
 - **R21 — a second API can forge the orphan row.** `RecordS3Orphan` runs its own
   `INSERT … IF NOT EXISTS` on `gc_s3_orphans` (`store_cassandra.go:1618-1630`) and sits in
   the `GCStore` interface (`store.go:196`) with **no production caller** — tests and the
   mock only — behind a doc comment that no longer describes reality. Harmless today,
   disqualifying the moment the orphan becomes the durable proof that `EACH_QUORUM == 0`
-  happened, which is what B's recovery argument and one of A+'s escapes from R18 both
-  need. Cheap to close now: drop it from the interface or narrow it to `IF EXISTS`.
+  happened, which is what B's recovery argument and R18 option (c) need. The conservative
+  A+ option (a) does not depend on historical authorization from the orphan. Cheap to
+  close now: drop it from the interface or narrow it to `IF EXISTS`.
 - **R22 — recovery destroys on projection data.** The document says `_by_day` is a
   discovery index and never an authorization source; the code does not honour that.
   `RecoverS3Orphans` takes its `S3OrphanInfo` — `StorageClass` included — straight from
   `ListS3OrphansByDay` and resolves the backend from it, never reloading the canonical
   orphan row. Required flow: `by_day` → canonical row → exact `P` match → destroy.
-- **R23 — `P` is only eternal if the storage-class name is.** `storage_class` is a logical
-  label resolved through `m.backends[className]` (`storage.go:493`) with bucket and
-  endpoint supplied by configuration (`config.go:3526,3532`). Rebinding a class to a
-  different bucket silently renames every persisted `P`, and a months-old orphan would
-  issue an exact DELETE into a namespace it never verified. Either the name is
-  contractually append-only, or an immutable `backend_id` takes over the role. Removing
-  the orphan TTL makes this contract permanent.
+- **R23 — `P` is only eternal if its backend namespace identity is immutable.** Define
+  `B` as that identity. `storage_class` is a logical label resolved through
+  `m.backends[className]` (`storage.go:493`) with bucket and endpoint supplied by
+  configuration (`config.go:3526,3532`). Rebinding a class to a different bucket silently
+  renames every persisted `P`, and a months-old orphan would issue an exact DELETE into a
+  namespace it never verified. A storage-class name may serve as `B` only under an
+  append-only/non-reuse contract; otherwise an immutable `backend_id` takes over the role.
+  Removing the orphan TTL makes this contract permanent.
 - **R24 — a minted key is single-use, canonical or not.** R9 has the losing writer clean
   up its own key; nothing stopped that same key from being reused by a later install.
   `W2` loses the CAS, schedules cleanup of `P2`, GC later removes `P1`, `blocks(L)` goes
   absent, and a lingering `W2` retry re-inserts `P2` — which now applies, just as the old
   cleanup DELETE lands. Same ABA as X1, produced by the writer's own cleanup rather than
-  by GC. Once an install loses, becomes unsettleable, or has cleanup authorized, that `P`
-  is burned forever. This also bounds R20: idempotent CAS retry is safe for claim and
-  orphan statements, not for an install whose history is already uncertain.
-- **The physical identity is the tuple `P = (storage_class, storage_key)`**, not the key
-  alone: `storage_class` is what selects the backend, so a CAS or an exact DELETE that
-  omits it does not name an object. A separate `physical_id` or `delete_id` column is not
-  needed once `P` is never reused. **R23** records the precondition that makes `P` an
-  eternal identity — a storage-class name must never be rebound to another bucket,
-  account or namespace, or an immutable `backend_id` must carry that role instead. And
+  by GC. Once an install is known lost, that `P` is burned and cleanup-eligible. An
+  ambiguous install becomes `install-uncertain`: it cannot be reused or cleaned until
+  serial settlement proves that it is not canonical; if settlement proves applied it is
+  canonical, and if it proves another locator won it becomes burned. An unresolved case
+  may leak as X3, but must not delete a possibly canonical object. This also bounds R20:
+  idempotent CAS retry is safe for claim and orphan statements, not for an install whose
+  history is already uncertain.
+- **The physical identity is the tuple `P = (B, storage_key)`**, not the key alone. `B`
+  is an immutable backend namespace identity; the current `storage_class` can provide it
+  only under R23's append-only/non-reuse contract, otherwise an immutable `backend_id`
+  must carry that role. A CAS or exact DELETE that omits `B` does not name an object. A
+  separate `physical_id` or `delete_id` column is not needed once `P` is never reused. And
   the SHA-1→SHA-256 mapping belongs to the logical block, not to any incarnation, so its
   lifecycle should be decoupled from the physical object's — the code already calls a
   leftover mapping "a harmless dangling pointer".

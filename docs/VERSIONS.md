@@ -60,7 +60,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 ## Docker
 
 ### Base Images
-- **Frontend**: `node:22-bookworm` → `nginx:alpine` (multi-stage build, `frontend/Dockerfile`)
+- **Frontend**: `node:22-bookworm` → `nginx:stable-alpine` (multi-stage build, `frontend/Dockerfile`)
 - **Backend**: `golang:1.25.12-trixie` → `debian:trixie-slim` (multi-stage build, `Dockerfile`)
 - **Cassandra**: `cassandra:5.0.9` (pin the exact digest for production/acceptance)
 - **MinIO**: (check docker-compose.yaml)
