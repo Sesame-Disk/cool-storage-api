@@ -3,6 +3,10 @@
 **Status:** Analysis and option comparison. **No option is accepted. Nothing is
 implemented. This is not an ADR.**
 
+Even a future verified X1 implementation would not enable destructive GC by itself;
+removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
+the closure evidence and operational rollout checks pass.
+
 **Date:** 2026-08-14 · Supersedes `GC-X1-X2-ALTERNATIVES.md` (2026-08-13), whose X2
 half is now history and whose X1 half is carried forward here, corrected and extended.
 
@@ -133,7 +137,7 @@ physical incarnations of one logical block are interchangeable to every reader. 
 what makes it unnecessary to bind references to a physical life: a reference means
 "content `L` is live", and any live incarnation of `L` satisfies it.
 
-This premise is load-bearing for the recommended option. If block IDs ever stop being a
+This premise is load-bearing for the recommended safety baseline. If block IDs ever stop being a
 hash of the stored bytes, the option below has to be re-derived.
 
 ---
@@ -178,9 +182,11 @@ Production is three DCs — NA, EU, Asia — at RF 1 each
 ### `EACH_QUORUM` vs `ALL`
 
 On RF 1 per DC they are equivalent — a quorum of 1 in each of three DCs is every replica.
-Prefer `EACH_QUORUM` so a later RF>1 does not require every replica. `ALL` is the
-stricter availability choice and is what a writer-visibility **fence** needs, as opposed
-to a liveness read.
+Prefer `EACH_QUORUM` for a cross-DC writer-visible fence: it reaches a quorum in every DC
+without requiring every replica when RF>1. The serial phase of the LWT is separate and
+should be `SERIAL`; the regular commit can be `EACH_QUORUM`, while writer fence reads use
+an explicit `LOCAL_QUORUM`. `ALL` remains a stricter policy choice, not a requirement for
+intersection with a `LOCAL_QUORUM` writer read.
 
 ---
 
@@ -258,9 +264,39 @@ returns `(false, nil)` on every path (`internal/api/seafhttp.go:2664-2681`). The
 v2 paths (`v2/blocks.go:1005`, `v2/files.go:3472`, `v2/onlyoffice.go`) pass `nil`. **No
 production path can shorten the wait.**
 
-**This is the single strongest argument for the recommended option.** A design in which
+**This is the strongest availability argument for B, not the safety-baseline argument.** A design in which
 the writer never waits behind a *physical* delete removes a 24-hour worst case, not a
 theoretical one.
+
+### But the 24 hours is a scheduling artifact, not a property of A+
+
+This is worth separating before the figure is used to choose a protocol. Orphan recovery
+is **Phase 16 of the scanner**, so it inherits `scan_interval`. Nothing about the work
+itself requires that cadence:
+
+- The worker already runs its own loop on `gc.worker_interval` (30 s) with its own
+  trigger channel (`internal/gc/gc.go:501-519`), and `RecoverS3Orphans` is a method on
+  the **worker**, not the scanner (`internal/gc/worker.go:1332`) — the scanner only calls
+  it (`internal/gc/scanner.go:1437-1444`).
+- A manual trigger already exists and is wired to the API layer
+  (`Service.TriggerScanner`, `internal/gc/gc.go:303-310`, called from
+  `internal/api/server.go:2392`), so 24 h is the *automatic* bound, not a hard one.
+- The inert `resolveFence` hook is the writer-side version of the same idea: a writer
+  that hits a fence could drive bounded recovery of that exact key instead of waiting for
+  a sweep.
+
+So A+'s worst case can plausibly be cut from ~24 h to the worker tick by **where the
+phase is scheduled**, with no protocol change and none of B's key-aware semantics. The
+residual after that is the case where S3 is persistently unavailable — where failing the
+upload closed is arguably the correct answer anyway.
+
+**Price this before treating the 24 h figure as the reason to adopt B.** If a scheduling
+change gets the stall to tens of seconds, B's remaining advantage is narrow enough that
+the larger proof obligation may not be worth taking on in the same change that closes the
+blocker. Two caveats keep it from being free: recovery on the worker tick pays its
+`EACH_QUORUM` verify and its bucket walk far more often, which lands squarely on the GC
+drain-capacity question below; and the cursor/`phaseErr` semantics were written for a
+daily sweep and would need re-examining at 30-second cadence.
 
 ---
 
@@ -268,14 +304,15 @@ theoretical one.
 
 | Option | Physical-delete ABA | Publication TOCTOU | Invasiveness | Verdict |
 |---|---|---|---|---|
-| **A** — sequential lives: minted keys, writer waits for the whole destructive window | Closed | Needs the `pub:` post-check | Medium | Correct but keeps the 24 h worst case |
-| **B** — overlapped lives ("d-lite"): minted keys, writer installs the next life as soon as the metadata row is free | Closed | Needs the `pub:` post-check, in a stronger form | Medium-high, still far below r3 | **Recommended** |
+| **A+** — sequential lives plus the complete X1 closure package | Closed | Needs the strong `pub:` post-check | Medium | **Recommended safety baseline; keeps the 24 h worst case** |
+| **B** — overlapped lives ("d-lite"): fresh key for each new life, next life installs as soon as the metadata row is free | Closed | Needs the strong `pub:` post-check, in a stronger form | Medium-high, still far below r3 | **Post-A+ availability optimization** |
 | **C** — writer references at `EACH_QUORUM` | **Open** | Open | Low | Not an X1 mechanism |
 | **D** — S3 object versioning | Closed only if *every* delete is version-id-specific | Unchanged | Backend + interface | Discussable, not preferred |
 | **E** — reduced fence, keep hash-derived keys | **Open** | Closable | Medium | Cannot close X1 |
 | **0** — the abandoned r3 generational fence | Closed | Closed | Very high | Abandoned 2026-08-14; reference only |
 
-Options A and B share everything except one decision, so they are described together.
+Options A+ and B share the physical-identity and claim package; they differ only in
+whether the old physical delete must finish before a new canonical life can exist.
 
 In the table, **Closed** under *Physical-delete ABA* means that the option can close that
 component only. It does not mean that X1 as a workstream is closed; the publication,
@@ -283,7 +320,7 @@ claim-ownership and recovery criteria remain open until implemented and evidence
 
 ---
 
-## The shared core of A and B — never-reused physical keys
+## The shared core of A+ and B — never-reused physical keys
 
 Keep the logical model exactly as it is:
 
@@ -309,9 +346,11 @@ delayed DELETE of `K1` cannot name `K2`. That closes the stale physical-delete A
 component of X1; publication validation, claim ownership and recovery liveness remain
 separate X1 criteria.
 
-**`storage_key` is sufficient as the physical identity.** An earlier draft proposed a
-separate `physical_id` column and a `delete_id`; neither is needed. If the key is
-globally fresh and never reused, it *is* the identity, and it works as a CAS token:
+**`storage_key` is sufficient as the incarnation/CAS identity within a storage class.**
+An earlier draft proposed a separate `physical_id` column and a `delete_id`; neither is
+needed. If the key is globally fresh and never reused, it *is* the identity. The exact
+storage I/O locator remains `(storage_class, storage_key)`, because the storage class
+selects the backend:
 
 ```sql
 INSERT INTO gc_s3_orphans (…, storage_key) VALUES (…, K1) IF NOT EXISTS
@@ -336,7 +375,9 @@ which any incarnation satisfies, because of the byte-identity premise above.
    does not mention `storage_key`. It must become `IF gc_state != 'deleting' AND
    storage_key = K1`, and the candidate/discovery identity must preserve `K1` until
    claim, finalize and cleanup. Otherwise a candidate enqueued for one life can claim or
-   clear another.
+   clear another. The `claimID` must also be a fresh UUID per worker attempt, not a
+   deterministic value derived from `candidateAt`; stale takeover and every release or
+   finalize must compare the previous attempt's `(K1, claimID, claimed_at)`.
 4. **`FinalizeBlockDelete` binds the life.** Its existing
    `IF gc_state = ? AND gc_claim_id = ?` (`store_cassandra.go:2227-2229`) grows
    `AND storage_key = K1`.
@@ -354,13 +395,13 @@ one of them. In particular the claim id is derived from the candidate timestamp
 (`blockDeleteClaimID(candidateAt)`, `internal/gc/worker.go:1276`) and is therefore
 *shared* by every attempt on the same logical candidate: one worker can drop the
 publication fence while another is still deleting under it, and the reuse probe can then
-hand a writer back the very incarnation being destroyed. Generational keys cannot prevent
-that, because no new incarnation is created. Neither option below closes it on its own;
+hand a writer back the very incarnation being destroyed. Physical-key uniqueness cannot
+prevent that, because no new incarnation is created. Neither option below closes it on its own;
 read the criteria in Registry X1 alongside this document.
 
 ---
 
-### Option A — sequential lives
+### Option A+ — sequential lives, hardened safety baseline
 
 GC drops the `blocks` row first, as today, and the writer keeps waiting until the whole
 destructive window is over:
@@ -376,17 +417,35 @@ people expect is structurally unnecessary: `ProbeBlockReuse` keeps its current m
 (an orphan blocks the logical block, because there is no live successor to distinguish it
 from), no "one outstanding delete" invariant has to be stated, and R11 cannot fire.
 
-**Why it is not recommended.** It is exactly today's protocol plus an identity, and it
-therefore inherits today's worst case in full: the writer is blocked for as long as the
-orphan row lives, which the measured section above puts at **up to 24 hours** when the
-S3 delete fails. Option A closes X1 and leaves that untouched.
+A+ is not merely "add a UUID". It combines sequential lives with the complete X1
+closure package: physical identity never reused; every destructive action bound to
+`(L, K, claimID)`; a fresh claim UUID per worker attempt with CAS-protected takeover;
+durable orphan creation before row removal; exact-key recovery and conditional orphan
+clear; a strong post-write publication check; and repair PUTs that revalidate the active
+canonical key immediately before writing. The existing X2 global liveness verification
+remains in orphan recovery under A+. A stale takeover must itself compare the prior
+`storage_key`, `gc_claim_id` and `gc_claimed_at`; age alone is not authority to release a
+claim owned by another attempt.
 
-Keep A on file as the fallback if B's corrections prove harder than they look. It is
-strictly smaller.
+For A+, any `gc_s3_orphans(L)` row remains a logical writer fence: after staging `up:` or
+`pub:`, publication succeeds only if `blocks(L)` exists, has a non-empty canonical
+`storage_key`, has no destructive or repair claim, and no orphan row exists for `L`.
+The check is stronger than merely asking whether a generic fence was observed earlier.
+
+**Cost.** The writer is blocked for as long as the orphan row lives, which the measured
+section above puts at **up to 24 hours** when the S3 delete fails. A+ can close X1 only
+when the complete package above is implemented and evidenced; never-reused keys alone
+close only the stale physical-delete ABA component.
+
+The existing `resolveFence` hook can later become a writer-assisted exact-key recovery
+optimization: attempt bounded recovery of the same `K1`, clear it conditionally only
+after success, then re-probe and mint `K2`. If S3 remains unavailable, the writer still
+fails closed and no successor life is created. That optimization is separate from the
+initial A+ safety closure.
 
 ---
 
-### Option B — overlapped lives ("d-lite") — **recommended**
+### Option B — overlapped lives ("d-lite") — **post-A+ optimization**
 
 Same drop-row-first ordering, but the writer stops waiting on the *physical* delete. The
 orphan row stops meaning "logical block `L` is blocked" and starts meaning "physical
@@ -488,6 +547,24 @@ longer the row being installed into. `RegisterUploadedBlock` therefore becomes
 key-aware: a repair preserves the current key, while a post-delete materialization uses a
 new key and an insert that wins the canonical row.
 
+#### Orphan creation outcomes — A+ and B
+
+`StartBlockDeleteOrphan` must distinguish an applied insert, an idempotent retry, a
+different lifecycle and an ambiguous database outcome. Treating all non-success results
+as conflicts is unsafe:
+
+| Result | Required action |
+|---|---|
+| `applied=true`, stored key `K1` | Proceed with `K1`; ensure the discovery projection and continue. |
+| `applied=false`, existing key `K1` | Treat as an idempotent resume of the same lifecycle; repair/ensure the projection and **do not release the claim**. |
+| `applied=false`, existing key differs from `K1` | Another physical delete is pending for this logical block; do not overwrite or reset it. Release the `K1` claim through its own CAS and postpone without spending the retry budget. |
+| Timeout, transport error or otherwise ambiguous CAS result | Do not release the claim. Read back/reconcile the orphan and retry fail-closed; an ambiguous result may mean that `orphan(L,K1)` already exists. |
+
+The storage interface may expose these outcomes directly or return enough existing-row
+identity for the worker to classify them. A retry that finds its own `K1` must never be
+treated as a competing lifecycle, while an ambiguous result must never reopen the claim
+window between `blocks(L)` and `orphan(L,K1)`.
+
 #### B.2 — The publication post-check must name the incarnation
 
 `StagePublishAttemptReferences` (`internal/db/block_references.go:495-513`) inserts the
@@ -509,7 +586,10 @@ insert `pub:` before GC has inserted `orphan(L,K1)`. A check that sees only "row
 and "no orphan yet" would accept a publication that GC is already authorized to remove.
 The post-check therefore requires `blocks(L)` to exist, `gc_state` and repair-claim state
 to be clear, and the canonical `storage_key` not to match a pending orphan. If any part
-is inconclusive, publication retries rather than succeeding.
+is inconclusive, the call must remove the `pub:` rows staged by that call and retry rather
+than succeeding. The rollback must be scoped to this attempt; if it fails, return an
+error/recovery signal rather than leaving a rejected publication live. The existing
+`pub:` TTL (35 days) is a leak bound, not a substitute for this rollback.
 
 `RegisterFSObjectBlockReferences` needs no check of its own: it runs only inside
 `PromotePublishAttemptReferences` (all three call sites — `seafhttp.go`, `sync.go`,
@@ -636,19 +716,21 @@ an active canonical incarnation preserve its key.
 | R2 | NA GC sees 0, then EU `up:` acked, then the writer's fence check | Writer sees the fence and returns a fence error; the wrapper retries. GC's DELETE names `K1` only, and the `blocks` cleanup is bound to `K1`. |
 | R3 | Writer stalled after `Probe=Reusable` (LQ, no fence yet); GC fences, sees 0, deletes `K1`; the writer then stages `pub:` | **Must not succeed as "pin `K1`".** The `pub:` stage needs the post-insert check of B.2. `fs:` needs no separate check — it runs inside the promote, under a still-live checked `pub:` row. |
 | R4 | GC sees 0, claims, verify still 0, row dropped, delayed S3 DELETE, writer PUTs | `K2` ≠ `K1`, so the delayed DELETE cannot hit `K2`. Orphan recovery must DELETE the **stored** key, never `hashToKey(block_id)`. |
-| R5 | Writer's probe misses a remote claim because the claim commits at `LOCAL_QUORUM` | **Fails the option.** The claim must commit with global visibility (`ALL` or equivalent). The orphan row also needs globally visible exclusion/recovery metadata, but after the canonical row is gone it is not a logical writer fence: a writer may install `K2` while orphan `K1` remains. |
+| R5 | Writer's probe misses a remote claim because the claim commits at `LOCAL_QUORUM` | **Fails the option.** The claim must commit with global visibility (`EACH_QUORUM`, or stricter `ALL`). The orphan row also needs globally visible exclusion/recovery metadata, but after the canonical row is gone it is not a logical writer fence: a writer may install `K2` while orphan `K1` remains. |
 | R6 | A non-local `QUORUM` GC read (2 of 3), writer LQ in the DC not contacted | **Forbidden.** Empirically red on the three-DC harness. |
 | R7 | One DC down during the authorizing read | Fail closed; no DELETE. Already the shipped behaviour. |
 | R8 | Who installs the next life, and with what CAS | `blocks` is one row per logical block and the install is `INSERT … IF NOT EXISTS`. **A:** the writer waits until the row is gone, so a plain insert suffices. **B:** the writer waits only until GC drops the row — same plain insert for a new incarnation. If the row still exists and is healthy, `NeedsPut` repairs the current key instead; it must not mint a losing second object. Neither needs a new CAS or a second table beyond the physical identity carried by the candidate/claim. |
-| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos rounds can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. |
+| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos rounds can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. The losing writer still knows its exact key and should best-effort delete it, or persist that exact key for cleanup. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
 | R10 | Writer stalls after `Probe=Reusable(K1)`; GC fences, sees 0, authorizes `DELETE K1`; the writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT a condemned key. Confirmed live: the `Reusable` branch of `StoreUploadedBlockForProbe` (`upload_reuse.go:152-174`) does `ObjectExists` → repair-PUT with **no** fence re-check, and `EnsureReusableBlockPresent` passes `beforePut = nil` (`:205`). The one caller that supplies `beforePut` (`v2/blocks.go:996`) uses it for the staging cap, not for the fence. Under minted keys the clean rule is **repair an active current incarnation with its current key; never repair a condemned incarnation — wait and mint a new key after the row is free**. |
 | R11 | `K1`'s delete completes, `K2` is created and live, then `K1`'s `cleanupBlockMapping` runs | The SHA-1→SHA-256 mapping now belongs to `L` and must survive. `RecoverS3Orphans` guards with `BlockExists` (`worker.go:1404`); `processBlock` has no equivalent (`worker.go:1256`), safe today only because the orphan fence blocks resurrection outright — which is exactly what B gives up. **Load-bearing under B**; preventive under A. B.3 proposes removing the coupling entirely. |
 | R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. See the inventory below — it is **eleven** statements, not six. |
-| R13 | `INSERT orphan(L,K1)` succeeds, `DELETE blocks` row fails persistently, the claim is released as stale after 15 min | **New, and it is a data-loss path under B.** The row is now live, unclaimed, and pointing at a key already authorized for retirement. Today `ProbeBlockReuse` refuses it because `hasOrphan` outranks everything (`block_references.go:927`); B must replace that logical fence with a key-aware one. The corrected outcome is not to mint `K2` while `blocks(L) -> K1` still exists: both repair and install paths must block because the canonical key is condemned. Once the row is removed, `K2` may be minted. This makes step 6 of the naive protocol ("`K1` is irrevocably retired once the orphan is written") false: retirement completes when the canonical row stops naming `K1`. |
+| R13 | `INSERT orphan(L,K1)` succeeds, `DELETE blocks` row fails persistently, and a later candidate pass may release the claim once it is at least 15 minutes old | **New, and it is a data-loss path under B.** The row is now live, unclaimed, and pointing at a key already authorized for retirement. Today `ProbeBlockReuse` refuses it because `hasOrphan` outranks everything (`block_references.go:927`); B must replace that logical fence with a key-aware one. The corrected outcome is not to mint `K2` while `blocks(L) -> K1` still exists: both repair and install paths must block because the canonical key is condemned. Once the row is removed, `K2` may be minted. This makes step 6 of the naive protocol ("`K1` is irrevocably retired once the orphan is written") false: retirement completes when the canonical row stops naming `K1`. |
 | R14 | A candidate enqueued for `K1` is processed after `K1` died and `K2` was installed | The claim CAS must bind the key (`IF … AND storage_key = K1`), or GC claims a life it never verified. The candidate/discovery work item must carry the expected physical key far enough for claim, finalize and candidate cleanup to reject stale `K1` work instead of touching `K2`. `processBlock` re-reads `GetBlockInfo` after the claim, which limits the damage, but the CAS should still name the life. |
+| R15 | `StartBlockDeleteOrphan` returns a conflict or ambiguous error after the orphan insert may have applied | Same-key conflict is an idempotent resume and must retain the claim; a different key is a confirmed competing lifecycle and may release/postpone by CAS; timeout/error must not release until read-back resolves it. Treating every non-applied result as a conflict reopens the claim/orphan gap. |
 
-R8 and R13 decide whether Option B is viable. R3, R9, R10, R11 and R12 decide whether it
-is correct once it is.
+R8, R13 and R15 decide whether Option B is viable. R3, R9, R10, R11 and R12 decide
+whether it is correct once it is. A+ still requires the common claim/orphan and
+publication package, but does not permit overlapping canonical lives.
 
 ---
 
@@ -685,9 +767,10 @@ The orphan partition carries five more conditional statements
 (`internal/gc/store_cassandra.go:1577, 1598, 1630, 1685, 1717`) plus one
 **unconditional** `DELETE` that clears the record (`internal/db/block_references.go:1199`),
 which B.1 requires to become conditional. Every relevant LWT in both partitions uses
-serial phase `SERIAL`, with the regular commit level chosen per statement (`ALL` for
-claim/orphan visibility, `QUORUM` or higher for installation). This is a consistency
-discipline, not cross-table atomicity.
+serial phase `SERIAL`, with `EACH_QUORUM` as the default regular commit for global
+claim/orphan visibility (`ALL` is stricter but not required for intersection with an
+explicit `LOCAL_QUORUM` writer read), and `QUORUM` or higher for installation. This is a
+consistency discipline, not cross-table atomicity.
 
 There is a related defect already filed against the same decision:
 `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, documented at length in
@@ -737,15 +820,15 @@ A conceptual diff, not an implementation list.
 | `hashToKey` / `StorageKeyForHash` | Deterministic locator | First-life helper only; the live locator is the persisted `storage_key` |
 | `DeleteBlock(hash)` / `BlockStoreDeleter` | Derives the key from the hash | Delete the exact key captured in the GC work. **No exact-key delete exists today** |
 | `GetBlock` / `BlockExists` / `PutBlock` / `PutBlockData` / `PutBlockAuto` / `PutBlockAutoDirect` | All derive via `hashToKey` | Take an exact key, or resolve one first. Exact-key `Put`/`Exists`/`Get` variants already exist and are the model |
-| `CheckBlocksExist` (canonical reader, primary `/check-blocks`) and `CheckBlocks` / `CheckBlocksParallel` (legacy fallback) | Both HEAD a key derived from the hash | **The dedup oracle stops being answerable by a derived HEAD and becomes a database question.** This is the widest change in the whole option and should not be filed under "locator" |
+| `CheckBlocksExist` (canonical reader, primary `/check-blocks`) and `CheckBlocks` / `CheckBlocksParallel` (legacy fallback) | Resolve the canonical location, then HEAD a key derived from the hash | Keep the physical existence check: `L → DB resolves (storage_class, storage_key) → HEAD exact storage_key → exists/missing`. This is a derived-HEAD to DB-resolved exact-key change, not a database-only dedup answer. |
 | `S3Store.Put(ctx, blockID, …)` | Second derivation layer: `s.key(blockID)` on what callers already pass as a key | Make the key parameter mean a key |
 | `canonical_block_reader.go:238` | Rejects persisted ≠ derived | Use the persisted key; validate org/hash/format instead |
-| `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Repair/reuse the active canonical key on `NeedsPut`; mint only when a new incarnation is allowed; never repair a condemned incarnation (R10) |
+| `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Immediately before repair PUT, re-read the canonical row and require the same `storage_key`, no destructive/repair claim and no orphan. Repair/reuse that active key; mint only when a new incarnation is allowed; never repair a condemned incarnation (R10) |
 | `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` inheriting the session serial level | Store the exact key; raise the serial phase to `SERIAL` so one incarnation wins globally (R9) |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND storage_key = K1` (R14) |
 | `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, inheriting the session serial level | Serial phase `SERIAL` — the one-serial-domain rule admits no exceptions on this partition (R12) |
 | `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | PK `((org_id, block_id))`; grew `external_sha1`/`recovery_phase` (migration 007) and `representation_id` (009) | Add the exact `storage_key` to both; recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on the key |
-| `StartBlockDeleteOrphan` | `INSERT … IF NOT EXISTS`, then **resets** an existing row to `pending_s3` | Real mutual exclusion: on conflict, release the claim and postpone (B.1) |
+| `StartBlockDeleteOrphan` | `INSERT … IF NOT EXISTS`, then **resets** an existing row to `pending_s3` | Return/classify applied, same-key idempotent, different-key conflict and ambiguous error; never overwrite/reset, never release on an ambiguous result, and postpone only a confirmed different lifecycle (B.1) |
 | `gcS3OrphanInitialScanLookbackDays = 90` | Cold-start horizon, matched to the TTL | Redefine together with the TTL removal |
 | `RecoverS3Orphans` | Re-verifies `BlockExists(L)` and `BlockHasReferencesGlobal(L)` | Inherit authorization from the orphan row, but compare the canonical `storage_key` before deletion; delete the exact key only when the row is absent or points elsewhere (B.1) |
 | `cleanupBlockMapping` | Deletes the SHA-1 mapping unconditionally from `processBlock`; `RecoverS3Orphans` guards with `BlockExists` | Decouple from the physical lifecycle (B.3), or add the same guard to `processBlock` (R11) |
@@ -758,29 +841,35 @@ A conceptual diff, not an implementation list.
 
 Ordered so the cheapest decisions come first.
 
-1. **R13 — the orphan must fence the key, not the logical block.** Settle the probe,
-   `NeedsPut`/repair semantics and install predicates. Nothing else in B is safe until
-   this is decided.
-2. **R12 — one serial domain**, across eleven `blocks` statements and the
-   `gc_s3_orphans` partition.
-3. **B.1 — the authorization amendment.** Write the new argument for
-   `RecoverS3Orphans` and rewrite the registry's X2 paragraph to match.
-4. **R3 — the `pub:` post-check**, in the B.2 form: active canonical row, no destructive
-   or repair claim, and canonical key not orphaned.
-5. **R10 — never repair a condemned incarnation.**
-6. **R9 — the losing PUT.** `SERIAL` picks a canonical winner, but the loser's minted key
-   is recorded nowhere: no `blocks` row, no orphan row. With derived keys a stray object
-   was reconcilable with a single HEAD; with minted keys it needs a bucket inventory,
-   which does not exist. Classify it as an X3-class leak and decide whether an inventory
-   story is in scope.
-7. **B.3 — the SHA-1 mapping.** Decouple and accept the growth, or build the reaper.
-8. **The TTL package**, all four changes together.
-9. **GC drain capacity.** The queue loop in `internal/gc/worker.go` is strictly serial at
-   `gc.batch_size = 100` on a `gc.worker_interval = 30s` tick. Any design that fences
-   globally adds per-block WAN LWTs to that loop. This is a throughput question, not a
-   latency one, and "GC is not the hot path" does not answer it. Independent of which
-   option wins.
-10. **Fail-closed observability.** `EACH_QUORUM` couples GC availability to every DC, and
+1. **A+ claim identity.** Replace the candidate-derived claim with a fresh UUID per
+   worker attempt; carry `(K, claimID, claimed_at)` through claim, release, finalize,
+   stale takeover and candidate cleanup.
+2. **A+ orphan outcomes (R15).** Distinguish applied, same-key idempotent, different-key
+   conflict and ambiguous CAS results. Never release on an ambiguous result.
+3. **R3 — the `pub:` post-check.** Require an active canonical row, no destructive or
+   repair claim, and a usable non-orphaned key. A failed post-check must roll back the
+   `pub:` rows staged by that call, with rollback failure treated as recovery/error rather
+   than publication success.
+4. **R10 — never repair a condemned incarnation.** Revalidate the exact canonical key,
+   claim state and orphan state immediately before repair PUT.
+5. **R12 — one serial domain**, across eleven `blocks` statements and the
+   `gc_s3_orphans` partition; use `SERIAL` for the serial phase and `EACH_QUORUM` as the
+   default regular visibility level for the global fence.
+6. **B-specific R13/B.1.** If B is pursued, settle the key-aware probe/install rules and
+   rewrite the recovery argument so `K1` authorization is not confused with `L` liveness.
+7. **R9 — the losing PUT.** `SERIAL` picks a canonical winner, but the loser's minted key
+   is not in `blocks` or an orphan row. The losing writer still knows that exact key and
+   should best-effort delete it or persist it for cleanup. A crash after PUT but before
+   any durable intent remains the existing X3 leak; do not make bucket inventory a
+   prerequisite for X1.
+8. **B.3 — the SHA-1 mapping.** Decouple and accept the growth, or build the reaper.
+9. **The TTL package**, all four changes together.
+10. **GC drain capacity.** The queue loop in `internal/gc/worker.go` is strictly serial at
+    `gc.batch_size = 100` on a `gc.worker_interval = 30s` tick. Any design that fences
+    globally adds per-block WAN LWTs to that loop. This is a throughput question, not a
+    latency one, and "GC is not the hot path" does not answer it. Independent of which
+    option wins.
+11. **Fail-closed observability.** `EACH_QUORUM` couples GC availability to every DC, and
     at RF 1 the tolerance is zero. Correct under "when in doubt, do not delete", but a
     silent stall defers the user/library/org purge SLAs and leaves space uncollected.
 
@@ -798,5 +887,6 @@ retrieve it from the reference branch rather than inventing a third protocol.
 of protocol specification) and PR #166, closed unmerged on 2026-08-14. It is retained as
 **investigative reference only**. Nothing in it is accepted, frozen, or scheduled, and no
 document should cite it as a design of record. Its lasting contributions are recorded
-above: never-reused physical keys as the only thing that closes X1, the one-serial-domain
-rule, and the exact-key recovery requirement.
+above: never-reused physical keys as the thing that closes the physical-delete ABA
+component (not X1 by itself), the one-serial-domain rule, and the exact-key recovery
+requirement.

@@ -50,7 +50,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 
 ### Storage
 - **MinIO**: (Docker image version in docker-compose.yaml)
-- **AWS SDK for Go**: (check go.mod for S3 client version)
+- **AWS SDK for Go v2**: core `v1.41.5`; S3 `v1.97.3` (`go.mod`)
 
 ### Crypto
 - **bcrypt**: `golang.org/x/crypto/bcrypt`

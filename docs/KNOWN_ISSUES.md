@@ -2039,7 +2039,7 @@ stale-delete component of X1: a stale delete can then target only the old key. P
 claim ownership and recovery liveness must also be implemented and verified. Keep
 destructive GC disabled until the complete X1 criteria pass.
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
-and the recommended design in
+and the A+ safety-baseline recommendation in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).
 
 ---

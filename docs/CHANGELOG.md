@@ -443,12 +443,14 @@ new relative to the withdrawn document:
   assumes no cross-table atomicity. Once the canonical row is gone, an orphan is a
   durable physical-delete record, not a logical writer fence; a later incarnation may
   proceed while the old key is recovered.
-- **A recommended option ("d-lite"): overlapped physical lives.** The writer stops waiting
-  on the physical delete and waits only for GC to release the metadata row. Its price is
-  named exactly: every destructive authorization in the code today is keyed by the
-  *logical* block id, and once two lives can coexist `BlockExists(L)` freezes the orphan
-  cursor permanently, `BlockHasReferencesGlobal(L)` can never authorize the older key, and
-  `StartBlockDeleteOrphan` overwrites the older key's only durable record.
+- **The option comparison now distinguishes the safety baseline from the availability
+  optimization.** A+ keeps physical lives sequential and carries the complete claim,
+  exact-key, publication and recovery package. d-lite/B can later stop waiting on the
+  physical delete, but its price is named exactly: every destructive authorization in the
+  code today is keyed by the *logical* block id, and once two lives can coexist
+  `BlockExists(L)` freezes the orphan cursor permanently, `BlockHasReferencesGlobal(L)`
+  can never authorize the older key, and `StartBlockDeleteOrphan` overwrites the older
+  key's only durable record.
 - **A new data-loss race, R13.** If the orphan insert succeeds and the `blocks` row delete
   fails persistently, the row survives pointing at a key already authorized dead. Today
   `ProbeBlockReuse` refuses it only because `hasOrphan` outranks everything

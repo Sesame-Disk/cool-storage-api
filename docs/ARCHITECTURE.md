@@ -621,7 +621,7 @@ requires a separately certified migration before GC can be reconsidered.
 | **Debian** | Trixie 13 slim | `debian:trixie-slim` |
 | **Cassandra** | 5.0.9 | Matches the Compose images; pin a digest for production acceptance |
 | **gocql driver** | v2.0.0 | Apache official driver |
-| **aws-sdk-go-v2** | v1.41.0 | Latest |
+| **aws-sdk-go-v2** | v1.41.5 | Matches `go.mod` |
 | **Gin** | v1.11.0 | HTTP framework |
 
 ---
