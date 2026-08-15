@@ -430,20 +430,27 @@ orphan(L,P1) durable → drop blocks row → DELETE exact P1 → clear orphan(P1
                                     writer wakes, mints K2, INSERT IF NOT EXISTS
 ```
 
-`K1` and `K2` never coexist. Because the lives are serialized, most of the machinery
-people expect is structurally unnecessary: `ProbeBlockReuse` keeps its current meaning
-(an orphan blocks the logical block, because there is no live successor to distinguish it
-from), no "one outstanding delete" invariant has to be stated, and R11 cannot fire.
+`P1` and `P2` never coexist **as canonical lives**. State the guarantee that way rather
+than "only one object can exist", which R9 disproves: two writers leaving the wait
+together can both PUT before the install CAS picks a winner, so two *objects* for one `L`
+are reachable. What A+ guarantees is that no canonical successor exists while the
+predecessor's destructive lifecycle is still open. Because the canonical lives are
+serialized, most of the machinery people expect is structurally unnecessary:
+`ProbeBlockReuse` keeps its current meaning (an orphan blocks the logical block, because
+there is no live successor to distinguish it from), no "one outstanding delete" invariant
+has to be stated, and R11 cannot fire.
 
-A+ is not merely "add a UUID". It combines sequential lives with the complete X1
-closure package: physical identity `P` never reused; every destructive action bound to
+A+ is not merely "add a UUID". It combines sequential canonical lives with the complete
+X1 closure package: physical identity `P` never reused; every destructive action bound to
 `(L, P, claimID)`; a fresh claim UUID per worker attempt with CAS-protected takeover;
 durable orphan creation before row removal; exact-key recovery and conditional orphan
-clear; a strong post-write publication check; and repair PUTs that revalidate the active
-canonical key immediately before writing. The existing X2 global liveness verification
-remains in orphan recovery under A+. A stale takeover must itself compare the prior
-`storage_key`, `gc_claim_id` and `gc_claimed_at`; age alone is not authority to release a
-claim owned by another attempt.
+clear; a strong post-write publication check; repair strictly separated from install
+(R17); and ambiguous LWT outcomes settled in the serial domain (R20). The existing X2
+global liveness verification remains in orphan recovery under A+ — **subject to R18,
+which is the one place that argument does not carry over unexamined.** A stale takeover
+must itself compare the prior `(P1, claimID, claimed_at)` — storage class included, since
+`P` and not `storage_key` is the identity; age alone is not authority to release a claim
+owned by another attempt.
 
 For A+, any `gc_s3_orphans(L)` row remains a logical writer fence: after staging `up:` or
 `pub:`, publication succeeds only if `blocks(L)` exists, has a non-empty canonical
@@ -580,12 +587,27 @@ as conflicts is unsafe:
 | Timeout, transport error or otherwise ambiguous CAS result | Do not release the claim. Read back/reconcile the orphan and retry fail-closed; an ambiguous result may mean that `orphan(L,P1)` already exists. |
 
 The storage interface may expose these outcomes directly or return enough existing-row
-identity for the worker to classify them. A retry that finds its own `K1` must never be
+identity for the worker to classify them. A retry that finds its own `P1` must never be
 treated as a competing lifecycle, while an ambiguous result must never reopen the claim
-window between `blocks(L)` and `orphan(L,P1)`. The canonical `blocks(L)` row must not be
-removed until both the canonical orphan row and its `_by_day` recovery projection are
-confirmed durable. A projection failure retains the claim and canonical row for retry;
-it must not leave an orphan that the cursor cannot rediscover.
+window between `blocks(L)` and `orphan(L,P1)` — and per **R20** it is settled in the
+serial domain, never by an ordinary read used as negative authority.
+
+**"Durable" needs an operational definition, not just the word.** The canonical
+`blocks(L)` row must not be removed until both the canonical orphan row and its `_by_day`
+recovery projection are durable, which means:
+
+| Write | Requirement |
+|---|---|
+| Canonical `gc_s3_orphans` row | LWT, serial phase `SERIAL`, regular commit `EACH_QUORUM` — same global visibility as the claim |
+| `gc_s3_orphans_by_day` projection | Ordinary write, but at an **explicit** per-statement consistency, acknowledged before `FinalizeBlockDelete`. It needs no Paxos, but it must not silently inherit whatever the session default happens to be |
+
+The projection is load-bearing for recovery *liveness*, not for authorization: losing it
+after the canonical row is removed is safe against data loss but leaves a fence that the
+day-cursor sweep never rediscovers. `upsertS3OrphanProjection` already returns its error
+to `StartBlockDeleteOrphan`, and `processBlock` already fails closed before
+`FinalizeBlockDelete` (`store_cassandra.go:1606-1608`), so **the ordering is correct
+today** — this rule exists so a refactor cannot lose it, and so the projection's
+consistency stops being implicit.
 
 #### B.2 — The publication post-check must name the incarnation
 
@@ -749,12 +771,17 @@ an active canonical incarnation preserve its key.
 | R13 | `INSERT orphan(L,P1)` succeeds, `DELETE blocks` row fails persistently, and a later candidate pass may release the claim once it is at least 15 minutes old | **New, and it is a data-loss path under B.** The row is now live, unclaimed, and pointing at a physical tuple already authorized for retirement. Today `ProbeBlockReuse` refuses it because `hasOrphan` outranks everything (`block_references.go:927`); B must replace that logical fence with a tuple-aware one. The corrected outcome is not to mint `P2` while `blocks(L) -> P1` still exists: both repair and install paths must block because the canonical tuple is condemned. Once the row is removed, `P2` may be minted. This makes step 6 of the naive protocol ("`P1` is irrevocably retired once the orphan is written") false: retirement completes when the canonical row stops naming `P1`. |
 | R14 | A candidate enqueued for `P1=(C1,K1)` is processed after `P1` died and `P2` was installed | The claim CAS must bind the physical tuple (`IF … AND storage_class = C1 AND storage_key = K1`), or GC claims a life it never verified. The candidate/discovery work item must carry `P1` far enough for claim, finalize and candidate cleanup to reject stale work instead of touching `P2`. `processBlock` re-reads `GetBlockInfo` after the claim, which limits the damage, but the CAS should still name the life. |
 | R15 | `StartBlockDeleteOrphan` returns a conflict or ambiguous error after the orphan insert may have applied | Same-key conflict is an idempotent resume and must retain the claim; a different key is a confirmed competing lifecycle and may release/postpone by CAS; timeout/error must not release until read-back resolves it. Treating every non-applied result as a conflict reopens the claim/orphan gap. |
-| R16 | A fresh attempt `D2` calls `ClaimBlockDelete(P1,D2)` while `P1` is already claimed by fresh `D1` | `!applied` is not completion. Classify row absent, same `P1` with fresh `D1` (postpone and preserve the candidate), same `P1` with stale `D1` (take over with CAS), different `P` (stale candidate; never touch it), and ambiguous timeout (read back/reconcile, no candidate cleanup). A fresh claim UUID invalidates the current `!applied → DeleteBlockGCCandidate` shortcut. |
+| R16 | A fresh attempt `D2` calls `ClaimBlockDelete(P1,D2)` while `P1` is already claimed by fresh `D1` | `!applied` is not completion. Classify row absent, same `P1` with fresh `D1` (postpone and preserve the candidate), same `P1` with stale `D1` (take over with CAS), different `P` (stale candidate; never touch it), and ambiguous timeout (settle serially per R20; no candidate cleanup). A fresh claim UUID invalidates the current `!applied → DeleteBlockGCCandidate` shortcut. |
+| R17 | A **repair** that began against `P1` completes its metadata write after `P1`'s whole destructive lifecycle finished | **Reopens X1, and revalidating before the repair PUT does not close it.** The dangerous step is the metadata install, not the PUT. `RegisterUploadedBlock` ends at `UpsertBlockMetadata`, whose first statement is `INSERT … IF NOT EXISTS` (`block_references.go:167-171`), and the `storageKey` it inserts is the one captured during the store phase (`StoreUploadedBlockForProbe` → `RegisterUploadedBlockAndMapping` → `RegisterUploadedBlock`). Sequence: writer revalidates `P1` and repair-PUTs it, then stalls; GC claims, verifies zero, orphans, drops the row, and its first exact DELETE times out ambiguously while a retry reports success; GC clears the orphan; the writer resumes, sees **no** fence (row and orphan are both gone), and its `INSERT … IF NOT EXISTS` **applies**, re-installing `blocks(L) → P1`; the confirm phase re-PUTs the object; the ambiguous first DELETE lands and the live bytes vanish. **Required outcome: repair and install must be different operations.** `REPAIR(P1)` may only *update* a canonical row that still names `P1` and must never create an absent row — if `blocks(L)` disappeared or changed, it returns retryable and the wrapper re-probes from scratch, minting `P2` if a new incarnation is warranted. Only `INSTALL(P2)`, on a key minted in this attempt, may `INSERT … IF NOT EXISTS`. |
+| R18 | A rejected upload leaves a live `up:` reference that vetoes recovery of the very key it was rejected for | **A+-specific, because A+ keeps `BlockHasReferencesGlobal(L)` in recovery.** `RegisterUploadedBlock` writes the provisional reference **before** checking the fence and deliberately does **not** roll it back when the fence is active (`fs_helpers.go:989-1003`); its TTL is 48 h (`ProvisionalBlockReferenceTTLSeconds`). So a writer that wakes after GC's `EACH_QUORUM` zero can insert `up:`, be refused, and leave a reference behind. Recovery then reads `refs(L) > 0` and refuses to delete `P1` — and that branch deliberately sets no `phaseErr`, so the cursor advances and the row **leaves the working set permanently** (`worker.go:1502-1530`, already filed as `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`). Rolling back the `up:` write is not a sufficient answer: the writer can die between the insert and the fence observation. Either A+ adopts the same durable-authorization argument as B for recovery (the orphan records that `P1` was authorized; a later reference does not re-authorize it), or it needs a durable way to distinguish references that actually published from rejected/crashed ones, plus re-projection of the orphan until they clear. **Decide this explicitly — it is the one place where A+ does not get X2's recovery argument for free.** |
+| R19 | A non-creating orphan mutation resurrects a cleared orphan row | `UpdateS3OrphanAttempt` is a plain `UPDATE … WHERE org_id = ? AND block_id = ?` with no `IF` (`store_cassandra.go:1742-1759`), and in Cassandra that is an upsert. A recoverer whose S3 delete failed can write it after another path already cleared the row, recreating a **partial** row with `last_attempt_at`/`retry_count`/`last_error` and no `storage_class`, no `recovery_phase`, no `first_seen_at` — and no `_by_day` projection row, because that mutation does not touch the projection. The result is worse than a stale row: under A+ it is a **writer fence** (`ProbeBlockReuse` answers `BlockedByGC` on any orphan) that recovery can never enumerate, and if the TTL is removed as the TTL package proposes, it never expires either. **Rule: once `P` exists, `StartBlockDeleteOrphan` is the only mutation allowed to create orphan state.** Every update/phase/clear is conditional on the expected `P` and fails when the row is gone. The `_by_day` table is a discovery index and never a source of authorization. |
+| R20 | An LWT returns a timeout or otherwise ambiguous result and the caller resolves it with an ordinary read | **An ordinary read is never authority to conclude that a claim or orphan does not exist.** Cassandra can accept a Paxos proposal that the client never learns, and an ordinary read need not materialize it — this is exactly the defect already filed as `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` and documented at `store_cassandra.go:1880-1910`, where the comment defers the fix to "the serial-domain decision X1 has to make anyway". Every "read back and reconcile" in R15 and R16 means **settle in the serial domain** — a `SERIAL` read or an idempotent retry of the same CAS — never a plain read used as *negative* authority. If settlement cannot be established (timeout, DC unavailable, serial quorum unreachable), the response is: retain the claim, retain the candidate, do not finalize, do not release, do not clear the orphan. Fail closed. |
 
-R8, R13 and R15 decide whether Option B is viable. R16, R3, R9, R10, R11 and R12 are
-common closure criteria, with R16 becoming newly load-bearing when claim IDs move from
-candidate identity to per-attempt UUIDs. A+ still requires the common claim/orphan and
-publication package, but does not permit overlapping canonical lives.
+R8, R13 and R15 decide whether Option B is viable. R16, R17, R19, R20, R3, R9, R10, R11
+and R12 are common closure criteria — R16 and R20 become newly load-bearing when claim IDs
+move from candidate identity to per-attempt UUIDs, and R17 is the one that shows why
+"revalidate immediately before the repair PUT" was never sufficient on its own. **R18 is
+A+-specific and is the one open question A+ does not inherit from X2 for free.**
 
 ---
 
@@ -857,44 +884,66 @@ A conceptual diff, not an implementation list.
 | `RecoverS3Orphans` | Re-verifies `BlockExists(L)` and `BlockHasReferencesGlobal(L)` | **A+:** retain `BlockHasReferencesGlobal(L)` and the canonical-row check, then delete exact validated `P1`. **B:** the orphan may carry the historical authorization for `P1`, but recovery still validates the canonical locator and legacy/keyless rows fail closed. |
 | `cleanupBlockMapping` | Deletes the SHA-1 mapping unconditionally from `processBlock`; `RecoverS3Orphans` guards with `BlockExists` | Decouple from the physical lifecycle (B.3), or add the same guard to `processBlock` (R11) |
 | `StagePublishAttemptReferences` | Insert only | Post-check the active canonical incarnation. **A+:** any orphan for `L` blocks success. **B:** the canonical `P` must differ from the pending orphan `P1`; both also require no destructive/repair claim. Roll back this call's `pub:` rows on failure. |
-| `RegisterUploadedBlock` | Write `up:` then check the logical fence | Make the materialization path key-aware: repair/reuse the active canonical key, block a condemned/deleting key, and mint a new key only after the canonical row is absent. The post-check must establish an active, unorphaned canonical incarnation. |
+| `RegisterUploadedBlock` | Write `up:` then check the logical fence, then `UpsertBlockMetadata`; the provisional ref is **not** rolled back when the fence is found active (`fs_helpers.go:989-1003`) | Split repair from install (**R17**): a repair may only update a row that still names the same `P`, never create an absent one. Make the path tuple-aware: reuse/repair the active canonical `P`, block a condemned/deleting one, mint only for a genuine new incarnation. And settle what the surviving `up:` row does to recovery (**R18**) |
+| `UpdateS3OrphanAttempt` | Plain `UPDATE` with no `IF` (`store_cassandra.go:1742-1759`) — an upsert that can recreate a cleared orphan as a partial row with no `storage_class` and no `_by_day` projection | Condition on the expected `P` and fail when the row is gone (**R19**). Only `StartBlockDeleteOrphan` may create orphan state |
 
 ---
 
 ## Open questions to settle before anything is accepted
 
-Ordered so the cheapest decisions come first.
+Item 0 comes first because it reopens X1 outright; the rest are ordered so the cheapest
+decisions come first.
 
+0. **R17 — repair must never become install.** The highest-severity item on this list and
+   the only one that reopens X1 outright. Split the metadata path in two: `REPAIR(P1)`
+   updates a canonical row that still names `P1` and **may not create an absent row**;
+   only `INSTALL(P2)`, on a key minted in this attempt, may `INSERT … IF NOT EXISTS`.
+   Settle this before anything else, because "revalidate before the repair PUT" reads
+   like a fix and is not one.
 1. **A+ claim identity.** Replace the candidate-derived claim with a fresh UUID per
-   worker attempt; carry `(K, claimID, claimed_at)` through claim, release, finalize,
+   worker attempt; carry `(P, claimID, claimed_at)` through claim, release, finalize,
    stale takeover and candidate cleanup.
-2. **A+ CAS outcomes (R15/R16).** Distinguish applied, same-physical-identity
+2. **A+ CAS outcomes (R15/R16/R20).** Distinguish applied, same-physical-identity
    idempotent, different-identity conflict, existing fresh owner, stale owner and
-   ambiguous results. Never release or complete a candidate on an ambiguous result.
-3. **R3 — the `pub:` post-check.** Require an active canonical row, no destructive or
+   ambiguous results. Settle ambiguity in the serial domain; never release, finalize or
+   complete a candidate on an ordinary read used as negative authority. This subsumes
+   `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, which was explicitly deferred to this
+   decision.
+3. **R18 — post-authorization reference poisoning.** Decide whether A+ keeps
+   `BlockHasReferencesGlobal(L)` in recovery or adopts B's durable-authorization
+   argument. As written, a rejected upload's surviving `up:` row can veto recovery of the
+   key it was rejected for, and the refusal branch drops the orphan out of the working
+   set. This is the one A+ question that X2's closure does not answer.
+4. **R3 — the `pub:` post-check.** Require an active canonical row, no destructive or
    repair claim, and a usable non-orphaned key. A failed post-check must roll back the
    `pub:` rows staged by that call, with rollback failure treated as recovery/error rather
    than publication success.
-4. **R10 — never repair a condemned incarnation.** Revalidate the exact canonical key,
-   claim state and orphan state immediately before repair PUT.
-5. **R12 — one serial domain**, across eleven `blocks` statements and the
+5. **R10 — never repair a condemned incarnation.** Revalidate the exact canonical key,
+   claim state and orphan state immediately before repair PUT. Necessary but not
+   sufficient on its own — see R17.
+6. **R19 — orphan mutation resurrection.** After `P` exists, `StartBlockDeleteOrphan` is
+   the only mutation permitted to create orphan state; every update/phase/clear is
+   conditional on the expected `P` and fails when the row is gone.
+7. **R12 — one serial domain**, across eleven `blocks` statements and the
    `gc_s3_orphans` partition; use `SERIAL` for the serial phase and `EACH_QUORUM` as the
    default regular visibility level for the global fence.
-6. **B-specific R13/B.1.** If B is pursued, settle the key-aware probe/install rules and
-   rewrite the recovery argument so `K1` authorization is not confused with `L` liveness.
-7. **R9 — the losing PUT.** `SERIAL` picks a canonical winner, but the loser's minted key
+8. **B-specific R13/B.1.** If B is pursued, settle the tuple-aware probe/install rules and
+   rewrite the recovery argument so `P1` authorization is not confused with `L` liveness.
+9. **R9 — the losing PUT.** `SERIAL` picks a canonical winner, but the loser's minted key
    is not in `blocks` or an orphan row. The losing writer still knows that exact key and
    should best-effort delete it or persist it for cleanup. A crash after PUT but before
    any durable intent remains the existing X3 leak; do not make bucket inventory a
    prerequisite for X1.
-8. **B.3 — the SHA-1 mapping.** Decouple and accept the growth, or build the reaper.
-9. **The TTL package**, all four changes together.
-10. **GC drain capacity.** The queue loop in `internal/gc/worker.go` is strictly serial at
+10. **B.3 — the SHA-1 mapping.** Decouple and accept the growth, or build the reaper.
+11. **The TTL package**, all four changes together — and note R19 first: removing the TTL
+    without closing the resurrection path turns a partial resurrected orphan into a
+    permanent, undiscoverable writer fence.
+12. **GC drain capacity.** The queue loop in `internal/gc/worker.go` is strictly serial at
     `gc.batch_size = 100` on a `gc.worker_interval = 30s` tick. Any design that fences
     globally adds per-block WAN LWTs to that loop. This is a throughput question, not a
     latency one, and "GC is not the hot path" does not answer it. Independent of which
     option wins.
-11. **Fail-closed observability.** `EACH_QUORUM` couples GC availability to every DC, and
+13. **Fail-closed observability.** `EACH_QUORUM` couples GC availability to every DC, and
     at RF 1 the tolerance is zero. Correct under "when in doubt, do not delete", but a
     silent stall defers the user/library/org purge SLAs and leaves space uncollected.
 

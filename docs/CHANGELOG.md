@@ -458,6 +458,35 @@ new relative to the withdrawn document:
   (`block_references.go:927`) — so a design that stops fencing on the logical block must
   fence on the *key* instead, or an upload reports success while the canonical row still
   names bytes that recovery will delete.
+- **R17 — a repair can become an install, and that reopens X1.** The highest-severity race
+  found in this series, and it shows why "revalidate immediately before the repair PUT"
+  was never sufficient: the dangerous step is the metadata write, not the PUT.
+  `RegisterUploadedBlock` ends at `UpsertBlockMetadata`, whose first statement is
+  `INSERT … IF NOT EXISTS` (`block_references.go:167-171`), carrying the `storage_key`
+  captured during the store phase. A writer that repair-PUTs `P1` and then stalls through
+  a complete GC lifecycle resumes to find no fence — row and orphan both gone — and its
+  insert *applies*, re-installing `blocks(L) → P1`; a delayed DELETE from the earlier
+  ambiguous attempt then removes live bytes. Repair and install must be different
+  operations: a repair may only update a row that still names the same `P`.
+- **R18 — a rejected upload can veto recovery of the key it was rejected for.** A+-specific,
+  because A+ keeps `BlockHasReferencesGlobal(L)` in recovery. `RegisterUploadedBlock`
+  writes the provisional `up:` reference *before* the fence check and deliberately does not
+  roll it back when the fence is active (`fs_helpers.go:989-1003`; TTL 48 h), so a refused
+  upload leaves a live reference. Recovery then reads `refs(L) > 0`, refuses, and that
+  branch sets no `phaseErr` — the cursor advances and the orphan leaves the working set
+  permanently (`ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`). Rolling back the write is not a
+  sufficient answer, because the writer can die between the insert and the fence check.
+- **R19 — a non-creating orphan mutation can resurrect a cleared row.**
+  `UpdateS3OrphanAttempt` is a plain `UPDATE` with no `IF` (`store_cassandra.go:1742-1759`),
+  which in Cassandra is an upsert. It can recreate a **partial** orphan with no
+  `storage_class` and, because it never touches the projection, no `_by_day` row — a
+  writer fence that recovery cannot enumerate. With the TTL removed as the TTL package
+  proposes, it would never expire either.
+- **R20 — an ordinary read never settles an ambiguous LWT.** Every "read back and
+  reconcile" in R15/R16 now means settle in the serial domain; a plain read is never
+  authority to conclude a claim or orphan does *not* exist. This is the same defect
+  already filed as `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, whose code comment
+  explicitly defers the fix to "the serial-domain decision X1 has to make anyway".
 - **`storage_key` is sufficient as the physical identity**; a separate `physical_id` or
   `delete_id` column is not needed. And the SHA-1→SHA-256 mapping belongs to the logical
   block, not to any incarnation, so its lifecycle should be decoupled from the physical

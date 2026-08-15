@@ -2408,7 +2408,8 @@ sole runtime activation blocker. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTR
 the analysis that established X2's independence from X1 is in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). **X1 has no accepted design yet.**
 The generational-fence protocol explored on `docs/gc-x1-x2-generation-fence-final` was
-abandoned 2026-08-14 in favour of a much smaller physical-identity design; the options
+abandoned 2026-08-14; smaller physical-identity designs are now being evaluated, with no
+option accepted and nothing implemented. The options
 and the evidence for that decision live in the document above.
 
 ---

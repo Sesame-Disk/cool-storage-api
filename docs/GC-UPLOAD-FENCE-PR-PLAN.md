@@ -218,7 +218,7 @@ unreachable behind the probe.
 8. Run focused unit tests, `go test -race` for affected packages in Docker, build,
    vet, integration-tag vet, and focused Cassandra integration regressions. Record
    exact commands/results in the PR, but move only F2 and X7 to closed after PR-2
-   merges. X1 remains open, later-PR behavior stays excluded and destructive GC
+   merges. X1/X2 remain open, later-PR behavior stays excluded and destructive GC
    remains disabled.
 
 Verification completed 2026-07-21 (the full integration service retains its built-in

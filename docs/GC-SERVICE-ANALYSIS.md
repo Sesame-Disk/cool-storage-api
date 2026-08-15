@@ -378,8 +378,10 @@ worker must never touch unrelated org work.
 ### Current safety statement
 
 The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
-That statement ends at delete authorization: it does not close X1's in-flight S3 DELETE ABA, and
-the reference check does not close X2's cross-DC visibility gap. Cassandra authorization/claim
+That statement ends at delete authorization: it does not close X1's in-flight S3 DELETE ABA.
+X2's cross-DC visibility gap **is** closed as of 2026-08-14 — the reference check that
+authorizes destruction is `BlockHasReferencesGlobal` at `EACH_QUORUM` behind a topology
+gate, under the stable-topology operational contract. Cassandra authorization/claim
 generations alone cannot close X1; new physical incarnations need never-reused physical keys,
 and publication, claim and recovery criteria must also hold. Consequently destructive GC remains
 disabled on every replica/DC.
