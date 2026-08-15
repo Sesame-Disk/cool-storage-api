@@ -4,9 +4,10 @@
 `KNOWN_ISSUES.md`; this document holds the reproduction, the runbook, and the
 findings turned up while implementing the fix.
 
-**Related:** `GC-X1-X2-ALTERNATIVES.md` (why X2 is separable from X1),
-`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2, `GC-X1-X2-GENERATION-FENCE-ADR.md` (r3,
-still the accepted-for-review design for **X1**, untouched by this fix).
+**Related:** [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (why X2 is separable
+from X1, and the closure options for X1 itself),
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2. **X1 has no accepted design**; this fix is
+untouched by that decision either way.
 
 ---
 
@@ -483,6 +484,16 @@ count out of `configs/`.
 
 ### 7. Carried into the X1 work, not fixed here
 
+- **The physical-key option changes the recovery argument, not the X2 result.** The
+  current implementation deliberately re-runs `BlockHasReferencesGlobal` during orphan
+  recovery, and the X2 closure evidence remains valid for that implementation. A future
+  exact-physical-key X1 design — **either** of the two under consideration, not only the
+  overlapped-lives one — may instead inherit authorization from an orphan that records an
+  exact never-reused physical locator, but only after verifying that the canonical row is
+  absent or points elsewhere, and only once that orphan cannot be fabricated by any other
+  API. That is an explicit X1 protocol amendment; it is not implied by `EACH_QUORUM` alone
+  and must be reflected in the registry when code changes.
+
 - **The `resolveFence` fast-clear is inert in production.** The only implementation,
   `clearSeafHTTPS3OrphanFence`, returns `(false, nil)` on every path. Writers cannot
   shorten a fence wait; they re-probe each retry and proceed on the first attempt
@@ -491,8 +502,10 @@ count out of `configs/`.
   inherit the session serial level, which the cluster profiles set to `LOCAL_SERIAL`.
   Mixing `LOCAL_SERIAL` and `SERIAL` on one partition breaks linearizability: they are
   different quorum domains, and one straggler invalidates every other statement's
-  guarantee. r3 calls this the **one-serial-domain rule**. X2 does not depend on it, but
-  any X1 design does. Tracked as R12 in `GC-X1-X2-ALTERNATIVES.md`.
+  guarantee. This is the **one-serial-domain rule**. X2 does not depend on it, but
+  any X1 design does. Tracked as R12 in
+  [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md), where the statement inventory
+  is **eleven** conditional statements on `blocks`, not the six an earlier count named.
 
   An earlier version of this bullet also said "this fix changes no LWT". That is no
   longer true — `ReleaseStaleBlockClaim` is one — and it did not matter for X2, since

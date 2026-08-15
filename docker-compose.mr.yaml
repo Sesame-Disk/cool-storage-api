@@ -11,7 +11,7 @@ services:
   # Database — shared Cassandra (no auth, single DC)
   # ==========================================================================
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     ports:
       - "${CASSANDRA_HOST_PORT:-8081}:9042"
     environment:
@@ -31,7 +31,7 @@ services:
     restart: unless-stopped
 
   cassandra-bootstrap:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     depends_on:
       cassandra:
         condition: service_healthy

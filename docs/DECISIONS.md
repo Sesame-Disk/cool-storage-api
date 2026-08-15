@@ -754,6 +754,46 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 
 ---
 
+## Abandon the generational GC fence (r3) for X1
+
+**Date:** 2026-08-14
+**Status:** Decided — r3 abandoned. **X1 still has no accepted design.**
+
+**Decision.** The generational-fence protocol drafted on
+`docs/gc-x1-x2-generation-fence-final` (block generations, generation-bound references,
+uses, retirement evidence, publication frontier, quarantine/abort) is **not** adopted.
+PR #166 was closed unmerged; the branch is retained as investigative reference only.
+
+**Reason.** The protocol existed to prove that no new reference could appear against a
+generation being retired *while ordinary reference writes stayed local*. That proof — the
+publication frontier — was the bulk of its complexity. `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`
+(X2) then closed on 2026-08-14 with a global GC-side liveness read at `EACH_QUORUM`
+behind a topology gate, without generations, physical incarnations or a writer hot-path
+round trip for the cross-DC liveness half. X2 is therefore separable from X1, but it did
+not eliminate the publication TOCTOU that the frontier addressed. The smaller closure
+option in the companion document attempts to replace that frontier with globally visible
+claims, post-write validation of an active canonical incarnation, and never-reused
+physical keys. That remains an X1 design question, not an accepted result.
+
+A second reason is cost of correctness: the r3 specification ran to roughly 8.9k lines
+and was still not frozen after three revisions, with each review round closing a wedge in
+its own quarantine/abort machinery. That is evidence about the design's surface area, not
+about the reviewers.
+
+**What replaces it.** [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) — the option
+comparison, race matrix and open questions for closing X1 with never-reused physical
+storage keys while keeping the logical SHA-256 as the deduplication identity. It is
+analysis, **not** an accepted design: no option is chosen, nothing is implemented, and
+`GC_ENABLED=false` remains mandatory on every replica in every DC.
+
+**What is preserved from r3.** Three findings, carried into that document: never-reused
+physical keys are necessary for the physical-delete ABA but are not sufficient for all of
+X1; the one-serial-domain discipline for relevant conditional statements; and the
+requirement that orphan recovery delete an exact recorded key rather than one derived from
+the hash.
+
+---
+
 ## Future Decisions (To Be Made)
 
 ### Multi-Region Replication Strategy

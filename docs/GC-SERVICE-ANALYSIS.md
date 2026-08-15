@@ -187,7 +187,8 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    the delete claim, and the worker re-checks live `block_references` at `EACH_QUORUM`
    (`BlockHasReferencesGlobal`) before authorizing the S3 delete. It does not close X1:
    Cassandra claims/generations cannot revoke an S3 DELETE already in flight; only
-   never-reused generational physical keys close that ABA. This mechanism must not be
+   never-reused physical keys close that ABA component, but that is not the whole X1
+   workstream. This mechanism must not be
    treated as production-safe activation while X1 is open.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to finish registering or promoting references.
@@ -377,10 +378,13 @@ worker must never touch unrelated org work.
 ### Current safety statement
 
 The physical block claim/recheck/recovery sequence is conservative **given correct classification**.
-That statement ends at delete authorization: it does not close X1's in-flight S3 DELETE ABA, and
-the reference check does not close X2's cross-DC visibility gap. Cassandra authorization/claim
-generations alone cannot close X1; new materializations need never-reused generational physical
-keys. Consequently destructive GC remains disabled on every replica/DC.
+That statement ends at delete authorization: it does not close X1's in-flight S3 DELETE ABA.
+X2's cross-DC visibility gap **is** closed as of 2026-08-14 — the reference check that
+authorizes destruction is `BlockHasReferencesGlobal` at `EACH_QUORUM` behind a topology
+gate, under the stable-topology operational contract. Cassandra authorization/claim
+generations alone cannot close X1; new physical incarnations need never-reused physical keys,
+and publication, claim and recovery criteria must also hold. Consequently destructive GC remains
+disabled on every replica/DC.
 The transient-error fail-open existence read (P6a) and execution-time canonical revalidation gap
 (P6b) are fixed. P6b uses durable guard modes, the existing library lock, an O(1) canonical
 point read, and synchronous fences before destructive mutations. P8 tracks Phase 9's provisional

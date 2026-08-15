@@ -408,6 +408,231 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ---
 
+## 2026-08-14 - X1: r3 generational fence abandoned; closure options documented; prod `GC_ENABLED=false` pinned
+
+No production behaviour changed, and no X1 safety fix landed. `internal/api/sync.go`
+gained four test seams for the R25 executable reproduction — `stageSyncPublishAttempt-
+ReferencesFn`, `promoteSyncPublishAttemptReferencesFn`, `buildSyncCommitBlockDeltaFn`,
+`resolveSyncBlockIDsFn` — and the production targets of those seams are the existing
+functions, so the compiled call graph is equivalent. Documentation and deployment
+configuration also changed. X1 stays open, no design is accepted, and `GC_ENABLED=false`
+remains mandatory on every replica in every DC.
+
+**The r3 generational-fence ADR is abandoned.** PR #166 closed unmerged; the branch
+`docs/gc-x1-x2-generation-fence-final` is retained as investigative reference only, and
+nothing in it is a decision of record. The reasoning is recorded in `DECISIONS.md`: r3's
+bulk was the publication frontier, which existed to prove that no new reference could
+appear against a retiring generation *while reference writes stayed local*. X2 closed on
+2026-08-14 with a global GC-side liveness read instead, so the cross-DC visibility half
+needs none of that machinery. The publication TOCTOU remains an X1 problem; the new
+options document evaluates whether a smaller claim/key/post-check protocol can replace
+the frontier.
+
+**New `docs/GC-X1-CLOSURE-OPTIONS.md`** carries the X1 half of the withdrawn alternatives
+analysis forward, corrected and extended, with every claim checked against code. What is
+new relative to the withdrawn document:
+
+- **The wait behind a physical delete is measured, not estimated.** The writer's retry
+  budget is ~1.95 s (`fs_helpers.go:680-684`); the GC inline S3 delete retries for ~2.6 s
+  (`worker.go:352`); and if that delete fails the orphan row is only revisited by scanner
+  **Phase 16 on the 24 h ticker** (`gc.go:690-706`, `config.prod.yaml:386`). The schema
+  carries a nominal 90-day default TTL, but that is **not** a row-lifetime recovery bound:
+  later updates refresh the TTL of only the columns they rewrite, which can leave partial
+  orphan state behind (**R28**). Absent later attempt references, the automatic retry may
+  therefore wait up to a day; under conservative A+ R18(a), a surviving `up:` or `pub:`
+  reference can keep the fence for its TTL, currently up to 48 h or 35 days. Persistent
+  recovery failure has **no trustworthy 90-day upper bound** on the fence, for the same
+  per-value reason. The `resolveFence`
+  escape hatch is inert: the two SeafHTTP paths wire it to
+  `clearSeafHTTPS3OrphanFence`, which returns `(false, nil)` on every path
+  (`seafhttp.go:2664-2681`), and the three v2 paths pass `nil`.
+- **The one-serial-domain inventory was undercounted.** There are **eleven** conditional
+  statements on the `blocks` partition, not six; the five that were missing are listed
+  with locations. The same global `SERIAL` discipline applies to the relevant
+  `gc_s3_orphans` LWTs, but the two partitions do not share a Paxos log and the protocol
+  assumes no cross-table atomicity. Under **B**, once the canonical row is gone, an orphan
+  is a durable physical-delete record, not a logical writer fence; a later incarnation
+  may proceed while the old key is recovered. **A+** deliberately retains the current
+  logical fence and waits for the orphan to clear.
+- **The option comparison now distinguishes the safety baseline from the availability
+  optimization.** A+ keeps physical lives sequential and carries the complete claim,
+  exact-key, publication and recovery package. d-lite/B can later stop waiting on the
+  physical delete, but its price is named exactly: every destructive authorization in the
+  code today is keyed by the *logical* block id, and once two lives can coexist
+  `BlockExists(L)` freezes the orphan cursor permanently, `BlockHasReferencesGlobal(L)`
+  can never authorize the older key, and `StartBlockDeleteOrphan` overwrites the older
+  key's only durable record.
+- **A new data-loss race, R13.** If the orphan insert succeeds and the `blocks` row delete
+  fails persistently, the row survives pointing at a key already authorized dead. Today
+  `ProbeBlockReuse` refuses it only because `hasOrphan` outranks everything
+  (`block_references.go:927`) — so a design that stops fencing on the logical block must
+  fence on the *key* instead, or an upload reports success while the canonical row still
+  names bytes that recovery will delete.
+- **R17 — a repair can become an install, and that reopens X1.** The highest-severity race
+  found in this series, and it shows why "revalidate immediately before the repair PUT"
+  was never sufficient: the dangerous step is the metadata write, not the PUT.
+  `RegisterUploadedBlock` ends at `UpsertBlockMetadata`, whose first statement is
+  `INSERT … IF NOT EXISTS` (`block_references.go:167-171`), carrying the `storage_key`
+  captured during the store phase. A writer that repair-PUTs `P1` and then stalls through
+  a complete GC lifecycle resumes to find no fence — row and orphan both gone — and its
+  insert *applies*, re-installing `blocks(L) → P1`; a delayed DELETE from the earlier
+  ambiguous attempt then removes live bytes. Repair and install must be different
+  operations: a repair may only update a row that still names the same `P`.
+- **R18 — a rejected upload can veto recovery of the key it was rejected for.** A+-specific,
+  because A+ keeps `BlockHasReferencesGlobal(L)` in recovery. `RegisterUploadedBlock`
+  writes the provisional `up:` reference *before* the fence check and deliberately does not
+  roll it back when the fence is active (`fs_helpers.go:989-1003`; TTL 48 h), so a refused
+  upload leaves a live reference. Recovery then reads `refs(L) > 0`, refuses, and that
+  branch sets no `phaseErr` — the cursor advances and the orphan leaves the working set
+  permanently (`ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`). Rolling back the write is not a
+  sufficient answer, because the writer can die between the insert and the fence check.
+- **R19 — a non-creating orphan mutation can resurrect a cleared row.**
+  `UpdateS3OrphanAttempt` is a plain `UPDATE` with no `IF` (`store_cassandra.go:1742-1759`),
+  which in Cassandra is an upsert. It can recreate a **partial** orphan with no
+  `storage_class` and, because it never touches the projection, no `_by_day` row — a
+  writer fence that recovery cannot enumerate. With the TTL removed as the TTL package
+  proposes, it would never expire either.
+- **R25 — a promote path creates `fs:` without ever staging a checked `pub:`.** The
+  highest-severity item after R17, and the one that **invalidates a conclusion this
+  document previously drew** rather than adding a requirement to it. R3 argued that
+  `RegisterFSObjectBlockReferences` needs no check of its own because promotion only
+  happens inside `PromotePublishAttemptReferences`, after a checked stage — "the gap is
+  one function, not two". The structure is real; the inference is not.
+  `PromotePublishAttemptReferences` never verifies a `pub:` row exists
+  (`block_references.go:519-544`), and sync has a fourth entry into finalize that skips
+  staging: an already-published HEAD goes `handleSyncHeadPromotion` →
+  `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) →
+  `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls
+  `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`). Permanent references are
+  written with no handshake at any point. Reachability is narrower than "any retry" and
+  still ordinary: `finalizedBlockDeltas` is a per-process memo marked only after a
+  successful finalize, so a warm same-instance retry short-circuits, but a retry landing
+  on another instance, a retry after the original finalize failed — the case the repair
+  exists to heal — a process restart or an eviction all reach it. The other three promote
+  sites stage correctly. Fix shape: re-stage on repair, rather than making `fs:`
+  generation-aware. **Now executable:**
+  `TestRepairPublishedSyncCommitBlockDeltaStagesBeforeFinalizing`
+  (`internal/api/sync_publish_handshake_test.go`) drives the real helper and is red; the
+  candidate one-line fix turns it green, which is the mutation that makes the red mean
+  something. The companion tests pin the primitive's behaviour and the intended
+  `stage → finalize` shape — they are explicitly **not** control-flow coverage of the
+  normal and auto-merge branches, which need a DB session and belong to the integration
+  leg.
+- **R26 — the discovery index needs binding in both directions.** R22 constrains how
+  recovery *reads* `_by_day`; nothing constrained writes to it. `DeleteS3Orphan` deletes
+  the projection by timestamp identity and resolves a zero `firstSeenAt` from whatever
+  canonical row is current (`store_cassandra.go:1766-1788`), so making only the canonical
+  clear conditional still lets a delayed `P1` cleanup erase `P2`'s discoverability.
+  Liveness, not data loss — but permanent once the TTL is removed. Preferred fix is to
+  fold `P` into the discovery row's identity rather than to add `IF P = P1`: a conditional
+  spends a Paxos round on a structure that is explicitly liveness and never authorization,
+  while an identity that cannot be named by the wrong lifecycle closes it by construction.
+- **R27 — R18(a) had no mechanism behind it.** "Re-project and retry" cannot work on the
+  current projection: `upsertS3OrphanProjection` always derives `first_seen_day` from the
+  original `firstSeenAt` (`store_cassandra.go:1561-1565`), so a re-projection lands in a
+  day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2`
+  back. Retry scheduling needs a mutable `next_retry_at` separate from the immutable
+  `first_seen_at` — **and the discovery structure must be partitioned on the mutable one**.
+  Adding `next_retry_at` as a clustering column under an immutable `first_seen_day` leaves
+  the row in the partition the cursor already passed and changes nothing; it needs
+  `(next_retry_day, bucket)` or a separate retry queue read by retry time. Until it exists,
+  A+'s availability cost under the recommended resolution is not long — it is unbounded.
+- **R28 — the 90-day TTL is not a ceiling on the row.** Cassandra expires each written
+  value independently. `UpdateS3OrphanAttempt` refreshes only its three diagnostic columns
+  and leaves `storage_class`/`first_seen_at`/`recovery_phase` on the original schedule, so
+  a late retry leaves a live primary key with no identity columns and no `_by_day` row —
+  R19's partial orphan, produced by ordinary expiry rather than by an upsert. Both fence
+  reads select only `block_id` (`block_references.go:851,1138`), which such a row still
+  returns, so the writer stays fenced. This is why the TTL package is indivisible.
+- **The fence clear was pointing at dead code.** An earlier revision named
+  `DeleteBlockS3Orphan` (`block_references.go:1199`) as the unconditional clear that B.1
+  must make conditional. That function has **no caller anywhere in the repo**, tests
+  included. The clear GC actually runs is `DeleteS3Orphan`
+  (`store_cassandra.go:1776`), reached from `processBlock` and all three recovery exits
+  (`worker.go:1261, 1411, 1429, 1584`); that is the statement the requirement attaches to.
+  `DeleteBlockS3Orphan` is R21's destructive twin — an exported way to clear a fence that
+  no protocol step authorizes — and should simply be removed.
+- **R20 — an ordinary consistency read never settles an ambiguous LWT.** Every "read
+  back and reconcile" in R15/R16 now means settle in the serial domain; a normal
+  `LOCAL_QUORUM`/`QUORUM` read is never authority to conclude that a claim or orphan does
+  *not* exist. This is the same defect already filed as
+  `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, whose code comment explicitly defers the
+  fix to "the serial-domain decision X1 has to make anyway". Prefer an idempotent no-op
+  retry of the same LWT; otherwise use a `SELECT` with query consistency `SERIAL` in the
+  same Paxos domain. In gocql, `Query.SerialConsistency(...)` configures the serial phase
+  of conditional mutations and is ignored for ordinary `SELECT`s. If neither settles,
+  the state stays ambiguous and the caller fails closed.
+- **R21 — a second API can forge the orphan row.** `RecordS3Orphan` runs its own
+  `INSERT … IF NOT EXISTS` on `gc_s3_orphans` (`store_cassandra.go:1618-1630`) and sits in
+  the `GCStore` interface (`store.go:196`) with **no production caller** — tests and the
+  mock only — behind a doc comment that no longer describes reality. Harmless today,
+  disqualifying the moment the orphan becomes the durable proof that `EACH_QUORUM == 0`
+  happened, which is what B's recovery argument and R18 option (c) need. The conservative
+  A+ option (a) does not depend on historical authorization from the orphan. Cheap to
+  close now: drop it from the interface or narrow it to `IF EXISTS`.
+- **R22 — recovery destroys on projection data.** The document says `_by_day` is a
+  discovery index and never an authorization source; the code does not honour that.
+  `RecoverS3Orphans` takes its `S3OrphanInfo` — `StorageClass` included — straight from
+  `ListS3OrphansByDay` and resolves the backend from it, never reloading the canonical
+  orphan row. Required flow: `by_day` → canonical row → exact `P` match → destroy.
+- **R23 — `P` is only eternal if its backend namespace identity is immutable.** Define
+  `B` as that identity. `storage_class` is a logical label resolved through
+  `m.backends[className]` (`storage.go:493`) with bucket and endpoint supplied by
+  configuration (`config.go:3526,3532`). Rebinding a class to a different bucket silently
+  renames every persisted `P`, and a months-old orphan would issue an exact DELETE into a
+  namespace it never verified. A storage-class name may serve as `B` only under an
+  append-only/non-reuse contract; otherwise an immutable `backend_id` takes over the role.
+  Removing the orphan TTL makes this contract permanent.
+- **R24 — a minted key is single-use, canonical or not.** R9 has the losing writer clean
+  up its own key; nothing stopped that same key from being reused by a later install.
+  `W2` loses the CAS, schedules cleanup of `P2`, GC later removes `P1`, `blocks(L)` goes
+  absent, and a lingering `W2` retry re-inserts `P2` — which now applies, just as the old
+  cleanup DELETE lands. Same ABA as X1, produced by the writer's own cleanup rather than
+  by GC. Once an install is known lost, that `P` is burned and cleanup-eligible. An
+  ambiguous install becomes `install-uncertain`: it cannot be reused or cleaned until
+  serial settlement proves that it is not canonical; if settlement proves applied it is
+  canonical, and if it proves another locator won it becomes burned. An unresolved case
+  may leak as X3, but must not delete a possibly canonical object. This also bounds R20:
+  idempotent CAS retry is safe for claim and orphan statements, not for an install whose
+  history is already uncertain.
+- **The physical identity is the tuple `P = (B, storage_key)`**, not the key alone. `B`
+  is an immutable backend namespace identity; the current `storage_class` can provide it
+  only under R23's append-only/non-reuse contract, otherwise an immutable `backend_id`
+  must carry that role. A CAS or exact DELETE that omits `B` does not name an object. A
+  separate `physical_id` or `delete_id` column is not needed once `P` is never reused. And
+  the SHA-1→SHA-256 mapping belongs to the logical block, not to any incarnation, so its
+  lifecycle should be decoupled from the physical object's — the code already calls a
+  leftover mapping "a harmless dangling pointer".
+- **The premise everything rests on is verified:** `L = sha256(storedContent)` is taken
+  over the bytes actually written, *after* encryption (`seafhttp.go:2468-2482`), so two
+  incarnations of one logical block are byte-identical by construction. That is why
+  references never need to become generation-aware.
+
+**Four broken documentation links on `main` are fixed.** `KNOWN_ISSUES.md`,
+`OPEN-WORK-INDEX.md` and `GC-X2-MULTIDC-VALIDATION.md` pointed at `GC-X1-X2-ALTERNATIVES.md`
+and `GC-X1-X2-GENERATION-FENCE-ADR.md`, neither of which ever existed on `main` — X2's fix
+merged before the branch that carried them.
+
+**Compose and versions, independent of any X1 design:**
+
+- `docker-compose.prod.yml` now sets `GC_ENABLED=false` explicitly rather than relying on
+  the environment, with the reason inline. `docker-compose.yaml` documents why the local
+  single-node stack deliberately does *not* pin it.
+- Cassandra pinned from `5.0` to `5.0.9` across the five previously-floating Compose
+  files (`docker-compose.cassandra-3dc.yaml` was already pinned); `VERSIONS.md`
+  corrected (it still claimed Go 1.21, Echo, and Cassandra 4.1 — the project uses Gin).
+
+**X4 / UP-2 / P-4 scope correction (2026-08-11), carried over:** the per-block Paxos round
+is paid per block invocation that *reaches* metadata registration, not by every logical
+block of every upload — browser and sync preflight can classify a fully deduplicated block
+before `RegisterUploadedBlock`. The ~128 rounds/1 GiB figure is a new-content sensitivity
+at 8 MiB blocks, not a universal per-file charge. Recorded with a consequence for X1: if a
+future design mints storage keys, P-4's proposed fix (drop the first-writer LWT) stops
+being available, because that LWT becomes the only thing choosing one canonical
+incarnation across DCs.
+
+---
+
 ## 2026-08-12 - Three sync findings opened while auditing the X9 caps (no code change)
 
 Auditing the caps above surfaced three follow-up findings on the same handlers: **two

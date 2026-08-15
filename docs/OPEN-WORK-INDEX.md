@@ -134,13 +134,18 @@ rests on X1 alone.
 DELETE.** Never-reused physical keys are necessary but not sufficient: a shared
 per-candidate claim id lets one worker drop the publication fence while another is
 still deleting under it, and the reuse probe can then hand a writer back the very
-incarnation being destroyed — which generational keys cannot prevent, because no new
-incarnation is created. Closure criteria are in Registry X1.
+incarnation being destroyed — which physical-key uniqueness cannot prevent, because no
+new incarnation is created. Closure criteria are in Registry X1.
+
+**Closure options are compared in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md)** (2026-08-14), which replaces the
+abandoned generational-fence ADR. Nothing there is accepted and no implementation has
+started.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) |
-| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [alternatives](./GC-X1-X2-ALTERNATIVES.md) · [r3 ADR](./GC-X1-X2-GENERATION-FENCE-ADR.md) (X1 only now) |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) · [closure options](./GC-X1-CLOSURE-OPTIONS.md) |
+| `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [X2 runbook](./GC-X2-MULTIDC-VALIDATION.md) |
 
 ## High / Medium — open (audit follow-ups)
 
@@ -185,7 +190,7 @@ incarnation is created. Closure criteria are in Registry X1.
 
 | Item | Sev | One line |
 |---|---|---|
-| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block. **PR-11, not started** — need a per-statement latency metric first. |
+| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation that reaches metadata registration; browser/sync preflight can bypass fully deduplicated blocks. **PR-11, not started** — need the per-statement production latency metric first (fix direction of record: `KNOWN_ISSUES.md`). |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |

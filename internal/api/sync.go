@@ -418,6 +418,25 @@ var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializati
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderWithFanout
 
+// The publication handshake seams. SeafHTTP already routes its stage/promote
+// pair through equivalent vars (stageSeafHTTPPublishAttemptReferencesFn,
+// promoteSeafHTTPPublishAttemptReferencesFn); sync did not, which is why no test
+// could observe that one of its entry points promotes without staging (R25 in
+// docs/GC-X1-CLOSURE-OPTIONS.md). Production wiring is unchanged.
+var stageSyncPublishAttemptReferencesFn = db.StagePublishAttemptReferences
+var promoteSyncPublishAttemptReferencesFn = db.PromotePublishAttemptReferences
+
+// buildSyncCommitBlockDeltaFn lets a test supply the delta without a DB session,
+// so the handshake property can be asserted over the real control flow of each
+// entry point rather than over a reconstruction of it.
+var buildSyncCommitBlockDeltaFn = func(h *SyncHandler, repoID, targetCommitID string) (syncCommitBlockDelta, error) {
+	return h.buildSyncCommitBlockDelta(repoID, targetCommitID)
+}
+
+var resolveSyncBlockIDsFn = func(h *SyncHandler, orgID, repoID string, blockIDs []string) ([]string, error) {
+	return h.resolveSyncBlockIDs(orgID, repoID, blockIDs)
+}
+
 // syncGetBlockIDMappingFn is the legacy SHA-1 -> internal SHA-256 resolution
 // used by check-blocks. It is a variable both for testing and because the
 // context argument is the point: bulk resolution must be abandonable, and the
@@ -4036,12 +4055,12 @@ func (h *SyncHandler) resolveSyncBlockIDs(orgID, repoID string, blockIDs []strin
 }
 
 func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID string) (syncCommitBlockDelta, error) {
-	delta, err := h.buildSyncCommitBlockDelta(repoID, targetCommitID)
+	delta, err := buildSyncCommitBlockDeltaFn(h, repoID, targetCommitID)
 	if err != nil {
 		return syncCommitBlockDelta{}, err
 	}
-	resolved, err := db.StagePublishAttemptReferences(h.db, orgID, repoID, targetCommitID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
-		return h.resolveSyncBlockIDs(orgID, repoID, blockIDs)
+	resolved, err := stageSyncPublishAttemptReferencesFn(h.db, orgID, repoID, targetCommitID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
+		return resolveSyncBlockIDsFn(h, orgID, repoID, blockIDs)
 	})
 	if err != nil {
 		return syncCommitBlockDelta{}, fmt.Errorf("stage publish-attempt refs for sync commit %s: %w", targetCommitID, err)
@@ -4059,7 +4078,7 @@ func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, remov
 
 func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID string, delta syncCommitBlockDelta) error {
 	if len(delta.resolvedAddedBlockIDs) == 0 && len(delta.addedFiles) > 0 {
-		resolved, err := h.resolveSyncBlockIDs(orgID, repoID, delta.addedBlockIDs())
+		resolved, err := resolveSyncBlockIDsFn(h, orgID, repoID, delta.addedBlockIDs())
 		if err != nil {
 			return fmt.Errorf("resolve added block IDs for sync commit %s: %w", targetCommitID, err)
 		}
@@ -4067,7 +4086,7 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 	}
 
 	fsHelper := v2.NewFSHelper(h.db)
-	if err := db.PromotePublishAttemptReferences(h.db, orgID, targetCommitID, delta.resolvedAddedBlockIDs, func() error {
+	if err := promoteSyncPublishAttemptReferencesFn(h.db, orgID, targetCommitID, delta.resolvedAddedBlockIDs, func() error {
 		for _, file := range delta.addedFiles {
 			if err := fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, file.fsID, file.blockIDs); err != nil {
 				return err
@@ -4106,7 +4125,7 @@ func (h *SyncHandler) repairPublishedSyncCommitBlockDelta(orgID, repoID, targetC
 	if h.db == nil {
 		return nil
 	}
-	delta, err := h.buildSyncCommitBlockDelta(repoID, targetCommitID)
+	delta, err := buildSyncCommitBlockDeltaFn(h, repoID, targetCommitID)
 	if err != nil {
 		return err
 	}

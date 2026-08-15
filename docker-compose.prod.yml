@@ -38,6 +38,9 @@ services:
       - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL}
       - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL}
       - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-true}
+      # Destructive GC remains blocked until X1 acceptance is complete; X2 is closed
+      # under the stable-topology operational contract.
+      - GC_ENABLED=false
 
       # Cassandra — defaults work for single-region; override in .env for multi-region
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
@@ -75,7 +78,7 @@ services:
   #                Ports are NEVER exposed on 0.0.0.0 — only on the bind IP.
   # ---------------------------------------------------------------------------
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     expose:
       - "9042"                      # Internal only — sesamefs reaches via 'internal' network
     ports:
@@ -130,7 +133,7 @@ services:
   # Cassandra bootstrap (auth + app role + keyspace)
   # ---------------------------------------------------------------------------
   cassandra-bootstrap:
-    image: cassandra:5.0
+    image: cassandra:5.0.9
     profiles:
       - bootstrap
     networks:
