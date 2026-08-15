@@ -497,9 +497,16 @@ new relative to the withdrawn document:
   `handleSyncHeadIdempotentSuccess` (`sync.go:4221-4224`) →
   `repairPublishedSyncCommitBlockDelta`, which rebuilds the delta and calls
   `finalizeSyncCommitBlockDelta` directly (`sync.go:4113`). Permanent references are
-  written with no handshake at any point, on the ordinary path of a client retrying an
-  applied HEAD. The other three promote sites stage correctly. Fix shape: re-stage on
-  repair, rather than making `fs:` generation-aware.
+  written with no handshake at any point. Reachability is narrower than "any retry" and
+  still ordinary: `finalizedBlockDeltas` is a per-process memo marked only after a
+  successful finalize, so a warm same-instance retry short-circuits, but a retry landing
+  on another instance, a retry after the original finalize failed — the case the repair
+  exists to heal — a process restart or an eviction all reach it. The other three promote
+  sites stage correctly. Fix shape: re-stage on repair, rather than making `fs:`
+  generation-aware. **Now executable:** `TestSyncPublishPathsStageBeforePromoting`
+  (`internal/api/sync_publish_handshake_test.go`) asserts the handshake over all four
+  entry points and is red on the repair case only; the candidate one-line fix turns it
+  green, which is the mutation that makes the red meaningful.
 - **R26 — the discovery index needs binding in both directions.** R22 constrains how
   recovery *reads* `_by_day`; nothing constrained writes to it. `DeleteS3Orphan` deletes
   the projection by timestamp identity and resolves a zero `firstSeenAt` from whatever
