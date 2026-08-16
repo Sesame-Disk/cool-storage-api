@@ -39,7 +39,7 @@ func TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan(t *testing.T) {
 	blockID := fmt.Sprintf("orph-no-resurrect-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	// Establish a normal orphan through the only mutation allowed to create one.
+	// Establish a normal orphan through the canonical lifecycle entry point.
 	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", db.PlainBlockRepresentationID, "", firstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
@@ -75,8 +75,7 @@ func TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan(t *testing.T) {
 
 	if gcS3OrphanExists(t, orgID.String(), blockID) {
 		t.Fatal("UpdateS3OrphanAttempt resurrected a cleared orphan row (R19). " +
-			"Only StartBlockDeleteOrphan may create orphan state; every other " +
-			"mutation must be conditional and fail when the row is gone. " +
+			"This mutation must remain non-creating and conditional when the row is gone. " +
 			"Under A+ this row is a writer fence with no discovery entry, so it " +
 			"blocks uploads of that content while no sweep can enumerate it.")
 	}
@@ -214,5 +213,26 @@ func TestGC_UpdateS3OrphanAttempt_AnchorsDiagnosticTTLOnFirstSeenAt(t *testing.T
 	if diagnosticTTL > identityTTL {
 		t.Fatalf("TTL(last_error) = %d exceeds TTL(storage_class) = %d: an annotation may not outlive what it annotates",
 			diagnosticTTL, identityTTL)
+	}
+}
+
+func TestGC_S3OrphanEffectiveTTLMatchesMigrationChain(t *testing.T) {
+	requireCassandra(t)
+
+	const wantTTL = 90 * 24 * 60 * 60
+	keyspace := envOrDefault("CASSANDRA_KEYSPACE", "sesamefs")
+	session := shareProjectionDBForTest(t).Session()
+	for _, table := range []string{"gc_s3_orphans", "gc_s3_orphans_by_day"} {
+		var actualTTL int
+		if err := session.Query(`
+			SELECT default_time_to_live
+			FROM system_schema.tables
+			WHERE keyspace_name = ? AND table_name = ?
+		`, keyspace, table).Scan(&actualTTL); err != nil {
+			t.Fatalf("read effective default_time_to_live for %s: %v", table, err)
+		}
+		if actualTTL != wantTTL {
+			t.Fatalf("%s effective default_time_to_live = %d, want %d after migration chain", table, actualTTL, wantTTL)
+		}
 	}
 }

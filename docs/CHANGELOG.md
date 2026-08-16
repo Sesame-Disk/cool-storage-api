@@ -451,14 +451,16 @@ existence, and both fence reads select only `block_id`, which such a row still r
   including a `recovery_phase` regression.
 - **Evidence, both directions.** Against the pre-fix statement the gates read
   `UpdateS3OrphanAttempt resurrected a cleared orphan row` and
-  `TTL(last_error) = 7776000, want <= 5270400` — the full 90-day term on a row with 60
-  days left. Both green after. A unit property loop
+  `TTL(last_error) = 7776000, want <= 5270400` — the table-default 90-day term even
+  though the application-derived schedule from a `first_seen_at` backdated by 30 days
+  had 60 days remaining. Both green after. A unit property loop
   (`TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule`) asserts across the row's
   whole application-clock schedule, including the fractional final second and a
   future `first_seen_at`, that the helper never schedules a diagnostic past its
   calculated expiry. It is not a proof against coordinator-clock skew or read-to-write
-  latency. `TestS3OrphanTTLConstantMatchesSchema` checks the greenfield/base schema;
-  later migration changes require a migration-chain audit.
+  latency. `TestS3OrphanTTLConstantMatchesSchema` checks the greenfield/base schema, while
+  the integration gate `TestGC_S3OrphanEffectiveTTLMatchesMigrationChain` checks the
+  effective `system_schema.tables` value after the migration chain.
 - **Scope.** This does **not** remove the TTL, so an orphan whose recovery keeps failing
   still expires and takes its durable record with it. That is the four-change package in
   `GC-X1-CLOSURE-OPTIONS.md`, and it cannot ship alone: `gcS3OrphanInitialScanLookbackDays`

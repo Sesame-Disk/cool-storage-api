@@ -131,8 +131,7 @@ func TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule(t *testing.T) {
 
 // TestS3OrphanTTLConstantMatchesSchema keeps gcS3OrphanTTLSeconds aligned with
 // the greenfield/base schema. The test does not inspect later ALTER TABLE
-// migrations; a migration-chain audit is required if a later migration changes
-// either table's default_time_to_live.
+// migrations; the integration suite checks the effective migrated schema.
 func TestS3OrphanTTLConstantMatchesSchema(t *testing.T) {
 	schemaPath := filepath.Join("..", "db", "migrations", "001_initial_schema.cql")
 	schema, err := os.ReadFile(schemaPath)
@@ -179,7 +178,7 @@ func TestMockUpdateS3OrphanAttemptNeverCreates(t *testing.T) {
 	}
 	if got := store.S3OrphanCount(); got != 0 {
 		t.Fatalf("orphan rows = %d after updating an absent row, want 0: only "+
-			"StartBlockDeleteOrphan may bring an orphan into existence (R19)", got)
+			"UpdateS3OrphanAttempt must remain non-creating (R19)", got)
 	}
 }
 

@@ -1761,9 +1761,10 @@ const gcS3OrphanTTLSeconds = 7776000
 //	upsert. A recoverer whose S3 delete failed could write it after another path
 //	had already cleared the row, recreating it from the three diagnostic columns
 //	alone. The expected first_seen_at makes the statement non-creating and
-//	stale-token-safe when the stored token differs; StartBlockDeleteOrphan stays
-//	the only mutation allowed to bring an orphan into existence. Reusing a token
-//	when resetting an existing lifecycle remains a separate open issue.
+//	stale-token-safe when the stored token differs. This mutation is non-creating;
+//	making StartBlockDeleteOrphan the sole creator remains the separate R21 issue
+//	because RecordS3Orphan still has its own INSERT IF NOT EXISTS path. Reusing a
+//	token when resetting an existing lifecycle remains a separate open issue.
 //
 //	R28: Cassandra applies default_time_to_live per written VALUE and counts it
 //	from the WRITE, so an UPDATE that rewrites only the diagnostic columns hands
