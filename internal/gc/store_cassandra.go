@@ -65,21 +65,6 @@ func parseCASTime(value interface{}) time.Time {
 	return time.Time{}
 }
 
-func parseCASString(value interface{}) string {
-	switch v := value.(type) {
-	case string:
-		return v
-	case []byte:
-		return string(v)
-	case fmt.Stringer:
-		return v.String()
-	case nil:
-		return ""
-	default:
-		return fmt.Sprint(v)
-	}
-}
-
 const hardDeleteLockTTLSeconds = 21600
 
 func acquireHardDeleteLock(session *gocql.Session, tableName, keyColumn string, keyValue, leaseToken uuid.UUID) (bool, error) {

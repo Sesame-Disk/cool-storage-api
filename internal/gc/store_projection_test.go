@@ -106,6 +106,29 @@ func TestStore_StartBlockDeleteOrphan_RepairsMissingProjectionAndPreservesFirstS
 	}
 }
 
+func TestStore_StartBlockDeleteOrphan_ResetRaceDoesNotResurrectRow(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	seedS3Orphan(t, store, orgID, "orph-reset-race", "hot", db.PlainBlockRepresentationID, "sha1-old", "prev", firstSeenAt)
+	store.SetStartBlockDeleteOrphanResetRaceForTest(true)
+
+	if _, err := store.StartBlockDeleteOrphan(orgID, "orph-reset-race", "cold", db.PlainBlockRepresentationID, "sha1-new", time.Now().UTC()); err == nil {
+		t.Fatal("StartBlockDeleteOrphan error = nil, want reset-race error")
+	}
+	if got := store.S3OrphanCount(); got != 0 {
+		t.Fatalf("expected no canonical orphan rows after reset race, got %d", got)
+	}
+	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-reset-race"), 10)
+	if err != nil {
+		t.Fatalf("ListS3OrphansByDay failed: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("expected no resurrected projection rows, got %d", len(orphans))
+	}
+}
+
 func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()

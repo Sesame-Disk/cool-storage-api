@@ -14,7 +14,8 @@ import (
 
 // TestR21OrphanAuthoritySurface is an untagged source gate. It runs with the
 // normal unit suite so a future refactor cannot quietly add a second orphan
-// creator or restore either removed authority surface.
+// creator, bypass the conditional orphan mutations, move the creator away from
+// the authorized worker path, or restore either removed authority surface.
 func TestR21OrphanAuthoritySurface(t *testing.T) {
 	root := filepath.Join("..", "..")
 	skipDirs := map[string]bool{
@@ -22,13 +23,15 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 		"node_modules": true, "vendor": true,
 	}
 	creatorPattern := regexp.MustCompile(`(?i)\bINSERT\s+INTO\s+gc_s3_orphans\b`)
+	updatePattern := regexp.MustCompile(`(?i)\bUPDATE\s+gc_s3_orphans\b`)
+	ifPattern := regexp.MustCompile(`(?i)\bIF\b`)
 	forbiddenIdentifiers := map[string]bool{
 		"RecordS3Orphan":      true,
 		"DeleteBlockS3Orphan": true,
 	}
 
-	countCreators := func(node ast.Node) int {
-		count := 0
+	stringLiterals := func(node ast.Node) []string {
+		values := []string{}
 		ast.Inspect(node, func(n ast.Node) bool {
 			literal, ok := n.(*ast.BasicLit)
 			if !ok || literal.Kind != token.STRING {
@@ -38,16 +41,38 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 			if err != nil {
 				value = literal.Value
 			}
-			if creatorPattern.MatchString(value) {
-				count++
-			}
+			values = append(values, value)
 			return true
 		})
-		return count
+		return values
+	}
+	matchingLiterals := func(node ast.Node, pattern *regexp.Regexp) []string {
+		matched := []string{}
+		for _, value := range stringLiterals(node) {
+			if pattern.MatchString(value) {
+				matched = append(matched, value)
+			}
+		}
+		return matched
+	}
+	functionName := func(fn *ast.FuncDecl) string {
+		if fn.Recv == nil || len(fn.Recv.List) == 0 {
+			return fn.Name.Name
+		}
+		switch receiver := fn.Recv.List[0].Type.(type) {
+		case *ast.StarExpr:
+			if ident, ok := receiver.X.(*ast.Ident); ok {
+				return "(*" + ident.Name + ")." + fn.Name.Name
+			}
+		case *ast.Ident:
+			return "(" + receiver.Name + ")." + fn.Name.Name
+		}
+		return fn.Name.Name
 	}
 
 	totalCreators := 0
 	creatorFunctions := []string{}
+	callsiteFunctions := []string{}
 	scanned := 0
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
@@ -81,21 +106,38 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 			return true
 		})
 
-		fileCreators := countCreators(file)
-		totalCreators += fileCreators
+		fileCreators := matchingLiterals(file, creatorPattern)
+		totalCreators += len(fileCreators)
+		for _, query := range matchingLiterals(file, updatePattern) {
+			if !ifPattern.MatchString(query) {
+				t.Errorf("%s: canonical orphan UPDATE must be conditional with IF", path)
+			}
+		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
-			functionCreators := countCreators(fn)
-			if functionCreators == 0 {
+			if len(matchingLiterals(fn, creatorPattern)) > 0 {
+				creatorFunctions = append(creatorFunctions, fn.Name.Name)
+				if fn.Name.Name != "StartBlockDeleteOrphan" {
+					t.Errorf("%s: gc_s3_orphans creator is %s, want StartBlockDeleteOrphan", path, fn.Name.Name)
+				}
+			}
+			if fn.Body == nil {
 				continue
 			}
-			creatorFunctions = append(creatorFunctions, fn.Name.Name)
-			if fn.Name.Name != "StartBlockDeleteOrphan" {
-				t.Errorf("%s: gc_s3_orphans creator is %s, want StartBlockDeleteOrphan", path, fn.Name.Name)
-			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if ok && selector.Sel.Name == "StartBlockDeleteOrphan" {
+					callsiteFunctions = append(callsiteFunctions, functionName(fn))
+				}
+				return true
+			})
 		}
 		return nil
 	})
@@ -110,5 +152,8 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 	}
 	if totalCreators != 1 {
 		t.Fatalf("found %d production INSERT INTO gc_s3_orphans statements, want exactly 1; creators=%v", totalCreators, creatorFunctions)
+	}
+	if len(callsiteFunctions) != 1 || callsiteFunctions[0] != "(*Worker).processBlock" {
+		t.Fatalf("expected exactly one authorized StartBlockDeleteOrphan callsite in (*Worker).processBlock, got %v", callsiteFunctions)
 	}
 }

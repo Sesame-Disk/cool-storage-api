@@ -186,9 +186,10 @@ type MockStore struct {
 	deleteProvisionalProjectionErr error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
-	getQueueSizeHook     func(orgID uuid.UUID, size int)
-	removeActiveOrgHook  func(orgID uuid.UUID, activeBefore time.Time)
-	recalculateStatsHook func(orgID uuid.UUID)
+	getQueueSizeHook                 func(orgID uuid.UUID, size int)
+	removeActiveOrgHook              func(orgID uuid.UUID, activeBefore time.Time)
+	recalculateStatsHook             func(orgID uuid.UUID)
+	startBlockDeleteOrphanResetRace bool
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
 	// where the LoggedBatch never applied.
@@ -3688,6 +3689,12 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
+		if m.startBlockDeleteOrphanResetRace {
+			firstSeenAt := existing.FirstSeenAt
+			delete(m.s3Orphans, key)
+			delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
+			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
+		}
 		existing.StorageClass = storageClass
 		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
@@ -3823,6 +3830,14 @@ func (m *MockStore) AllS3Orphans() []S3OrphanInfo {
 		return out[i].BlockID < out[j].BlockID
 	})
 	return out
+}
+
+// SetStartBlockDeleteOrphanResetRaceForTest makes the mock model the canonical
+// row disappearing after the CAS read and before the conditional reset update.
+func (m *MockStore) SetStartBlockDeleteOrphanResetRaceForTest(enabled bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startBlockDeleteOrphanResetRace = enabled
 }
 
 // AllBlockGCCandidates is a test helper returning every candidate row across

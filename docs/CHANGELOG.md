@@ -18,10 +18,13 @@ use `UpdateS3OrphanAttempt` when they need to model an initial failed delete.
 
 The unused exported `DeleteBlockS3Orphan` helper was removed as the destructive twin
 of the former creator. An untagged source gate rejects both identifiers in production
-Go and requires exactly one canonical orphan INSERT. This PR does not change the
-active `DeleteS3Orphan` path, TTL policy, projection schema or the X1 activation gate.
+Go, requires exactly one canonical orphan INSERT, requires every canonical orphan
+UPDATE to carry an IF condition, and restricts the production creator callsite to
+`Worker.processBlock`. This PR does not change the active `DeleteS3Orphan` path, TTL
+policy, projection schema or the X1 activation gate.
 
-R21 is closed; X1, R3, R26, R27, R28b, R30 and R31 remain open.
+R21 is closed; X1 remains open, and this PR does not close any of the other X1
+criteria tracked in `GC-X1-CLOSURE-OPTIONS.md`.
 
 ---
 
