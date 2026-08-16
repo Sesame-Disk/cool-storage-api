@@ -460,14 +460,16 @@ existence, and both fence reads select only `block_id`, which such a row still r
   calculated expiry. It is not a proof against coordinator-clock skew or read-to-write
   latency. `TestS3OrphanTTLConstantMatchesSchema` checks the greenfield/base schema, while
   the integration gate `TestGC_S3OrphanEffectiveTTLMatchesMigrationChain` checks the
-  effective `system_schema.tables` value after the migration chain.
+  effective `system_schema.tables` value after the migration chain, and
+  `TestGC_UpdateS3OrphanAttemptMatchesEffectiveTTL` binds that runtime value to the
+  actual Go-to-CQL update path.
 - **Scope.** This does **not** remove the TTL, so an orphan whose recovery keeps failing
   still expires and takes its durable record with it. That is the four-change package in
   `GC-X1-CLOSURE-OPTIONS.md`, and it cannot ship alone: `gcS3OrphanInitialScanLookbackDays`
   is pinned to the same 90 days, so dropping the TTL without redefining the cold-start
   horizon makes any orphan older than that permanently invisible after a cursor loss —
   R27's unsolved partitioning problem. Other row-wide TTL writers remain open, as do
-  the lifecycle reset identity and the R12 serial-domain inventory update.
+  the lifecycle reset identity and application of R12's serial-domain contract.
   **X1 open, R3 open, R19 reset reuse open, R21/R26/R27/R28b/R28 expiry/R31 open,
   `GC_ENABLED=false` unchanged.**
 

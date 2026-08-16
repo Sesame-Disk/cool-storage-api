@@ -1876,11 +1876,6 @@ func s3OrphanRemainingTTLSeconds(firstSeenAt, now time.Time) int {
 	}
 	expiresAt := firstSeenAt.Add(gcS3OrphanTTLSeconds * time.Second)
 	remaining := int(expiresAt.Sub(now) / time.Second)
-	if remaining > gcS3OrphanTTLSeconds {
-		// Clock skew or a first_seen_at in the future makes the real Cassandra
-		// expiry unknowable from application timestamps. Do not write diagnostics.
-		return 0
-	}
 	return remaining
 }
 

@@ -202,7 +202,7 @@ type GCStore interface {
 	// delete has completed so restart recovery can finish forward-mapping cleanup
 	// without touching S3 again.
 	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error
-	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, firstSeenAt time.Time, errMsg string, now time.Time) error
+	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
 	// Commit operations (worker)

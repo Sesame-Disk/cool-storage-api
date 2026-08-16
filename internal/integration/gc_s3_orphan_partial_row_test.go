@@ -236,3 +236,39 @@ func TestGC_S3OrphanEffectiveTTLMatchesMigrationChain(t *testing.T) {
 		}
 	}
 }
+
+func TestGC_UpdateS3OrphanAttemptMatchesEffectiveTTL(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-ttl-effective-%d", time.Now().UnixNano())
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", db.PlainBlockRepresentationID, "", firstSeenAt); err != nil {
+		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, firstSeenAt); err != nil {
+			t.Logf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+
+	if err := store.UpdateS3OrphanAttempt(orgID, blockID, firstSeenAt, "fresh failure", time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateS3OrphanAttempt: %v", err)
+	}
+
+	var identityTTL, diagnosticTTL int
+	if err := database.Session().Query(`
+		SELECT TTL(storage_class), TTL(last_error)
+		FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&identityTTL, &diagnosticTTL); err != nil {
+		t.Fatalf("read effective per-column TTLs: %v", err)
+	}
+	if identityTTL <= 0 || diagnosticTTL <= 0 {
+		t.Fatalf("effective TTLs = storage_class %d, last_error %d; want both positive", identityTTL, diagnosticTTL)
+	}
+	if delta := identityTTL - diagnosticTTL; delta < -2 || delta > 2 {
+		t.Fatalf("effective TTLs diverged = storage_class %d, last_error %d; want <= 2s difference", identityTTL, diagnosticTTL)
+	}
+}
