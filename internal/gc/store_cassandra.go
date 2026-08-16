@@ -1761,8 +1761,9 @@ const gcS3OrphanTTLSeconds = 7776000
 //	upsert. A recoverer whose S3 delete failed could write it after another path
 //	had already cleared the row, recreating it from the three diagnostic columns
 //	alone. The expected first_seen_at makes the statement non-creating and
-//	incarnation-safe; StartBlockDeleteOrphan stays the only mutation allowed to
-//	bring an orphan into existence.
+//	stale-token-safe when the stored token differs; StartBlockDeleteOrphan stays
+//	the only mutation allowed to bring an orphan into existence. Reusing a token
+//	when resetting an existing lifecycle remains a separate open issue.
 //
 //	R28: Cassandra applies default_time_to_live per written VALUE and counts it
 //	from the WRITE, so an UPDATE that rewrites only the diagnostic columns hands
@@ -1771,7 +1772,8 @@ const gcS3OrphanTTLSeconds = 7776000
 //	the diagnostics months past the identity columns, and the projection — never
 //	rewritten — expired with the identity. No upsert was needed to produce a
 //	partial orphan; ordinary expiry did it. Anchoring the diagnostic TTL on
-//	first_seen_at keeps the whole row on one schedule.
+//	first_seen_at keeps this writer on the same application-derived schedule;
+//	coordinator-clock alignment remains a separate open requirement.
 //
 // Rewriting the identity columns to realign them was the other candidate and is
 // deliberately NOT what happens here: representation_id, external_sha1 and
@@ -1828,12 +1830,12 @@ func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, 
 		// a short life is still a partial row.
 		return nil
 	}
-	applied, err := s.db.Session().Query(fmt.Sprintf(`
-		UPDATE gc_s3_orphans USING TTL %d
+	applied, err := s.db.Session().Query(`
+		UPDATE gc_s3_orphans USING TTL ?
 		SET last_attempt_at = ?, retry_count = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF first_seen_at = ?
-	`, ttl), now, prev+1, errMsg, orgID.String(), blockID, expectedFirstSeenAt).MapScanCAS(map[string]interface{}{})
+	`, ttl, now, prev+1, errMsg, orgID.String(), blockID, expectedFirstSeenAt).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("failed to record S3 orphan attempt: %w", err)
 	}
@@ -1856,18 +1858,27 @@ func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, 
 // cells, which is a partial row with a very short life rather than no partial
 // row at all.
 //
-// This is conservative rather than exact. Cassandra counts a cell's TTL from its
-// write, so the identity columns really expire at insert_time + TTL, while this
-// computes first_seen_at + TTL. For a normally created row those coincide,
-// because StartBlockDeleteOrphan inserts with first_seen_at = now. Where they
-// differ the diagnostic simply expires early, which is the safe direction.
+// This is an application-clock schedule, not a read of Cassandra's actual
+// remaining TTL. Cassandra counts a cell's TTL from its write, so the identity
+// columns really expire at insert_time + TTL, while this computes first_seen_at
+// + TTL. If first_seen_at is in the future, the chronology is uncertain and the
+// diagnostic is skipped rather than risking an extension beyond the identity.
+// Exact protection against coordinator-clock skew and read-to-write latency is
+// a separate open requirement documented with R28.
 func s3OrphanRemainingTTLSeconds(firstSeenAt, now time.Time) int {
-	expiresAt := firstSeenAt.UTC().Add(gcS3OrphanTTLSeconds * time.Second)
-	remaining := int(expiresAt.Sub(now.UTC()) / time.Second)
+	firstSeenAt = firstSeenAt.UTC()
+	now = now.UTC()
+	if now.Before(firstSeenAt) {
+		// Even a subsecond future value is an uncertain chronology. Do not let
+		// integer division turn TTL+fraction into a fresh full TTL.
+		return 0
+	}
+	expiresAt := firstSeenAt.Add(gcS3OrphanTTLSeconds * time.Second)
+	remaining := int(expiresAt.Sub(now) / time.Second)
 	if remaining > gcS3OrphanTTLSeconds {
-		// Clock skew, or a first_seen_at in the future. Never extend past the
-		// schema default.
-		return gcS3OrphanTTLSeconds
+		// Clock skew or a first_seen_at in the future makes the real Cassandra
+		// expiry unknowable from application timestamps. Do not write diagnostics.
+		return 0
 	}
 	return remaining
 }

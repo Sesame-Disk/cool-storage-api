@@ -34,9 +34,9 @@ import (
 // so it has always had the semantics the Cassandra implementation lacked. Every
 // worker-level unit test therefore exercised correct behaviour against the mock
 // while production could still resurrect a row. TestMockUpdateS3OrphanAttempt-
-// NeverCreates below pins the mock so the two cannot drift apart again, and the
-// non-creating, incarnation-safe condition is gated for real in
-// internal/integration/gc_s3_orphan_partial_row_test.go, which needs Cassandra.
+// NeverCreates and GuardsTokenAndExpiry below pin the mock's non-creating,
+// different-token, and expired-schedule behavior. The Cassandra LWT remains
+// gated for real in internal/integration/gc_s3_orphan_partial_row_test.go.
 
 // TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule is the R28 gate. A retry
 // must not outlive the identity columns it describes: the diagnostic write is
@@ -87,9 +87,14 @@ func TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule(t *testing.T) {
 			want: gcS3OrphanTTLSeconds - 400*day,
 		},
 		{
-			name: "clock skew backwards is capped at the schema default",
+			name: "first seen in the future skips the diagnostic write",
 			now:  firstSeen.AddDate(0, 0, -30),
-			want: gcS3OrphanTTLSeconds,
+			want: 0,
+		},
+		{
+			name: "subsecond future first seen also skips the diagnostic write",
+			now:  firstSeen.Add(-500 * time.Millisecond),
+			want: 0,
 		},
 	}
 
@@ -105,13 +110,12 @@ func TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule(t *testing.T) {
 		})
 	}
 
-	// The property the table above is really asserting: a diagnostic write can
-	// never land after the identity columns it annotates. Stated directly so a
-	// future change to the clamping cannot satisfy the cases while breaking the
-	// invariant — the first draft of this function clamped to 1 second and this
-	// loop is what caught the one-second overhang at exact expiry.
+	// The property the table above is really asserting: under the application
+	// clock schedule, a diagnostic write is never scheduled after the calculated
+	// identity expiry. The actual Cassandra-cell expiry remains a separate
+	// coordinator-clock concern.
 	identityExpiry := firstSeen.Add(gcS3OrphanTTLSeconds * time.Second)
-	for elapsedDays := 0; elapsedDays <= 120; elapsedDays++ {
+	for elapsedDays := -30; elapsedDays <= 120; elapsedDays++ {
 		now := firstSeen.AddDate(0, 0, elapsedDays)
 		ttl := s3OrphanRemainingTTLSeconds(firstSeen, now)
 		if ttl <= 0 {
@@ -125,11 +129,10 @@ func TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule(t *testing.T) {
 	}
 }
 
-// TestS3OrphanTTLConstantMatchesSchema keeps gcS3OrphanTTLSeconds honest. The
-// constant exists only to compute a remaining TTL against the schema's own
-// default; if someone changes default_time_to_live in a migration and not here,
-// every retry would silently start writing diagnostics on the wrong schedule and
-// reintroduce R28.
+// TestS3OrphanTTLConstantMatchesSchema keeps gcS3OrphanTTLSeconds aligned with
+// the greenfield/base schema. The test does not inspect later ALTER TABLE
+// migrations; a migration-chain audit is required if a later migration changes
+// either table's default_time_to_live.
 func TestS3OrphanTTLConstantMatchesSchema(t *testing.T) {
 	schemaPath := filepath.Join("..", "db", "migrations", "001_initial_schema.cql")
 	schema, err := os.ReadFile(schemaPath)
@@ -149,7 +152,7 @@ func TestS3OrphanTTLConstantMatchesSchema(t *testing.T) {
 		ttlPattern := regexp.MustCompile(`default_time_to_live\s*=\s*(\d+)`)
 		ttlMatch := ttlPattern.FindSubmatch(match[1])
 		if ttlMatch == nil {
-			t.Fatalf("%s has no default_time_to_live; if the TTL package removed it, "+
+			t.Fatalf("%s has no default_time_to_live in the base schema; if the TTL package removed it, "+
 				"UpdateS3OrphanAttempt must stop computing a remaining TTL (R28)", table)
 		}
 		ttl, err := strconv.Atoi(string(ttlMatch[1]))
@@ -177,5 +180,70 @@ func TestMockUpdateS3OrphanAttemptNeverCreates(t *testing.T) {
 	if got := store.S3OrphanCount(); got != 0 {
 		t.Fatalf("orphan rows = %d after updating an absent row, want 0: only "+
 			"StartBlockDeleteOrphan may bring an orphan into existence (R19)", got)
+	}
+}
+
+func TestMockUpdateS3OrphanAttemptGuardsTokenAndExpiry(t *testing.T) {
+	firstSeen := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		expected   time.Time
+		now        time.Time
+		wantUpdate bool
+	}{
+		{
+			name:       "different lifecycle token",
+			expected:   firstSeen.Add(time.Second),
+			now:        firstSeen.Add(time.Hour),
+			wantUpdate: false,
+		},
+		{
+			name:       "future application clock",
+			expected:   firstSeen,
+			now:        firstSeen.Add(-500 * time.Millisecond),
+			wantUpdate: false,
+		},
+		{
+			name:       "identity expiry",
+			expected:   firstSeen,
+			now:        firstSeen.Add(gcS3OrphanTTLSeconds * time.Second),
+			wantUpdate: false,
+		},
+		{
+			name:       "live matching lifecycle",
+			expected:   firstSeen,
+			now:        firstSeen.Add(time.Hour),
+			wantUpdate: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			orgID := uuid.New()
+			const blockID = "mock-guarded-orphan"
+			if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "plain", "", firstSeen); err != nil {
+				t.Fatalf("StartBlockDeleteOrphan: %v", err)
+			}
+
+			if err := store.UpdateS3OrphanAttempt(orgID, blockID, tc.expected, "boom", tc.now); err != nil {
+				t.Fatalf("UpdateS3OrphanAttempt: %v", err)
+			}
+			orphans := store.AllS3Orphans()
+			if len(orphans) != 1 {
+				t.Fatalf("orphan rows = %d, want 1", len(orphans))
+			}
+			orphan := orphans[0]
+			if tc.wantUpdate {
+				if orphan.RetryCount != 1 || orphan.LastError != "boom" {
+					t.Fatalf("updated orphan = retry_count %d, last_error %q; want 1, boom", orphan.RetryCount, orphan.LastError)
+				}
+				return
+			}
+			if orphan.RetryCount != 0 || orphan.LastError != "" {
+				t.Fatalf("guarded orphan mutated = retry_count %d, last_error %q; want 0, empty", orphan.RetryCount, orphan.LastError)
+			}
+		})
 	}
 }

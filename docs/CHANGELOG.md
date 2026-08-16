@@ -408,7 +408,7 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ---
 
-## 2026-08-15 - R19 fixed and R28's TTL skew closed: `UpdateS3OrphanAttempt` can no longer produce a partial orphan
+## 2026-08-15 - Incremental R19 hardening and `UpdateS3OrphanAttempt` TTL guard
 
 Both defects produced the same shape — a `gc_s3_orphans` row whose primary key is live,
 whose identity columns are gone, and which has no `_by_day` entry. Under A+ that is a
@@ -418,22 +418,34 @@ existence, and both fence reads select only `block_id`, which such a row still r
 - **R19 — the statement was an upsert.** A plain `UPDATE` with no `IF`, so a recoverer
   whose S3 delete failed could write it after another path had cleared the row and
   recreate it from three diagnostic columns. It is now conditional on the expected
-  `first_seen_at`, so both an absent row and a newer incarnation are a no-op rather
-  than an error.
+  `first_seen_at`, so both an absent row and a row with a different observed token
+  are a no-op rather than an error. `StartBlockDeleteOrphan` can still reset an
+  existing row while preserving its `first_seen_at`; that lifecycle-reuse case remains
+  open and is not claimed as a complete incarnation identity. The existing reset
+  behavior is covered by `TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState`;
+  a delayed-update gate for that reset path is still pending.
 - **Where the defect hid.** `MockStore.UpdateS3OrphanAttempt` only ever mutated a key
-  already present, so it always had the semantics the Cassandra store lacked. Every
-  worker-level unit test therefore agreed with the fix while production carried the
-  defect. The gate had to be an integration test; a unit test could not have caught it.
-- **R19 — incarnation ABA.** `IF EXISTS` alone would still let a delayed P1 update
-  modify a newly-created P2 row with the same `(org_id, block_id)`. The attempt now
-  carries P1's `first_seen_at`, and the LWT requires that exact identity. The real
-  gate is `TestGC_UpdateS3OrphanAttempt_DoesNotCrossOrphanIncarnations`; it verifies
-  that P2's retry count and error remain untouched.
-- **R28 — per-value TTL skew.** Cassandra applies `default_time_to_live` per written
-  value and counts it from the *write*, so rewriting only the diagnostic columns handed
-  them a fresh full term while the identity columns kept theirs. The diagnostics now
-  carry `USING TTL` anchored on the row's `first_seen_at`, so every cell shares one
-  expiry. Rewriting the identity columns to realign them was rejected:
+   already present, so it always had the semantics the Cassandra store lacked. Every
+   worker-level unit test therefore agreed with the fix while production carried the
+   defect. The gate had to be an integration test; a unit test could not have caught it.
+- The mock now also pins the non-creating guard, differing lifecycle-token rejection,
+  and the no-write behavior at or beyond the calculated expiry, so worker tests cannot
+  drift from the Cassandra method on those boundaries. Cassandra-specific LWT behavior
+  remains covered by the integration gates below.
+- **R19 — stale-token guard.** `IF EXISTS` alone would still let a delayed P1 update
+  modify a newly-created P2 row with a different `(org_id, block_id, first_seen_at)`.
+  The attempt now carries P1's token, and the LWT rejects that mismatch. The real gate
+  is `TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken`; it verifies that
+  P2's retry count and error remain untouched. A reset of an existing canonical row
+  reuses its token and remains a documented follow-up for lifecycle identity.
+- **R28a — this writer's per-value TTL skew.** Cassandra applies
+  `default_time_to_live` per written value and counts it from the *write*, so rewriting
+  only the diagnostic columns handed them a fresh full term while the identity columns
+  kept theirs. `UpdateS3OrphanAttempt` now uses a bound TTL on its application-derived
+  remaining schedule and skips an impossible future `first_seen_at`. This does not
+  prove equality with Cassandra's actual coordinator expiry, and it does not fix the
+  other orphan writers, which remain R28b.
+  Rewriting the identity columns to realign them was rejected:
   `representation_id`, `external_sha1` and `recovery_phase` all have other conditional
   writers, so echoing back a just-read value trades a TTL race for a lost-update race,
   including a `recovery_phase` regression.
@@ -442,18 +454,19 @@ existence, and both fence reads select only `block_id`, which such a row still r
   `TTL(last_error) = 7776000, want <= 5270400` — the full 90-day term on a row with 60
   days left. Both green after. A unit property loop
   (`TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule`) asserts across the row's
-  whole life, including the fractional final second, that a diagnostic write can never
-  land after the identity columns; the remaining TTL is floored from `expiry - now`,
-  so the final subsecond interval returns zero and skips the write.
-  `TestS3OrphanTTLConstantMatchesSchema` parses `001_initial_schema.cql` so the Go
-  constant cannot drift from the schema.
+  whole application-clock schedule, including the fractional final second and a
+  future `first_seen_at`, that the helper never schedules a diagnostic past its
+  calculated expiry. It is not a proof against coordinator-clock skew or read-to-write
+  latency. `TestS3OrphanTTLConstantMatchesSchema` checks the greenfield/base schema;
+  later migration changes require a migration-chain audit.
 - **Scope.** This does **not** remove the TTL, so an orphan whose recovery keeps failing
   still expires and takes its durable record with it. That is the four-change package in
   `GC-X1-CLOSURE-OPTIONS.md`, and it cannot ship alone: `gcS3OrphanInitialScanLookbackDays`
   is pinned to the same 90 days, so dropping the TTL without redefining the cold-start
   horizon makes any orphan older than that permanently invisible after a cursor loss —
-  R27's unsolved partitioning problem. The rule also binds every *other* non-creating
-  orphan mutation; only this one has been done. **X1 open, R3 open, R21/R26/R27/R31 open,
+  R27's unsolved partitioning problem. Other row-wide TTL writers remain open, as do
+  the lifecycle reset identity and the R12 serial-domain inventory update.
+  **X1 open, R3 open, R19 reset reuse open, R21/R26/R27/R28b/R28 expiry/R31 open,
   `GC_ENABLED=false` unchanged.**
 
 ---

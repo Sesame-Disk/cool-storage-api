@@ -85,12 +85,13 @@ func TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan(t *testing.T) {
 	}
 }
 
-// TestGC_UpdateS3OrphanAttempt_DoesNotCrossOrphanIncarnations is the R19 ABA
+// TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken is the R19 stale-token
 // gate. A non-creating condition prevents an update after a clear from
 // recreating a row, but existence alone does not stop that same delayed update
-// from landing on a new P2 row with the same primary key. The conditional
-// first_seen_at is the lifecycle token.
-func TestGC_UpdateS3OrphanAttempt_DoesNotCrossOrphanIncarnations(t *testing.T) {
+// from landing on a new P2 row with the same primary key when its observed
+// first_seen_at differs. It is a stale-token guard, not a unique lifecycle ID;
+// StartBlockDeleteOrphan can reuse the value when resetting an existing row.
+func TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)

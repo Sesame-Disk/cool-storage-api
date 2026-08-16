@@ -3784,9 +3784,14 @@ func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expec
 	if expectedFirstSeenAt.IsZero() {
 		return nil
 	}
+	expectedFirstSeenAt = expectedFirstSeenAt.UTC().Truncate(time.Millisecond)
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
-		if !existing.FirstSeenAt.Equal(expectedFirstSeenAt) {
+		storedFirstSeenAt := existing.FirstSeenAt.UTC().Truncate(time.Millisecond)
+		if !storedFirstSeenAt.Equal(expectedFirstSeenAt) {
+			return nil
+		}
+		if s3OrphanRemainingTTLSeconds(expectedFirstSeenAt, now) <= 0 {
 			return nil
 		}
 		existing.LastAttemptAt = now

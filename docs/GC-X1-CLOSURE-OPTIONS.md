@@ -857,8 +857,16 @@ an active canonical incarnation preserve its key.
 > **R19 implementation note:** the original row above records the historical upsert
 > defect and its first `IF EXISTS` fix. The current implementation is stricter:
 > `UpdateS3OrphanAttempt` carries the expected `first_seen_at` and uses
-> `IF first_seen_at = ?`, which closes both resurrection and P1→P2 cross-incarnation
-> updates. See checklist item 10 and the two R19 integration gates below.
+> `IF first_seen_at = ?`, which closes resurrection and mismatches against a
+> differently-tokened row. `StartBlockDeleteOrphan` can reset an existing row while
+> preserving that token, so the existing-row lifecycle reuse remains open. See
+> checklist item 10 and the two R19 integration gates below.
+
+> **R28 implementation note:** the `SKEW FIXED` wording in the historical row above
+> applies only to `UpdateS3OrphanAttempt`'s application-clock schedule. The
+> `StartBlockDeleteOrphan`, `RecordS3Orphan`, `MarkS3OrphanMappingCleanupPending` and
+> projection writes still refresh selected cells with the table default TTL. The actual
+> Cassandra coordinator expiry is also not observed by this helper.
 
 R8, R13 and R15 decide whether Option B is viable. R16, R17, R19, R20, R22, R23, R24, R25,
 R26, R28, R29, R31, R3, R9, R10, R11 and R12 are common safety-closure criteria — R16 and R20 become newly
@@ -931,8 +939,8 @@ The two partitions do not share a Paxos log and `SERIAL` does not make orphan in
 and canonical-row deletion atomic; R13 remains a real two-step crash window. The protocol
 must provide the ordering and recovery checks explicitly.
 
-The orphan partition carries five more conditional statements
-(`internal/gc/store_cassandra.go:1577, 1598, 1630, 1685, 1717`) plus **two**
+The orphan partition carries six more conditional statements
+(`internal/gc/store_cassandra.go:1577, 1598, 1630, 1685, 1717, 1835`) plus **two**
 unconditional `DELETE`s that clear the record. Only one of them runs: `DeleteS3Orphan`
 (`internal/gc/store_cassandra.go:1776`), which B.1 requires to become conditional.
 `DeleteBlockS3Orphan` (`internal/db/block_references.go:1199`) has no caller in the repo
@@ -1016,7 +1024,7 @@ A conceptual diff, not an implementation list.
 | `cleanupBlockMapping` | Deletes the SHA-1 mapping unconditionally from `processBlock`; `RecoverS3Orphans` guards with `BlockExists` | Decouple from the physical lifecycle (B.3), or add the same guard to `processBlock` (R11) |
 | `StagePublishAttemptReferences` | Insert only | Post-check the active canonical incarnation. **A+:** any orphan for `L` blocks success. **B:** the canonical `P` must differ from the pending orphan `P1`; both also require no destructive/repair claim. Roll back this call's `pub:` rows on failure. |
 | `RegisterUploadedBlock` | Write `up:` then check the logical fence, then `UpsertBlockMetadata`; the provisional ref is **not** rolled back when the fence is found active (`fs_helpers.go:989-1003`) | Split repair from install (**R17**): a repair may only update a row that still names the same `P`, never create an absent one. Make the path tuple-aware: reuse/repair the active canonical `P`, block a condemned/deleting one, mint only for a genuine new incarnation. And settle what the surviving `up:` row does to recovery (**R18**) |
-| `UpdateS3OrphanAttempt` | Plain `UPDATE` with no `IF` (`store_cassandra.go:1742-1759`) — an upsert that can recreate a cleared orphan as a partial row with no `storage_class` and no `_by_day` projection | Condition on the expected `P` and fail when the row is gone (**R19**) |
+| `UpdateS3OrphanAttempt` | Reads the expected `first_seen_at`, then performs `UPDATE … IF first_seen_at = ?` with a bound TTL; absent or differently-tokened rows are no-ops, while an existing-row lifecycle reset can still reuse the token | Guard the actual non-reusable lifecycle identity `P` and fail when the row is gone or reset to another lifecycle (**R19**) |
 | `RecordS3Orphan` | A **second** `INSERT … IF NOT EXISTS` creator of `gc_s3_orphans` (`store_cassandra.go:1618-1630`), exposed in the `GCStore` interface (`store.go:196`) with **no production caller** — tests and the mock only — and a stale doc comment | Remove from the interface, or narrow to `RepairExistingS3Orphan` with `IF EXISTS` and no ability to create. `StartBlockDeleteOrphan` must be the sole creator before any design treats the orphan as an authorization certificate (**R21**) |
 | `RecoverS3Orphans` discovery | Takes `S3OrphanInfo` — `StorageClass` included — straight from `ListS3OrphansByDay` and destroys on it, never reloading the canonical row | `by_day` → load canonical orphan → require exact `P` match → destroy. Mismatch or missing canonical row repairs/drops the index entry and never deletes (**R22**) |
 | `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go:1776`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`); its projection half deletes by timestamp identity and resolves a zero `firstSeenAt` from whatever canonical row is current | Condition the canonical clear on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) — **and bind the projection clear the same way** (**R26**), or the stale lifecycle still erases the newer one's discoverability |
@@ -1121,14 +1129,17 @@ decisions come first.
    sufficient on its own — see R17.
 10. **R19 / R28 — partial and undiscoverable orphans. ⚠️ PARTLY SETTLED.**
    `UpdateS3OrphanAttempt` now carries the expected `first_seen_at` and performs
-   `IF first_seen_at = ?`, so an absent row and a newer P2 incarnation are both
-   non-applicable. It also writes on the row's own expiry schedule, with a floored
-   remaining TTL that skips the final fractional second. **Two things are still
-   open, and neither is cosmetic.** First, the rule binds *every* non-creating
+   `IF first_seen_at = ?`, so an absent row and a row with a different observed
+   token are non-applicable. It also floors its application-clock schedule, skips a
+   future `first_seen_at`, and avoids dynamic prepared-statement text. **Three things
+   are still open, and none is cosmetic.** First, `StartBlockDeleteOrphan` can reset
+   an existing row while preserving `first_seen_at`, so a delayed P1 update can still
+   match P2; a fresh lifecycle identity is needed. Second, the rule binds *every* non-creating
    mutation, and only this one has been done: `RecordS3Orphan` remains a second
    creator (R21), and the phase/clear statements still key on `(org, block)` rather
    than on the expected `P` — they cannot key on `P` until the physical identity is
-   persisted, which is the A+ package. Second, the TTL itself remains, so an orphan
+   persisted, which is the A+ package. Third, the actual coordinator-clock expiry is
+   not proven by the application schedule, and the TTL itself remains, so an orphan
    can still expire and take its recovery record with it; removing it needs the
    cold-start horizon and cursor semantics redefined at the same time, which is
    R27's unsolved partitioning problem, not a one-line schema change.
@@ -1183,8 +1194,9 @@ All instruments live in `internal/api/sync_publish_handshake_test.go` unless not
 | R30 retention | A successful fresh-UUID repair retires the original crashed publisher's `pub:` refs | not built — availability/retention follow-up; requires durable attempt lineage or an explicit accepted 35-day retention bound |
 | R31 durable repair | A possibly successful published HEAD converges to permanent `fs:` without a later client request | **BLOCKER / not built** — requires a durable reconciliation record or background repair independent of the 35-day TTL |
 | **R19 non-creating** | `UpdateS3OrphanAttempt` may not resurrect a cleared orphan — `TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan` (integration; the mock never had the defect, so a unit test could not gate it) | **GREEN.** Red against the pre-fix statement: `UpdateS3OrphanAttempt resurrected a cleared orphan row` |
-| **R19 incarnation** | A delayed P1 attempt may not mutate a new P2 row sharing `(org_id, block_id)` — `TestGC_UpdateS3OrphanAttempt_DoesNotCrossOrphanIncarnations` | **GREEN.** P2's `first_seen_at`, `retry_count` and `last_error` remain unchanged |
-| **R28 skew** | Diagnostic columns must expire with the identity columns they annotate — `TestGC_UpdateS3OrphanAttempt_AnchorsDiagnosticTTLOnFirstSeenAt` (integration) plus `TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule` (unit, property loop) | **GREEN.** Red against the pre-fix statement: `TTL(last_error) = 7776000, want <= 5270400` |
+| **R19 timestamp guard** | A delayed P1 attempt may not mutate a row with a different observed `first_seen_at` — `TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken` | **GREEN for differing tokens.** Existing-row lifecycle reset reuse remains open |
+| **R28a application schedule** | `UpdateS3OrphanAttempt` must not schedule diagnostics beyond its application-derived expiry — `TestGC_UpdateS3OrphanAttempt_AnchorsDiagnosticTTLOnFirstSeenAt` (integration) plus `TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule` (unit, property loop) | **GREEN for the tested schedule.** Not proof of coordinator-clock expiry alignment |
+| R28b other orphan writers | All canonical/projection writers must preserve one row-wide expiry schedule | **OPEN** |
 | R28 expiry | An orphan whose recovery keeps failing must not lose its durable record | not built — the TTL is still in the schema; removing it is blocked on R27's retry-scheduling partitioning |
 | R3 safety | A block under an active delete fence must not gain a permanent `fs:` reference through the retry path | not built — needs a second instance for a cold memo, and cannot go green until R3's post-check exists on any path |
 | Physical ABA | An authorized DELETE landing after a byte-identical rematerialization destroys live bytes | not built — needs deterministic control of the S3 delete between authorization and landing |
