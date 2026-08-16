@@ -463,6 +463,14 @@ existence, and both fence reads select only `block_id`, which such a row still r
   effective `system_schema.tables` value after the migration chain, and
   `TestGC_UpdateS3OrphanAttemptMatchesEffectiveTTL` binds that runtime value to the
   actual Go-to-CQL update path.
+- **Why a test-cleanup change rides along.** `scripts/test-batch-operations.sh` created
+  `batch-ops-test-*` libraries that no cleanup pattern matched, so they accumulated across
+  runs until the org hit its storage quota and unrelated integration tests began failing
+  on quota rather than on their own subject. The prefix is now in
+  `cleanup-test-repos.sh` and `check-test-cleanup.sh`, and the batch script keeps its
+  cleanup trap armed across the create request so a failure after the server created the
+  library still removes it. Unrelated to R19/R28 in subject, but the orphan integration
+  gates in this branch could not be run green without it.
 - **Scope.** This does **not** remove the TTL, so an orphan whose recovery keeps failing
   still expires and takes its durable record with it. That is the four-change package in
   `GC-X1-CLOSURE-OPTIONS.md`, and it cannot ship alone: `gcS3OrphanInitialScanLookbackDays`
