@@ -768,9 +768,7 @@ func TestX2_DestructiveTimestampsArePerPath(t *testing.T) {
 
 	// Orphan recovery cannot authorize anything: its liveness read fails.
 	orgID := uuid.New()
-	if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1)); err != nil {
-		t.Fatalf("seed orphan: %v", err)
-	}
+	seedS3Orphan(t, store, orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1))
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("expected the sweep to fail closed")
@@ -866,9 +864,7 @@ func TestX2_OrphanRecoveryClassifiesItsGlobalVerifyFailure(t *testing.T) {
 	seedRefusedOrphan := func(t *testing.T, w *Worker, store *MockStore, sp *MockStorageProvider, at time.Time, livenessErr error) {
 		t.Helper()
 		orgID := uuid.New()
-		if _, err := store.RecordS3Orphan(orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", at.AddDate(0, 0, -1)); err != nil {
-			t.Fatalf("seed orphan: %v", err)
-		}
+		seedS3Orphan(t, store, orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", at.AddDate(0, 0, -1))
 		store.SetBlockHasReferencesGlobalErrForTest(livenessErr)
 		if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 			t.Fatal("the sweep must defer when its global verify fails, whatever the error was")
