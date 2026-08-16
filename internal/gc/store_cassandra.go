@@ -191,6 +191,8 @@ type CassandraStore struct {
 	db *db.DB
 }
 
+var _ GCStore = (*CassandraStore)(nil)
+
 const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
@@ -1609,98 +1611,6 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 	return effectiveFirstSeenAt, nil
 }
 
-// RecordS3Orphan upserts a gc_s3_orphans row preserving and returning the
-// effective first_seen_at when the row already exists. Called both for the
-// recovery scanner and for actual S3 delete failures.
-//
-// It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
-// recovery can enumerate every orphan without scanning canonical partitions.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, errMsg string, now time.Time) (time.Time, error) {
-	initialRetryCount := 0
-	if errMsg != "" {
-		initialRetryCount = 1
-	}
-	representationID = strings.TrimSpace(representationID)
-	existing := map[string]interface{}{}
-	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
-	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
-	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
-	}
-	effectiveFirstSeenAt := now.UTC()
-	effectiveStorageClass := storageClass
-	effectiveRepresentationID := representationID
-	effectiveExternalSHA1 := strings.TrimSpace(externalSHA1)
-	effectiveRecoveryPhase := S3OrphanPhasePendingS3
-	if !applied {
-		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if effectiveFirstSeenAt.IsZero() {
-			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
-		}
-		effectiveStorageClass, err = casStringValue(existing, "storage_class")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if effectiveStorageClass == "" {
-			effectiveStorageClass = storageClass
-		}
-		effectiveRepresentationID, err = casStringValue(existing, "representation_id")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if strings.TrimSpace(effectiveRepresentationID) == "" {
-			effectiveRepresentationID = representationID
-		}
-		effectiveExternalSHA1, err = casStringValue(existing, "external_sha1")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if strings.TrimSpace(effectiveExternalSHA1) == "" {
-			effectiveExternalSHA1 = strings.TrimSpace(externalSHA1)
-		}
-		effectiveRecoveryPhase, err = casStringValue(existing, "recovery_phase")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if strings.TrimSpace(effectiveRecoveryPhase) == "" {
-			effectiveRecoveryPhase = S3OrphanPhasePendingS3
-		}
-	}
-	if !applied && (strings.TrimSpace(parseCASString(existing["representation_id"])) == "" ||
-		strings.TrimSpace(parseCASString(existing["external_sha1"])) == "" && effectiveExternalSHA1 != "" ||
-		strings.TrimSpace(parseCASString(existing["recovery_phase"])) == "") {
-		updateState := map[string]interface{}{}
-		updated, err := s.db.Session().Query(`
-			UPDATE gc_s3_orphans
-			SET representation_id = ?, external_sha1 = ?, recovery_phase = ?
-			WHERE org_id = ? AND block_id = ?
-			IF EXISTS
-		`, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, orgID.String(), blockID).MapScanCAS(updateState)
-		if err != nil {
-			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
-		}
-		if !updated {
-			return effectiveFirstSeenAt, fmt.Errorf("update S3 orphan recovery state for org=%s block=%s: row disappeared before repair", orgID, blockID)
-		}
-	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveRepresentationID, effectiveExternalSHA1, effectiveRecoveryPhase, effectiveFirstSeenAt); err != nil {
-		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
-	}
-	if !applied && errMsg != "" {
-		if err := s.UpdateS3OrphanAttempt(orgID, blockID, effectiveFirstSeenAt, errMsg, now); err != nil {
-			return effectiveFirstSeenAt, err
-		}
-	}
-	return effectiveFirstSeenAt, nil
-}
-
 func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
 	representationID = strings.TrimSpace(representationID)
@@ -1762,9 +1672,8 @@ const gcS3OrphanTTLSeconds = 7776000
 //	had already cleared the row, recreating it from the three diagnostic columns
 //	alone. The expected first_seen_at makes the statement non-creating and
 //	stale-token-safe when the stored token differs. This mutation is non-creating;
-//	making StartBlockDeleteOrphan the sole creator remains the separate R21 issue
-//	because RecordS3Orphan still has its own INSERT IF NOT EXISTS path. Reusing a
-//	token when resetting an existing lifecycle remains a separate open issue.
+//	making StartBlockDeleteOrphan the sole creator is the R21 authority boundary.
+//	Reusing a token when resetting an existing lifecycle remains a separate open issue.
 //
 //	R28: Cassandra applies default_time_to_live per written VALUE and counts it
 //	from the WRITE, so an UPDATE that rewrites only the diagnostic columns hands
@@ -1779,7 +1688,7 @@ const gcS3OrphanTTLSeconds = 7776000
 // Rewriting the identity columns to realign them was the other candidate and is
 // deliberately NOT what happens here: representation_id, external_sha1 and
 // recovery_phase all have other conditional writers (StartBlockDeleteOrphan's
-// reset, RecordS3Orphan's repair, the pending_mapping_cleanup transition), so
+// reset and the pending_mapping_cleanup transition), so
 // echoing back values read a moment earlier would trade a TTL race for a
 // lost-update race — including a recovery_phase regression.
 //

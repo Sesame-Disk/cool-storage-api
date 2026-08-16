@@ -1183,32 +1183,3 @@ func (db *DB) ReleaseBlockDeleteClaim(orgID, blockID, claimID string) (bool, err
 		IF gc_state = ? AND gc_claim_id = ?
 	`, orgID, blockID, BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
 }
-
-func (db *DB) DeleteBlockS3Orphan(orgID, blockID string, firstSeenAt time.Time) error {
-	if firstSeenAt.IsZero() {
-		if err := db.Session().Query(`
-			SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-		`, orgID, blockID).Scan(&firstSeenAt); err != nil {
-			if !errors.Is(err, gocql.ErrNotFound) {
-				return fmt.Errorf("failed to read gc_s3_orphans row for delete: %w", err)
-			}
-		}
-	}
-
-	if err := db.Session().Query(`
-		DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Exec(); err != nil {
-		return err
-	}
-
-	if firstSeenAt.IsZero() {
-		return nil
-	}
-	if err := db.Session().Query(`
-		DELETE FROM gc_s3_orphans_by_day
-		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
-	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID).Exec(); err != nil {
-		return err
-	}
-	return nil
-}

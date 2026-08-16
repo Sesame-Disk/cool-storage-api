@@ -8,6 +8,23 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-16 - R21 orphan authority surfaces removed
+
+Closed R21's provenance gap without changing runtime GC behaviour. `RecordS3Orphan`
+was removed from `GCStore`, `CassandraStore` and `MockStore`, so
+`StartBlockDeleteOrphan` is now the only production lifecycle entry point that can
+create `gc_s3_orphans`. Test fixtures now create the row through that lifecycle and
+use `UpdateS3OrphanAttempt` when they need to model an initial failed delete.
+
+The unused exported `DeleteBlockS3Orphan` helper was removed as the destructive twin
+of the former creator. An untagged source gate rejects both identifiers in production
+Go and requires exactly one canonical orphan INSERT. This PR does not change the
+active `DeleteS3Orphan` path, TTL policy, projection schema or the X1 activation gate.
+
+R21 is closed; X1, R3, R26, R27, R28b, R30 and R31 remain open.
+
+---
+
 ## 2026-08-13 - X2 cross-DC reference visibility: EACH_QUORUM destructive liveness
 
 First runtime change of the X1/X2 series. Implements the cross-DC half without r3: no
