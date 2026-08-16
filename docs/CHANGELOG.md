@@ -19,9 +19,15 @@ use `UpdateS3OrphanAttempt` when they need to model an initial failed delete.
 The unused exported `DeleteBlockS3Orphan` helper was removed as the destructive twin
 of the former creator. An untagged source gate rejects both identifiers in production
 Go, requires exactly one canonical orphan INSERT, requires every canonical orphan
-UPDATE to carry an IF condition, and restricts the production creator callsite to
-`Worker.processBlock`. This PR does not change the active `DeleteS3Orphan` path, TTL
-policy, projection schema or the X1 activation gate.
+UPDATE to carry a real `IF EXISTS`/`IF <col> =` predicate rather than the bare word,
+and restricts the production creator to a single reference in `Worker.processBlock` —
+a method value counts, not only a direct call. This PR does not change the active
+`DeleteS3Orphan` path, TTL policy, projection schema or the X1 activation gate.
+
+The gate checks that an orphan UPDATE is conditional, not that its predicate is the
+right one: `IF EXISTS` prevents resurrection, while preventing cross-lifecycle
+mutation needs `IF <lifecycle identity> = P1`. That distinction is the still-open
+reset-reuse issue, not something this PR closes.
 
 R21 is closed; X1 remains open, and this PR does not close any of the other X1
 criteria tracked in `GC-X1-CLOSURE-OPTIONS.md`.

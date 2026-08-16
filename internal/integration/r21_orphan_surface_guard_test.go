@@ -12,6 +12,83 @@ import (
 	"testing"
 )
 
+func stripCQLComments(query string) string {
+	var out strings.Builder
+	out.Grow(len(query))
+	inSingleQuote := false
+	inDoubleQuote := false
+	for i := 0; i < len(query); {
+		char := query[i]
+		if inSingleQuote {
+			out.WriteByte(char)
+			i++
+			if char == '\'' {
+				if i < len(query) && query[i] == '\'' {
+					out.WriteByte(query[i])
+					i++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			out.WriteByte(char)
+			i++
+			if char == '"' {
+				if i < len(query) && query[i] == '"' {
+					out.WriteByte(query[i])
+					i++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+		if char == '\'' {
+			inSingleQuote = true
+			out.WriteByte(char)
+			i++
+			continue
+		}
+		if char == '"' {
+			inDoubleQuote = true
+			out.WriteByte(char)
+			i++
+			continue
+		}
+		if char == '-' && i+1 < len(query) && query[i+1] == '-' {
+			out.WriteString("  ")
+			i += 2
+			for i < len(query) && query[i] != '\r' && query[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if char == '/' && i+1 < len(query) && query[i+1] == '*' {
+			out.WriteString("  ")
+			i += 2
+			for i < len(query) {
+				if query[i] == '*' && i+1 < len(query) && query[i+1] == '/' {
+					out.WriteString("  ")
+					i += 2
+					break
+				}
+				if query[i] == '\r' || query[i] == '\n' {
+					out.WriteByte(query[i])
+				} else {
+					out.WriteByte(' ')
+				}
+				i++
+			}
+			continue
+		}
+		out.WriteByte(char)
+		i++
+	}
+	return out.String()
+}
+
 // TestR21OrphanAuthoritySurface is an untagged source gate. It runs with the
 // normal unit suite so a future refactor cannot quietly add a second orphan
 // creator, bypass the conditional orphan mutations, move the creator away from
@@ -24,7 +101,9 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 	}
 	creatorPattern := regexp.MustCompile(`(?i)\bINSERT\s+INTO\s+gc_s3_orphans\b`)
 	updatePattern := regexp.MustCompile(`(?i)\bUPDATE\s+gc_s3_orphans\b`)
-	ifPattern := regexp.MustCompile(`(?i)\bIF\b`)
+	// Match the three predicate shapes this package actually writes, after CQL
+	// comments have been removed so comment text cannot satisfy the gate.
+	conditionalUpdatePattern := regexp.MustCompile(`(?is)(?:\bWHERE\b.*\bIF\s+(?:NOT\s+)?EXISTS\b|\bWHERE\b.*\bIF\s+\w+\s*=\s*\?)`)
 	forbiddenIdentifiers := map[string]bool{
 		"RecordS3Orphan":      true,
 		"DeleteBlockS3Orphan": true,
@@ -55,6 +134,7 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 		}
 		return matched
 	}
+	callsiteFunctions := []string{}
 	functionName := func(fn *ast.FuncDecl) string {
 		if fn.Recv == nil || len(fn.Recv.List) == 0 {
 			return fn.Name.Name
@@ -69,10 +149,18 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 		}
 		return fn.Name.Name
 	}
+	recordCallsites := func(node ast.Node, caller string) {
+		ast.Inspect(node, func(n ast.Node) bool {
+			selector, ok := n.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == "StartBlockDeleteOrphan" {
+				callsiteFunctions = append(callsiteFunctions, caller)
+			}
+			return true
+		})
+	}
 
 	totalCreators := 0
 	creatorFunctions := []string{}
-	callsiteFunctions := []string{}
 	scanned := 0
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
@@ -109,13 +197,14 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 		fileCreators := matchingLiterals(file, creatorPattern)
 		totalCreators += len(fileCreators)
 		for _, query := range matchingLiterals(file, updatePattern) {
-			if !ifPattern.MatchString(query) {
+			if !conditionalUpdatePattern.MatchString(stripCQLComments(query)) {
 				t.Errorf("%s: canonical orphan UPDATE must be conditional with IF", path)
 			}
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
+				recordCallsites(decl, "<package>")
 				continue
 			}
 			if len(matchingLiterals(fn, creatorPattern)) > 0 {
@@ -127,17 +216,11 @@ func TestR21OrphanAuthoritySurface(t *testing.T) {
 			if fn.Body == nil {
 				continue
 			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if ok && selector.Sel.Name == "StartBlockDeleteOrphan" {
-					callsiteFunctions = append(callsiteFunctions, functionName(fn))
-				}
-				return true
-			})
+			// Any selector naming the method counts, not only a direct call: a
+			// method value (`start := store.StartBlockDeleteOrphan`) hands the
+			// creator to an unauthorized path just as effectively. Package-level
+			// method expressions are recorded as <package> above for the same reason.
+			recordCallsites(fn.Body, functionName(fn))
 		}
 		return nil
 	})

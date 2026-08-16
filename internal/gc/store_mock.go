@@ -186,9 +186,9 @@ type MockStore struct {
 	deleteProvisionalProjectionErr error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
-	getQueueSizeHook                 func(orgID uuid.UUID, size int)
-	removeActiveOrgHook              func(orgID uuid.UUID, activeBefore time.Time)
-	recalculateStatsHook             func(orgID uuid.UUID)
+	getQueueSizeHook                func(orgID uuid.UUID, size int)
+	removeActiveOrgHook             func(orgID uuid.UUID, activeBefore time.Time)
+	recalculateStatsHook            func(orgID uuid.UUID)
 	startBlockDeleteOrphanResetRace bool
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
