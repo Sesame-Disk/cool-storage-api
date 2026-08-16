@@ -97,6 +97,22 @@ check_success() {
     fi
 }
 
+# Keep the cleanup trap active before the create request. If the request or the
+# response parsing fails after the server has created the library, the global
+# cleanup script still has the batch-ops-test- prefix as a second safety net.
+REPO_ID=""
+cleanup() {
+    if [ -z "$REPO_ID" ] || [ "$REPO_ID" = "null" ]; then
+        return
+    fi
+    info "Cleaning up test library..."
+    api_delete "/api/v2.1/repos/${REPO_ID}/" > /dev/null 2>&1 || true
+    REPO_ID=""
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Create a test library
 info "Creating test library..."
 TIMESTAMP=$(date +%s)
@@ -114,13 +130,6 @@ fi
 
 pass "Created test library: $REPO_ID"
 echo ""
-
-# Cleanup function
-cleanup() {
-    info "Cleaning up test library..."
-    api_delete "/api/v2.1/repos/${REPO_ID}/" > /dev/null 2>&1 || true
-}
-trap cleanup EXIT
 
 # Setup: Create test folders
 echo "=== Setup: Creating test folders ==="
