@@ -658,6 +658,21 @@ func blockIDMappingExistsForRepresentation(t *testing.T, orgID, representationID
 	return err == nil && internalID != ""
 }
 
+// gcS3OrphanExists reports whether the canonical row is materializable at all.
+// It selects only block_id on purpose: that is exactly what the two production
+// fence reads do (block_references.go), so a row whose identity columns have
+// expired or were never written still answers true here — and still fences the
+// writer. Asserting on storage_class instead would miss the partial-row shape
+// that R19 and R28 are about.
+func gcS3OrphanExists(t *testing.T, orgID, blockID string) bool {
+	t.Helper()
+	var storedBlockID string
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Scan(&storedBlockID)
+	return err == nil && storedBlockID == blockID
+}
+
 func gcS3OrphanProjectionExists(t *testing.T, orgID, blockID string, firstSeenAt time.Time) bool {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()

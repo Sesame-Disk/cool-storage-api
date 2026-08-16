@@ -1235,7 +1235,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		if delErr := w.deleteS3WithRetry(ctx, blockStore, item.ItemID); delErr != nil {
 			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v (recording for scanner recovery)", item.ItemID, delErr)
-			if recErr := w.store.UpdateS3OrphanAttempt(item.OrgID, item.ItemID, delErr.Error(), w.clock()); recErr != nil {
+			if recErr := w.store.UpdateS3OrphanAttempt(item.OrgID, item.ItemID, orphanFirstSeenAt, delErr.Error(), w.clock()); recErr != nil {
 				log.Printf("[GC Worker] ERROR: Failed to update S3 orphan %s: %v", item.ItemID, recErr)
 				metrics.GCErrorsTotal.WithLabelValues("s3_orphan_record").Inc()
 			}
@@ -1556,7 +1556,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					continue
 				}
 				if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
-					if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
+					if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, orph.FirstSeenAt, err.Error(), w.clock()); updErr != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
 						if phaseErr == nil {
 							phaseErr = fmt.Errorf("update S3 orphan attempt for block %s: %w", orph.BlockID, updErr)
