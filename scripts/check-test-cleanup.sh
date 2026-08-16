@@ -25,13 +25,13 @@ DELETED_TEST_ORGS=$(curl -s -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
 
 # Regex notes: outer ^ anchors the whole match; per-branch $ (e.g. with-parents-test$, sesamefs-public-smoke$) restricts that branch to an exact-name match.
 LEFTOVER_TEST_LIBS_SUPERADMIN=$(curl -s -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
-  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(test-|sa-test-lib-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
+  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(batch-ops-test-|test-|sa-test-lib-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
 
 LEFTOVER_TEST_LIBS_ADMIN=$(curl -s -H "Authorization: Token ${ADMIN_TOKEN}" \
-  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(test-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
+  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(batch-ops-test-|test-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
 
 LEFTOVER_TEST_LIBS_USER=$(curl -s -H "Authorization: Token ${USER_TOKEN}" \
-  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(test-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
+  "${API_URL}/api/v2.1/repos/?type=mine" | jq -r '.repos[]? | select(.repo_name | test("^(batch-ops-test-|test-|nested-move-copy-test|FileOpsTest-|HistoryTest-|cross-lib-src-|cross-lib-dst-|with-parents-test$|api-token-test-|tag-test-library-|sync-test-|sync-aa-|inttest-|smoke-|sesamefs-public-smoke$)")) | .repo_name')
 
 ACTIVE_TEST_GROUPS=$(curl -s -H "Authorization: Token ${SUPERADMIN_TOKEN}" \
   "${API_URL}/api/v2.1/admin/groups/" | jq -r '.groups[]? | select((.name // .group_name // "") | test("^(TestAdminGroup-|TestGroup-)")) | (.name // .group_name // "")')

@@ -408,6 +408,81 @@ their evidence. All four are closed here; none of them reopened X2.
 
 ---
 
+## 2026-08-15 - Incremental R19 hardening and `UpdateS3OrphanAttempt` TTL guard
+
+Both defects produced the same shape — a `gc_s3_orphans` row whose primary key is live,
+whose identity columns are gone, and which has no `_by_day` entry. Under A+ that is a
+writer fence no sweep can enumerate: `ProbeBlockReuse` answers `BlockedByGC` on mere
+existence, and both fence reads select only `block_id`, which such a row still returns.
+
+- **R19 — the statement was an upsert.** A plain `UPDATE` with no `IF`, so a recoverer
+  whose S3 delete failed could write it after another path had cleared the row and
+  recreate it from three diagnostic columns. It is now conditional on the expected
+  `first_seen_at`, so both an absent row and a row with a different observed token
+  are a no-op rather than an error. `StartBlockDeleteOrphan` can still reset an
+  existing row while preserving its `first_seen_at`; that lifecycle-reuse case remains
+  open and is not claimed as a complete incarnation identity. The existing reset
+  behavior is covered by `TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState`;
+  a delayed-update gate for that reset path is still pending.
+- **Where the defect hid.** `MockStore.UpdateS3OrphanAttempt` only ever mutated a key
+   already present, so it always had the semantics the Cassandra store lacked. Every
+   worker-level unit test therefore agreed with the fix while production carried the
+   defect. The gate had to be an integration test; a unit test could not have caught it.
+- The mock now also pins the non-creating guard, differing lifecycle-token rejection,
+  and the no-write behavior at or beyond the calculated expiry, so worker tests cannot
+  drift from the Cassandra method on those boundaries. Cassandra-specific LWT behavior
+  remains covered by the integration gates below.
+- **R19 — stale-token guard.** `IF EXISTS` alone would still let a delayed P1 update
+  modify a newly-created P2 row with a different `(org_id, block_id, first_seen_at)`.
+  The attempt now carries P1's token, and the LWT rejects that mismatch. The real gate
+  is `TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken`; it verifies that
+  P2's retry count and error remain untouched. A reset of an existing canonical row
+  reuses its token and remains a documented follow-up for lifecycle identity.
+- **R28a — this writer's per-value TTL skew.** Cassandra applies
+  `default_time_to_live` per written value and counts it from the *write*, so rewriting
+  only the diagnostic columns handed them a fresh full term while the identity columns
+  kept theirs. `UpdateS3OrphanAttempt` now uses a bound TTL on its application-derived
+  remaining schedule and skips an impossible future `first_seen_at`. This does not
+  prove equality with Cassandra's actual coordinator expiry, and it does not fix the
+  other orphan writers, which remain R28b.
+  Rewriting the identity columns to realign them was rejected:
+  `representation_id`, `external_sha1` and `recovery_phase` all have other conditional
+  writers, so echoing back a just-read value trades a TTL race for a lost-update race,
+  including a `recovery_phase` regression.
+- **Evidence, both directions.** Against the pre-fix statement the gates read
+  `UpdateS3OrphanAttempt resurrected a cleared orphan row` and
+  `TTL(last_error) = 7776000, want <= 5270400` — the table-default 90-day term even
+  though the application-derived schedule from a `first_seen_at` backdated by 30 days
+  had 60 days remaining. Both green after. A unit property loop
+  (`TestS3OrphanRemainingTTLSecondsKeepsOneExpirySchedule`) asserts across the row's
+  whole application-clock schedule, including the fractional final second and a
+  future `first_seen_at`, that the helper never schedules a diagnostic past its
+  calculated expiry. It is not a proof against coordinator-clock skew or read-to-write
+  latency. `TestS3OrphanTTLConstantMatchesSchema` checks the greenfield/base schema, while
+  the integration gate `TestGC_S3OrphanEffectiveTTLMatchesMigrationChain` checks the
+  effective `system_schema.tables` value after the migration chain, and
+  `TestGC_UpdateS3OrphanAttemptMatchesEffectiveTTL` binds that runtime value to the
+  actual Go-to-CQL update path.
+- **Why a test-cleanup change rides along.** `scripts/test-batch-operations.sh` created
+  `batch-ops-test-*` libraries that no cleanup pattern matched, so they accumulated across
+  runs until the org hit its storage quota and unrelated integration tests began failing
+  on quota rather than on their own subject. The prefix is now in
+  `cleanup-test-repos.sh` and `check-test-cleanup.sh`, and the batch script keeps its
+  cleanup trap armed across the create request so a failure after the server created the
+  library still removes it. Unrelated to R19/R28 in subject, but the orphan integration
+  gates in this branch could not be run green without it.
+- **Scope.** This does **not** remove the TTL, so an orphan whose recovery keeps failing
+  still expires and takes its durable record with it. That is the four-change package in
+  `GC-X1-CLOSURE-OPTIONS.md`, and it cannot ship alone: `gcS3OrphanInitialScanLookbackDays`
+  is pinned to the same 90 days, so dropping the TTL without redefining the cold-start
+  horizon makes any orphan older than that permanently invisible after a cursor loss —
+  R27's unsolved partitioning problem. Other row-wide TTL writers remain open, as do
+  the lifecycle reset identity and application of R12's serial-domain contract.
+  **X1 open, R3 open, R19 reset reuse open, R21/R26/R27/R28b/R28 expiry/R31 open,
+  `GC_ENABLED=false` unchanged.**
+
+---
+
 ## 2026-08-15 - R25 fixed structurally: the idempotent sync repair establishes the publication handshake
 
 `repairPublishedSyncCommitBlockDelta` previously built the block delta and went straight

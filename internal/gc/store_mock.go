@@ -3778,11 +3778,22 @@ func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, 
 	return nil
 }
 
-func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
+func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if expectedFirstSeenAt.IsZero() {
+		return nil
+	}
+	expectedFirstSeenAt = expectedFirstSeenAt.UTC().Truncate(time.Millisecond)
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
+		storedFirstSeenAt := existing.FirstSeenAt.UTC().Truncate(time.Millisecond)
+		if !storedFirstSeenAt.Equal(expectedFirstSeenAt) {
+			return nil
+		}
+		if s3OrphanRemainingTTLSeconds(expectedFirstSeenAt, now) <= 0 {
+			return nil
+		}
 		existing.LastAttemptAt = now
 		existing.RetryCount++
 		existing.LastError = errMsg

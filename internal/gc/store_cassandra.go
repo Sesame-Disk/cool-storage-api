@@ -1694,7 +1694,7 @@ func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, 
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	if !applied && errMsg != "" {
-		if err := s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now); err != nil {
+		if err := s.UpdateS3OrphanAttempt(orgID, blockID, effectiveFirstSeenAt, errMsg, now); err != nil {
 			return effectiveFirstSeenAt, err
 		}
 	}
@@ -1739,23 +1739,144 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	return nil
 }
 
-func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
-	// Cassandra UPDATE with counter-like increment requires a read-modify-write;
-	// do it with a simple UPDATE + read of the prior retry_count. Conflict is
-	// acceptable: worst case retry_count is off-by-one, which has no correctness
-	// impact — the field is a diagnostic.
-	var prev int
-	err := s.db.Session().Query(`
-		SELECT retry_count FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&prev)
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		return fmt.Errorf("failed to read prior retry count: %w", err)
+// gcS3OrphanTTLSeconds mirrors `default_time_to_live` on gc_s3_orphans and
+// gc_s3_orphans_by_day (001_initial_schema.cql). It is duplicated here because
+// UpdateS3OrphanAttempt has to write its diagnostic columns with an explicit TTL
+// anchored on the row's own first_seen_at rather than on the retry's wall clock
+// — see the comment there. TestS3OrphanTTLConstantMatchesSchema fails if the two
+// ever drift.
+const gcS3OrphanTTLSeconds = 7776000
+
+// UpdateS3OrphanAttempt records a failed recovery attempt on an EXISTING orphan
+// row. It never creates one.
+//
+// Two defects this closes, both of which produced the same shape — a row whose
+// primary key is still live, whose identity columns are gone, and which has no
+// gc_s3_orphans_by_day entry. Under A+ any orphan row is a writer fence
+// (ProbeBlockReuse answers BlockedByGC on mere existence, and both fence reads
+// select only block_id, which such a row still returns), so that shape blocks
+// every upload of the content while no sweep can enumerate it.
+//
+//	R19: the statement was a plain UPDATE with no IF, and in Cassandra that is an
+//	upsert. A recoverer whose S3 delete failed could write it after another path
+//	had already cleared the row, recreating it from the three diagnostic columns
+//	alone. The expected first_seen_at makes the statement non-creating and
+//	stale-token-safe when the stored token differs. This mutation is non-creating;
+//	making StartBlockDeleteOrphan the sole creator remains the separate R21 issue
+//	because RecordS3Orphan still has its own INSERT IF NOT EXISTS path. Reusing a
+//	token when resetting an existing lifecycle remains a separate open issue.
+//
+//	R28: Cassandra applies default_time_to_live per written VALUE and counts it
+//	from the WRITE, so an UPDATE that rewrites only the diagnostic columns hands
+//	them a fresh full term while storage_class, first_seen_at and recovery_phase
+//	keep the term they were inserted with. A retry late in the row's life pushed
+//	the diagnostics months past the identity columns, and the projection — never
+//	rewritten — expired with the identity. No upsert was needed to produce a
+//	partial orphan; ordinary expiry did it. Anchoring the diagnostic TTL on
+//	first_seen_at keeps this writer on the same application-derived schedule;
+//	coordinator-clock alignment remains a separate open requirement.
+//
+// Rewriting the identity columns to realign them was the other candidate and is
+// deliberately NOT what happens here: representation_id, external_sha1 and
+// recovery_phase all have other conditional writers (StartBlockDeleteOrphan's
+// reset, RecordS3Orphan's repair, the pending_mapping_cleanup transition), so
+// echoing back values read a moment earlier would trade a TTL race for a
+// lost-update race — including a recovery_phase regression.
+//
+// Note what this does NOT do: the row still expires, and expiry still destroys
+// the durable record that an object needs deleting. Removing the TTL outright is
+// the documented package (R28 in docs/GC-X1-CLOSURE-OPTIONS.md) and needs the
+// cold-start horizon and cursor semantics redefined with it, since
+// gcS3OrphanInitialScanLookbackDays is pinned to this same 90 days.
+func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error {
+	// A missing identity is never a wildcard. The caller must carry the
+	// first_seen_at it observed for this lifecycle so a delayed P1 attempt cannot
+	// update a newly-created P2 row with the same primary key.
+	if expectedFirstSeenAt.IsZero() {
+		return nil
 	}
-	return s.db.Session().Query(`
-		UPDATE gc_s3_orphans
+	// Cassandra TIMESTAMP values have millisecond precision. Normalize the
+	// caller's token before comparing it with the value read from Cassandra;
+	// StartBlockDeleteOrphan may have returned a time.Now() value with nanos.
+	expectedFirstSeenAt = expectedFirstSeenAt.UTC().Truncate(time.Millisecond)
+
+	// The read supplies retry_count; the identity predicate on the LWT closes
+	// the read-to-write race where this lifecycle can be cleared and recreated.
+	// retry_count comes along because a counter-like increment needs a
+	// read-modify-write; a lost update there is acceptable, since the field is a
+	// diagnostic and being off by one changes no decision.
+	var prev int
+	var storedFirstSeenAt time.Time
+	err := s.db.Session().Query(`
+		SELECT retry_count, first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&prev, &storedFirstSeenAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("failed to read prior S3 orphan attempt state: %w", err)
+	}
+	storedFirstSeenAt = storedFirstSeenAt.UTC().Truncate(time.Millisecond)
+	if storedFirstSeenAt.IsZero() || !storedFirstSeenAt.Equal(expectedFirstSeenAt) {
+		// A row whose identity columns already expired, one written by an older
+		// build, or a newer incarnation for the same key. Refuse to extend or
+		// cross lifecycles.
+		return nil
+	}
+
+	ttl := s3OrphanRemainingTTLSeconds(expectedFirstSeenAt, now)
+	if ttl <= 0 {
+		// At or past the row's original expiry. Writing a diagnostic now could
+		// only outlive the identity columns it annotates, and a partial row with
+		// a short life is still a partial row.
+		return nil
+	}
+	applied, err := s.db.Session().Query(`
+		UPDATE gc_s3_orphans USING TTL ?
 		SET last_attempt_at = ?, retry_count = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
-	`, now, prev+1, errMsg, orgID.String(), blockID).Exec()
+		IF first_seen_at = ?
+	`, ttl, now, prev+1, errMsg, orgID.String(), blockID, expectedFirstSeenAt).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("failed to record S3 orphan attempt: %w", err)
+	}
+	if !applied {
+		// Cleared or replaced between the read and the write. Not an error: the
+		// lifecycle this attempt belonged to is over, and crossing it is the defect.
+		return nil
+	}
+	return nil
+}
+
+// s3OrphanRemainingTTLSeconds returns the seconds left until the orphan created
+// at firstSeenAt reaches its original expiry. It is deliberately derived from
+// first_seen_at rather than from "now + full TTL": the whole point is that a
+// retry must not outlive the identity columns it describes.
+//
+// A result of zero or less means the row is at or past that expiry and the
+// caller must not write. Clamping to one second instead was the first attempt
+// and is wrong: it puts the diagnostic cell one second beyond the identity
+// cells, which is a partial row with a very short life rather than no partial
+// row at all.
+//
+// This is an application-clock schedule, not a read of Cassandra's actual
+// remaining TTL. Cassandra counts a cell's TTL from its write, so the identity
+// columns really expire at insert_time + TTL, while this computes first_seen_at
+// + TTL. If first_seen_at is in the future, the chronology is uncertain and the
+// diagnostic is skipped rather than risking an extension beyond the identity.
+// Exact protection against coordinator-clock skew and read-to-write latency is
+// a separate open requirement documented with R28.
+func s3OrphanRemainingTTLSeconds(firstSeenAt, now time.Time) int {
+	firstSeenAt = firstSeenAt.UTC()
+	now = now.UTC()
+	if now.Before(firstSeenAt) {
+		// Even a subsecond future value is an uncertain chronology. Do not let
+		// integer division turn TTL+fraction into a fresh full TTL.
+		return 0
+	}
+	expiresAt := firstSeenAt.Add(gcS3OrphanTTLSeconds * time.Second)
+	remaining := int(expiresAt.Sub(now) / time.Second)
+	return remaining
 }
 
 // DeleteS3Orphan removes both the canonical row and the matching discovery
