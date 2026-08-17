@@ -167,10 +167,11 @@ rollout — no such legacy rows exist — and fail-closed is the intended postur
 
 - Resolve external SHA-1 block IDs only within the target library's effective
   `representation_id`.
-- Treat `blocks.representation_id` as the exact forward-mapping cleanup domain for
-  GC; do not infer it from the current destination library at delete time.
-- Do not delete forward mappings from GC without an explicit `representation_id`;
-  exact cleanup must come from canonical block metadata, not a guessed default.
+- Treat `block_id_mappings` as logical metadata owned by the SHA-1 -> SHA-256
+  relationship, not by a physical block-GC lifecycle.
+- Physical GC must not delete forward mappings. A future logical-death reaper, if
+  needed, must define its own ownership and representation rules rather than
+  reusing the physical block delete path.
 - Stamp `block_representation_id` on GC queue work at enqueue time; never
   re-resolve it from live library state during durable processing.
 - Add future schema changes as new migrations; do not rewrite migration `001`.

@@ -8,6 +8,31 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-17 - R11a decouples physical GC from logical mappings
+
+Physical block GC no longer deletes `block_id_mappings`. The SHA-1 -> SHA-256
+mapping belongs to the logical block, while `processBlock` and
+`RecoverS3Orphans` operate on a physical storage lifecycle. The worker no longer
+uses `cleanupBlockMapping`, and `DeleteBlockMappingExact` was removed from the GC
+store interface and implementations.
+
+The `pending_mapping_cleanup` phase remains as a compatibility state for rows
+written by the previous implementation. Its name is historical: after R11a it
+means that the S3 delete completed and only orphan finalization remains. The
+phase still avoids a repeated S3 delete, but it performs no `BlockExists` read and
+no mapping delete. The existing topology gate, canonical `EACH_QUORUM` reads and
+commit-point reload remain in force.
+
+Forward mappings may now remain as harmless dangling metadata after a logical
+block's physical incarnation is deleted. A SHA-1 lookup can resolve such a row
+and then receive a 404 until the same content is materialized again. This is an
+intentional metadata-retention tradeoff; no bytes or live references are deleted
+by the change. The old `gc_block_mapping_sha1_missing` and
+`gc_block_mapping_representation_missing` audit labels are no longer produced by
+physical GC.
+
+---
+
 ## 2026-08-17 - R22b projection is identity-only
 
 Migration `014_gc_s3_orphans_by_day_identity_only.cql` drops `storage_class`,

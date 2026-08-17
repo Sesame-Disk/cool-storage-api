@@ -4042,14 +4042,13 @@ CleanupFileTagsByPath(database, repoID, prefix)
 **Status**: ✅ Audit correction — no confirmed mapping leak
 **Date identified**: 2026-05-18
 
-When `saveEditedDocument` rolls back a materialized block after a publish failure, it calls `DecrementBlockRefCountsOnce` + `enqueueZeroRefBlocks`. The mapping rows are inserted before rollback, but the GC worker cascades mapping cleanup when it processes the zero-ref internal block.
+When `saveEditedDocument` rolls back a materialized block after a publish failure, it calls `DecrementBlockRefCountsOnce` + `enqueueZeroRefBlocks`. The mapping rows are inserted before rollback, and R11a intentionally lets the physical GC lifecycle leave that logical mapping in place.
 
 There is still ordinary async-cleanup risk if the enqueue or GC worker path is unavailable, but that is covered by the fire-and-forget cleanup debt in `TECHNICAL-DEBT.md`; it is not a separate confirmed OnlyOffice mapping leak.
 
 **Evidence**:
 - OnlyOffice rollback path: `internal/api/v2/onlyoffice.go` calls `DecrementBlockRefCountsOnce` and `enqueueZeroRefBlocks` after metadata publish failure.
-- GC worker block deletion now resolves the external SHA-1 from `blocks.sha1` on the canonical row before deleting the single forward `block_id_mappings` row.
-- The reverse table `block_id_mappings_by_internal` was dropped in PR7; PR8 closes the restart/redeploy cleanup gap by persisting `external_sha1` + `recovery_phase` in `gc_s3_orphans`, so normal crash recovery can now finish the forward mapping cleanup without the reverse table.
+- The reverse table `block_id_mappings_by_internal` was dropped in PR7. R11a keeps the forward mapping independent of physical GC; a later logical-death reaper remains optional follow-up work.
 
 ---
 

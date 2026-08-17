@@ -719,36 +719,6 @@ func (w *Worker) ProcessOrgOnce(ctx context.Context, orgID uuid.UUID) (int, erro
 	return w.processOrg(ctx, orgID)
 }
 
-// cleanupBlockMapping removes the single forward block_id_mappings row (external
-// SHA-1 -> internal SHA-256) for a block being GC'd. externalSHA1 is the block's
-// blocks.sha1, captured from GetBlockInfo BEFORE the canonical row is deleted.
-//
-// The reverse index (block_id_mappings_by_internal) was dropped in migration 006,
-// so there is no alias enumeration: blocks.sha1 is the authoritative, single-
-// valued external id (block encryption is deterministic — AES-CBC with a derived
-// fixed IV — so SHA-256 -> SHA-1 is 1:1). The delete is a single-partition write
-// by (org_id, external_id): no ALLOW FILTERING, no clustering/tombstone scan.
-func (w *Worker) cleanupBlockMapping(orgID uuid.UUID, internalBlockID, representationID, externalSHA1 string) error {
-	externalSHA1 = strings.TrimSpace(externalSHA1)
-	if externalSHA1 == "" {
-		// No server-derived SHA-1 to resolve the forward row. Without the reverse
-		// index we cannot locate it; a leftover forward row is a harmless dangling
-		// pointer (a desktop bare-SHA-1 block GET 404s; it self-heals if the
-		// identical block is re-uploaded). Record it so any such leak is observable.
-		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_sha1_missing").Inc()
-		return nil
-	}
-	representationID = strings.TrimSpace(representationID)
-	if representationID == "" {
-		metrics.GCAuditEventsTotal.WithLabelValues("gc_block_mapping_representation_missing").Inc()
-		return nil
-	}
-	if err := w.store.DeleteBlockMappingExact(orgID, representationID, externalSHA1); err != nil {
-		return fmt.Errorf("failed to delete forward block mapping %s for %s: %w", externalSHA1, internalBlockID, err)
-	}
-	return nil
-}
-
 func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	activeBefore := w.clock()
 	items, err := w.queue.DequeueBatch(orgID, w.batchSize, w.gracePeriod)
@@ -1006,12 +976,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return w.failClosedIfUnavailable("failed to check canonical block row", item.ItemID, err)
 	}
 	if !exists {
-		// Canonical blocks row is already gone, so blocks.sha1 is unavailable; the
-		// forward mapping (if any) can no longer be resolved without the dropped
-		// reverse index. cleanupBlockMapping records this as observable.
-		if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, "", ""); err != nil {
-			return err
-		}
+		// The canonical row is already gone. The forward SHA-1 mapping belongs to
+		// the logical block, not this physical GC candidate, so leave it alone.
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return w.failClosedIfUnavailable("failed to clear stale block GC candidate", item.ItemID, err)
 		}
@@ -1122,12 +1088,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			if strings.TrimSpace(blockInfo.StorageClass) != "" {
 				return fmt.Errorf("stub block %s has storage class without creation timestamp", item.ItemID)
 			}
-			// The owned claim fences writers. Remove any partially backfilled mapping
-			// before deleting the only row that carries its identity; retries are
-			// idempotent if the subsequent conditional stub delete fails.
-			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
-				return err
-			}
+			// The owned claim fences writers. Remove only the metadata-free stub;
+			// logical SHA-1 mappings are independent of this physical row.
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
 			if deleteErr != nil {
 				return w.failClosedIfUnavailable("failed to delete re-referenced claimed stub", item.ItemID, deleteErr)
@@ -1172,9 +1134,6 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
 		if blockInfo.CreatedAt == nil {
-			if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
-				return err
-			}
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
 			if deleteErr != nil {
 				return w.failClosedIfUnavailable("failed to remove stub block row", item.ItemID, deleteErr)
@@ -1182,9 +1141,6 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			if !deleted {
 				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
 			}
-			// Stub row carries no canonical metadata; blockInfo.Sha1 is captured
-			// before deletion and is normally empty, but may have been backfilled by
-			// an interrupted materialization attempt.
 			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 				return w.failClosedIfUnavailable("failed to clear block GC candidate after stub cleanup", item.ItemID, err)
 			}
@@ -1248,7 +1204,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// With no storage provider (degenerate/no-storage-manager config) there is no S3
 	// step and RecoverS3Orphans is a no-op, so the recovery row has nothing left to
-	// drive: clear it after mapping cleanup instead of leaving it to TTL. With
+	// drive: clear it instead of leaving it to TTL. With
 	// storage, the row is only cleared once the S3 delete has succeeded (or it stays
 	// for RecoverS3Orphans to retry).
 	clearRecoveryRow := w.storage == nil
@@ -1274,16 +1230,11 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 	}
 
-	// 5. Clean up the forward mapping after the canonical row is gone, using the
-	// blocks.sha1 captured in blockInfo BEFORE FinalizeBlockDelete. The recovery
-	// row now persists this SHA-1 and remains live until this cleanup finishes, so
-	// restart recovery can resume safely after either the DB delete or the S3 step.
-	if err := w.cleanupBlockMapping(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1); err != nil {
-		return err
-	}
+	// 5. Finalize the recovery row after the physical delete. The forward mapping
+	// is logical metadata and intentionally survives this physical GC lifecycle.
 	if clearRecoveryRow {
 		if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
-			log.Printf("[GC Worker] WARNING: block %s mapping cleanup succeeded but failed to clear recovery row: %v", item.ItemID, err)
+			log.Printf("[GC Worker] WARNING: block %s physical cleanup succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
 
@@ -1469,65 +1420,28 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 
 				phase := strings.TrimSpace(canonical.RecoveryPhase)
 				if phase == S3OrphanPhasePendingMappingCleanup {
-					// Guard against block resurrection: if the same block_id was
-					// re-uploaded after its delete (deterministic content -> same
-					// block_id + same SHA-1), the live block now OWNS the forward
-					// mapping. Deleting it here would strand the resurrected block (a
-					// desktop bare-SHA-1 GET would 404, with no self-heal). Discard the
-					// stale recovery row instead of cleaning the mapping.
-					if exists, err := w.store.BlockExists(canonical.OrgID, canonical.BlockID); err != nil {
-						log.Printf("[GC Worker] S3 orphan recovery: block existence lookup failed for org=%s block=%s: %v", canonical.OrgID, canonical.BlockID, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("check block existence for mapping-cleanup orphan org=%s block=%s: %w", canonical.OrgID, canonical.BlockID, err)
-						}
-						continue
-					} else if exists {
-						canonicalCommit, reloadErr := reloadCanonical(canonical)
-						if reloadErr != nil {
-							w.recordS3OrphanCanonicalReloadFailure(reloadErr)
-							log.Printf("[GC Worker] S3 orphan recovery: refusing to discard resurrected mapping-cleanup row %s after canonical reload: %v", canonical.BlockID, reloadErr)
-							if phaseErr == nil {
-								phaseErr = reloadErr
-							}
-							continue
-						}
-						if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
-							log.Printf("[GC Worker] S3 orphan recovery: failed to discard stale mapping-cleanup row for resurrected block %s: %v", canonical.BlockID, err)
-							if phaseErr == nil {
-								phaseErr = fmt.Errorf("discard stale mapping-cleanup orphan for resurrected block %s: %w", canonical.BlockID, err)
-							}
-							continue
-						}
-						metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_resurrected_discarded").Inc()
-						log.Printf("[GC Worker] S3 orphan recovery: block %s resurrected; discarded stale mapping-cleanup row, kept its live forward mapping", canonical.BlockID)
-						continue
-					}
+					// Historical phase name. S3 has already succeeded; only finalize the
+					// orphan lifecycle. The old BlockExists guard and mapping delete were
+					// coupled to the physical lifecycle and are intentionally gone.
 					canonicalCommit, reloadErr := reloadCanonical(canonical)
 					if reloadErr != nil {
 						w.recordS3OrphanCanonicalReloadFailure(reloadErr)
-						log.Printf("[GC Worker] S3 orphan recovery: refusing mapping cleanup for %s after canonical reload: %v", canonical.BlockID, reloadErr)
+						log.Printf("[GC Worker] S3 orphan recovery: refusing post-S3 orphan finalization for %s after canonical reload: %v", canonical.BlockID, reloadErr)
 						if phaseErr == nil {
 							phaseErr = reloadErr
 						}
 						continue
 					}
-					if err := w.cleanupBlockMapping(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.RepresentationID, canonicalCommit.ExternalSHA1); err != nil {
-						log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed for org=%s block=%s: %v", canonicalCommit.OrgID, canonicalCommit.BlockID, err)
-						if phaseErr == nil {
-							phaseErr = fmt.Errorf("cleanup forward mapping for recovered block org=%s block=%s: %w", canonicalCommit.OrgID, canonicalCommit.BlockID, err)
-						}
-						continue
-					}
 					if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
-						log.Printf("[GC Worker] S3 orphan recovery: failed to clear mapping-cleanup row %s: %v", canonicalCommit.BlockID, err)
+						log.Printf("[GC Worker] S3 orphan recovery: failed to finalize post-S3 orphan row %s: %v", canonicalCommit.BlockID, err)
 						if phaseErr == nil {
-							phaseErr = fmt.Errorf("clear mapping-cleanup orphan row for block %s: %w", canonicalCommit.BlockID, err)
+							phaseErr = fmt.Errorf("finalize post-S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)
 						}
 						continue
 					}
 					recovered++
 					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
-					log.Printf("[GC Worker] Recovered mapping cleanup for block %s (org=%s, retries=%d)", canonicalCommit.BlockID, canonicalCommit.OrgID, canonicalCommit.RetryCount)
+					log.Printf("[GC Worker] Finalized post-S3 orphan for block %s (org=%s, retries=%d)", canonicalCommit.BlockID, canonicalCommit.OrgID, canonicalCommit.RetryCount)
 					continue
 				}
 				if phase != S3OrphanPhasePendingS3 {
@@ -1681,13 +1595,6 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					log.Printf("[GC Worker] S3 orphan recovery: failed to advance %s to mapping cleanup: %v", canonicalCommit.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("advance recovered block %s to mapping cleanup: %w", canonicalCommit.BlockID, err)
-					}
-					continue
-				}
-				if err := w.cleanupBlockMapping(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.RepresentationID, canonicalCommit.ExternalSHA1); err != nil {
-					log.Printf("[GC Worker] S3 orphan recovery: forward mapping cleanup failed after S3 delete for org=%s block=%s: %v", canonicalCommit.OrgID, canonicalCommit.BlockID, err)
-					if phaseErr == nil {
-						phaseErr = fmt.Errorf("cleanup forward mapping after S3 recovery for block %s: %w", canonicalCommit.BlockID, err)
 					}
 					continue
 				}

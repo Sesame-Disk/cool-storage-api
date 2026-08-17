@@ -130,9 +130,9 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     on re-upload).
   - **Tests**: unit `TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable` (fail-safe);
     rewrote the GC mapping-cleanup unit/integration assertions to the forward-only model; added the
-    encrypted-equivalent integration guard `TestGC_WorkerCleansForwardMappingViaBlockSHA1` (deletes a
-    block whose external SHA-1 != internal block_id and asserts the forward row is resolved/cleaned
-    from `blocks.sha1`). See the safety + performance section below.
+    encrypted-equivalent integration guard `TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete`
+    (deletes a block whose external SHA-1 != internal block_id and now asserts the forward row
+    survives physical GC under R11a). See the safety + performance section below.
 - `PR8` — **merged to `main`**: GC recovery hardening for the forward-only mapping-cleanup model.
   - **Migration `007_gc_s3_orphan_mapping_recovery.cql`** extends `gc_s3_orphans` and
     `gc_s3_orphans_by_day` with `external_sha1` and `recovery_phase`, so recovery can still clean the
@@ -143,6 +143,13 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     `pending_mapping_cleanup` phase and skip the physical S3 delete.
   - **Tests** pin both behaviors: `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`
     and `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
+- `R11a` — physical GC no longer deletes the logical forward mapping. The mapping belongs
+  to the SHA-1 -> SHA-256 relationship rather than to a physical block incarnation. The
+  historical `pending_mapping_cleanup` phase remains for restart compatibility, but now
+  means only that S3 deletion completed and the orphan row still needs finalization.
+  Physical GC does not issue a mapping delete, and the previous
+  `gc_block_mapping_sha1_missing` / `gc_block_mapping_representation_missing` audit labels
+  are no longer produced by the worker.
 
 ## Notes / Debt
 
@@ -175,7 +182,7 @@ Carried forward from review. Status as of the PR3 partial branch:
 | 5 | ~~After the writer flip, no row may have SHA-256 `block_ids` with empty `seafile_block_ids_sha1`.~~ **DONE (PR4)** — `seafileServeBlockIDs` / `seafileFSObjectBlockIDs` return `(list, ok)` and fail closed when the SHA-1 column is empty and `block_ids` is 64-hex; `GetFSObject`, `PackFS`, `CheckFS`/`buildFSIDMapping`, and copy all refuse to serve/hash corrupted rows. (Writers already set both columns, so this is defense-in-depth.) | Blocker | resolved |
 | 6 | ~~Add an integration test for a post-flip file object.~~ **DONE (PR4)** — `TestSyncServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncPackFSServesSHA1BlockIDsForCanonicalFSObject`, `TestSyncRefusesToServeSHA256BlockIDsWithoutSHA1Column`, `TestSyncPackFSRefusesBrokenCanonicalObject`, and `TestSyncCheckFSRefusesBrokenCanonicalTree`. | Med | resolved |
 | 7 | ~~Confirm sync reference-accounting feeds `block_references` in SHA-256.~~ **DONE** — it resolves before writing refs; keep reading `block_ids`. | — | resolved |
-| 8 | ~~Do not drop the reverse mapping (`block_id_mappings_by_internal`) until the alias / encrypted / GC enumeration check passes.~~ **DONE (PR7)** — block encryption is deterministic (AES-CBC, derived fixed IV), so SHA-256 -> SHA-1 is 1:1 and `blocks.sha1` is the complete single-valued source; no honest internal id has multiple aliases. GC no longer enumerates; it resolves the single forward row from `blocks.sha1`. See the safety section. | Med | resolved |
+| 8 | ~~Do not drop the reverse mapping (`block_id_mappings_by_internal`) until the alias / encrypted / GC enumeration check passes.~~ **DONE (PR7)** — block encryption is deterministic (AES-CBC, derived fixed IV), so SHA-256 -> SHA-1 is 1:1 and `blocks.sha1` is the complete single-valued source; no honest internal id has multiple aliases. GC no longer needs reverse enumeration, and R11a makes physical GC leave the forward mapping untouched. See the safety section. | Med | resolved |
 
 ---
 
@@ -427,31 +434,21 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
    forward mapping via `UpsertBlockMetadataWithSHA1`: web block flow, seafhttp upload/finalize,
    desktop `PutBlock`, `CreateFile`, OnlyOffice, copy. On the pre-deploy/empty DB there are no
    pre-PR2 rows with an empty `sha1`; PR5 self-heals any such row on re-upload.
-4. **No blind deletes, fail-closed and observable.** When `blocks.sha1` is empty (or the canonical
-   row is already gone, so it cannot be read), GC does NOT delete a forward row by guessing — it
-   increments `gc_block_mapping_sha1_missing` and leaves the row as a harmless dangling pointer (a
-   desktop bare-SHA-1 GET 404s; it self-heals on re-upload). Pinned by
-   `TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable` and the rewritten
-   missing-canonical-row guard.
-5. **No regression vs. today.** The previous code already deleted the forward row unconditionally
-   (`DeleteBlockMappingResolved`); PR7 keeps identical delete semantics and only changes the SHA-1
-   *source* (from a reverse-table enumeration to the single `blocks.sha1`). The encrypted-equivalent
-   path (external SHA-1 ≠ internal block_id) is covered by
-   `TestGC_WorkerCleansForwardMappingViaBlockSHA1`.
-6. **Crash recovery now covers mapping cleanup too.** PR8 extends the existing
-   `gc_s3_orphans` recovery row with `external_sha1` and `recovery_phase`, written before
-   `FinalizeBlockDelete`. If a worker crashes/redeploys after the canonical `blocks` row is gone,
-   recovery can still either (a) retry S3 deletion in `pending_s3`, or (b) skip straight to forward
-   mapping cleanup in `pending_mapping_cleanup`. The fail-safe metric
-   `gc_block_mapping_sha1_missing` remains only for genuinely legacy / metadata-free rows where no
-   `blocks.sha1` was ever available.
-   - **Resurrection guard (both phases).** Block content is deterministic, so a re-uploaded block
-     reuses the same `block_id` + SHA-1 and re-creates a *live* forward mapping. Recovery must not
-     delete that live mapping. Both recovery phases therefore re-check `BlockExists` before touching
-     the mapping: `pending_s3` defers while the canonical row is present, and `pending_mapping_cleanup`
-     discards the stale recovery row (incrementing `gc_s3_orphan_resurrected_discarded`) instead of
-     cleaning the mapping. Pinned by
-     `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`.
+4. **Physical GC has no mapping-delete authority.** When `blocks.sha1` is empty, when the
+   canonical row is already gone, or when a block has a normal verified SHA-1, physical GC leaves
+   `block_id_mappings` untouched. The resulting dangling mapping is metadata retention, not a
+   byte or reference deletion. Pinned by the normal-delete, stub, missing-canonical and recovery
+   mapping-survival tests.
+5. **Crash recovery still separates physical phases.** PR8's `external_sha1` and
+   `recovery_phase` remain durable metadata for the post-claim S3 lifecycle. A worker can retry
+   S3 in `pending_s3`, or skip S3 in the historical `pending_mapping_cleanup` phase and finalize
+   the orphan row. Neither phase deletes the logical mapping after R11a.
+    - **Resurrection safety.** `pending_s3` still checks `BlockExists` before any possible
+      repeated physical delete. `pending_mapping_cleanup` no longer needs that read because it
+      performs no physical or mapping delete; it reloads canonical orphan state and finalizes the
+      orphan row. Pinned by
+      `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping` and
+      `TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists`.
    - **Stale-phase reset on a new delete.** A NEW block delete writes its recovery row via
      `StartBlockDeleteOrphan`, which always resets the phase to `pending_s3` (and `retry_count`,
      `last_error`) — even if a stale row from an older delete of the same `block_id` was left at

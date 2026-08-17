@@ -118,8 +118,9 @@ CREATE TABLE block_id_mappings (
 );
 ```
 
-Libraries persist `block_representation_id`, and canonical `blocks` rows also keep
-the `representation_id` used for exact forward-mapping cleanup during GC.
+Libraries persist `block_representation_id`, and canonical `blocks` rows keep the
+representation domain used for physical storage and logical mapping writes. Physical
+GC does not delete the forward mapping; its lifecycle is independent of the block row.
 
 **Flow**:
 ```

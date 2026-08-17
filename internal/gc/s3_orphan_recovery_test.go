@@ -59,8 +59,8 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 }
 
 // TestWorker_ProcessBlock_S3RetryExhausted verifies that when all retries are
-// exhausted, the block is recorded in gc_s3_orphans and the DB cleanup
-// continues (mapping deleted, candidate cleared, stats incremented). Critically
+// exhausted, the block is recorded in gc_s3_orphans and the physical DB cleanup
+// continues (candidate cleared, stats incremented). Critically
 // the queue item completes successfully so it does NOT re-enter the LWT path
 // that would skip S3 deletion forever.
 func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
@@ -109,8 +109,8 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	if store.GetBlock(orgID, "block-perma") != nil {
 		t.Error("block DB row should be gone after LWT delete")
 	}
-	if store.ForwardBlockMappingExists(orgID, "sha1-xyz") {
-		t.Error("expected forward block mapping cleaned up via blocks.sha1")
+	if !store.ForwardBlockMappingExists(orgID, "sha1-xyz") {
+		t.Error("forward block mapping should survive physical GC")
 	}
 	if stats.BlocksDeleted() != 1 {
 		t.Errorf("BlocksDeleted=%d, want 1 (logical deletion counts even with S3 orphan)", stats.BlocksDeleted())
@@ -208,7 +208,7 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassForPhysicalDelete(t *t
 	}
 }
 
-func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForMappingCleanup(t *testing.T) {
+func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForOrphanFinalization(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
@@ -232,8 +232,8 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForMappingCleanup(t *testing.
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Fatalf("stale projection phase caused a repeated S3 delete: %v", got)
 	}
-	if store.ForwardBlockMappingExists(orgID, canonicalSHA1) {
-		t.Fatal("canonical mapping was not cleaned")
+	if !store.ForwardBlockMappingExists(orgID, canonicalSHA1) {
+		t.Fatal("canonical mapping should survive post-S3 orphan finalization")
 	}
 }
 
@@ -354,11 +354,9 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 }
 
 // The pending_s3 branch above was the only commit-point reload with a regression
-// behind it. The pending_mapping_cleanup branch has two more — one before
-// cleanupBlockMapping, one before discarding a resurrected row — and both were
-// reachable with the whole suite still green if someone removed only their
-// reload. These two tests close that: the reload exists in all three places
-// today, so this is regression coverage, not a runtime fix.
+// behind it. The post-S3 finalization branch also needs its reload before clearing
+// the orphan; otherwise a changed canonical lifecycle could be finalized from a
+// stale observation. These tests pin that reload independently.
 
 func TestWorker_RecoverS3Orphans_MappingCleanupCanonicalStateChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
@@ -505,7 +503,7 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 	}
 }
 
-func TestWorker_RecoverS3Orphans_S3ThenMappingCleanup(t *testing.T) {
+func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -526,8 +524,8 @@ func TestWorker_RecoverS3Orphans_S3ThenMappingCleanup(t *testing.T) {
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
-	if store.ForwardBlockMappingExists(orgID, "sha1-recover") {
-		t.Fatal("forward mapping should be cleaned up after S3 recovery")
+	if !store.ForwardBlockMappingExists(orgID, "sha1-recover") {
+		t.Fatal("forward mapping should survive S3 recovery")
 	}
 	deleted := sp.DeletedBlocks()
 	if len(deleted) != 1 || deleted[0] != "orph-map" {
@@ -559,8 +557,8 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
-	if store.ForwardBlockMappingExists(orgID, "sha1-pending-cleanup") {
-		t.Fatal("forward mapping should be cleaned up from pending mapping phase")
+	if !store.ForwardBlockMappingExists(orgID, "sha1-pending-cleanup") {
+		t.Fatal("forward mapping should survive post-S3 orphan finalization")
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Fatalf("S3 should not be touched in pending mapping phase, got %v", got)
@@ -602,8 +600,8 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
-	if store.ForwardBlockMappingExists(orgID, "sha1-new") {
-		t.Fatal("forward mapping should be cleaned up after recovered S3 delete")
+	if !store.ForwardBlockMappingExists(orgID, "sha1-new") {
+		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
 	if len(deleted) != 1 || deleted[0] != "blk-redelete" {
@@ -612,11 +610,10 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 }
 
 // TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping
-// pins the resurrection guard: if a crash leaves a recovery row at
+// pins post-S3 finalization: if a crash leaves a recovery row at
 // pending_mapping_cleanup and the same block_id is re-uploaded before recovery
-// runs (deterministic content -> same block_id + SHA-1, so a live canonical row +
-// forward mapping exist again), recovery must NOT delete that live forward
-// mapping. It discards the stale recovery row instead.
+// runs, recovery must discard the stale recovery row without touching the live
+// logical mapping.
 func TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -676,8 +673,8 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupPreservesSiblingRepresenta
 	if recovered != 1 {
 		t.Fatalf("recovered=%d, want 1", recovered)
 	}
-	if store.ForwardBlockMappingExistsForRepresentation(orgID, encRep, externalSHA1) {
-		t.Fatal("encrypted forward mapping should be cleaned up from pending mapping phase")
+	if !store.ForwardBlockMappingExistsForRepresentation(orgID, encRep, externalSHA1) {
+		t.Fatal("encrypted forward mapping should survive pending mapping phase")
 	}
 	if !store.ForwardBlockMappingExistsForRepresentation(orgID, db.PlainBlockRepresentationID, externalSHA1) {
 		t.Fatal("plain sibling mapping must be preserved during encrypted orphan cleanup")
@@ -687,6 +684,73 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupPreservesSiblingRepresenta
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Fatalf("S3 should not be touched in pending mapping phase, got %v", got)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-post-s3-no-block-read"
+	sha1 := "sha1-post-s3-no-block-read"
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, sha1, "", time.Now())
+	store.AddBlockMapping(orgID, sha1, blockID)
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, sha1, firstSeenAt.Add(time.Second)); err != nil {
+		t.Fatalf("advance orphan phase: %v", err)
+	}
+	store.SetBlockExistsErrForTest(errors.New("BlockExists must not be called for post-S3 finalization"))
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	if calls := store.BlockExistsCallsForTest(); calls != 0 {
+		t.Fatalf("BlockExists calls=%d, want 0 for pending_mapping_cleanup", calls)
+	}
+	if !store.ForwardBlockMappingExists(orgID, sha1) {
+		t.Fatal("forward mapping should survive post-S3 finalization")
+	}
+}
+
+func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-post-s3-clear-retry"
+	sha1 := "sha1-post-s3-clear-retry"
+	store.AddBlockMapping(orgID, sha1, blockID)
+	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, sha1, "", time.Now())
+	store.SetDeleteS3OrphanErrOnceForTest(errors.New("simulated crash before orphan clear"))
+
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("first recovery error = nil, want failed orphan clear")
+	}
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
+	}
+	if !store.ForwardBlockMappingExists(orgID, sha1) {
+		t.Fatal("forward mapping must survive the first recovery")
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("retry recovery: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("retry recovered=%d, want 1", recovered)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 1 {
+		t.Fatalf("retry repeated S3 delete: %v", got)
+	}
+	if !store.ForwardBlockMappingExists(orgID, sha1) {
+		t.Fatal("forward mapping must survive post-S3 clear retry")
 	}
 }
 

@@ -166,6 +166,8 @@ type MockStore struct {
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
+	blockExistsErr                 error
+	blockExistsCalls               int
 	libraryExistsErr               error
 	canonicalLibraryExistsErr      error
 	forceRenewLibraryLockNotOwned  bool
@@ -187,6 +189,7 @@ type MockStore struct {
 	getS3OrphanGlobalErr           error
 	getS3OrphanGlobalCalls         int
 	getS3OrphanGlobalHook          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
+	deleteS3OrphanErrOnce          error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook                func(orgID uuid.UUID, size int)
@@ -739,6 +742,29 @@ func (m *MockStore) SetGetS3OrphanGlobalErrForTest(err error) {
 	m.getS3OrphanGlobalErr = err
 }
 
+// SetBlockExistsErrForTest makes BlockExists fail without affecting the other
+// block reads. It is used to prove that post-S3 orphan finalization no longer
+// depends on the resurrection guard that protected mapping deletion.
+func (m *MockStore) SetBlockExistsErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockExistsErr = err
+}
+
+func (m *MockStore) BlockExistsCallsForTest() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.blockExistsCalls
+}
+
+// SetDeleteS3OrphanErrOnceForTest makes the next orphan clear fail without
+// mutating state, modeling a crash or failed canonical clear after S3 succeeds.
+func (m *MockStore) SetDeleteS3OrphanErrOnceForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleteS3OrphanErrOnce = err
+}
+
 // SetGetS3OrphanGlobalHookForTest injects deterministic changes into canonical
 // reloads. The call number starts at one for the first row read.
 func (m *MockStore) SetGetS3OrphanGlobalHookForTest(hook func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)) {
@@ -766,11 +792,10 @@ func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representa
 	m.addBlockMappingLocked(orgID, representationID, externalID, internalID)
 }
 
-// addBlockMappingLocked mirrors the server-derived blocks.sha1 + representation_id
-// onto the block row so GC mapping cleanup (which reads blocks.sha1 / representation_id
-// instead of the dropped reverse index) can resolve and scope the forward row. Each
-// field is filled independently so a block that already carries a sha1 still gets its
-// representation modeled. Caller must hold m.mu.
+// addBlockMappingLocked mirrors the server-derived blocks.sha1 and
+// representation_id onto the block row. Each field is filled independently so a
+// block that already carries a sha1 still gets its representation modeled. Caller
+// must hold m.mu.
 func (m *MockStore) addBlockMappingLocked(orgID uuid.UUID, representationID, externalID, internalID string) {
 	// Canonicalize exactly like the Cassandra writer (writeCheckedBlockIDMapping +
 	// UpsertBlockMetadataWithRepresentationAndSHA1) so a test that passes an
@@ -1902,8 +1927,12 @@ func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 }
 
 func (m *MockStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockExistsCalls++
+	if m.blockExistsErr != nil {
+		return false, m.blockExistsErr
+	}
 	if m.getBlockRefCountErr != nil {
 		return false, m.getBlockRefCountErr
 	}
@@ -2386,15 +2415,6 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string
 		return fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	delete(m.blocks, key)
-	return nil
-}
-
-func (m *MockStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := mockMappingKey(orgID, representationID, externalID)
-	delete(m.mappings, key)
 	return nil
 }
 
@@ -3854,6 +3874,11 @@ func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expec
 func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deleteS3OrphanErrOnce != nil {
+		err := m.deleteS3OrphanErrOnce
+		m.deleteS3OrphanErrOnce = nil
+		return err
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if firstSeenAt.IsZero() {
 		if existing, ok := m.s3Orphans[key]; ok {
