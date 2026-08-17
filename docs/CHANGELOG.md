@@ -16,6 +16,11 @@ mapping belongs to the logical block, while `processBlock` and
 uses `cleanupBlockMapping`, and `DeleteBlockMappingExact` was removed from the GC
 store interface and implementations.
 
+The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate scans
+production Go and rejects both removed identifiers plus any production CQL delete
+against `block_id_mappings`. A future logical-death reaper must change this gate
+explicitly rather than silently reintroducing mapping ownership into physical GC.
+
 The `pending_mapping_cleanup` phase remains as a compatibility state and legacy
 name. Current code still writes it after a successful S3 delete so restart recovery
 can distinguish "S3 pending" from "S3 complete" without repeating the physical delete.
@@ -30,7 +35,10 @@ intentional metadata-retention tradeoff; no bytes or live references are deleted
 by the change. The old `gc_block_mapping_sha1_missing` and
 `gc_block_mapping_representation_missing` audit labels are no longer produced by
 physical GC. The resulting retention debt is tracked as
-`ISSUE-GC-LOGICAL-MAPPING-RETENTION-01`.
+`ISSUE-GC-LOGICAL-MAPPING-RETENTION-01`. The former
+`gc_s3_orphan_resurrected_discarded` label also has no producer now: the post-S3
+phase no longer branches on resurrection because it performs neither a physical
+delete nor a mapping delete.
 
 ---
 
