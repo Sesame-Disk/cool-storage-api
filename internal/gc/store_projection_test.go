@@ -101,12 +101,16 @@ func TestStore_StartBlockDeleteOrphan_RepairsMissingProjectionAndPreservesFirstS
 	if !discovery[0].FirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("projection first_seen_at = %v, want %v", discovery[0].FirstSeenAt, firstSeenAt)
 	}
+	// The repaired row is checked by identity, not payload: since R22b the
+	// projection has no payload to re-derive, and the lifecycle reset above
+	// (storage class hot -> cold) must leave the discovery key untouched because
+	// first_seen_at is preserved.
 	projection, ok := store.GetS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
 	if !ok {
-		t.Fatal("expected raw projection payload")
+		t.Fatal("expected repaired discovery row")
 	}
-	if projection.StorageClass != "cold" {
-		t.Fatalf("projection storage_class = %q, want %q", projection.StorageClass, "cold")
+	if projection.OrgID != orgID || projection.BlockID != "orph-repair" || !projection.FirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("repaired discovery identity = %+v, want org=%s block=%s first_seen_at=%v", projection, orgID, "orph-repair", firstSeenAt)
 	}
 }
 

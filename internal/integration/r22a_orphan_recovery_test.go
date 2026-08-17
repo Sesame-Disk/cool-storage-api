@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestGC_R22aCanonicalOrphanReadIgnoresProjectionPayload(t *testing.T) {
+func TestGC_R22aCanonicalReadAndDiscoveryIdentity(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
@@ -26,16 +26,14 @@ func TestGC_R22aCanonicalOrphanReadIgnoresProjectionPayload(t *testing.T) {
 		}
 	})
 
-	projectionDay := db.GCProjectionUTCDate(firstSeenAt)
+	// R22b removed the poisoning step this test was built around. It used to write
+	// storage_class/representation_id/external_sha1/recovery_phase onto the
+	// discovery row and prove recovery ignored them; migration 014 dropped those
+	// columns, so the statement is no longer expressible and the property is
+	// structural — see TestR22bProjectionSchemaIsIdentityOnly. What remains here is
+	// the functional half, which no schema gate can express: canonical state is
+	// intact and discovery yields the identity that points at it.
 	bucket := db.GCDiscoveryBucket(orgID.String(), blockID)
-	if err := database.Session().Query(`
-		UPDATE gc_s3_orphans_by_day
-		SET storage_class = ?, representation_id = ?, external_sha1 = ?, recovery_phase = ?
-		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
-	`, "evil", "wrong-representation", "wrong-sha1", gcpkg.S3OrphanPhasePendingS3,
-		projectionDay, bucket, firstSeenAt, orgID.String(), blockID).Exec(); err != nil {
-		t.Fatalf("mutate stale discovery payload: %v", err)
-	}
 
 	canonical, found, err := store.GetS3OrphanGlobal(orgID, blockID)
 	if err != nil {
@@ -45,7 +43,7 @@ func TestGC_R22aCanonicalOrphanReadIgnoresProjectionPayload(t *testing.T) {
 		t.Fatal("canonical orphan not found")
 	}
 	if canonical.StorageClass != "hot" || canonical.RepresentationID != db.PlainBlockRepresentationID || canonical.ExternalSHA1 != "sha1-canonical" {
-		t.Fatalf("canonical orphan was affected by projection payload: %+v", canonical)
+		t.Fatalf("canonical orphan state changed unexpectedly: %+v", canonical)
 	}
 
 	discovery, err := store.ListS3OrphansByDay(firstSeenAt, bucket, 10)

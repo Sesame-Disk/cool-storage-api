@@ -8,6 +8,60 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-17 - R22b projection is identity-only
+
+Migration `014_gc_s3_orphans_by_day_identity_only.cql` drops `storage_class`,
+`representation_id`, `external_sha1` and `recovery_phase` from the discovery
+projection. R22a had already left them with zero readers; they were write-only
+duplicates of canonical state that could diverge, refreshed TTL cells that served no
+purpose, and sat there for a future refactor to start trusting again. R22a's API
+separation becomes a storage separation: "the worker does not read the payload"
+becomes "the payload does not exist". Canonical `gc_s3_orphans` keeps all four
+columns — it is the authority recovery reads, and only the copy is removed.
+
+`upsertS3OrphanProjection` went from seven parameters to three, and
+`MarkS3OrphanMappingCleanupPending` no longer reads `storage_class` and
+`representation_id` back after advancing the phase; it fetched them solely to refill
+projection cells nothing consulted. Its republish is now purely idempotent identity
+that heals a lost discovery row, and records no phase — the phase lives only in the
+canonical row.
+
+Every surviving column of the projection is a primary-key column, so a row has no
+regular cells and exists by its row marker alone. `TestR22bProjectionWriteIsInsert`
+pins the write to an INSERT of exactly the five identity columns; the INSERT half is a
+conditional guard, since an UPDATE of the table is currently inexpressible (CQL needs a
+SET over a non-key column and none remains) but becomes possible again the moment a
+regular column is re-added, at which point it would create rows the day scan cannot
+enumerate. `TestR22bProjectionSchemaIsIdentityOnly` asserts the effective schema after
+the whole migration chain and fails on any regular column;
+`TestR22bProjectionPayloadIsUnreachable` forbids the four names in any production
+statement touching the table; `TestGC_R22bProjectionRowIsIdentityOnly` confirms against
+the real engine that a marker-only row reads back, is enumerable, and still carries the
+table's default TTL, which is the only observable half because `TTL()` cannot be applied
+to a key column.
+
+Two coverage additions came out of review rather than the migration. The commit-point
+canonical reload had a regression behind only one of its three call sites, so removing
+the reload from either `pending_mapping_cleanup` branch left the suite green;
+`TestWorker_RecoverS3Orphans_MappingCleanupCanonicalStateChangeBeforeCommitFailsClosed`
+and `..._ResurrectedDiscardCanonicalStateChangeBeforeCommitFailsClosed` close that. The
+reload already existed in all three places, so this is regression coverage, not a fix.
+The unit tests that poisoned projection payload to prove recovery ignored it are gone
+with the columns; the property is now structural.
+
+TTL semantics are unchanged and deliberately so. The projection is still written
+without an explicit TTL, so a phase advance still re-anchors its term to wall clock
+while canonical `first_seen_at` keeps its original one. Before R22b that refreshed every
+cell, now it refreshes the row marker; the skew is identical. That remains R28's
+row-wide alignment item.
+
+Migration 014 is intended for the clean deployment described by this branch: run all
+migrations before serving traffic and deploy no pre-R22b binary against the resulting
+schema. It is not a mixed-version rolling-upgrade contract; once the dropped columns
+are applied, rollback must be forward-only.
+
+---
+
 ## 2026-08-16 - R22a canonical orphan reload
 
 R22a removes recovery authority from `gc_s3_orphans_by_day`. Discovery now returns

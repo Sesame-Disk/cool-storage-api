@@ -2200,23 +2200,19 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		t.Fatalf("gc_s3_orphans.first_seen_at = %v, want %v", storedFirstSeenAt.UTC(), firstSeenAt.UTC())
 	}
 
-	var projStorageClass, projExternalSHA1, projRecoveryPhase string
+	// The projection is checked by identity only. Its storage_class/external_sha1/
+	// recovery_phase columns were dropped by migration 014 (R22b); selecting them
+	// here would now be rejected by Cassandra, and the property they used to assert
+	// — that the projection mirrors canonical payload — is deliberately gone. What
+	// must still hold is that the lifecycle reset republished the discovery row
+	// under the preserved first_seen_at.
 	var projFirstSeenAt time.Time
 	if err := database.Session().Query(`
-		SELECT storage_class, external_sha1, recovery_phase, first_seen_at
+		SELECT first_seen_at
 		FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Scan(&projStorageClass, &projExternalSHA1, &projRecoveryPhase, &projFirstSeenAt); err != nil {
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Scan(&projFirstSeenAt); err != nil {
 		t.Fatalf("read gc_s3_orphans_by_day: %v", err)
-	}
-	if projStorageClass != "hot" {
-		t.Fatalf("gc_s3_orphans_by_day.storage_class = %q, want %q", projStorageClass, "hot")
-	}
-	if projExternalSHA1 != "sha1-new" {
-		t.Fatalf("gc_s3_orphans_by_day.external_sha1 = %q, want %q", projExternalSHA1, "sha1-new")
-	}
-	if projRecoveryPhase != gcpkg.S3OrphanPhasePendingS3 {
-		t.Fatalf("gc_s3_orphans_by_day.recovery_phase = %q, want %q", projRecoveryPhase, gcpkg.S3OrphanPhasePendingS3)
 	}
 	if !projFirstSeenAt.UTC().Equal(firstSeenAt.UTC()) {
 		t.Fatalf("gc_s3_orphans_by_day.first_seen_at = %v, want %v", projFirstSeenAt.UTC(), firstSeenAt.UTC())

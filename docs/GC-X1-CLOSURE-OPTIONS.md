@@ -67,19 +67,43 @@ exists. R26 remains fully valid for `DeleteS3Orphan` itself, whose zero-`firstSe
 path really does resolve the token from whatever canonical row is current — that is the
 shared-token route. Retain-and-fail-closed stays correct until R20 is settled.
 
-**Next increment, cheapest first.** The payload columns on `gc_s3_orphans_by_day`
-(`storage_class`, `representation_id`, `external_sha1`, `recovery_phase`) now have
-**zero readers** — `ListS3OrphansByDay` selects identity only, and no other reader
-exists. They are write-only. Dropping them turns R22a's API separation into a storage
-separation and removes the last way a payload can reach a worker. Per the project's
-migration policy this needs a new `NNN_` migration, not an edit to
-`001_initial_schema.cql`. Three things move with it, and they are the whole cost:
-`upsertS3OrphanProjection` stops writing the columns (and loses four parameters);
-`gc_integration_test.go` asserts on `storage_class`/`external_sha1`/`recovery_phase`
-in the projection and must drop those assertions; and the R22a integration test
-poisons the payload to prove it is ignored, so it needs a different way to express
-that — most likely deletion, since with the columns gone the property is structural.
-Do this before introducing `P`, and before R26.
+**R22b — projection payload dropped (delivered).** The payload columns on
+`gc_s3_orphans_by_day` (`storage_class`, `representation_id`, `external_sha1`,
+`recovery_phase`) had **zero readers** after R22a and were write-only. Migration
+`014_gc_s3_orphans_by_day_identity_only.cql` drops them, which turns R22a's API
+separation into a storage separation: "the worker does not read the payload" becomes
+"the payload does not exist". `upsertS3OrphanProjection` fell from seven parameters to
+three, and `MarkS3OrphanMappingCleanupPending` stopped reading `storage_class` and
+`representation_id` back, since it fetched them solely to refill projection cells no
+reader consulted. Canonical `gc_s3_orphans` keeps all four columns — only the copy is
+gone.
+
+**What R22b changed about the table itself.** Every surviving column is a primary-key
+column, so a discovery row now has no regular cells and exists solely by its row
+marker. Two consequences are pinned rather than assumed. An `UPDATE` of this table is
+inexpressible today (CQL needs a `SET` over a non-key column and none remains), so the
+INSERT requirement is a *conditional* guard: re-add a regular column and an
+UPDATE-based writer becomes possible again, producing rows the day scan cannot
+enumerate. `TestR22bProjectionWriteIsInsert` pins statement and column list together
+for that reason. And because `TTL()` cannot be applied to a key column, the row's
+lifetime is observable only through the table default;
+`TestGC_R22bProjectionRowIsIdentityOnly` confirms against the real engine that a
+marker-only row reads back, is enumerable, and that migration 014 left
+`default_time_to_live` intact.
+
+**What R22b did NOT change.** It does not touch TTL semantics. `upsertS3OrphanProjection`
+still writes without an explicit TTL, so the phase-advance republish still re-anchors the
+projection's term to wall-clock while canonical `first_seen_at` keeps its original one —
+before R22b it refreshed every cell, now it refreshes the row marker, and the skew is
+identical either way. That is R28's open row-wide alignment item, not something this
+increment closes, and R22b must not be described as removing the stall path it produces.
+
+**R22b deployment boundary.** Migration 014 is a clean-cut schema change: this branch
+assumes a greenfield deployment where all migrations run before any application traffic
+and no pre-R22b binary remains in the fleet. Once 014 is applied, an older binary that
+still inserts the dropped projection payload will fail after its canonical write, so
+this migration is not a mixed-version rolling-upgrade contract. Rollback is forward-only
+through a new migration and binary; do not roll back to an image that predates R22b.
 
 **Gate hardening, and one gate defect (2026-08-17).** The caveats recorded here on
 2026-08-16 are closed, and auditing them turned up a fourth item that was not
@@ -113,6 +137,17 @@ The three previously recorded caveats, all now closed:
 Each was verified in its red form against a deliberately mutated `store_cassandra.go`,
 and each mutation was confirmed to pass the pre-fix gate. Runtime behaviour is
 unchanged; only the tests moved.
+
+**Scope of every source gate in the R21/R22 series, stated so it is not overread.**
+They scan **string literals**. CQL assembled by concatenation or a query builder would
+evade all of them. That is acceptable today — every CQL statement in this repo is a
+literal, and a builder would be a visible architectural change rather than a quiet
+one — but it means these gates are evidence that no *currently written form* of a
+second writer or a payload read exists, not a proof that none is expressible. Nothing
+in this document should describe them as closing a class of defect outright; they
+close the shapes the codebase actually uses. The same applies to the commit-point
+reload gates, which pin the three call sites that exist rather than the property that
+no irreversible action may run without a reload.
 
 **Related:**
 
@@ -1121,7 +1156,7 @@ A conceptual diff, not an implementation list.
 | `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` inheriting the session serial level | Store the exact key; raise the serial phase to `SERIAL` so one incarnation wins globally (R9) |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND backend_identity = B1 AND storage_key = K1`, with fresh per-attempt claim identity (R14/R16) |
 | `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, inheriting the session serial level | Serial phase `SERIAL` — the one-serial-domain rule admits no exceptions on this partition (R12) |
-| `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | PK `((org_id, block_id))`; grew `external_sha1`/`recovery_phase` (migration 007) and `representation_id` (009) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
+| `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007) plus `representation_id` (009); R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
 | `StartBlockDeleteOrphan` | `INSERT … IF NOT EXISTS`, then **resets** an existing row to `pending_s3` | Return/classify applied, same-key idempotent, different-key conflict and ambiguous error; never overwrite/reset, never release on an ambiguous result, and postpone only a confirmed different lifecycle (B.1) |
 | `gcS3OrphanInitialScanLookbackDays = 90` | Cold-start horizon, matched to the TTL | Redefine together with the TTL removal |
 | `RecoverS3Orphans` | Re-verifies `BlockExists(L)` and `BlockHasReferencesGlobal(L)` | **A+:** retain `BlockHasReferencesGlobal(L)` and the canonical-row check, then delete exact validated `P1`. **B:** the orphan may carry the historical authorization for `P1`, but recovery still validates the canonical locator and legacy/keyless rows fail closed. |
