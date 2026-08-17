@@ -18,17 +18,25 @@
 -- from 009_block_representation_mappings.cql.
 --
 -- After this migration every remaining column of gc_s3_orphans_by_day is part of
--- the PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id),
--- so a row has no regular cells and exists solely by virtue of its row marker,
--- which only INSERT writes. Note what this does NOT mean: an UPDATE of this table
--- is not merely discouraged, it is inexpressible, because CQL requires a SET over
--- a non-key column and none remains. The hazard is conditional — re-add any
--- regular column and an UPDATE-based writer becomes expressible again, and would
--- then create rows carrying that column but no row marker, which the day scan
--- would not enumerate. TestR22bProjectionWriteIsInsert therefore pins the pair:
--- INSERT, and exactly these five columns. TestGC_R22bProjectionRowIsIdentityOnly
--- confirms against the real engine that a marker-only row reads back and that the
--- table keeps its default TTL.
+-- the PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id), so
+-- a row carries no regular cells and its primary-key liveness IS the row. Only
+-- INSERT writes that liveness. An UPDATE of this table is not merely discouraged,
+-- it is inexpressible, because CQL requires a SET over a non-key column and none
+-- remains -- so the hazard is conditional: re-add any regular column and an
+-- UPDATE-based writer becomes expressible again.
+--
+-- What that would break is worth stating exactly, because the intuitive answer is
+-- wrong. An UPDATE-created row is NOT invisible: Cassandra considers a row present
+-- when it has live cells even with no PK liveness, which is why UPDATE upserts, so
+-- the day scan would enumerate it normally at first. The defect is deferred — the
+-- row's lifetime becomes its payload cell's, so it disappears when that cell is
+-- deleted or expires under the 90-day TTL, dropping an identity that was still
+-- supposed to be recoverable. Publication must stay an INSERT so a discovery row's
+-- existence is carried by the identity itself, never by payload.
+--
+-- TestR22bProjectionWriteIsInsert pins the pair: INSERT, and exactly these five
+-- columns. TestGC_R22bProjectionRowIsIdentityOnly confirms against the real engine
+-- that such a row reads back, enumerates, and keeps the table's default TTL.
 --
 -- Note on canonical: gc_s3_orphans keeps all four columns. They are the
 -- authority recovery reads; only the projection copy is removed.

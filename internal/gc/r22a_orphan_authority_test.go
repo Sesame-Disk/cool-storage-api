@@ -155,8 +155,11 @@ func TestR22aCanonicalOrphanReadAndDiscoverySurface(t *testing.T) {
 			continue
 		}
 		discoveryQueryFound = true
+		// Lowercased: unquoted CQL identifiers are case-insensitive, and the table
+		// matchers above already are. Inherited from R22a, corrected with R22b.
+		normalizedQuery := strings.ToLower(query)
 		for _, forbidden := range canonicalPayloadColumns {
-			if strings.Contains(query, forbidden) {
+			if strings.Contains(normalizedQuery, forbidden) {
 				t.Fatalf("discovery query exposes canonical field %q: %s", forbidden, query)
 			}
 		}

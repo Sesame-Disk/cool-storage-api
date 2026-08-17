@@ -29,15 +29,21 @@ var projectionUpdate = regexp.MustCompile(`(?is)\bUPDATE\s+gc_s3_orphans_by_day\
 //
 // The INSERT half is a conditional guard, and it is worth being precise about why
 // it is not redundant today. After migration 014 every column belongs to the
-// primary key, so a row has no regular cells and exists solely by its row marker,
-// which only INSERT writes. An UPDATE of this table is not merely wrong, it is
-// currently inexpressible: CQL requires a SET over a non-key column and none
-// remains. The two clauses of this test therefore protect each other — re-add a
-// regular column and an UPDATE-based writer becomes expressible again, producing
-// rows with that column set and no row marker, which the day scan would not
-// enumerate. That failure is silent and total: orphans created, canonical state
-// correct, discovery enumerating nothing, objects left in S3 with no durable
-// record that anything needs deleting.
+// primary key, so a row carries no regular cells and its primary-key liveness IS
+// the row; only INSERT writes that liveness. An UPDATE of this table is not merely
+// wrong, it is currently inexpressible: CQL requires a SET over a non-key column
+// and none remains. The two clauses of this test therefore protect each other —
+// re-add a regular column and an UPDATE-based writer becomes expressible again.
+//
+// Be precise about what that would break, because the obvious answer is wrong: an
+// UPDATE-created row is NOT invisible. Cassandra considers a row present when it
+// has live cells even with no PK liveness — that is exactly why UPDATE upserts —
+// so the day scan would enumerate it normally. The defect is deferred instead: the
+// row's lifetime would be the payload cell's, so it would vanish the moment that
+// cell is deleted or expires under the table's 90-day TTL, silently dropping an
+// identity that was still supposed to be recoverable. R22b's property is that a
+// discovery identity is durable on its own; binding its existence to a payload
+// cell is what gives that away.
 func TestR22bProjectionWriteIsInsert(t *testing.T) {
 	path := filepath.Join("store_cassandra.go")
 	source, err := os.ReadFile(path)
@@ -83,8 +89,11 @@ func TestR22bProjectionWriteIsInsert(t *testing.T) {
 			t.Fatalf("discovery write is not an INSERT of exactly (first_seen_day, bucket, first_seen_at, org_id, block_id): %s", query)
 		}
 		insertFound = true
+		// Lowercased: unquoted CQL identifiers are case-insensitive, and the table
+		// match above already is.
+		normalized := strings.ToLower(query)
 		for _, forbidden := range canonicalPayloadColumns {
-			if strings.Contains(query, forbidden) {
+			if strings.Contains(normalized, forbidden) {
 				t.Fatalf("discovery write names dropped payload column %q; migration 014 removed it and Cassandra will reject the statement: %s", forbidden, query)
 			}
 		}

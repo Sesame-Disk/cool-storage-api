@@ -68,8 +68,13 @@ func TestR22bProjectionPayloadIsUnreachable(t *testing.T) {
 				continue
 			}
 			statements++
+			// Unquoted CQL identifiers are case-insensitive, so the column match
+			// must be too — the table match above already is. Cassandra would
+			// reject STORAGE_CLASS exactly as it rejects storage_class, and the
+			// point of this gate is to fail here rather than mid-sweep.
+			normalized := strings.ToLower(query)
 			for _, forbidden := range droppedPayloadColumns {
-				if strings.Contains(query, forbidden) {
+				if strings.Contains(normalized, forbidden) {
 					t.Errorf("%s: statement touching gc_s3_orphans_by_day names %q, dropped by migration 014: %s",
 						path, forbidden, strings.Join(strings.Fields(query), " "))
 				}

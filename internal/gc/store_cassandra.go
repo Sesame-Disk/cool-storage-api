@@ -1550,13 +1550,18 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UU
 // writes is part of the primary key and the statement carries no state beyond
 // "this identity is enumerable on this day".
 //
-// It must remain an INSERT. With no regular columns left, the row exists only by
-// its row marker, and in Cassandra only INSERT writes one. An UPDATE of this
+// It must remain an INSERT. Only INSERT writes primary-key liveness information,
+// and with no regular cells left that liveness IS the row. An UPDATE of this
 // table is currently inexpressible — CQL needs a SET over a non-key column and
 // none remains — so the hazard is conditional: re-add a regular column and an
-// UPDATE-based writer becomes possible again, producing rows the day scan cannot
-// enumerate. TestR22bProjectionWriteIsInsert pins the pair, statement and column
-// list, because neither half is visible at the call site.
+// UPDATE-based writer becomes possible again. Such a row would not be invisible;
+// Cassandra treats a row with live cells and no PK liveness as present, so it
+// would enumerate normally at first. It would disappear later, when that payload
+// cell is deleted or expires under the table's TTL, taking with it an identity
+// that was still supposed to be discoverable. Publication stays an INSERT so a
+// discovery row's existence is carried by the identity itself and never by a
+// payload cell. TestR22bProjectionWriteIsInsert pins the pair, statement and
+// column list, because neither half is visible at the call site.
 func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	return s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id)

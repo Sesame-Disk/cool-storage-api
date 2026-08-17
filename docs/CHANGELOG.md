@@ -26,13 +26,19 @@ projection cells nothing consulted. Its republish is now purely idempotent ident
 that heals a lost discovery row, and records no phase — the phase lives only in the
 canonical row.
 
-Every surviving column of the projection is a primary-key column, so a row has no
-regular cells and exists by its row marker alone. `TestR22bProjectionWriteIsInsert`
-pins the write to an INSERT of exactly the five identity columns; the INSERT half is a
-conditional guard, since an UPDATE of the table is currently inexpressible (CQL needs a
-SET over a non-key column and none remains) but becomes possible again the moment a
-regular column is re-added, at which point it would create rows the day scan cannot
-enumerate. `TestR22bProjectionSchemaIsIdentityOnly` asserts the effective schema after
+Every surviving column of the projection is a primary-key column, so a row carries no
+regular cells and its primary-key liveness is the row. `TestR22bProjectionWriteIsInsert`
+pins the write to an INSERT of exactly the five identity columns, since only INSERT
+writes that liveness. The INSERT half is a conditional guard: an UPDATE of the table is
+currently inexpressible (CQL needs a SET over a non-key column and none remains) but
+becomes possible again the moment a regular column is re-added. What it would break is
+not what intuition suggests — such a row is not invisible, because Cassandra considers a
+row present when it has live cells even with no PK liveness, which is precisely why
+UPDATE upserts. The defect is deferred: the row's lifetime would become its payload
+cell's, so it would vanish when that cell is deleted or expires under the 90-day TTL,
+dropping an identity that was still supposed to be recoverable. R22b's property is that
+a discovery identity is durable on its own.
+`TestR22bProjectionSchemaIsIdentityOnly` asserts the effective schema after
 the whole migration chain and fails on any regular column;
 `TestR22bProjectionPayloadIsUnreachable` forbids the four names in any production
 statement touching the table; `TestGC_R22bProjectionRowIsIdentityOnly` confirms against
