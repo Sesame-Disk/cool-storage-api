@@ -242,6 +242,21 @@ remaining tradeoff is intentionally conservative cursor advancement: if the
 canonical block row still exists (for example claimed but not yet finalized),
 recovery defers that row to a later pass instead of touching S3 early.
 
+Two operational consequences of step 4 that matter during an incident. Every row now
+costs at least one `EACH_QUORUM` read before recovery can even classify it, including
+rows in `pending_mapping_cleanup`, which previously completed with no global read at
+all — so a single unreachable DC now stalls forward-mapping cleanup entirely, and
+because an orphan row fences writers (`ProbeBlockReuse` answers `BlockedByGC` on mere
+existence), that outage extends upload fencing for the affected content until it
+clears. Availability failures on either canonical read move
+`gc_destructive_last_blocked_timestamp_seconds{path="orphan"}`, so the standard
+`blocked > liveness_success` alert covers this; permanent per-row failures
+deliberately do not move it and surface as `s3_orphan_canonical_read_failed` /
+`s3_orphan_canonical_reload_failed` instead. A discovery row whose canonical row is
+gone holds the day cursor until its 90-day TTL expires;
+`gc_s3_orphan_discovery_delete_failures_total` is the counter that names the usual
+cause, a canonical delete whose projection half failed.
+
 ### RESOLVED (High): Existence checks failed open before destructive orphan cleanup
 
 `CassandraStore.LibraryExists` and `GroupExists` returned "missing" for any Cassandra error,

@@ -143,19 +143,16 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, blockID, referrer), expiresAt.UTC(), orgID, blockID, referrer)
 }
 
-func AddUpsertS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass string, firstSeenAt time.Time) {
-	batch.Query(`
-		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID, storageClass)
-}
-
-func AddDeleteS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID string, firstSeenAt time.Time) {
-	batch.Query(`
-		DELETE FROM gc_s3_orphans_by_day
-		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
-	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID)
-}
+// The gc_s3_orphans_by_day batch helpers that used to sit here were removed by
+// R22a. They had no production caller and wrote a partial payload (storage_class
+// only, no recovery_phase) with no canonical-row counterpart in the same batch —
+// the same "second creator waiting to be wired up" shape R21 removed from the
+// canonical table. Since R22a, recovery fails closed and retains the day cursor
+// when a discovery row has no canonical row, so wiring such a helper up would
+// freeze the cursor until the 90-day TTL rather than merely leave a stale index
+// entry. gc_s3_orphans_by_day is now written only by the canonical orphan store
+// (upsertS3OrphanProjection / DeleteS3Orphan); TestR22aDiscoveryWriterSurface
+// fails if a second writer reappears.
 
 func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
 	batch.Query(`

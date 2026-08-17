@@ -20,6 +20,11 @@ type gcFailureCoder interface {
 	FailureCode() string
 }
 
+var (
+	errS3OrphanCanonicalMissing = errors.New("canonical S3 orphan disappeared")
+	errS3OrphanCanonicalChanged = errors.New("canonical S3 orphan state changed")
+)
+
 type libraryHardDeleteInProgressError struct {
 	LibraryID uuid.UUID
 	ItemID    string
@@ -302,6 +307,24 @@ func (w *Worker) recordDestructiveBlocked(path string) {
 // blocked.
 func (w *Worker) recordDestructiveLivenessSuccess(path string) {
 	metrics.GCDestructiveLastLivenessSuccessTimestamp.WithLabelValues(path).Set(prometheusTimestamp(w.clock()))
+}
+
+// recordS3OrphanCanonicalReloadFailure records why the defense-in-depth canonical
+// reload refused to continue. Only an availability failure says the orphan path's
+// environment could not authorize destructive work; missing, changed, and permanent
+// read errors are item/projection conditions and must not move the blocked timestamp.
+func (w *Worker) recordS3OrphanCanonicalReloadFailure(err error) {
+	switch {
+	case isClusterUnavailableError(err):
+		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable").Inc()
+		w.recordDestructiveBlocked(destructivePathOrphan)
+	case errors.Is(err, errS3OrphanCanonicalMissing):
+		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing").Inc()
+	case errors.Is(err, errS3OrphanCanonicalChanged):
+		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed").Inc()
+	default:
+		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_failed").Inc()
+	}
 }
 
 // prometheusTimestamp renders an instant as a Prometheus timestamp gauge value.
@@ -1397,7 +1420,12 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 
 				canonical, found, err := w.store.GetS3OrphanGlobal(discovery.OrgID, discovery.BlockID)
 				if err != nil {
-					metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed").Inc()
+					if isClusterUnavailableError(err) {
+						metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_unavailable").Inc()
+						w.recordDestructiveBlocked(destructivePathOrphan)
+					} else {
+						metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed").Inc()
+					}
 					log.Printf("[GC Worker] S3 orphan recovery: canonical read failed for org=%s block=%s: %v", discovery.OrgID, discovery.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("read canonical S3 orphan org=%s block=%s: %w", discovery.OrgID, discovery.BlockID, err)
@@ -1430,10 +1458,10 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 						return S3OrphanInfo{}, fmt.Errorf("reload canonical S3 orphan org=%s block=%s: %w", discovery.OrgID, discovery.BlockID, reloadErr)
 					}
 					if !exists {
-						return S3OrphanInfo{}, fmt.Errorf("canonical S3 orphan disappeared for org=%s block=%s", discovery.OrgID, discovery.BlockID)
+						return S3OrphanInfo{}, fmt.Errorf("canonical S3 orphan disappeared for org=%s block=%s: %w", discovery.OrgID, discovery.BlockID, errS3OrphanCanonicalMissing)
 					}
 					if !s3OrphanRecoveryStateEqual(previous, next) {
-						return S3OrphanInfo{}, fmt.Errorf("canonical S3 orphan state changed for org=%s block=%s", discovery.OrgID, discovery.BlockID)
+						return S3OrphanInfo{}, fmt.Errorf("canonical S3 orphan state changed for org=%s block=%s: %w", discovery.OrgID, discovery.BlockID, errS3OrphanCanonicalChanged)
 					}
 					return next, nil
 				}
@@ -1455,7 +1483,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					} else if exists {
 						canonicalCommit, reloadErr := reloadCanonical(canonical)
 						if reloadErr != nil {
-							metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed").Inc()
+							w.recordS3OrphanCanonicalReloadFailure(reloadErr)
 							log.Printf("[GC Worker] S3 orphan recovery: refusing to discard resurrected mapping-cleanup row %s after canonical reload: %v", canonical.BlockID, reloadErr)
 							if phaseErr == nil {
 								phaseErr = reloadErr
@@ -1475,7 +1503,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					canonicalCommit, reloadErr := reloadCanonical(canonical)
 					if reloadErr != nil {
-						metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed").Inc()
+						w.recordS3OrphanCanonicalReloadFailure(reloadErr)
 						log.Printf("[GC Worker] S3 orphan recovery: refusing mapping cleanup for %s after canonical reload: %v", canonical.BlockID, reloadErr)
 						if phaseErr == nil {
 							phaseErr = reloadErr
@@ -1613,7 +1641,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 
 				canonicalCommit, reloadErr := reloadCanonical(canonical)
 				if reloadErr != nil {
-					metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed").Inc()
+					w.recordS3OrphanCanonicalReloadFailure(reloadErr)
 					log.Printf("[GC Worker] S3 orphan recovery: refusing physical delete for %s after canonical reload: %v", canonical.BlockID, reloadErr)
 					if phaseErr == nil {
 						phaseErr = reloadErr

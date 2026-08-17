@@ -19,8 +19,33 @@ errors, and a discovery-token mismatch fail closed and retain the cursor.
 Recovery performs a second canonical reload immediately before mapping cleanup or
 physical S3 deletion and refuses the action if the canonical recovery state changed.
 This narrows stale-read windows but is defense in depth only: it is not lifecycle
-exclusion and does not close R20, R23, R26, or the physical `P` identity problem.
-The orphan TTL and cleanup mutation semantics are unchanged.
+exclusion and does not close R3, R20, R23, R26, or the physical `P` identity problem.
+Canonical read and reload availability failures now update the orphan destructive-path
+blocked signal; missing, changed, and permanent reload failures retain separate error
+labels. The orphan cleanup path also counts failures deleting the by-day discovery
+projection after canonical deletion. Canonical absence and discovery-token mismatch
+still retain the cursor by design, so a stale discovery row can hold that cursor until
+the 90-day TTL; this remains a liveness/repair concern rather than an authorization
+fallback. The orphan TTL and cleanup mutation semantics are otherwise unchanged.
+
+The discovery projection's second writer is gone. `AddUpsertS3OrphanDiscoveryQuery`
+and `AddDeleteS3OrphanDiscoveryQuery` had no production caller and wrote a partial
+payload with no canonical-row counterpart — the shape R21 removed from the canonical
+table, which R21's own gate could not see because its pattern ends in
+`gc_s3_orphans\b`. `gc_s3_orphans_by_day` is now written only by
+`upsertS3OrphanProjection` and `DeleteS3Orphan`, pinned by
+`TestR22aDiscoveryWriterSurface`.
+
+Two behaviours worth knowing before enabling GC, both recorded in
+`GC-X1-CLOSURE-OPTIONS.md`. The `pending_mapping_cleanup` branch previously issued no
+global read at all and now requires two `EACH_QUORUM` reads, so forward-mapping
+cleanup stalls through a single-DC outage it used to survive — and because an orphan
+row fences writers, such an outage now extends upload fencing for that content. And
+the `BlockExists` resurrection guard in that branch remains a session-consistency
+read (pre-existing, untouched here), so it can still read a live block as absent on a
+multi-DC cluster; R22a made it the most visible remaining defect by removing the
+louder one. The by-day payload columns now have zero readers and are candidates for
+removal in a following migration.
 
 ---
 

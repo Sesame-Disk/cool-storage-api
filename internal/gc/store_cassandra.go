@@ -1839,6 +1839,7 @@ func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSe
 		DELETE FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
 	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		metrics.GCS3OrphanDiscoveryDeleteFailuresTotal.Inc()
 		log.Printf("[GC] WARNING: failed to delete gc_s3_orphans_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
 	}
 	return nil
