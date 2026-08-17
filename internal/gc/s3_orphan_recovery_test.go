@@ -355,11 +355,13 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 }
 
 // This is the reachable canonical-state shape that would be lost if R11b
-// removed the logical identity fields. StartBlockDeleteOrphan preserves
+// removed the external SHA-1 field. StartBlockDeleteOrphan preserves
 // first_seen_at when it resets an existing row, so phase and storage class can
-// remain unchanged while a later metadata repair fills previously empty logical
-// identity fields. This test does not establish a physical lifecycle change.
-func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFailsClosed(t *testing.T) {
+// remain unchanged while a later metadata repair fills a previously empty SHA-1.
+// This test does not establish a physical lifecycle change. representation_id is
+// intentionally not mutated here because production inserts validate and persist
+// it; its empty-value repair is an imported/legacy-row path.
+func TestWorker_RecoverS3Orphans_BackfilledSHA1ChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
@@ -370,11 +372,9 @@ func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFail
 	seedS3Orphan(t, store, orgID, blockID, "hot", "", "", "", time.Now())
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
-			// Keep first_seen_at, storage_class and recovery_phase identical. Only
-			// the logical identity is backfilled while the canonical recovery state
-			// remains otherwise unchanged. Populated-to-different-populated identity
-			// is rejected by the canonical metadata writer and is not this vector.
-			info.RepresentationID = db.PlainBlockRepresentationID
+			// Keep first_seen_at, storage_class, recovery_phase and representation_id
+			// identical. Only the SHA-1 is backfilled while canonical recovery state
+			// remains otherwise unchanged.
 			info.ExternalSHA1 = backfilledSHA1
 		}
 		return info, nil

@@ -45,11 +45,14 @@ The canonical `external_sha1` and `representation_id` fields remain intentionall
 present. R11a removed their mapping-cleanup authority, but the commit-point reload
 still compares them as auxiliary canonical-state discriminators while
 `StartBlockDeleteOrphan` can reset an existing row without changing `first_seen_at`.
-The reachable divergence is a metadata backfill from empty to populated. The
-reload detects that change, but this characterization does not establish a
+The reachable greenfield divergence is `external_sha1` backfill from empty to
+populated. The sole production `blocks` INSERT validates and persists a non-empty
+`representation_id`; its empty-value repair is an imported/legacy-row path. The
+reload detects the SHA-1 change, but this characterization does not establish a
 physical lifecycle change or prove that the discriminator is safety-load-bearing
 rather than defense-in-depth. Removing these fields is deferred pending that
-proof or an explicit physical/lifecycle identity that supersedes them.
+proof or an explicit physical/lifecycle identity that supersedes them. A separate
+reachability audit may justify pruning `representation_id` earlier.
 
 The recovery tests distinguish two post-S3 windows. A failed orphan clear after the
 phase advance retries without another S3 delete. A failure before the phase advance

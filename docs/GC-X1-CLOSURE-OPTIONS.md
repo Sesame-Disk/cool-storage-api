@@ -62,12 +62,14 @@ cleanup, but they remain auxiliary canonical-state discriminators in the
 commit-point reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it
 resets an existing `(org_id, block_id)` row. Therefore two observations of the
 same canonical recovery row can have the same `first_seen_at`, `storage_class`,
-and `recovery_phase` while `representation_id`/`external_sha1` change through
-the reachable empty-to-populated metadata-backfill path. The current reload
-detects that change. This does not establish a physical target change or prove
-that the discriminator is safety-load-bearing rather than defense-in-depth.
-Whether it can be pruned must be established by reachability analysis, or the
-discriminator must first be replaced by explicit P/lifecycle identity.
+and `recovery_phase` while `external_sha1` changes through the reachable
+greenfield empty-to-populated metadata-backfill path. The sole production
+`blocks` INSERT validates and persists a non-empty `representation_id`; its
+empty-value repair is an imported/legacy-row path. The current reload detects
+the SHA-1 change. This does not establish a physical target change or prove that
+the discriminator is safety-load-bearing rather than defense-in-depth.
+Whether either field can be pruned must be established by reachability analysis,
+or the discriminator must first be replaced by explicit P/lifecycle identity.
 R11b remains deferred pending that proof or an explicit identity superseding it.
 
 The recovery path also has two distinct post-S3 windows. If the orphan clear fails
