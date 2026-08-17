@@ -240,7 +240,9 @@ recovery path:
 This turns the old permanent storage leak into an operational retry path. The
 remaining tradeoff is intentionally conservative cursor advancement: if the
 canonical block row still exists (for example claimed but not yet finalized),
-recovery defers that row to a later pass instead of touching S3 early.
+recovery defers that row to a later pass instead of touching S3 early. The same
+cursor retention applies to a missing canonical row, a read error, or a discovery
+token mismatch only when that discovery row is encountered by the current sweep.
 
 Two operational consequences of step 4 that matter during an incident. Every row now
 costs at least one `EACH_QUORUM` read before recovery can even classify it, including
@@ -248,14 +250,18 @@ rows in `pending_mapping_cleanup`, which previously completed with no global rea
 all — so a single unreachable DC now stalls forward-mapping cleanup entirely, and
 because an orphan row fences writers (`ProbeBlockReuse` answers `BlockedByGC` on mere
 existence), that outage extends upload fencing for the affected content until it
-clears. Availability failures on either canonical read move
-`gc_destructive_last_blocked_timestamp_seconds{path="orphan"}`, so the standard
-`blocked > liveness_success` alert covers this; permanent per-row failures
-deliberately do not move it and surface as `s3_orphan_canonical_read_failed` /
-`s3_orphan_canonical_reload_failed` instead. A discovery row whose canonical row is
-gone holds the day cursor until its 90-day TTL expires;
-`gc_s3_orphan_discovery_delete_failures_total` is the counter that names the usual
-cause, a canonical delete whose projection half failed.
+clears. Errors classified as unavailable by `isClusterUnavailableError` on either
+canonical read move `gc_destructive_last_blocked_timestamp_seconds{path="orphan"}`,
+so the standard `blocked > liveness_success` alert covers this; other per-row/read
+errors deliberately do not move it and surface as
+`s3_orphan_canonical_read_failed`, `s3_orphan_canonical_reload_missing`, or
+`s3_orphan_canonical_reload_failed` as appropriate. A canonical delete followed by
+a failed projection delete is different: `DeleteS3Orphan` records
+`gc_s3_orphan_discovery_delete_failures_total` but returns success, so the sweep
+may advance the cursor. If the stale row is later encountered within the configured
+overlap it retains the cursor; if the cursor has already passed that old day, the
+row can fall behind the overlap and survive until its 90-day TTL. The counter names
+possible stale discovery state, not a guaranteed cursor hold.
 
 ### RESOLVED (High): Existence checks failed open before destructive orphan cleanup
 

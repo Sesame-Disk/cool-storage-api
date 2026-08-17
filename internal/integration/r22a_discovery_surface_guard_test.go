@@ -25,11 +25,11 @@ import (
 //
 // R22a is what makes that gap load-bearing. Recovery now reloads the canonical
 // row and fails closed when a discovery row has no canonical counterpart, which
-// retains the day cursor. So a second writer that can emit a discovery row
-// without a canonical row no longer produces a stale index entry that recovery
-// shrugs off — it produces one that freezes the cursor until the 90-day TTL
-// expires. The shape to prevent is exactly the one R21 removed on the canonical
-// side: a helper with no production caller, waiting to be wired up.
+// retains the day cursor if that row is encountered. A second writer could
+// therefore leave stale discovery state that either holds the cursor while it
+// remains in the scan overlap or falls behind the cursor and survives until
+// the 90-day TTL. The shape to prevent is exactly the one R21 removed on the
+// canonical side: a helper with no production caller, waiting to be wired up.
 func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	root := filepath.Join("..", "..")
 	skipDirs := map[string]bool{
@@ -41,10 +41,16 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 
 	// The canonical store owns both halves. upsertS3OrphanProjection is reached
 	// only from StartBlockDeleteOrphan and MarkS3OrphanMappingCleanupPending,
-	// both of which write the canonical row first; DeleteS3Orphan removes the
-	// canonical row and then its projection.
+	// both of which establish canonical state before publishing the projection;
+	// the cross-table sequence is not atomic, so concurrent lifecycle races remain
+	// fail-closed in recovery. DeleteS3Orphan removes the canonical row and then
+	// its projection.
 	allowedInsert := "upsertS3OrphanProjection"
 	allowedDelete := "DeleteS3Orphan"
+	allowedProjectionCallsites := map[string]bool{
+		"(*CassandraStore).StartBlockDeleteOrphan":            true,
+		"(*CassandraStore).MarkS3OrphanMappingCleanupPending": true,
+	}
 
 	// Identifiers removed by R22a, kept by name so a revert is caught even if the
 	// CQL is reformatted or moved behind a builder.
@@ -56,6 +62,30 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	scanned := 0
 	insertWriters := []string{}
 	deleteWriters := []string{}
+	projectionCallsites := []string{}
+	functionName := func(fn *ast.FuncDecl) string {
+		if fn.Recv == nil || len(fn.Recv.List) == 0 {
+			return fn.Name.Name
+		}
+		switch receiver := fn.Recv.List[0].Type.(type) {
+		case *ast.StarExpr:
+			if ident, ok := receiver.X.(*ast.Ident); ok {
+				return "(*" + ident.Name + ")." + fn.Name.Name
+			}
+		case *ast.Ident:
+			return "(" + receiver.Name + ")." + fn.Name.Name
+		}
+		return fn.Name.Name
+	}
+	recordProjectionCallsites := func(node ast.Node, caller string) {
+		ast.Inspect(node, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == allowedInsert {
+				projectionCallsites = append(projectionCallsites, caller)
+			}
+			return true
+		})
+	}
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -99,7 +129,16 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 						t.Errorf("%s: gc_s3_orphans_by_day write outside any function", path)
 					}
 				}
+				if filepath.Base(path) != "store_mock.go" {
+					recordProjectionCallsites(declaration, "<package>")
+				}
 				continue
+			}
+			// store_mock.go mirrors the Cassandra mutation for unit fixtures. It is
+			// compiled Go but is not a production caller of the Cassandra helper;
+			// do not let the mirror weaken the exact Cassandra callsite contract.
+			if filepath.Base(path) != "store_mock.go" {
+				recordProjectionCallsites(fn.Body, functionName(fn))
 			}
 			for _, query := range stringLiteralsIn(fn) {
 				if insertPattern.MatchString(query) {
@@ -133,6 +172,14 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	}
 	if len(deleteWriters) != 1 {
 		t.Errorf("gc_s3_orphans_by_day DELETE writers = %v, want exactly [%s]", deleteWriters, allowedDelete)
+	}
+	for _, caller := range projectionCallsites {
+		if !allowedProjectionCallsites[caller] {
+			t.Errorf("%s: %s callsite is not an authorized canonical-first lifecycle caller", caller, allowedInsert)
+		}
+	}
+	if len(projectionCallsites) != len(allowedProjectionCallsites) {
+		t.Errorf("%s callsites = %v, want exactly %v", allowedInsert, projectionCallsites, allowedProjectionCallsites)
 	}
 }
 

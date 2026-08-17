@@ -112,8 +112,9 @@ var (
 
 	// GCS3OrphanDiscoveryDeleteFailuresTotal counts canonical orphan cleanups where
 	// the canonical row was deleted but the by-day discovery projection delete failed.
-	// The canonical row remains authoritative; this exposes the stale discovery row
-	// that can otherwise hold the orphan cursor until its TTL expires.
+	// The canonical row remains authoritative; this exposes possible stale discovery
+	// state. If the row is encountered before the cursor passes its day, recovery
+	// retains the cursor; otherwise it can fall behind the overlap and survive to TTL.
 	GCS3OrphanDiscoveryDeleteFailuresTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "gc_s3_orphan_discovery_delete_failures_total",

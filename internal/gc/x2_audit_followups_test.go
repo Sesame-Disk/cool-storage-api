@@ -1068,6 +1068,49 @@ func TestX2_OrphanRecoveryCanonicalReloadUnavailableMovesBlockedMark(t *testing.
 	}
 }
 
+// TestX2_OrphanRecoveryCanonicalReloadMissingIsDistinctFromInitialMissing keeps
+// a mid-item disappearance separate from a discovery row that was stale before
+// the sweep began. Both fail closed, but the reload case is the stronger signal
+// that the canonical lifecycle changed while recovery was acting on it.
+func TestX2_OrphanRecoveryCanonicalReloadMissingIsDistinctFromInitialMissing(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+
+	orgID := uuid.New()
+	blockID := "orph-reload-missing"
+	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 1 {
+			// The first read has already returned a canonical row. Remove it before
+			// the commit-point reload to model a lifecycle clear in the race window.
+			store.DeleteS3OrphanCanonicalForTest(orgID, blockID)
+		}
+		return info, nil
+	})
+
+	beforeReloadMissing := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_missing"))
+	beforeInitialMissing := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if deletes := sp.BlockStoreRequests(); len(deletes) != 0 {
+		t.Fatalf("resolved storage after a missing canonical reload: %+v", deletes)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus reload", calls)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_missing")); got != beforeReloadMissing+1 {
+		t.Errorf("canonical reload missing = %v, want %v", got, beforeReloadMissing+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing")); got != beforeInitialMissing {
+		t.Errorf("initial canonical missing also moved for a reload disappearance: %v -> %v", beforeInitialMissing, got)
+	}
+}
+
 // TestX2_OrphanRecoveryCanonicalReloadPermanentErrorIsNotAnOutage keeps a malformed
 // or otherwise permanent reload failure out of the availability signal. The reload
 // still refuses the destructive action, but it needs item-level diagnosis instead of

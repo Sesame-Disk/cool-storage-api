@@ -20,13 +20,18 @@ Recovery performs a second canonical reload immediately before mapping cleanup o
 physical S3 deletion and refuses the action if the canonical recovery state changed.
 This narrows stale-read windows but is defense in depth only: it is not lifecycle
 exclusion and does not close R3, R20, R23, R26, or the physical `P` identity problem.
-Canonical read and reload availability failures now update the orphan destructive-path
-blocked signal; missing, changed, and permanent reload failures retain separate error
-labels. The orphan cleanup path also counts failures deleting the by-day discovery
-projection after canonical deletion. Canonical absence and discovery-token mismatch
-still retain the cursor by design, so a stale discovery row can hold that cursor until
-the 90-day TTL; this remains a liveness/repair concern rather than an authorization
-fallback. The orphan TTL and cleanup mutation semantics are otherwise unchanged.
+Errors classified as unavailable by `isClusterUnavailableError` on either canonical
+read or reload now update the orphan destructive-path blocked signal; initial missing,
+reload missing, changed, and other reload failures retain separate error labels. The
+orphan cleanup path also counts failures deleting the by-day discovery projection after
+canonical deletion. If canonical absence or a discovery-token mismatch is encountered
+while the row is still in the scan, recovery retains the cursor by design. A projection
+delete failure is different: `DeleteS3Orphan` records the counter and returns success
+after canonical deletion, so the cursor may advance and an old stale row can fall
+behind the configured overlap and survive until the 90-day TTL. The counter signals
+possible stale discovery state, not proof that the row is holding the cursor. This
+remains a liveness/repair concern rather than an authorization fallback. The orphan
+TTL and cleanup mutation semantics are otherwise unchanged.
 
 The discovery projection's second writer is gone. `AddUpsertS3OrphanDiscoveryQuery`
 and `AddDeleteS3OrphanDiscoveryQuery` had no production caller and wrote a partial
@@ -34,7 +39,10 @@ payload with no canonical-row counterpart — the shape R21 removed from the can
 table, which R21's own gate could not see because its pattern ends in
 `gc_s3_orphans\b`. `gc_s3_orphans_by_day` is now written only by
 `upsertS3OrphanProjection` and `DeleteS3Orphan`, pinned by
-`TestR22aDiscoveryWriterSurface`.
+`TestR22aDiscoveryWriterSurface`, which also pins `upsertS3OrphanProjection` to
+the two current canonical-first lifecycle callers, `StartBlockDeleteOrphan` and
+`MarkS3OrphanMappingCleanupPending`. The cross-table publication is not atomic,
+so concurrent lifecycle races remain fail-closed in recovery.
 
 Two behaviours worth knowing before enabling GC, both recorded in
 `GC-X1-CLOSURE-OPTIONS.md`. The `pending_mapping_cleanup` branch previously issued no

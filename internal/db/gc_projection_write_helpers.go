@@ -148,11 +148,12 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 // only, no recovery_phase) with no canonical-row counterpart in the same batch —
 // the same "second creator waiting to be wired up" shape R21 removed from the
 // canonical table. Since R22a, recovery fails closed and retains the day cursor
-// when a discovery row has no canonical row, so wiring such a helper up would
-// freeze the cursor until the 90-day TTL rather than merely leave a stale index
-// entry. gc_s3_orphans_by_day is now written only by the canonical orphan store
-// (upsertS3OrphanProjection / DeleteS3Orphan); TestR22aDiscoveryWriterSurface
-// fails if a second writer reappears.
+// if such a discovery row is encountered, so wiring such a helper up could hold
+// the cursor while the row remains in the overlap or leave stale state behind
+// the cursor until the 90-day TTL. gc_s3_orphans_by_day is now written only by
+// the canonical orphan store (upsertS3OrphanProjection / DeleteS3Orphan);
+// TestR22aDiscoveryWriterSurface fails if a second writer or helper caller
+// reappears.
 
 func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
 	batch.Query(`

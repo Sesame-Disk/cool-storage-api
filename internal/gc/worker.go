@@ -310,16 +310,17 @@ func (w *Worker) recordDestructiveLivenessSuccess(path string) {
 }
 
 // recordS3OrphanCanonicalReloadFailure records why the defense-in-depth canonical
-// reload refused to continue. Only an availability failure says the orphan path's
-// environment could not authorize destructive work; missing, changed, and permanent
-// read errors are item/projection conditions and must not move the blocked timestamp.
+// reload refused to continue. Only an error classified as unavailable by
+// isClusterUnavailableError says the orphan path's environment could not authorize
+// destructive work; missing, changed, and other read errors are item/projection
+// conditions and must not move the blocked timestamp.
 func (w *Worker) recordS3OrphanCanonicalReloadFailure(err error) {
 	switch {
 	case isClusterUnavailableError(err):
 		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable").Inc()
 		w.recordDestructiveBlocked(destructivePathOrphan)
 	case errors.Is(err, errS3OrphanCanonicalMissing):
-		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing").Inc()
+		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_missing").Inc()
 	case errors.Is(err, errS3OrphanCanonicalChanged):
 		metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed").Inc()
 	default:
