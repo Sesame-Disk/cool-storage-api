@@ -110,6 +110,18 @@ var (
 		[]string{"source"},
 	)
 
+	// GCS3OrphanDiscoveryDeleteFailuresTotal counts canonical orphan cleanups where
+	// the canonical row was deleted but the by-day discovery projection delete failed.
+	// The canonical row remains authoritative; this exposes possible stale discovery
+	// state. If the row is encountered before the cursor passes its day, recovery
+	// retains the cursor; otherwise it can fall behind the overlap and survive to TTL.
+	GCS3OrphanDiscoveryDeleteFailuresTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gc_s3_orphan_discovery_delete_failures_total",
+			Help: "Number of S3 orphan cleanups where deleting the discovery projection failed after canonical deletion.",
+		},
+	)
+
 	// GCDestructiveLastBlockedTimestamp and GCDestructiveLastLivenessSuccessTimestamp
 	// are a PAIR, and only mean anything when read together: whichever carries the
 	// later timestamp is the last thing that path actually observed.
@@ -1093,6 +1105,7 @@ func Register() {
 		GCItemsSkippedTotal,
 		GCZeroRefEnqueueFailuresTotal,
 		GCBlockCandidateDiscoveryDegradedTotal,
+		GCS3OrphanDiscoveryDeleteFailuresTotal,
 		GCDestructiveLastBlockedTimestamp,
 		GCDestructiveLastLivenessSuccessTimestamp,
 		GCLastWorkerRun,

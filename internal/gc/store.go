@@ -190,10 +190,16 @@ type GCStore interface {
 	// pending_mapping_cleanup row from an older delete cannot make recovery skip
 	// the physical object delete for this new lifecycle.
 	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error)
+	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
+	// destructive recovery path. It supplies recovery state and the physical
+	// backend selector; it is not a Paxos settlement read and does not authorize
+	// deletion by itself. R22a keeps an absent or failed read fail-closed.
+	GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3OrphanInfo, bool, error)
 	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
-	// falls on the given UTC day for one discovery bucket. `limit` caps the
-	// number of rows returned for a single (day, bucket) pair.
-	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error)
+	// falls on the given UTC day for one discovery bucket. It returns only the
+	// discovery identity; callers must reload the canonical orphan before acting.
+	// `limit` caps the number of rows returned for a single (day, bucket) pair.
+	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanDiscoveryInfo, error)
 	// MarkS3OrphanMappingCleanupPending advances the recovery row after the S3
 	// delete has completed so restart recovery can finish forward-mapping cleanup
 	// without touching S3 again.
@@ -453,7 +459,17 @@ type GCDirtyOrg struct {
 	MarkedAt time.Time
 }
 
-// S3OrphanInfo holds data about a block whose S3 deletion still needs recovery.
+// S3OrphanDiscoveryInfo is the non-authoritative identity emitted by the
+// gc_s3_orphans_by_day discovery projection. Its first_seen_at value is only a
+// correlation token; it is not a complete lifecycle identity.
+type S3OrphanDiscoveryInfo struct {
+	OrgID       uuid.UUID
+	BlockID     string
+	FirstSeenAt time.Time
+}
+
+// S3OrphanInfo holds canonical data about a block whose S3 deletion still needs
+// recovery.
 // Rows are created as soon as GC claims the block for deletion, before the DB
 // row is physically removed, so a crash between DB and S3 phases remains
 // recoverable after restart.

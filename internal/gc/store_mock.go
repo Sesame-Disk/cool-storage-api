@@ -184,6 +184,9 @@ type MockStore struct {
 	blockReferenceExistsErr        error
 	ensureBlockGCCandidateErr      error
 	deleteProvisionalProjectionErr error
+	getS3OrphanGlobalErr           error
+	getS3OrphanGlobalCalls         int
+	getS3OrphanGlobalHook          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook                func(orgID uuid.UUID, size int)
@@ -686,6 +689,70 @@ func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID str
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
+}
+
+// AddS3OrphanProjectionForTest seeds a discovery row independently of the
+// canonical row, so recovery tests can model stale or malicious projection data.
+func (m *MockStore) AddS3OrphanProjectionForTest(info S3OrphanInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upsertS3OrphanProjection(&info)
+}
+
+// SetS3OrphanProjectionForTest changes only the non-authoritative payload of an
+// existing discovery row. Recovery must not use any of these fields for action.
+func (m *MockStore) SetS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time, storageClass, representationID, externalSHA1, recoveryPhase string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt)
+	projection, ok := m.s3OrphanProjections[key]
+	if !ok {
+		return
+	}
+	projection.StorageClass = storageClass
+	projection.RepresentationID = representationID
+	projection.ExternalSHA1 = externalSHA1
+	projection.RecoveryPhase = recoveryPhase
+	m.s3OrphanProjections[key] = projection
+}
+
+// GetS3OrphanProjectionForTest reads the raw projection payload for store tests.
+// Production recovery cannot call this because discovery exposes only its key.
+func (m *MockStore) GetS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) (S3OrphanInfo, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	projection, ok := m.s3OrphanProjections[newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt)]
+	return projection, ok
+}
+
+// DeleteS3OrphanCanonicalForTest removes only the canonical row, leaving its
+// discovery projection behind to model canonical expiry or drift.
+func (m *MockStore) DeleteS3OrphanCanonicalForTest(orgID uuid.UUID, blockID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.s3Orphans, fmt.Sprintf("%s:%s", orgID, blockID))
+}
+
+// SetGetS3OrphanGlobalErrForTest makes the canonical EACH_QUORUM read fail.
+func (m *MockStore) SetGetS3OrphanGlobalErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getS3OrphanGlobalErr = err
+}
+
+// SetGetS3OrphanGlobalHookForTest injects deterministic changes into canonical
+// reloads. The call number starts at one for the first row read.
+func (m *MockStore) SetGetS3OrphanGlobalHookForTest(hook func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getS3OrphanGlobalHook = hook
+}
+
+// GetS3OrphanGlobalCallsForTest reports canonical reloads issued by recovery.
+func (m *MockStore) GetS3OrphanGlobalCallsForTest() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getS3OrphanGlobalCalls
 }
 
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
@@ -3684,6 +3751,33 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
+func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3OrphanInfo, bool, error) {
+	m.mu.Lock()
+	m.getS3OrphanGlobalCalls++
+	call := m.getS3OrphanGlobalCalls
+	err := m.getS3OrphanGlobalErr
+	var info S3OrphanInfo
+	existing, found := m.s3Orphans[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if found {
+		info = *existing
+	}
+	hook := m.getS3OrphanGlobalHook
+	m.mu.Unlock()
+	if err != nil {
+		return S3OrphanInfo{}, false, err
+	}
+	if !found {
+		return S3OrphanInfo{}, false, nil
+	}
+	if hook != nil {
+		info, err = hook(orgID, blockID, call, info)
+		if err != nil {
+			return S3OrphanInfo{}, false, err
+		}
+	}
+	return info, true, nil
+}
+
 func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3774,14 +3868,14 @@ func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt 
 	return nil
 }
 
-func (m *MockStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error) {
+func (m *MockStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanDiscoveryInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if limit <= 0 {
 		limit = 100
 	}
 	targetDay := db.GCProjectionUTCDate(day)
-	var out []S3OrphanInfo
+	var out []S3OrphanDiscoveryInfo
 	for key, orphan := range m.s3OrphanProjections {
 		if !key.FirstSeenDay.Equal(targetDay) {
 			continue
@@ -3789,7 +3883,11 @@ func (m *MockStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]
 		if key.Bucket != bucket {
 			continue
 		}
-		out = append(out, orphan)
+		out = append(out, S3OrphanDiscoveryInfo{
+			OrgID:       orphan.OrgID,
+			BlockID:     orphan.BlockID,
+			FirstSeenAt: orphan.FirstSeenAt,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].FirstSeenAt.Equal(out[j].FirstSeenAt) {

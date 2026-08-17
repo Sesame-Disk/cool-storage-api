@@ -935,3 +935,219 @@ func TestX2_OrphanRecoveryClassifiesItsGlobalVerifyFailure(t *testing.T) {
 		}
 	})
 }
+
+// TestX2_OrphanRecoveryCanonicalReadUnavailableMovesBlockedMark covers the new
+// EACH_QUORUM canonical read that runs before the global liveness verify. An outage
+// must still be visible in the orphan path even though that verify is never reached.
+func TestX2_OrphanRecoveryCanonicalReadUnavailableMovesBlockedMark(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-canonical-unavailable", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalErrForTest(fakeRequestError{
+		code: gocql.ErrCodeUnavailable,
+		msg:  "Cannot achieve consistency level EACH_QUORUM in DC dc-asia",
+	})
+
+	beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_unavailable"))
+	beforeFailed := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if deletes := sp.BlockStoreRequests(); len(deletes) != 0 {
+		t.Fatalf("resolved storage after an unavailable canonical read: %+v", deletes)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_unavailable")); got != beforeUnavailable+1 {
+		t.Errorf("canonical read unavailable = %v, want %v", got, beforeUnavailable+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed")); got != beforeFailed {
+		t.Errorf("canonical read failed moved on an availability error: %v -> %v", beforeFailed, got)
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked <= livenessSuccess {
+		t.Errorf("last_blocked=%v last_liveness_success=%v, want blocked later", blocked, livenessSuccess)
+	}
+}
+
+// TestX2_OrphanRecoveryCanonicalReadPermanentErrorIsNotAnOutage is the other half
+// of the read-side classification, and the reason it exists is asymmetry: the
+// reload side already pins both directions
+// (…ReloadUnavailableMovesBlockedMark and …ReloadPermanentErrorIsNotAnOutage)
+// while the initial read only pinned the outage direction. Without this, nothing
+// stops the cheaper "any canonical read failure moves the blocked mark" edit,
+// which pages whoever is on call for a datacenter outage over a condition that
+// survives every DC being up.
+//
+// Unlike its outage twin, this is not a regression test for the classification
+// itself — an unclassified read failure moves no mark either. It is a guard on
+// the direction a future change is most likely to break.
+func TestX2_OrphanRecoveryCanonicalReadPermanentErrorIsNotAnOutage(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+	// A liveness success first, so "blocked is not later than success" below is a
+	// statement about this sweep rather than about two zero-valued gauges.
+	w.recordDestructiveLivenessSuccess(destructivePathOrphan)
+	_, baselineSuccess := destructivePairForTest(t, destructivePathOrphan)
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-canonical-read-permanent", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalErrForTest(fakeRequestError{
+		code: gocql.ErrCodeReadFailure,
+		msg:  "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING",
+	})
+
+	beforeFailed := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed"))
+	beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_unavailable"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if deletes := sp.BlockStoreRequests(); len(deletes) != 0 {
+		t.Fatalf("resolved storage after a permanent canonical read failure: %+v", deletes)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_failed")); got != beforeFailed+1 {
+		t.Errorf("canonical read failed = %v, want %v: a ReadFailure is specific to this partition and permanent until someone looks at it", got, beforeFailed+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_read_unavailable")); got != beforeUnavailable {
+		t.Errorf("canonical read unavailable moved on a non-availability failure: %v -> %v", beforeUnavailable, got)
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked > livenessSuccess {
+		t.Errorf("last_blocked=%v last_liveness_success=%v (baseline success %v), want the mark unmoved: one poisoned partition does not answer whether this path can authorize deletes", blocked, livenessSuccess, baselineSuccess)
+	}
+}
+
+// TestX2_OrphanRecoveryCanonicalReloadUnavailableMovesBlockedMark covers the
+// commit-point reload. Its failure is not a state change, and must not be reported
+// as one or leave the orphan path's availability signal silent.
+func TestX2_OrphanRecoveryCanonicalReloadUnavailableMovesBlockedMark(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-reload-unavailable", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			return S3OrphanInfo{}, fakeRequestError{
+				code: gocql.ErrCodeUnavailable,
+				msg:  "Cannot achieve consistency level EACH_QUORUM in DC dc-asia",
+			}
+		}
+		return info, nil
+	})
+
+	beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable"))
+	beforeChanged := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if deletes := sp.BlockStoreRequests(); len(deletes) != 0 {
+		t.Fatalf("resolved storage after an unavailable canonical reload: %+v", deletes)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus reload", calls)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable")); got != beforeUnavailable+1 {
+		t.Errorf("canonical reload unavailable = %v, want %v", got, beforeUnavailable+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed")); got != beforeChanged {
+		t.Errorf("canonical changed moved on an availability error: %v -> %v", beforeChanged, got)
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked <= livenessSuccess {
+		t.Errorf("last_blocked=%v last_liveness_success=%v, want blocked later", blocked, livenessSuccess)
+	}
+}
+
+// TestX2_OrphanRecoveryCanonicalReloadMissingIsDistinctFromInitialMissing keeps
+// a mid-item disappearance separate from a discovery row that was stale before
+// the sweep began. Both fail closed, but the reload case is the stronger signal
+// that the canonical lifecycle changed while recovery was acting on it.
+func TestX2_OrphanRecoveryCanonicalReloadMissingIsDistinctFromInitialMissing(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+
+	orgID := uuid.New()
+	blockID := "orph-reload-missing"
+	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 1 {
+			// The first read has already returned a canonical row. Remove it before
+			// the commit-point reload to model a lifecycle clear in the race window.
+			store.DeleteS3OrphanCanonicalForTest(orgID, blockID)
+		}
+		return info, nil
+	})
+
+	beforeReloadMissing := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_missing"))
+	beforeInitialMissing := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if deletes := sp.BlockStoreRequests(); len(deletes) != 0 {
+		t.Fatalf("resolved storage after a missing canonical reload: %+v", deletes)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus reload", calls)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_missing")); got != beforeReloadMissing+1 {
+		t.Errorf("canonical reload missing = %v, want %v", got, beforeReloadMissing+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_missing")); got != beforeInitialMissing {
+		t.Errorf("initial canonical missing also moved for a reload disappearance: %v -> %v", beforeInitialMissing, got)
+	}
+}
+
+// TestX2_OrphanRecoveryCanonicalReloadPermanentErrorIsNotAnOutage keeps a malformed
+// or otherwise permanent reload failure out of the availability signal. The reload
+// still refuses the destructive action, but it needs item-level diagnosis instead of
+// paging for a datacenter outage.
+func TestX2_OrphanRecoveryCanonicalReloadPermanentErrorIsNotAnOutage(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	w.clock = advancingClock(now)
+	resetDestructivePairForTest(destructivePathOrphan)
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-reload-failed", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			return S3OrphanInfo{}, errors.New("canonical row has an incompatible recovery schema")
+		}
+		return info, nil
+	})
+
+	beforeFailed := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_failed"))
+	beforeUnavailable := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable"))
+	beforeChanged := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed"))
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("expected the sweep to fail closed")
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_failed")); got != beforeFailed+1 {
+		t.Errorf("canonical reload failed = %v, want %v", got, beforeFailed+1)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_reload_unavailable")); got != beforeUnavailable {
+		t.Errorf("canonical reload unavailable moved on a permanent error: %v -> %v", beforeUnavailable, got)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("s3_orphan_canonical_changed")); got != beforeChanged {
+		t.Errorf("canonical changed moved on a permanent reload error: %v -> %v", beforeChanged, got)
+	}
+	if blocked, livenessSuccess := destructivePairForTest(t, destructivePathOrphan); blocked > livenessSuccess {
+		t.Errorf("last_blocked=%v last_liveness_success=%v, want blocked mark unchanged", blocked, livenessSuccess)
+	}
+}

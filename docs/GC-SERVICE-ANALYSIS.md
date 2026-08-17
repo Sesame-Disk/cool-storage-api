@@ -231,14 +231,37 @@ recovery path:
 3. Scanner phase `s3_orphan_recovery` walks `gc_s3_orphans_by_day` from a
    persisted UTC-day cursor across all discovery buckets; on cold start it scans
    the full 90-day TTL horizon so old orphan rows are still recoverable.
-4. Recovery resolves the `BlockStore` from the orphan row's exact `(org_id,
-   storage_class)`. Empty classes and invalid org IDs fail closed; the orphan and
-   cursor position are retained rather than guessing a default backend.
+4. Recovery treats `gc_s3_orphans_by_day` as discovery only, reloads the canonical
+    `gc_s3_orphans` row at `EACH_QUORUM`, and resolves the `BlockStore` from the
+    canonical `(org_id, storage_class)`. Empty classes, invalid org IDs, missing
+    canonical rows, read errors, and discovery-token mismatches fail closed; the
+    orphan and cursor position are retained rather than guessing a default backend.
 
 This turns the old permanent storage leak into an operational retry path. The
 remaining tradeoff is intentionally conservative cursor advancement: if the
 canonical block row still exists (for example claimed but not yet finalized),
-recovery defers that row to a later pass instead of touching S3 early.
+recovery defers that row to a later pass instead of touching S3 early. The same
+cursor retention applies to a missing canonical row, a read error, or a discovery
+token mismatch only when that discovery row is encountered by the current sweep.
+
+Two operational consequences of step 4 that matter during an incident. Every row now
+costs at least one `EACH_QUORUM` read before recovery can even classify it, including
+rows in `pending_mapping_cleanup`, which previously completed with no global read at
+all — so a single unreachable DC now stalls forward-mapping cleanup entirely, and
+because an orphan row fences writers (`ProbeBlockReuse` answers `BlockedByGC` on mere
+existence), that outage extends upload fencing for the affected content until it
+clears. Errors classified as unavailable by `isClusterUnavailableError` on either
+canonical read move `gc_destructive_last_blocked_timestamp_seconds{path="orphan"}`,
+so the standard `blocked > liveness_success` alert covers this; other per-row/read
+errors deliberately do not move it and surface as
+`s3_orphan_canonical_read_failed`, `s3_orphan_canonical_reload_missing`, or
+`s3_orphan_canonical_reload_failed` as appropriate. A canonical delete followed by
+a failed projection delete is different: `DeleteS3Orphan` records
+`gc_s3_orphan_discovery_delete_failures_total` but returns success, so the sweep
+may advance the cursor. If the stale row is later encountered within the configured
+overlap it retains the cursor; if the cursor has already passed that old day, the
+row can fall behind the overlap and survive until its 90-day TTL. The counter names
+possible stale discovery state, not a guaranteed cursor hold.
 
 ### RESOLVED (High): Existence checks failed open before destructive orphan cleanup
 

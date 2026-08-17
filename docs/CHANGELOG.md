@@ -8,6 +8,70 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-16 - R22a canonical orphan reload
+
+R22a removes recovery authority from `gc_s3_orphans_by_day`. Discovery now returns
+only `(org_id, block_id, first_seen_at)`, while `RecoverS3Orphans` reloads the
+canonical `gc_s3_orphans` row through an explicit `EACH_QUORUM` read before using
+the recovery phase, mapping identity, or storage class. Canonical absence, read
+errors, and a discovery-token mismatch fail closed and retain the cursor.
+
+Recovery performs a second canonical reload immediately before mapping cleanup or
+physical S3 deletion and refuses the action if the canonical recovery state changed.
+This narrows stale-read windows but is defense in depth only: it is not lifecycle
+exclusion and does not close R3, R20, R23, R26, or the physical `P` identity problem.
+Errors classified as unavailable by `isClusterUnavailableError` on either canonical
+read or reload now update the orphan destructive-path blocked signal; initial missing,
+reload missing, changed, and other reload failures retain separate error labels. The
+orphan cleanup path also counts failures deleting the by-day discovery projection after
+canonical deletion. If canonical absence or a discovery-token mismatch is encountered
+while the row is still in the scan, recovery retains the cursor by design. A projection
+delete failure is different: `DeleteS3Orphan` records the counter and returns success
+after canonical deletion, so the cursor may advance and an old stale row can fall
+behind the configured overlap and survive until the 90-day TTL. The counter signals
+possible stale discovery state, not proof that the row is holding the cursor. This
+remains a liveness/repair concern rather than an authorization fallback. The orphan
+TTL and cleanup mutation semantics are otherwise unchanged.
+
+The discovery projection's second writer is gone. `AddUpsertS3OrphanDiscoveryQuery`
+and `AddDeleteS3OrphanDiscoveryQuery` had no production caller and wrote a partial
+payload with no canonical-row counterpart — the shape R21 removed from the canonical
+table, which R21's own gate could not see because its pattern ends in
+`gc_s3_orphans\b`. `gc_s3_orphans_by_day` is now written only by
+`upsertS3OrphanProjection` and `DeleteS3Orphan`, pinned by
+`TestR22aDiscoveryWriterSurface`, which also pins `upsertS3OrphanProjection` to
+the two current canonical-first lifecycle callers, `StartBlockDeleteOrphan` and
+`MarkS3OrphanMappingCleanupPending`, counted per caller. The cross-table publication
+is not atomic, so concurrent lifecycle races remain fail-closed in recovery.
+
+The R22a gates were then audited against their own red forms, which found one of them
+blind to the defect it names. `TestR22aCanonicalOrphanReadAndDiscoverySurface` matched
+the canonical read with the substring `FROM gc_s3_orphans`, which also occurs inside
+`FROM gc_s3_orphans_by_day`, so repointing `GetS3OrphanGlobal` at the discovery
+projection kept the gate green — R21 avoided exactly this with a `gc_s3_orphans\b`
+boundary, since `_` is a word character. Both table matchers are now boundary-aware
+regexes (`canonicalOrphanRead`, `discoveryOrphanTable`), and
+`GetS3OrphanGlobal` fails if it names the projection at all, `gocql.EachQuorum` is
+attributed to the canonical query's own `.Consistency(...)` call chain rather than to
+the function at large, and the discovery check inspects every statement naming the
+projection instead of only those matching an expected `SELECT` prefix. The callsite
+check moved from set membership plus a total count to a count per caller, which the old
+form let two publications from one caller and none from the other satisfy. Tests only;
+no runtime behaviour changed.
+
+Two behaviours worth knowing before enabling GC, both recorded in
+`GC-X1-CLOSURE-OPTIONS.md`. The `pending_mapping_cleanup` branch previously issued no
+global read at all and now requires two `EACH_QUORUM` reads, so forward-mapping
+cleanup stalls through a single-DC outage it used to survive — and because an orphan
+row fences writers, such an outage now extends upload fencing for that content. And
+the `BlockExists` resurrection guard in that branch remains a session-consistency
+read (pre-existing, untouched here), so it can still read a live block as absent on a
+multi-DC cluster; R22a made it the most visible remaining defect by removing the
+louder one. The by-day payload columns now have zero readers and are candidates for
+removal in a following migration.
+
+---
+
 ## 2026-08-16 - R21 orphan authority surfaces removed
 
 Closed R21's provenance gap without changing runtime GC behaviour. `RecordS3Orphan`

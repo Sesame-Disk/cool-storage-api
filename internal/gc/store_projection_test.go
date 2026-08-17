@@ -91,18 +91,22 @@ func TestStore_StartBlockDeleteOrphan_RepairsMissingProjectionAndPreservesFirstS
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
 
-	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-repair"), 10)
+	discovery, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-repair"), 10)
 	if err != nil {
 		t.Fatalf("ListS3OrphansByDay failed: %v", err)
 	}
-	if len(orphans) != 1 {
-		t.Fatalf("expected repaired S3 orphan discovery row, got %d rows", len(orphans))
+	if len(discovery) != 1 {
+		t.Fatalf("expected repaired S3 orphan discovery row, got %d rows", len(discovery))
 	}
-	if !orphans[0].FirstSeenAt.Equal(firstSeenAt) {
-		t.Fatalf("projection first_seen_at = %v, want %v", orphans[0].FirstSeenAt, firstSeenAt)
+	if !discovery[0].FirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("projection first_seen_at = %v, want %v", discovery[0].FirstSeenAt, firstSeenAt)
 	}
-	if orphans[0].StorageClass != "cold" {
-		t.Fatalf("projection storage_class = %q, want %q", orphans[0].StorageClass, "cold")
+	projection, ok := store.GetS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
+	if !ok {
+		t.Fatal("expected raw projection payload")
+	}
+	if projection.StorageClass != "cold" {
+		t.Fatalf("projection storage_class = %q, want %q", projection.StorageClass, "cold")
 	}
 }
 
@@ -120,12 +124,12 @@ func TestStore_StartBlockDeleteOrphan_ResetRaceDoesNotResurrectRow(t *testing.T)
 	if got := store.S3OrphanCount(); got != 0 {
 		t.Fatalf("expected no canonical orphan rows after reset race, got %d", got)
 	}
-	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-reset-race"), 10)
+	discovery, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "orph-reset-race"), 10)
 	if err != nil {
 		t.Fatalf("ListS3OrphansByDay failed: %v", err)
 	}
-	if len(orphans) != 0 {
-		t.Fatalf("expected no resurrected projection rows, got %d", len(orphans))
+	if len(discovery) != 0 {
+		t.Fatalf("expected no resurrected projection rows, got %d", len(discovery))
 	}
 }
 
