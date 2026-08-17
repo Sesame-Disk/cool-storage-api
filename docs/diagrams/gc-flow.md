@@ -42,7 +42,7 @@ flowchart TD
     Start[Block candidate queue item] --> Refs{Any block_references row?}
     Refs -->|yes| Stale[Delete stale candidate; keep block]
     Refs -->|no| Exists{Canonical block exists?}
-    Exists -->|no| CleanupMissing[Best-effort mapping/candidate cleanup]
+    Exists -->|no| CleanupMissing[Preserve mapping + clean candidate]
     Exists -->|yes| Claim[LWT set gc_state=deleting + stable claim_id]
     Claim --> Won{Claim owned by this logical candidate?}
     Won -->|no| Skip[Skip / retry owner]
@@ -52,8 +52,7 @@ flowchart TD
     WAL --> Finalize[LWT finalize canonical block delete]
     Finalize --> S3[Delete S3 with bounded retry]
     S3 -->|failure| Recover[Keep orphan row for scanner recovery]
-    S3 -->|success| Mapping[Delete exact forward mapping]
-    Mapping --> Clear[Clear orphan + candidate]
+    S3 -->|success| Clear[Clear orphan + candidate; preserve mapping]
 ```
 
 The sequence above is conservative **up to S3 delete authorization**, given correct upstream classification/reference ownership. It does not close X1: Cassandra authorization/claim generations cannot revoke an S3 DELETE already in flight; only never-reused physical keys prevent a stale delete from targeting re-uploaded bytes. That closes only the physical-delete ABA component of X1. The P6

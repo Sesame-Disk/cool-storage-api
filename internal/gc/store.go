@@ -158,7 +158,6 @@ type GCStore interface {
 	// FinalizeBlockDelete removes the block row only when the same claimID still
 	// owns the row.
 	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
-	DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
@@ -201,8 +200,9 @@ type GCStore interface {
 	// `limit` caps the number of rows returned for a single (day, bucket) pair.
 	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanDiscoveryInfo, error)
 	// MarkS3OrphanMappingCleanupPending advances the recovery row after the S3
-	// delete has completed so restart recovery can finish forward-mapping cleanup
-	// without touching S3 again.
+	// delete has completed so restart recovery can finish the orphan lifecycle
+	// without touching S3 again. The phase name is historical: after R11a this
+	// transition performs no block-id mapping cleanup.
 	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
@@ -383,9 +383,9 @@ type BlockInfo struct {
 	StorageClass     string
 	CreatedAt        *time.Time
 	RepresentationID string
-	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), captured here so
-	// GC mapping cleanup can delete the single forward block_id_mappings row
-	// without the dropped reverse index. Empty for legacy/pre-PR2 rows.
+	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), retained for
+	// orphan recovery metadata and legacy diagnostics. Empty for legacy/pre-PR2
+	// rows.
 	Sha1 string
 }
 
@@ -487,7 +487,9 @@ type S3OrphanInfo struct {
 }
 
 const (
-	S3OrphanPhasePendingS3             = "pending_s3"
+	S3OrphanPhasePendingS3 = "pending_s3"
+	// Historical name. After R11a this phase means the physical S3 delete has
+	// completed and only orphan finalization remains; it performs no mapping delete.
 	S3OrphanPhasePendingMappingCleanup = "pending_mapping_cleanup"
 )
 

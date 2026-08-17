@@ -8,6 +8,40 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-17 - R11a decouples physical GC from logical mappings
+
+Physical block GC no longer deletes `block_id_mappings`. The SHA-1 -> SHA-256
+mapping belongs to the logical block, while `processBlock` and
+`RecoverS3Orphans` operate on a physical storage lifecycle. The worker no longer
+uses `cleanupBlockMapping`, and `DeleteBlockMappingExact` was removed from the GC
+store interface and implementations.
+
+The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate scans
+production Go and rejects both removed identifiers plus any production CQL delete
+against `block_id_mappings`. A future logical-death reaper must change this gate
+explicitly rather than silently reintroducing mapping ownership into physical GC.
+
+The `pending_mapping_cleanup` phase remains as a compatibility state and legacy
+name. Current code still writes it after a successful S3 delete so restart recovery
+can distinguish "S3 pending" from "S3 complete" without repeating the physical delete.
+After R11a it means that S3 deletion completed and only orphan finalization remains:
+the phase performs no `BlockExists` read and no mapping delete. The existing topology
+gate, canonical `EACH_QUORUM` reads and commit-point reload remain in force.
+
+Forward mappings may now remain as harmless dangling metadata after a logical
+block's physical incarnation is deleted. A SHA-1 lookup can resolve such a row
+and then receive a 404 until the same content is materialized again. This is an
+intentional metadata-retention tradeoff; no bytes or live references are deleted
+by the change. The old `gc_block_mapping_sha1_missing` and
+`gc_block_mapping_representation_missing` audit labels are no longer produced by
+physical GC. The resulting retention debt is tracked as
+`ISSUE-GC-LOGICAL-MAPPING-RETENTION-01`. The former
+`gc_s3_orphan_resurrected_discarded` label also has no producer now: the post-S3
+phase no longer branches on resurrection because it performs neither a physical
+delete nor a mapping delete.
+
+---
+
 ## 2026-08-17 - R22b projection is identity-only
 
 Migration `014_gc_s3_orphans_by_day_identity_only.cql` drops `storage_class`,

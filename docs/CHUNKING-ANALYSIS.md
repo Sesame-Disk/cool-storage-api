@@ -137,15 +137,16 @@ network endpoint.
 
 ### LOW: Orphaned block mappings after block deletion
 
-When GC deletes a block from S3 and the `blocks` table, PR7 deletes the forward
-mapping using `blocks.sha1`. If the worker crashes after deleting the canonical
-row but before mapping cleanup, some forward mappings (`block_id_mappings`) may
-remain as harmless dangling pointers because the reverse table no longer exists.
+When GC deletes a block from S3 and the `blocks` table, R11a deliberately leaves
+the forward mapping in `block_id_mappings`: the mapping belongs to the logical
+SHA-1 -> SHA-256 relationship, not the physical block lifecycle. Such rows are
+harmless dangling pointers when the logical content is not currently materialized.
 
 **Impact:** Wasted Cassandra storage. No data loss.
 
-**Tested:** Covered by unit/integration tests for the PR7 fail-safe; monitor
-`gc_block_mapping_sha1_missing` in production.
+**Tested:** Covered by unit/integration tests for normal physical deletion,
+stub cleanup, missing canonical rows and orphan recovery. The old
+`gc_block_mapping_sha1_missing` metric is no longer produced by physical GC.
 
 ---
 

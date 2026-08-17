@@ -296,7 +296,7 @@ the canonical id moved into `block_ids` and the SHA-1 list moved to its own colu
 | `block_references.block_id` | SHA-256 |
 | S3 object key | SHA-256 |
 | `block_id_mappings` (forward) | SHA-1 → SHA-256 (still resolves the desktop bare-SHA-1 block GET) |
-| `block_id_mappings_by_internal` (reverse) | **DROPPED (PR7, migration 006)** — GC cleanup now sources the SHA-1 from `blocks.sha1` |
+| `block_id_mappings_by_internal` (reverse) | **DROPPED (PR7, migration 006)** — R11a leaves the forward mapping independent of physical GC; `blocks.sha1` remains canonical block metadata |
 
 
 **Validated end-to-end (2026-06-24) against a real Seafile desktop client** on

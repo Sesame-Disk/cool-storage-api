@@ -62,13 +62,16 @@ old org-wide forward-mapping namespace.
 
 ## PR1 runtime scope
 
-PR1 updates the live runtime consumers that resolve or clean mappings:
+PR1 updates the live runtime consumers that resolve or persist mappings. R11a later
+decouples the logical mapping lifecycle from physical block GC:
 
 - upload materialization and verified web block mapping writes
 - batch SHA-1 resolution for file view, share-link view, sync, and seafhttp reads
 - direct sync/seafhttp single-block lookups
-- canonical block metadata writes so GC can later delete the exact forward mapping
-- GC orphan and mapping cleanup, now keyed by `representation_id`
+- canonical block metadata writes so GC can persist the exact representation and
+  external identity in durable orphan recovery metadata
+- GC orphan recovery and physical block cleanup, keyed by `representation_id`; physical
+  GC does not delete the forward mapping
 - cross-repo batch copy/move guard: same-representation allowed, different
   representation rejected before copying `fs_objects`
 
@@ -89,7 +92,7 @@ any missing `blocks.representation_id` deterministically on imported/legacy rows
 
 ## GC representation durability (PR2)
 
-PR1 keyed GC mapping cleanup by `representation_id`, but the GC *queue* did not
+PR1 keyed the former GC mapping-cleanup operation by `representation_id`, but the GC *queue* did not
 carry that representation. fs_object/commit GC can run long after a library is
 soft-deleted or fully hard-deleted, at which point re-resolving the SHA-1 domain
 from live library state is no longer reliable. PR2 makes the representation
@@ -167,10 +170,11 @@ rollout — no such legacy rows exist — and fail-closed is the intended postur
 
 - Resolve external SHA-1 block IDs only within the target library's effective
   `representation_id`.
-- Treat `blocks.representation_id` as the exact forward-mapping cleanup domain for
-  GC; do not infer it from the current destination library at delete time.
-- Do not delete forward mappings from GC without an explicit `representation_id`;
-  exact cleanup must come from canonical block metadata, not a guessed default.
+- Treat `block_id_mappings` as logical metadata owned by the SHA-1 -> SHA-256
+  relationship, not by a physical block-GC lifecycle.
+- Physical GC must not delete forward mappings. A future logical-death reaper, if
+  needed, must define its own ownership and representation rules rather than
+  reusing the physical block delete path.
 - Stamp `block_representation_id` on GC queue work at enqueue time; never
   re-resolve it from live library state during durable processing.
 - Add future schema changes as new migrations; do not rewrite migration `001`.

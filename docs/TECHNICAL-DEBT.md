@@ -2055,23 +2055,24 @@ AES-256-CBC with a derived, fixed IV — no random IV), so SHA-1(plaintext) ↔ 
 single forward row from `blocks.sha1` (a keyed point read) instead of enumerating the reverse
 clustering range. The reverse table's multi-alias capability was only ever populated by stale/orphan
 rows, which disappear with the table. `ListBlockMappingsByInternalID` and `DeleteBlockMappingResolved`
-are removed; the fail-safe (`gc_block_mapping_sha1_missing`) makes any empty-`sha1` block observable
-rather than triggering a blind delete.
+are removed. That was the PR7 cleanup contract; R11a supersedes its physical-delete half, so the
+current worker leaves the forward mapping untouched regardless of whether `blocks.sha1` is present.
 
 ### Post-merge monitoring
-**RESOLVED FOLLOW-UP (PR8).** The old restart window between `FinalizeBlockDelete` and forward
-mapping cleanup is closed by persisting `external_sha1` plus a tiny `recovery_phase` in
-`gc_s3_orphans` / `gc_s3_orphans_by_day` (migration `007_gc_s3_orphan_mapping_recovery.cql`).
+**RESOLVED FOLLOW-UP (PR8), superseded by R11a.** Migration
+`007_gc_s3_orphan_mapping_recovery.cql` still provides the durable post-claim recovery
+phases in `gc_s3_orphans` / `gc_s3_orphans_by_day`.
 
-GC block deletion is now crash-recoverable across both post-claim phases:
-- `pending_s3` — canonical row is gone; recovery still knows which S3 object to delete and which
-  forward mapping must eventually be cleaned.
-- `pending_mapping_cleanup` — S3 delete already succeeded; restart recovery skips S3 and finishes
-  only the `block_id_mappings` cleanup before removing the orphan row.
+GC block deletion remains crash-recoverable across both post-claim phases:
+- `pending_s3` — canonical row is gone and recovery still knows which S3 object to delete.
+- `pending_mapping_cleanup` — historical name; S3 delete already succeeded and restart
+  recovery skips S3 and finalizes the orphan row without touching `block_id_mappings`.
 
-The fail-safe metric `gc_block_mapping_sha1_missing` remains valuable for genuinely legacy or
-metadata-free rows (`blocks.sha1` empty), but normal crash/redeploy/restart paths no longer depend
-on that metric to bound leaked forward mappings.
+R11a deliberately decouples the logical forward mapping from physical GC. Mappings may
+remain as harmless dangling metadata after the physical block is gone; no bytes or live
+references are lost. The old `gc_block_mapping_sha1_missing` and
+`gc_block_mapping_representation_missing` audit labels are no longer produced by the
+physical block worker.
 
 ---
 

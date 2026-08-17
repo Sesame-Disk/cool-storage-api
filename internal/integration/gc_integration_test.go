@@ -1606,7 +1606,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	// candidate/queue/projection but CANNOT resolve the forward mapping: blocks.sha1
 	// is unavailable once the row is gone, and the reverse index was dropped in
 	// migration 006. The forward mapping is left as a harmless dangling pointer
-	// (recorded via the gc_block_mapping_sha1_missing metric).
+	// as intentional logical metadata retention.
 	for attempt := 0; attempt < 8; attempt++ {
 		if !gcCandidateExists(t, orgID, blockID) &&
 			!gcCandidateProjectionExists(t, orgID, blockID, candidateAt) &&
@@ -1642,21 +1642,17 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 		)
 	}
 
-	// The forward mapping survives: with the canonical row gone there is no
-	// blocks.sha1 to resolve it, and PR7 must not blind-delete it.
+	// The forward mapping survives because physical GC does not own the logical
+	// SHA-1 -> SHA-256 relationship.
 	if !blockIDMappingExists(t, orgID, externalBlockID) {
-		t.Fatal("expected forward mapping to survive the missing-canonical-row path (dangling pointer, observable via metric)")
+		t.Fatal("expected forward mapping to survive the missing-canonical-row path")
 	}
 }
 
-// TestGC_WorkerCleansForwardMappingViaBlockSHA1 is the PR7 encrypted-equivalent
-// guard: it deletes a real block whose external SHA-1 differs from its internal
-// block_id (exactly the encrypted-library shape — SHA-1 over plaintext, SHA-256
-// over ciphertext — but the same shape any web/seafhttp block has). With the
-// reverse index dropped (migration 006), GC must resolve and delete the forward
-// block_id_mappings row from blocks.sha1, NOT from block_id. A wrong source would
-// leave the forward mapping behind (or delete the wrong row).
-func TestGC_WorkerCleansForwardMappingViaBlockSHA1(t *testing.T) {
+// TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete verifies that a block
+// delete does not delete the logical SHA-1 -> SHA-256 mapping, even when the
+// external SHA-1 differs from the internal block_id.
+func TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
@@ -1695,7 +1691,7 @@ func TestGC_WorkerCleansForwardMappingViaBlockSHA1(t *testing.T) {
 	}
 
 	for attempt := 0; attempt < 8; attempt++ {
-		if !blockExistsInDB(t, orgID, blockID) && !blockIDMappingExists(t, orgID, externalSHA1) {
+		if !blockExistsInDB(t, orgID, blockID) {
 			break
 		}
 		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
@@ -1710,8 +1706,8 @@ func TestGC_WorkerCleansForwardMappingViaBlockSHA1(t *testing.T) {
 	if blockExistsInDB(t, orgID, blockID) {
 		t.Fatal("expected block row deleted")
 	}
-	if blockIDMappingExists(t, orgID, externalSHA1) {
-		t.Fatal("expected forward mapping deleted via blocks.sha1 (resolved from sha1, not block_id)")
+	if !blockIDMappingExists(t, orgID, externalSHA1) {
+		t.Fatal("expected forward mapping to survive physical delete")
 	}
 }
 
@@ -1763,8 +1759,7 @@ func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
 	}
 
 	for attempt := 0; attempt < 8; attempt++ {
-		if !blockExistsInDB(t, orgID, plainBlockID) &&
-			!blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
+		if !blockExistsInDB(t, orgID, plainBlockID) {
 			break
 		}
 		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
@@ -1779,8 +1774,8 @@ func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
 	if blockExistsInDB(t, orgID, plainBlockID) {
 		t.Fatal("expected plain block row deleted")
 	}
-	if blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
-		t.Fatal("expected plain forward mapping deleted")
+	if !blockIDMappingExistsForRepresentation(t, orgID, plainRep, externalSHA1) {
+		t.Fatal("expected plain forward mapping to survive physical delete")
 	}
 	if !blockExistsInDB(t, orgID, encBlockID) {
 		t.Fatal("expected encrypted sibling block row preserved")
@@ -1838,8 +1833,7 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	}
 
 	for attempt := 0; attempt < 8; attempt++ {
-		if !blockExistsInDB(t, orgID, encBlockID) &&
-			!blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		if !blockExistsInDB(t, orgID, encBlockID) {
 			break
 		}
 		processed, err := worker.ProcessOrgOnce(context.Background(), orgUUID)
@@ -1854,8 +1848,8 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	if blockExistsInDB(t, orgID, encBlockID) {
 		t.Fatal("expected encrypted block row deleted")
 	}
-	if blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
-		t.Fatal("expected encrypted forward mapping deleted")
+	if !blockIDMappingExistsForRepresentation(t, orgID, encRep, externalSHA1) {
+		t.Fatal("expected encrypted forward mapping to survive physical delete")
 	}
 	if !blockExistsInDB(t, orgID, plainBlockID) {
 		t.Fatal("expected plain sibling block row preserved")

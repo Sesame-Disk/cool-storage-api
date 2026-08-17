@@ -83,9 +83,9 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 
-	// Forward block mapping should be cleaned up (resolved via blocks.sha1)
-	if store.ForwardBlockMappingExists(orgID, "sha1-abc") {
-		t.Error("expected forward mapping sha1-abc cleaned up via blocks.sha1")
+	// Physical GC must not delete the logical SHA-1 -> SHA-256 mapping.
+	if !store.ForwardBlockMappingExists(orgID, "sha1-abc") {
+		t.Error("expected forward mapping sha1-abc to survive physical GC")
 	}
 
 	// Stats should be updated
@@ -98,8 +98,7 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 // PR7 fail-safe: when a deleted block has no blocks.sha1 (a legacy/pre-PR2 row),
 // GC cannot resolve its forward block_id_mappings row without the dropped reverse
 // index, so it must NOT delete a mapping blindly. The mapping survives as a
-// harmless dangling pointer (recorded via the gc_block_mapping_sha1_missing
-// metric), and the block itself is still deleted from DB + S3.
+// harmless dangling pointer, and the block itself is still deleted from DB + S3.
 func TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -385,10 +384,8 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
 	}
-	// The canonical blocks row never existed here, so blocks.sha1 is unavailable
-	// and the forward mapping cannot be resolved without the (dropped) reverse
-	// index. It survives as a harmless dangling pointer (recorded via the
-	// gc_block_mapping_sha1_missing metric); it is NOT swept on this path.
+	// The canonical blocks row never existed here, so the forward mapping is not
+	// owned by this stale physical candidate and must remain untouched.
 	if !store.ForwardBlockMappingExists(orgID, "sha1-missing") {
 		t.Fatal("missing-row path should leave the unresolvable forward mapping in place")
 	}
@@ -427,8 +424,8 @@ func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) 
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
 	}
-	if store.ForwardBlockMappingExists(orgID, "sha1-stub") {
-		t.Fatal("expected stub cleanup to remove the forward mapping via blocks.sha1")
+	if !store.ForwardBlockMappingExists(orgID, "sha1-stub") {
+		t.Fatal("expected stub cleanup to preserve the logical forward mapping")
 	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)

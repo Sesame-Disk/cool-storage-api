@@ -368,9 +368,10 @@ reviewed sequence deletes a live block, though a code audit cannot prove a unive
 3. **Re-check refs after the claim** (claim-then-verify); release + abort if a ref appeared.
 4. Register recovery in `gc_s3_orphans` **before** deleting the canonical `blocks` row
    (closes the crash window between Cassandra and S3).
-5. Delete the DB row (LWT-guarded) → delete S3 with exponential retry → clean the mapping.
-6. Resurrection guard: if the same `block_id` was re-uploaded, the live row owns the mapping
-   and the recovery is discarded instead of deleting.
+5. Delete the DB row (LWT-guarded) → delete S3 with exponential retry → preserve the logical
+   forward mapping.
+6. A re-uploaded `block_id` retains its mapping independently of the old physical lifecycle;
+   post-S3 recovery only finalizes its orphan row and does not delete mapping metadata.
 
 Representation is validated fail-closed (`CanonicalBlockRepresentationIDForLibrary` derives the
 one legal representation from identity + `encrypted` and rejects any stored value that would

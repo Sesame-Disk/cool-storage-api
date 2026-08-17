@@ -118,8 +118,9 @@ CREATE TABLE block_id_mappings (
 );
 ```
 
-Libraries persist `block_representation_id`, and canonical `blocks` rows also keep
-the `representation_id` used for exact forward-mapping cleanup during GC.
+Libraries persist `block_representation_id`, and canonical `blocks` rows keep the
+representation domain used for physical storage and logical mapping writes. Physical
+GC does not delete the forward mapping; its lifecycle is independent of the block row.
 
 **Flow**:
 ```
@@ -492,7 +493,6 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | `block` | Check org-scoped reference rows; if none, claim + recheck → delete metadata and the exact org-scoped S3 object |
 | `commit` | Fetch commit → enqueue root `fs_object` for cascading deletion → delete commit |
 | `fs_object` | Enqueue child dir entries (recursive) + enqueue blocks → delete fs_object |
-| `block_mapping` | Delete forward + reverse `block_id_mappings` entries |
 | `share_link` | Delete from all 4 share_links tables (quad-delete) |
 | `share` | Delete user-to-user share from `shares` + `shares_by_user` |
 | `restore_job` | Delete completed/expired restore job |
@@ -609,7 +609,7 @@ requires a separately certified migration before GC can be reconsidered.
 
 #### Reverse Lookup Table — DROPPED (PR7, migration 006)
 
-`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. GC cleanup now sources the external SHA-1 from `blocks.sha1` (a keyed point read captured before the block row is deleted) and deletes the single forward `block_id_mappings` row by `(org_id, representation_id, external_id)` — no reverse enumeration, no dual-write. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md) (PR7).
+`block_id_mappings_by_internal` (a reverse internal SHA-256 → external SHA-1 lookup, dual-written on every upload) **was dropped** in `006_drop_block_id_mappings_by_internal.cql`. During PR7, GC briefly used `blocks.sha1` (a keyed point read captured before the block row was deleted) to resolve and delete the single forward `block_id_mappings` row. R11a supersedes that physical-delete step: physical GC preserves the forward mapping, while `blocks.sha1` and the durable orphan metadata remain available for identity and recovery checks. See [SHA256-CANONICAL-BLOCK-IDS.md](./SHA256-CANONICAL-BLOCK-IDS.md).
 
 ---
 

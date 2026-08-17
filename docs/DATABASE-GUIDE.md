@@ -588,11 +588,12 @@ PUT /seafhttp/repo/{repo_id}/block/{sha1_hash}
 ---
 
 ### 9b. `block_id_mappings_by_internal` — DROPPED (PR7, migration 006)
-> **Removed.** This reverse table was dropped in `006_drop_block_id_mappings_by_internal.cql`. GC
-> cleanup now sources a block's external SHA-1 from `blocks.sha1` (a keyed point read, captured from
-> `GetBlockInfo` before the row is deleted) and deletes the single forward `block_id_mappings` row by
-> `(org_id, representation_id, external_id)`. No reverse enumeration, no dual-write. The description below is retained
-> for historical context only.
+> **Removed.** This reverse table was dropped in `006_drop_block_id_mappings_by_internal.cql`. The
+> historical PR7 cleanup path sourced a block's external SHA-1 from `blocks.sha1` and deleted the
+> single forward mapping row. R11a supersedes that physical-delete step: GC preserves
+> `block_id_mappings`, and the `blocks.sha1`/representation values remain useful for durable orphan
+> identity and recovery checks. No reverse enumeration or dual-write exists. The description below is
+> retained for historical context only.
 
 **Historical purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup before PR7.
 
@@ -606,7 +607,7 @@ PRIMARY KEY ((org_id), internal_id, external_id)  -- Lookup by SHA-256
 - It was dual-written alongside `block_id_mappings` on every upload.
 - PR7 removed that need by reading the authoritative SHA-1 from `blocks.sha1` on the canonical block row itself.
 
-**GC Usage:**
+**Historical PR7 GC Usage:**
 ```
 Worker reads blocks.sha1 from blocks(org_id, block_id) →
     Deletes the single forward row from block_id_mappings(org_id, representation_id, external_id)

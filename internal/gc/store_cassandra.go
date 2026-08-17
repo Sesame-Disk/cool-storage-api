@@ -2152,8 +2152,8 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	//
 	// Unlike streaming this resolver is deliberately LENIENT: a non-hex or
 	// wrong-length id is not a fatal error and a missing/garbage mapping keeps the
-	// original id. GC mapping cleanup legitimately runs after the forward mapping
-	// was already deleted, so failing closed here would wedge fs_object GC on a
+	// original id. GC reference cleanup legitimately runs after the forward mapping
+	// has become dangling, so failing closed here would wedge fs_object GC on a
 	// row that can never resolve. Worst case is a skipped reference removal (a
 	// leak + a harmless GC candidate), never a live-data delete. Each lenient skip
 	// is counted (gc_block_id_invalid / gc_block_mapping_unresolved_*) so silent
@@ -2306,16 +2306,6 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 	}
 	if !applied {
 		return fmt.Errorf("block delete finalize not applied for %s", blockID)
-	}
-	return nil
-}
-
-func (s *CassandraStore) DeleteBlockMappingExact(orgID uuid.UUID, representationID, externalID string) error {
-	externalID = db.NormalizeBlockID(externalID)
-	if err := s.db.Session().Query(`
-		DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?
-	`, orgID.String(), representationID, externalID).Exec(); err != nil {
-		return fmt.Errorf("delete block mapping org=%s representation_id=%s external_id=%s: %w", orgID, representationID, externalID, err)
 	}
 	return nil
 }

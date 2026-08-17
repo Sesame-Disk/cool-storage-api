@@ -247,10 +247,11 @@ token mismatch only when that discovery row is encountered by the current sweep.
 Two operational consequences of step 4 that matter during an incident. Every row now
 costs at least one `EACH_QUORUM` read before recovery can even classify it, including
 rows in `pending_mapping_cleanup`, which previously completed with no global read at
-all — so a single unreachable DC now stalls forward-mapping cleanup entirely, and
-because an orphan row fences writers (`ProbeBlockReuse` answers `BlockedByGC` on mere
-existence), that outage extends upload fencing for the affected content until it
-clears. Errors classified as unavailable by `isClusterUnavailableError` on either
+all — so a single unreachable DC now stalls post-S3 orphan finalization entirely.
+That branch no longer touches forward mappings, but because an orphan row fences
+writers (`ProbeBlockReuse` answers `BlockedByGC` on mere existence), the outage still
+extends upload fencing for the affected content until it clears. Errors classified by
+`isClusterUnavailableError` on either
 canonical read move `gc_destructive_last_blocked_timestamp_seconds{path="orphan"}`,
 so the standard `blocked > liveness_success` alert covers this; other per-row/read
 errors deliberately do not move it and surface as
