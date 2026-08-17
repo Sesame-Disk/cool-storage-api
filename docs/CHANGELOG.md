@@ -29,7 +29,8 @@ and then receive a 404 until the same content is materialized again. This is an
 intentional metadata-retention tradeoff; no bytes or live references are deleted
 by the change. The old `gc_block_mapping_sha1_missing` and
 `gc_block_mapping_representation_missing` audit labels are no longer produced by
-physical GC.
+physical GC. The resulting retention debt is tracked as
+`ISSUE-GC-LOGICAL-MAPPING-RETENTION-01`.
 
 ---
 

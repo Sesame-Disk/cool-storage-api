@@ -609,12 +609,13 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	}
 }
 
-// TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping
+// TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock
 // pins post-S3 finalization: if a crash leaves a recovery row at
 // pending_mapping_cleanup and the same block_id is re-uploaded before recovery
 // runs, recovery must discard the stale recovery row without touching the live
-// logical mapping.
-func TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping(t *testing.T) {
+// canonical row or S3. The mapping assertion is an explicit retention contract;
+// the branch itself no longer owns any mapping-delete operation.
+func TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}

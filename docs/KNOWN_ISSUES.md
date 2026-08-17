@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-07
+**Last Updated**: 2026-08-17
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -102,6 +102,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | ⏸ Deferred (greenfield prod) | Brownfield clusters with pre-fix residue may need a read-only reconcile pass. **Not required** for the planned empty prod deploy. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 | **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Fixed (2026-07-13) | Confirmed live-path leak: `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`. Fixed by standardizing block enqueue on `uuid.Nil` + store backstop. Pre-existing orphans on brownfield clusters only. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
+| **Forward SHA-1 Mappings Retained After Physical GC** | 🟡 Confirmed retention debt (Low) | R11a intentionally keeps `block_id_mappings` after physical block deletion. Rows are idempotent per `(org, representation, SHA-1)` rather than per delete churn, but they have no TTL or logical-death reaper and can resolve to a 404 until rematerialization. No live bytes or references are deleted. See ISSUE-GC-LOGICAL-MAPPING-RETENTION-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -2021,6 +2022,27 @@ This closed the missing-CAS and missing-parent-validation bug class. The remaini
 ---
 
 ## 🔴 OPEN ISSUES
+
+### ISSUE-GC-LOGICAL-MAPPING-RETENTION-01: Forward SHA-1 mappings have no logical-death reaper
+
+**Status**: 🟡 Open — retention debt; not a destructive-GC safety blocker
+**Discovered**: 2026-08-17
+**Priority**: Low/Medium — storage growth and stale lookup metadata
+**Affected**: `block_id_mappings`, SHA-1 block lookup, future logical cleanup
+
+R11a correctly decouples the logical SHA-1 → SHA-256 mapping from the physical block
+lifecycle, so physical GC must not delete this row. The tradeoff is that mappings have
+no TTL and no logical-death reaper. A row can therefore resolve a SHA-1 to an internal
+block ID whose canonical `blocks` row and S3 bytes are gone; the lookup then returns
+404 until the same content is materialized again.
+
+This is bounded by distinct logical content, not delete churn: the mapping writer is
+idempotent for an existing `(org_id, representation_id, external_id)` key. It remains
+an unbounded retention cost over the lifetime of a tenant, however. A future reaper
+must define logical ownership, representation scope, rematerialization races and a
+safe negative-authority rule before deleting mappings. Do not reuse the physical GC
+path or enable destructive GC as part of this issue. See B.3 in
+`GC-X1-CLOSURE-OPTIONS.md`.
 
 ### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Physical-delete ABA can remove re-uploaded bytes
 

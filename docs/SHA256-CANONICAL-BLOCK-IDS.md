@@ -141,7 +141,7 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     live block does not lose its freshly re-created forward mapping.
   - **Stale-phase reset on new delete** ensures a fresh block lifecycle cannot inherit an old
     `pending_mapping_cleanup` phase and skip the physical S3 delete.
-  - **Tests** pin both behaviors: `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping`
+  - **Tests** pin both behaviors: `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock`
     and `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
 - `R11a` — physical GC no longer deletes the logical forward mapping. The mapping belongs
   to the SHA-1 -> SHA-256 relationship rather than to a physical block incarnation. The
@@ -447,7 +447,7 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       repeated physical delete. `pending_mapping_cleanup` no longer needs that read because it
       performs no physical or mapping delete; it reloads canonical orphan state and finalizes the
       orphan row. Pinned by
-      `TestWorker_RecoverS3Orphans_PendingMappingCleanupKeepsResurrectedBlockMapping` and
+      `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock` and
       `TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists`.
    - **Stale-phase reset on a new delete.** A NEW block delete writes its recovery row via
      `StartBlockDeleteOrphan`, which always resets the phase to `pending_s3` (and `retry_count`,

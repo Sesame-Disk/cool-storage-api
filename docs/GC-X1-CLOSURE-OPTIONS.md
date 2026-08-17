@@ -881,7 +881,8 @@ it:
 post-S3 phase is now a legacy finalization state rather than a mapping-cleanup action.
 The price is that nothing reaps the mapping when `L` genuinely dies, so the table grows
 by one small row per ever-deleted block with an external SHA-1. This PR accepts that
-growth explicitly; a logical-death reaper remains a separate follow-up.
+growth explicitly; the logical-death reaper is tracked separately as
+`ISSUE-GC-LOGICAL-MAPPING-RETENTION-01`.
 
 #### B.4 — What B deliberately does not add
 

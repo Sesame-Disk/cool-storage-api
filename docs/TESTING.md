@@ -683,7 +683,7 @@ All of these run without any external dependencies:
 
 | Test | What It Verifies |
 |------|------------------|
-| `Worker_ProcessBlock_RefCountZero` | Block with ref_count=0 deleted from mock S3 + DB, block mappings cleaned |
+| `Worker_ProcessBlock_RefCountZero` | Block with ref_count=0 deleted from mock S3 + DB while the logical forward mapping survives |
 | `Worker_ProcessBlock_RefCountPositive` | Block with ref_count>0 is NOT deleted (safety check) |
 | `Worker_ProcessBlock_DryRun` | Dry run mode logs but doesn't delete anything |
 | `Worker_ProcessFSObject_CascadeBlocks` | FS object deletion decrements block ref_counts, enqueues blocks that hit 0 |

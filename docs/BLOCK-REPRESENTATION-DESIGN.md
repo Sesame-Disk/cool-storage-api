@@ -62,13 +62,16 @@ old org-wide forward-mapping namespace.
 
 ## PR1 runtime scope
 
-PR1 updates the live runtime consumers that resolve or clean mappings:
+PR1 updates the live runtime consumers that resolve or persist mappings. R11a later
+decouples the logical mapping lifecycle from physical block GC:
 
 - upload materialization and verified web block mapping writes
 - batch SHA-1 resolution for file view, share-link view, sync, and seafhttp reads
 - direct sync/seafhttp single-block lookups
-- canonical block metadata writes so GC can later delete the exact forward mapping
-- GC orphan and mapping cleanup, now keyed by `representation_id`
+- canonical block metadata writes so GC can persist the exact representation and
+  external identity in durable orphan recovery metadata
+- GC orphan recovery and physical block cleanup, keyed by `representation_id`; physical
+  GC does not delete the forward mapping
 - cross-repo batch copy/move guard: same-representation allowed, different
   representation rejected before copying `fs_objects`
 
@@ -89,7 +92,7 @@ any missing `blocks.representation_id` deterministically on imported/legacy rows
 
 ## GC representation durability (PR2)
 
-PR1 keyed GC mapping cleanup by `representation_id`, but the GC *queue* did not
+PR1 keyed the former GC mapping-cleanup operation by `representation_id`, but the GC *queue* did not
 carry that representation. fs_object/commit GC can run long after a library is
 soft-deleted or fully hard-deleted, at which point re-resolving the SHA-1 domain
 from live library state is no longer reliable. PR2 makes the representation
