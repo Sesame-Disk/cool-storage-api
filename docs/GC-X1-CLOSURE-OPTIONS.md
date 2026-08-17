@@ -56,18 +56,19 @@ finalization, and because an orphan row is a writer fence (`ProbeBlockReuse` ans
 affected content for as long as it lasts. This is a liveness cost, not a reason to
 let the branch clear an unverified canonical state.
 
-**R11a lifecycle characterization (2026-08-17).** The canonical
+**R11a canonical-state characterization (2026-08-17).** The canonical
 `external_sha1` and `representation_id` fields are no longer used for mapping
-cleanup, but they remain auxiliary lifecycle discriminators in the commit-point
-reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it resets an
-existing `(org_id, block_id)` row. Therefore two lifecycles can have the same
-`first_seen_at`, `storage_class`, and `recovery_phase` while their logical identity
-fields differ through the reachable empty-to-populated metadata backfill path.
-The canonical identity writer rejects populated-to-different-populated values,
-so that is not the lifecycle vector being characterized. Recovery must fail closed
-for the backfill shape until an explicit lifecycle/physical identity replaces the
-current discriminators. R11b payload pruning is consequently deferred until
-P/lifecycle identity is durable and authoritative.
+cleanup, but they remain auxiliary canonical-state discriminators in the
+commit-point reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it
+resets an existing `(org_id, block_id)` row. Therefore two observations of the
+same canonical recovery row can have the same `first_seen_at`, `storage_class`,
+and `recovery_phase` while `representation_id`/`external_sha1` change through
+the reachable empty-to-populated metadata-backfill path. The current reload
+detects that change. This does not establish a physical target change or prove
+that the discriminator is safety-load-bearing rather than defense-in-depth.
+Whether it can be pruned must be established by reachability analysis, or the
+discriminator must first be replaced by explicit P/lifecycle identity.
+R11b remains deferred pending that proof or an explicit identity superseding it.
 
 The recovery path also has two distinct post-S3 windows. If the orphan clear fails
 after `pending_mapping_cleanup` is durably recorded, retry recovery does not issue

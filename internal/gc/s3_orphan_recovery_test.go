@@ -354,11 +354,11 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 }
 
-// This is the reachable lifecycle shape that would be lost if R11b removed the
-// logical identity fields before replacing them with an explicit lifecycle
-// identity. StartBlockDeleteOrphan preserves first_seen_at when it resets an
-// existing row, so phase and storage class can remain unchanged while a later
-// metadata repair fills previously empty logical identity fields.
+// This is the reachable canonical-state shape that would be lost if R11b
+// removed the logical identity fields. StartBlockDeleteOrphan preserves
+// first_seen_at when it resets an existing row, so phase and storage class can
+// remain unchanged while a later metadata repair fills previously empty logical
+// identity fields. This test does not establish a physical lifecycle change.
 func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -371,9 +371,9 @@ func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFail
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			// Keep first_seen_at, storage_class and recovery_phase identical. Only
-			// the logical identity is backfilled, matching a same-phase lifecycle
-			// reset. Populated-to-different-populated identity is rejected by the
-			// canonical metadata writer and is not this reachable vector.
+			// the logical identity is backfilled while the canonical recovery state
+			// remains otherwise unchanged. Populated-to-different-populated identity
+			// is rejected by the canonical metadata writer and is not this vector.
 			info.RepresentationID = db.PlainBlockRepresentationID
 			info.ExternalSHA1 = backfilledSHA1
 		}
@@ -382,13 +382,13 @@ func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFail
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
-		t.Fatal("RecoverS3Orphans() error = nil, want logical identity mismatch")
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical-state mismatch")
 	}
 	if recovered != 0 {
 		t.Fatalf("recovered=%d, want 0", recovered)
 	}
 	if got := sp.BlockStoreRequests(); len(got) != 0 {
-		t.Fatalf("storage was resolved after the logical lifecycle changed: %+v", got)
+		t.Fatalf("storage was resolved after canonical state changed: %+v", got)
 	}
 	if store.S3OrphanCount() != 1 {
 		t.Fatalf("orphan rows=%d, want the row retained for retry", store.S3OrphanCount())
