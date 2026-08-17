@@ -231,9 +231,11 @@ recovery path:
 3. Scanner phase `s3_orphan_recovery` walks `gc_s3_orphans_by_day` from a
    persisted UTC-day cursor across all discovery buckets; on cold start it scans
    the full 90-day TTL horizon so old orphan rows are still recoverable.
-4. Recovery resolves the `BlockStore` from the orphan row's exact `(org_id,
-   storage_class)`. Empty classes and invalid org IDs fail closed; the orphan and
-   cursor position are retained rather than guessing a default backend.
+4. Recovery treats `gc_s3_orphans_by_day` as discovery only, reloads the canonical
+    `gc_s3_orphans` row at `EACH_QUORUM`, and resolves the `BlockStore` from the
+    canonical `(org_id, storage_class)`. Empty classes, invalid org IDs, missing
+    canonical rows, read errors, and discovery-token mismatches fail closed; the
+    orphan and cursor position are retained rather than guessing a default backend.
 
 This turns the old permanent storage leak into an operational retry path. The
 remaining tradeoff is intentionally conservative cursor advancement: if the

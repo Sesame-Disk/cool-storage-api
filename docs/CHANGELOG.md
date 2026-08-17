@@ -8,6 +8,22 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-16 - R22a canonical orphan reload
+
+R22a removes recovery authority from `gc_s3_orphans_by_day`. Discovery now returns
+only `(org_id, block_id, first_seen_at)`, while `RecoverS3Orphans` reloads the
+canonical `gc_s3_orphans` row through an explicit `EACH_QUORUM` read before using
+the recovery phase, mapping identity, or storage class. Canonical absence, read
+errors, and a discovery-token mismatch fail closed and retain the cursor.
+
+Recovery performs a second canonical reload immediately before mapping cleanup or
+physical S3 deletion and refuses the action if the canonical recovery state changed.
+This narrows stale-read windows but is defense in depth only: it is not lifecycle
+exclusion and does not close R20, R23, R26, or the physical `P` identity problem.
+The orphan TTL and cleanup mutation semantics are unchanged.
+
+---
+
 ## 2026-08-16 - R21 orphan authority surfaces removed
 
 Closed R21's provenance gap without changing runtime GC behaviour. `RecordS3Orphan`

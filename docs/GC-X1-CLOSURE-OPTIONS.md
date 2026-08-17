@@ -13,6 +13,14 @@ half is now history and whose X1 half is carried forward here, corrected and ext
 **Scope:** `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1), the sole remaining
 runtime blocker for destructive GC.
 
+**R22a status (2026-08-16):** recovery now treats `gc_s3_orphans_by_day` as a
+discovery-only identity, reloads the canonical orphan at `EACH_QUORUM`, and uses
+canonical recovery state for mapping cleanup and backend selection. Missing or
+failed canonical reads and discovery-token mismatches fail closed. The reload is
+not a Paxos settlement or lifecycle lock; exact `P` binding remains open R20/R23/R26
+work. The R22 row below records the original defect and its remaining exact-identity
+requirements.
+
 **Related:**
 
 - [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — status of record
@@ -1029,7 +1037,7 @@ A conceptual diff, not an implementation list.
 | `RegisterUploadedBlock` | Write `up:` then check the logical fence, then `UpsertBlockMetadata`; the provisional ref is **not** rolled back when the fence is found active (`fs_helpers.go:989-1003`) | Split repair from install (**R17**): a repair may only update a row that still names the same `P`, never create an absent one. Make the path tuple-aware: reuse/repair the active canonical `P`, block a condemned/deleting one, mint only for a genuine new incarnation. And settle what the surviving `up:` row does to recovery (**R18**) |
 | `UpdateS3OrphanAttempt` | Reads the expected `first_seen_at`, then performs `UPDATE … IF first_seen_at = ?` with a bound TTL; absent or differently-tokened rows are no-ops, while an existing-row lifecycle reset can still reuse the token | Guard the actual non-reusable lifecycle identity `P` and fail when the row is gone or reset to another lifecycle (**R19**) |
 | `RecordS3Orphan` | **Removed by the R21 authority-surface PR.** It was a second `INSERT … IF NOT EXISTS` creator of `gc_s3_orphans` with no production caller. | Test fixtures use `StartBlockDeleteOrphan` and `UpdateS3OrphanAttempt`; the untagged R21 gate requires exactly one production creator (**R21 closed**) |
-| `RecoverS3Orphans` discovery | Takes `S3OrphanInfo` — `StorageClass` included — straight from `ListS3OrphansByDay` and destroys on it, never reloading the canonical row | `by_day` → load canonical orphan → require exact `P` match → destroy. Mismatch or missing canonical row repairs/drops the index entry and never deletes (**R22**) |
+| `RecoverS3Orphans` discovery | **R22a implemented:** `ListS3OrphansByDay` returns only `(org_id, block_id, first_seen_at)`; recovery reloads canonical state at `EACH_QUORUM` and uses it for phase, mapping, and backend selection. A second canonical reload guards each irreversible action. | Missing/error canonical reads and discovery-token mismatches fail closed and retain the cursor. This is not exact `P` matching or lifecycle exclusion; R20/R23/R26 remain open. |
 | `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`); its projection half deletes by timestamp identity and resolves a zero `firstSeenAt` from whatever canonical row is current | Condition the canonical clear on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) — **and bind the projection clear the same way** (**R26**), or the stale lifecycle still erases the newer one's discoverability |
 | `upsertS3OrphanProjection` | Always derives `first_seen_day` from the original `firstSeenAt` (`store_cassandra.go`), so a re-projection lands in the day the cursor already passed | Give retry scheduling its own mutable fact (`next_retry_at`), separate from the immutable `first_seen_at`; without it R18(a)'s "re-project and retry" has no mechanism (**R27**) |
 | `repairPublishedSyncCommitBlockDelta` | Before R25, rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, promoting `fs:` without establishing `pub:` | Rebuild → fresh-ID `StagePublishAttemptReferences` with rollback scoped to that repair → R3 post-check → promote (**R25**) |

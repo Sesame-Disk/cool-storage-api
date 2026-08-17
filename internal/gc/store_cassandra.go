@@ -1552,6 +1552,45 @@ func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, stor
 	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, representationID, externalSHA1, recoveryPhase).Exec()
 }
 
+// GetS3OrphanGlobal reads the canonical recovery row at EACH_QUORUM. The
+// discovery projection is deliberately not consulted here: recovery uses this
+// row for phase, mapping identity, and backend selection. EACH_QUORUM provides
+// the same cross-DC visibility contract as the destructive liveness read, but
+// this ordinary SELECT is not a Paxos settlement and does not authorize a
+// physical delete by itself.
+func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3OrphanInfo, bool, error) {
+	var info S3OrphanInfo
+	var firstSeenAt time.Time
+	err := s.db.Session().Query(`
+		SELECT storage_class, representation_id, external_sha1, recovery_phase,
+		       first_seen_at, last_attempt_at, retry_count, last_error
+		FROM gc_s3_orphans
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Consistency(gocql.EachQuorum).Scan(
+		&info.StorageClass,
+		&info.RepresentationID,
+		&info.ExternalSHA1,
+		&info.RecoveryPhase,
+		&firstSeenAt,
+		&info.LastAttemptAt,
+		&info.RetryCount,
+		&info.LastError,
+	)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return S3OrphanInfo{}, false, nil
+		}
+		return S3OrphanInfo{}, false, fmt.Errorf("failed to read canonical S3 orphan org=%s block=%s at EACH_QUORUM: %w", orgID, blockID, err)
+	}
+	info.OrgID = orgID
+	info.BlockID = blockID
+	info.RepresentationID = strings.TrimSpace(info.RepresentationID)
+	info.ExternalSHA1 = strings.TrimSpace(info.ExternalSHA1)
+	info.RecoveryPhase = strings.TrimSpace(info.RecoveryPhase)
+	info.FirstSeenAt = firstSeenAt.UTC()
+	return info, true, nil
+}
+
 // StartBlockDeleteOrphan records the durable recovery row for a NEW block
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
@@ -1805,32 +1844,28 @@ func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSe
 	return nil
 }
 
-// ListS3OrphansByDay enumerates orphans for one (UTC day, discovery bucket)
-// partition. `limit` caps the rows returned for one (day, bucket); the worker
-// walks buckets [0, GCDiscoveryBucketCount) for each day from the persisted
-// recovery cursor.
-func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error) {
+// ListS3OrphansByDay enumerates discovery identities for one (UTC day,
+// discovery bucket) partition. It intentionally does not select recovery phase,
+// mapping identity, or storage class; the worker must reload those fields from
+// gc_s3_orphans before taking any action.
+func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanDiscoveryInfo, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	iter := s.db.Session().Query(`
-		SELECT first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase
+		SELECT first_seen_at, org_id, block_id
 		FROM gc_s3_orphans_by_day
 		WHERE first_seen_day = ? AND bucket = ?
 		LIMIT ?
 	`, db.GCProjectionUTCDate(day), bucket, limit).Iter()
-	var out []S3OrphanInfo
+	var out []S3OrphanDiscoveryInfo
 	var firstSeen time.Time
-	var orgIDStr, blockID, storageClass, representationID, externalSHA1, recoveryPhase string
-	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass, &representationID, &externalSHA1, &recoveryPhase) {
-		out = append(out, S3OrphanInfo{
-			OrgID:            parseUUID(orgIDStr),
-			BlockID:          blockID,
-			StorageClass:     storageClass,
-			RepresentationID: strings.TrimSpace(representationID),
-			ExternalSHA1:     strings.TrimSpace(externalSHA1),
-			RecoveryPhase:    strings.TrimSpace(recoveryPhase),
-			FirstSeenAt:      firstSeen,
+	var orgIDStr, blockID string
+	for iter.Scan(&firstSeen, &orgIDStr, &blockID) {
+		out = append(out, S3OrphanDiscoveryInfo{
+			OrgID:       parseUUID(orgIDStr),
+			BlockID:     blockID,
+			FirstSeenAt: firstSeen,
 		})
 	}
 	if err := iter.Close(); err != nil {

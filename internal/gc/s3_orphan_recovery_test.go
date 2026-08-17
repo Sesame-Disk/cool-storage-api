@@ -182,6 +182,176 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 	}
 }
 
+func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassWhenProjectionIsStale(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	firstSeenAt := seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	store.SetS3OrphanProjectionForTest(orgID, "orph-canonical-class", firstSeenAt, "cold", "wrong-representation", "wrong-sha1", S3OrphanPhasePendingS3)
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	deletes := sp.ScopedBlockDeletes()
+	if len(deletes) != 1 || deletes[0].StorageClass != "hot" {
+		t.Fatalf("physical delete used stale projection data: %+v", deletes)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForMappingCleanup(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-canonical-phase"
+	canonicalSHA1 := "sha1-canonical"
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "previous failure", time.Now())
+	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+		t.Fatalf("advance canonical orphan phase: %v", err)
+	}
+	store.SetS3OrphanProjectionForTest(orgID, blockID, firstSeenAt, "cold", "wrong-representation", "wrong-sha1", S3OrphanPhasePendingS3)
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("stale projection phase caused a repeated S3 delete: %v", got)
+	}
+	if store.ForwardBlockMappingExists(orgID, canonicalSHA1) {
+		t.Fatal("canonical mapping was not cleaned")
+	}
+}
+
+func TestWorker_RecoverS3Orphans_CanonicalMissingRetainsDiscoveryAndCursor(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-canonical-missing"
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	store.DeleteS3OrphanCanonicalForTest(orgID, blockID)
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical-missing deferral")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved for a missing canonical row: %+v", got)
+	}
+	discovery, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), blockID), 10)
+	if err != nil {
+		t.Fatalf("ListS3OrphansByDay: %v", err)
+	}
+	if len(discovery) != 1 {
+		t.Fatalf("discovery row was removed on canonical absence: %d", len(discovery))
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced on canonical absence: %v", err)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_DiscoveryTokenMismatchFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-discovery-token-mismatch"
+	canonicalFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	store.DeleteS3OrphanProjectionForTest(orgID, blockID, canonicalFirstSeenAt)
+	staleFirstSeenAt := canonicalFirstSeenAt.Add(-time.Hour)
+	store.AddS3OrphanProjectionForTest(S3OrphanInfo{
+		OrgID:         orgID,
+		BlockID:       blockID,
+		FirstSeenAt:   staleFirstSeenAt,
+		StorageClass:  "hot",
+		RecoveryPhase: S3OrphanPhasePendingS3,
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want discovery-token deferral")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved on a discovery-token mismatch: %+v", got)
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced on discovery-token mismatch: %v", err)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_CanonicalReadErrorFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-canonical-read-error", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	store.SetGetS3OrphanGlobalErrForTest(errors.New("EACH_QUORUM unavailable"))
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical read error")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved after canonical read failure: %+v", got)
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced after canonical read failure: %v", err)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-canonical-reload", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			info.StorageClass = "cold"
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved after canonical state changed: %+v", got)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
+	}
+}
+
 func TestWorker_RecoverS3Orphans_EmptyStorageClassFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
