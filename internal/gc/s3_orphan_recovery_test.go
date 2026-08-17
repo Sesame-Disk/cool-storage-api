@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -347,6 +348,50 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 	if got := sp.BlockStoreRequests(); len(got) != 0 {
 		t.Fatalf("storage was resolved after canonical state changed: %+v", got)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
+	}
+}
+
+// This is the reachable canonical-state shape that would be lost if R11b
+// removed the external SHA-1 field. StartBlockDeleteOrphan preserves
+// first_seen_at when it resets an existing row, so phase and storage class can
+// remain unchanged while a later metadata repair fills a previously empty SHA-1.
+// This test does not establish a physical lifecycle change. representation_id is
+// intentionally not mutated here because production inserts validate and persist
+// it; its empty-value repair is an imported/legacy-row path.
+func TestWorker_RecoverS3Orphans_BackfilledSHA1ChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-logical-identity-reload"
+	backfilledSHA1 := strings.Repeat("2", 40)
+	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "", time.Now())
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			// Keep first_seen_at, storage_class, recovery_phase and representation_id
+			// identical. Only the SHA-1 is backfilled while canonical recovery state
+			// remains otherwise unchanged.
+			info.ExternalSHA1 = backfilledSHA1
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical-state mismatch")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved after canonical state changed: %+v", got)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatalf("orphan rows=%d, want the row retained for retry", store.S3OrphanCount())
 	}
 	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
 		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
@@ -755,6 +800,47 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	}
 	if !store.ForwardBlockMappingExists(orgID, sha1) {
 		t.Fatal("forward mapping must survive post-S3 clear retry")
+	}
+}
+
+// Characterize the earlier crash window separately from a failed orphan clear:
+// if S3 succeeds but the phase transition is not durable, recovery has no
+// durable evidence that the first delete completed and may retry S3. This test
+// models a clean non-applied phase-advance error; an ambiguous LWT outcome is
+// deliberately not covered and remains R20 work. R11a does not claim
+// at-most-once physical deletion; exact P identity is future work.
+func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-phase-advance-window"
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "sha1-phase-window", "", time.Now())
+	store.SetMarkS3OrphanMappingCleanupPendingErrOnceForTest(errors.New("simulated phase advance failure"))
+
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("first recovery error = nil, want phase advance failure")
+	}
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
+	}
+	// The pending_s3 path checks BlockExists before deleting. This repeat case
+	// therefore applies only after the canonical block is already absent; a
+	// resurrected block is deferred rather than deleted again.
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 || orphans[0].RecoveryPhase != S3OrphanPhasePendingS3 {
+		t.Fatalf("orphan after phase advance failure = %+v, want pending_s3 row retained", orphans)
+	}
+	if !firstSeenAt.Equal(orphans[0].FirstSeenAt) {
+		t.Fatalf("first_seen_at changed after phase advance failure: got %v, want %v", orphans[0].FirstSeenAt, firstSeenAt)
+	}
+
+	if recovered, err := w.RecoverS3Orphans(context.Background(), 100); err != nil || recovered != 1 {
+		t.Fatalf("retry recovery = (%d, %v), want (1, nil)", recovered, err)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 2 {
+		t.Fatalf("retry S3 deletes = %v, want the characterized repeat", got)
 	}
 }
 

@@ -56,6 +56,31 @@ finalization, and because an orphan row is a writer fence (`ProbeBlockReuse` ans
 affected content for as long as it lasts. This is a liveness cost, not a reason to
 let the branch clear an unverified canonical state.
 
+**R11a canonical-state characterization (2026-08-17).** The canonical
+`external_sha1` and `representation_id` fields are no longer used for mapping
+cleanup, but they remain auxiliary canonical-state discriminators in the
+commit-point reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it
+resets an existing `(org_id, block_id)` row. Therefore two observations of the
+same canonical recovery row can have the same `first_seen_at`, `storage_class`,
+and `recovery_phase` while `external_sha1` changes through the reachable
+greenfield empty-to-populated metadata-backfill path. The sole production
+`blocks` INSERT validates and persists a non-empty `representation_id`; its
+empty-value repair is an imported/legacy-row path. The current reload detects
+the SHA-1 change. This does not establish a physical target change or prove that
+the discriminator is safety-load-bearing rather than defense-in-depth.
+Whether either field can be pruned must be established by reachability analysis,
+or the discriminator must first be replaced by explicit P/lifecycle identity.
+R11b remains deferred pending that proof or an explicit identity superseding it.
+
+The recovery path also has two distinct post-S3 windows. If the orphan clear fails
+after `pending_mapping_cleanup` is durably recorded, retry recovery does not issue
+S3 again. If the process fails before that phase transition is durable, the row
+remains `pending_s3` and a later retry may issue S3 again. This is not an R11a
+mapping-safety regression, but it is not an at-most-once physical-delete guarantee;
+the `pending_s3` block-existence guard still defers recovery when the canonical
+block has been resurrected. Exact P identity is the future mechanism that makes a
+repeat of P1 harmless to P2.
+
 **Why the obvious repair for a stranded discovery row is not safe yet, and which R
 gates it.** When canonical is absent, the tempting fix is "delete the projection row".
 The gating requirement is **R20, not R26**. `StartBlockDeleteOrphan` preserves
