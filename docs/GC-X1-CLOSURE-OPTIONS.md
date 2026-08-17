@@ -81,13 +81,38 @@ poisons the payload to prove it is ignored, so it needs a different way to expre
 that — most likely deletion, since with the columns gone the property is structural.
 Do this before introducing `P`, and before R26.
 
-**Gate caveat.** `TestR22aCanonicalOrphanReadAndDiscoverySurface` proves
-`gocql.EachQuorum` appears somewhere in `GetS3OrphanGlobal`, not that it is the
-argument to `.Consistency(...)` on that specific query; and on the discovery side it
-inspects only queries already matching the expected `SELECT` prefix, so a future query
-with a different prefix would be skipped entirely. Both hold today. The writer gate
-now inspects both raw writers and helper callsites; tightening the read-side AST checks
-to inspect the full call chain remains hardening, not a defect.
+**Gate hardening, and one gate defect (2026-08-17).** The caveats recorded here on
+2026-08-16 are closed, and auditing them turned up a fourth item that was not
+hardening but a real hole in the gate.
+
+The hole: `TestR22aCanonicalOrphanReadAndDiscoverySurface` identified the canonical
+read with `strings.Contains(query, "FROM gc_s3_orphans")`, and that substring is also
+present in `FROM gc_s3_orphans_by_day`. Pointing `GetS3OrphanGlobal` at the discovery
+projection therefore left the gate green — the precise authority inversion the whole
+of R22a exists to prevent, unguarded by the test named after it. This is R21's `\b`
+lesson lost on the way to R22a: R21 was written with `gc_s3_orphans\b` *because* `_`
+is a word character, and the sibling gate dropped the boundary. Both table matchers
+are now boundary-aware regexes (`canonicalOrphanRead`, `discoveryOrphanTable`), and
+`GetS3OrphanGlobal` additionally fails if it names the projection at all.
+
+The three previously recorded caveats, all now closed:
+
+- `gocql.EachQuorum` is attributed to the canonical query's own call chain — the gate
+  walks for a `.Consistency(...)` call whose receiver subtree contains the `Query(...)`
+  holding the canonical CQL, and requires that single argument to be `gocql.EachQuorum`.
+  Merely mentioning the identifier in the function no longer satisfies it.
+- The discovery side inspects every statement naming `gc_s3_orphans_by_day` rather than
+  only those matching an expected `SELECT` prefix, so a reworded query cannot skip the
+  payload-column check; `ListS3OrphansByDay` also fails if it reads canonical.
+- `TestR22aDiscoveryWriterSurface` compares helper callsites **by count per caller**,
+  not set membership plus a total. The old form accepted two publications from
+  `StartBlockDeleteOrphan` and none from `MarkS3OrphanMappingCleanupPending`: two
+  elements, both in the allowed set, total matching — green while a lifecycle
+  transition had silently stopped publishing its discovery row.
+
+Each was verified in its red form against a deliberately mutated `store_cassandra.go`,
+and each mutation was confirmed to pass the pre-fix gate. Runtime behaviour is
+unchanged; only the tests moved.
 
 **Related:**
 

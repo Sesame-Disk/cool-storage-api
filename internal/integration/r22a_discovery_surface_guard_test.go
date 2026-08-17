@@ -47,9 +47,13 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	// its projection.
 	allowedInsert := "upsertS3OrphanProjection"
 	allowedDelete := "DeleteS3Orphan"
-	allowedProjectionCallsites := map[string]bool{
-		"(*CassandraStore).StartBlockDeleteOrphan":            true,
-		"(*CassandraStore).MarkS3OrphanMappingCleanupPending": true,
+	// Counts, not set membership. Each authorized caller publishes the projection
+	// exactly once, after establishing canonical state. A set check plus a total
+	// count would accept two publications from one caller and none from the other,
+	// which is precisely the case where a lifecycle transition stops publishing.
+	allowedProjectionCallsites := map[string]int{
+		"(*CassandraStore).StartBlockDeleteOrphan":            1,
+		"(*CassandraStore).MarkS3OrphanMappingCleanupPending": 1,
 	}
 
 	// Identifiers removed by R22a, kept by name so a revert is caught even if the
@@ -62,7 +66,7 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	scanned := 0
 	insertWriters := []string{}
 	deleteWriters := []string{}
-	projectionCallsites := []string{}
+	projectionCallsites := map[string]int{}
 	functionName := func(fn *ast.FuncDecl) string {
 		if fn.Recv == nil || len(fn.Recv.List) == 0 {
 			return fn.Name.Name
@@ -79,9 +83,21 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	}
 	recordProjectionCallsites := func(node ast.Node, caller string) {
 		ast.Inspect(node, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if ok {
+				if function, identOK := call.Fun.(*ast.Ident); identOK && function.Name == allowedInsert {
+					projectionCallsites[caller]++
+				}
+			}
+			return true
+		})
+		// Selectors cover method calls and method values. Direct identifier calls
+		// were counted above; keeping the passes separate avoids counting a
+		// selector call twice.
+		ast.Inspect(node, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
 			if ok && selector.Sel.Name == allowedInsert {
-				projectionCallsites = append(projectionCallsites, caller)
+				projectionCallsites[caller]++
 			}
 			return true
 		})
@@ -173,13 +189,22 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	if len(deleteWriters) != 1 {
 		t.Errorf("gc_s3_orphans_by_day DELETE writers = %v, want exactly [%s]", deleteWriters, allowedDelete)
 	}
-	for _, caller := range projectionCallsites {
-		if !allowedProjectionCallsites[caller] {
+	for caller, count := range projectionCallsites {
+		want, authorized := allowedProjectionCallsites[caller]
+		if !authorized {
 			t.Errorf("%s: %s callsite is not an authorized canonical-first lifecycle caller", caller, allowedInsert)
+			continue
+		}
+		if count != want {
+			t.Errorf("%s calls %s %d times, want %d: a second publication in one caller can mask a transition that stopped publishing",
+				caller, allowedInsert, count, want)
 		}
 	}
-	if len(projectionCallsites) != len(allowedProjectionCallsites) {
-		t.Errorf("%s callsites = %v, want exactly %v", allowedInsert, projectionCallsites, allowedProjectionCallsites)
+	for caller, want := range allowedProjectionCallsites {
+		if _, present := projectionCallsites[caller]; !present {
+			t.Errorf("%s no longer calls %s (want %d): its canonical state would exist with no discovery row, invisible to the day scan until the canonical TTL",
+				caller, allowedInsert, want)
+		}
 	}
 }
 

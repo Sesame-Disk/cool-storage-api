@@ -41,8 +41,23 @@ table, which R21's own gate could not see because its pattern ends in
 `upsertS3OrphanProjection` and `DeleteS3Orphan`, pinned by
 `TestR22aDiscoveryWriterSurface`, which also pins `upsertS3OrphanProjection` to
 the two current canonical-first lifecycle callers, `StartBlockDeleteOrphan` and
-`MarkS3OrphanMappingCleanupPending`. The cross-table publication is not atomic,
-so concurrent lifecycle races remain fail-closed in recovery.
+`MarkS3OrphanMappingCleanupPending`, counted per caller. The cross-table publication
+is not atomic, so concurrent lifecycle races remain fail-closed in recovery.
+
+The R22a gates were then audited against their own red forms, which found one of them
+blind to the defect it names. `TestR22aCanonicalOrphanReadAndDiscoverySurface` matched
+the canonical read with the substring `FROM gc_s3_orphans`, which also occurs inside
+`FROM gc_s3_orphans_by_day`, so repointing `GetS3OrphanGlobal` at the discovery
+projection kept the gate green — R21 avoided exactly this with a `gc_s3_orphans\b`
+boundary, since `_` is a word character. Both table matchers are now boundary-aware
+regexes (`canonicalOrphanRead`, `discoveryOrphanTable`), and
+`GetS3OrphanGlobal` fails if it names the projection at all, `gocql.EachQuorum` is
+attributed to the canonical query's own `.Consistency(...)` call chain rather than to
+the function at large, and the discovery check inspects every statement naming the
+projection instead of only those matching an expected `SELECT` prefix. The callsite
+check moved from set membership plus a total count to a count per caller, which the old
+form let two publications from one caller and none from the other satisfy. Tests only;
+no runtime behaviour changed.
 
 Two behaviours worth knowing before enabling GC, both recorded in
 `GC-X1-CLOSURE-OPTIONS.md`. The `pending_mapping_cleanup` branch previously issued no
