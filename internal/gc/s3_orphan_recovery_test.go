@@ -353,6 +353,46 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 }
 
+// This is the lifecycle shape that would be lost if R11b removed the logical
+// identity fields before replacing them with an explicit lifecycle identity.
+// StartBlockDeleteOrphan preserves first_seen_at when it resets an existing
+// row, so phase and storage class can remain unchanged across two lifecycles.
+func TestWorker_RecoverS3Orphans_LogicalIdentityChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-logical-identity-reload"
+	seedS3Orphan(t, store, orgID, blockID, "hot", "representation-one", "sha1-one", "", time.Now())
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			// Keep first_seen_at, storage_class and recovery_phase identical. Only
+			// the logical identity changes, matching a same-phase lifecycle reset.
+			info.RepresentationID = "representation-two"
+			info.ExternalSHA1 = "sha1-two"
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want logical identity mismatch")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage was resolved after the logical lifecycle changed: %+v", got)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatalf("orphan rows=%d, want the row retained for retry", store.S3OrphanCount())
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
+	}
+}
+
 // The pending_s3 branch above was the only commit-point reload with a regression
 // behind it. The post-S3 finalization branch also needs its reload before clearing
 // the orphan; otherwise a changed canonical lifecycle could be finalized from a
@@ -755,6 +795,42 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	}
 	if !store.ForwardBlockMappingExists(orgID, sha1) {
 		t.Fatal("forward mapping must survive post-S3 clear retry")
+	}
+}
+
+// Characterize the earlier crash window separately from a failed orphan clear:
+// if S3 succeeds but the phase transition is not durable, recovery has no
+// durable evidence that the first delete completed and may retry S3. R11a does
+// not claim at-most-once physical deletion; exact P identity is future work.
+func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-phase-advance-window"
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "sha1-phase-window", "", time.Now())
+	store.SetMarkS3OrphanMappingCleanupPendingErrOnceForTest(errors.New("simulated phase advance failure"))
+
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
+		t.Fatal("first recovery error = nil, want phase advance failure")
+	}
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
+	}
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 || orphans[0].RecoveryPhase != S3OrphanPhasePendingS3 {
+		t.Fatalf("orphan after phase advance failure = %+v, want pending_s3 row retained", orphans)
+	}
+	if !firstSeenAt.Equal(orphans[0].FirstSeenAt) {
+		t.Fatalf("first_seen_at changed after phase advance failure: got %v, want %v", orphans[0].FirstSeenAt, firstSeenAt)
+	}
+
+	if recovered, err := w.RecoverS3Orphans(context.Background(), 100); err != nil || recovered != 1 {
+		t.Fatalf("retry recovery = (%d, %v), want (1, nil)", recovered, err)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 2 {
+		t.Fatalf("retry S3 deletes = %v, want the characterized repeat", got)
 	}
 }
 

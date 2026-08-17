@@ -190,6 +190,7 @@ type MockStore struct {
 	getS3OrphanGlobalCalls         int
 	getS3OrphanGlobalHook          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
 	deleteS3OrphanErrOnce          error
+	markS3OrphanErrOnce            error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook                func(orgID uuid.UUID, size int)
@@ -763,6 +764,15 @@ func (m *MockStore) SetDeleteS3OrphanErrOnceForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleteS3OrphanErrOnce = err
+}
+
+// SetMarkS3OrphanMappingCleanupPendingErrOnceForTest makes the next phase
+// advance fail without mutating the canonical row. This characterizes the
+// window after a successful S3 delete and before the durable phase transition.
+func (m *MockStore) SetMarkS3OrphanMappingCleanupPendingErrOnceForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.markS3OrphanErrOnce = err
 }
 
 // SetGetS3OrphanGlobalHookForTest injects deterministic changes into canonical
@@ -3836,6 +3846,11 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.markS3OrphanErrOnce != nil {
+		err := m.markS3OrphanErrOnce
+		m.markS3OrphanErrOnce = nil
+		return err
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
 		existing.RepresentationID = strings.TrimSpace(representationID)

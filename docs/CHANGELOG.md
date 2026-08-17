@@ -21,9 +21,10 @@ production Go and rejects both removed identifiers plus any production CQL delet
 against `block_id_mappings`. A future logical-death reaper must change this gate
 explicitly rather than silently reintroducing mapping ownership into physical GC.
 
-The `pending_mapping_cleanup` phase remains as a compatibility state and legacy
-name. Current code still writes it after a successful S3 delete so restart recovery
-can distinguish "S3 pending" from "S3 complete" without repeating the physical delete.
+The `pending_mapping_cleanup` phase remains as a durable post-S3 state under a
+historical name. Current code still writes it after a successful S3 delete so
+restart recovery can distinguish "S3 pending" from "S3 complete" without repeating
+the physical delete when that phase transition was durably recorded.
 After R11a it means that S3 deletion completed and only orphan finalization remains:
 the phase performs no `BlockExists` read and no mapping delete. The existing topology
 gate, canonical `EACH_QUORUM` reads and commit-point reload remain in force.
@@ -39,6 +40,19 @@ physical GC. The resulting retention debt is tracked as
 `gc_s3_orphan_resurrected_discarded` label also has no producer now: the post-S3
 phase no longer branches on resurrection because it performs neither a physical
 delete nor a mapping delete.
+
+The canonical `external_sha1` and `representation_id` fields remain intentionally
+present. R11a removed their mapping-cleanup authority, but the commit-point reload
+still compares them as auxiliary lifecycle discriminators while
+`StartBlockDeleteOrphan` can reset an existing row without changing `first_seen_at`.
+Removing them is deferred until an explicit physical/lifecycle identity replaces
+that protection.
+
+The recovery tests distinguish two post-S3 windows. A failed orphan clear after the
+phase advance retries without another S3 delete. A failure before the phase advance
+leaves `pending_s3`, so a later recovery can repeat S3; R11a does not provide an
+at-most-once physical-delete guarantee. Exact P identity is required to make a
+repeat of P1 harmless to a later P2.
 
 ---
 
