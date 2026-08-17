@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -353,24 +354,28 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 }
 
-// This is the lifecycle shape that would be lost if R11b removed the logical
-// identity fields before replacing them with an explicit lifecycle identity.
-// StartBlockDeleteOrphan preserves first_seen_at when it resets an existing
-// row, so phase and storage class can remain unchanged across two lifecycles.
-func TestWorker_RecoverS3Orphans_LogicalIdentityChangeBeforeCommitFailsClosed(t *testing.T) {
+// This is the reachable lifecycle shape that would be lost if R11b removed the
+// logical identity fields before replacing them with an explicit lifecycle
+// identity. StartBlockDeleteOrphan preserves first_seen_at when it resets an
+// existing row, so phase and storage class can remain unchanged while a later
+// metadata repair fills previously empty logical identity fields.
+func TestWorker_RecoverS3Orphans_BackfilledLogicalIdentityChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
 	blockID := "orph-logical-identity-reload"
-	seedS3Orphan(t, store, orgID, blockID, "hot", "representation-one", "sha1-one", "", time.Now())
+	backfilledSHA1 := strings.Repeat("2", 40)
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "", "", time.Now())
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			// Keep first_seen_at, storage_class and recovery_phase identical. Only
-			// the logical identity changes, matching a same-phase lifecycle reset.
-			info.RepresentationID = "representation-two"
-			info.ExternalSHA1 = "sha1-two"
+			// the logical identity is backfilled, matching a same-phase lifecycle
+			// reset. Populated-to-different-populated identity is rejected by the
+			// canonical metadata writer and is not this reachable vector.
+			info.RepresentationID = db.PlainBlockRepresentationID
+			info.ExternalSHA1 = backfilledSHA1
 		}
 		return info, nil
 	})
@@ -800,8 +805,10 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 
 // Characterize the earlier crash window separately from a failed orphan clear:
 // if S3 succeeds but the phase transition is not durable, recovery has no
-// durable evidence that the first delete completed and may retry S3. R11a does
-// not claim at-most-once physical deletion; exact P identity is future work.
+// durable evidence that the first delete completed and may retry S3. This test
+// models a clean non-applied phase-advance error; an ambiguous LWT outcome is
+// deliberately not covered and remains R20 work. R11a does not claim
+// at-most-once physical deletion; exact P identity is future work.
 func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -818,6 +825,9 @@ func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *
 	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
 		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
 	}
+	// The pending_s3 path checks BlockExists before deleting. This repeat case
+	// therefore applies only after the canonical block is already absent; a
+	// resurrected block is deferred rather than deleted again.
 	orphans := store.AllS3Orphans()
 	if len(orphans) != 1 || orphans[0].RecoveryPhase != S3OrphanPhasePendingS3 {
 		t.Fatalf("orphan after phase advance failure = %+v, want pending_s3 row retained", orphans)

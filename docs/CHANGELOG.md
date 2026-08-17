@@ -45,14 +45,17 @@ The canonical `external_sha1` and `representation_id` fields remain intentionall
 present. R11a removed their mapping-cleanup authority, but the commit-point reload
 still compares them as auxiliary lifecycle discriminators while
 `StartBlockDeleteOrphan` can reset an existing row without changing `first_seen_at`.
-Removing them is deferred until an explicit physical/lifecycle identity replaces
-that protection.
+The reachable divergence is a metadata backfill from empty to populated; the
+canonical identity writer rejects populated-to-different-populated values.
+Removing these fields is deferred until an explicit physical/lifecycle identity
+replaces that protection.
 
 The recovery tests distinguish two post-S3 windows. A failed orphan clear after the
 phase advance retries without another S3 delete. A failure before the phase advance
 leaves `pending_s3`, so a later recovery can repeat S3; R11a does not provide an
-at-most-once physical-delete guarantee. Exact P identity is required to make a
-repeat of P1 harmless to a later P2.
+at-most-once physical-delete guarantee. The `pending_s3` block-existence guard
+still defers recovery when the canonical block has been resurrected. Exact P
+identity is required to make a repeat of P1 harmless to a later P2.
 
 ---
 

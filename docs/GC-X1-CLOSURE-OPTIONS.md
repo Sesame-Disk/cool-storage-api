@@ -62,17 +62,21 @@ cleanup, but they remain auxiliary lifecycle discriminators in the commit-point
 reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it resets an
 existing `(org_id, block_id)` row. Therefore two lifecycles can have the same
 `first_seen_at`, `storage_class`, and `recovery_phase` while their logical identity
-fields differ. Recovery must fail closed for that shape until an explicit
-lifecycle/physical identity replaces the current discriminators. R11b payload
-pruning is consequently deferred until P/lifecycle identity is durable and
-authoritative.
+fields differ through the reachable empty-to-populated metadata backfill path.
+The canonical identity writer rejects populated-to-different-populated values,
+so that is not the lifecycle vector being characterized. Recovery must fail closed
+for the backfill shape until an explicit lifecycle/physical identity replaces the
+current discriminators. R11b payload pruning is consequently deferred until
+P/lifecycle identity is durable and authoritative.
 
 The recovery path also has two distinct post-S3 windows. If the orphan clear fails
 after `pending_mapping_cleanup` is durably recorded, retry recovery does not issue
 S3 again. If the process fails before that phase transition is durable, the row
 remains `pending_s3` and a later retry may issue S3 again. This is not an R11a
 mapping-safety regression, but it is not an at-most-once physical-delete guarantee;
-exact P identity is the future mechanism that makes a repeat of P1 harmless to P2.
+the `pending_s3` block-existence guard still defers recovery when the canonical
+block has been resurrected. Exact P identity is the future mechanism that makes a
+repeat of P1 harmless to P2.
 
 **Why the obvious repair for a stranded discovery row is not safe yet, and which R
 gates it.** When canonical is absent, the tempting fix is "delete the projection row".
