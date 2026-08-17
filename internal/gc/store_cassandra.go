@@ -1545,11 +1545,28 @@ func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UU
 
 // --- S3 orphan recovery ---
 
-func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1, recoveryPhase string, firstSeenAt time.Time) error {
+// upsertS3OrphanProjection publishes the discovery identity for an orphan. R22b
+// dropped the projection's payload columns (migration 014), so every column this
+// writes is part of the primary key and the statement carries no state beyond
+// "this identity is enumerable on this day".
+//
+// It must remain an INSERT. Only INSERT writes primary-key liveness information,
+// and with no regular cells left that liveness IS the row. An UPDATE of this
+// table is currently inexpressible — CQL needs a SET over a non-key column and
+// none remains — so the hazard is conditional: re-add a regular column and an
+// UPDATE-based writer becomes possible again. Such a row would not be invisible;
+// Cassandra treats a row with live cells and no PK liveness as present, so it
+// would enumerate normally at first. It would disappear later, when that payload
+// cell is deleted or expires under the table's TTL, taking with it an identity
+// that was still supposed to be discoverable. Publication stays an INSERT so a
+// discovery row's existence is carried by the identity itself and never by a
+// payload cell. TestR22bProjectionWriteIsInsert pins the pair, statement and
+// column list, because neither half is visible at the call site.
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	return s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass, representationID, externalSHA1, recoveryPhase).Exec()
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id)
+		VALUES (?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Exec()
 }
 
 // GetS3OrphanGlobal reads the canonical recovery row at EACH_QUORUM. The
@@ -1629,7 +1646,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, effectiveFirstSeenAt); err != nil {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveFirstSeenAt); err != nil {
 		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return effectiveFirstSeenAt, nil
@@ -1655,20 +1672,25 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	if !applied {
 		return nil
 	}
+	// Only first_seen_at is read back: it is the projection's clustering key, and
+	// since R22b the projection has nothing else to carry. Before R22b this also
+	// fetched storage_class and representation_id purely to refill projection
+	// payload columns that no reader consulted.
 	var firstSeenAt time.Time
-	var storageClass string
-	var effectiveRepresentationID string
 	err = s.db.Session().Query(`
-		SELECT first_seen_at, storage_class, representation_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&firstSeenAt, &storageClass, &effectiveRepresentationID)
+		SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&firstSeenAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("read S3 orphan after phase advance org=%s block=%s: %w", orgID, blockID, err)
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, storageClass, effectiveRepresentationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, firstSeenAt); err != nil {
-		return fmt.Errorf("update S3 orphan discovery phase org=%s block=%s: %w", orgID, blockID, err)
+	// Re-publishing the same identity is idempotent and heals a projection row
+	// lost between the canonical insert and here. It does NOT record the phase
+	// advance — the phase lives only in the canonical row.
+	if err := s.upsertS3OrphanProjection(orgID, blockID, firstSeenAt); err != nil {
+		return fmt.Errorf("republish S3 orphan discovery identity org=%s block=%s: %w", orgID, blockID, err)
 	}
 	return nil
 }

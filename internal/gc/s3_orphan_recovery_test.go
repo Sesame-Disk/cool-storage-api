@@ -182,14 +182,18 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 	}
 }
 
-func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassWhenProjectionIsStale(t *testing.T) {
+// The stale-projection variant of this test is gone with R22b: the projection has
+// no storage_class to disagree with canonical (migration 014), so there is nothing
+// to poison. What survives is the positive half — the physical delete is issued
+// with the canonical storage class — while TestR22bProjectionSchemaIsIdentityOnly
+// and the source gates carry the "no other source exists" half structurally.
+func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassForPhysicalDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	firstSeenAt := seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
-	store.SetS3OrphanProjectionForTest(orgID, "orph-canonical-class", firstSeenAt, "cold", "wrong-representation", "wrong-sha1", S3OrphanPhasePendingS3)
+	seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -217,7 +221,6 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForMappingCleanup(t *testing.
 	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
 		t.Fatalf("advance canonical orphan phase: %v", err)
 	}
-	store.SetS3OrphanProjectionForTest(orgID, blockID, firstSeenAt, "cold", "wrong-representation", "wrong-sha1", S3OrphanPhasePendingS3)
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -276,12 +279,10 @@ func TestWorker_RecoverS3Orphans_DiscoveryTokenMismatchFailsClosed(t *testing.T)
 	canonicalFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
 	store.DeleteS3OrphanProjectionForTest(orgID, blockID, canonicalFirstSeenAt)
 	staleFirstSeenAt := canonicalFirstSeenAt.Add(-time.Hour)
-	store.AddS3OrphanProjectionForTest(S3OrphanInfo{
-		OrgID:         orgID,
-		BlockID:       blockID,
-		FirstSeenAt:   staleFirstSeenAt,
-		StorageClass:  "hot",
-		RecoveryPhase: S3OrphanPhasePendingS3,
+	store.AddS3OrphanProjectionForTest(S3OrphanDiscoveryInfo{
+		OrgID:       orgID,
+		BlockID:     blockID,
+		FirstSeenAt: staleFirstSeenAt,
 	})
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -346,6 +347,97 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 	if got := sp.BlockStoreRequests(); len(got) != 0 {
 		t.Fatalf("storage was resolved after canonical state changed: %+v", got)
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
+	}
+}
+
+// The pending_s3 branch above was the only commit-point reload with a regression
+// behind it. The pending_mapping_cleanup branch has two more — one before
+// cleanupBlockMapping, one before discarding a resurrected row — and both were
+// reachable with the whole suite still green if someone removed only their
+// reload. These two tests close that: the reload exists in all three places
+// today, so this is regression coverage, not a runtime fix.
+
+func TestWorker_RecoverS3Orphans_MappingCleanupCanonicalStateChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-mapping-reload"
+	canonicalSHA1 := "sha1-mapping-reload"
+	// No AddBlock: the canonical block row is gone, so the resurrection guard
+	// falls through to the mapping-cleanup commit point.
+	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+		t.Fatalf("advance canonical orphan phase: %v", err)
+	}
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			info.ExternalSHA1 = "sha1-changed-under-us"
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch before mapping cleanup")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if !store.ForwardBlockMappingExists(orgID, canonicalSHA1) {
+		t.Fatal("forward mapping was deleted after the canonical row changed under the commit point")
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatalf("orphan rows=%d, want the row retained for retry", store.S3OrphanCount())
+	}
+	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
+		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_ResurrectedDiscardCanonicalStateChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := "orph-resurrected-reload"
+	canonicalSHA1 := "sha1-resurrected-reload"
+	// Live canonical block row: recovery takes the "discard the stale row" path,
+	// whose irreversible action is DeleteS3Orphan rather than a mapping delete.
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+		t.Fatalf("advance canonical orphan phase: %v", err)
+	}
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			info.RecoveryPhase = S3OrphanPhasePendingS3
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch before discarding the resurrected row")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatalf("orphan rows=%d, want the row retained: discarding it on changed canonical state drops recovery work", store.S3OrphanCount())
+	}
+	if !store.ForwardBlockMappingExists(orgID, canonicalSHA1) {
+		t.Fatal("resurrected block lost its live forward mapping")
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched on this path, got %v", got)
 	}
 	if calls := store.GetS3OrphanGlobalCallsForTest(); calls != 2 {
 		t.Fatalf("canonical reads=%d, want initial read plus commit-point reload", calls)

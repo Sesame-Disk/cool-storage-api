@@ -29,8 +29,8 @@ var discoveryOrphanTable = regexp.MustCompile(`(?i)\bgc_s3_orphans_by_day\b`)
 var discoveryOrphanIdentityRead = regexp.MustCompile(`(?is)\bSELECT\s+first_seen_at\s*,\s*org_id\s*,\s*block_id\s+FROM\s+gc_s3_orphans_by_day\b`)
 
 // canonicalPayloadColumns are the fields recovery must take from the canonical
-// row. The projection still carries columns by these names until they are
-// dropped, so the discovery read must never name one.
+// row. Migration 014 removed these names from the projection, so a discovery read
+// must never name one, even if a future schema change reintroduces a column.
 var canonicalPayloadColumns = []string{"storage_class", "representation_id", "external_sha1", "recovery_phase"}
 
 // queryReadsCanonical reports whether node contains a `.Query(<canonical CQL>)`
@@ -155,8 +155,11 @@ func TestR22aCanonicalOrphanReadAndDiscoverySurface(t *testing.T) {
 			continue
 		}
 		discoveryQueryFound = true
+		// Lowercased: unquoted CQL identifiers are case-insensitive, and the table
+		// matchers above already are. Inherited from R22a, corrected with R22b.
+		normalizedQuery := strings.ToLower(query)
 		for _, forbidden := range canonicalPayloadColumns {
-			if strings.Contains(query, forbidden) {
+			if strings.Contains(normalizedQuery, forbidden) {
 				t.Fatalf("discovery query exposes canonical field %q: %s", forbidden, query)
 			}
 		}

@@ -1,1 +1,10 @@
 *.sh text eol=lf
+
+# Migrations are embedded verbatim with go:embed and the migrator records a
+# SHA-256 of the raw file bytes in schema_migrations. With core.autocrlf=true a
+# Windows checkout materializes these as CRLF while a Linux/CI checkout gets LF,
+# so the same commit produces two different checksums and the migrator reports
+# "the file was modified after it was applied" on a migration nobody touched.
+# Observed repeatedly, and only clearable with a destructive `docker compose
+# down -v`. Pinning the checkout encoding removes the class outright.
+*.cql text eol=lf

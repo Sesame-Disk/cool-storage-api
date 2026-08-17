@@ -221,7 +221,7 @@ type MockStore struct {
 	// S3 orphans keyed by "orgID:blockID"
 	s3Orphans map[string]*S3OrphanInfo
 	// S3 orphan discovery rows keyed by the full projection PK.
-	s3OrphanProjections map[mockS3OrphanProjectionKey]S3OrphanInfo
+	s3OrphanProjections map[mockS3OrphanProjectionKey]S3OrphanDiscoveryInfo
 }
 
 var _ GCStore = (*MockStore)(nil)
@@ -454,7 +454,7 @@ func NewMockStore() *MockStore {
 		gcStats:                              make(map[string]string),
 		organizations:                        nil,
 		s3Orphans:                            make(map[string]*S3OrphanInfo),
-		s3OrphanProjections:                  make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
+		s3OrphanProjections:                  make(map[mockS3OrphanProjectionKey]S3OrphanDiscoveryInfo),
 	}
 }
 
@@ -512,9 +512,17 @@ func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandi
 	}
 }
 
-func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
-	key := newMockS3OrphanProjectionKey(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
-	m.s3OrphanProjections[key] = *orphan
+// upsertS3OrphanProjection mirrors the Cassandra discovery write. Since R22b the
+// projection stores identity only, so this deliberately takes an
+// S3OrphanDiscoveryInfo rather than the canonical row: a mock that kept the full
+// payload could satisfy a test that production Cassandra would now fail.
+func (m *MockStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID string, firstSeenAt time.Time) {
+	key := newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt)
+	m.s3OrphanProjections[key] = S3OrphanDiscoveryInfo{
+		OrgID:       orgID,
+		BlockID:     blockID,
+		FirstSeenAt: firstSeenAt.UTC(),
+	}
 }
 
 func mockMappingKey(orgID uuid.UUID, representationID, externalID string) string {
@@ -692,33 +700,24 @@ func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID str
 }
 
 // AddS3OrphanProjectionForTest seeds a discovery row independently of the
-// canonical row, so recovery tests can model stale or malicious projection data.
-func (m *MockStore) AddS3OrphanProjectionForTest(info S3OrphanInfo) {
+// canonical row, so recovery tests can model a projection that outlived, or
+// never matched, its canonical counterpart.
+//
+// R22b removed the payload counterpart of this helper, SetS3OrphanProjectionForTest,
+// which existed to poison storage_class/representation_id/external_sha1/recovery_phase
+// on a discovery row and prove recovery ignored them. Those columns no longer exist
+// (migration 014), so the property is now structural rather than behavioural and is
+// gated by TestR22bProjectionSchemaIsIdentityOnly instead of by a poisoned fixture.
+func (m *MockStore) AddS3OrphanProjectionForTest(info S3OrphanDiscoveryInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.upsertS3OrphanProjection(&info)
+	m.upsertS3OrphanProjection(info.OrgID, info.BlockID, info.FirstSeenAt)
 }
 
-// SetS3OrphanProjectionForTest changes only the non-authoritative payload of an
-// existing discovery row. Recovery must not use any of these fields for action.
-func (m *MockStore) SetS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time, storageClass, representationID, externalSHA1, recoveryPhase string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt)
-	projection, ok := m.s3OrphanProjections[key]
-	if !ok {
-		return
-	}
-	projection.StorageClass = storageClass
-	projection.RepresentationID = representationID
-	projection.ExternalSHA1 = externalSHA1
-	projection.RecoveryPhase = recoveryPhase
-	m.s3OrphanProjections[key] = projection
-}
-
-// GetS3OrphanProjectionForTest reads the raw projection payload for store tests.
-// Production recovery cannot call this because discovery exposes only its key.
-func (m *MockStore) GetS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) (S3OrphanInfo, bool) {
+// GetS3OrphanProjectionForTest reads the raw discovery row for store tests.
+// Production recovery cannot learn anything more from it than this: since R22b
+// the stored row IS its key.
+func (m *MockStore) GetS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) (S3OrphanDiscoveryInfo, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	projection, ok := m.s3OrphanProjections[newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt)]
@@ -3796,7 +3795,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		existing.LastAttemptAt = now
 		existing.RetryCount = 0
 		existing.LastError = ""
-		m.upsertS3OrphanProjection(existing)
+		m.upsertS3OrphanProjection(existing.OrgID, existing.BlockID, existing.FirstSeenAt)
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
@@ -3810,7 +3809,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		LastAttemptAt:    now,
 	}
 	m.s3Orphans[key] = orphan
-	m.upsertS3OrphanProjection(orphan)
+	m.upsertS3OrphanProjection(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
 	return orphan.FirstSeenAt, nil
 }
 
@@ -3824,7 +3823,7 @@ func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, 
 		existing.RecoveryPhase = S3OrphanPhasePendingMappingCleanup
 		existing.LastAttemptAt = now
 		existing.LastError = ""
-		m.upsertS3OrphanProjection(existing)
+		m.upsertS3OrphanProjection(existing.OrgID, existing.BlockID, existing.FirstSeenAt)
 	}
 	return nil
 }
