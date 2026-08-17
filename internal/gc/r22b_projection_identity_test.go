@@ -80,7 +80,7 @@ func TestR22bProjectionWriteIsInsert(t *testing.T) {
 	insertFound := false
 	for _, query := range stringLiteralsIn(writer) {
 		if projectionUpdate.MatchString(query) {
-			t.Fatalf("discovery write uses UPDATE: with every column in the primary key the row would have no row marker and no SELECT would return it: %s", query)
+			t.Fatalf("discovery write uses UPDATE: an UPDATE would make discovery depend on a payload cell whose TTL can expire independently; publication must remain INSERT: %s", query)
 		}
 		if !discoveryOrphanTable.MatchString(query) {
 			continue
