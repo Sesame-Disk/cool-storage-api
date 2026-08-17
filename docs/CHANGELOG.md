@@ -8,6 +8,28 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-17 - R11b-1 prunes physical orphan representation state
+
+Migration `015_gc_s3_orphans_without_representation_id.cql` removes
+`gc_s3_orphans.representation_id`. R11a already removed physical GC authority
+over logical mappings, and the reachability audit confirmed that the remaining
+orphan recovery path did not use this field to select a backend, delete bytes,
+or advance a phase. `external_sha1` remains in the canonical orphan row and in
+the commit-point equality because its reachable empty-to-populated backfill is
+still characterized as a conservative fail-closed discriminator.
+
+The GC store contract, Cassandra/mock implementations, worker, and `BlockInfo`
+no longer carry the orphan representation field. Representation metadata remains
+in `blocks`, libraries, queue state, and mapping domains; this migration changes
+only the physical orphan recovery subsystem. Source and effective-schema gates
+reject reintroducing the field to canonical orphan statements or schema.
+
+This is a clean-cut schema change. No pre-R11b-1 binary may remain active after
+the migration is applied, and production destructive GC remains disabled while
+exact physical identity and lifecycle fencing remain open X1/R23 work.
+
+---
+
 ## 2026-08-17 - R11a decouples physical GC from logical mappings
 
 Physical block GC no longer deletes `block_id_mappings`. The SHA-1 -> SHA-256

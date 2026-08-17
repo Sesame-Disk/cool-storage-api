@@ -56,21 +56,36 @@ finalization, and because an orphan row is a writer fence (`ProbeBlockReuse` ans
 affected content for as long as it lasts. This is a liveness cost, not a reason to
 let the branch clear an unverified canonical state.
 
-**R11a canonical-state characterization (2026-08-17).** The canonical
-`external_sha1` and `representation_id` fields are no longer used for mapping
-cleanup, but they remain auxiliary canonical-state discriminators in the
+**Historical R11a canonical-state characterization (2026-08-17, before R11b-1).**
+The canonical `external_sha1` and `representation_id` fields were no longer used
+for mapping cleanup, but remained auxiliary canonical-state discriminators in the
 commit-point reload. `StartBlockDeleteOrphan` preserves `first_seen_at` when it
 resets an existing `(org_id, block_id)` row. Therefore two observations of the
-same canonical recovery row can have the same `first_seen_at`, `storage_class`,
-and `recovery_phase` while `external_sha1` changes through the reachable
+same canonical recovery row could have the same `first_seen_at`, `storage_class`,
+and `recovery_phase` while `external_sha1` changed through the reachable
 greenfield empty-to-populated metadata-backfill path. The sole production
 `blocks` INSERT validates and persists a non-empty `representation_id`; its
-empty-value repair is an imported/legacy-row path. The current reload detects
-the SHA-1 change. This does not establish a physical target change or prove that
-the discriminator is safety-load-bearing rather than defense-in-depth.
-Whether either field can be pruned must be established by reachability analysis,
-or the discriminator must first be replaced by explicit P/lifecycle identity.
-R11b remains deferred pending that proof or an explicit identity superseding it.
+empty-value repair is an imported/legacy-row path. That reload detected the
+SHA-1 change. This did not establish a physical target change or prove that the
+discriminator was safety-load-bearing rather than defense-in-depth. R11b-1 below
+resolved the reachability question for `representation_id` and retained only the
+conservative `external_sha1` characterization.
+
+**R11b-1 (2026-08-17).** The reachability audit established that
+`representation_id` is not used by physical orphan recovery to select a backend,
+authorize a delete, or advance a phase. Migration
+`015_gc_s3_orphans_without_representation_id.cql` therefore drops it from the
+canonical `gc_s3_orphans` table and the GC contract. `external_sha1` remains in
+the canonical row and in `s3OrphanRecoveryStateEqual`: its reachable
+empty-to-populated backfill is still retained as conservative fail-closed
+coverage. This is a metadata-surface reduction, not an X1 closure; the orphan
+still identifies a logical block and storage class rather than an immutable
+physical `P=(B,K)`.
+
+The older R28 discussion below describes the pre-R11b-1 writer set; its
+references to `representation_id` as an orphan identity writer are historical.
+After R11b-1, the remaining conditional orphan identity writers are
+`external_sha1` and `recovery_phase`.
 
 The recovery path also has two distinct post-S3 windows. If the orphan clear fails
 after `pending_mapping_cleanup` is durably recorded, retry recovery does not issue
@@ -102,8 +117,8 @@ separation into a storage separation: "the worker does not read the payload" bec
 "the payload does not exist". `upsertS3OrphanProjection` fell from seven parameters to
 three, and `MarkS3OrphanMappingCleanupPending` stopped reading `storage_class` and
 `representation_id` back, since it fetched them solely to refill projection cells no
-reader consulted. Canonical `gc_s3_orphans` keeps all four columns — only the copy is
-gone.
+reader consulted. At the time of R22b, canonical `gc_s3_orphans` kept all four
+columns; R11b-1 subsequently removes only its `representation_id` column.
 
 **What R22b changed about the table itself.** Every surviving column is a primary-key
 column, so a discovery row now carries no regular cells and its **primary-key liveness
@@ -1192,7 +1207,7 @@ A conceptual diff, not an implementation list.
 | `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` inheriting the session serial level | Store the exact key; raise the serial phase to `SERIAL` so one incarnation wins globally (R9) |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND backend_identity = B1 AND storage_key = K1`, with fresh per-attempt claim identity (R14/R16) |
 | `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, inheriting the session serial level | Serial phase `SERIAL` — the one-serial-domain rule admits no exceptions on this partition (R12) |
-| `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007) plus `representation_id` (009); R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
+| `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007); R11b-1 removes the redundant `representation_id`, while R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
 | `StartBlockDeleteOrphan` | `INSERT … IF NOT EXISTS`, then **resets** an existing row to `pending_s3` | Return/classify applied, same-key idempotent, different-key conflict and ambiguous error; never overwrite/reset, never release on an ambiguous result, and postpone only a confirmed different lifecycle (B.1) |
 | `gcS3OrphanInitialScanLookbackDays = 90` | Cold-start horizon, matched to the TTL | Redefine together with the TTL removal |
 | `RecoverS3Orphans` | Re-verifies `BlockExists(L)` and `BlockHasReferencesGlobal(L)` | **A+:** retain `BlockHasReferencesGlobal(L)` and the canonical-row check, then delete exact validated `P1`. **B:** the orphan may carry the historical authorization for `P1`, but recovery still validates the canonical locator and legacy/keyless rows fail closed. |

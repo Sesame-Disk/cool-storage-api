@@ -768,7 +768,7 @@ func TestX2_DestructiveTimestampsArePerPath(t *testing.T) {
 
 	// Orphan recovery cannot authorize anything: its liveness read fails.
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-1", "hot", "", "", now.AddDate(0, 0, -1))
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("expected the sweep to fail closed")
@@ -864,7 +864,7 @@ func TestX2_OrphanRecoveryClassifiesItsGlobalVerifyFailure(t *testing.T) {
 	seedRefusedOrphan := func(t *testing.T, w *Worker, store *MockStore, sp *MockStorageProvider, at time.Time, livenessErr error) {
 		t.Helper()
 		orgID := uuid.New()
-		seedS3Orphan(t, store, orgID, "orph-1", "hot", db.PlainBlockRepresentationID, "", "", at.AddDate(0, 0, -1))
+		seedS3Orphan(t, store, orgID, "orph-1", "hot", "", "", at.AddDate(0, 0, -1))
 		store.SetBlockHasReferencesGlobalErrForTest(livenessErr)
 		if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 			t.Fatal("the sweep must defer when its global verify fails, whatever the error was")
@@ -948,7 +948,7 @@ func TestX2_OrphanRecoveryCanonicalReadUnavailableMovesBlockedMark(t *testing.T)
 	resetDestructivePairForTest(destructivePathOrphan)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-unavailable", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-canonical-unavailable", "hot", "", "previous failure", now.AddDate(0, 0, -1))
 	store.SetGetS3OrphanGlobalErrForTest(fakeRequestError{
 		code: gocql.ErrCodeUnavailable,
 		msg:  "Cannot achieve consistency level EACH_QUORUM in DC dc-asia",
@@ -998,7 +998,7 @@ func TestX2_OrphanRecoveryCanonicalReadPermanentErrorIsNotAnOutage(t *testing.T)
 	_, baselineSuccess := destructivePairForTest(t, destructivePathOrphan)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-read-permanent", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-canonical-read-permanent", "hot", "", "previous failure", now.AddDate(0, 0, -1))
 	store.SetGetS3OrphanGlobalErrForTest(fakeRequestError{
 		code: gocql.ErrCodeReadFailure,
 		msg:  "Operation failed - received 0 responses and 1 failures: TOMBSTONE_OVERWHELMING",
@@ -1035,7 +1035,7 @@ func TestX2_OrphanRecoveryCanonicalReloadUnavailableMovesBlockedMark(t *testing.
 	resetDestructivePairForTest(destructivePathOrphan)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-reload-unavailable", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-reload-unavailable", "hot", "", "previous failure", now.AddDate(0, 0, -1))
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			return S3OrphanInfo{}, fakeRequestError{
@@ -1082,7 +1082,7 @@ func TestX2_OrphanRecoveryCanonicalReloadMissingIsDistinctFromInitialMissing(t *
 
 	orgID := uuid.New()
 	blockID := "orph-reload-missing"
-	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", now.AddDate(0, 0, -1))
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 1 {
 			// The first read has already returned a canonical row. Remove it before
@@ -1124,7 +1124,7 @@ func TestX2_OrphanRecoveryCanonicalReloadPermanentErrorIsNotAnOutage(t *testing.
 	resetDestructivePairForTest(destructivePathOrphan)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-reload-failed", "hot", db.PlainBlockRepresentationID, "", "previous failure", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-reload-failed", "hot", "", "previous failure", now.AddDate(0, 0, -1))
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			return S3OrphanInfo{}, errors.New("canonical row has an incompatible recovery schema")

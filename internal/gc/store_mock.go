@@ -1254,7 +1254,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, RepresentationID: block.RepresentationID, Sha1: block.Sha1}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -3807,7 +3807,7 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 	return info, true, nil
 }
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -3819,7 +3819,6 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 		existing.StorageClass = storageClass
-		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3829,21 +3828,20 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		return existing.FirstSeenAt, nil
 	}
 	orphan := &S3OrphanInfo{
-		OrgID:            orgID,
-		BlockID:          blockID,
-		StorageClass:     storageClass,
-		RepresentationID: strings.TrimSpace(representationID),
-		ExternalSHA1:     strings.TrimSpace(externalSHA1),
-		RecoveryPhase:    S3OrphanPhasePendingS3,
-		FirstSeenAt:      now.UTC(),
-		LastAttemptAt:    now,
+		OrgID:         orgID,
+		BlockID:       blockID,
+		StorageClass:  storageClass,
+		ExternalSHA1:  strings.TrimSpace(externalSHA1),
+		RecoveryPhase: S3OrphanPhasePendingS3,
+		FirstSeenAt:   now.UTC(),
+		LastAttemptAt: now,
 	}
 	m.s3Orphans[key] = orphan
 	m.upsertS3OrphanProjection(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
 	return orphan.FirstSeenAt, nil
 }
 
-func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
+func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.markS3OrphanErrOnce != nil {
@@ -3853,7 +3851,6 @@ func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, 
 	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
-		existing.RepresentationID = strings.TrimSpace(representationID)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingMappingCleanup
 		existing.LastAttemptAt = now

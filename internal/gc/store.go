@@ -188,7 +188,7 @@ type GCStore interface {
 	// deletion. It always resets recovery state to pending_s3 so a stale
 	// pending_mapping_cleanup row from an older delete cannot make recovery skip
 	// the physical object delete for this new lifecycle.
-	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error)
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error)
 	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
 	// destructive recovery path. It supplies recovery state and the physical
 	// backend selector; it is not a Paxos settlement read and does not authorize
@@ -203,7 +203,7 @@ type GCStore interface {
 	// delete has completed so restart recovery can finish the orphan lifecycle
 	// without touching S3 again. The phase name is historical: after R11a this
 	// transition performs no block-id mapping cleanup.
-	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error
+	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
@@ -379,10 +379,9 @@ type CommitInfo struct {
 
 // BlockInfo holds data about a block needed by the scanner.
 type BlockInfo struct {
-	BlockID          string
-	StorageClass     string
-	CreatedAt        *time.Time
-	RepresentationID string
+	BlockID      string
+	StorageClass string
+	CreatedAt    *time.Time
 	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), retained for
 	// orphan recovery metadata and legacy diagnostics. Empty for legacy/pre-PR2
 	// rows.
@@ -474,16 +473,15 @@ type S3OrphanDiscoveryInfo struct {
 // row is physically removed, so a crash between DB and S3 phases remains
 // recoverable after restart.
 type S3OrphanInfo struct {
-	OrgID            uuid.UUID
-	BlockID          string
-	StorageClass     string
-	RepresentationID string
-	ExternalSHA1     string
-	RecoveryPhase    string
-	FirstSeenAt      time.Time
-	LastAttemptAt    time.Time
-	RetryCount       int
-	LastError        string
+	OrgID         uuid.UUID
+	BlockID       string
+	StorageClass  string
+	ExternalSHA1  string
+	RecoveryPhase string
+	FirstSeenAt   time.Time
+	LastAttemptAt time.Time
+	RetryCount    int
+	LastError     string
 }
 
 const (

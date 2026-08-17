@@ -83,10 +83,10 @@ func TestStore_StartBlockDeleteOrphan_RepairsMissingProjectionAndPreservesFirstS
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	seedS3Orphan(t, store, orgID, "orph-repair", "hot", db.PlainBlockRepresentationID, "", "prev", firstSeenAt)
+	seedS3Orphan(t, store, orgID, "orph-repair", "hot", "", "prev", firstSeenAt)
 	store.DeleteS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, "orph-repair", "cold", db.PlainBlockRepresentationID, "", "", time.Now())
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, "orph-repair", "cold", "", "", time.Now())
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
@@ -119,10 +119,10 @@ func TestStore_StartBlockDeleteOrphan_ResetRaceDoesNotResurrectRow(t *testing.T)
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	seedS3Orphan(t, store, orgID, "orph-reset-race", "hot", db.PlainBlockRepresentationID, "sha1-old", "prev", firstSeenAt)
+	seedS3Orphan(t, store, orgID, "orph-reset-race", "hot", "sha1-old", "prev", firstSeenAt)
 	store.SetStartBlockDeleteOrphanResetRaceForTest(true)
 
-	if _, err := store.StartBlockDeleteOrphan(orgID, "orph-reset-race", "cold", db.PlainBlockRepresentationID, "sha1-new", time.Now().UTC()); err == nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, "orph-reset-race", "cold", "sha1-new", time.Now().UTC()); err == nil {
 		t.Fatal("StartBlockDeleteOrphan error = nil, want reset-race error")
 	}
 	if got := store.S3OrphanCount(); got != 0 {
@@ -142,12 +142,12 @@ func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testin
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	seedS3Orphan(t, store, orgID, "orph-reset", "cold", db.PlainBlockRepresentationID, "sha1-old", "prev", firstSeenAt)
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-reset", db.PlainBlockRepresentationID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+	seedS3Orphan(t, store, orgID, "orph-reset", "cold", "sha1-old", "prev", firstSeenAt)
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-reset", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("MarkS3OrphanMappingCleanupPending failed: %v", err)
 	}
 
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", db.PlainBlockRepresentationID, "sha1-new", time.Now().UTC())
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan failed: %v", err)
 	}

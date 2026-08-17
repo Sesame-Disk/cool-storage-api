@@ -238,6 +238,22 @@ func TestUpsertBlockMetadataRejectsEmptyStorageClassBeforeInsert(t *testing.T) {
 	}
 }
 
+func TestUpsertBlockMetadataRejectsEmptyRepresentationBeforeInsert(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
+	})
+	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("representation insert must not run with an empty representation id")
+		return false, nil
+	}
+
+	err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", "", "block-1", "", 1, "hot", "key")
+	if err == nil || !strings.Contains(err.Error(), "missing block representation id") {
+		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v, want missing representation error", err)
+	}
+}
+
 func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn

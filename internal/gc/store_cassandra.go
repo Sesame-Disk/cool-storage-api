@@ -1571,7 +1571,7 @@ func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID strin
 
 // GetS3OrphanGlobal reads the canonical recovery row at EACH_QUORUM. The
 // discovery projection is deliberately not consulted here: recovery uses this
-// row for phase, mapping identity, and backend selection. EACH_QUORUM provides
+// row for phase, external SHA-1 characterization, and backend selection. EACH_QUORUM provides
 // the same cross-DC visibility contract as the destructive liveness read, but
 // this ordinary SELECT is not a Paxos settlement and does not authorize a
 // physical delete by itself.
@@ -1579,13 +1579,12 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 	var info S3OrphanInfo
 	var firstSeenAt time.Time
 	err := s.db.Session().Query(`
-		SELECT storage_class, representation_id, external_sha1, recovery_phase,
+		SELECT storage_class, external_sha1, recovery_phase,
 		       first_seen_at, last_attempt_at, retry_count, last_error
 		FROM gc_s3_orphans
 		WHERE org_id = ? AND block_id = ?
 	`, orgID.String(), blockID).Consistency(gocql.EachQuorum).Scan(
 		&info.StorageClass,
-		&info.RepresentationID,
 		&info.ExternalSHA1,
 		&info.RecoveryPhase,
 		&firstSeenAt,
@@ -1601,7 +1600,6 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 	}
 	info.OrgID = orgID
 	info.BlockID = blockID
-	info.RepresentationID = strings.TrimSpace(info.RepresentationID)
 	info.ExternalSHA1 = strings.TrimSpace(info.ExternalSHA1)
 	info.RecoveryPhase = strings.TrimSpace(info.RecoveryPhase)
 	info.FirstSeenAt = firstSeenAt.UTC()
@@ -1611,14 +1609,13 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 // StartBlockDeleteOrphan records the durable recovery row for a NEW block
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
-func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, representationID, externalSHA1 string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
-	representationID = strings.TrimSpace(representationID)
 	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, representation_id, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
 	}
@@ -1635,10 +1632,10 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET storage_class = ?, representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveStorageClass, representationID, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1652,9 +1649,8 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 	return effectiveFirstSeenAt, nil
 }
 
-func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, representationID, externalSHA1 string, now time.Time) error {
+func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
 	externalSHA1 = strings.TrimSpace(externalSHA1)
-	representationID = strings.TrimSpace(representationID)
 	// IF EXISTS: a plain UPDATE is an upsert in Cassandra, so if a concurrent
 	// DeleteS3Orphan (multi-worker recovery race) already removed the row, an
 	// unconditional UPDATE would resurrect a partial phantom row (PK + these cols,
@@ -1662,10 +1658,10 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 	// applied=false means another worker finished the recovery — nothing to advance.
 	applied, err := s.db.Session().Query(`
 		UPDATE gc_s3_orphans
-		SET representation_id = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
+		SET external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF EXISTS
-	`, representationID, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
+	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("mark S3 orphan mapping cleanup pending org=%s block=%s: %w", orgID, blockID, err)
 	}
@@ -1673,9 +1669,7 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 		return nil
 	}
 	// Only first_seen_at is read back: it is the projection's clustering key, and
-	// since R22b the projection has nothing else to carry. Before R22b this also
-	// fetched storage_class and representation_id purely to refill projection
-	// payload columns that no reader consulted.
+	// since R22b the projection has nothing else to carry.
 	var firstSeenAt time.Time
 	err = s.db.Session().Query(`
 		SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
@@ -1732,9 +1726,9 @@ const gcS3OrphanTTLSeconds = 7776000
 //	coordinator-clock alignment remains a separate open requirement.
 //
 // Rewriting the identity columns to realign them was the other candidate and is
-// deliberately NOT what happens here: representation_id, external_sha1 and
-// recovery_phase all have other conditional writers (StartBlockDeleteOrphan's
-// reset and the pending_mapping_cleanup transition), so
+// deliberately NOT what happens here: external_sha1 and recovery_phase both
+// have other conditional writers (StartBlockDeleteOrphan's reset and the
+// pending_mapping_cleanup transition), so
 // echoing back values read a moment earlier would trade a TTL race for a
 // lost-update race — including a recovery_phase regression.
 //
@@ -2029,18 +2023,16 @@ func (s *CassandraStore) BlockReferenceExists(orgID uuid.UUID, blockID, referrer
 func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	info := BlockInfo{BlockID: blockID}
 	var createdAt *time.Time
-	var representationID string
 	var sha1 string
 	// Single-partition point read by the full ((org_id), block_id) key. sha1 is
 	// the same row, so reading it adds no extra query and no tombstone scan.
 	err := s.db.Session().Query(`
-		SELECT storage_class, created_at, representation_id, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &representationID, &sha1)
+		SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &sha1)
 	if err != nil {
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
-	info.RepresentationID = strings.TrimSpace(representationID)
 	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }

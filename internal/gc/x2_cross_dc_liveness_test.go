@@ -742,7 +742,7 @@ func TestX2_OrphanRecoveryRefusesAReferencedBlock(t *testing.T) {
 	w.clock = func() time.Time { return now }
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-referenced", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-referenced", "hot", "", "", now.AddDate(0, 0, -1))
 	// The canonical row is gone (that is why there is an orphan row at all), but a
 	// reference to the content exists somewhere in the fleet.
 	store.AddBlockReferenceForTest(orgID, "orph-referenced", "fs:lib:obj")
@@ -781,7 +781,7 @@ func TestX2_OrphanRecoveryFailsClosedOnAnUnavailableDatacenter(t *testing.T) {
 	w.clock = func() time.Time { return now }
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-dc-down", "hot", db.PlainBlockRepresentationID, "", "", now.AddDate(0, 0, -1))
+	seedS3Orphan(t, store, orgID, "orph-dc-down", "hot", "", "", now.AddDate(0, 0, -1))
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)

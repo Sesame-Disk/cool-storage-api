@@ -60,6 +60,10 @@ the representation-aware primary key. New library creation paths now persist
 representation metadata on surviving library/block rows; it does not preserve the
 old org-wide forward-mapping namespace.
 
+R11b-1 drops `gc_s3_orphans.representation_id` from the physical GC recovery
+row. The representation column remains authoritative on `blocks` and in the
+logical mapping domains; it is not a physical orphan lifecycle field.
+
 ## PR1 runtime scope
 
 PR1 updates the live runtime consumers that resolve or persist mappings. R11a later
@@ -68,10 +72,11 @@ decouples the logical mapping lifecycle from physical block GC:
 - upload materialization and verified web block mapping writes
 - batch SHA-1 resolution for file view, share-link view, sync, and seafhttp reads
 - direct sync/seafhttp single-block lookups
-- canonical block metadata writes so GC can persist the exact representation and
-  external identity in durable orphan recovery metadata
-- GC orphan recovery and physical block cleanup, keyed by `representation_id`; physical
-  GC does not delete the forward mapping
+- canonical block metadata writes so the block row persists the exact
+  representation and external identity
+- GC orphan recovery and physical block cleanup, which use the canonical storage
+  class and retain only the external SHA-1 characterization; physical GC does not
+  delete the forward mapping
 - cross-repo batch copy/move guard: same-representation allowed, different
   representation rejected before copying `fs_objects`
 
