@@ -16,12 +16,12 @@ mapping belongs to the logical block, while `processBlock` and
 uses `cleanupBlockMapping`, and `DeleteBlockMappingExact` was removed from the GC
 store interface and implementations.
 
-The `pending_mapping_cleanup` phase remains as a compatibility state for rows
-written by the previous implementation. Its name is historical: after R11a it
-means that the S3 delete completed and only orphan finalization remains. The
-phase still avoids a repeated S3 delete, but it performs no `BlockExists` read and
-no mapping delete. The existing topology gate, canonical `EACH_QUORUM` reads and
-commit-point reload remain in force.
+The `pending_mapping_cleanup` phase remains as a compatibility state and legacy
+name. Current code still writes it after a successful S3 delete so restart recovery
+can distinguish "S3 pending" from "S3 complete" without repeating the physical delete.
+After R11a it means that S3 deletion completed and only orphan finalization remains:
+the phase performs no `BlockExists` read and no mapping delete. The existing topology
+gate, canonical `EACH_QUORUM` reads and commit-point reload remain in force.
 
 Forward mappings may now remain as harmless dangling metadata after a logical
 block's physical incarnation is deleted. A SHA-1 lookup can resolve such a row

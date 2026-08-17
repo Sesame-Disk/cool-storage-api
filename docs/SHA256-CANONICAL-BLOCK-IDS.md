@@ -114,34 +114,39 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     on `WriteVerifiedWebBlockMapping` stayed in place through the SHA-256
     transition and the later representation-aware mapping work generalized the
     same fail-closed contract to `WriteBlockIDMapping` as well.
-- `PR7` — **merged to `main`**: drop the reverse mapping table
+- **Historical PR7 behavior (superseded by R11a)** — PR7 was **merged to `main`** and
+  dropped the reverse mapping table
   `block_id_mappings_by_internal`.
   - **Migration `006_drop_block_id_mappings_by_internal.cql`** (`DROP TABLE IF EXISTS`).
   - **Stopped the reverse dual-write** in `WriteBlockIDMapping` and `WriteVerifiedWebBlockMapping`
     (both are now single forward INSERTs); removed the now-dead `WriteBlockIDMappingDualWrite`.
-  - **GC cleanup sources the SHA-1 from `blocks.sha1`**: `GetBlockInfo` now also returns `sha1`
-    (same single-partition point read, no extra query); `cleanupBlockMapping(orgID, internalID,
-    externalSHA1)` deletes the single forward row by its `(org_id, external_id)` key. Removed
-    `ListBlockMappingsByInternalID` and `DeleteBlockMappingResolved`; `DeleteBlockMapping` is a
-    plain single-partition delete (no read-before-delete, no reverse cleanup).
-  - **Fail-safe**: when `blocks.sha1` is empty (legacy/pre-PR2 row, or the canonical row is already
-    gone), GC does NOT blind-delete a mapping — it records `gc_block_mapping_sha1_missing` and
-    leaves the forward row as a harmless dangling pointer (a desktop SHA-1 GET 404s; it self-heals
-    on re-upload).
+  - **Historical GC cleanup**: `GetBlockInfo` also returned `sha1` (same single-partition point
+    read, no extra query), and the former `cleanupBlockMapping` deleted the single forward row by
+    its `(org_id, external_id)` key. `ListBlockMappingsByInternalID` and
+    `DeleteBlockMappingResolved` were removed; `DeleteBlockMapping` was a plain single-partition
+    delete (no read-before-delete, no reverse cleanup). R11a removed this physical mapping-delete
+    authority entirely.
+  - **Historical fail-safe**: when `blocks.sha1` was empty (legacy/pre-PR2 row, or the canonical
+    row was already gone), the former GC path did NOT blind-delete a mapping — it recorded
+    `gc_block_mapping_sha1_missing` and left the forward row as a harmless dangling pointer (a
+    desktop SHA-1 GET 404s; it self-heals on re-upload). R11a now leaves mappings untouched in
+    all physical-GC cases, so these labels are no longer produced by the worker.
   - **Tests**: unit `TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable` (fail-safe);
     rewrote the GC mapping-cleanup unit/integration assertions to the forward-only model; added the
     encrypted-equivalent integration guard `TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete`
     (deletes a block whose external SHA-1 != internal block_id and now asserts the forward row
     survives physical GC under R11a). See the safety + performance section below.
-- `PR8` — **merged to `main`**: GC recovery hardening for the forward-only mapping-cleanup model.
-  - **Migration `007_gc_s3_orphan_mapping_recovery.cql`** extends `gc_s3_orphans` and
-    `gc_s3_orphans_by_day` with `external_sha1` and `recovery_phase`, so recovery can still clean the
-    forward SHA-1 mapping after the canonical `blocks` row is gone.
-  - **Resurrection-safe recovery** re-checks `BlockExists` before mapping cleanup, so a re-uploaded
-    live block does not lose its freshly re-created forward mapping.
-  - **Stale-phase reset on new delete** ensures a fresh block lifecycle cannot inherit an old
-    `pending_mapping_cleanup` phase and skip the physical S3 delete.
-  - **Tests** pin both behaviors: `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock`
+- `PR8` — **merged to `main`**: GC recovery hardening for the former forward-only
+  mapping-cleanup model. The mapping-cleanup portion below is historical and superseded
+  by R11a; the durable physical-orphan recovery and stale-phase reset remain active.
+  - **Historical mapping-cleanup design (superseded by R11a):** Migration
+    `007_gc_s3_orphan_mapping_recovery.cql` added `external_sha1` and `recovery_phase`
+    so recovery could clean the forward SHA-1 mapping after the canonical `blocks` row
+    was gone.
+  - **Active stale-phase reset on new delete** ensures a fresh block lifecycle cannot
+    inherit an old `pending_mapping_cleanup` phase and skip the physical S3 delete.
+  - **Tests** pin the current finalization and reset behavior:
+    `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock`
     and `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
 - `R11a` — physical GC no longer deletes the logical forward mapping. The mapping belongs
   to the SHA-1 -> SHA-256 relationship rather than to a physical block incarnation. The
@@ -458,29 +463,27 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
      Pinned by `TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup` and
      `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
 
-**No tombstone / hot-partition risk (Cassandra access pattern).** Both queries hit a full partition
-key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone accumulation to read
-through:
+**No tombstone / hot-partition risk (Cassandra access pattern).** The canonical block lookup hits a
+full partition key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone
+accumulation to read through:
 - `GetBlockInfo` reads `blocks` by `((org_id), block_id)` — a single-row point read; `sha1` is the
   same row, so it adds no query.
-- `DeleteBlockMapping` deletes `block_id_mappings` by `((org_id, external_id))` — a single-partition
-  delete with no read-before-delete.
 - The dropped table was the only one that required reading a clustering range
   (`block_id_mappings_by_internal WHERE org_id=? AND internal_id=?`); removing it removes that
-  pattern entirely. Critically, GC never queries `block_id_mappings WHERE internal_id=?` (that would
-  be `ALLOW FILTERING` over the whole table) — `blocks.sha1` makes the SHA-256 → SHA-1 lookup a keyed
-  single-row read.
+  pattern entirely. Physical GC now performs no forward-mapping query or delete. Critically, no
+  current path queries `block_id_mappings WHERE internal_id=?` (that would be `ALLOW FILTERING` over
+  the whole table); `blocks.sha1` remains useful for canonical identity and orphan recovery metadata,
+  not for a physical mapping delete.
 
 **Performance / cost wins.**
 - **Upload hot path: one fewer write per block.** `WriteBlockIDMapping` /
   `WriteVerifiedWebBlockMapping` drop the second INSERT (the reverse row), halving the mapping-write
   cost on every block upload (web + seafhttp/desktop). `WriteVerifiedWebBlockMapping` also no longer
   needs the no-op reverse rewrite on the already-mapped path.
-- **GC block delete: fewer round-trips and no LWT batch.** Per deleted block GC now does one keyed
-  point read (folded into the `GetBlockInfo` it already issues — **zero extra reads**) plus one
-  single-partition delete, instead of a clustering-range SELECT (`ListBlockMappingsByInternalID`)
-  followed by a per-alias `LoggedBatch` deleting two tables. No `LoggedBatch`, no reverse partition
-  writes.
+- **Physical GC: no logical-mapping round-trip.** R11a leaves the forward mapping in place, so a
+  deleted block performs no mapping read or delete. The former PR7 clustering-range SELECT
+  (`ListBlockMappingsByInternalID`) and per-alias `LoggedBatch` are gone; the existing canonical
+  `GetBlockInfo` point read remains available for physical-orphan identity metadata.
 - **Less storage + compaction.** One fewer table to store, replicate, repair, and compact; the
   upload path stops generating reverse-partition tombstones on GC.
 

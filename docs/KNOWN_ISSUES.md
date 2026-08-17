@@ -2060,6 +2060,16 @@ cannot revoke an S3 DELETE already in flight. Never-reused physical keys close o
 stale-delete component of X1: a stale delete can then target only the old key. Publication,
 claim ownership and recovery liveness must also be implemented and verified. Keep
 destructive GC disabled until the complete X1 criteria pass.
+
+R3 is part of this same blocker, not a separate issue: `check-blocks` is an advisory
+read and does not reserve a block or bind its result to a later publish. A client can
+skip it, or GC can remove a zero-reference block after the check and before
+`stageSyncCommitBlockDelta`. That stage resolves the retained SHA-1 mapping and writes
+`pub:` references without an atomic physical-existence/post-stage check, so a commit
+can publish an `fs_object` that points at already-missing bytes. The race matrix tracks
+this as R3; closing it requires the publication-fence/post-stage validation that is
+already part of the X1 closure work.
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
 and the A+ safety-baseline recommendation in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).

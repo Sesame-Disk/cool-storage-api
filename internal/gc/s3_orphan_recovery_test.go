@@ -636,6 +636,9 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBl
 		t.Fatalf("RecoverS3Orphans: %v", err)
 	}
 
+	if store.GetBlock(orgID, "blk-resurrected") == nil {
+		t.Fatal("resurrected canonical block row was removed during post-S3 finalization")
+	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-resurrected") {
 		t.Fatal("forward mapping of a resurrected block must NOT be deleted by recovery")
 	}
