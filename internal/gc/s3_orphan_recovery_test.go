@@ -369,7 +369,7 @@ func TestWorker_RecoverS3Orphans_BackfilledSHA1ChangeBeforeCommitFailsClosed(t *
 	orgID := uuid.New()
 	blockID := "orph-logical-identity-reload"
 	backfilledSHA1 := strings.Repeat("2", 40)
-	seedS3Orphan(t, store, orgID, blockID, "hot", "", "", "", time.Now())
+	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "", time.Now())
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			// Keep first_seen_at, storage_class, recovery_phase and representation_id
