@@ -1365,7 +1365,7 @@ func TestUploadLink_ReuploadBlockedByS3OrphanFence(t *testing.T) {
 		t.Fatalf("parse orgID %q: %v", orgID, err)
 	}
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgUUID, blockID, "hot", db.PlainBlockRepresentationID, "", "seed orphan fence", firstSeenAt)
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgUUID, blockID, "hot", "", "seed orphan fence", firstSeenAt)
 	t.Cleanup(func() {
 		if err := store.DeleteS3Orphan(orgUUID, blockID, effectiveFirstSeenAt); err != nil {
 			t.Errorf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
@@ -2089,7 +2089,7 @@ func TestGC_StartBlockDeleteOrphan_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	blockID := fmt.Sprintf("orph-repair-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "seed", firstSeenAt)
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "", "seed", firstSeenAt)
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
@@ -2108,7 +2108,7 @@ func TestGC_StartBlockDeleteOrphan_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 		t.Fatal("expected S3 orphan projection row to be deleted before repair")
 	}
 
-	repairedFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", db.PlainBlockRepresentationID, "", "", time.Now().UTC())
+	repairedFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", "", "", time.Now().UTC())
 	if !repairedFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("repaired first_seen_at = %v, want original %v", repairedFirstSeenAt, firstSeenAt)
 	}
@@ -2126,7 +2126,7 @@ func TestGC_DeleteS3Orphan_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
 	blockID := fmt.Sprintf("orph-cleanup-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "seed", firstSeenAt)
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "", "seed", firstSeenAt)
 	if !gcS3OrphanProjectionExists(t, orgID.String(), blockID, firstSeenAt) {
 		t.Fatal("expected gc_s3_orphans_by_day projection row to exist")
 	}
@@ -2151,11 +2151,11 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	blockID := fmt.Sprintf("orph-reset-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", db.PlainBlockRepresentationID, "sha1-old", "seed", firstSeenAt)
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", "sha1-old", "seed", firstSeenAt)
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("MarkS3OrphanMappingCleanupPending: %v", err)
 	}
 	t.Cleanup(func() {
@@ -2164,7 +2164,7 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		}
 	})
 
-	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", db.PlainBlockRepresentationID, "sha1-new", time.Now().UTC())
+	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}

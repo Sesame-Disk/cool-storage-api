@@ -233,6 +233,20 @@ func TestMigration005AddsSHA256CanonicalBlockIDColumns(t *testing.T) {
 	assert.Contains(t, content, "ALTER TABLE blocks ADD sha1 TEXT;")
 }
 
+func TestMigration015DropsOnlyGCOrphanRepresentationID(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/015_gc_s3_orphans_without_representation_id.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	statements := parseCQLStatements(content)
+	require.Len(t, statements, 1)
+	assert.Contains(t, statements[0], "ALTER TABLE gc_s3_orphans")
+	assert.Contains(t, statements[0], "DROP IF EXISTS representation_id")
+	statement := strings.Join(statements, " ")
+	assert.NotContains(t, statement, "external_sha1")
+	assert.NotContains(t, statement, "blocks")
+}
+
 func TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission(t *testing.T) {
 	raw, err := migrationsFS.ReadFile("migrations/008_block_upload_staging_caps.cql")
 	require.NoError(t, err)

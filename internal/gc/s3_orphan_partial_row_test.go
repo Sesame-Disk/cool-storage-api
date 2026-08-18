@@ -222,7 +222,7 @@ func TestMockUpdateS3OrphanAttemptGuardsTokenAndExpiry(t *testing.T) {
 			store := NewMockStore()
 			orgID := uuid.New()
 			const blockID = "mock-guarded-orphan"
-			if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "plain", "", firstSeen); err != nil {
+			if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "", firstSeen); err != nil {
 				t.Fatalf("StartBlockDeleteOrphan: %v", err)
 			}
 

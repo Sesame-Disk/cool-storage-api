@@ -19,7 +19,7 @@ func TestGC_R22aCanonicalReadAndDiscoveryIdentity(t *testing.T) {
 	orgID := uuid.New()
 	blockID := "r22a-canonical-" + uuid.NewString()
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "sha1-canonical", "seed", firstSeenAt)
+	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-canonical", "seed", firstSeenAt)
 	t.Cleanup(func() {
 		if err := store.DeleteS3Orphan(orgID, blockID, effectiveFirstSeenAt); err != nil {
 			t.Errorf("cleanup DeleteS3Orphan: %v", err)
@@ -42,7 +42,7 @@ func TestGC_R22aCanonicalReadAndDiscoveryIdentity(t *testing.T) {
 	if !found {
 		t.Fatal("canonical orphan not found")
 	}
-	if canonical.StorageClass != "hot" || canonical.RepresentationID != db.PlainBlockRepresentationID || canonical.ExternalSHA1 != "sha1-canonical" {
+	if canonical.StorageClass != "hot" || canonical.ExternalSHA1 != "sha1-canonical" {
 		t.Fatalf("canonical orphan state changed unexpectedly: %+v", canonical)
 	}
 

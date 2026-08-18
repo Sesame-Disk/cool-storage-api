@@ -130,7 +130,7 @@ func TestWorker_ProcessBlock_UsesExistingOrphanFirstSeenAtForCleanup(t *testing.
 	orgID := uuid.New()
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddBlock(orgID, "block-orphan-cleanup", "hot", 0)
-	seedS3Orphan(t, store, orgID, "block-orphan-cleanup", "hot", db.PlainBlockRepresentationID, "", "previous failure", firstSeenAt)
+	seedS3Orphan(t, store, orgID, "block-orphan-cleanup", "hot", "", "previous failure", firstSeenAt)
 	if err := store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-orphan-cleanup", uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 
 	orgID := uuid.New()
 	// Seed an orphan directly.
-	seedS3Orphan(t, store, orgID, "orph-1", " hot ", db.PlainBlockRepresentationID, "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-1", " hot ", "", "earlier failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -194,7 +194,7 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassForPhysicalDelete(t *t
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", "", "previous failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -217,9 +217,9 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalPhaseForOrphanFinalization(t *test
 	orgID := uuid.New()
 	blockID := "orph-canonical-phase"
 	canonicalSHA1 := "sha1-canonical"
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "previous failure", time.Now())
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", canonicalSHA1, "previous failure", time.Now())
 	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
 		t.Fatalf("advance canonical orphan phase: %v", err)
 	}
 
@@ -245,7 +245,7 @@ func TestWorker_RecoverS3Orphans_CanonicalMissingRetainsDiscoveryAndCursor(t *te
 
 	orgID := uuid.New()
 	blockID := "orph-canonical-missing"
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", time.Now())
 	store.DeleteS3OrphanCanonicalForTest(orgID, blockID)
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -277,7 +277,7 @@ func TestWorker_RecoverS3Orphans_DiscoveryTokenMismatchFailsClosed(t *testing.T)
 
 	orgID := uuid.New()
 	blockID := "orph-discovery-token-mismatch"
-	canonicalFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	canonicalFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", time.Now())
 	store.DeleteS3OrphanProjectionForTest(orgID, blockID, canonicalFirstSeenAt)
 	staleFirstSeenAt := canonicalFirstSeenAt.Add(-time.Hour)
 	store.AddS3OrphanProjectionForTest(S3OrphanDiscoveryInfo{
@@ -307,7 +307,7 @@ func TestWorker_RecoverS3Orphans_CanonicalReadErrorFailsClosed(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-read-error", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-canonical-read-error", "hot", "", "previous failure", time.Now())
 	store.SetGetS3OrphanGlobalErrForTest(errors.New("EACH_QUORUM unavailable"))
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -331,7 +331,7 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-reload", "hot", db.PlainBlockRepresentationID, "", "previous failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-canonical-reload", "hot", "", "previous failure", time.Now())
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
 			info.StorageClass = "cold"
@@ -358,9 +358,9 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 // removed the external SHA-1 field. StartBlockDeleteOrphan preserves
 // first_seen_at when it resets an existing row, so phase and storage class can
 // remain unchanged while a later metadata repair fills a previously empty SHA-1.
-// This test does not establish a physical lifecycle change. representation_id is
-// intentionally not mutated here because production inserts validate and persist
-// it; its empty-value repair is an imported/legacy-row path.
+// This test does not establish a physical lifecycle change. The physical orphan
+// state no longer carries representation_id; the block writer invariant remains
+// a separate global metadata contract.
 func TestWorker_RecoverS3Orphans_BackfilledSHA1ChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -369,11 +369,11 @@ func TestWorker_RecoverS3Orphans_BackfilledSHA1ChangeBeforeCommitFailsClosed(t *
 	orgID := uuid.New()
 	blockID := "orph-logical-identity-reload"
 	backfilledSHA1 := strings.Repeat("2", 40)
-	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "", time.Now())
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "", time.Now())
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
 		if call == 2 {
-			// Keep first_seen_at, storage_class, recovery_phase and representation_id
-			// identical. Only the SHA-1 is backfilled while canonical recovery state
+			// Keep first_seen_at, storage_class and recovery_phase identical. Only the
+			// SHA-1 is backfilled while canonical recovery state
 			// remains otherwise unchanged.
 			info.ExternalSHA1 = backfilledSHA1
 		}
@@ -414,8 +414,8 @@ func TestWorker_RecoverS3Orphans_MappingCleanupCanonicalStateChangeBeforeCommitF
 	// No AddBlock: the canonical block row is gone, so the resurrection guard
 	// falls through to the mapping-cleanup commit point.
 	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "", time.Now())
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", canonicalSHA1, "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
 		t.Fatalf("advance canonical orphan phase: %v", err)
 	}
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
@@ -455,8 +455,8 @@ func TestWorker_RecoverS3Orphans_ResurrectedDiscardCanonicalStateChangeBeforeCom
 	// whose irreversible action is DeleteS3Orphan rather than a mapping delete.
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.AddBlockMapping(orgID, canonicalSHA1, blockID)
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, canonicalSHA1, "", time.Now())
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", canonicalSHA1, "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, canonicalSHA1, firstSeenAt.Add(time.Second)); err != nil {
 		t.Fatalf("advance canonical orphan phase: %v", err)
 	}
 	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
@@ -493,7 +493,7 @@ func TestWorker_RecoverS3Orphans_EmptyStorageClassFailsClosed(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-empty-class", "", db.PlainBlockRepresentationID, "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-empty-class", "", "", "earlier failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -521,7 +521,7 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 	orgA := uuid.New()
 	orgB := uuid.New()
 	for _, orgID := range []uuid.UUID{orgA, orgB} {
-		seedS3Orphan(t, store, orgID, "shared-hash", "hot", db.PlainBlockRepresentationID, "", "earlier failure", time.Now())
+		seedS3Orphan(t, store, orgID, "shared-hash", "hot", "", "earlier failure", time.Now())
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -557,7 +557,7 @@ func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlockMapping(orgID, "sha1-recover", "orph-map")
-	seedS3Orphan(t, store, orgID, "orph-map", "hot", db.PlainBlockRepresentationID, "sha1-recover", "prev", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-map", "hot", "sha1-recover", "prev", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -587,8 +587,8 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 
 	orgID := uuid.New()
 	store.AddBlockMapping(orgID, "sha1-pending-cleanup", "orph-cleanup")
-	firstSeenAt := seedS3Orphan(t, store, orgID, "orph-cleanup", "hot", db.PlainBlockRepresentationID, "sha1-pending-cleanup", "", time.Now())
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-cleanup", db.PlainBlockRepresentationID, "sha1-pending-cleanup", firstSeenAt.Add(5*time.Second)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, "orph-cleanup", "hot", "sha1-pending-cleanup", "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-cleanup", "sha1-pending-cleanup", firstSeenAt.Add(5*time.Second)); err != nil {
 		t.Fatalf("advance orphan phase: %v", err)
 	}
 
@@ -620,15 +620,15 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	orgID := uuid.New()
 	store.AddBlock(orgID, "blk-redelete", "hot", 0)
 	store.AddBlockMapping(orgID, "sha1-new", "blk-redelete")
-	firstSeenAt := seedS3Orphan(t, store, orgID, "blk-redelete", "hot", db.PlainBlockRepresentationID, "sha1-old", "prev", time.Now().Add(-time.Hour))
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-redelete", db.PlainBlockRepresentationID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, "blk-redelete", "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-redelete", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("advance stale orphan phase: %v", err)
 	}
 	applied, err := store.ClaimBlockDelete(orgID, "blk-redelete", "claim-1")
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", db.PlainBlockRepresentationID, "sha1-new", time.Now().UTC()); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	if err := store.FinalizeBlockDelete(orgID, "blk-redelete", "claim-1"); err != nil {
@@ -672,8 +672,8 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBl
 	store.AddBlock(orgID, "blk-resurrected", "hot", 0)
 	store.AddBlockMapping(orgID, "sha1-resurrected", "blk-resurrected")
 	// Stale recovery row stuck at pending_mapping_cleanup from the earlier delete.
-	firstSeenAt := seedS3Orphan(t, store, orgID, "blk-resurrected", "hot", db.PlainBlockRepresentationID, "sha1-resurrected", "", time.Now())
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-resurrected", db.PlainBlockRepresentationID, "sha1-resurrected", firstSeenAt.Add(5*time.Second)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, "blk-resurrected", "hot", "sha1-resurrected", "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-resurrected", "sha1-resurrected", firstSeenAt.Add(5*time.Second)); err != nil {
 		t.Fatalf("advance orphan phase: %v", err)
 	}
 
@@ -710,8 +710,8 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupPreservesSiblingRepresenta
 
 	store.AddBlockMappingForRepresentation(orgID, db.PlainBlockRepresentationID, externalSHA1, plainBlockID)
 	store.AddBlockMappingForRepresentation(orgID, encRep, externalSHA1, encBlockID)
-	firstSeenAt := seedS3Orphan(t, store, orgID, encBlockID, "hot", encRep, externalSHA1, "", time.Now())
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, encBlockID, encRep, externalSHA1, firstSeenAt.Add(5*time.Second)); err != nil {
+	firstSeenAt := seedS3Orphan(t, store, orgID, encBlockID, "hot", externalSHA1, "", time.Now())
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, encBlockID, externalSHA1, firstSeenAt.Add(5*time.Second)); err != nil {
 		t.Fatalf("advance orphan phase: %v", err)
 	}
 
@@ -744,9 +744,9 @@ func TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists(t *
 	orgID := uuid.New()
 	blockID := "orph-post-s3-no-block-read"
 	sha1 := "sha1-post-s3-no-block-read"
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, sha1, "", time.Now())
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", sha1, "", time.Now())
 	store.AddBlockMapping(orgID, sha1, blockID)
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, db.PlainBlockRepresentationID, sha1, firstSeenAt.Add(time.Second)); err != nil {
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, sha1, firstSeenAt.Add(time.Second)); err != nil {
 		t.Fatalf("advance orphan phase: %v", err)
 	}
 	store.SetBlockExistsErrForTest(errors.New("BlockExists must not be called for post-S3 finalization"))
@@ -775,7 +775,7 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	blockID := "orph-post-s3-clear-retry"
 	sha1 := "sha1-post-s3-clear-retry"
 	store.AddBlockMapping(orgID, sha1, blockID)
-	seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, sha1, "", time.Now())
+	seedS3Orphan(t, store, orgID, blockID, "hot", sha1, "", time.Now())
 	store.SetDeleteS3OrphanErrOnceForTest(errors.New("simulated crash before orphan clear"))
 
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
@@ -816,7 +816,7 @@ func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *
 
 	orgID := uuid.New()
 	blockID := "orph-phase-advance-window"
-	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "sha1-phase-window", "", time.Now())
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-phase-window", "", time.Now())
 	store.SetMarkS3OrphanMappingCleanupPendingErrOnceForTest(errors.New("simulated phase advance failure"))
 
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
@@ -856,8 +856,8 @@ func TestWorker_RecoverS3Orphans_PartialFailure(t *testing.T) {
 
 	orgID := uuid.New()
 	now := time.Now()
-	seedS3Orphan(t, store, orgID, "orph-A", "hot", db.PlainBlockRepresentationID, "", "prev", now)
-	seedS3Orphan(t, store, orgID, "orph-B", "hot", db.PlainBlockRepresentationID, "", "prev", now)
+	seedS3Orphan(t, store, orgID, "orph-A", "hot", "", "prev", now)
+	seedS3Orphan(t, store, orgID, "orph-B", "hot", "", "prev", now)
 
 	// Fail one call during this recovery attempt. Since iteration order over a
 	// map is random, assert on totals rather than which block survives.
@@ -894,7 +894,7 @@ func TestWorker_RecoverS3Orphans_DryRun(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, true, stats) // dryRun=true
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-dr", "hot", db.PlainBlockRepresentationID, "", "prev", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-dr", "hot", "", "prev", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -925,7 +925,7 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}
-	seedS3Orphan(t, store, orgID, "orph-claimed", "hot", db.PlainBlockRepresentationID, "", "", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-claimed", "hot", "", "", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -960,7 +960,7 @@ func TestWorker_RecoverS3Orphans_ColdStartSeesOldRows(t *testing.T) {
 
 	orgID := uuid.New()
 	firstSeenAt := now.AddDate(0, 0, -30)
-	seedS3Orphan(t, store, orgID, "orph-old", "hot", db.PlainBlockRepresentationID, "", "old failure", firstSeenAt)
+	seedS3Orphan(t, store, orgID, "orph-old", "hot", "", "old failure", firstSeenAt)
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -999,7 +999,7 @@ func TestWorker_RecoverS3Orphans_PartitionLimitKeepsCursorUnchanged(t *testing.T
 		if db.GCDiscoveryBucket(orgID.String(), blockID) != targetBucket {
 			continue
 		}
-		seedS3Orphan(t, store, orgID, blockID, "hot", db.PlainBlockRepresentationID, "", "prev", now.AddDate(0, 0, -30))
+		seedS3Orphan(t, store, orgID, blockID, "hot", "", "prev", now.AddDate(0, 0, -30))
 		seeded++
 	}
 
@@ -1050,7 +1050,7 @@ func TestWorker_RecoverS3Orphans_RefCountLookupErrorKeepsCursorUnchanged(t *test
 	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
 	w.clock = func() time.Time { return now }
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-refcount-error", "hot", db.PlainBlockRepresentationID, "", "prev", now.AddDate(0, 0, -10))
+	seedS3Orphan(t, store, orgID, "orph-refcount-error", "hot", "", "prev", now.AddDate(0, 0, -10))
 	store.getBlockRefCountErr = fmt.Errorf("temporary cassandra failure")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -1102,7 +1102,7 @@ func TestScanner_S3OrphanRecoveryPhase_CallsRecoverer(t *testing.T) {
 	s.SetOrphanRecoverer(w)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-phase", "hot", db.PlainBlockRepresentationID, "", "prev", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-phase", "hot", "", "prev", time.Now())
 
 	n, err := s.scanS3OrphanRecovery(context.Background())
 	if err != nil {

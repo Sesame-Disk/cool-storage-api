@@ -1191,7 +1191,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
 	}
 
-	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.RepresentationID, blockInfo.Sha1, w.clock().UTC())
+	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, w.clock().UTC())
 	if err != nil {
 		return w.failClosedIfUnavailable("failed to record pending S3 delete", item.ItemID, err)
 	}
@@ -1222,7 +1222,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
 			// Continue to post-delete cleanup so the queue item completes.
-		} else if err := w.store.MarkS3OrphanMappingCleanupPending(item.OrgID, item.ItemID, blockInfo.RepresentationID, blockInfo.Sha1, w.clock()); err != nil {
+		} else if err := w.store.MarkS3OrphanMappingCleanupPending(item.OrgID, item.ItemID, blockInfo.Sha1, w.clock()); err != nil {
 			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to advance recovery row: %v", item.ItemID, err)
 			clearRecoveryRow = true
 		} else {
@@ -1591,7 +1591,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := w.store.MarkS3OrphanMappingCleanupPending(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.RepresentationID, canonicalCommit.ExternalSHA1, w.clock()); err != nil {
+				if err := w.store.MarkS3OrphanMappingCleanupPending(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.ExternalSHA1, w.clock()); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to advance %s to mapping cleanup: %v", canonicalCommit.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("advance recovered block %s to mapping cleanup: %w", canonicalCommit.BlockID, err)
@@ -1654,7 +1654,6 @@ func s3OrphanRecoveryStateEqual(left, right S3OrphanInfo) bool {
 		left.BlockID == right.BlockID &&
 		normalizeS3OrphanRecoveryTime(left.FirstSeenAt).Equal(normalizeS3OrphanRecoveryTime(right.FirstSeenAt)) &&
 		strings.TrimSpace(left.StorageClass) == strings.TrimSpace(right.StorageClass) &&
-		strings.TrimSpace(left.RepresentationID) == strings.TrimSpace(right.RepresentationID) &&
 		strings.TrimSpace(left.ExternalSHA1) == strings.TrimSpace(right.ExternalSHA1) &&
 		strings.TrimSpace(left.RecoveryPhase) == strings.TrimSpace(right.RecoveryPhase)
 }
