@@ -97,8 +97,11 @@ func PrepareUploadedBlockProbe(database *db.DB, orgID, blockID string, probe db.
 // object (blocks/<org_id>/...). The fallback store must already be org-scoped by
 // the caller.
 func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass, orgID string) (*storage.BlockStore, error) {
-	if canonicalClass == "" {
-		return nil, errors.New("canonical storage class is empty")
+	if !config.IsCanonicalStorageClassName(canonicalClass) {
+		if canonicalClass == "" {
+			return nil, errors.New("canonical storage class is empty")
+		}
+		return nil, fmt.Errorf("canonical storage class %q is not canonical", canonicalClass)
 	}
 	if storageManager != nil {
 		return storageManager.GetBlockStoreForOrg(orgID, canonicalClass)

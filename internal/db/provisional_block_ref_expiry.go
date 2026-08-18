@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -80,6 +81,9 @@ func addProvisionalBlockRefExpiryQueries(batch *gocql.Batch, orgID, blockID, ref
 // A zero/past expiresAt is rejected rather than silently written: an untracked
 // provisional reference is exactly the leak this function exists to prevent.
 func (db *DB) AddProvisionalBlockReferenceWithExpiry(orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
+	if !config.IsCanonicalStorageClassName(storageClass) {
+		return fmt.Errorf("%w: non-canonical storage class %q for provisional block reference", ErrBlockMetadataPermanent, storageClass)
+	}
 	if db == nil {
 		return fmt.Errorf("add provisional block reference for org=%s block=%s referrer=%s: no database", orgID, blockID, referrer)
 	}

@@ -679,6 +679,20 @@ func TestCanonicalBlockReaderExactClassAndBackendErrorsFailClosed(t *testing.T) 
 	}
 }
 
+func TestCanonicalBlockReaderRejectsNonCanonicalFallbackIdentity(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	blockID := canonicalReaderTestID(750)
+	store := canonicalReaderTestStore(t)
+	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+		return db.BlockStorageLocation{StorageClass: "CANONICAL", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+	}
+
+	reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{blockID}, store, "CANONICAL")
+	if reader != nil || err == nil || !strings.Contains(err.Error(), "not canonical") {
+		t.Fatalf("non-canonical fallback identity = (%v, %v), want rejection", reader, err)
+	}
+}
+
 func TestCanonicalBlockReaderExistenceBackendErrorFailsClosed(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	blockID := canonicalReaderTestID(800)

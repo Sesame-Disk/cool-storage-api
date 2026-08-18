@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"golang.org/x/sync/errgroup"
@@ -215,6 +216,9 @@ dispatchLocations:
 			storageClass := metadata.StorageClass
 			if storageClass == "" {
 				return fmt.Errorf("canonical storage class is empty for block %s", blockID)
+			}
+			if !config.IsCanonicalStorageClassName(storageClass) {
+				return fmt.Errorf("canonical storage class %q for block %s is not canonical", storageClass, blockID)
 			}
 
 			var store *storage.BlockStore

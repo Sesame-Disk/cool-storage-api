@@ -20,14 +20,16 @@ Change-storage-class, library-creation defaults and bootstrap admission use the
 same raw canonical-name rule as configuration and physical resolution, and the
 bootstrap picker no longer offers a class the manager cannot register. Runtime
 backend failover now detects cycles and returns an error instead of recursing
-forever when every member is unhealthy. The legacy `hot` name remains reserved;
-rejecting a class/backend collision prevents a failed modern initialization from
-rebinding that name.
+forever when every member is unhealthy. The modern-class and legacy-backend
+namespaces may not share a name; rejecting that collision prevents a failed
+modern initialization from rebinding the same identity to a different backend.
 
 The canonical rule also holds at the persistence boundary:
 `UpsertBlockMetadataWithRepresentationAndSHA1` refuses a non-canonical
 `storage_class` as a permanent error, and the reuse probe refuses one it reads
-back.
+back. The provisional-reference tracker and discovery projection now reject an
+empty or non-canonical class before their batch is built, and that permanent
+identity error is not misclassified as retryable.
 
 **Every layer decides on the RAW value.** An audit pass found three places that
 still normalized first, which is how a name certifies at one layer and fails at

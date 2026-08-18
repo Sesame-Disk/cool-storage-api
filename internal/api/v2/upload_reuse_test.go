@@ -763,6 +763,23 @@ func TestResolveCanonicalBlockStoreRejectsInexactFallbackClass(t *testing.T) {
 	}
 }
 
+func TestResolveCanonicalBlockStoreRejectsNonCanonicalFallbackIdentity(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	fallback, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, class := range []string{"CANONICAL", " canonical", "canonical ", "canonical_v1"} {
+		t.Run(fmt.Sprintf("class_%q", class), func(t *testing.T) {
+			got, err := ResolveCanonicalBlockStore(nil, fallback, class, class, orgID)
+			if got != nil || err == nil {
+				t.Fatalf("ResolveCanonicalBlockStore() = (%p, %v), want non-canonical identity rejection", got, err)
+			}
+		})
+	}
+}
+
 func TestResolveNeedsPutBlockStoreUsesPreferredPlacementForFirstWriter(t *testing.T) {
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)

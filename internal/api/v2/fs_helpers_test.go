@@ -296,6 +296,31 @@ func TestRegisterUploadedBlock_ReturnsPermanentMetadataFailureUntagged(t *testin
 	}
 }
 
+func TestRegisterUploadedBlockReturnsPermanentProvisionalStorageClassFailureUntagged(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+	})
+
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+		return fmt.Errorf("provisional identity: %w", db.ErrBlockMetadataPermanent)
+	}
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		t.Fatal("fence check must not run after a permanent provisional-identity failure")
+		return false, nil
+	}
+
+	err := (&FSHelper{}).RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 1, "hot", "key", "")
+	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
+		t.Fatalf("error = %v, want db.ErrBlockMetadataPermanent", err)
+	}
+	if errors.Is(err, ErrBlockMaterializationTransient) || IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("permanent provisional failure must not be retryable: %v", err)
+	}
+}
+
 // TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence proves
 // that a benign lost stub-repair race inside the metadata upsert (the backstop for
 // the unprobed web-session funnel) surfaces as the retryable ErrBlockDeleteInProgress
