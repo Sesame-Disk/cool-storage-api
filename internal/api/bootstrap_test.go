@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -465,6 +466,28 @@ func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *t
 
 	if got := s.resolveBootstrapDefaultStorageClass("unknown.example.com"); got != "hot-alpha" {
 		t.Fatalf("resolveBootstrapDefaultStorageClass = %q, want %q", got, "hot-alpha")
+	}
+}
+
+func TestBuildBootstrapStorageOptionsUsesRegisteredBackends(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "hot-broken"
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-broken": {Bucket: "broken"},
+		"hot-good":   {Bucket: "good"},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+	s.storageManager = storage.NewManager()
+	s.storageManager.RegisterBackend("hot-good", &storage.S3Store{}, "")
+
+	options := s.buildBootstrapStorageOptions("unknown.example.com")
+	for _, option := range options {
+		if option["id"] == "hot-broken" {
+			t.Fatalf("bootstrap advertised an unregistered storage class: %v", options)
+		}
+	}
+	if len(options) != 1 || options[0]["id"] != "hot-good" {
+		t.Fatalf("bootstrap options = %v, want only hot-good", options)
 	}
 }
 

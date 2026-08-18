@@ -351,7 +351,10 @@ func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+		preferredClass, err := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+		if err != nil {
+			return nil, libraryClass, err
+		}
 		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 

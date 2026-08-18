@@ -1784,7 +1784,10 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 func (h *SeafHTTPHandler) resolveLibraryBlockStoreContext(ctx context.Context, hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClassContext(ctx, orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
+		preferredClass, err := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
+		if err != nil {
+			return nil, libraryClass, err
+		}
 		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 	// Fallback: org-scoped store from the raw S3 store; never the org-less singleton.

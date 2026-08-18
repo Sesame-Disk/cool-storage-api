@@ -133,6 +133,7 @@ func TestManagerResolveStorageClass(t *testing.T) {
 		libraryClass string
 		tier         string
 		want         string
+		wantErr      bool
 	}{
 		{
 			name:     "USA endpoint hot",
@@ -172,11 +173,12 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			want:         "hot-s3-eu",
 		},
 		{
-			name:         "Invalid library falls back",
+			name:         "Invalid library returns an error",
 			hostname:     "us.sesamefs.com",
 			libraryClass: "nonexistent",
 			tier:         "hot",
-			want:         "hot-s3-usa",
+			want:         "",
+			wantErr:      true,
 		},
 		{
 			name:     "localhost",
@@ -188,7 +190,16 @@ func TestManagerResolveStorageClass(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := m.ResolveStorageClass(tt.hostname, tt.libraryClass, tt.tier)
+			got, err := m.ResolveStorageClass(tt.hostname, tt.libraryClass, tt.tier)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("ResolveStorageClass accepted an unregistered explicit library class")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveStorageClass returned error: %v", err)
+			}
 			if got != tt.want {
 				t.Errorf("ResolveStorageClass(%s, %s, %s) = %s, want %s",
 					tt.hostname, tt.libraryClass, tt.tier, got, tt.want)
@@ -202,7 +213,10 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			"*": "usa",
 		})
 		m.SetLocalRegion("eu")
-		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		got, err := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if err != nil {
+			t.Fatalf("ResolveStorageClass returned error: %v", err)
+		}
 		if got != "hot-s3-eu" {
 			t.Fatalf("ResolveStorageClass local fallback = %q, want %q", got, "hot-s3-eu")
 		}
@@ -214,7 +228,10 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			"*.sesamefs.com": "usa",
 			"*":              "usa",
 		})
-		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		got, err := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if err != nil {
+			t.Fatalf("ResolveStorageClass returned error: %v", err)
+		}
 		if got != "hot-s3-usa" {
 			t.Fatalf("ResolveStorageClass wildcard override = %q, want %q", got, "hot-s3-usa")
 		}
@@ -226,7 +243,10 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			" *.sesamefs.com ": "usa",
 			"*":                "eu",
 		})
-		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		got, err := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if err != nil {
+			t.Fatalf("ResolveStorageClass returned error: %v", err)
+		}
 		if got != "hot-s3-usa" {
 			t.Fatalf("ResolveStorageClass spaced wildcard = %q, want %q", got, "hot-s3-usa")
 		}
@@ -238,7 +258,10 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			"us.sesamefs.com": "usa",
 			"*":               "usa",
 		})
-		got := m.ResolveStorageClass("us.sesamefs.com", "", "hot")
+		got, err := m.ResolveStorageClass("us.sesamefs.com", "", "hot")
+		if err != nil {
+			t.Fatalf("ResolveStorageClass returned error: %v", err)
+		}
 		if got != "hot-s3-usa" {
 			t.Fatalf("ResolveStorageClass exact override = %q, want %q", got, "hot-s3-usa")
 		}

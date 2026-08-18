@@ -296,6 +296,10 @@ func (s *Server) isBootstrapKnownStorageClass(storageClass string) bool {
 	if s == nil || s.config == nil || !config.IsCanonicalStorageClassName(storageClass) {
 		return false
 	}
+	if s.storageManager != nil {
+		_, registered := s.storageManager.GetBackend(storageClass)
+		return registered
+	}
 	return s.config.IsConfiguredStorageClass(storageClass)
 }
 

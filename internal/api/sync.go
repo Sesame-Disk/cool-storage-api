@@ -340,7 +340,7 @@ var lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID stri
 	return h.lookupLibraryStorageClass(orgID, repoID)
 }
 
-func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) string {
+func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) (string, error) {
 	libraryClass := lookupLibraryStorageClassForSyncFn(h, orgID, repoID)
 	if h.storageManager != nil {
 		configuredURL := ""
@@ -350,20 +350,23 @@ func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID,
 		return h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c, configuredURL), libraryClass, "hot")
 	}
 	if libraryClass != "" {
-		return libraryClass
+		return libraryClass, nil
 	}
-	return "hot"
+	return "hot", nil
 }
 
-func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, repoID, storageClass string) string {
-	preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
+func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, repoID, storageClass string) (string, error) {
+	preferredClass, err := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
+	if err != nil {
+		return "", err
+	}
 	if preferredClass != "" {
-		return preferredClass
+		return preferredClass, nil
 	}
 	if storageClass != "" {
-		return storageClass
+		return storageClass, nil
 	}
-	return "hot"
+	return "hot", nil
 }
 
 func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, storageClass string) (*storage.BlockStore, string, error) {
@@ -378,7 +381,10 @@ func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, 
 			log.Printf("resolveBlockStoreForLookup: storage class %s unavailable: %v", storageClass, err)
 		}
 
-		fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
+		fallbackClass, err := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
+		if err != nil {
+			return nil, fallbackClass, err
+		}
 		blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, fallbackClass)
 		if err != nil {
 			return nil, fallbackClass, err
@@ -399,7 +405,10 @@ func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, 
 }
 
 func (h *SyncHandler) resolvePreferredBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
-	preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
+	preferredClass, err := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
+	if err != nil {
+		return nil, preferredClass, err
+	}
 	if h.storageManager != nil {
 		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
@@ -1349,7 +1358,12 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		}
 	} else {
 		// Preserve the legacy no-metadata routed fallback.
-		storageClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, "")
+		storageClass, resolveErr := h.resolveBlockLookupFallbackClass(c, orgID, repoID, "")
+		if resolveErr != nil {
+			lifecycle.ReleasePreparationError(resolveErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
 		blockStore, _, resolveErr := h.resolveBlockStoreForLookup(c, orgID, repoID, storageClass)
 		if resolveErr != nil || blockStore == nil {
 			lifecycle.ReleasePreparationError(resolveErr)

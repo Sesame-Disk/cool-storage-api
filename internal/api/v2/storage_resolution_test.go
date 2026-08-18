@@ -23,7 +23,11 @@ func TestResolvePreferredLibraryStorageClassForRequestUsesLibraryOverride(t *tes
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "hot-s3-usa", ""); got != "hot-s3-usa" {
+	got, err := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "hot-s3-usa", "")
+	if err != nil {
+		t.Fatalf("resolvePreferredLibraryStorageClassForRequest returned error: %v", err)
+	}
+	if got != "hot-s3-usa" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-usa")
 	}
 }
@@ -41,7 +45,11 @@ func TestResolvePreferredLibraryStorageClassForRequestUsesEndpointRoutingFallbac
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", ""); got != "hot-s3-eu" {
+	got, err := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", "")
+	if err != nil {
+		t.Fatalf("resolvePreferredLibraryStorageClassForRequest returned error: %v", err)
+	}
+	if got != "hot-s3-eu" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-eu")
 	}
 }
@@ -59,13 +67,21 @@ func TestResolvePreferredLibraryStorageClassForRequestIgnoresServerURLForRouting
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", ""); got != "hot-s3-eu" {
+	got, err := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", "")
+	if err != nil {
+		t.Fatalf("resolvePreferredLibraryStorageClassForRequest returned error: %v", err)
+	}
+	if got != "hot-s3-eu" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-eu")
 	}
 }
 
 func TestResolvePreferredLibraryStorageClassForRequestUsesDefaultWithoutManager(t *testing.T) {
-	if got := resolvePreferredLibraryStorageClassForRequest(nil, nil, nil, "", "hot-minio-local"); got != "hot-minio-local" {
+	got, err := resolvePreferredLibraryStorageClassForRequest(nil, nil, nil, "", "hot-minio-local")
+	if err != nil {
+		t.Fatalf("resolvePreferredLibraryStorageClassForRequest returned error: %v", err)
+	}
+	if got != "hot-minio-local" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-minio-local")
 	}
 }

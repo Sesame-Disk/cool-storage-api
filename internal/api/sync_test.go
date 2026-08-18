@@ -265,13 +265,18 @@ func TestResolvePreferredLibraryStorageClassUsesEndpointRouting(t *testing.T) {
 	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
 		"eu": {Hot: "hot-s3-eu"},
 	})
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
 	h := &SyncHandler{storageManager: manager}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo-id/block/block-id", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := h.resolvePreferredLibraryStorageClass(c, "org-id", "repo-id"); got != "hot-s3-eu" {
+	got, err := h.resolvePreferredLibraryStorageClass(c, "org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolvePreferredLibraryStorageClass returned error: %v", err)
+	}
+	if got != "hot-s3-eu" {
 		t.Fatalf("resolvePreferredLibraryStorageClass = %q, want %q", got, "hot-s3-eu")
 	}
 }
@@ -283,13 +288,18 @@ func TestResolveBlockLookupFallbackClassUsesLibraryPreference(t *testing.T) {
 	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
 		"eu": {Hot: "hot-s3-eu"},
 	})
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
 	h := &SyncHandler{storageManager: manager}
 
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := h.resolveBlockLookupFallbackClass(c, "org-id", "repo-id", "missing-class"); got != "hot-s3-eu" {
+	got, err := h.resolveBlockLookupFallbackClass(c, "org-id", "repo-id", "missing-class")
+	if err != nil {
+		t.Fatalf("resolveBlockLookupFallbackClass returned error: %v", err)
+	}
+	if got != "hot-s3-eu" {
 		t.Fatalf("resolveBlockLookupFallbackClass = %q, want %q", got, "hot-s3-eu")
 	}
 }

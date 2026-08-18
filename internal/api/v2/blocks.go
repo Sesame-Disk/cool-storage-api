@@ -214,7 +214,11 @@ func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, strin
 
 	// Resolve storage class based on hostname
 	hostname := routingHostname(c, h.config)
-	storageClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+	storageClass, err := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+	if err != nil {
+		log.Printf("v2/blocks: failed to resolve storage class: %v\n", err)
+		return nil, storageClass
+	}
 
 	// Get healthy org-scoped BlockStore with failover
 	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, storageClass)
@@ -270,7 +274,11 @@ func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string
 		return bs, "legacy"
 	}
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
-	preferred := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+	preferred, err := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+	if err != nil {
+		log.Printf("v2/blocks: failed to resolve storage class for repo %s: %v\n", repoID, err)
+		return nil, preferred
+	}
 	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferred)
 	if err != nil {
 		log.Printf("v2/blocks: failed to get healthy backend for repo %s (%s): %v\n", repoID, preferred, err)

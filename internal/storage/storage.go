@@ -299,15 +299,19 @@ func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error
 	return nil, "", fmt.Errorf("no healthy backend available for class %s", preferredClass)
 }
 
-// ResolveStorageClass determines the storage class based on context
-// Priority: library override > endpoint region > default
-func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier string) string {
-	// 1. Library override takes precedence
+// ResolveStorageClass determines the storage class based on context.
+// Priority: library override > endpoint region > default. An explicit library
+// class is persisted placement metadata, so it must be registered exactly as
+// stored; only an empty library class may use routing/default selection.
+func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("storage manager is nil")
+	}
+
+	// 1. Library override takes precedence and never falls back. The raw label
+	// is the physical namespace identity used by R23a.
 	if libraryClass != "" {
-		if _, ok := m.backends[libraryClass]; ok {
-			return libraryClass
-		}
-		log.Printf("Warning: library storage class %s not found, falling back", libraryClass)
+		return m.resolveRegisteredStorageClass(libraryClass, "library")
 	}
 
 	// 2. Resolve region from hostname
@@ -316,24 +320,34 @@ func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier
 	// 3. Get class for region and tier
 	if regionConfig, ok := m.regionClasses[region]; ok {
 		if tier == "cold" && regionConfig.Cold != "" {
-			return regionConfig.Cold
+			return m.resolveRegisteredStorageClass(regionConfig.Cold, "region")
 		}
 		if regionConfig.Hot != "" {
-			return regionConfig.Hot
+			return m.resolveRegisteredStorageClass(regionConfig.Hot, "region")
 		}
 	}
 
 	// 4. Fallback to default
 	if m.defaultClass != "" {
-		return m.defaultClass
+		return m.resolveRegisteredStorageClass(m.defaultClass, "default")
 	}
 
 	// 5. Last resort: return first available backend
 	for name := range m.backends {
-		return name
+		return name, nil
 	}
 
-	return ""
+	return "", fmt.Errorf("no storage class is registered")
+}
+
+func (m *Manager) resolveRegisteredStorageClass(className, source string) (string, error) {
+	if !config.IsCanonicalStorageClassName(className) {
+		return "", fmt.Errorf("%s storage class %q is not canonical", source, className)
+	}
+	if _, ok := m.backends[className]; !ok {
+		return className, fmt.Errorf("%s storage class %q is not registered", source, className)
+	}
+	return className, nil
 }
 
 // ResolveEndpointRegion resolves a request hostname to a configured region.

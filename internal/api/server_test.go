@@ -220,6 +220,21 @@ func TestInitStorageManagerSkipsEmptyLegacyHotBackend(t *testing.T) {
 	}
 }
 
+func TestInitStorageManagerPanicsWhenConfiguredClassFails(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-broken": {Type: "s3"},
+	}
+	cfg.Storage.Backends = nil
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("initStorageManager did not panic for a configured class that failed to initialize")
+		}
+	}()
+	initStorageManager(cfg)
+}
+
 func TestInitStorageClassUsesResolvedConfigBucketAndCredentials(t *testing.T) {
 	store, err := initStorageClass("hot-s3-na", config.StorageClassConfig{
 		Type:      "s3",

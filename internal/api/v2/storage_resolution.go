@@ -52,17 +52,17 @@ func lookupLibraryStorageClassContext(ctx context.Context, database *db.DB, orgI
 	return storageClass
 }
 
-func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, cfg *config.Config, storageManager *storage.Manager, libraryClass, defaultClass string) string {
+func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, cfg *config.Config, storageManager *storage.Manager, libraryClass, defaultClass string) (string, error) {
 	if storageManager != nil {
 		hostname := routingHostname(c, cfg)
 		return storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
 	}
 
 	if libraryClass != "" {
-		return libraryClass
+		return libraryClass, nil
 	}
 
-	return defaultClass
+	return defaultClass, nil
 }
 
 func resolveLibraryBlockStoreForRequest(c *gin.Context, database *db.DB, cfg *config.Config, storageManager *storage.Manager, s3Store *storage.S3Store, orgID, repoID string) (*storage.BlockStore, string, error) {
@@ -76,7 +76,10 @@ func resolveLibraryBlockStoreForRequestContext(ctx context.Context, c *gin.Conte
 		defaultClass = cfg.Storage.DefaultClass
 	}
 
-	preferredClass := resolvePreferredLibraryStorageClassForRequest(c, cfg, storageManager, libraryClass, defaultClass)
+	preferredClass, err := resolvePreferredLibraryStorageClassForRequest(c, cfg, storageManager, libraryClass, defaultClass)
+	if err != nil {
+		return nil, libraryClass, err
+	}
 	if storageManager != nil {
 		return storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
