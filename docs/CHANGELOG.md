@@ -8,6 +8,107 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-18 - R23a validation hardening and raw-identity consistency
+
+Storage-class references now require a class that can actually be registered,
+including a non-empty bucket for modern classes. Literal empty optional references
+remain allowed, while whitespace-only values are rejected. Canonical names no
+longer allow consecutive hyphens, avoiding collisions in the
+`S3_CLASS_<CLASS>_*` environment-variable mapping.
+
+Change-storage-class, library-creation defaults and bootstrap admission use the
+same raw canonical-name rule as configuration and physical resolution, and the
+bootstrap picker no longer offers a class the manager cannot register. Runtime
+backend failover now detects cycles and returns an error instead of recursing
+forever when every member is unhealthy. The legacy `hot` name remains reserved;
+rejecting a class/backend collision prevents a failed modern initialization from
+rebinding that name.
+
+The canonical rule also holds at the persistence boundary:
+`UpsertBlockMetadataWithRepresentationAndSHA1` refuses a non-canonical
+`storage_class` as a permanent error, and the reuse probe refuses one it reads
+back.
+
+**Every layer decides on the RAW value.** An audit pass found three places that
+still normalized first, which is how a name certifies at one layer and fails at
+another.
+
+`resolveFlexibleCreateStorageClass` and `resolveStrictCreateStorageClass` trimmed
+the request before validating, so `" hot-v1 "` was accepted and persisted as
+`hot-v1` while `ChangeStorageClass` refused that same raw value. The asymmetry was
+the defect, not the padding: two doors onto one field disagreeing about what it
+means. Both now admit the raw request, as does `storageClassRegion`, whose only
+caller decides data residency with it.
+
+The upsert validated only its incoming argument. When the `IF NOT EXISTS` insert
+loses, the caller INHERITS the identity already on the row, and
+`ensureBlockIdentityRow` only checked that the stored class was non-empty after a
+trim -- so an upsert carrying a canonical class could return `nil` over a row whose
+stored class `ProbeBlockReuse` and GC would both refuse, finishing an upload whose
+metadata no reader can resolve. It is now checked there as
+`ErrBlockMetadataPermanent`: unlike a claim or a stub, a corrupt label never
+converges, so retrying it is wrong.
+
+Readers resolve the raw stored value throughout. The trims in canonical block
+reading, upload reuse and GC are gone, GC's orphan-recovery state comparison is as
+strict as the resolver it protects, and `loadZeroRefBlockStorageClasses` groups by
+the raw stored value under the canonical check (which subsumes its old empty check)
+instead of enqueueing GC work under a class name that was never persisted. The six
+dead `TrimSpace(probe.StorageClass)` copies are gone -- the probe already certifies
+what it returns. The two no-manager fallbacks compared a stored identity against a
+trimmed copy of the fallback label; both sides are raw now.
+
+**Not changed, deliberately.** `IsCanonicalStorageClassName` runs on every
+`GetBlockStoreForOrg` call, before the block-store cache lookup. Measured at 163
+ns/op against milliseconds of S3 I/O per block. Moving it behind the cache would
+buy nothing and would weaken unconditional validation at the resolution boundary
+into a cache-miss-only check, which is backwards for the contract this branch
+exists to certify.
+
+**Deployment note.** Every class declared under `storage.classes` must now be
+registrable, not only the ones something references. `configs/config.prod.yaml`
+declares `hot-s3-na`, `hot-s3-eu` and `hot-s3-asia` with empty buckets that
+deployment fills through `S3_CLASS_<CLASS>_BUCKET`; a node that provides only
+some of them now refuses to start instead of booting without the missing class
+and failing every request routed to it. Provide a bucket for each declared class,
+or remove the class the deployment does not use.
+
+---
+
+## 2026-08-17 - R23a certifies storage class as physical identity
+
+R23a defines `B = storage_class` under an append-only/non-reuse configuration
+contract. A storage class that has stored objects must never be rebound to another
+physical namespace or reused for a different backend; moving data to a new namespace
+requires a new class name. Configuration validation now rejects ambiguous,
+non-canonical storage-class names and collisions between modern classes and legacy
+backend names.
+
+The two halves of the contract differ in how they fail. No-rebind is largely
+self-enforcing: repointing a class that holds objects makes every block in it
+unreadable at once, a loud outage rather than a quiet hazard. No-reuse is silent —
+reviving a decommissioned class name on a fresh bucket breaks nothing visibly while
+any surviving persisted `storage_class` starts resolving to the new namespace. Only
+the second half needs future machinery, and it belongs with R23b.
+
+The class/legacy collision check closes a rebind the code could produce by itself:
+a class whose initialization fails is skipped with a warning, after which the legacy
+`backends:` loop registers the same name against a different bucket, so the binding
+depended on whether a transient failure happened at boot.
+
+Validation now also covers the fields that REFERENCE a class — `default_class`,
+`failover_class` and `region_classes.*` — because a reference that does not resolve
+is not an identity. `failover_class` motivated this: a typo there is invisible until
+the primary backend is down. `IsCanonicalStorageClassName` is now the single
+definition of the canon, shared by configuration and the storage runtime and applied
+to the raw value, so a name can no longer certify at one layer and fail at the other.
+
+No `backend_id` field, migration, storage-key change, or GC protocol change is
+introduced. R23b will persist the exact `storage_key` and form
+`P = (storage_class, storage_key)`.
+
+---
+
 ## 2026-08-17 - R11b-1 prunes physical orphan representation state
 
 Migration `015_gc_s3_orphans_without_representation_id.cql` removes

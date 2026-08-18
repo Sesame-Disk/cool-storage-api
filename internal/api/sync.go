@@ -356,11 +356,10 @@ func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID,
 }
 
 func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, repoID, storageClass string) string {
-	preferredClass := strings.TrimSpace(h.resolvePreferredLibraryStorageClass(c, orgID, repoID))
+	preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
 	if preferredClass != "" {
 		return preferredClass
 	}
-	storageClass = strings.TrimSpace(storageClass)
 	if storageClass != "" {
 		return storageClass
 	}
@@ -368,7 +367,8 @@ func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, rep
 }
 
 func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, storageClass string) (*storage.BlockStore, string, error) {
-	storageClass = strings.TrimSpace(storageClass)
+	// Raw: the manager resolves the exact label, and a trimmed copy of it would
+	// select a namespace under a name nothing ever stored.
 	if h.storageManager != nil {
 		if storageClass != "" {
 			blockStore, err := h.storageManager.GetBlockStoreForOrg(orgID, storageClass)
@@ -2005,7 +2005,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+				materializedStorageClass = probe.StorageClass
 				_, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
 				return ensureErr
 			case db.BlockReuseNeedsPut:

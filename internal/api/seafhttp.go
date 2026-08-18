@@ -2503,7 +2503,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+			materializedStorageClass = probe.StorageClass
 			_, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID)
 			if ensureErr != nil {
 				return ensureErr
@@ -3014,7 +3014,7 @@ readLoop:
 					}
 					switch probe.Decision {
 					case db.BlockReuseReusable:
-						materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+						materializedStorageClass = probe.StorageClass
 						_, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
 						return ensureErr
 					case db.BlockReuseNeedsPut:

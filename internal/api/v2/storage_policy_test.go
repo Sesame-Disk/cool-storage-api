@@ -11,9 +11,9 @@ func testStoragePolicyConfig() *config.Config {
 		Storage: config.StorageConfig{
 			DefaultClass: "hot-s3-usa",
 			Classes: map[string]config.StorageClassConfig{
-				"hot-s3-usa": {Tier: "hot"},
-				"hot-s3-eu":  {Tier: "hot"},
-				"cold-s3-eu": {Tier: "cold"},
+				"hot-s3-usa": {Tier: "hot", Bucket: "usa"},
+				"hot-s3-eu":  {Tier: "hot", Bucket: "eu"},
+				"cold-s3-eu": {Tier: "cold", Bucket: "archive"},
 			},
 			EndpointRegions: map[string]string{
 				"eu.example.com": "eu",
@@ -46,6 +46,23 @@ func TestNormalizeOrgStoragePolicy(t *testing.T) {
 			t.Fatal("expected error for invalid data_residency")
 		}
 	})
+}
+
+func TestIsKnownStorageClassRequiresCanonicalName(t *testing.T) {
+	cfg := testStoragePolicyConfig()
+	cfg.Storage.Classes["empty"] = config.StorageClassConfig{Tier: "hot"}
+
+	if !isKnownStorageClass(cfg, "hot-s3-usa") {
+		t.Fatal("canonical storage class should be known")
+	}
+	if isKnownStorageClass(cfg, "empty") {
+		t.Fatal("storage class without a registrable bucket should not be known")
+	}
+	for _, name := range []string{" hot-s3-usa ", "hot_s3_usa", "Hot-s3-usa", "   "} {
+		if isKnownStorageClass(cfg, name) {
+			t.Fatalf("storage class %q should not be accepted as canonical", name)
+		}
+	}
 }
 
 func TestResolveCreateStorageClass(t *testing.T) {
@@ -124,6 +141,35 @@ func TestResolveCreateStorageClass(t *testing.T) {
 			t.Fatal("expected cold tier rejection")
 		}
 	})
+}
+
+// Create is the other door onto the same field ChangeStorageClass guards, and both
+// must answer the same way about the same raw value. Normalizing the request here
+// would persist an identity the caller never named while the change endpoint
+// refuses it -- the asymmetry, not the padding, is the defect.
+func TestResolveCreateStorageClassRejectsNonCanonicalRequests(t *testing.T) {
+	cfg := testStoragePolicyConfig()
+
+	for _, requested := range []string{" hot-s3-eu", "hot-s3-eu ", " hot-s3-eu ", "Hot-S3-EU", "hot_s3_eu"} {
+		t.Run("flexible/"+requested, func(t *testing.T) {
+			resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
+				DataResidency: orgDataResidencyFlexible,
+			}, "eu.example.com", requested)
+			if err == nil {
+				t.Fatalf("resolveCreateStorageClass(%q) = %q, want rejection", requested, resolved)
+			}
+		})
+
+		t.Run("strict/"+requested, func(t *testing.T) {
+			resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
+				DataResidency: orgDataResidencyStrict,
+				DefaultRegion: "eu",
+			}, "eu.example.com", requested)
+			if err == nil {
+				t.Fatalf("resolveCreateStorageClass(%q) = %q, want rejection", requested, resolved)
+			}
+		})
+	}
 }
 
 func TestValidateOrgStoragePolicy(t *testing.T) {

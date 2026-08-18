@@ -1221,7 +1221,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+			materializedStorageClass = probe.StorageClass
 			var ensureErr error
 			storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
 			return ensureErr

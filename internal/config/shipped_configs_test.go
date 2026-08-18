@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -41,6 +42,20 @@ func loadShippedConfig(t *testing.T, path string) *Config {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	return cfg
+}
+
+// Some shipped production files intentionally leave class buckets empty because
+// deployment injects them through S3_CLASS_<CLASS>_BUCKET. Reference validation
+// below exercises the topology independently; fill those deployment placeholders
+// with deterministic test buckets. Config.Validate still rejects an empty bucket
+// when the deployment did not provide the required environment override.
+func hydrateShippedStoragePlaceholders(cfg *Config) {
+	for name, classCfg := range cfg.Storage.Classes {
+		if strings.TrimSpace(classCfg.Bucket) == "" {
+			classCfg.Bucket = "shipped-test-" + name
+			cfg.Storage.Classes[name] = classCfg
+		}
+	}
 }
 
 func TestShippedConfigsPassDownloadAdmissionValidation(t *testing.T) {
@@ -142,6 +157,32 @@ func TestShippedConfigsKeepProfileCapsUnderTheNodeCeiling(t *testing.T) {
 				if cap > d.MaxActivePerNode {
 					t.Fatalf("%s = %d exceeds max_active_per_node = %d", name, cap, d.MaxActivePerNode)
 				}
+			}
+		})
+	}
+}
+
+func TestShippedConfigsUseCanonicalStorageClassNames(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			if err := validateStorageClassNames(cfg.Storage); err != nil {
+				t.Fatalf("shipped configuration has invalid storage class identity: %v", err)
+			}
+		})
+	}
+}
+
+// Every storage class a shipped config REFERENCES must resolve to one it
+// declares. A typo in failover_class is invisible until the primary backend is
+// down, so the repo's own files are the cheapest place to catch it.
+func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			hydrateShippedStoragePlaceholders(cfg)
+			if err := cfg.validateStorageClassIdentity(); err != nil {
+				t.Fatalf("shipped configuration would refuse to start: %v", err)
 			}
 		})
 	}

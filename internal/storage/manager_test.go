@@ -3,8 +3,11 @@ package storage
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
 // mockStore implements Store interface for testing
@@ -70,6 +73,30 @@ func TestManagerRegisterBackend(t *testing.T) {
 	}
 	if health.FailoverClass != "hot-s3-eu" {
 		t.Errorf("failover class = %s, want hot-s3-eu", health.FailoverClass)
+	}
+}
+
+func TestManagerResolvePhysicalStorageClassUsesTheCanonicalLabel(t *testing.T) {
+	m := NewManager()
+	m.RegisterBackend("hot-v1", &mockStore{accessType: AccessImmediate}, "hot-v2")
+	m.RegisterBackend("hot-v2", &mockStore{accessType: AccessImmediate}, "")
+
+	got, err := m.ResolvePhysicalStorageClass("hot-v1")
+	if err != nil {
+		t.Fatalf("ResolvePhysicalStorageClass returned error: %v", err)
+	}
+	if got != "hot-v1" {
+		t.Fatalf("physical storage class = %q, want %q", got, "hot-v1")
+	}
+
+	if _, err := m.ResolvePhysicalStorageClass(" hot-v1"); err == nil {
+		t.Fatal("ResolvePhysicalStorageClass accepted a non-canonical class with surrounding whitespace")
+	}
+	if _, err := m.ResolvePhysicalStorageClass("Hot-v1"); err == nil {
+		t.Fatal("ResolvePhysicalStorageClass accepted an uppercase class")
+	}
+	if _, err := m.ResolvePhysicalStorageClass("missing"); err == nil {
+		t.Fatal("ResolvePhysicalStorageClass accepted an unknown class")
 	}
 }
 
@@ -262,6 +289,19 @@ func TestManagerGetHealthyBackend(t *testing.T) {
 			t.Error("expected error for nonexistent backend")
 		}
 	})
+}
+
+func TestManagerGetHealthyBackendRejectsFailoverCycle(t *testing.T) {
+	m := NewManager()
+	m.RegisterBackend("hot-s3-usa", &mockStore{accessType: AccessImmediate}, "hot-s3-eu")
+	m.RegisterBackend("hot-s3-eu", &mockStore{accessType: AccessImmediate}, "hot-s3-usa")
+	m.UpdateHealth("hot-s3-usa", HealthUnhealthy, nil)
+	m.UpdateHealth("hot-s3-eu", HealthUnhealthy, nil)
+
+	_, _, err := m.GetHealthyBackend("hot-s3-usa")
+	if err == nil || !strings.Contains(err.Error(), "failover cycle") {
+		t.Fatalf("GetHealthyBackend() error = %v, want failover cycle error", err)
+	}
 }
 
 func TestManagerCheckHealth(t *testing.T) {
@@ -633,5 +673,26 @@ func TestGetHealthyBlockStoreForOrg_FailoverCachesCanonicalStore(t *testing.T) {
 	}
 	if bs1 != bs2 {
 		t.Fatal("repeated healthy lookup should reuse the cached BlockStore")
+	}
+}
+
+// The resolver and configuration validation must apply one canon, so a class
+// name cannot certify at one layer and fail at the other.
+func TestResolvePhysicalStorageClassSharesTheConfigCanon(t *testing.T) {
+	m := NewManager()
+	m.RegisterBackend("hot-v1", &S3Store{}, "")
+	// Registered out of band, bypassing configuration validation.
+	m.RegisterBackend("hot_v1", &S3Store{}, "")
+
+	if got, err := m.ResolvePhysicalStorageClass("hot-v1"); err != nil || got != "hot-v1" {
+		t.Fatalf("ResolvePhysicalStorageClass(canonical) = (%q, %v), want (\"hot-v1\", nil)", got, err)
+	}
+	for _, name := range []string{"hot_v1", " hot-v1", "Hot-V1", ""} {
+		if _, err := m.ResolvePhysicalStorageClass(name); err == nil {
+			t.Errorf("ResolvePhysicalStorageClass(%q) error = nil, want a non-canonical or missing-class rejection", name)
+		}
+	}
+	if config.IsCanonicalStorageClassName("hot_v1") {
+		t.Error("test premise broken: hot_v1 is not supposed to be canonical")
 	}
 }

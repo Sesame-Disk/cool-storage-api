@@ -165,7 +165,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 
 	orgID := uuid.New()
 	// Seed an orphan directly.
-	seedS3Orphan(t, store, orgID, "orph-1", " hot ", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-1", "hot", "", "earlier failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -180,6 +180,32 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 	deletes := sp.ScopedBlockDeletes()
 	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "orph-1"}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
+	}
+}
+
+func TestWorker_RecoverS3Orphans_NonCanonicalStorageClassFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	seedS3Orphan(t, store, orgID, "orph-padded-class", " hot ", "", "earlier failure", time.Now())
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want non-canonical storage class error")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered = %d, want 0", recovered)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatal("orphan row must remain for repair/retry")
+	}
+	if got := sp.BlockStoreRequests(); len(got) != 0 {
+		t.Fatalf("storage must not be touched for non-canonical class, got %+v", got)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched for non-canonical class, got %+v", got)
 	}
 }
 

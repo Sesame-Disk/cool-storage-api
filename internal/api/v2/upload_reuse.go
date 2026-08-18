@@ -96,7 +96,6 @@ func PrepareUploadedBlockProbe(database *db.DB, orgID, blockID string, probe db.
 // object (blocks/<org_id>/...). The fallback store must already be org-scoped by
 // the caller.
 func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass, orgID string) (*storage.BlockStore, error) {
-	canonicalClass = strings.TrimSpace(canonicalClass)
 	if canonicalClass == "" {
 		return nil, errors.New("canonical storage class is empty")
 	}
@@ -104,7 +103,6 @@ func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *
 		return storageManager.GetBlockStoreForOrg(orgID, canonicalClass)
 	}
 	if fallbackStore != nil {
-		fallbackClass = strings.TrimSpace(fallbackClass)
 		if fallbackClass != "" && fallbackClass == canonicalClass {
 			return fallbackStore, nil
 		}
@@ -121,7 +119,7 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 		return nil, "", "", fmt.Errorf("block %s does not need a PUT", blockID)
 	}
 
-	canonicalClass := strings.TrimSpace(probe.StorageClass)
+	canonicalClass := probe.StorageClass
 	if canonicalClass == "" {
 		if preferredStore == nil {
 			return nil, "", "", fmt.Errorf("preferred block store is unavailable for %s", blockID)
@@ -150,30 +148,33 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (storageKey, storageClass string, didPut bool, err error) {
 	switch probe.Decision {
 	case db.BlockReuseReusable:
-		canonicalStore, resolveErr := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, probe.StorageClass, orgID)
+		// The class this returns is re-persisted by the caller, so it must be the
+		// stored identity itself, never a normalized copy of it.
+		canonicalClass := probe.StorageClass
+		canonicalStore, resolveErr := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, canonicalClass, orgID)
 		if resolveErr != nil {
-			return "", strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
+			return "", canonicalClass, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
 		}
 		storageKey = canonicalStore.StorageKeyForHash(blockID)
 		if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
-			return "", strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+			return "", canonicalClass, false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, existsErr)
+			return storageKey, canonicalClass, false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, existsErr)
 		}
 		if exists {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, nil
+			return storageKey, canonicalClass, false, nil
 		}
 		if beforePut != nil {
 			if beforeErr := beforePut(); beforeErr != nil {
-				return storageKey, strings.TrimSpace(probe.StorageClass), false, beforeErr
+				return storageKey, canonicalClass, false, beforeErr
 			}
 		}
 		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, putErr)
+			return storageKey, canonicalClass, false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, putErr)
 		}
-		return storageKey, strings.TrimSpace(probe.StorageClass), true, nil
+		return storageKey, canonicalClass, true, nil
 	case db.BlockReuseNeedsPut:
 		putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(storageManager, preferredStore, preferredClass, probe, orgID, blockID)
 		if resolveErr != nil {

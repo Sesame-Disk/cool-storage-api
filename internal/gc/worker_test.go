@@ -329,7 +329,7 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
-	store.AddBlock(orgID, "block-canonical-cold", "cold-tier ", 0)
+	store.AddBlock(orgID, "block-canonical-cold", "cold-tier", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-canonical-cold", uuid.Nil, "hot-tier", 0); err != nil {
 		t.Fatalf("EnqueueItem() error = %v", err)
@@ -352,6 +352,41 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	deletes := sp.ScopedBlockDeletes()
 	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier", BlockID: "block-canonical-cold"}) {
 		t.Fatalf("delete used queued rather than canonical scope: %+v", deletes)
+	}
+}
+
+// A stored class that is not canonical cannot name a physical namespace. The
+// block must stay put, the claim must come down so the fence does not outlive the
+// pass, and S3 must not be touched on a guess about what the label meant.
+func TestWorker_ProcessBlock_NonCanonicalStorageClassFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, "blk-padded-class", " hot-tier", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "blk-padded-class", uuid.Nil, " hot-tier", 0); err != nil {
+		t.Fatalf("EnqueueItem() error = %v", err)
+	}
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce() error = %v", err)
+	}
+
+	block := store.GetBlock(orgID, "blk-padded-class")
+	if block == nil {
+		t.Fatal("canonical row must survive a non-canonical storage class")
+	}
+	if block.GCState != "" || block.GCClaimID != "" {
+		t.Fatalf("claim must be released, got state=%q claim=%q", block.GCState, block.GCClaimID)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched for a non-canonical class, got %+v", got)
+	}
+	if got := store.AllS3Orphans(); len(got) != 0 {
+		t.Fatalf("no orphan may be recorded for a class that never resolved, got %+v", got)
 	}
 }
 

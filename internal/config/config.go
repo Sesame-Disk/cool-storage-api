@@ -1438,6 +1438,9 @@ func DefaultConfig() *Config {
 		Storage: StorageConfig{
 			Mode:         "",
 			DefaultClass: "hot",
+			// "hot" is the reserved legacy backend name. Modern classes must use a
+			// distinct name so a failed class initialization cannot fall through to
+			// the legacy registration loop and silently bind another namespace.
 			Backends: map[string]BackendConfig{
 				"hot": {
 					Type:   "s3",
@@ -2281,21 +2284,33 @@ func (c *Config) shouldUseLegacySingleRegionStorage() bool {
 	return strings.TrimSpace(hot.Bucket) != ""
 }
 
+// configuredStorageClass reports whether name resolves to a backend the storage
+// manager will actually register. It does NOT trim: runtime resolution is an
+// exact map lookup, and a lenient check here would certify a name that fails at
+// use time (R23a). Modern classes use the same non-empty bucket requirement as
+// initStorageClass; an entry that cannot be initialized is not a backend.
 func (c *Config) configuredStorageClass(name string) bool {
-	name = strings.TrimSpace(name)
 	if name == "" || c == nil {
 		return false
 	}
-	if _, ok := c.Storage.Classes[name]; ok {
-		return true
+	if class, ok := c.Storage.Classes[name]; ok {
+		return strings.TrimSpace(class.Bucket) != ""
 	}
 	if backend, ok := c.Storage.Backends[name]; ok {
-		if strings.EqualFold(backend.Type, "s3") {
-			return strings.TrimSpace(backend.Bucket) != ""
-		}
-		return true
+		// initStorageManager converts legacy backends to StorageClassConfig and
+		// sends them through initStorageClass, which requires a bucket for every
+		// backend type it can currently register.
+		return strings.TrimSpace(backend.Bucket) != ""
 	}
 	return false
+}
+
+// IsConfiguredStorageClass reports whether name identifies a backend that the
+// storage manager can register from this configuration. It intentionally uses
+// exact-name and registrability checks so API callers cannot persist a class
+// that configuration validation would later fail to resolve.
+func (c *Config) IsConfiguredStorageClass(name string) bool {
+	return c.configuredStorageClass(name)
 }
 
 func (c *Config) regionClassConfig(region string) (RegionClassConfig, bool) {
@@ -3150,14 +3165,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("storage.mode must be one of: single, multi")
 	}
 	storageMode := c.storageMode()
-	for region, regionConfig := range c.Storage.RegionClasses {
-		if strings.TrimSpace(regionConfig.Hot) != "" && !c.configuredStorageClass(regionConfig.Hot) {
-			return fmt.Errorf("storage.region_classes.%s.hot references unknown or unconfigured storage class %q", region, regionConfig.Hot)
-		}
-		if strings.TrimSpace(regionConfig.Cold) != "" && !c.configuredStorageClass(regionConfig.Cold) {
-			return fmt.Errorf("storage.region_classes.%s.cold references unknown or unconfigured storage class %q", region, regionConfig.Cold)
-		}
-	}
 	if !c.Auth.DevMode && storageMode == "multi" {
 		if len(c.Storage.RegionClasses) == 0 {
 			return fmt.Errorf("storage.mode=multi requires storage.region_classes to be configured")
@@ -3377,6 +3384,113 @@ func (c *Config) Validate() error {
 	c.Server.TrustedProxies = normalizedTrustedProxies
 	if c.Auth.OIDC.Enabled && !hasConfiguredStrings(c.Auth.OIDC.RedirectURIs) {
 		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
+	}
+	if err := c.validateStorageClassIdentity(); err != nil {
+		return err
+	}
+	return nil
+}
+
+var storageClassNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// IsCanonicalStorageClassName is the single definition of a canonical storage
+// class name, shared by configuration validation and the storage runtime. R23a
+// makes a persisted storage_class the physical namespace identity itself, so
+// "canonical" must mean one thing in both places: a second, looser copy of this
+// rule would let a name certify at one layer and fail at the other.
+//
+// The check is deliberately on the RAW value. Runtime resolution is an exact map
+// lookup, so a validator that trimmed or folded first would be more permissive
+// than the thing it certifies.
+func IsCanonicalStorageClassName(name string) bool {
+	return name == strings.TrimSpace(name) &&
+		name == strings.ToLower(name) &&
+		storageClassNamePattern.MatchString(name)
+}
+
+// validateStorageClassIdentity protects the R23a contract that a persisted
+// storage_class is itself the immutable physical namespace identity.
+//
+// It covers both halves of "identity": the declared names must be canonical and
+// unambiguous, and every field that REFERENCES a class must name one that
+// actually resolves. An unresolvable reference is not an identity, and the
+// failure modes differ sharply in how loudly they surface -- a bad default_class
+// breaks the first classless write, while a bad failover_class breaks nothing
+// until the primary is down, which is precisely when it is needed.
+//
+// What it cannot do: detect an operator rebinding an already-deployed name to
+// another namespace, or reusing a decommissioned name for a fresh one. That stays
+// an append-only configuration contract; see docs/GC-X1-CLOSURE-OPTIONS.md R23a.
+func (c *Config) validateStorageClassIdentity() error {
+	if err := validateStorageClassNames(c.Storage); err != nil {
+		return err
+	}
+	for name := range c.Storage.Classes {
+		if !c.configuredStorageClass(name) {
+			return fmt.Errorf("storage.classes.%s is declared but cannot be registered; configure a non-empty bucket", name)
+		}
+	}
+	if err := c.validateStorageClassReference("storage.default_class", c.Storage.DefaultClass); err != nil {
+		return err
+	}
+	for name, classCfg := range c.Storage.Classes {
+		if err := c.validateStorageClassReference("storage.classes."+name+".failover_class", classCfg.FailoverClass); err != nil {
+			return err
+		}
+	}
+	for region, regionConfig := range c.Storage.RegionClasses {
+		if err := c.validateStorageClassReference("storage.region_classes."+region+".hot", regionConfig.Hot); err != nil {
+			return err
+		}
+		if err := c.validateStorageClassReference("storage.region_classes."+region+".cold", regionConfig.Cold); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateStorageClassReference checks one field that names a storage class. A
+// literal empty value means "not configured" and is left to the mode-specific
+// rules that already decide whether that is allowed. Whitespace-only values are
+// non-empty raw references and must fail the canonical-name check.
+func (c *Config) validateStorageClassReference(scope, name string) error {
+	if name == "" {
+		return nil
+	}
+	if !IsCanonicalStorageClassName(name) {
+		return fmt.Errorf("%s references storage class %q, which is not canonical; use lowercase ASCII letters, digits, and hyphens without surrounding whitespace", scope, name)
+	}
+	if !c.configuredStorageClass(name) {
+		return fmt.Errorf("%s references unknown or unconfigured storage class %q", scope, name)
+	}
+	return nil
+}
+
+func validateStorageClassNames(storageConfig StorageConfig) error {
+	seen := make(map[string]string, len(storageConfig.Classes)+len(storageConfig.Backends))
+	validate := func(scope, name string) error {
+		if name == "" {
+			return fmt.Errorf("%s storage class name must not be empty", scope)
+		}
+		if !IsCanonicalStorageClassName(name) {
+			return fmt.Errorf("%s storage class name %q must use lowercase ASCII letters, digits, and hyphens without surrounding whitespace", scope, name)
+		}
+		if previousScope, ok := seen[name]; ok {
+			return fmt.Errorf("%s storage class name %q collides with %s; class and legacy backend names must be unambiguous", scope, name, previousScope)
+		}
+		seen[name] = scope
+		return nil
+	}
+
+	for name := range storageConfig.Classes {
+		if err := validate("storage.classes", name); err != nil {
+			return err
+		}
+	}
+	for name := range storageConfig.Backends {
+		if err := validate("storage.backends", name); err != nil {
+			return err
+		}
 	}
 	return nil
 }

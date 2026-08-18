@@ -626,10 +626,28 @@ func newLibraryHandlerForLiveFenceTests() *LibraryHandler {
 		config: &config.Config{
 			Storage: config.StorageConfig{
 				Classes: map[string]config.StorageClassConfig{
-					"standard": {},
+					"standard": {Bucket: "standard"},
 				},
 			},
 		},
+	}
+}
+
+func TestChangeStorageClassRejectsNonCanonicalReference(t *testing.T) {
+	r := gin.New()
+	handler := newLibraryHandlerForLiveFenceTests()
+	r.POST("/repos/:repo_id/storage-class", func(c *gin.Context) {
+		c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+		handler.ChangeStorageClass(c)
+	})
+
+	req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/storage-class", strings.NewReader(`{"storage_class":" standard "}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

@@ -2436,3 +2436,173 @@ func TestEnvOverrideSyncBlockInflightCaps(t *testing.T) {
 		t.Fatalf("Validate() with safe overrides: %v", err)
 	}
 }
+
+func TestConfigValidateRequiresCanonicalStorageClassNames(t *testing.T) {
+	newConfig := func() *Config {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.Storage.Classes = map[string]StorageClassConfig{
+			"hot-v1": {Type: "s3", Bucket: "blocks"},
+		}
+		cfg.Storage.Backends = nil
+		// DefaultConfig points default_class at the legacy "hot" backend that was
+		// just removed; leaving it would fail reference validation for a reason
+		// this test is not about.
+		cfg.Storage.DefaultClass = "hot-v1"
+		return cfg
+	}
+
+	if err := newConfig().Validate(); err != nil {
+		t.Fatalf("Validate() returned error for canonical class: %v", err)
+	}
+
+	for _, name := range []string{"", "Hot-v1", " hot-v1", "hot_v1", "hot/v1"} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			cfg := newConfig()
+			classConfig := cfg.Storage.Classes["hot-v1"]
+			delete(cfg.Storage.Classes, "hot-v1")
+			cfg.Storage.Classes[name] = classConfig
+			cfg.Storage.DefaultClass = ""
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "storage class name") {
+				t.Fatalf("Validate() error = %v, want storage class name error", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateRejectsClassAndLegacyStorageNameCollision(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot": {Type: "s3", Bucket: "class-bucket"},
+	}
+	cfg.Storage.Backends = map[string]BackendConfig{
+		"hot": {Type: "s3", Bucket: "legacy-bucket"},
+	}
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("Validate() error = %v, want storage class collision error", err)
+	}
+}
+
+// A reference that does not resolve is not an identity. The failure modes differ
+// in how loudly they surface: default_class breaks the first classless write,
+// while failover_class breaks nothing until the primary is down -- which is
+// exactly when it is needed, so only startup validation can surface it in time.
+func TestConfigValidateRejectsUnresolvableStorageClassReferences(t *testing.T) {
+	newConfig := func() *Config {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.Storage.Classes = map[string]StorageClassConfig{
+			"hot-v1": {Type: "s3", Bucket: "blocks"},
+			"hot-v2": {Type: "s3", Bucket: "blocks-2"},
+		}
+		cfg.Storage.Backends = nil
+		cfg.Storage.DefaultClass = "hot-v1"
+		return cfg
+	}
+
+	if err := newConfig().Validate(); err != nil {
+		t.Fatalf("Validate() returned error for resolvable references: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantSub string
+	}{
+		{
+			name:    "unknown default_class",
+			mutate:  func(c *Config) { c.Storage.DefaultClass = "hot-v9" },
+			wantSub: "storage.default_class references unknown or unconfigured storage class",
+		},
+		{
+			name: "modern class without bucket",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: ""}
+			},
+			wantSub: "storage.classes.hot-v1 is declared but cannot be registered",
+		},
+		{
+			name:    "non-canonical default_class",
+			mutate:  func(c *Config) { c.Storage.DefaultClass = " hot-v1 " },
+			wantSub: "storage.default_class references storage class",
+		},
+		{
+			name:    "whitespace-only default_class",
+			mutate:  func(c *Config) { c.Storage.DefaultClass = "   " },
+			wantSub: "storage.default_class references storage class",
+		},
+		{
+			name: "unknown failover_class",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", FailoverClass: "hot-v9"}
+			},
+			wantSub: "failover_class references unknown or unconfigured storage class",
+		},
+		{
+			name: "non-canonical failover_class",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", FailoverClass: "Hot-V2"}
+			},
+			wantSub: "failover_class references storage class",
+		},
+		{
+			name: "unknown region class",
+			mutate: func(c *Config) {
+				c.Storage.RegionClasses = map[string]RegionClassConfig{"eu": {Hot: "hot-v9"}}
+			},
+			wantSub: "storage.region_classes.eu.hot references unknown or unconfigured storage class",
+		},
+		{
+			// The old check trimmed before resolving while the runtime lookup does
+			// not, so a padded reference certified and then failed at use time.
+			name: "padded region class",
+			mutate: func(c *Config) {
+				c.Storage.RegionClasses = map[string]RegionClassConfig{"eu": {Hot: " hot-v1 "}}
+			},
+			wantSub: "storage.region_classes.eu.hot references storage class",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("Validate() error = %v, want error containing %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+// A resolvable failover_class must stay accepted; the point of the check is to
+// reject typos, not to forbid failover.
+func TestConfigValidateAcceptsResolvableFailoverClass(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.Storage.Backends = nil
+	cfg.Storage.DefaultClass = "hot-v1"
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-v1": {Type: "s3", Bucket: "blocks", FailoverClass: "hot-v2"},
+		"hot-v2": {Type: "s3", Bucket: "blocks-2"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for a resolvable failover chain", err)
+	}
+}
+
+func TestIsCanonicalStorageClassName(t *testing.T) {
+	for _, name := range []string{"hot", "hot-v1", "hot-s3-usa", "h0t-2"} {
+		if !IsCanonicalStorageClassName(name) {
+			t.Errorf("IsCanonicalStorageClassName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", " hot", "hot ", "Hot", "hot_v1", "hot/v1", "-hot", "hot-", "hot--v1", "hót"} {
+		if IsCanonicalStorageClassName(name) {
+			t.Errorf("IsCanonicalStorageClassName(%q) = true, want false", name)
+		}
+	}
+}

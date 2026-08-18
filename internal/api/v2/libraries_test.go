@@ -148,8 +148,8 @@ func TestResolveRequestedStorageClass(t *testing.T) {
 			Storage: config.StorageConfig{
 				DefaultClass: "hot-usa",
 				Classes: map[string]config.StorageClassConfig{
-					"hot-usa": {},
-					"hot-eu":  {},
+					"hot-usa": {Bucket: "usa"},
+					"hot-eu":  {Bucket: "eu"},
 				},
 				EndpointRegions: map[string]string{
 					"eu.example.com": "eu",
@@ -193,8 +193,8 @@ func TestResolveRequestedStorageClass(t *testing.T) {
 		h.config.Storage.EndpointRegions = map[string]string{}
 		h.config.Storage.RegionClasses = map[string]config.RegionClassConfig{}
 		h.config.Storage.Classes = map[string]config.StorageClassConfig{
-			"hot-zeta":  {},
-			"hot-alpha": {},
+			"hot-zeta":  {Bucket: "zeta"},
+			"hot-alpha": {Bucket: "alpha"},
 		}
 		h.config.Storage.Backends = map[string]config.BackendConfig{}
 

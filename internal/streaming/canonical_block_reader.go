@@ -203,7 +203,7 @@ dispatchLocations:
 				return fmt.Errorf("canonical block %s has unknown gc state %q", blockID, metadata.GCState)
 			}
 			if metadata.CreatedAt == nil {
-				if !strictRead && strings.TrimSpace(metadata.StorageClass) == "" {
+				if !strictRead && metadata.StorageClass == "" {
 					mu.Lock()
 					reader.locations[blockID] = canonicalBlockLocation{missing: true}
 					mu.Unlock()
@@ -212,7 +212,7 @@ dispatchLocations:
 				return fmt.Errorf("canonical block %s has storage metadata without a creation timestamp", blockID)
 			}
 
-			storageClass := strings.TrimSpace(metadata.StorageClass)
+			storageClass := metadata.StorageClass
 			if storageClass == "" {
 				return fmt.Errorf("canonical storage class is empty for block %s", blockID)
 			}
@@ -224,7 +224,7 @@ dispatchLocations:
 				if err != nil {
 					return fmt.Errorf("resolve canonical storage class %q for block %s: %w", storageClass, blockID, err)
 				}
-			case fallback != nil && storageClass == strings.TrimSpace(fallbackClass):
+			case fallback != nil && fallbackClass != "" && storageClass == fallbackClass:
 				store = fallback
 			default:
 				return fmt.Errorf("canonical storage class %q for block %s is unavailable", storageClass, blockID)

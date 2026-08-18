@@ -295,8 +295,8 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -337,8 +337,8 @@ func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabels(t *testing.T) {
 		"eu": {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-na": {Label: "North America"},
-		"hot-eu": {Label: "Europe"},
+		"hot-na": {Label: "North America", Bucket: "na"},
+		"hot-eu": {Label: "Europe", Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -364,8 +364,8 @@ func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabelsWithoutRegionClass
 	s.config.Storage.EndpointRegions = map[string]string{}
 	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"archive-hot": {Label: "Archive Storage"},
-		"hot-zeta":    {},
+		"archive-hot": {Label: "Archive Storage", Bucket: "archive"},
+		"hot-zeta":    {Bucket: "zeta"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -394,8 +394,8 @@ func TestBuildBootstrapStorageOptionsFallsBackToServerRegion(t *testing.T) {
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -425,8 +425,8 @@ func TestBuildBootstrapStorageOptionsWildcardRoutingOverridesServerRegion(t *tes
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -458,8 +458,8 @@ func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *t
 	s := createTestServer()
 	s.config.Storage.DefaultClass = "missing"
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-zeta":  {},
-		"hot-alpha": {},
+		"hot-zeta":  {Bucket: "zeta"},
+		"hot-alpha": {Bucket: "alpha"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
