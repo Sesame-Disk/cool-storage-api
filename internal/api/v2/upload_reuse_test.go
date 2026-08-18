@@ -779,6 +779,30 @@ func TestResolveNeedsPutBlockStoreUsesPreferredPlacementForFirstWriter(t *testin
 	}
 }
 
+// The first writer MINTS the block's physical identity -- the class this returns is
+// the one persisted. It is the last write-path door a non-canonical label could
+// enter through, and it must refuse rather than normalize: a trim here would turn
+// the write funnel's hard refusal into a silent rewrite, and it would do so AFTER
+// the PUT, leaving bytes in S3 that no row ends up pointing at.
+func TestResolveNeedsPutBlockStoreRefusesNonCanonicalFirstWriterClass(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, preferredClass := range []string{" hot-v1", "hot-v1 ", " hot-v1 ", "Hot-V1", "hot_v1", "hot--v1", "   "} {
+		gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, preferredClass,
+			db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, "abcd1234")
+		if err == nil {
+			t.Fatalf("preferred class %q: placement = %p/%q/%q, want refusal", preferredClass, gotStore, gotClass, gotKey)
+		}
+		if gotStore != nil || gotClass != "" || gotKey != "" {
+			t.Fatalf("preferred class %q: refusal must return no placement, got %p/%q/%q", preferredClass, gotStore, gotClass, gotKey)
+		}
+	}
+}
+
 func TestResolveNeedsPutBlockStoreUsesExistingCanonicalPlacement(t *testing.T) {
 	oldResolve := resolveCanonicalBlockStoreFn
 	t.Cleanup(func() { resolveCanonicalBlockStoreFn = oldResolve })

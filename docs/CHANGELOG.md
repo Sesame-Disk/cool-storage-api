@@ -58,12 +58,23 @@ dead `TrimSpace(probe.StorageClass)` copies are gone -- the probe already certif
 what it returns. The two no-manager fallbacks compared a stored identity against a
 trimmed copy of the fallback label; both sides are raw now.
 
+The first writer MINTS a block's physical identity -- `ResolveNeedsPutBlockStore`
+returns the class that gets persisted -- and it was the last normalization left on a
+write path. It now certifies instead of trimming, and does so before the PUT rather
+than leaving it to the write funnel: the object is stored before materialization, so
+a class rejected downstream would leave bytes in S3 that no row points at.
+
 **Not changed, deliberately.** `IsCanonicalStorageClassName` runs on every
 `GetBlockStoreForOrg` call, before the block-store cache lookup. Measured at 163
 ns/op against milliseconds of S3 I/O per block. Moving it behind the cache would
 buy nothing and would weaken unconditional validation at the resolution boundary
 into a cache-miss-only check, which is backwards for the contract this branch
 exists to certify.
+
+**Scope.** R23a is identity *hardening*; it does not prove the class-to-namespace
+binding. See the corrected 2026-08-17 note below and the R23 row in
+`docs/GC-X1-CLOSURE-OPTIONS.md`: both rebind and reuse silently retarget a persisted
+identity, and closing them needs R23b's durable per-class namespace fingerprint.
 
 **Deployment note.** Every class declared under `storage.classes` must now be
 registrable, not only the ones something references. `configs/config.prod.yaml`
@@ -75,21 +86,31 @@ or remove the class the deployment does not use.
 
 ---
 
-## 2026-08-17 - R23a certifies storage class as physical identity
+## 2026-08-17 - R23a hardens storage class as physical identity (PARTIAL)
 
-R23a defines `B = storage_class` under an append-only/non-reuse configuration
-contract. A storage class that has stored objects must never be rebound to another
+R23a adopts `storage_class` as the candidate `B` under an append-only/non-reuse
+configuration contract, and hardens every layer to preserve it exactly. The
+contract itself is asserted by operators, not enforced: see the corrected scope
+note below. A storage class that has stored objects must never be rebound to another
 physical namespace or reused for a different backend; moving data to a new namespace
 requires a new class name. Configuration validation now rejects ambiguous,
 non-canonical storage-class names and collisions between modern classes and legacy
 backend names.
 
-The two halves of the contract differ in how they fail. No-rebind is largely
-self-enforcing: repointing a class that holds objects makes every block in it
-unreadable at once, a loud outage rather than a quiet hazard. No-reuse is silent —
-reviving a decommissioned class name on a fresh bucket breaks nothing visibly while
-any surviving persisted `storage_class` starts resolving to the new namespace. Only
-the second half needs future machinery, and it belongs with R23b.
+**Corrected scope (2026-08-18).** An earlier version of this entry claimed no-rebind
+was largely self-enforcing, because repointing a class that holds objects would make
+every block unreadable at once. That is wrong for the most likely rebind — copy
+bucket A to B, then repoint — where reads keep working and nothing is loud. And
+"the system will probably make noise" is not a safety property in the first place.
+
+What actually makes a migration rebind survivable is narrower: keys are content
+addressed (`blocks/<org_id>/…/<hash>`, no namespace component) and liveness lives in
+Cassandra, so the garbage verdict still describes the same content and a misdirected
+delete removes the same condemned bytes. That holds only while the new namespace
+answers to the same liveness authority — which is exactly what reuse breaks, and
+what a rebind onto another cluster's bucket breaks too. Both halves silently
+retarget a persisted identity and neither is prevented; R23b must record a durable
+per-class namespace fingerprint, re-checked fail-closed.
 
 The class/legacy collision check closes a rebind the code could produce by itself:
 a class whose initialization fails is skipped with a warning, after which the legacy

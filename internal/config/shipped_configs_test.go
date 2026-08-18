@@ -162,6 +162,63 @@ func TestShippedConfigsKeepProfileCapsUnderTheNodeCeiling(t *testing.T) {
 	}
 }
 
+// Nothing reserves "hot" globally -- what is enforced is that the class and legacy
+// backend namespaces may not overlap. In practice that still rejects a modern class
+// named "hot", but only because DefaultConfig ships a legacy "hot" backend and YAML
+// decoding MERGES into that map rather than replacing it. That merge is the load
+// bearing and non-obvious part: a `backends: {}` line looks like it clears the
+// default and does not, while a null `backends:` does. The comment in DefaultConfig
+// states the rule; this pins the behavior it rests on.
+func TestModernHotClassCollidesWithTheShippedLegacyBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		doc           string
+		wantCollision bool
+	}{
+		{"backends omitted", `storage:
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, true},
+		{"empty mapping merges, does not clear", `storage:
+  backends: {}
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, true},
+		{"nulled leaves no legacy loop to fall through to", `storage:
+  backends:
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			if err := yaml.Unmarshal([]byte(tc.doc), cfg); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if _, legacyHot := cfg.Storage.Backends["hot"]; legacyHot != tc.wantCollision {
+				t.Fatalf("legacy backends[hot] present = %v, want %v", legacyHot, tc.wantCollision)
+			}
+
+			err := validateStorageClassNames(cfg.Storage)
+			if tc.wantCollision {
+				if err == nil || !strings.Contains(err.Error(), "collides") {
+					t.Fatalf("error = %v, want a collision rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error = %v, want acceptance: with no legacy entry there is no second binding to fall through to", err)
+			}
+		})
+	}
+}
+
 func TestShippedConfigsUseCanonicalStorageClassNames(t *testing.T) {
 	for _, path := range shippedConfigPaths(t) {
 		t.Run(filepath.Base(path), func(t *testing.T) {

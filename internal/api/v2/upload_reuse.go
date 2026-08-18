@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -124,9 +125,20 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 		if preferredStore == nil {
 			return nil, "", "", fmt.Errorf("preferred block store is unavailable for %s", blockID)
 		}
-		preferredClass = strings.TrimSpace(preferredClass)
+		// The first writer MINTS this block's physical identity: the class returned
+		// here is the one persisted, so it is certified, never normalized. Trimming
+		// would store an identity the writer never named -- and now that the write
+		// funnel refuses a non-canonical class outright, a trim's only remaining
+		// effect would be to turn that hard refusal into a silent rewrite.
+		//
+		// Certifying here rather than leaving it to the funnel also keeps the PUT
+		// from landing: the object is written before materialization, so a class
+		// rejected downstream would leave bytes in S3 that no row points at.
 		if preferredClass == "" {
 			return nil, "", "", fmt.Errorf("preferred storage class is empty for %s", blockID)
+		}
+		if !config.IsCanonicalStorageClassName(preferredClass) {
+			return nil, "", "", fmt.Errorf("preferred storage class %q for block %s is not canonical", preferredClass, blockID)
 		}
 		return preferredStore, preferredClass, preferredStore.StorageKeyForHash(blockID), nil
 	}

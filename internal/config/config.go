@@ -1438,9 +1438,15 @@ func DefaultConfig() *Config {
 		Storage: StorageConfig{
 			Mode:         "",
 			DefaultClass: "hot",
-			// "hot" is the reserved legacy backend name. Modern classes must use a
-			// distinct name so a failed class initialization cannot fall through to
-			// the legacy registration loop and silently bind another namespace.
+			// Nothing reserves the name "hot" globally; what validateStorageClassNames
+			// enforces is that the class and legacy-backend namespaces may not overlap.
+			// This default entry is what makes storage.classes.hot a collision -- and so
+			// a startup failure -- in any configuration that does not explicitly null
+			// "backends:", which is the point: a class whose initialization fails is
+			// skipped with a warning, and the legacy loop would then bind the same name
+			// to a different bucket. A config that DOES null "backends:" may use "hot"
+			// as a modern class, because there is no legacy entry left to fall through
+			// to.
 			Backends: map[string]BackendConfig{
 				"hot": {
 					Type:   "s3",
