@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1451,7 +1452,7 @@ func DefaultConfig() *Config {
 				"hot": {
 					Type:   "s3",
 					Bucket: "sesamefs-blocks",
-					Region: "us-east-1",
+					Region: DefaultStorageRegion,
 				},
 			},
 		},
@@ -3414,6 +3415,124 @@ func IsCanonicalStorageClassName(name string) bool {
 		storageClassNamePattern.MatchString(name)
 }
 
+// DefaultStorageRegion is the region the runtime applies to a class that declares
+// none. It lives here, next to the namespace descriptor, because the two must not
+// drift: if validation compared the raw empty value while the runtime substituted
+// a region, two classes could compare as distinct namespaces and still address the
+// same bucket through the same endpoint.
+const DefaultStorageRegion = "us-east-1"
+
+// EffectiveRegion returns the region the S3 client will actually be built with.
+// The storage runtime calls this too, so the value validation reasons about is
+// the value the client uses.
+func (c StorageClassConfig) EffectiveRegion() string {
+	if region := strings.TrimSpace(c.Region); region != "" {
+		return region
+	}
+	return DefaultStorageRegion
+}
+
+// EffectiveEndpoint returns the endpoint the S3 client will actually be built
+// with. It only trims: an endpoint can carry a path, and paths are case and
+// slash sensitive, so this must not rewrite what the runtime dials.
+func (c StorageClassConfig) EffectiveEndpoint() string {
+	return strings.TrimSpace(c.Endpoint)
+}
+
+// StorageClassConfig converts a legacy backend entry into the class config the
+// storage manager registers it as. Shared with initStorageManager so a legacy
+// backend is validated as exactly the thing that gets built.
+func (b BackendConfig) StorageClassConfig() StorageClassConfig {
+	return StorageClassConfig{
+		Label:                b.Label,
+		Type:                 b.Type,
+		Bucket:               b.Bucket,
+		Region:               b.Region,
+		Endpoint:             b.Endpoint,
+		AccessKey:            b.AccessKey,
+		SecretKey:            b.SecretKey,
+		ServerSideEncryption: b.ServerSideEncryption,
+		SSEKMSKeyID:          b.SSEKMSKeyID,
+	}
+}
+
+// physicalNamespace renders the object collection a class names: the endpoint,
+// the region and the bucket, and nothing else. Credentials, encryption, tier and
+// failover configure ACCESS to a namespace; they do not decide which one it is,
+// so two classes that differ only there are still two names for one namespace.
+//
+// The comparison is deliberately more aggressive than the runtime: it folds case
+// and a trailing slash that the S3 client would keep. Erring toward "these are the
+// same" can only produce a startup rejection, never a silent alias -- the right
+// direction for a name that authorizes deletes.
+//
+// The declared `type` is not part of the key. initStorageClass builds an S3Store
+// for every registrable entry regardless of what type says, so including it would
+// let `type: glacier` and `type: s3` over one bucket read as two namespaces while
+// the runtime opens the same one.
+func (c StorageClassConfig) physicalNamespace() string {
+	endpoint := strings.ToLower(strings.TrimRight(c.EffectiveEndpoint(), "/"))
+	return fmt.Sprintf("endpoint=%q region=%q bucket=%q",
+		endpoint,
+		strings.ToLower(c.EffectiveRegion()),
+		strings.ToLower(strings.TrimSpace(c.Bucket)),
+	)
+}
+
+// validateStorageClassNamespaceAliasing rejects two storage class names over one
+// physical namespace -- the inverse of the rebind R23 describes, and the half a
+// configuration file can actually prove.
+//
+// It matters because storage keys carry no class component: hashToKey derives
+// blocks/<org_id>/<h[0:2]>/<h[2:4]>/<hash> and every BlockStore uses the same
+// "blocks/" prefix, so two classes over one bucket share an org's key space
+// exactly. Under derived keys that is a collision between identities that are
+// supposed to be independent; minted keys would remove the collision, but the two
+// names still would not be two namespaces, and R23 requires that they are.
+//
+// Unregistrable entries are skipped: initStorageManager skips a legacy s3 backend
+// with an empty bucket, so it names no namespace and cannot alias one. Declared
+// modern classes are already required to be registrable by the caller.
+func (c *Config) validateStorageClassNamespaceAliasing() error {
+	type declaration struct {
+		scope     string
+		namespace string
+	}
+	declarations := make([]declaration, 0, len(c.Storage.Classes)+len(c.Storage.Backends))
+	for name, classCfg := range c.Storage.Classes {
+		if !c.configuredStorageClass(name) {
+			continue
+		}
+		declarations = append(declarations, declaration{
+			scope:     "storage.classes." + name,
+			namespace: classCfg.physicalNamespace(),
+		})
+	}
+	for name, backendCfg := range c.Storage.Backends {
+		if !c.configuredStorageClass(name) {
+			continue
+		}
+		declarations = append(declarations, declaration{
+			scope:     "storage.backends." + name,
+			namespace: backendCfg.StorageClassConfig().physicalNamespace(),
+		})
+	}
+	// Map iteration order is not stable, and an error that names a different pair
+	// on every boot is an error nobody can act on.
+	sort.Slice(declarations, func(i, j int) bool { return declarations[i].scope < declarations[j].scope })
+
+	claimedBy := make(map[string]string, len(declarations))
+	for _, declared := range declarations {
+		if previousScope, ok := claimedBy[declared.namespace]; ok {
+			return fmt.Errorf(
+				"%s and %s both name the physical namespace %s; a storage class name is the permanent identity of one namespace, so give each namespace exactly one class name",
+				previousScope, declared.scope, declared.namespace)
+		}
+		claimedBy[declared.namespace] = declared.scope
+	}
+	return nil
+}
+
 // validateStorageClassIdentity protects the R23a contract that a persisted
 // storage_class is itself the immutable physical namespace identity.
 //
@@ -3452,7 +3571,7 @@ func (c *Config) validateStorageClassIdentity() error {
 			return err
 		}
 	}
-	return nil
+	return c.validateStorageClassNamespaceAliasing()
 }
 
 // validateStorageClassReference checks one field that names a storage class. A

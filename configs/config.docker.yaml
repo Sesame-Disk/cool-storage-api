@@ -121,15 +121,14 @@ storage:
       hot: hot-minio-local
       cold: ""
 
-  # Legacy backends (kept for backwards compatibility)
+  # No legacy backends. This entry used to declare "hot" over the very bucket
+  # hot-minio-local already names (http://minio:9000/sesamefs-blocks), which made
+  # one physical namespace answer to two storage class names -- the inverse of the
+  # R23 rebind, and rejected by validation since R23b. The explicit null matters:
+  # DefaultConfig ships a legacy "hot" backend and YAML decoding MERGES into that
+  # map, so an omitted or empty-mapping "backends:" would leave the default in
+  # place, pointing at AWS instead of MinIO.
   backends:
-    hot:
-      type: s3
-      endpoint: "http://minio:9000"
-      bucket: sesamefs-blocks
-      region: us-east-1
-      server_side_encryption: ""
-      sse_kms_key_id: ""
 
 web_uploads:
   enable_upload_folder: true

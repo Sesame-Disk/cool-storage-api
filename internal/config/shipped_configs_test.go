@@ -244,3 +244,27 @@ func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
 		})
 	}
 }
+
+// R23b states the second half of the storage identity contract: a class name is
+// the permanent identity of ONE physical namespace, so one namespace may not
+// answer to two names. config.docker.yaml shipped exactly that defect until R23b
+// -- a legacy "hot" backend over http://minio:9000/sesamefs-blocks, the bucket
+// hot-minio-local already named -- which gave the dev stack two class identities
+// sharing one org key space, since storage keys carry no class component.
+//
+// Scope limit worth knowing: hydrateShippedStoragePlaceholders fills empty buckets
+// with a per-name placeholder, so classes whose bucket comes from the deployment
+// environment are made distinct here by construction. This test proves the shipped
+// FILES declare no alias; a deployment that points two of those env vars at one
+// bucket is caught by Config.Validate at startup, not here.
+func TestShippedConfigsDeclareOneClassPerPhysicalNamespace(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			hydrateShippedStoragePlaceholders(cfg)
+			if err := cfg.validateStorageClassNamespaceAliasing(); err != nil {
+				t.Fatalf("shipped configuration aliases a storage namespace: %v", err)
+			}
+		})
+	}
+}

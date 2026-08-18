@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -1417,5 +1418,26 @@ func TestHandleUserAvatar(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &response)
 	if response["url"] == nil {
 		t.Error("response should contain url field")
+	}
+}
+
+// R23b: validation rejects two storage class names over one physical namespace,
+// and that comparison is only sound while the descriptor it compares is the one
+// the S3 clients are actually built from. A local region default in this file is
+// exactly how that stops being true: config would compare the raw "" and the
+// runtime would open us-east-1, so two names for one bucket would read as two
+// namespaces and pass.
+//
+// A source gate rather than a behavioral one because S3Store does not expose the
+// region it was constructed with; what needs protecting is that this file has no
+// second definition of the effective value at all.
+func TestServerDoesNotRedefineTheEffectiveStorageRegion(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+	if strings.Contains(string(source), config.DefaultStorageRegion) {
+		t.Fatalf("server.go names the region default %q literally; derive it from config.StorageClassConfig.EffectiveRegion instead",
+			config.DefaultStorageRegion)
 	}
 }

@@ -8,6 +8,47 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-18 - R23b storage-class namespace contract freeze
+
+`storage_class` is now stated as the permanent identity of one physical namespace,
+and the half of that contract configuration can prove is enforced. A used class
+name may never be repointed at another namespace and never reused for one; new
+placement takes a new name. Credentials, encryption, tier and failover may change
+freely — endpoint, region and bucket may not.
+
+`Config.Validate` rejects two storage class names over one physical namespace,
+covering modern classes and legacy backends together. The descriptor is
+`(endpoint, region, bucket)`; credentials, SSE, tier and failover configure access
+to a collection rather than deciding which collection it is. Comparison folds case
+and a trailing slash, which can only over-reject, never alias. This is not a
+hypothetical: storage keys carry no class component, so two classes over one bucket
+share an org's key space exactly.
+
+`config.docker.yaml` had that defect. Its legacy `hot` backend named
+`http://minio:9000/sesamefs-blocks`, the same bucket as `hot-minio-local`, the
+docker `default_class` — two class identities over one namespace in the dev and
+integration stack, with `hot` selectable as an explicit library storage class. The
+entry is now an explicit YAML null; an omitted or `{}` section would merge with the
+legacy `hot` backend `DefaultConfig` ships and point at AWS instead of MinIO.
+
+`StorageClassConfig.EffectiveRegion`/`EffectiveEndpoint` and
+`BackendConfig.StorageClassConfig()` are now the single definitions shared by
+validation and the storage runtime, including the legacy singleton store, so what
+gets compared is what the S3 client is built from. `initStorageClass` previously
+applied its own `us-east-1` default, which would have made `region: ""` and
+`region: us-east-1` over one bucket compare as two namespaces;
+`TestServerDoesNotRedefineTheEffectiveStorageRegion` guards against it returning.
+
+Deliberately NOT included: the durable class→namespace fingerprint table. It
+answers whether a name meant another bucket in the past, which needs durable
+history and a serial-domain settled LWT, and it is not what closes X1 — the minted
+single-use `storage_key` is. Deferred, not cancelled; the moment to revisit is
+right after `P` is exact. An in-place rebind between boots and reuse of a retired
+name by a fresh install over another cluster's bucket therefore remain contract,
+not runtime proof.
+
+---
+
 ## 2026-08-18 - R23a validation hardening and raw-identity consistency
 
 Storage-class references now require a class that can actually be registered,

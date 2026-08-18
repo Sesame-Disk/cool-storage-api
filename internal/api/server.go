@@ -440,16 +440,9 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 			slog.Info("Skipping unconfigured legacy storage backend", "backend", name)
 			continue
 		}
-		classCfg := config.StorageClassConfig{
-			Type:                 backendCfg.Type,
-			Bucket:               backendCfg.Bucket,
-			Region:               backendCfg.Region,
-			Endpoint:             backendCfg.Endpoint,
-			AccessKey:            backendCfg.AccessKey,
-			SecretKey:            backendCfg.SecretKey,
-			ServerSideEncryption: backendCfg.ServerSideEncryption,
-			SSEKMSKeyID:          backendCfg.SSEKMSKeyID,
-		}
+		// Shared with configuration validation so a legacy backend is checked as
+		// exactly the class config it gets registered as.
+		classCfg := backendCfg.StorageClassConfig()
 		s3Store, err := initStorageClass(name, classCfg)
 		if err != nil {
 			panic(fmt.Errorf("initialize legacy storage backend %q: %w", name, err))
@@ -472,12 +465,11 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 		return nil, fmt.Errorf("storage class %s bucket is not configured", name)
 	}
 
-	region := strings.TrimSpace(cfg.Region)
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	endpoint := strings.TrimSpace(cfg.Endpoint)
+	// Both come from config, which is also what validation compares when it
+	// checks that no two class names denote one physical namespace. A local
+	// default here would be a second definition of "which bucket is this".
+	region := cfg.EffectiveRegion()
+	endpoint := cfg.EffectiveEndpoint()
 	accessKey := strings.TrimSpace(cfg.AccessKey)
 	secretKey := strings.TrimSpace(cfg.SecretKey)
 	serverSideEncryption := strings.TrimSpace(cfg.ServerSideEncryption)
@@ -520,21 +512,21 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	// Do not derive the singleton store from storage.classes; multi-region nodes
 	// must use storageManager-backed resolution instead of a process-wide default.
 	if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
-		endpoint = strings.TrimSpace(hotBackend.Endpoint)
-		bucket = strings.TrimSpace(hotBackend.Bucket)
-		region = strings.TrimSpace(hotBackend.Region)
-		accessKey = strings.TrimSpace(hotBackend.AccessKey)
-		secretKey = strings.TrimSpace(hotBackend.SecretKey)
-		sseMode = strings.TrimSpace(hotBackend.ServerSideEncryption)
-		sseKMSKeyID = strings.TrimSpace(hotBackend.SSEKMSKeyID)
+		// Same conversion and same effective values the manager registers this
+		// backend with, so the singleton cannot end up addressing a different
+		// bucket/region than the class named "hot".
+		classCfg := hotBackend.StorageClassConfig()
+		endpoint = classCfg.EffectiveEndpoint()
+		bucket = strings.TrimSpace(classCfg.Bucket)
+		region = classCfg.EffectiveRegion()
+		accessKey = strings.TrimSpace(classCfg.AccessKey)
+		secretKey = strings.TrimSpace(classCfg.SecretKey)
+		sseMode = strings.TrimSpace(classCfg.ServerSideEncryption)
+		sseKMSKeyID = strings.TrimSpace(classCfg.SSEKMSKeyID)
 	}
 
 	if bucket == "" {
 		return nil, errLegacyS3NotConfigured
-	}
-
-	if region == "" {
-		region = "us-east-1"
 	}
 
 	s3Cfg := storage.S3Config{

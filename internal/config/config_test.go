@@ -2606,3 +2606,159 @@ func TestIsCanonicalStorageClassName(t *testing.T) {
 		}
 	}
 }
+
+// R23b freezes storage_class as the permanent name of a physical namespace. That
+// contract has two directions, and R23a only closed one of them: one name must
+// never mean two namespaces, and two names must never mean one namespace.
+//
+// The second direction is the one configuration can actually prove, and it is not
+// cosmetic. Storage keys are content addressed and carry no class component
+// (hashToKey → blocks/<org>/<h0:2>/<h2:4>/<hash>), so two classes over one bucket
+// share an org's key space exactly: work authorized under one class name operates
+// on objects the other class also names.
+func TestConfigValidateRejectsTwoStorageClassesOverOneNamespace(t *testing.T) {
+	newConfig := func() *Config {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.Storage.Backends = nil
+		cfg.Storage.DefaultClass = "hot-v1"
+		cfg.Storage.Classes = map[string]StorageClassConfig{
+			"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000"},
+		}
+		return cfg
+	}
+
+	if err := newConfig().Validate(); err != nil {
+		t.Fatalf("Validate() returned error for a single class: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "two modern classes",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
+				}
+			},
+		},
+		{
+			name: "modern class and legacy backend",
+			mutate: func(c *Config) {
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000"},
+				}
+			},
+		},
+		{
+			// The runtime substitutes DefaultStorageRegion for an empty region, so a
+			// descriptor built from the raw value would read these as two namespaces
+			// while the S3 clients address one.
+			name: "declared region versus the runtime default",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "", Endpoint: "http://minio:9000",
+				}
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: DefaultStorageRegion, Endpoint: "http://minio:9000",
+				}
+			},
+		},
+		{
+			name: "endpoint spelled with a trailing slash and different case",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://MinIO:9000/",
+				}
+			},
+		},
+		{
+			// Identity is the object collection, not the configuration around it.
+			// Different credentials, encryption, tier or failover still name one bucket.
+			name: "same namespace with different non-identity fields",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
+					Tier: "cold", AccessKey: "other", SecretKey: "other",
+					ServerSideEncryption: "AES256", FailoverClass: "hot-v1",
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "physical namespace") {
+				t.Fatalf("Validate() error = %v, want a shared-namespace rejection", err)
+			}
+		})
+	}
+}
+
+// The check must reject aliasing, not multi-backend deployments: every shipped
+// multi-region config declares several classes, and they must keep validating.
+func TestConfigValidateAcceptsDistinctStorageNamespaces(t *testing.T) {
+	cases := []struct {
+		name    string
+		classes map[string]StorageClassConfig
+	}{
+		{
+			name: "different buckets on one endpoint",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks-a", Region: "us-east-1", Endpoint: "http://minio:9000"},
+				"hot-v2": {Type: "s3", Bucket: "blocks-b", Region: "us-east-1", Endpoint: "http://minio:9000"},
+			},
+		},
+		{
+			name: "same bucket name in different regions",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+				"hot-v2": {Type: "s3", Bucket: "blocks", Region: "eu-west-1"},
+			},
+		},
+		{
+			name: "same bucket name on different endpoints",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio-a:9000"},
+				"hot-v2": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio-b:9000"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.Storage.Backends = nil
+			cfg.Storage.DefaultClass = "hot-v1"
+			cfg.Storage.Classes = tc.classes
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v, want nil for distinct namespaces", err)
+			}
+		})
+	}
+}
+
+// A legacy backend the manager will skip declares no namespace, so it cannot
+// alias one. initStorageManager skips an s3 backend with an empty bucket; the
+// validator must agree, or a shipped config that relies on that skip stops booting.
+func TestConfigValidateIgnoresUnregistrableLegacyBackendForNamespaceAliasing(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.Storage.DefaultClass = "hot-v1"
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+	}
+	cfg.Storage.Backends = map[string]BackendConfig{
+		"hot": {Type: "s3", Bucket: "", Region: ""},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil: an unregistrable backend names no namespace", err)
+	}
+}
