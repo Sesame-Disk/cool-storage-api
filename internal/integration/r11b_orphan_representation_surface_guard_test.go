@@ -20,8 +20,12 @@ func TestR11bCanonicalOrphanRepresentationSurface(t *testing.T) {
 		".git": true, "frontend": true, "mobile-frontend": true,
 		"node_modules": true, "vendor": true,
 	}
+	// `_` is a word character, so `gc_s3_orphans\b` already cannot match inside
+	// `gc_s3_orphans_by_day` — the same boundary the R22a gate relies on. Skipping
+	// literals that merely mention the projection would therefore buy nothing and
+	// would open an evasion: one literal naming both tables would carry a canonical
+	// violation past the gate.
 	canonicalOrphanTable := regexp.MustCompile(`(?i)\bgc_s3_orphans\b`)
-	projectionTable := regexp.MustCompile(`(?i)\bgc_s3_orphans_by_day\b`)
 
 	scanned := 0
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
@@ -48,7 +52,7 @@ func TestR11bCanonicalOrphanRepresentationSurface(t *testing.T) {
 			return nil
 		}
 		for _, query := range stringLiteralsIn(file) {
-			if !canonicalOrphanTable.MatchString(query) || projectionTable.MatchString(query) {
+			if !canonicalOrphanTable.MatchString(query) {
 				continue
 			}
 			if strings.Contains(strings.ToLower(query), "representation_id") {
