@@ -195,6 +195,9 @@ func TestManagerResolveStorageClass(t *testing.T) {
 				if err == nil {
 					t.Fatal("ResolveStorageClass accepted an unregistered explicit library class")
 				}
+				if got != "" {
+					t.Fatalf("ResolveStorageClass returned invalid class %q with error", got)
+				}
 				return
 			}
 			if err != nil {
@@ -266,6 +269,19 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			t.Fatalf("ResolveStorageClass exact override = %q, want %q", got, "hot-s3-usa")
 		}
 	})
+}
+
+func TestManagerResolveStorageClassRejectsNonCanonicalLastResortBackend(t *testing.T) {
+	m := NewManager()
+	m.RegisterBackend("hot_v1", &mockStore{accessType: AccessImmediate}, "")
+
+	got, err := m.ResolveStorageClass("", "", "hot")
+	if err == nil {
+		t.Fatalf("ResolveStorageClass returned %q for a non-canonical fallback backend", got)
+	}
+	if got != "" {
+		t.Fatalf("ResolveStorageClass returned invalid class %q with error", got)
+	}
 }
 
 func TestManagerGetHealthyBackend(t *testing.T) {

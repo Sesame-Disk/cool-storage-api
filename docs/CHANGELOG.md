@@ -114,10 +114,12 @@ what a rebind onto another cluster's bucket breaks too. Both halves silently
 retarget a persisted identity and neither is prevented; R23b must record a durable
 per-class namespace fingerprint, re-checked fail-closed.
 
-The class/legacy collision check closes a rebind the code could produce by itself:
-a class whose initialization fails is skipped with a warning, after which the legacy
-`backends:` loop registers the same name against a different bucket, so the binding
-depended on whether a transient failure happened at boot.
+The class/legacy collision check closes a rebind the code could produce by itself.
+Before R23a, a class whose initialization failed was skipped with a warning, after
+which the legacy `backends:` loop could register the same name against a different
+bucket, so the binding depended on whether a transient failure happened at boot.
+R23a now rejects the ambiguous configuration and makes initialization failure fatal,
+so the process cannot continue with a partial backend set.
 
 Validation now also covers the fields that REFERENCE a class — `default_class`,
 `failover_class` and `region_classes.*` — because a reference that does not resolve

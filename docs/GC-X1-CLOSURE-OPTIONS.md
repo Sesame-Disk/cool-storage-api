@@ -109,14 +109,15 @@ recorded per class and re-checked fail-closed would close both. It belongs with
 R23b, and until it lands `B = storage_class` is asserted rather than certified.
 
 **The collision check closes a rebind the code could produce on its own, with no
-operator action.** A class whose `initStorageClass` fails is skipped with only a
-warning (`internal/api/server.go`), and the legacy `backends:` loop then registers
-any name not already registered. With `classes: hot` and `backends: hot` both
-defined, a boot where the class initializes binds `hot` to the class bucket, and a
-boot where it fails transiently binds the same name to the legacy bucket. Same
-persisted `storage_class`, two physical namespaces, chosen by a transient failure.
-Rejecting the ambiguous configuration at startup is what makes the label usable as
-`B` at all.
+operator action.** Before R23a, a class whose `initStorageClass` failed was skipped
+with only a warning (`internal/api/server.go`), and the legacy `backends:` loop then
+registered any name not already registered. With `classes: hot` and `backends: hot`
+both defined, a boot where the class initialized bound `hot` to the class bucket,
+and a boot where it failed transiently bound the same name to the legacy bucket.
+Same persisted `storage_class`, two physical namespaces, chosen by a transient
+failure. R23a rejects the ambiguous configuration and now aborts startup when a
+declared class fails to initialize, so the manager cannot silently continue with a
+partial backend set.
 
 **The canon holds at the persistence boundary, not only at admission.** A stored
 `storage_class` is the identity, so the write funnel

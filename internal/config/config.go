@@ -1442,11 +1442,11 @@ func DefaultConfig() *Config {
 			// enforces is that the class and legacy-backend namespaces may not overlap.
 			// This default entry is what makes storage.classes.hot a collision -- and so
 			// a startup failure -- in any configuration that does not explicitly null
-			// "backends:", which is the point: a class whose initialization fails is
-			// skipped with a warning, and the legacy loop would then bind the same name
-			// to a different bucket. A config that DOES null "backends:" may use "hot"
-			// as a modern class, because there is no legacy entry left to fall through
-			// to.
+			// "backends:", which is the point. Before R23a, a failed class was skipped with
+			// a warning, and the legacy loop could then bind the same name to a different
+			// bucket. Runtime now aborts startup when any declared class fails to
+			// initialize. A config that DOES null "backends:" may use "hot" as a modern
+			// class, because there is no legacy entry left to fall through to.
 			Backends: map[string]BackendConfig{
 				"hot": {
 					Type:   "s3",

@@ -332,9 +332,9 @@ func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier
 		return m.resolveRegisteredStorageClass(m.defaultClass, "default")
 	}
 
-	// 5. Last resort: return first available backend
+	// 5. Last resort: validate the first available backend
 	for name := range m.backends {
-		return name, nil
+		return m.resolveRegisteredStorageClass(name, "fallback")
 	}
 
 	return "", fmt.Errorf("no storage class is registered")
@@ -345,7 +345,7 @@ func (m *Manager) resolveRegisteredStorageClass(className, source string) (strin
 		return "", fmt.Errorf("%s storage class %q is not canonical", source, className)
 	}
 	if _, ok := m.backends[className]; !ok {
-		return className, fmt.Errorf("%s storage class %q is not registered", source, className)
+		return "", fmt.Errorf("%s storage class %q is not registered", source, className)
 	}
 	return className, nil
 }
