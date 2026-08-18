@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -574,9 +575,15 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		return fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
 	}
-	storageClass = strings.TrimSpace(storageClass)
+	// R23a: the persisted storage_class is the physical namespace identity, so this
+	// funnel is the last door a non-canonical value could enter through. Normalizing
+	// here instead would persist an identity the writer never named, and every reader
+	// downstream — GC included — resolves the raw stored value.
 	if storageClass == "" {
 		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
+	}
+	if !config.IsCanonicalStorageClassName(storageClass) {
+		return fmt.Errorf("%w: non-canonical storage class %q for block %s", ErrBlockMetadataPermanent, storageClass, blockID)
 	}
 	sha1 = NormalizeBlockID(sha1)
 	if sha1 != "" && !isHexN(sha1, 40) {
@@ -646,11 +653,19 @@ func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1 stri
 		// rather than retry into the same corrupt row or mask it.
 		return fmt.Errorf("%w: block %s has malformed GC ownership: %w", ErrBlockMetadataPermanent, blockID, ownershipErr)
 	}
-	if activeClaim || repairClaim || row.CreatedAt == nil || !row.StorageClassPresent || strings.TrimSpace(row.StorageClass) == "" {
+	if activeClaim || repairClaim || row.CreatedAt == nil || !row.StorageClassPresent || row.StorageClass == "" {
 		// Deliberately transient (unmarked): an active/repair claim or a still-stub
 		// row can converge on a re-probe (GC abandons, or a concurrent uploader
 		// completes it), so the caller retries instead of failing the upload.
 		return fmt.Errorf("block %s has incomplete canonical metadata", blockID)
+	}
+	// R23a: validating only the incoming argument is not enough. When the INSERT
+	// loses, the caller INHERITS the identity already on the row, and reporting
+	// success would hand back a physical identity that no reader can resolve --
+	// ProbeBlockReuse and GC both refuse a non-canonical stored class. Permanent,
+	// not transient: unlike a claim or a stub, a corrupt label never converges.
+	if !config.IsCanonicalStorageClassName(row.StorageClass) {
+		return fmt.Errorf("%w: block %s has non-canonical storage class %q", ErrBlockMetadataPermanent, blockID, row.StorageClass)
 	}
 
 	currentRepresentationID := strings.TrimSpace(row.RepresentationID)
@@ -904,11 +919,17 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 	probe := BlockReuseProbe{
 		Sha1:         strings.TrimSpace(metadata.Sha1),
 		SizeBytes:    metadata.SizeBytes,
-		StorageClass: strings.TrimSpace(metadata.StorageClass),
+		StorageClass: metadata.StorageClass,
 		StorageKey:   strings.TrimSpace(metadata.StorageKey),
 	}
 	if !metadata.StorageClassPresent || probe.StorageClass == "" {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
+	}
+	// A stored class that is not canonical cannot name a physical namespace, and the
+	// probe is what every reuse/repair path resolves through. Reject it here rather
+	// than let a normalized copy of it select a backend.
+	if !config.IsCanonicalStorageClassName(probe.StorageClass) {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has non-canonical storage class %q", blockID, probe.StorageClass)
 	}
 	if activeClaim || repairClaim {
 		probe.Decision = BlockReuseBlockedByGC

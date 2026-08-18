@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -41,6 +42,20 @@ func loadShippedConfig(t *testing.T, path string) *Config {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	return cfg
+}
+
+// Some shipped production files intentionally leave class buckets empty because
+// deployment injects them through S3_CLASS_<CLASS>_BUCKET. Reference validation
+// below exercises the topology independently; fill those deployment placeholders
+// with deterministic test buckets. Config.Validate still rejects an empty bucket
+// when the deployment did not provide the required environment override.
+func hydrateShippedStoragePlaceholders(cfg *Config) {
+	for name, classCfg := range cfg.Storage.Classes {
+		if strings.TrimSpace(classCfg.Bucket) == "" {
+			classCfg.Bucket = "shipped-test-" + name
+			cfg.Storage.Classes[name] = classCfg
+		}
+	}
 }
 
 func TestShippedConfigsPassDownloadAdmissionValidation(t *testing.T) {
@@ -142,6 +157,89 @@ func TestShippedConfigsKeepProfileCapsUnderTheNodeCeiling(t *testing.T) {
 				if cap > d.MaxActivePerNode {
 					t.Fatalf("%s = %d exceeds max_active_per_node = %d", name, cap, d.MaxActivePerNode)
 				}
+			}
+		})
+	}
+}
+
+// Nothing reserves "hot" globally -- what is enforced is that the class and legacy
+// backend namespaces may not overlap. In practice that still rejects a modern class
+// named "hot", but only because DefaultConfig ships a legacy "hot" backend and YAML
+// decoding MERGES into that map rather than replacing it. That merge is the load
+// bearing and non-obvious part: a `backends: {}` line looks like it clears the
+// default and does not, while a null `backends:` does. The comment in DefaultConfig
+// states the rule; this pins the behavior it rests on.
+func TestModernHotClassCollidesWithTheShippedLegacyBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		doc           string
+		wantCollision bool
+	}{
+		{"backends omitted", `storage:
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, true},
+		{"empty mapping merges, does not clear", `storage:
+  backends: {}
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, true},
+		{"nulled leaves no legacy loop to fall through to", `storage:
+  backends:
+  classes:
+    hot:
+      type: s3
+      bucket: b
+`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			if err := yaml.Unmarshal([]byte(tc.doc), cfg); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if _, legacyHot := cfg.Storage.Backends["hot"]; legacyHot != tc.wantCollision {
+				t.Fatalf("legacy backends[hot] present = %v, want %v", legacyHot, tc.wantCollision)
+			}
+
+			err := validateStorageClassNames(cfg.Storage)
+			if tc.wantCollision {
+				if err == nil || !strings.Contains(err.Error(), "collides") {
+					t.Fatalf("error = %v, want a collision rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error = %v, want acceptance: with no legacy entry there is no second binding to fall through to", err)
+			}
+		})
+	}
+}
+
+func TestShippedConfigsUseCanonicalStorageClassNames(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			if err := validateStorageClassNames(cfg.Storage); err != nil {
+				t.Fatalf("shipped configuration has invalid storage class identity: %v", err)
+			}
+		})
+	}
+}
+
+// Every storage class a shipped config REFERENCES must resolve to one it
+// declares. A typo in failover_class is invisible until the primary backend is
+// down, so the repo's own files are the cheapest place to catch it.
+func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			hydrateShippedStoragePlaceholders(cfg)
+			if err := cfg.validateStorageClassIdentity(); err != nil {
+				t.Fatalf("shipped configuration would refuse to start: %v", err)
 			}
 		})
 	}

@@ -25,7 +25,10 @@ func (c *storageManagerHealthChecker) HeadBucket(ctx context.Context) error {
 		return fmt.Errorf("storage manager not configured")
 	}
 
-	preferredClass := c.manager.ResolveStorageClass("", "", "hot")
+	preferredClass, err := c.manager.ResolveStorageClass("", "", "hot")
+	if err != nil {
+		return err
+	}
 	backend, actualClass, err := c.manager.GetHealthyBackend(preferredClass)
 	if err != nil {
 		return err

@@ -660,8 +660,8 @@ func TestGetBlockStoreDoesNotFallBackToLegacyWhenStorageManagerFails(t *testing.
 	if blockStore != nil {
 		t.Fatal("expected nil blockStore when storage manager cannot resolve a healthy backend")
 	}
-	if storageClass != "hot-s3-eu" {
-		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
+	if storageClass != "" {
+		t.Fatalf("storageClass = %q, want empty on resolution error", storageClass)
 	}
 }
 

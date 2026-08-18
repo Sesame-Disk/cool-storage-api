@@ -351,7 +351,10 @@ func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+		preferredClass, err := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
+		if err != nil {
+			return nil, libraryClass, err
+		}
 		return h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferredClass)
 	}
 
@@ -1353,7 +1356,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				}
 				switch probe.Decision {
 				case db.BlockReuseReusable:
-					templateMaterializedStorageClass = strings.TrimSpace(probe.StorageClass)
+					templateMaterializedStorageClass = probe.StorageClass
 					if _, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID); ensureErr != nil {
 						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
@@ -3447,7 +3450,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = strings.TrimSpace(probe.StorageClass)
+			materializedStorageClass = probe.StorageClass
 			_, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
 			return ensureErr
 		case db.BlockReuseNeedsPut:

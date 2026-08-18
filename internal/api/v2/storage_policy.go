@@ -54,29 +54,20 @@ func (p orgStoragePolicy) storageConfig() map[string]string {
 }
 
 func isKnownStorageClass(cfg *config.Config, class string) bool {
-	class = strings.TrimSpace(class)
-	if class == "" || cfg == nil {
+	if cfg == nil || !config.IsCanonicalStorageClassName(class) {
 		return false
 	}
-	if _, ok := cfg.Storage.Classes[class]; ok {
-		return true
-	}
-	if _, ok := cfg.Storage.Backends[class]; ok {
-		return true
-	}
-	return false
+	return cfg.IsConfiguredStorageClass(class)
 }
 
 func isHotStorageClass(cfg *config.Config, class string) bool {
-	class = strings.TrimSpace(class)
-	if class == "" || cfg == nil {
+	if cfg == nil || !config.IsCanonicalStorageClassName(class) || !cfg.IsConfiguredStorageClass(class) {
 		return false
 	}
 	if classCfg, ok := cfg.Storage.Classes[class]; ok {
 		return strings.ToLower(strings.TrimSpace(classCfg.Tier)) != "cold"
 	}
-	_, ok := cfg.Storage.Backends[class]
-	return ok
+	return true
 }
 
 func resolveEndpointRegion(cfg *config.Config, hostname string) string {
@@ -107,7 +98,9 @@ func storageClassRegion(cfg *config.Config, storageClass string) string {
 	if cfg == nil {
 		return ""
 	}
-	storageClass = strings.TrimSpace(storageClass)
+	// Raw on both sides: the only caller decides data residency with this, and the
+	// class it passes was already certified canonical. Regions are not classes and
+	// keep their own lenient matching below.
 	if storageClass == "" {
 		return ""
 	}
@@ -125,7 +118,7 @@ func resolveGlobalDefaultHotStorageClass(cfg *config.Config) string {
 	}
 
 	if isHotStorageClass(cfg, cfg.Storage.DefaultClass) {
-		return strings.TrimSpace(cfg.Storage.DefaultClass)
+		return cfg.Storage.DefaultClass
 	}
 
 	classNames := make([]string, 0, len(cfg.Storage.Classes))
@@ -186,7 +179,9 @@ func validateOrgStoragePolicy(cfg *config.Config, policy orgStoragePolicy) error
 }
 
 func resolveFlexibleCreateStorageClass(cfg *config.Config, policy orgStoragePolicy, hostname, requestedClass string) (string, error) {
-	requestedClass = strings.TrimSpace(requestedClass)
+	// R23a: admit the RAW request. Trimming first would accept " hot-v1 " here and
+	// persist an identity the caller never named, while ChangeStorageClass refuses
+	// that same value -- two doors onto one field disagreeing about what it means.
 	if requestedClass != "" {
 		if err := validateRequestedCreateStorageClass(cfg, requestedClass); err != nil {
 			return "", err
@@ -220,7 +215,7 @@ func resolveStrictCreateStorageClass(cfg *config.Config, policy orgStoragePolicy
 		return "", fmt.Errorf("organization data residency policy is misconfigured; contact an administrator or support")
 	}
 
-	requestedClass = strings.TrimSpace(requestedClass)
+	// Raw, for the same reason as the flexible path above.
 	if requestedClass != "" {
 		if err := validateRequestedCreateStorageClass(cfg, requestedClass); err != nil {
 			return "", err

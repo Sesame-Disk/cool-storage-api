@@ -254,6 +254,74 @@ func TestUpsertBlockMetadataRejectsEmptyRepresentationBeforeInsert(t *testing.T)
 	}
 }
 
+// R23a: the persisted storage_class is the physical namespace identity, so the
+// write funnel is where a non-canonical value has to be stopped. Normalizing it
+// would store an identity the writer never named; every reader resolves the raw
+// stored value and would fail on it later, far from the cause.
+func TestUpsertBlockMetadataRejectsNonCanonicalStorageClass(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
+	})
+	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("insert must not run with a non-canonical storage class")
+		return false, nil
+	}
+
+	for _, storageClass := range []string{" hot", "hot ", "Hot", "hot_tier", "hot--tier", "   "} {
+		err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", PlainBlockRepresentationID, "block-1", "", 1, storageClass, "key")
+		if err == nil || !strings.Contains(err.Error(), "non-canonical storage class") {
+			t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1(%q) error = %v, want non-canonical rejection", storageClass, err)
+		}
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1(%q) error is not permanent: %v", storageClass, err)
+		}
+	}
+}
+
+// Validating only the incoming argument leaves the case that actually matters
+// uncovered: when the INSERT loses, the caller inherits whatever identity the
+// existing row already carries. Reporting success there would finish an upload
+// whose metadata ProbeBlockReuse and GC both refuse to resolve.
+func TestUpsertBlockMetadataRejectsNonCanonicalStorageClassOnTheExistingRow(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+
+	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
+		t.Fatal("must not repair identity on a row whose storage class cannot name a namespace")
+		return false, nil
+	}
+
+	for _, storedClass := range []string{" hot", "hot ", "Hot", "hot_tier", "   "} {
+		upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+			return false, nil // the row already exists; converge on it
+		}
+		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+			row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
+			row.StorageClass = storedClass
+			return row, true, nil
+		}
+
+		// The ARGUMENT is canonical here; only the stored row is not.
+		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+		if err == nil {
+			t.Fatalf("stored class %q: error = nil, want rejection", storedClass)
+		}
+		if !strings.Contains(err.Error(), "non-canonical storage class") {
+			t.Fatalf("stored class %q: error = %v, want non-canonical rejection", storedClass, err)
+		}
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("stored class %q: error is not permanent (a corrupt label never converges): %v", storedClass, err)
+		}
+	}
+}
+
 func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
@@ -1114,7 +1182,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
 
 	probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
-		row := completeProbeMetadataRow("   ")
+		row := completeProbeMetadataRow("")
 		row.SizeBytes = 123
 		return row, true, nil
 	}
@@ -1125,6 +1193,29 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 	}
 	if probe.Decision != BlockReuseUnknownError {
 		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
+
+// A stored class that only looks empty after normalization is corruption, not an
+// absent class: the probe must refuse it instead of resolving a trimmed copy.
+func TestProbeBlockReuseReturnsUnknownErrorForNonCanonicalStorageClass(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	t.Cleanup(func() { probeBlockReuseMetadataFn = oldMetadata })
+
+	for _, storageClass := range []string{"   ", " hot-s3-eu", "Hot-S3-EU", "hot_s3_eu"} {
+		probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+			row := completeProbeMetadataRow(storageClass)
+			row.SizeBytes = 123
+			return row, true, nil
+		}
+
+		probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+		if err == nil {
+			t.Fatalf("ProbeBlockReuse(%q) error = nil, want error", storageClass)
+		}
+		if probe.Decision != BlockReuseUnknownError {
+			t.Fatalf("ProbeBlockReuse(%q) decision = %v, want BlockReuseUnknownError", storageClass, probe.Decision)
+		}
 	}
 }
 

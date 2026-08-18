@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
 // AccessType defines whether storage is immediately accessible or requires retrieval
@@ -232,6 +234,26 @@ func (m *Manager) GetBackend(name string) (Store, bool) {
 	return store, ok
 }
 
+// ResolvePhysicalStorageClass validates the canonical class that names a
+// physical namespace. R23a deliberately uses storage_class itself as B, so
+// this resolver never follows failover or rewrites the label. Callers that
+// selected a backend through GetHealthyBackend must pass its returned class.
+func (m *Manager) ResolvePhysicalStorageClass(className string) (string, error) {
+	if className == "" {
+		return "", fmt.Errorf("storage class is empty")
+	}
+	// Same canon as configuration validation, from one definition, so a name
+	// cannot certify at one layer and fail at the other. This resolver also
+	// vets classes read back from persisted rows, not just configured ones.
+	if !config.IsCanonicalStorageClassName(className) {
+		return "", fmt.Errorf("storage class %q is not canonical", className)
+	}
+	if _, ok := m.backends[className]; !ok {
+		return "", fmt.Errorf("storage class %s not found", className)
+	}
+	return className, nil
+}
+
 // GetHealthyBackend returns a healthy backend for the given class, with failover
 func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error) {
 	// Fall back to default class if empty
@@ -239,8 +261,22 @@ func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error
 		preferredClass = m.defaultClass
 	}
 
-	// Try preferred class first
-	if store, ok := m.backends[preferredClass]; ok {
+	// Failover configurations commonly form a cycle so either region can be
+	// primary. Walk iteratively with a visited set: when every member of that
+	// cycle is unhealthy, return an error instead of exhausting the goroutine
+	// stack while trying the same classes forever.
+	visited := make(map[string]struct{})
+	for {
+		if _, seen := visited[preferredClass]; seen {
+			return nil, "", fmt.Errorf("storage failover cycle detected at class %s", preferredClass)
+		}
+		visited[preferredClass] = struct{}{}
+
+		// Try preferred class first
+		store, ok := m.backends[preferredClass]
+		if !ok {
+			break
+		}
 		m.healthMu.RLock()
 		health := m.health[preferredClass]
 		m.healthMu.RUnlock()
@@ -253,23 +289,29 @@ func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error
 		if health.FailoverClass != "" {
 			log.Printf("Storage class %s is %s, trying failover to %s",
 				preferredClass, health.Status, health.FailoverClass)
-			return m.GetHealthyBackend(health.FailoverClass)
+			preferredClass = health.FailoverClass
+			continue
 		}
+		break
 	}
 
 	// No backend found
 	return nil, "", fmt.Errorf("no healthy backend available for class %s", preferredClass)
 }
 
-// ResolveStorageClass determines the storage class based on context
-// Priority: library override > endpoint region > default
-func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier string) string {
-	// 1. Library override takes precedence
+// ResolveStorageClass determines the storage class based on context.
+// Priority: library override > endpoint region > default. An explicit library
+// class is persisted placement metadata, so it must be registered exactly as
+// stored; only an empty library class may use routing/default selection.
+func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("storage manager is nil")
+	}
+
+	// 1. Library override takes precedence and never falls back. The raw label
+	// is the physical namespace identity used by R23a.
 	if libraryClass != "" {
-		if _, ok := m.backends[libraryClass]; ok {
-			return libraryClass
-		}
-		log.Printf("Warning: library storage class %s not found, falling back", libraryClass)
+		return m.resolveRegisteredStorageClass(libraryClass, "library")
 	}
 
 	// 2. Resolve region from hostname
@@ -278,24 +320,34 @@ func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier
 	// 3. Get class for region and tier
 	if regionConfig, ok := m.regionClasses[region]; ok {
 		if tier == "cold" && regionConfig.Cold != "" {
-			return regionConfig.Cold
+			return m.resolveRegisteredStorageClass(regionConfig.Cold, "region")
 		}
 		if regionConfig.Hot != "" {
-			return regionConfig.Hot
+			return m.resolveRegisteredStorageClass(regionConfig.Hot, "region")
 		}
 	}
 
 	// 4. Fallback to default
 	if m.defaultClass != "" {
-		return m.defaultClass
+		return m.resolveRegisteredStorageClass(m.defaultClass, "default")
 	}
 
-	// 5. Last resort: return first available backend
+	// 5. Last resort: validate the first available backend
 	for name := range m.backends {
-		return name
+		return m.resolveRegisteredStorageClass(name, "fallback")
 	}
 
-	return ""
+	return "", fmt.Errorf("no storage class is registered")
+}
+
+func (m *Manager) resolveRegisteredStorageClass(className, source string) (string, error) {
+	if !config.IsCanonicalStorageClassName(className) {
+		return "", fmt.Errorf("%s storage class %q is not canonical", source, className)
+	}
+	if _, ok := m.backends[className]; !ok {
+		return "", fmt.Errorf("%s storage class %q is not registered", source, className)
+	}
+	return className, nil
 }
 
 // ResolveEndpointRegion resolves a request hostname to a configured region.
@@ -480,7 +532,11 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 	if err != nil {
 		return nil, err
 	}
-	key := blockStoreKey{orgID: normalizedOrgID, class: className}
+	physicalClass, err := m.ResolvePhysicalStorageClass(className)
+	if err != nil {
+		return nil, err
+	}
+	key := blockStoreKey{orgID: normalizedOrgID, class: physicalClass}
 
 	// Check cache first.
 	m.blockStoresMu.RLock()
@@ -490,15 +546,15 @@ func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, err
 	}
 	m.blockStoresMu.RUnlock()
 
-	store, ok := m.backends[className]
+	store, ok := m.backends[physicalClass]
 	if !ok {
-		return nil, fmt.Errorf("storage class %s not found", className)
+		return nil, fmt.Errorf("storage class %s not found", physicalClass)
 	}
 
 	// Cast to S3Store (BlockStore requires S3Store)
 	s3Store, ok := store.(*S3Store)
 	if !ok {
-		return nil, fmt.Errorf("storage class %s is not an S3 backend", className)
+		return nil, fmt.Errorf("storage class %s is not an S3 backend", physicalClass)
 	}
 
 	bs, err := NewOrgBlockStore(s3Store, "blocks/", normalizedOrgID)
@@ -529,19 +585,23 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 	if err != nil {
 		return nil, "", err
 	}
+	physicalClass, err := m.ResolvePhysicalStorageClass(actualClass)
+	if err != nil {
+		return nil, "", err
+	}
 
 	// Cast to S3Store
 	s3Store, ok := store.(*S3Store)
 	if !ok {
-		return nil, "", fmt.Errorf("storage class %s is not an S3 backend", actualClass)
+		return nil, "", fmt.Errorf("storage class %s is not an S3 backend", physicalClass)
 	}
 
-	key := blockStoreKey{orgID: normalizedOrgID, class: actualClass}
+	key := blockStoreKey{orgID: normalizedOrgID, class: physicalClass}
 
 	m.blockStoresMu.RLock()
 	if bs, ok := m.blockStoresByOrg[key]; ok {
 		m.blockStoresMu.RUnlock()
-		return bs, actualClass, nil
+		return bs, physicalClass, nil
 	}
 	m.blockStoresMu.RUnlock()
 
@@ -553,9 +613,9 @@ func (m *Manager) GetHealthyBlockStoreForOrg(orgID, preferredClass string) (*Blo
 	m.blockStoresMu.Lock()
 	defer m.blockStoresMu.Unlock()
 	if existing, ok := m.blockStoresByOrg[key]; ok {
-		return existing, actualClass, nil
+		return existing, physicalClass, nil
 	}
 
 	m.blockStoresByOrg[key] = bs
-	return bs, actualClass, nil
+	return bs, physicalClass, nil
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -1085,7 +1086,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return w.failClosedIfUnavailable("failed to load re-referenced block info", item.ItemID, infoErr)
 		}
 		if blockInfo.CreatedAt == nil {
-			if strings.TrimSpace(blockInfo.StorageClass) != "" {
+			if blockInfo.StorageClass != "" {
 				return fmt.Errorf("stub block %s has storage class without creation timestamp", item.ItemID)
 			}
 			// The owned claim fences writers. Remove only the metadata-free stub;
@@ -1131,7 +1132,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return w.failClosedIfUnavailable("failed to load canonical block info", item.ItemID, err)
 	}
-	storageClass := strings.TrimSpace(blockInfo.StorageClass)
+	storageClass := blockInfo.StorageClass
 	if storageClass == "" {
 		if blockInfo.CreatedAt == nil {
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, claimID)
@@ -1159,6 +1160,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return relErr
 		}
 		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
+	}
+	if !config.IsCanonicalStorageClassName(storageClass) {
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return relErr
+		}
+		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
 	}
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
@@ -1564,10 +1571,16 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					continue
 				}
 
-				storageClass := strings.TrimSpace(canonicalCommit.StorageClass)
+				storageClass := canonicalCommit.StorageClass
 				if storageClass == "" {
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("S3 orphan recovery row has empty storage class for org=%s block=%s", canonicalCommit.OrgID, canonicalCommit.BlockID)
+					}
+					continue
+				}
+				if !config.IsCanonicalStorageClassName(storageClass) {
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("S3 orphan recovery row has non-canonical storage class %q for org=%s block=%s", storageClass, canonicalCommit.OrgID, canonicalCommit.BlockID)
 					}
 					continue
 				}
@@ -1653,9 +1666,9 @@ func s3OrphanRecoveryStateEqual(left, right S3OrphanInfo) bool {
 	return left.OrgID == right.OrgID &&
 		left.BlockID == right.BlockID &&
 		normalizeS3OrphanRecoveryTime(left.FirstSeenAt).Equal(normalizeS3OrphanRecoveryTime(right.FirstSeenAt)) &&
-		strings.TrimSpace(left.StorageClass) == strings.TrimSpace(right.StorageClass) &&
-		strings.TrimSpace(left.ExternalSHA1) == strings.TrimSpace(right.ExternalSHA1) &&
-		strings.TrimSpace(left.RecoveryPhase) == strings.TrimSpace(right.RecoveryPhase)
+		left.StorageClass == right.StorageClass &&
+		left.ExternalSHA1 == right.ExternalSHA1 &&
+		left.RecoveryPhase == right.RecoveryPhase
 }
 
 func (w *Worker) loadS3OrphansStartDay(cutoffDay time.Time) (time.Time, error) {

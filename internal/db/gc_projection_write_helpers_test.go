@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -49,5 +50,17 @@ func TestGCProjectionUTCDateNormalizesOtherZones(t *testing.T) {
 	want := time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("GCProjectionUTCDate(%v) = %v, want %v", in, got, want)
+	}
+}
+
+func TestAddProvisionalBlockReferenceWithExpiryRejectsNonCanonicalStorageClassBeforeDatabase(t *testing.T) {
+	var database *DB
+	for _, storageClass := range []string{"", " hot", "hot ", "Hot", "hot_v1"} {
+		err := database.AddProvisionalBlockReferenceWithExpiry(
+			"org-1", "block-1", "up:attempt", "lib-1", storageClass, time.Now().Add(time.Hour),
+		)
+		if err == nil || !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("storage class %q: error = %v, want permanent canonical-name error", storageClass, err)
+		}
 	}
 }

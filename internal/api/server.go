@@ -420,8 +420,7 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	for className, classCfg := range cfg.Storage.Classes {
 		s3Store, err := initStorageClass(className, classCfg)
 		if err != nil {
-			slog.Warn("Failed to initialize storage class", "class", className, "error", err)
-			continue
+			panic(fmt.Errorf("initialize storage class %q: %w", className, err))
 		}
 		manager.RegisterBackend(className, s3Store, classCfg.FailoverClass)
 		slog.Info("Registered storage class", "class", className, "type", classCfg.Type, "tier", classCfg.Tier, "bucket", classCfg.Bucket)
@@ -453,8 +452,7 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 		}
 		s3Store, err := initStorageClass(name, classCfg)
 		if err != nil {
-			slog.Warn("Failed to initialize legacy storage backend", "backend", name, "error", err)
-			continue
+			panic(fmt.Errorf("initialize legacy storage backend %q: %w", name, err))
 		}
 		manager.RegisterBackend(name, s3Store, "")
 		slog.Info("Registered legacy storage backend", "backend", name, "bucket", backendCfg.Bucket)

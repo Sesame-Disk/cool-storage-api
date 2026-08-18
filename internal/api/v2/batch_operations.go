@@ -178,9 +178,12 @@ func loadZeroRefBlockStorageClasses(database *db.DB, orgID string, blockIDs []st
 			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: %w", blockID, err))
 			continue
 		}
-		storageClass = strings.TrimSpace(storageClass)
-		if storageClass == "" {
-			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: empty canonical storage class", blockID))
+		// R23a: this reads the persisted physical identity straight from `blocks`,
+		// so it groups by the RAW stored value. Trimming would enqueue the block
+		// under a class name that was never persisted, and GC resolves the stored
+		// one. The canonical check subsumes the empty case.
+		if !config.IsCanonicalStorageClassName(storageClass) {
+			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: non-canonical storage class %q", blockID, storageClass))
 			continue
 		}
 		grouped[storageClass] = append(grouped[storageClass], blockID)

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/plans"
@@ -292,17 +293,14 @@ func (s *Server) resolveBootstrapDefaultStorageClass(hostname string) string {
 }
 
 func (s *Server) isBootstrapKnownStorageClass(storageClass string) bool {
-	storageClass = strings.TrimSpace(storageClass)
-	if storageClass == "" || s == nil || s.config == nil {
+	if s == nil || s.config == nil || !config.IsCanonicalStorageClassName(storageClass) {
 		return false
 	}
-	if _, ok := s.config.Storage.Classes[storageClass]; ok {
-		return true
+	if s.storageManager != nil {
+		_, registered := s.storageManager.GetBackend(storageClass)
+		return registered
 	}
-	if _, ok := s.config.Storage.Backends[storageClass]; ok {
-		return true
-	}
-	return false
+	return s.config.IsConfiguredStorageClass(storageClass)
 }
 
 func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
@@ -314,8 +312,7 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 	options := make([]gin.H, 0)
 	seen := make(map[string]struct{})
 	appendOption := func(id, name string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
+		if !s.isBootstrapKnownStorageClass(id) {
 			return
 		}
 		if _, ok := seen[id]; ok {

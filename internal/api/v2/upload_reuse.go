@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -96,15 +97,16 @@ func PrepareUploadedBlockProbe(database *db.DB, orgID, blockID string, probe db.
 // object (blocks/<org_id>/...). The fallback store must already be org-scoped by
 // the caller.
 func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, canonicalClass, orgID string) (*storage.BlockStore, error) {
-	canonicalClass = strings.TrimSpace(canonicalClass)
-	if canonicalClass == "" {
-		return nil, errors.New("canonical storage class is empty")
+	if !config.IsCanonicalStorageClassName(canonicalClass) {
+		if canonicalClass == "" {
+			return nil, errors.New("canonical storage class is empty")
+		}
+		return nil, fmt.Errorf("canonical storage class %q is not canonical", canonicalClass)
 	}
 	if storageManager != nil {
 		return storageManager.GetBlockStoreForOrg(orgID, canonicalClass)
 	}
 	if fallbackStore != nil {
-		fallbackClass = strings.TrimSpace(fallbackClass)
 		if fallbackClass != "" && fallbackClass == canonicalClass {
 			return fallbackStore, nil
 		}
@@ -121,14 +123,25 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 		return nil, "", "", fmt.Errorf("block %s does not need a PUT", blockID)
 	}
 
-	canonicalClass := strings.TrimSpace(probe.StorageClass)
+	canonicalClass := probe.StorageClass
 	if canonicalClass == "" {
 		if preferredStore == nil {
 			return nil, "", "", fmt.Errorf("preferred block store is unavailable for %s", blockID)
 		}
-		preferredClass = strings.TrimSpace(preferredClass)
+		// The first writer MINTS this block's physical identity: the class returned
+		// here is the one persisted, so it is certified, never normalized. Trimming
+		// would store an identity the writer never named -- and now that the write
+		// funnel refuses a non-canonical class outright, a trim's only remaining
+		// effect would be to turn that hard refusal into a silent rewrite.
+		//
+		// Certifying here rather than leaving it to the funnel also keeps the PUT
+		// from landing: the object is written before materialization, so a class
+		// rejected downstream would leave bytes in S3 that no row points at.
 		if preferredClass == "" {
 			return nil, "", "", fmt.Errorf("preferred storage class is empty for %s", blockID)
+		}
+		if !config.IsCanonicalStorageClassName(preferredClass) {
+			return nil, "", "", fmt.Errorf("preferred storage class %q for block %s is not canonical", preferredClass, blockID)
 		}
 		return preferredStore, preferredClass, preferredStore.StorageKeyForHash(blockID), nil
 	}
@@ -150,30 +163,33 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (storageKey, storageClass string, didPut bool, err error) {
 	switch probe.Decision {
 	case db.BlockReuseReusable:
-		canonicalStore, resolveErr := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, probe.StorageClass, orgID)
+		// The class this returns is re-persisted by the caller, so it must be the
+		// stored identity itself, never a normalized copy of it.
+		canonicalClass := probe.StorageClass
+		canonicalStore, resolveErr := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, canonicalClass, orgID)
 		if resolveErr != nil {
-			return "", strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
+			return "", canonicalClass, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
 		}
 		storageKey = canonicalStore.StorageKeyForHash(blockID)
 		if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
-			return "", strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+			return "", canonicalClass, false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, existsErr)
+			return storageKey, canonicalClass, false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, existsErr)
 		}
 		if exists {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, nil
+			return storageKey, canonicalClass, false, nil
 		}
 		if beforePut != nil {
 			if beforeErr := beforePut(); beforeErr != nil {
-				return storageKey, strings.TrimSpace(probe.StorageClass), false, beforeErr
+				return storageKey, canonicalClass, false, beforeErr
 			}
 		}
 		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
-			return storageKey, strings.TrimSpace(probe.StorageClass), false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, probe.StorageClass, putErr)
+			return storageKey, canonicalClass, false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, putErr)
 		}
-		return storageKey, strings.TrimSpace(probe.StorageClass), true, nil
+		return storageKey, canonicalClass, true, nil
 	case db.BlockReuseNeedsPut:
 		putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(storageManager, preferredStore, preferredClass, probe, orgID, blockID)
 		if resolveErr != nil {

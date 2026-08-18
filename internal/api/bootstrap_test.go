@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -295,8 +296,8 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -337,8 +338,8 @@ func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabels(t *testing.T) {
 		"eu": {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-na": {Label: "North America"},
-		"hot-eu": {Label: "Europe"},
+		"hot-na": {Label: "North America", Bucket: "na"},
+		"hot-eu": {Label: "Europe", Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -364,8 +365,8 @@ func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabelsWithoutRegionClass
 	s.config.Storage.EndpointRegions = map[string]string{}
 	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"archive-hot": {Label: "Archive Storage"},
-		"hot-zeta":    {},
+		"archive-hot": {Label: "Archive Storage", Bucket: "archive"},
+		"hot-zeta":    {Bucket: "zeta"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -394,8 +395,8 @@ func TestBuildBootstrapStorageOptionsFallsBackToServerRegion(t *testing.T) {
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -425,8 +426,8 @@ func TestBuildBootstrapStorageOptionsWildcardRoutingOverridesServerRegion(t *tes
 		"eu":  {Hot: "hot-eu"},
 	}
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-usa": {},
-		"hot-eu":  {},
+		"hot-usa": {Bucket: "usa"},
+		"hot-eu":  {Bucket: "eu"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
@@ -458,13 +459,35 @@ func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *t
 	s := createTestServer()
 	s.config.Storage.DefaultClass = "missing"
 	s.config.Storage.Classes = map[string]config.StorageClassConfig{
-		"hot-zeta":  {},
-		"hot-alpha": {},
+		"hot-zeta":  {Bucket: "zeta"},
+		"hot-alpha": {Bucket: "alpha"},
 	}
 	s.config.Storage.Backends = map[string]config.BackendConfig{}
 
 	if got := s.resolveBootstrapDefaultStorageClass("unknown.example.com"); got != "hot-alpha" {
 		t.Fatalf("resolveBootstrapDefaultStorageClass = %q, want %q", got, "hot-alpha")
+	}
+}
+
+func TestBuildBootstrapStorageOptionsUsesRegisteredBackends(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "hot-broken"
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-broken": {Bucket: "broken"},
+		"hot-good":   {Bucket: "good"},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+	s.storageManager = storage.NewManager()
+	s.storageManager.RegisterBackend("hot-good", &storage.S3Store{}, "")
+
+	options := s.buildBootstrapStorageOptions("unknown.example.com")
+	for _, option := range options {
+		if option["id"] == "hot-broken" {
+			t.Fatalf("bootstrap advertised an unregistered storage class: %v", options)
+		}
+	}
+	if len(options) != 1 || options[0]["id"] != "hot-good" {
+		t.Fatalf("bootstrap options = %v, want only hot-good", options)
 	}
 }
 

@@ -976,7 +976,8 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // The provisional reference and its GC expiry tracking are written in a single
 // logged batch (F10). They used to be two writes with a compensating rollback on
 // the second one's failure; a batch removes the split state instead of cleaning up
-// after it, so every failure here is simply retryable.
+// after it, so storage/database I/O failures here are retryable while permanent
+// identity failures are returned without a retry tag.
 //
 // Cassandra I/O in this helper is transient and tagged ErrBlockMaterializationTransient
 // so the wrapper retries it inside its bounded budget instead of failing on the
@@ -990,6 +991,9 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		// One logged batch: the reference and its GC tracking either both landed or
 		// neither did, so there is no half-written state to compensate for and a
 		// plain transient retry is safe.
+		if errors.Is(err, db.ErrBlockMetadataPermanent) {
+			return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
+		}
 		return fmt.Errorf("%w: add provisional block reference for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 	}
 
