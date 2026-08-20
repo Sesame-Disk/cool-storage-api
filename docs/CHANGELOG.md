@@ -64,9 +64,6 @@ condemned-incarnation writer safety (R10, R13, R17); **P4** exact-`P` destructiv
 lifecycle (R14, R19, R20, R26), with R18/R27 attaching per recovery/retry
 resolution and an explicit warning against reading P0-P4 as exhaustive.
 
-X1 remains OPEN and `GC_ENABLED=false` remains required; none of this closes any
-part of it.
-
 The remaining HTTP inconsistency from the review is closed without changing the
 fail-closed storage behavior: session-mode `POST /api/v2/blocks/check` now maps
 placement/store-resolution failures to its existing `503 block storage not
@@ -74,6 +71,17 @@ available` response, while metadata and physical-reader failures retain their
 existing classification. Regression coverage includes transport errors and a
 wrapped `gocql.ErrNotFound`, and asserts that no canonical storage reader is
 reached.
+
+A 503 there is not only a different number: the web uploader's
+`isRetriableControlPlaneError` treats 502/503/504 as retriable and everything else
+as terminal, so a failed placement read now gets backoff retries where it used to
+abort at once. That is right for a transport failure or an unhealthy backend, and
+harmless for an absent library -- the retries expire and the upload fails, later.
+`getBlockStoreForRepo` also logs the placement failure now, matching the two
+storage failures below it; without that line the new 503 left no trace at all.
+
+X1 remains OPEN and `GC_ENABLED=false` remains required; none of this closes any
+part of it.
 
 ---
 

@@ -262,6 +262,10 @@ func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) (string, 
 func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass, err := h.lookupLibraryStorageClass(orgID, repoID)
 	if err != nil {
+		// Logged like the two storage failures below, and for the same reason: this
+		// now surfaces as a 503 the caller treats as ordinary backpressure, so
+		// without a line here a failing placement read leaves no trace at all.
+		log.Printf("v2/blocks: failed to read placement for repo %s: %v\n", repoID, err)
 		return nil, "", err
 	}
 	if h.storageManager == nil {
