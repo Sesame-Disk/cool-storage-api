@@ -123,10 +123,12 @@ storage:
       cold: ""
 
   # Keep the legacy name available for compatibility, but isolate it in its own
-  # MinIO bucket. Local Compose pins the generic S3_* variables consumed by this
-  # backend to the values below, overriding stale .env values. Production
-  # single-region deployments use ordinary S3_* directly; modern classes use
-  # class-specific config.
+  # MinIO bucket: hot-minio-local above owns sesamefs-blocks, and two class names
+  # over one bucket is exactly what R23b rejects. Local Compose defaults the
+  # generic S3_* variables consumed by this backend to the values below and lets
+  # .env override them; pointing S3_BUCKET back at sesamefs-blocks is refused at
+  # startup rather than silently aliased. Production single-region deployments use
+  # ordinary S3_* directly; modern classes use class-specific config.
   backends:
     hot:
       type: s3

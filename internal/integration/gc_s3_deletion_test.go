@@ -29,17 +29,32 @@ import (
 // production worker adapters and call ProcessOrgOnce for only their fixture org;
 // they never fan out across unrelated org queues.
 
+// defaultClassS3Config resolves the namespace the local stack's default_class
+// resolves to -- hot-minio-local in configs/config.docker.yaml, which Dockerfile
+// bakes in as CONFIG_FILE -- following the same precedence the server itself uses:
+// the per-class S3_CLASS_HOT_MINIO_LOCAL_* override when set, otherwise the value
+// declared in that file, with credentials falling back to the generic keys exactly
+// as applyStorageClassEnvOverrides does.
+//
+// Deliberately NOT S3_BUCKET/S3_ENDPOINT/S3_REGION: those configure the LEGACY
+// "hot" backend, which the local stack keeps in its own separate bucket. The server
+// under test writes through default_class, so a verification store that followed
+// S3_BUCKET would be reading a bucket nothing ever wrote to.
+func defaultClassS3Config() storage.S3Config {
+	return storage.S3Config{
+		Endpoint:        envOrDefault("S3_CLASS_HOT_MINIO_LOCAL_ENDPOINT", "http://minio:9000"),
+		Bucket:          envOrDefault("S3_CLASS_HOT_MINIO_LOCAL_BUCKET", "sesamefs-blocks"),
+		Region:          envOrDefault("S3_CLASS_HOT_MINIO_LOCAL_REGION", "us-east-1"),
+		AccessKeyID:     envOrDefault("S3_CLASS_HOT_MINIO_LOCAL_ACCESS_KEY_ID", envOrDefault("S3_ACCESS_KEY_ID", "minioadmin")),
+		SecretAccessKey: envOrDefault("S3_CLASS_HOT_MINIO_LOCAL_SECRET_ACCESS_KEY", envOrDefault("S3_SECRET_ACCESS_KEY", "minioadmin")),
+		UsePathStyle:    true,
+	}
+}
+
 func newVerificationS3Store(t *testing.T) *storage.S3Store {
 	t.Helper()
 	ctx := context.Background()
-	s3cfg := storage.S3Config{
-		Endpoint:        envOrDefault("S3_ENDPOINT", "http://minio:9000"),
-		Bucket:          envOrDefault("S3_BUCKET", "sesamefs-blocks"),
-		Region:          envOrDefault("S3_REGION", "us-east-1"),
-		AccessKeyID:     envOrDefault("S3_ACCESS_KEY_ID", "minioadmin"),
-		SecretAccessKey: envOrDefault("S3_SECRET_ACCESS_KEY", "minioadmin"),
-		UsePathStyle:    true,
-	}
+	s3cfg := defaultClassS3Config()
 	s3Store, err := storage.NewS3Store(ctx, s3cfg)
 	if err != nil {
 		t.Skipf("MinIO S3 store unavailable (%v); skipping", err)

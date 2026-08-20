@@ -440,7 +440,9 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	// Both formats register backends under the same storage manager so the rest of the code
 	// (GetHealthyBlockStore, ResolveStorageClass, etc.) works identically regardless of which
 	// config format was used. A profile may carry both formats when their namespaces are
-	// distinct and the effective mode allows it.
+	// distinct, but only where Config.Validate allows it: single mode, or a dev-mode
+	// profile like config.docker.yaml. Production multi-region rejects a configured
+	// legacy hot backend outright, so this loop registers nothing there.
 	for name, backendCfg := range cfg.Storage.Backends {
 		if _, alreadyRegistered := manager.GetBackend(name); alreadyRegistered {
 			continue

@@ -99,11 +99,12 @@ providers and fail startup; that is conservative collision detection, not proof 
 universal physical identity. Use one canonical endpoint spelling per physical service
 across all class and legacy-backend declarations.
 
-A durable fingerprint or namespace claim marker is optional cross-install hardening
-outside R23, R24 and X1. Neither is required, and neither belongs on the request hot
-path. Library placement reads fail closed: only a successful empty
-`libraries.storage_class` permits hostname/default routing; any Cassandra read error
-is UNKNOWN and must not fall back to another backend.
+A durable fingerprint is optional hardening against a historical rebind within one metadata history: the same Cassandra remembers what `hot-v1` meant, so a repoint between boots can be caught. It cannot help a fresh install, whose binding table is empty and which therefore has no memory of what a class name meant elsewhere. A namespace claim marker is the cross-install one: written inside the physical namespace, it lets a foreign or fresh install discover that the namespace is already owned. Neither is part of R23, R24 or X1, and neither belongs on the request hot path. Library placement reads fail closed: only a successful empty
+`libraries.storage_class` permits hostname/default routing. Any Cassandra read error
+is UNKNOWN and must not fall back to another backend, and a missing `libraries` row
+counts as UNKNOWN too — the caller already validated the library, so an absent row is
+dangling metadata rather than permission to route to the default class. Expect
+storage-unavailable responses, not 404s, for that case.
 
 Download admission is one of the safety defaults: `DefaultConfig()` carries the
 measured D6 values, so a config file that does not pin the `download_admission`

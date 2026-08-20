@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -307,26 +308,67 @@ func TestDockerConfigKeepsLegacyBackendInSeparateBucket(t *testing.T) {
 	}
 }
 
-func TestDockerComposePinsLocalSesameFSS3Namespace(t *testing.T) {
+type composeFile struct {
+	Services map[string]struct {
+		Build       any      `yaml:"build"`
+		EnvFile     []string `yaml:"env_file"`
+		Environment []string `yaml:"environment"`
+		Entrypoint  any      `yaml:"entrypoint"`
+	} `yaml:"services"`
+}
+
+// Compose accepts entrypoint in string or list form; flatten both so a caller
+// can just search the command text.
+func composeEntrypointText(entrypoint any) string {
+	switch typed := entrypoint.(type) {
+	case string:
+		return typed
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, part := range typed {
+			parts = append(parts, fmt.Sprint(part))
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
+}
+
+func loadDockerCompose(t *testing.T) composeFile {
+	t.Helper()
 	data, err := os.ReadFile(filepath.Join("..", "..", "docker-compose.yaml"))
 	if err != nil {
 		t.Fatalf("read docker-compose.yaml: %v", err)
 	}
-	var compose struct {
-		Services map[string]struct {
-			Build       any      `yaml:"build"`
-			EnvFile     []string `yaml:"env_file"`
-			Environment []string `yaml:"environment"`
-		} `yaml:"services"`
-	}
+	var compose composeFile
 	if err := yaml.Unmarshal(data, &compose); err != nil {
 		t.Fatalf("parse docker-compose.yaml: %v", err)
 	}
+	return compose
+}
+
+func composeServiceEnvironment(assignments []string) map[string]string {
+	environment := make(map[string]string, len(assignments))
+	for _, assignment := range assignments {
+		if key, value, ok := strings.Cut(assignment, "="); ok {
+			environment[key] = value
+		}
+	}
+	return environment
+}
+
+// The local SesameFS services stay overridable from .env, but their DEFAULT must
+// keep the legacy "hot" backend off hot-minio-local's bucket. A default that fell
+// back to sesamefs-blocks would put two class names on one namespace, which
+// Config.Validate then rejects at startup -- correct, but only after the stack is
+// already broken for anyone who never set S3_BUCKET.
+func TestDockerComposeDefaultsLocalSesameFSS3Namespace(t *testing.T) {
+	compose := loadDockerCompose(t)
 
 	want := map[string]string{
-		"S3_REGION":   "us-east-1",
-		"S3_ENDPOINT": "http://minio:9000",
-		"S3_BUCKET":   "sesamefs-legacy-blocks",
+		"S3_REGION":   "${S3_REGION:-us-east-1}",
+		"S3_ENDPOINT": "${S3_ENDPOINT:-http://minio:9000}",
+		"S3_BUCKET":   "${S3_BUCKET:-sesamefs-legacy-blocks}",
 	}
 	checked := 0
 	for name, service := range compose.Services {
@@ -334,20 +376,38 @@ func TestDockerComposePinsLocalSesameFSS3Namespace(t *testing.T) {
 			continue
 		}
 		checked++
-		environment := make(map[string]string, len(service.Environment))
-		for _, assignment := range service.Environment {
-			key, value, ok := strings.Cut(assignment, "=")
-			if ok {
-				environment[key] = value
-			}
-		}
+		environment := composeServiceEnvironment(service.Environment)
 		for key, value := range want {
 			if got := environment[key]; got != value {
-				t.Errorf("services.%s.environment %s = %q, want fixed value %q", name, key, got, value)
+				t.Errorf("services.%s.environment %s = %q, want %q", name, key, got, value)
 			}
 		}
 	}
 	if checked != 4 {
 		t.Fatalf("checked %d local SesameFS services, want 4", checked)
+	}
+}
+
+// minio-init must create whatever bucket the services resolve S3_BUCKET to,
+// using the same default. Hardcoding the bucket name here would leave a custom
+// S3_BUCKET without a bucket until the first write failed.
+func TestDockerComposeMinioInitCreatesConfiguredLegacyBucket(t *testing.T) {
+	compose := loadDockerCompose(t)
+	service, ok := compose.Services["minio-init"]
+	if !ok {
+		t.Fatal("docker-compose.yaml has no minio-init service")
+	}
+	environment := composeServiceEnvironment(service.Environment)
+	if got := environment["S3_BUCKET"]; got != "${S3_BUCKET:-sesamefs-legacy-blocks}" {
+		t.Errorf("minio-init S3_BUCKET = %q, want the same default the services use", got)
+	}
+	entrypoint := composeEntrypointText(service.Entrypoint)
+	// "$$" is compose's escape: the mc shell receives ${S3_BUCKET} and expands it
+	// from the service environment, so compose must NOT interpolate it here.
+	if !strings.Contains(entrypoint, "mc mb myminio/$${S3_BUCKET} --ignore-existing") {
+		t.Errorf("minio-init does not create the configured legacy bucket; entrypoint = %q", entrypoint)
+	}
+	if !strings.Contains(entrypoint, "mc mb myminio/sesamefs-blocks --ignore-existing") {
+		t.Errorf("minio-init does not create the default_class bucket; entrypoint = %q", entrypoint)
 	}
 }

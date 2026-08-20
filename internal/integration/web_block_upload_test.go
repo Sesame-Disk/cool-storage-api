@@ -140,14 +140,7 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 func blockStoreForCleanupOrNil(t *testing.T, orgID string) *storage.BlockStore {
 	t.Helper()
 	ctx := context.Background()
-	s3Store, err := storage.NewS3Store(ctx, storage.S3Config{
-		Endpoint:        envOrDefault("S3_ENDPOINT", "http://minio:9000"),
-		Bucket:          envOrDefault("S3_BUCKET", "sesamefs-blocks"),
-		Region:          envOrDefault("S3_REGION", "us-east-1"),
-		AccessKeyID:     envOrDefault("S3_ACCESS_KEY_ID", "minioadmin"),
-		SecretAccessKey: envOrDefault("S3_SECRET_ACCESS_KEY", "minioadmin"),
-		UsePathStyle:    true,
-	})
+	s3Store, err := storage.NewS3Store(ctx, defaultClassS3Config())
 	if err != nil {
 		t.Logf("cleanup: S3 store unavailable (%v); block objects will be left behind", err)
 		return nil

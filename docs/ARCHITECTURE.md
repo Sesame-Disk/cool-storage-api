@@ -187,8 +187,7 @@ discover provider account/tenant scope; endpoint paths and queries also have pro
 specific semantics. The conservative equivalence may reject exotic configurations at
 startup, which is safe but does not prove universal identity. Operators must use one
 canonical endpoint spelling per service and independently preserve the full namespace
-contract. A durable namespace fingerprint is optional cross-install hardening outside
-R23, R24 and X1, not a request-path lookup. Greenfield scope means there is no migration,
+contract. A durable fingerprint is optional hardening against a historical rebind within one metadata history: the same Cassandra remembers what `hot-v1` meant, so a repoint between boots can be caught. It cannot help a fresh install, whose binding table is empty and which therefore has no memory of what a class name meant elsewhere. A namespace claim marker is the cross-install one: written inside the physical namespace, it lets a foreign or fresh install discover that the namespace is already owned. Neither is part of R23, R24 or X1, and neither belongs on the request hot path. Greenfield scope means there is no migration,
 claim-marker or preflight requirement for historical class values.
 
 **`classes:` - multi-region production default**
@@ -366,6 +365,14 @@ The library placement lookup is tri-state. A successful non-empty
 hostname/region/default policy above; any Cassandra read error is UNKNOWN and fails
 closed. Sync, SeafHTTP, v2 block/file and OnlyOffice paths do not route, probe, or
 write through a default backend after a failed placement read.
+
+A missing `libraries` row is part of that third state, not the second. Every caller
+reaches this lookup with an org/library pair an access token or upload session already
+validated, so an absent row is dangling metadata — a permanent delete that raced the
+request, a partial write, cross-DC lag — and not a statement that default routing is
+allowed. This matches how the repository treats an absent row behind a validated
+reference elsewhere (see `findValidatedEntryInDir`). Callers therefore surface it as
+their storage-unavailable response rather than as a 404.
 
 **Endpoint-to-Region Mapping**:
 ```yaml

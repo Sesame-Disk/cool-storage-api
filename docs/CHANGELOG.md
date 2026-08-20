@@ -8,6 +8,62 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-20 - R23b audit follow-ups: overridable local S3 config
+
+Local Compose no longer hardcodes the S3 values for the legacy `hot` backend.
+`S3_REGION`, `S3_ENDPOINT` and `S3_BUCKET` are back to `${VAR:-default}` on all
+four SesameFS services, with defaults that keep the legacy name off
+`hot-minio-local`'s bucket. The pin was redundant protection: pointing `S3_BUCKET`
+back at `sesamefs-blocks` is now refused by `Config.Validate` at startup with the
+colliding key named, so an operator gets a stated error instead of a silently
+aliased namespace. `minio-init` resolves `S3_BUCKET` with the same default and
+creates whatever bucket the services will actually use, so a custom value no longer
+fails on first write.
+
+The integration verification stores stopped reading `S3_BUCKET`. That variable
+configures the LEGACY backend, while the server under test writes through
+`default_class` `hot-minio-local`, and the two now name different buckets — so the
+stores were checking a bucket nothing ever wrote to. `TestGC_BlockDeletion_RemovesObjectFromS3` and `TestGC_S3OrphanRecovery_DeletesLingeringObject` silently skipped
+on `discoverStorageClass`'s bucket-mismatch self-check, taking physical GC-deletion
+coverage with them, and `TestGC_CrossOrgIdenticalBlockDeleteIsolation` — which has
+no such check — failed its "physical object missing before GC" precondition.
+
+The fix keeps the bucket configurable rather than hardcoding it: a new
+`defaultClassS3Config` helper resolves the namespace with the same precedence the
+server applies to that class, reading `S3_CLASS_HOT_MINIO_LOCAL_BUCKET`/`_ENDPOINT`/
+`_REGION`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY` and falling back to the values
+`configs/config.docker.yaml` declares, with credentials falling back to the generic
+keys exactly as `applyStorageClassEnvOverrides` does. Both stores use it, so
+repointing the local default class through `.env` moves verification with it.
+
+`configs/config.prod.yaml`'s in-file single-region recipe now states the
+`STORAGE_MODE=single` requirement it omitted. The file hardcodes `mode: "multi"`
+and an explicit mode is never inferred away, so following the old recipe failed
+startup with `storage.classes.hot-s3-na is declared but cannot be registered` — an
+error that names the symptom rather than the cause.
+
+Documentation corrections. The placement-read tri-state now says explicitly that a
+missing `libraries` row belongs to UNKNOWN, not to default routing, with the reason
+(the caller already validated the library, so absence is dangling metadata) and the
+visible cost (storage-unavailable, not 404). `initStorageManager`'s note that a
+profile "may carry both formats" now records that production multi-region rejects a
+configured legacy hot backend outright, so coexistence is a single-mode and dev-mode
+arrangement only.
+
+Two review corrections to the X1 specification wording. First, "fingerprint or claim
+marker = cross-install hardening" conflated two different guards: a durable
+fingerprint catches a historical rebind within ONE metadata history (the same
+Cassandra remembers what a class name meant), and is useless to a fresh install whose
+binding table is empty; a namespace claim marker written inside the physical namespace
+is the cross-install one. Second, "exact `P` belongs exclusively to R24" understated
+the work. R24 keeps its own narrow meaning — single-use install identity and
+`install-uncertain` settlement — while minting `K` opens a series touching R9, R10,
+R14, R17, R19, R20, R24 and R26. `docs/GC-X1-CLOSURE-OPTIONS.md` now carries a
+sequencing note with a P1-P4 split so the foundation slice persists `K` without
+granting destructive authority on the new `P`.
+
+---
+
 ## 2026-08-20 - R23 contract reconciliation and fail-closed placement reads
 
 The accepted R23 deployment contract is now stated consistently: a
@@ -28,8 +84,7 @@ The durable class-to-namespace fingerprint and namespace claim marker discussed 
 earlier analysis are optional cross-install hardening outside R23, R24 and X1. They do
 not participate in request routing and must not be added to the request hot path. The
 accepted contract plus conservative configuration collision detection is the current
-`B` guarantee; R24 is exclusively the minted, never-reused `P=(storage_class,
-storage_key)` work.
+`B` guarantee. Minting a never-reused `storage_key` and forming `P=(storage_class, storage_key)` opens an exact-`P` SERIES, not one row. R24 keeps its own narrower meaning — install identity is single-use, and an ambiguous install becomes `install-uncertain` until serial settlement — and the mint touches R9 (SERIAL install winner), R10 (condemned-key repair), R14 (tuple-bound claim CAS), R17, R19, R20, R24 and R26 as separate properties. Minted keys make several of those races physically observable for the first time: today two writers derive the same key and store the same object, so a double accept is only conceptually wrong; with `W1 -> K1` and `W2 -> K2` it is two objects. The foundation slice must therefore persist `K` WITHOUT granting destructive authority based on the new `P`, or close the minimum install property that makes it safe in the same change.
 
 Configuration no-aliasing now canonicalizes one terminal DNS root dot in both
 custom and AWS S3 endpoints, in addition to host case, default ports, trailing
@@ -46,6 +101,15 @@ UNKNOWN and fails closed. Sync, SeafHTTP, v2 block/file and OnlyOffice storage
 resolution propagate the error and perform no storage probe or write through a
 default backend; upload-facing paths return their existing storage-unavailable
 response.
+
+A missing `libraries` row is deliberately in the UNKNOWN state, not the
+default-routing one. Callers arrive with an org/library pair that an access token
+or upload session already validated, so an absent row means dangling metadata --
+a permanent delete racing the request, a partial write, cross-DC lag -- and the
+one thing that must not follow is a block write into whichever backend the
+default policy happens to name. This is the same rule `findValidatedEntryInDir`
+already applies to an absent row behind a validated reference. The visible cost
+is that such a request answers storage-unavailable rather than 404.
 
 `docker-compose.yaml` remains only the local development/integration stack.
 Production behavior and storage topology are defined by
@@ -82,6 +146,15 @@ integration stack. The legacy name remains selectable for compatibility, now ove
 the separate `sesamefs-legacy-blocks` bucket, which the local MinIO initializer
 creates alongside the modern buckets.
 
+**Existing local stacks need a reset.** `config.docker.yaml` now declares
+`mode: multi`; before, the absence of `server.region` plus a configured
+`backends.hot` made it *infer* single mode, which forced `default_class` to `hot`.
+Libraries created under the old inference carry `storage_class: "hot"` and now
+resolve to the new, empty `sesamefs-legacy-blocks` bucket. The physical bucket for
+new local data is unchanged (`sesamefs-blocks`, via `hot-minio-local`) — only the
+class name stamped on rows changed — so wipe the local Cassandra and MinIO volumes
+rather than expecting old dev libraries to read. Greenfield scope, no migration.
+
 `StorageClassConfig.EffectiveEndpoint` and `BackendConfig.StorageClassConfig()` are
 shared by validation and the storage runtime, including the legacy singleton store.
 Region has no runtime fallback: every registrable class or backend must declare one,
@@ -104,8 +177,9 @@ single-region deployments continue to use ordinary `S3_*` variables directly.
 
 Deliberately NOT included: a durable class-to-namespace fingerprint or namespace
 claim marker. Either can be optional cross-install hardening, outside R23, R24 and X1,
-and neither belongs on the request hot path. R24 is exclusively the minted single-use
-`storage_key` work that advances exact `P`.
+and neither belongs on the request hot path. The minted `storage_key` work that
+advances exact `P` is a series spanning R9, R10, R14, R17, R19, R20, R24 and R26;
+R24 alone remains the single-use install identity property.
 An in-place rebind between boots remains prohibited by deployment contract rather
 than runtime proof. This is a greenfield deployment, so no migration or preflight
 for historical `storage_class` values is required.
@@ -236,7 +310,9 @@ to the raw value, so a name can no longer certify at one layer and fail at the o
 
 No `backend_id` field, migration, storage-key change, or GC protocol change is
 introduced. Minting the never-reused `storage_key` and forming
-`P = (storage_class, storage_key)` belongs exclusively to R24, not R23b.
+`P = (storage_class, storage_key)` is the exact-`P` series that follows R23b — it
+spans R9, R10, R14, R17, R19, R20, R24 and R26, and R24 alone stays the single-use
+install identity property.
 
 ---
 
