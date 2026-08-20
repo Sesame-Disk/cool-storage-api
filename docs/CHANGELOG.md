@@ -8,6 +8,67 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-20 - R23b review closure: upgrade path, drift gate, exact-P sequence
+
+Six findings from an external review of the R23b follow-ups, all confirmed against
+the tree before acting on them.
+
+**The local upgrade path was broken and the reset recipe hid it.** Every `.env`
+copied from the pre-R23b `.env.example` carries `S3_BUCKET=sesamefs-blocks`, which
+now points the legacy `hot` name at `hot-minio-local`'s bucket — the alias
+`Config.Validate` refuses, and that validation is not dev-mode gated
+(`validateStorageClassIdentity` calls it on both the single and multi paths). The
+stack therefore fails to start for anyone with an existing `.env`, and the recipe as
+written ("wipe the volumes") could not fix it, because the collision is in the
+environment rather than the data. The recipe now leads with the `.env` edit and says
+why the volume wipe is a separate matter.
+
+**A missing `libraries` row is now pinned by a test, not only by prose.** The
+fail-closed placement tests asserted on a generic `errors.New`, so the documented
+claim that an absent row is UNKNOWN rested on reading `Scan`'s behavior. Both
+`TestSyncPutBlockPlacementLookupFailureSkipsStorage` and
+`TestSeafHTTPHandleUploadPlacementLookupFailureSkipsStorage` are now table-driven
+over a transport error and a wrapped `gocql.ErrNotFound`, each asserting the same
+`probe == 0 / put == 0` and 503.
+
+**The verification helper had the drift it was written to remove.**
+`defaultClassS3Config` repeats the class name and the location
+`configs/config.docker.yaml` declares, so editing that file alone would desync them
+and — as before — express the desync as a silent skip rather than a failure.
+`TestVerificationStoreMatchesShippedDefaultClass` reads the shipped profile and
+fails when the helper's defaults or its `S3_CLASS_*` class name stop matching. Its
+negative case was verified by temporarily repointing the shipped bucket.
+
+**Two overstatements corrected.** `minio-init` provisions the overridden `S3_BUCKET`
+only while the legacy backend still targets Compose MinIO: the initializer aliases
+`http://minio:9000` unconditionally, so an overridden `S3_ENDPOINT` points the
+backend at a namespace nobody provisioned. And `.env.example` claimed the generic
+`S3_*` set does not name a bucket the server writes to, which is false for a library
+explicitly placed on class `hot`; it names the DEFAULT placement bucket instead, and
+notes that per-class credentials override the shared ones.
+
+**The exact-`P` sequencing note was missing two requirements and started in the
+wrong place.** It listed eight properties and omitted R12 and R13 — the same
+document elsewhere states that "R8, R13 and R15 decide whether Option B is viable",
+so R13's absence from a sequence implementing Option B was substantive. R12 is a
+prerequisite rather than a member: mixing `LOCAL_SERIAL` and `SERIAL` conditional
+statements on the `blocks` partition leaves two quorum domains where one straggler
+invalidates every other guarantee, and closing that needs no minted key. The note
+also opened with "mint and persist `K`", which cannot be first: every path that
+must find those bytes still derives its locator through `hashToKey`, and no
+`storage_key` column exists, so minting before the locator is authoritative puts
+objects at `K1` while readers look elsewhere — unreachable bytes with GC disabled.
+The sequence is now **P0** R12 SERIAL domain; **P1** locator authority with the
+currently derived value; **P2** mint plus canonical install (R9, R24); **P3**
+condemned-incarnation writer safety (R10, R13, R17); **P4** exact-`P` destructive
+lifecycle (R14, R19, R20, R26), with R18/R27 attaching per recovery/retry
+resolution and an explicit warning against reading P0-P4 as exhaustive.
+
+X1 remains OPEN and `GC_ENABLED=false` remains required; none of this closes any
+part of it.
+
+---
+
 ## 2026-08-20 - R23b audit follow-ups: overridable local S3 config
 
 Local Compose no longer hardcodes the S3 values for the legacy `hot` backend.
@@ -18,7 +79,11 @@ back at `sesamefs-blocks` is now refused by `Config.Validate` at startup with th
 colliding key named, so an operator gets a stated error instead of a silently
 aliased namespace. `minio-init` resolves `S3_BUCKET` with the same default and
 creates whatever bucket the services will actually use, so a custom value no longer
-fails on first write.
+fails on first write. That provisioning holds only while the legacy backend still
+targets the Compose MinIO: `minio-init` aliases `http://minio:9000` unconditionally,
+so overriding `S3_ENDPOINT` to another service leaves that namespace to be
+provisioned externally. Teaching the initializer to reach arbitrary S3 endpoints is
+deliberately not attempted.
 
 The integration verification stores stopped reading `S3_BUCKET`. That variable
 configures the LEGACY backend, while the server under test writes through
@@ -69,9 +134,8 @@ binding table is empty; a namespace claim marker written inside the physical nam
 is the cross-install one. Second, "exact `P` belongs exclusively to R24" understated
 the work. R24 keeps its own narrow meaning — single-use install identity and
 `install-uncertain` settlement — while minting `K` opens a series touching R9, R10,
-R14, R17, R19, R20, R24 and R26. `docs/GC-X1-CLOSURE-OPTIONS.md` now carries a
-sequencing note with a P1-P4 split so the foundation slice persists `K` without
-granting destructive authority on the new `P`.
+R12, R13, R14, R17, R19, R20, R24 and R26. `docs/GC-X1-CLOSURE-OPTIONS.md` now
+carries a sequencing note with a P0-P4 split.
 
 ---
 
@@ -157,14 +221,25 @@ integration stack. The legacy name remains selectable for compatibility, now ove
 the separate `sesamefs-legacy-blocks` bucket, which the local MinIO initializer
 creates alongside the modern buckets.
 
-**Existing local stacks need a reset.** `config.docker.yaml` now declares
+**Existing local stacks need a reset, and the first step is `.env`, not the
+volumes.** Every `.env` copied from the pre-R23b `.env.example` carries
+`S3_BUCKET=sesamefs-blocks`, which now points the legacy `hot` name at
+`hot-minio-local`'s bucket — exactly the alias `Config.Validate` refuses. Startup
+fails before anything else matters, and wiping volumes does not help because the
+collision is in the environment, not the data. So:
+
+1. Set `S3_BUCKET=sesamefs-legacy-blocks` in `.env` (or remove the line and take the
+   Compose default; any bucket other than `sesamefs-blocks` works).
+2. Then wipe the local Cassandra and MinIO volumes.
+
+The volumes need wiping for a separate reason. `config.docker.yaml` now declares
 `mode: multi`; before, the absence of `server.region` plus a configured
 `backends.hot` made it *infer* single mode, which forced `default_class` to `hot`.
 Libraries created under the old inference carry `storage_class: "hot"` and now
 resolve to the new, empty `sesamefs-legacy-blocks` bucket. The physical bucket for
 new local data is unchanged (`sesamefs-blocks`, via `hot-minio-local`) — only the
-class name stamped on rows changed — so wipe the local Cassandra and MinIO volumes
-rather than expecting old dev libraries to read. Greenfield scope, no migration.
+class name stamped on rows changed — so do not expect old dev libraries to read.
+Greenfield scope, no migration.
 
 `StorageClassConfig.EffectiveEndpoint` and `BackendConfig.StorageClassConfig()` are
 shared by validation and the storage runtime, including the legacy singleton store.
@@ -189,7 +264,8 @@ single-region deployments continue to use ordinary `S3_*` variables directly.
 Deliberately NOT included: a durable class-to-namespace fingerprint or namespace
 claim marker. Either can be optional cross-install hardening, outside R23, R24 and X1,
 and neither belongs on the request hot path. The minted `storage_key` work that
-advances exact `P` is a series spanning R9, R10, R14, R17, R19, R20, R24 and R26;
+advances exact `P` is a series spanning R9, R10, R12, R13, R14, R17, R19, R20, R24
+and R26;
 R24 alone remains the single-use install identity property.
 An in-place rebind between boots remains prohibited by deployment contract rather
 than runtime proof. This is a greenfield deployment, so no migration or preflight
@@ -322,7 +398,7 @@ to the raw value, so a name can no longer certify at one layer and fail at the o
 No `backend_id` field, migration, storage-key change, or GC protocol change is
 introduced. Minting the never-reused `storage_key` and forming
 `P = (storage_class, storage_key)` is the exact-`P` series that follows R23b — it
-spans R9, R10, R14, R17, R19, R20, R24 and R26, and R24 alone stays the single-use
+spans R9, R10, R12, R13, R14, R17, R19, R20, R24 and R26, and R24 alone stays the single-use
 install identity property.
 
 ---

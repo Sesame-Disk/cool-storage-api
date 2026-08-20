@@ -4,56 +4,85 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
+// placementLookupFailures are the two shapes a failed placement read takes. The
+// second one is the reason this is a table: an absent libraries row surfaces as
+// gocql.ErrNotFound from Scan, and it must land in the same UNKNOWN state as a
+// transport error rather than reading as "no class set, default routing is fine".
+// Every caller reaches this lookup with an org/library pair an access token or
+// upload session already validated, so an absent row is dangling metadata.
+var placementLookupFailures = []struct {
+	name string
+	err  error
+}{
+	{name: "cassandra read error", err: errors.New("placement lookup failed")},
+	{name: "missing libraries row", err: fmt.Errorf("lookup library storage class: %w", gocql.ErrNotFound)},
+}
+
 func TestSyncPutBlockPlacementLookupFailureSkipsStorage(t *testing.T) {
-	oldLookupClass := lookupLibraryStorageClassForSyncFn
-	oldProbe := syncProbeUploadedBlockReuseFn
-	oldPutDirect := syncPutBlockAutoDirectFn
-	t.Cleanup(func() {
-		lookupLibraryStorageClassForSyncFn = oldLookupClass
-		syncProbeUploadedBlockReuseFn = oldProbe
-		syncPutBlockAutoDirectFn = oldPutDirect
-	})
+	for _, failure := range placementLookupFailures {
+		t.Run(failure.name, func(t *testing.T) {
+			oldLookupClass := lookupLibraryStorageClassForSyncFn
+			oldProbe := syncProbeUploadedBlockReuseFn
+			oldPutDirect := syncPutBlockAutoDirectFn
+			t.Cleanup(func() {
+				lookupLibraryStorageClassForSyncFn = oldLookupClass
+				syncProbeUploadedBlockReuseFn = oldProbe
+				syncPutBlockAutoDirectFn = oldPutDirect
+			})
 
-	lookupLibraryStorageClassForSyncFn = func(*SyncHandler, string, string) (string, error) {
-		return "", errors.New("placement lookup failed")
-	}
-	probeCalls := 0
-	syncProbeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
-		probeCalls++
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
-	}
-	putCalls := 0
-	syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
-		putCalls++
-		return "", nil
-	}
+			lookupLibraryStorageClassForSyncFn = func(*SyncHandler, string, string) (string, error) {
+				return "", failure.err
+			}
+			probeCalls := 0
+			syncProbeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+				probeCalls++
+				return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+			}
+			putCalls := 0
+			syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+				putCalls++
+				return "", nil
+			}
 
-	r := setupSyncTestRouter()
-	handler := &SyncHandler{storage: &storage.S3Store{}, db: &db.DB{}}
-	r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
-	req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
-	req.ContentLength = int64(len("hello"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
+			r := setupSyncTestRouter()
+			handler := &SyncHandler{storage: &storage.S3Store{}, db: &db.DB{}}
+			r.PUT("/seafhttp/repo/:repo_id/block/:block_id", handler.PutBlock)
+			req := httptest.NewRequest(http.MethodPut, "/seafhttp/repo/repo-1/block/0123456789012345678901234567890123456789", bytes.NewBufferString("hello"))
+			req.ContentLength = int64(len("hello"))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-	if probeCalls != 0 || putCalls != 0 {
-		t.Fatalf("probe/put calls = %d/%d, want 0/0", probeCalls, putCalls)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+			}
+			if probeCalls != 0 || putCalls != 0 {
+				t.Fatalf("probe/put calls = %d/%d, want 0/0", probeCalls, putCalls)
+			}
+		})
 	}
 }
 
 func TestSeafHTTPHandleUploadPlacementLookupFailureSkipsStorage(t *testing.T) {
+	for _, failure := range placementLookupFailures {
+		t.Run(failure.name, func(t *testing.T) {
+			seafHTTPUploadSkipsStorageOnPlacementFailure(t, failure.err)
+		})
+	}
+}
+
+func seafHTTPUploadSkipsStorageOnPlacementFailure(t *testing.T, lookupErr error) {
+	t.Helper()
 	oldLookupClass := lookupLibraryStorageClassForSeafHTTPFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
@@ -68,7 +97,7 @@ func TestSeafHTTPHandleUploadPlacementLookupFailureSkipsStorage(t *testing.T) {
 	})
 
 	lookupLibraryStorageClassForSeafHTTPFn = func(context.Context, *SeafHTTPHandler, string, string) (string, error) {
-		return "", errors.New("placement lookup failed")
+		return "", lookupErr
 	}
 	checkUploadStorageQuotaForCurrentHeadFn = func(*SeafHTTPHandler, string, string, string, string, string, int64, bool) (int64, int64, error) {
 		return 5, 1, nil

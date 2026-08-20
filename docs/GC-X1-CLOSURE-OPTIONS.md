@@ -114,12 +114,51 @@ path. For this greenfield deployment, `B = storage_class` is accepted under the
 append-only, never-rebind and never-reuse contract; the next X1 priority is the
 minted `storage_key` that closes the physical ABA.
 
-**Sequencing the exact-`P` series.** Minting a never-reused `storage_key` and forming `P=(storage_class, storage_key)` opens an exact-`P` SERIES, not one row. R24 keeps its own narrower meaning — install identity is single-use, and an ambiguous install becomes `install-uncertain` until serial settlement — and the mint touches R9 (SERIAL install winner), R10 (condemned-key repair), R14 (tuple-bound claim CAS), R17, R19, R20, R24 and R26 as separate properties. Minted keys make several of those races physically observable for the first time: today two writers derive the same key and store the same object, so a double accept is only conceptually wrong; with `W1 -> K1` and `W2 -> K2` it is two objects. The foundation slice must therefore persist `K` WITHOUT granting destructive authority based on the new `P`, or close the minimum install property that makes it safe in the same change. A workable split, one property
-per PR as the R11/R22/R23 slices were: **P1** mint and persist `K`, no new destructive
-authority; **P2** SERIAL canonical install and losing-`P` handling (R9, R24); **P3**
-tuple-aware repair and writer fence (R10, R17); **P4** tuple-bound GC, orphan,
-candidate and projection lifecycle (R14, R19, R20, R26). Do not let "`K` is unique"
-read as "X1 solved".
+**Sequencing the exact-`P` series.** Minting a never-reused `storage_key` and forming
+`P=(storage_class, storage_key)` opens an exact-`P` SERIES, not one row. R24 keeps its own
+narrower meaning — install identity is single-use, and an ambiguous install becomes
+`install-uncertain` until serial settlement — while the mint itself touches R9, R10, R12,
+R13, R14, R17, R19, R20, R24 and R26 as separate properties. Minted keys make several of
+those races physically observable for the first time: today two writers derive the same key
+and store the same object, so a double accept is only conceptually wrong; with `W1 -> K1`
+and `W2 -> K2` it is two objects.
+
+Two constraints shape the order, and an earlier draft of this note got both wrong by
+listing eight requirements and starting at the mint.
+
+**The mint cannot be the first slice.** Every path that has to *find* those bytes still
+derives its locator from the logical id (`hashToKey`, `internal/storage/blocks.go`), and no
+`storage_key` column exists yet. Mint `K1` while any reader still derives `K`, and the object
+sits at `K1` while readers look elsewhere: bytes unreachable with GC switched off entirely.
+So the locator must become authoritative BEFORE it becomes distinct — persist and consume
+`storage_key` across reads, HEAD/existence and repair while still storing the derived value,
+then change what the value is.
+
+**R12 is a prerequisite, not a member.** Raising some conditional statements on the `blocks`
+partition to `SERIAL` while others stay `LOCAL_SERIAL` leaves two quorum domains, and one
+straggler invalidates every other statement's guarantee — see R12's inventory of eleven
+statements. That must land before any install property depends on a serial round, and it
+needs no minted key to do so.
+
+A workable split, one property per PR as the R11/R22/R23 slices were:
+
+- **P0 — SERIAL domain (R12).** Every relevant `blocks` LWT on one consistency level. No
+  minted keys, no new identity.
+- **P1 — locator authority.** The persisted `storage_key` becomes the exact locator for
+  reads, existence checks and repair, still holding the currently derived value. Nothing
+  destructive changes; the deployment is observable before identity moves.
+- **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
+  canonical winner, single-use install identity with `install-uncertain` settlement, exact
+  losing-`P` cleanup.
+- **P3 — condemned-incarnation writer safety (R10, R13, R17).** Tuple-aware repair and writer
+  fence. R13 belongs here and not later: it is the data-loss path under B, where a live
+  `blocks(L) -> P1` names a tuple already authorized for retirement, so both repair and
+  install must block until the canonical row stops naming `P1`.
+- **P4 — exact-`P` destructive lifecycle (R14, R19, R20, R26).** Tuple-bound GC, orphan,
+  candidate and projection lifecycle.
+
+R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
+P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
 
 **The collision check closes a rebind the code could produce on its own, with no
 operator action.** Before R23a, a class whose `initStorageClass` failed was skipped
