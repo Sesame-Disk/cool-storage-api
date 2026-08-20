@@ -48,6 +48,10 @@ for how `SERVER_TRUSTED_PROXIES` interacts with this two-nginx chain.
 | `frontend/nginx.conf` | nginx:alpine config baked into the frontend image (SPA routing + API proxy_pass) |
 | `.env.prod.example` | Template for the single `.env` file you create on the server |
 
+`docker-compose.yaml` is not a production fallback; it is the local
+development/integration stack. Production behavior is defined by
+`docker-compose.prod.yml` and `configs/config.prod.yaml`, with `.env` overrides.
+
 ---
 
 ## Read This First
@@ -75,6 +79,26 @@ SesameFS resolves configuration in this order:
 2. The YAML file pointed to by `CONFIG_PATH` is loaded on top of those defaults.
   In production compose, that is `configs/config.prod.yaml` mounted as `/app/config.yaml`.
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
+
+### Storage namespace contract
+
+This repository's deployment scope is greenfield. Once a `storage_class` name is
+used, treat its physical endpoint/bucket namespace as permanent: never rebind that
+name and never reuse it after retirement. Create a new class name for new placement.
+No migration or startup preflight of historical `storage_class` values is required.
+
+Startup validation rejects two configured names over canonically equivalent
+endpoint/bucket declarations. Canonicalization covers host case, default ports,
+trailing URL slashes, equivalent AWS S3 spellings, and one terminal DNS root dot.
+It does not perform DNS resolution and cannot prove arbitrary DNS names or IP
+addresses reach the same service. Use one canonical endpoint spelling per physical
+service across all class and legacy-backend declarations.
+
+A durable class-to-namespace fingerprint is deferred defense in depth. It is not a
+prerequisite for R23 or X1, is not part of request routing, and must not be placed on
+the request hot path. Library placement reads fail closed: only a successful empty
+`libraries.storage_class` permits hostname/default routing; any Cassandra read error
+is UNKNOWN and must not fall back to another backend.
 
 Download admission is one of the safety defaults: `DefaultConfig()` carries the
 measured D6 values, so a config file that does not pin the `download_admission`

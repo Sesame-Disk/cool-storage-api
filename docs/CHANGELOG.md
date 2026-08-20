@@ -8,6 +8,44 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-20 - R23 contract reconciliation and fail-closed placement reads
+
+The accepted R23 deployment contract is now stated consistently: a
+`storage_class` name is append-only, may never be rebound to another physical
+namespace, and may never be reused. New placement always receives a new class
+name. This is a greenfield deployment contract, so no migration or preflight of
+historical class values is required.
+
+The durable class-to-namespace fingerprint discussed in earlier analysis is a
+deferred defense-in-depth measure. It is not a prerequisite for R23 or X1, does
+not participate in request routing, and must not be added to the request hot
+path. The accepted contract plus configuration validation is the current `B`
+guarantee; X1 progresses by making `P=(storage_class, storage_key)` exact with a
+minted, never-reused key.
+
+Configuration no-aliasing now canonicalizes one terminal DNS root dot in both
+custom and AWS S3 endpoints, in addition to host case, default ports, trailing
+URL slashes, and equivalent AWS endpoint spellings. It therefore catches
+canonically equivalent endpoint/bucket declarations, including
+`minio`/`minio.`, but it does not resolve DNS and cannot prove that arbitrary
+DNS names or IP addresses reach the same physical service. Operators must use
+one canonical endpoint spelling per service.
+
+Library placement reads now preserve three states instead of conflating them:
+a successful non-empty value selects the persisted class, a successful empty
+value permits hostname/default routing, and every Cassandra read error is
+UNKNOWN and fails closed. Sync, SeafHTTP, v2 block/file and OnlyOffice storage
+resolution propagate the error and perform no storage probe or write through a
+default backend; upload-facing paths return their existing storage-unavailable
+response.
+
+`docker-compose.yaml` remains only the local development/integration stack.
+Production behavior and storage topology are defined by
+`docker-compose.prod.yml` together with `configs/config.prod.yaml` and their
+environment overrides.
+
+---
+
 ## 2026-08-18 - R23b storage-class namespace contract freeze
 
 `storage_class` is now stated as the permanent identity of one physical namespace,
@@ -21,10 +59,12 @@ configuration and never creates a second namespace for the same endpoint and buc
 covering modern classes and legacy backends together. The descriptor is the
 canonical `(endpoint, bucket)`; credentials, region, SSE, tier and failover
 configure access to a collection rather than deciding which collection it is.
-Comparison folds host case, default ports, trailing slashes and equivalent AWS
-endpoint spellings, which can only over-reject, never alias. This is not a
-hypothetical: storage keys carry no class component, so two classes over one bucket
-share an org's key space exactly.
+Comparison folds host case, one terminal DNS root dot, default ports, trailing
+slashes and equivalent AWS endpoint spellings. This catches canonically equivalent
+declarations, but does not resolve DNS or prove that arbitrary DNS/IP aliases reach
+one service; operators must use one canonical endpoint spelling per service. This
+is not hypothetical: storage keys carry no class component, so two classes over one
+bucket share an org's key space exactly.
 
 `config.docker.yaml` had that defect. Its legacy `hot` backend named
 `http://minio:9000/sesamefs-blocks`, the same bucket as `hot-minio-local`, the
@@ -53,13 +93,13 @@ the legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` /
 legacy `hot` cannot accidentally alias `hot-minio-local`. Production
 single-region deployments continue to use ordinary `S3_*` variables directly.
 
-Deliberately NOT included: the durable class→namespace fingerprint table. It
-answers whether a name meant another bucket in the past, which needs durable
-history and a serial-domain settled LWT, and it is not what closes X1 — the minted
-single-use `storage_key` is. Deferred, not cancelled; the moment to revisit is
-right after `P` is exact. An in-place rebind between boots and reuse of a retired
-name by a fresh install over another cluster's bucket therefore remain contract,
-not runtime proof.
+Deliberately NOT included: the durable class-to-namespace fingerprint table. It
+answers whether a name meant another bucket in the past and needs durable history.
+It is deferred defense in depth, not a prerequisite for R23 or X1, and is not part
+of the request hot path; the minted single-use `storage_key` is what advances X1.
+An in-place rebind between boots remains prohibited by deployment contract rather
+than runtime proof. This is a greenfield deployment, so no migration or preflight
+for historical `storage_class` values is required.
 
 ---
 
@@ -128,10 +168,11 @@ buy nothing and would weaken unconditional validation at the resolution boundary
 into a cache-miss-only check, which is backwards for the contract this branch
 exists to certify.
 
-**Scope.** R23a is identity *hardening*; it does not prove the class-to-namespace
-binding. See the corrected 2026-08-17 note below and the R23 row in
-`docs/GC-X1-CLOSURE-OPTIONS.md`: both rebind and reuse silently retarget a persisted
-identity, and closing them needs R23b's durable per-class namespace fingerprint.
+**Historical scope, superseded by the R23b contract above.** R23a alone did not
+prove the class-to-namespace binding. The current requirement does not assign a
+fingerprint to R23b: R23 is closed by the accepted append-only/never-rebind/
+never-reuse greenfield deployment contract plus configuration no-aliasing. A
+durable fingerprint remains optional defense in depth, not an R23 or X1 gate.
 
 **Deployment note.** Every class declared under `storage.classes` must now be
 registrable, not only the ones something references. `configs/config.prod.yaml`
@@ -166,8 +207,9 @@ Cassandra, so the garbage verdict still describes the same content and a misdire
 delete removes the same condemned bytes. That holds only while the new namespace
 answers to the same liveness authority — which is exactly what reuse breaks, and
 what a rebind onto another cluster's bucket breaks too. Both halves silently
-retarget a persisted identity and neither is prevented; R23b must record a durable
-per-class namespace fingerprint, re-checked fail-closed.
+retarget a persisted identity. **Superseded requirement:** R23b did not add a
+fingerprint; it closed this item by the accepted append-only, never-rebind and
+never-reuse deployment contract plus the configuration checks described above.
 
 The class/legacy collision check closes a rebind the code could produce by itself.
 Before R23a, a class whose initialization failed was skipped with a warning, after

@@ -2925,6 +2925,53 @@ func TestAWSPartitionForRegion(t *testing.T) {
 	}
 }
 
+func TestCanonicalPhysicalEndpointCustomHTTPHosts(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"DNS root dot with port", "http://MinIO.:9000", "http://minio:9000"},
+		{"DNS root dot with default port", "http://minio.:80", "http://minio"},
+		{"IPv4 root dot with port", "http://127.0.0.1.:9000", "http://127.0.0.1:9000"},
+		{"IPv6 literal with port", "http://[2001:DB8::1]:9000", "http://[2001:db8::1]:9000"},
+		{"IPv6 literal with default port", "http://[2001:db8::1]:80", "http://[2001:db8::1]"},
+		{"path case and escape preserved", "http://minio.:9000/Tenant/%2FBlocks/", "http://minio:9000/Tenant/%2FBlocks"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalPhysicalEndpoint(tc.raw, "us-east-1"); got != tc.want {
+				t.Fatalf("canonicalPhysicalEndpoint(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalPhysicalEndpointKeepsDistinctCustomEndpoints(t *testing.T) {
+	cases := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{"different DNS names", "http://minio-a:9000", "http://minio-b:9000"},
+		{"path case", "http://minio:9000/Tenant", "http://minio:9000/tenant"},
+		{"escaped path", "http://minio:9000/a%2Fb", "http://minio:9000/a/b"},
+		{"non-default port", "http://minio", "http://minio:9000"},
+		{"invalid double terminal dot", "http://minio.:9000", "http://minio..:9000"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			left := canonicalPhysicalEndpoint(tc.left, "us-east-1")
+			right := canonicalPhysicalEndpoint(tc.right, "us-east-1")
+			if left == right {
+				t.Fatalf("canonicalPhysicalEndpoint(%q) and canonicalPhysicalEndpoint(%q) both = %q, want distinct identities", tc.left, tc.right, left)
+			}
+		})
+	}
+}
+
 func TestCanonicalPhysicalEndpointMatchesImplicitAWSPartition(t *testing.T) {
 	cases := []struct {
 		region   string
@@ -2941,9 +2988,11 @@ func TestCanonicalPhysicalEndpointMatchesImplicitAWSPartition(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.region, func(t *testing.T) {
 			implicit := canonicalPhysicalEndpoint("", tc.region)
-			explicit := canonicalPhysicalEndpoint(tc.endpoint, tc.region)
-			if explicit != implicit {
-				t.Fatalf("canonicalPhysicalEndpoint(%q, %q) = %q, want implicit identity %q", tc.endpoint, tc.region, explicit, implicit)
+			for _, endpoint := range []string{tc.endpoint, tc.endpoint + "."} {
+				explicit := canonicalPhysicalEndpoint(endpoint, tc.region)
+				if explicit != implicit {
+					t.Fatalf("canonicalPhysicalEndpoint(%q, %q) = %q, want implicit identity %q", endpoint, tc.region, explicit, implicit)
+				}
 			}
 		})
 	}

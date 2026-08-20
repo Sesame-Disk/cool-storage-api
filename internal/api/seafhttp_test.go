@@ -3076,6 +3076,69 @@ func TestFinalizeUploadStreamingFailsClosedWhenEncryptionStatusLookupFails(t *te
 	}
 }
 
+func TestFinalizeUploadStreamingPlacementLookupFailureSkipsStorage(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 5)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer cm.CleanupUpload("token1", "test.bin")
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	oldLookupClass := lookupLibraryStorageClassForSeafHTTPFn
+	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
+	oldEncrypted := lookupLibraryEncryptedForUploadFn
+	oldProbe := probeUploadedBlockReuseForUploadFn
+	oldPutDirect := putUploadedBlockAutoDirectForUploadFn
+	t.Cleanup(func() {
+		lookupLibraryStorageClassForSeafHTTPFn = oldLookupClass
+		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
+		lookupLibraryEncryptedForUploadFn = oldEncrypted
+		probeUploadedBlockReuseForUploadFn = oldProbe
+		putUploadedBlockAutoDirectForUploadFn = oldPutDirect
+	})
+
+	lookupErr := errors.New("placement lookup failed")
+	lookupLibraryStorageClassForSeafHTTPFn = func(context.Context, *SeafHTTPHandler, string, string) (string, error) {
+		return "", lookupErr
+	}
+	checkUploadStorageQuotaForCurrentHeadFn = func(*SeafHTTPHandler, string, string, string, string, string, int64, bool) (int64, int64, error) {
+		return 5, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(*SeafHTTPHandler, string, string) (bool, error) {
+		return false, nil
+	}
+	probeCalls := 0
+	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		probeCalls++
+		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+	}
+	putCalls := 0
+	putUploadedBlockAutoDirectForUploadFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot")
+	manager.RegisterBackend("hot", &storage.S3Store{}, "")
+	handler := NewSeafHTTPHandler(nil, manager, nil, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/token1", nil)
+	token := &AccessToken{OrgID: "org1", RepoID: "repo1", UserID: "user1", Token: "token1"}
+
+	_, _, _, _, err = handler.finalizeUploadStreaming(c, token, upload, "/", "test.bin", "", 5, false)
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("finalizeUploadStreaming error = %v, want wrapped lookup error %v", err, lookupErr)
+	}
+	if probeCalls != 0 || putCalls != 0 {
+		t.Fatalf("probe/put calls = %d/%d, want 0/0", probeCalls, putCalls)
+	}
+}
+
 func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSentinelBeforeStorage(t *testing.T) {
 	const (
 		orgID  = "org-encrypted-finalize"

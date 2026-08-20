@@ -3488,7 +3488,7 @@ func canonicalPhysicalEndpoint(raw, region string) string {
 		return "aws-s3:" + partition
 	}
 
-	host := strings.ToLower(parsed.Hostname())
+	host := canonicalEndpointHostname(parsed)
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
@@ -3506,6 +3506,18 @@ func canonicalPhysicalEndpoint(raw, region string) string {
 	return parsed.Scheme + "://" + host + path
 }
 
+// canonicalEndpointHostname folds URL hostname spelling without resolving DNS.
+// A single terminal dot is the DNS root label, so it does not distinguish two
+// endpoints. IPv6 literals have no root dot and remain intact for re-bracketing
+// by canonicalPhysicalEndpoint.
+func canonicalEndpointHostname(endpoint *url.URL) string {
+	host := strings.ToLower(endpoint.Hostname())
+	if len(host) > 1 && strings.HasSuffix(host, ".") && !strings.HasSuffix(host, "..") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	return host
+}
+
 func awsPartitionForS3Endpoint(endpoint *url.URL) (string, bool) {
 	if endpoint == nil || endpoint.Scheme != "https" || (endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawQuery != "" {
 		return "", false
@@ -3513,7 +3525,7 @@ func awsPartitionForS3Endpoint(endpoint *url.URL) (string, bool) {
 	if port := endpoint.Port(); port != "" && port != "443" {
 		return "", false
 	}
-	host := strings.ToLower(endpoint.Hostname())
+	host := canonicalEndpointHostname(endpoint)
 	if host == "s3.amazonaws.com" {
 		return "aws", true
 	}

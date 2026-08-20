@@ -247,17 +247,11 @@ func (h *BlockHandler) buildFallbackOrgBlockStore(orgID string) *storage.BlockSt
 }
 
 // lookupLibraryStorageClass reads the storage class a library's blocks live in.
-func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) string {
-	if h.db == nil || orgID == "" || repoID == "" {
-		return ""
+func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) (string, error) {
+	if h == nil || h.db == nil || orgID == "" || repoID == "" {
+		return "", nil
 	}
-	var storageClass string
-	if err := h.db.Session().Query(`
-		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
-		return ""
-	}
-	return storageClass
+	return lookupLibraryStorageClass(h.db, orgID, repoID)
 }
 
 // getBlockStoreForRepo resolves the BlockStore for a specific library, honoring
@@ -265,26 +259,29 @@ func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 // hostname/"hot" getBlockStore), or it could store/materialize a block in a
 // different backend than the one file-from-blocks later verifies for that repo —
 // which would make the commit report the block missing even though it was sent.
-func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string) {
+func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass, err := h.lookupLibraryStorageClass(orgID, repoID)
+	if err != nil {
+		return nil, "", err
+	}
 	if h.storageManager == nil {
 		bs := h.buildFallbackOrgBlockStore(orgID)
 		if bs == nil {
-			return nil, "legacy"
+			return nil, "legacy", nil
 		}
-		return bs, "legacy"
+		return bs, "legacy", nil
 	}
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	preferred, err := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
 	if err != nil {
 		log.Printf("v2/blocks: failed to resolve storage class for repo %s: %v\n", repoID, err)
-		return nil, preferred
+		return nil, preferred, err
 	}
 	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStoreForOrg(orgID, preferred)
 	if err != nil {
 		log.Printf("v2/blocks: failed to get healthy backend for repo %s (%s): %v\n", repoID, preferred, err)
-		return nil, preferred
+		return nil, preferred, err
 	}
-	return blockStore, actualClass
+	return blockStore, actualClass, nil
 }
 
 // blockUploadFlowEnabled reports whether the web block-upload flow is enabled
@@ -701,7 +698,10 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 		return CheckBlocksResponse{Existing: nil, Missing: append([]string(nil), hashes...)}, nil
 	}
 
-	blockStore, storageClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	blockStore, storageClass, err := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	if err != nil {
+		return CheckBlocksResponse{}, err
+	}
 	if blockStore == nil {
 		return CheckBlocksResponse{}, errSessionCheckBlockStoreUnavailable
 	}
@@ -954,7 +954,11 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	// The upload probes metadata before storage so an existing placement is
 	// repaired in its canonical backend rather than the repo-preferred backend.
-	preferredStore, preferredClass := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	preferredStore, preferredClass, err := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
 	if preferredStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return

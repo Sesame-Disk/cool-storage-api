@@ -1755,13 +1755,13 @@ func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine, zipRL ...gi
 	}
 }
 
-func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) (string, error) {
 	return h.lookupLibraryStorageClassContext(context.Background(), orgID, repoID)
 }
 
-func (h *SeafHTTPHandler) lookupLibraryStorageClassContext(ctx context.Context, orgID, repoID string) string {
+func (h *SeafHTTPHandler) lookupLibraryStorageClassContext(ctx context.Context, orgID, repoID string) (string, error) {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
-		return ""
+		return "", nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1771,10 +1771,14 @@ func (h *SeafHTTPHandler) lookupLibraryStorageClassContext(ctx context.Context, 
 	if err := h.db.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).WithContext(ctx).Scan(&storageClass); err != nil {
-		return ""
+		return "", err
 	}
 
-	return storageClass
+	return storageClass, nil
+}
+
+var lookupLibraryStorageClassForSeafHTTPFn = func(ctx context.Context, h *SeafHTTPHandler, orgID, repoID string) (string, error) {
+	return h.lookupLibraryStorageClassContext(ctx, orgID, repoID)
 }
 
 func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
@@ -1782,7 +1786,10 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 }
 
 func (h *SeafHTTPHandler) resolveLibraryBlockStoreContext(ctx context.Context, hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
-	libraryClass := h.lookupLibraryStorageClassContext(ctx, orgID, repoID)
+	libraryClass, err := lookupLibraryStorageClassForSeafHTTPFn(ctx, h, orgID, repoID)
+	if err != nil {
+		return nil, "", fmt.Errorf("lookup library storage class: %w", err)
+	}
 	if h.storageManager != nil {
 		preferredClass, err := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
 		if err != nil {
@@ -2487,7 +2494,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := c.Request.Context()
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStoreContext(ctx, httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get org-scoped block store: %v", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})

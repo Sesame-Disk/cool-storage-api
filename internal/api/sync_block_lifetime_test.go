@@ -515,7 +515,7 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 		syncRetryUploadedBlockMaterializationFn = oldRetry
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
-	lookupLibraryStorageClassForSyncFn = func(*SyncHandler, string, string) string { return "hot" }
+	lookupLibraryStorageClassForSyncFn = func(*SyncHandler, string, string) (string, error) { return "hot", nil }
 
 	syncProbeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
 		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil

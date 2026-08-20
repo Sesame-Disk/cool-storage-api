@@ -169,7 +169,18 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 
 #### Storage Config Formats
 
-The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. The local Docker profile intentionally carries both formats: modern classes use the regional MinIO buckets, and legacy `hot` uses a separate compatibility bucket. Local Compose pins the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`, overriding stale values from its `.env` file.
+The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. `docker-compose.yaml` is only the local development/integration profile; it intentionally carries both formats, with modern classes on regional MinIO buckets and legacy `hot` on a separate compatibility bucket. Local Compose pins the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`, overriding stale values from its `.env` file. Production behavior is defined by `docker-compose.prod.yml` and `configs/config.prod.yaml`, with environment overrides applied last.
+
+**Storage namespace contract.** In this greenfield deployment, a `storage_class`
+name is append-only, never rebound to another endpoint/bucket namespace, and never
+reused. A new physical placement receives a new class name. Configuration rejects
+two class/backend declarations over one canonically equivalent `(endpoint, bucket)`,
+including host case, default-port, trailing-slash, equivalent AWS spelling and a
+terminal DNS-dot variant. This is not DNS resolution: arbitrary hostnames or IPs
+may still address one service, so operators must use one canonical endpoint spelling
+per service. A durable namespace fingerprint is deferred defense in depth, not a
+prerequisite for R23/X1 and not part of the request hot path. Greenfield scope means
+there is no migration or preflight requirement for historical class values.
 
 **`classes:` - multi-region production default**
 
@@ -340,6 +351,12 @@ Endpoint region mapping ──▶ Find hot class for region
       ▼
 Store block + record storage_class in DB
 ```
+
+The library placement lookup is tri-state. A successful non-empty
+`libraries.storage_class` selects that class; a successful empty value permits the
+hostname/region/default policy above; any Cassandra read error is UNKNOWN and fails
+closed. Sync, SeafHTTP, v2 block/file and OnlyOffice paths do not route, probe, or
+write through a default backend after a failed placement read.
 
 **Endpoint-to-Region Mapping**:
 ```yaml

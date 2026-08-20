@@ -321,27 +321,30 @@ func (h *SyncHandler) SetDownloadAdmissionCoordinator(coordinator *downloadadmis
 	h.downloadAdmission = coordinator
 }
 
-func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) (string, error) {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
-		return ""
+		return "", nil
 	}
 
 	var storageClass string
 	if err := h.db.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&storageClass); err != nil {
-		return ""
+		return "", err
 	}
 
-	return storageClass
+	return storageClass, nil
 }
 
-var lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) string {
+var lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) (string, error) {
 	return h.lookupLibraryStorageClass(orgID, repoID)
 }
 
 func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) (string, error) {
-	libraryClass := lookupLibraryStorageClassForSyncFn(h, orgID, repoID)
+	libraryClass, err := lookupLibraryStorageClassForSyncFn(h, orgID, repoID)
+	if err != nil {
+		return "", fmt.Errorf("lookup library storage class: %w", err)
+	}
 	if h.storageManager != nil {
 		configuredURL := ""
 		if h.config != nil {

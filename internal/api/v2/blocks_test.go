@@ -34,6 +34,15 @@ type checkBlocksTestCanonicalReader struct {
 	err    error
 }
 
+func stubSuccessfulLibraryStorageClassLookup(t *testing.T, storageClass string) {
+	t.Helper()
+	original := lookupLibraryStorageClassContextFn
+	lookupLibraryStorageClassContextFn = func(context.Context, *db.DB, string, string) (string, error) {
+		return storageClass, nil
+	}
+	t.Cleanup(func() { lookupLibraryStorageClassContextFn = original })
+}
+
 func (r *checkBlocksTestCanonicalReader) CheckBlocksExist(context.Context, []string, int) (map[string]bool, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -500,6 +509,7 @@ func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testi
 }
 
 func TestCheckBlocksForSession_UsesCanonicalStoreBeforeOwnership(t *testing.T) {
+	stubSuccessfulLibraryStorageClassLookup(t, "")
 	origProbe := checkBlocksProbeReuseFn
 	origClassify := checkBlocksClassifyOwnershipFn
 	origNewReader := checkBlocksNewCanonicalReaderFn
@@ -721,7 +731,64 @@ func TestUploadBlock_NoSessionIsRejected(t *testing.T) {
 	}
 }
 
+func TestUploadBlock_PlacementLookupErrorSkipsStorage(t *testing.T) {
+	oldGetSession := getBlockUploadSessionFn
+	oldLookup := lookupLibraryStorageClassContextFn
+	oldProbe := probeUploadedBlockReuseFn
+	t.Cleanup(func() {
+		getBlockUploadSessionFn = oldGetSession
+		lookupLibraryStorageClassContextFn = oldLookup
+		probeUploadedBlockReuseFn = oldProbe
+	})
+
+	const (
+		orgID     = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		userID    = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
+		sessionID = "sess-placement-error"
+	)
+	getBlockUploadSessionFn = func(*db.DB, string) (db.BlockUploadSession, bool, error) {
+		return db.BlockUploadSession{SessionID: sessionID, OrgID: orgID, UserID: userID, RepoID: "repo-1", BlockSizeBytes: 1024}, true, nil
+	}
+	lookupLibraryStorageClassContextFn = func(context.Context, *db.DB, string, string) (string, error) {
+		return "", errors.New("cassandra unavailable")
+	}
+	probeCalls := 0
+	probeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		probeCalls++
+		return db.BlockReuseProbe{}, nil
+	}
+
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-default")
+	manager.RegisterBackend("hot-s3-default", &storage.S3Store{}, "")
+	h := &BlockHandler{
+		db:             &db.DB{},
+		storageManager: manager,
+		config:         &config.Config{WebUploads: config.WebUploadsConfig{EnableWebBlockUpload: true}},
+	}
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", orgID)
+		c.Set("user_id", userID)
+		c.Next()
+	})
+	r.POST("/api/v2/blocks/upload", h.UploadBlock)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/upload", bytes.NewBufferString("hello"))
+	req.ContentLength = 5
+	req.Header.Set("X-Block-Upload-Session", sessionID)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusServiceUnavailable, w.Body.String())
+	}
+	if probeCalls != 0 {
+		t.Fatalf("storage probe calls = %d, want 0", probeCalls)
+	}
+}
+
 func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
+	stubSuccessfulLibraryStorageClassLookup(t, "")
 	fastBlockMaterializationRetries(t)
 	oldGetSession := getBlockUploadSessionFn
 	oldCount := countSessionStagedBlocksFn
@@ -833,6 +900,7 @@ func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
 }
 
 func TestUploadBlockSessionExhaustedFenceReturnsRetryable409(t *testing.T) {
+	stubSuccessfulLibraryStorageClassLookup(t, "")
 	fastBlockMaterializationRetries(t)
 	oldGetSession := getBlockUploadSessionFn
 	oldProbe := probeUploadedBlockReuseFn
