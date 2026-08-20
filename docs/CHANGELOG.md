@@ -16,12 +16,20 @@ namespace, and may never be reused. New placement always receives a new class
 name. This is a greenfield deployment contract, so no migration or preflight of
 historical class values is required.
 
-The durable class-to-namespace fingerprint discussed in earlier analysis is a
-deferred defense-in-depth measure. It is not a prerequisite for R23 or X1, does
-not participate in request routing, and must not be added to the request hot
-path. The accepted contract plus configuration validation is the current `B`
-guarantee; X1 progresses by making `P=(storage_class, storage_key)` exact with a
-minted, never-reused key.
+The namespace contract includes every value that can change the addressed physical
+collection. Credentials, account/tenant or provider scope, region, endpoint and bucket
+may change only when they still reach exactly the same namespace; multi-tenant scope is
+immutable even when configuration cannot reveal it. The endpoint+bucket algorithm is
+therefore described only as a conservative canonical-collision key, not an exhaustive
+physical identity. Its path/query/bucket equivalences can safely over-reject exotic
+providers at startup without proving universal identity.
+
+The durable class-to-namespace fingerprint and namespace claim marker discussed in
+earlier analysis are optional cross-install hardening outside R23, R24 and X1. They do
+not participate in request routing and must not be added to the request hot path. The
+accepted contract plus conservative configuration collision detection is the current
+`B` guarantee; R24 is exclusively the minted, never-reused `P=(storage_class,
+storage_key)` work.
 
 Configuration no-aliasing now canonicalizes one terminal DNS root dot in both
 custom and AWS S3 endpoints, in addition to host case, default ports, trailing
@@ -49,22 +57,23 @@ environment overrides.
 ## 2026-08-18 - R23b storage-class namespace contract freeze
 
 `storage_class` is now stated as the permanent identity of one physical namespace,
-and the half of that contract configuration can prove is enforced. A used class
-name may never be repointed at another namespace and never reused for one; new
-placement takes a new name. Credentials, encryption, tier and failover may change
-freely — endpoint and bucket define the physical namespace; region is access/signing
-configuration and never creates a second namespace for the same endpoint and bucket.
+and conservative canonical collisions are rejected. A used class name may never be
+repointed at another namespace and never reused for one; new placement takes a new
+name. Credentials, account/tenant or provider scope, region, endpoint and bucket may
+change only if they continue to address exactly the same namespace. Encryption, tier
+and failover policy may change only insofar as they do not retarget physical storage.
 
-`Config.Validate` rejects two storage class names over one physical namespace,
-covering modern classes and legacy backends together. The descriptor is the
-canonical `(endpoint, bucket)`; credentials, region, SSE, tier and failover
-configure access to a collection rather than deciding which collection it is.
+`Config.Validate` rejects two storage class names with the same conservative
+canonical `(endpoint, bucket)` collision key, covering modern classes and legacy
+backends together. The key deliberately does not inspect credentials or infer
+provider account/tenant scope, so it is not an exhaustive namespace identity.
 Comparison folds host case, one terminal DNS root dot, default ports, trailing
 slashes and equivalent AWS endpoint spellings. This catches canonically equivalent
 declarations, but does not resolve DNS or prove that arbitrary DNS/IP aliases reach
-one service; operators must use one canonical endpoint spelling per service. This
-is not hypothetical: storage keys carry no class component, so two classes over one
-bucket share an org's key space exactly.
+one service; path/query/bucket equivalences may also over-reject exotic providers and
+fail startup. Operators must use one canonical endpoint spelling per service. This
+is not hypothetical: storage keys carry no class component, so two classes that do
+reach one namespace share an org's key space exactly.
 
 `config.docker.yaml` had that defect. Its legacy `hot` backend named
 `http://minio:9000/sesamefs-blocks`, the same bucket as `hot-minio-local`, the
@@ -93,10 +102,10 @@ the legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` /
 legacy `hot` cannot accidentally alias `hot-minio-local`. Production
 single-region deployments continue to use ordinary `S3_*` variables directly.
 
-Deliberately NOT included: the durable class-to-namespace fingerprint table. It
-answers whether a name meant another bucket in the past and needs durable history.
-It is deferred defense in depth, not a prerequisite for R23 or X1, and is not part
-of the request hot path; the minted single-use `storage_key` is what advances X1.
+Deliberately NOT included: a durable class-to-namespace fingerprint or namespace
+claim marker. Either can be optional cross-install hardening, outside R23, R24 and X1,
+and neither belongs on the request hot path. R24 is exclusively the minted single-use
+`storage_key` work that advances exact `P`.
 An in-place rebind between boots remains prohibited by deployment contract rather
 than runtime proof. This is a greenfield deployment, so no migration or preflight
 for historical `storage_class` values is required.
@@ -168,11 +177,11 @@ buy nothing and would weaken unconditional validation at the resolution boundary
 into a cache-miss-only check, which is backwards for the contract this branch
 exists to certify.
 
-**Historical scope, superseded by the R23b contract above.** R23a alone did not
-prove the class-to-namespace binding. The current requirement does not assign a
-fingerprint to R23b: R23 is closed by the accepted append-only/never-rebind/
-never-reuse greenfield deployment contract plus configuration no-aliasing. A
-durable fingerprint remains optional defense in depth, not an R23 or X1 gate.
+**Historical scope, superseded by the current contract above.** R23a alone did not
+prove the class-to-namespace binding. R23 is closed by the accepted append-only/
+never-rebind/never-reuse greenfield deployment contract plus conservative
+configuration collision detection. A durable fingerprint or namespace claim marker
+is optional cross-install hardening outside R23, R24 and X1.
 
 **Deployment note.** Every class declared under `storage.classes` must now be
 registrable, not only the ones something references. `configs/config.prod.yaml`
@@ -226,8 +235,8 @@ definition of the canon, shared by configuration and the storage runtime and app
 to the raw value, so a name can no longer certify at one layer and fail at the other.
 
 No `backend_id` field, migration, storage-key change, or GC protocol change is
-introduced. R23b will persist the exact `storage_key` and form
-`P = (storage_class, storage_key)`.
+introduced. Minting the never-reused `storage_key` and forming
+`P = (storage_class, storage_key)` belongs exclusively to R24, not R23b.
 
 ---
 

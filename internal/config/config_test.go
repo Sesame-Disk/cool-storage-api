@@ -2718,16 +2718,15 @@ func TestIsCanonicalStorageClassName(t *testing.T) {
 	}
 }
 
-// R23b freezes storage_class as the permanent name of a physical namespace. That
-// contract has two directions, and R23a only closed one of them: one name must
-// never mean two namespaces, and two names must never mean one namespace.
+// R23b freezes storage_class as the permanent name of a physical namespace. The
+// endpoint+bucket key is only a conservative canonical-collision detector: matching
+// keys must be rejected, but they are not an exhaustive proof of physical identity.
 //
-// The second direction is the one configuration can actually prove, and it is not
-// cosmetic. Storage keys are content addressed and carry no class component
+// A matching key is not cosmetic. Storage keys are content addressed and carry no class component
 // (hashToKey → blocks/<org>/<h0:2>/<h2:4>/<hash>), so two classes over one bucket
 // share an org's key space exactly: work authorized under one class name operates
 // on objects the other class also names.
-func TestConfigValidateRejectsTwoStorageClassesOverOneNamespace(t *testing.T) {
+func TestConfigValidateRejectsMatchingNamespaceCollisionKeys(t *testing.T) {
 	newConfig := func() *Config {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
@@ -2830,9 +2829,10 @@ func TestConfigValidateRejectsTwoStorageClassesOverOneNamespace(t *testing.T) {
 			},
 		},
 		{
-			// Identity is the object collection, not the configuration around it.
-			// Different credentials, encryption, tier or failover still name one bucket.
-			name: "same namespace with different non-identity fields",
+			// The detector intentionally ignores fields it cannot interpret. Credentials
+			// may carry account/tenant scope, but cannot make this duplicate declaration
+			// safe to accept without a stronger namespace proof.
+			name: "same collision key with different opaque fields",
 			mutate: func(c *Config) {
 				c.Storage.Classes["hot-v2"] = StorageClassConfig{
 					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
@@ -2848,7 +2848,7 @@ func TestConfigValidateRejectsTwoStorageClassesOverOneNamespace(t *testing.T) {
 			cfg := newConfig()
 			tc.mutate(cfg)
 			err := cfg.Validate()
-			if err == nil || !strings.Contains(err.Error(), "physical namespace") {
+			if err == nil || !strings.Contains(err.Error(), "namespace collision key") {
 				t.Fatalf("Validate() error = %v, want a shared-namespace rejection", err)
 			}
 		})
@@ -2857,7 +2857,7 @@ func TestConfigValidateRejectsTwoStorageClassesOverOneNamespace(t *testing.T) {
 
 // The check must reject aliasing, not multi-backend deployments: every shipped
 // multi-region config declares several classes, and they must keep validating.
-func TestConfigValidateAcceptsDistinctStorageNamespaces(t *testing.T) {
+func TestConfigValidateAcceptsDistinctNamespaceCollisionKeys(t *testing.T) {
 	cases := []struct {
 		name    string
 		classes map[string]StorageClassConfig

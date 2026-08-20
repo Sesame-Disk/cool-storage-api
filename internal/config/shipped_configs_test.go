@@ -256,18 +256,17 @@ func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
 	}
 }
 
-// R23b states the second half of the storage identity contract: a class name is
-// the permanent identity of ONE physical namespace, so one namespace may not
-// answer to two names. config.docker.yaml keeps both modern and legacy names for
-// compatibility, but the legacy "hot" backend uses a separate MinIO bucket from
-// hot-minio-local, so the dev stack does not give two identities one org key space.
+// R23b makes a class name permanent for one physical namespace. The conservative
+// endpoint+bucket collision key rejects canonical aliases without claiming to infer
+// every provider, account or tenant scope. config.docker.yaml keeps both modern and
+// legacy names, but gives them distinct MinIO buckets and therefore distinct keys.
 //
 // Scope limit worth knowing: hydrateShippedStoragePlaceholders fills empty buckets
 // with a per-name placeholder, so classes whose bucket comes from the deployment
 // environment are made distinct here by construction. This test proves the shipped
 // FILES declare no alias; a deployment that points two of those env vars at one
 // bucket is caught by Config.Validate at startup, not here.
-func TestShippedConfigsDeclareOneClassPerPhysicalNamespace(t *testing.T) {
+func TestShippedConfigsHaveDistinctNamespaceCollisionKeys(t *testing.T) {
 	for _, path := range shippedConfigPaths(t) {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			cfg := loadShippedConfig(t, path)

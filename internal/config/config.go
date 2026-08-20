@@ -3442,24 +3442,25 @@ func (b BackendConfig) StorageClassConfig() StorageClassConfig {
 	}
 }
 
-// physicalNamespace renders the object collection a class names: the endpoint
-// and the bucket. Credentials, encryption, tier and failover configure ACCESS to
-// a namespace; they do not decide which collection it is. S3-compatible services
-// commonly use region only for request signing, so two regions over one custom
-// endpoint and bucket still name one namespace. For implicit AWS endpoints, region
-// selects the AWS partition, but regions within that partition remain equivalent.
+// namespaceCollisionKey conservatively identifies configurations that may address
+// the same object collection. It is not an exhaustive physical identity: credentials
+// can select an account or tenant scope that configuration cannot infer, and provider
+// scope, region, endpoint and bucket changes are valid only when they still address
+// exactly the same physical namespace.
 //
 // The endpoint is canonicalized more aggressively than the runtime: hosts are
 // folded to lowercase, default ports and trailing slashes are removed, and the
 // implicit AWS S3 endpoint is grouped with explicit regional AWS endpoints. Erring
-// toward "these are the same" can only produce a startup rejection, never a silent
-// alias -- the right direction for a name that authorizes deletes.
+// toward "these collide" can only produce a startup rejection, never a silent alias
+// -- the right direction for a name that authorizes deletes. In particular, bucket
+// case folding and ignoring endpoint query spelling may over-reject exotic providers;
+// that conservative failure does not prove universal physical identity.
 //
 // The declared `type` is not part of the key. initStorageClass builds an S3Store
 // for every registrable entry regardless of what type says, so including it would
 // let `type: glacier` and `type: s3` over one bucket read as two namespaces while
 // the runtime opens the same one.
-func (c StorageClassConfig) physicalNamespace() string {
+func (c StorageClassConfig) namespaceCollisionKey() string {
 	return fmt.Sprintf("endpoint=%q bucket=%q",
 		canonicalPhysicalEndpoint(c.EffectiveEndpoint(), c.Region),
 		strings.ToLower(strings.TrimSpace(c.Bucket)),
@@ -3586,9 +3587,9 @@ func awsPartitionForRegion(region string) string {
 	}
 }
 
-// validateStorageClassNamespaceAliasing rejects two storage class names over one
-// physical namespace -- the inverse of the rebind R23 describes, and the half a
-// configuration file can actually prove.
+// validateStorageClassNamespaceAliasing rejects two storage class names whose
+// conservative collision keys match. This detects canonical aliases; it does not
+// establish an exhaustive physical namespace identity.
 //
 // It matters because storage keys carry no class component: hashToKey derives
 // blocks/<org_id>/<h[0:2]>/<h[2:4]>/<hash> and every BlockStore uses the same
@@ -3602,8 +3603,8 @@ func awsPartitionForRegion(region string) string {
 // modern classes are already required to be registrable by the caller.
 func (c *Config) validateStorageClassNamespaceAliasing() error {
 	type declaration struct {
-		scope     string
-		namespace string
+		scope        string
+		collisionKey string
 	}
 	declarations := make([]declaration, 0, len(c.Storage.Classes)+len(c.Storage.Backends))
 	for name, classCfg := range c.Storage.Classes {
@@ -3611,8 +3612,8 @@ func (c *Config) validateStorageClassNamespaceAliasing() error {
 			continue
 		}
 		declarations = append(declarations, declaration{
-			scope:     "storage.classes." + name,
-			namespace: classCfg.physicalNamespace(),
+			scope:        "storage.classes." + name,
+			collisionKey: classCfg.namespaceCollisionKey(),
 		})
 	}
 	for name, backendCfg := range c.Storage.Backends {
@@ -3620,8 +3621,8 @@ func (c *Config) validateStorageClassNamespaceAliasing() error {
 			continue
 		}
 		declarations = append(declarations, declaration{
-			scope:     "storage.backends." + name,
-			namespace: backendCfg.StorageClassConfig().physicalNamespace(),
+			scope:        "storage.backends." + name,
+			collisionKey: backendCfg.StorageClassConfig().namespaceCollisionKey(),
 		})
 	}
 	// Map iteration order is not stable, and an error that names a different pair
@@ -3630,12 +3631,12 @@ func (c *Config) validateStorageClassNamespaceAliasing() error {
 
 	claimedBy := make(map[string]string, len(declarations))
 	for _, declared := range declarations {
-		if previousScope, ok := claimedBy[declared.namespace]; ok {
+		if previousScope, ok := claimedBy[declared.collisionKey]; ok {
 			return fmt.Errorf(
-				"%s and %s both name the physical namespace %s; a storage class name is the permanent identity of one namespace, so give each namespace exactly one class name",
-				previousScope, declared.scope, declared.namespace)
+				"%s and %s have the same conservative namespace collision key %s; use one class name for configurations that may address the same physical namespace",
+				previousScope, declared.scope, declared.collisionKey)
 		}
-		claimedBy[declared.namespace] = declared.scope
+		claimedBy[declared.collisionKey] = declared.scope
 	}
 	return nil
 }

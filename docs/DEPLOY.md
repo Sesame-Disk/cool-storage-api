@@ -83,20 +83,25 @@ SesameFS resolves configuration in this order:
 ### Storage namespace contract
 
 This repository's deployment scope is greenfield. Once a `storage_class` name is
-used, treat its physical endpoint/bucket namespace as permanent: never rebind that
-name and never reuse it after retirement. Create a new class name for new placement.
+used, bind it permanently to exactly one physical namespace and never reuse it after
+retirement. Credentials, account/tenant or provider scope, region, endpoint and bucket
+may change only if the effective configuration still reaches exactly that namespace.
+For multi-tenant S3-compatible providers, account/tenant scope is immutable even when
+SesameFS cannot infer it from configuration. Create a new class name for new placement.
 No migration or startup preflight of historical `storage_class` values is required.
 
-Startup validation rejects two configured names over canonically equivalent
-endpoint/bucket declarations. Canonicalization covers host case, default ports,
-trailing URL slashes, equivalent AWS S3 spellings, and one terminal DNS root dot.
-It does not perform DNS resolution and cannot prove arbitrary DNS names or IP
-addresses reach the same service. Use one canonical endpoint spelling per physical
-service across all class and legacy-backend declarations.
+Startup validation rejects two configured names with the same conservative
+endpoint+bucket collision key. Canonicalization covers host case, default ports,
+trailing URL slashes, equivalent AWS S3 spellings, one terminal DNS root dot and
+bucket case. It does not perform DNS resolution, inspect credential scope or discover
+provider account/tenant boundaries. Path/query/bucket rules may over-reject exotic
+providers and fail startup; that is conservative collision detection, not proof of
+universal physical identity. Use one canonical endpoint spelling per physical service
+across all class and legacy-backend declarations.
 
-A durable class-to-namespace fingerprint is deferred defense in depth. It is not a
-prerequisite for R23 or X1, is not part of request routing, and must not be placed on
-the request hot path. Library placement reads fail closed: only a successful empty
+A durable fingerprint or namespace claim marker is optional cross-install hardening
+outside R23, R24 and X1. Neither is required, and neither belongs on the request hot
+path. Library placement reads fail closed: only a successful empty
 `libraries.storage_class` permits hostname/default routing; any Cassandra read error
 is UNKNOWN and must not fall back to another backend.
 

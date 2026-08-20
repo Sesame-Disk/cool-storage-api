@@ -172,15 +172,24 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. `docker-compose.yaml` is only the local development/integration profile; it intentionally carries both formats, with modern classes on regional MinIO buckets and legacy `hot` on a separate compatibility bucket. Local Compose pins the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`, overriding stale values from its `.env` file. Production behavior is defined by `docker-compose.prod.yml` and `configs/config.prod.yaml`, with environment overrides applied last.
 
 **Storage namespace contract.** In this greenfield deployment, a `storage_class`
-name is append-only, never rebound to another endpoint/bucket namespace, and never
-reused. A new physical placement receives a new class name. Configuration rejects
-two class/backend declarations over one canonically equivalent `(endpoint, bucket)`,
-including host case, default-port, trailing-slash, equivalent AWS spelling and a
-terminal DNS-dot variant. This is not DNS resolution: arbitrary hostnames or IPs
-may still address one service, so operators must use one canonical endpoint spelling
-per service. A durable namespace fingerprint is deferred defense in depth, not a
-prerequisite for R23/X1 and not part of the request hot path. Greenfield scope means
-there is no migration or preflight requirement for historical class values.
+name is append-only, permanently bound to exactly one physical namespace, and never
+reused. Credentials, account/tenant or provider scope, region, endpoint and bucket may
+change only when the resulting configuration still addresses exactly that same
+namespace. This is especially important for multi-tenant S3-compatible services:
+account/tenant scope is immutable contract state even when it cannot be inferred from
+configuration. A new physical placement receives a new class name.
+
+Configuration's canonical `(endpoint, bucket)` key is only a conservative collision
+detector, not an exhaustive physical identity. It rejects matching declarations after
+folding host case, default ports, trailing slashes, equivalent AWS spellings, one
+terminal DNS dot and bucket case. It does not resolve DNS, inspect credentials or
+discover provider account/tenant scope; endpoint paths and queries also have provider-
+specific semantics. The conservative equivalence may reject exotic configurations at
+startup, which is safe but does not prove universal identity. Operators must use one
+canonical endpoint spelling per service and independently preserve the full namespace
+contract. A durable namespace fingerprint is optional cross-install hardening outside
+R23, R24 and X1, not a request-path lookup. Greenfield scope means there is no migration,
+claim-marker or preflight requirement for historical class values.
 
 **`classes:` - multi-region production default**
 
