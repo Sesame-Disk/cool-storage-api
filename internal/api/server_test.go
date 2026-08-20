@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -221,6 +220,42 @@ func TestInitStorageManagerSkipsEmptyLegacyHotBackend(t *testing.T) {
 	}
 }
 
+func TestInitStorageManagerSkipsInactiveModernPlaceholdersInSingleRegion(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Storage.Mode = "single"
+	cfg.Storage.DefaultClass = "hot"
+	cfg.Storage.EndpointRegions = map[string]string{
+		"inactive.example.com": "eu",
+		"*.example.com":        "na",
+	}
+	cfg.Storage.RegionClasses = map[string]config.RegionClassConfig{
+		"na": {Hot: "hot-s3-na"},
+		"eu": {Hot: "hot-s3-eu"},
+	}
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-na": {Type: "s3", Region: "us-east-1"},
+		"hot-s3-eu": {Type: "s3", Region: "eu-west-1"},
+	}
+	cfg.Storage.Backends = map[string]config.BackendConfig{
+		"hot": {Type: "s3", Bucket: "sesamefs-single", Region: "us-east-1"},
+	}
+
+	manager := initStorageManager(cfg)
+	if _, ok := manager.GetBackend("hot"); !ok {
+		t.Fatal("legacy hot backend was not registered")
+	}
+	if _, ok := manager.GetBackend("hot-s3-na"); ok {
+		t.Fatal("inactive modern placeholder was registered in single-region mode")
+	}
+	got, err := manager.ResolveStorageClass("inactive.example.com", "", "hot")
+	if err != nil {
+		t.Fatalf("ResolveStorageClass returned error: %v", err)
+	}
+	if got != "hot" {
+		t.Fatalf("ResolveStorageClass = %q, want legacy default %q", got, "hot")
+	}
+}
+
 func TestInitStorageManagerPanicsWhenConfiguredClassFails(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Storage.Classes = map[string]config.StorageClassConfig{
@@ -284,6 +319,26 @@ func TestInitStorageClassRequiresBucketFromResolvedConfig(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bucket is not configured") {
 		t.Fatalf("initStorageClass error = %q, want missing bucket message", err.Error())
+	}
+}
+
+func TestInitStorageClassRequiresExplicitRegion(t *testing.T) {
+	_, err := initStorageClass("hot-s3-na", config.StorageClassConfig{
+		Type:   "s3",
+		Bucket: "sesamefs-na-prod",
+	})
+	if err == nil || !strings.Contains(err.Error(), "region is not configured") {
+		t.Fatalf("initStorageClass error = %v, want missing region error", err)
+	}
+}
+
+func TestInitS3StorageRequiresExplicitLegacyRegion(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Storage.Backends["hot"] = config.BackendConfig{Type: "s3", Bucket: "sesamefs-single"}
+
+	_, err := initS3Storage(cfg)
+	if err == nil || !strings.Contains(err.Error(), "region is not configured") {
+		t.Fatalf("initS3Storage error = %v, want missing region error", err)
 	}
 }
 
@@ -1418,26 +1473,5 @@ func TestHandleUserAvatar(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &response)
 	if response["url"] == nil {
 		t.Error("response should contain url field")
-	}
-}
-
-// R23b: validation rejects two storage class names over one physical namespace,
-// and that comparison is only sound while the descriptor it compares is the one
-// the S3 clients are actually built from. A local region default in this file is
-// exactly how that stops being true: config would compare the raw "" and the
-// runtime would open us-east-1, so two names for one bucket would read as two
-// namespaces and pass.
-//
-// A source gate rather than a behavioral one because S3Store does not expose the
-// region it was constructed with; what needs protecting is that this file has no
-// second definition of the effective value at all.
-func TestServerDoesNotRedefineTheEffectiveStorageRegion(t *testing.T) {
-	source, err := os.ReadFile("server.go")
-	if err != nil {
-		t.Fatalf("read server.go: %v", err)
-	}
-	if strings.Contains(string(source), config.DefaultStorageRegion) {
-		t.Fatalf("server.go names the region default %q literally; derive it from config.StorageClassConfig.EffectiveRegion instead",
-			config.DefaultStorageRegion)
 	}
 }

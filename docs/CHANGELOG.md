@@ -14,30 +14,44 @@ Session-by-session development history for SesameFS.
 and the half of that contract configuration can prove is enforced. A used class
 name may never be repointed at another namespace and never reused for one; new
 placement takes a new name. Credentials, encryption, tier and failover may change
-freely — endpoint, region and bucket may not.
+freely — endpoint and bucket define the physical namespace; region is access/signing
+configuration and never creates a second namespace for the same endpoint and bucket.
 
 `Config.Validate` rejects two storage class names over one physical namespace,
-covering modern classes and legacy backends together. The descriptor is
-`(endpoint, region, bucket)`; credentials, SSE, tier and failover configure access
-to a collection rather than deciding which collection it is. Comparison folds case
-and a trailing slash, which can only over-reject, never alias. This is not a
+covering modern classes and legacy backends together. The descriptor is the
+canonical `(endpoint, bucket)`; credentials, region, SSE, tier and failover
+configure access to a collection rather than deciding which collection it is.
+Comparison folds host case, default ports, trailing slashes and equivalent AWS
+endpoint spellings, which can only over-reject, never alias. This is not a
 hypothetical: storage keys carry no class component, so two classes over one bucket
 share an org's key space exactly.
 
 `config.docker.yaml` had that defect. Its legacy `hot` backend named
 `http://minio:9000/sesamefs-blocks`, the same bucket as `hot-minio-local`, the
 docker `default_class` — two class identities over one namespace in the dev and
-integration stack, with `hot` selectable as an explicit library storage class. The
-entry is now an explicit YAML null; an omitted or `{}` section would merge with the
-legacy `hot` backend `DefaultConfig` ships and point at AWS instead of MinIO.
+integration stack. The legacy name remains selectable for compatibility, now over
+the separate `sesamefs-legacy-blocks` bucket, which the local MinIO initializer
+creates alongside the modern buckets.
 
-`StorageClassConfig.EffectiveRegion`/`EffectiveEndpoint` and
-`BackendConfig.StorageClassConfig()` are now the single definitions shared by
-validation and the storage runtime, including the legacy singleton store, so what
-gets compared is what the S3 client is built from. `initStorageClass` previously
-applied its own `us-east-1` default, which would have made `region: ""` and
-`region: us-east-1` over one bucket compare as two namespaces;
-`TestServerDoesNotRedefineTheEffectiveStorageRegion` guards against it returning.
+`StorageClassConfig.EffectiveEndpoint` and `BackendConfig.StorageClassConfig()` are
+shared by validation and the storage runtime, including the legacy singleton store.
+Region has no runtime fallback: every registrable class or backend must declare one,
+and the runtime trims and passes that value directly to the S3 client. The
+`us-east-1` on `DefaultConfig`'s legacy `hot` backend is an explicit development
+configuration value, not a default applied to arbitrary entries.
+
+The two storage formats remain deployment alternatives, not dev-only features.
+Production single-region mode accepts `backends.hot` and its `S3_*` overrides;
+when the shared production file retains empty modern-class placeholders, single
+mode ignores those inactive entries and initializes only the configured legacy
+backend. Multi-region mode still requires registrable modern classes and uses
+`S3_CLASS_<CLASS>_*` for class locations.
+
+Local Compose deterministically pins the generic `S3_*` variables consumed by
+the legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` /
+`us-east-1`. Its explicit service environment wins over stale `.env` values, so
+legacy `hot` cannot accidentally alias `hot-minio-local`. Production
+single-region deployments continue to use ordinary `S3_*` variables directly.
 
 Deliberately NOT included: the durable class→namespace fingerprint table. It
 answers whether a name meant another bucket in the past, which needs durable

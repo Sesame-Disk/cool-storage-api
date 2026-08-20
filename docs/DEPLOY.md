@@ -568,7 +568,7 @@ S3_CLASS_HOT_S3_ASIA_BUCKET=<your-asia-bucket>
 OIDC_REDIRECT_URIS=https://<files-hostname>/sso/,https://<files-hostname>/oauth/callback/
 
 # Single-region only: set STORAGE_MODE=single, leave SERVER_REGION empty, and
-# uncomment these to point the legacy hot backend at one bucket.
+# uncomment both required location values to point the legacy hot backend at one bucket.
 # In multi-region, keep these unset and use S3_CLASS_*_BUCKET above.
 # S3_BUCKET=<your-bucket-name>
 # S3_REGION=us-east-1
@@ -679,7 +679,7 @@ instead of attempting `CREATE KEYSPACE` through the restricted app role.
 
 > Set `SERVER_URL` only if you need an explicit fallback for unusual reverse-proxy paths or absolute-link generation when the request itself does not carry usable host context.
 
-> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`.
+> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`. Setting `S3_BUCKET` activates the backend, so `S3_REGION` is required; startup fails if either an active legacy backend or an active modern class has no explicit region.
 
 > In multi-region mode, `configs/config.prod.yaml` keeps the public topology: storage classes, provider regions, and failover chains. Real bucket names come from per-class `S3_CLASS_*_BUCKET` env vars.
 
@@ -1182,13 +1182,13 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `CASSANDRA_LOCAL_DC` | `database.local_dc` | |
 | `CASSANDRA_USERNAME` | `database.username` | Required by the prod compose bootstrap. Use a dedicated non-superuser role. |
 | `CASSANDRA_PASSWORD` | `database.password` | Required by the prod compose bootstrap. |
-| `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only |
-| `S3_REGION` | `storage.backends.hot.region` | Env override applied onto `storage.backends.hot` in single-region mode |
+| `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only. A non-empty value activates the backend and requires `S3_REGION`. |
+| `S3_REGION` | `storage.backends.hot.region` | Required when `S3_BUCKET` activates the single-region legacy backend. No runtime region fallback is applied. |
 | `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Single-region legacy path; empty = real AWS |
 | `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | Single-region legacy path |
 | `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Single-region legacy path |
 | `S3_CLASS_<CLASS>_BUCKET` | `storage.classes.<class>.bucket` | Multi-region only. Required per class. Example: `S3_CLASS_HOT_S3_NA_BUCKET`. |
-| `S3_CLASS_<CLASS>_REGION` | `storage.classes.<class>.region` | Optional per-class region override. |
+| `S3_CLASS_<CLASS>_REGION` | `storage.classes.<class>.region` | Per-class region override. Every class with a non-empty bucket must have a region after YAML and env overrides. |
 | `S3_CLASS_<CLASS>_ENDPOINT` | `storage.classes.<class>.endpoint` | Optional per-class endpoint override. |
 | `S3_CLASS_<CLASS>_ACCESS_KEY_ID` | — | Optional per-class credential override. Falls back to `S3_ACCESS_KEY_ID`. |
 | `S3_CLASS_<CLASS>_SECRET_ACCESS_KEY` | — | Optional per-class credential override. Falls back to `S3_SECRET_ACCESS_KEY`. |

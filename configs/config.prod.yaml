@@ -65,7 +65,7 @@ database:
 #
 # Single-region:
 #   - leave SERVER_REGION unset
-#   - fill S3_* env vars for the legacy "hot" backend below
+#   - set both S3_BUCKET and S3_REGION for the legacy "hot" backend below
 #   - runtime overrides switch the effective default_class back to "hot"
 #
 # Multi-region:
@@ -138,7 +138,7 @@ storage:
       type: s3
       endpoint: ""
       bucket: ""
-      region: ""
+      region: ""                       # Required via S3_REGION whenever S3_BUCKET activates this backend
       server_side_encryption: "AES256"
       sse_kms_key_id: ""
 

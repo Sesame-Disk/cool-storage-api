@@ -41,9 +41,9 @@ services:
       - OIDC_DEFAULT_ORG_ID=${OIDC_DEFAULT_ORG_ID}
       - OIDC_PLATFORM_ORG_ID=${OIDC_PLATFORM_ORG_ID}
       - OIDC_PLATFORM_ORG_CLAIM_VALUE=${OIDC_PLATFORM_ORG_CLAIM_VALUE}
-      - S3_REGION=${S3_REGION:-us-east-1}
-      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
-      - S3_BUCKET=${S3_BUCKET:-sesamefs-blocks}
+      - S3_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=sesamefs-legacy-blocks
       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
       - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
@@ -95,9 +95,9 @@ services:
       - OIDC_DEFAULT_ORG_ID=${OIDC_DEFAULT_ORG_ID}
       - OIDC_PLATFORM_ORG_ID=${OIDC_PLATFORM_ORG_ID}
       - OIDC_PLATFORM_ORG_CLAIM_VALUE=${OIDC_PLATFORM_ORG_CLAIM_VALUE}
-      - S3_REGION=${S3_REGION:-us-east-1}
-      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
-      - S3_BUCKET=${S3_BUCKET:-sesamefs-blocks}
+      - S3_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=sesamefs-legacy-blocks
       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
       - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
@@ -151,9 +151,9 @@ services:
       - OIDC_DEFAULT_ORG_ID=${OIDC_DEFAULT_ORG_ID}
       - OIDC_PLATFORM_ORG_ID=${OIDC_PLATFORM_ORG_ID}
       - OIDC_PLATFORM_ORG_CLAIM_VALUE=${OIDC_PLATFORM_ORG_CLAIM_VALUE}
-      - S3_REGION=${S3_REGION:-us-east-1}
-      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
-      - S3_BUCKET=${S3_BUCKET:-sesamefs-blocks}
+      - S3_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=sesamefs-legacy-blocks
       - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
       - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
@@ -221,6 +221,9 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
       - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      - S3_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=sesamefs-legacy-blocks
       # Pinned, not inherited. env_file could otherwise hand this node an
       # explicit budget, and a derived budget is indistinguishable from a
       # configured one of the same size -- the assertion would pass while the
@@ -474,8 +477,9 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
-      echo 'Creating buckets for multi-region simulation...';
+      echo 'Creating buckets for multi-region and legacy compatibility...';
       mc mb myminio/sesamefs-blocks --ignore-existing;
+      mc mb myminio/sesamefs-legacy-blocks --ignore-existing;
       mc mb myminio/sesamefs-usa --ignore-existing;
       mc mb myminio/sesamefs-eu --ignore-existing;
       mc mb myminio/sesamefs-china --ignore-existing;

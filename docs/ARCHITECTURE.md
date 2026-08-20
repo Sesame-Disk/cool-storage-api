@@ -169,7 +169,7 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 
 #### Storage Config Formats
 
-The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path.
+The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. The local Docker profile intentionally carries both formats: modern classes use the regional MinIO buckets, and legacy `hot` uses a separate compatibility bucket. Local Compose pins the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`, overriding stale values from its `.env` file.
 
 **`classes:` - multi-region production default**
 
@@ -198,9 +198,9 @@ storage:
     eu:  { hot: hot-s3-eu }
 ```
 
-**`backends:` - single-region compatibility**
+**`backends:` - legacy/single-region compatibility**
 
-Used only when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for this mode. Empty legacy S3 backends are skipped so a multi-region node cannot accidentally route writes to an unconfigured `hot` bucket.
+This is the primary format when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for single-region mode. Production single-region deployments use those ordinary `S3_*` variables directly; the fixed values above are specific to local Compose. A profile may also carry a configured legacy backend alongside modern classes for compatibility, as the Docker profile does, when their physical namespaces are distinct. Every class or backend with a non-empty bucket must declare a region; startup fails rather than inventing a signing region. Empty legacy S3 backends are skipped, and empty modern classes remain inactive placeholders in single mode.
 
 ```yaml
 storage:

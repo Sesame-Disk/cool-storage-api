@@ -230,6 +230,17 @@ func TestShippedConfigsUseCanonicalStorageClassNames(t *testing.T) {
 	}
 }
 
+func TestShippedActiveStorageEntriesDeclareRegions(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			if err := cfg.validateActiveStorageRegions(); err != nil {
+				t.Fatalf("shipped active storage entry has no explicit region: %v", err)
+			}
+		})
+	}
+}
+
 // Every storage class a shipped config REFERENCES must resolve to one it
 // declares. A typo in failover_class is invisible until the primary backend is
 // down, so the repo's own files are the cheapest place to catch it.
@@ -247,10 +258,9 @@ func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
 
 // R23b states the second half of the storage identity contract: a class name is
 // the permanent identity of ONE physical namespace, so one namespace may not
-// answer to two names. config.docker.yaml shipped exactly that defect until R23b
-// -- a legacy "hot" backend over http://minio:9000/sesamefs-blocks, the bucket
-// hot-minio-local already named -- which gave the dev stack two class identities
-// sharing one org key space, since storage keys carry no class component.
+// answer to two names. config.docker.yaml keeps both modern and legacy names for
+// compatibility, but the legacy "hot" backend uses a separate MinIO bucket from
+// hot-minio-local, so the dev stack does not give two identities one org key space.
 //
 // Scope limit worth knowing: hydrateShippedStoragePlaceholders fills empty buckets
 // with a per-name placeholder, so classes whose bucket comes from the deployment
@@ -266,5 +276,79 @@ func TestShippedConfigsDeclareOneClassPerPhysicalNamespace(t *testing.T) {
 				t.Fatalf("shipped configuration aliases a storage namespace: %v", err)
 			}
 		})
+	}
+}
+
+func TestDockerConfigKeepsLegacyBackendInSeparateBucket(t *testing.T) {
+	var dockerPath string
+	for _, path := range shippedConfigPaths(t) {
+		if filepath.Base(path) == "config.docker.yaml" {
+			dockerPath = path
+			break
+		}
+	}
+	if dockerPath == "" {
+		t.Fatal("config.docker.yaml was not found")
+	}
+
+	cfg := loadShippedConfig(t, dockerPath)
+	legacy, ok := cfg.Storage.Backends["hot"]
+	if !ok || strings.TrimSpace(legacy.Bucket) == "" {
+		t.Fatal("config.docker.yaml must keep a configured legacy hot backend")
+	}
+	modern, ok := cfg.Storage.Classes["hot-minio-local"]
+	if !ok || strings.TrimSpace(modern.Bucket) == "" {
+		t.Fatal("config.docker.yaml must keep the modern local storage class")
+	}
+	if legacy.Bucket == modern.Bucket && legacy.Endpoint == modern.Endpoint {
+		t.Fatalf("legacy hot and modern local class share a physical namespace: legacy=%#v modern=%#v", legacy, modern)
+	}
+	if err := cfg.validateStorageClassNamespaceAliasing(); err != nil {
+		t.Fatalf("config.docker.yaml aliases a storage namespace: %v", err)
+	}
+}
+
+func TestDockerComposePinsLocalSesameFSS3Namespace(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docker-compose.yaml"))
+	if err != nil {
+		t.Fatalf("read docker-compose.yaml: %v", err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Build       any      `yaml:"build"`
+			EnvFile     []string `yaml:"env_file"`
+			Environment []string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &compose); err != nil {
+		t.Fatalf("parse docker-compose.yaml: %v", err)
+	}
+
+	want := map[string]string{
+		"S3_REGION":   "us-east-1",
+		"S3_ENDPOINT": "http://minio:9000",
+		"S3_BUCKET":   "sesamefs-legacy-blocks",
+	}
+	checked := 0
+	for name, service := range compose.Services {
+		if !strings.HasPrefix(name, "sesamefs") || service.Build == nil || len(service.EnvFile) == 0 {
+			continue
+		}
+		checked++
+		environment := make(map[string]string, len(service.Environment))
+		for _, assignment := range service.Environment {
+			key, value, ok := strings.Cut(assignment, "=")
+			if ok {
+				environment[key] = value
+			}
+		}
+		for key, value := range want {
+			if got := environment[key]; got != value {
+				t.Errorf("services.%s.environment %s = %q, want fixed value %q", name, key, got, value)
+			}
+		}
+	}
+	if checked != 4 {
+		t.Fatalf("checked %d local SesameFS services, want 4", checked)
 	}
 }
