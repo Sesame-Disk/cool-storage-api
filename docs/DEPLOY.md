@@ -48,6 +48,10 @@ for how `SERVER_TRUSTED_PROXIES` interacts with this two-nginx chain.
 | `frontend/nginx.conf` | nginx:alpine config baked into the frontend image (SPA routing + API proxy_pass) |
 | `.env.prod.example` | Template for the single `.env` file you create on the server |
 
+`docker-compose.yaml` is not a production fallback; it is the local
+development/integration stack. Production behavior is defined by
+`docker-compose.prod.yml` and `configs/config.prod.yaml`, with `.env` overrides.
+
 ---
 
 ## Read This First
@@ -75,6 +79,32 @@ SesameFS resolves configuration in this order:
 2. The YAML file pointed to by `CONFIG_PATH` is loaded on top of those defaults.
   In production compose, that is `configs/config.prod.yaml` mounted as `/app/config.yaml`.
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
+
+### Storage namespace contract
+
+This repository's deployment scope is greenfield. Once a `storage_class` name is
+used, bind it permanently to exactly one physical namespace and never reuse it after
+retirement. Credentials, account/tenant or provider scope, region, endpoint and bucket
+may change only if the effective configuration still reaches exactly that namespace.
+For multi-tenant S3-compatible providers, account/tenant scope is immutable even when
+SesameFS cannot infer it from configuration. Create a new class name for new placement.
+No migration or startup preflight of historical `storage_class` values is required.
+
+Startup validation rejects two configured names with the same conservative
+endpoint+bucket collision key. Canonicalization covers host case, default ports,
+trailing URL slashes, equivalent AWS S3 spellings, one terminal DNS root dot and
+bucket case. It does not perform DNS resolution, inspect credential scope or discover
+provider account/tenant boundaries. Path/query/bucket rules may over-reject exotic
+providers and fail startup; that is conservative collision detection, not proof of
+universal physical identity. Use one canonical endpoint spelling per physical service
+across all class and legacy-backend declarations.
+
+A durable fingerprint is optional hardening against a historical rebind within one metadata history: the same Cassandra remembers what `hot-v1` meant, so a repoint between boots can be caught. It cannot help a fresh install, whose binding table is empty and which therefore has no memory of what a class name meant elsewhere. A namespace claim marker is the cross-install one: written inside the physical namespace, it lets a foreign or fresh install discover that the namespace is already owned. Neither is part of R23, R24 or X1, and neither belongs on the request hot path. Library placement reads fail closed: only a successful empty
+`libraries.storage_class` permits hostname/default routing. Any Cassandra read error
+is UNKNOWN and must not fall back to another backend, and a missing `libraries` row
+counts as UNKNOWN too — the caller already validated the library, so an absent row is
+dangling metadata rather than permission to route to the default class. Expect
+storage-unavailable responses, not 404s, for that case.
 
 Download admission is one of the safety defaults: `DefaultConfig()` carries the
 measured D6 values, so a config file that does not pin the `download_admission`
@@ -568,7 +598,7 @@ S3_CLASS_HOT_S3_ASIA_BUCKET=<your-asia-bucket>
 OIDC_REDIRECT_URIS=https://<files-hostname>/sso/,https://<files-hostname>/oauth/callback/
 
 # Single-region only: set STORAGE_MODE=single, leave SERVER_REGION empty, and
-# uncomment these to point the legacy hot backend at one bucket.
+# uncomment both required location values to point the legacy hot backend at one bucket.
 # In multi-region, keep these unset and use S3_CLASS_*_BUCKET above.
 # S3_BUCKET=<your-bucket-name>
 # S3_REGION=us-east-1
@@ -679,7 +709,7 @@ instead of attempting `CREATE KEYSPACE` through the restricted app role.
 
 > Set `SERVER_URL` only if you need an explicit fallback for unusual reverse-proxy paths or absolute-link generation when the request itself does not carry usable host context.
 
-> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`.
+> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`. Setting `S3_BUCKET` activates the backend, so `S3_REGION` is required; startup fails if either an active legacy backend or an active modern class has no explicit region.
 
 > In multi-region mode, `configs/config.prod.yaml` keeps the public topology: storage classes, provider regions, and failover chains. Real bucket names come from per-class `S3_CLASS_*_BUCKET` env vars.
 
@@ -1182,13 +1212,13 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `CASSANDRA_LOCAL_DC` | `database.local_dc` | |
 | `CASSANDRA_USERNAME` | `database.username` | Required by the prod compose bootstrap. Use a dedicated non-superuser role. |
 | `CASSANDRA_PASSWORD` | `database.password` | Required by the prod compose bootstrap. |
-| `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only |
-| `S3_REGION` | `storage.backends.hot.region` | Env override applied onto `storage.backends.hot` in single-region mode |
+| `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only. A non-empty value activates the backend and requires `S3_REGION`. |
+| `S3_REGION` | `storage.backends.hot.region` | Required when `S3_BUCKET` activates the single-region legacy backend. No runtime region fallback is applied. |
 | `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Single-region legacy path; empty = real AWS |
 | `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | Single-region legacy path |
 | `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Single-region legacy path |
 | `S3_CLASS_<CLASS>_BUCKET` | `storage.classes.<class>.bucket` | Multi-region only. Required per class. Example: `S3_CLASS_HOT_S3_NA_BUCKET`. |
-| `S3_CLASS_<CLASS>_REGION` | `storage.classes.<class>.region` | Optional per-class region override. |
+| `S3_CLASS_<CLASS>_REGION` | `storage.classes.<class>.region` | Per-class region override. Every class with a non-empty bucket must have a region after YAML and env overrides. |
 | `S3_CLASS_<CLASS>_ENDPOINT` | `storage.classes.<class>.endpoint` | Optional per-class endpoint override. |
 | `S3_CLASS_<CLASS>_ACCESS_KEY_ID` | — | Optional per-class credential override. Falls back to `S3_ACCESS_KEY_ID`. |
 | `S3_CLASS_<CLASS>_SECRET_ACCESS_KEY` | — | Optional per-class credential override. Falls back to `S3_SECRET_ACCESS_KEY`. |

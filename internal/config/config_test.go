@@ -921,6 +921,88 @@ func TestConfigValidate(t *testing.T) {
 			wantErrContain: "storage.mode=single requires server.region to be empty",
 		},
 		{
+			name: "production single-region accepts legacy backends",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "single"
+				c.Storage.DefaultClass = "hot"
+				// config.prod.yaml keeps these modern placeholders so the same file
+				// can also serve multi-region deployments; single-region mode uses
+				// only the legacy backend below.
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-na": {Type: "s3", Region: "us-east-1"},
+					"hot-s3-eu": {Type: "s3", Region: "eu-west-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{
+					"na": {Hot: "hot-s3-na"},
+					"eu": {Hot: "hot-s3-eu"},
+				}
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "s3", Bucket: "legacy-bucket", Region: "us-east-1"},
+				}
+			},
+			wantErr: false,
+		},
+		{
+			name: "active modern storage class requires explicit region",
+			modify: func(c *Config) {
+				c.Storage.Mode = "single"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-modern": {Type: "s3", Bucket: "modern-bucket"},
+				}
+			},
+			wantErr:        true,
+			wantErrContain: "storage.classes.hot-modern.region must be set",
+		},
+		{
+			name: "active legacy storage backend requires explicit region",
+			modify: func(c *Config) {
+				c.Storage.Mode = "single"
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "s3", Bucket: "legacy-bucket"},
+				}
+			},
+			wantErr:        true,
+			wantErrContain: "storage.backends.hot.region must be set",
+		},
+		{
+			name: "empty non-S3 legacy backend requires bucket",
+			modify: func(c *Config) {
+				c.Storage.Mode = "single"
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "glacier"},
+				}
+			},
+			wantErr:        true,
+			wantErrContain: "storage.backends.hot.bucket must be set",
+		},
+		{
+			name: "single-region accepts inactive modern placeholders without regions",
+			modify: func(c *Config) {
+				c.Storage.Mode = "single"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-na": {Type: "s3"},
+					"hot-s3-eu": {Type: "s3"},
+				}
+			},
+			wantErr: false,
+		},
+		{
+			name: "active storage entries accept explicit regions",
+			modify: func(c *Config) {
+				c.Storage.Mode = "single"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-modern": {Type: "s3", Bucket: "modern-bucket", Region: " eu-west-1 "},
+				}
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "s3", Bucket: "legacy-bucket", Region: " us-east-1 "},
+				}
+			},
+			wantErr: false,
+		},
+		{
 			name: "non-positive web block upload block size",
 			modify: func(c *Config) {
 				c.WebUploads.WebBlockUploadBlockSizeMB = 0
@@ -1464,6 +1546,35 @@ func TestEnvOverrideS3(t *testing.T) {
 	}
 	if hot.ServerSideEncryption != "AES256" {
 		t.Errorf("Storage.Backends[hot].ServerSideEncryption = %s, want AES256", hot.ServerSideEncryption)
+	}
+}
+
+func TestEnvDrivenProductionSingleRegionRequiresS3Region(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.ShareLinkHMACKey = "very-secure-test-key"
+	cfg.CORS.AllowedOrigins = []string{"https://app.example.com"}
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-s3-na": {Type: "s3"},
+	}
+	// config.prod.yaml explicitly leaves the inactive legacy location empty so
+	// activating it with S3_BUCKET also requires S3_REGION.
+	cfg.Storage.Backends = map[string]BackendConfig{
+		"hot": {Type: "s3"},
+	}
+	t.Setenv("STORAGE_MODE", "single")
+	t.Setenv("S3_BUCKET", "production-bucket")
+	t.Setenv("S3_REGION", "")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "storage.backends.hot.region must be set") {
+		t.Fatalf("Validate() error = %v, want S3_REGION requirement", err)
+	}
+
+	t.Setenv("S3_REGION", "us-east-1")
+	cfg.applyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with S3_REGION returned error: %v", err)
 	}
 }
 
@@ -2442,7 +2553,7 @@ func TestConfigValidateRequiresCanonicalStorageClassNames(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
 		cfg.Storage.Classes = map[string]StorageClassConfig{
-			"hot-v1": {Type: "s3", Bucket: "blocks"},
+			"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
 		}
 		cfg.Storage.Backends = nil
 		// DefaultConfig points default_class at the legacy "hot" backend that was
@@ -2495,8 +2606,8 @@ func TestConfigValidateRejectsUnresolvableStorageClassReferences(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Auth.DevMode = true
 		cfg.Storage.Classes = map[string]StorageClassConfig{
-			"hot-v1": {Type: "s3", Bucket: "blocks"},
-			"hot-v2": {Type: "s3", Bucket: "blocks-2"},
+			"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+			"hot-v2": {Type: "s3", Bucket: "blocks-2", Region: "us-east-1"},
 		}
 		cfg.Storage.Backends = nil
 		cfg.Storage.DefaultClass = "hot-v1"
@@ -2537,14 +2648,14 @@ func TestConfigValidateRejectsUnresolvableStorageClassReferences(t *testing.T) {
 		{
 			name: "unknown failover_class",
 			mutate: func(c *Config) {
-				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", FailoverClass: "hot-v9"}
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", Region: "us-east-1", FailoverClass: "hot-v9"}
 			},
 			wantSub: "failover_class references unknown or unconfigured storage class",
 		},
 		{
 			name: "non-canonical failover_class",
 			mutate: func(c *Config) {
-				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", FailoverClass: "Hot-V2"}
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{Type: "s3", Bucket: "blocks", Region: "us-east-1", FailoverClass: "Hot-V2"}
 			},
 			wantSub: "failover_class references storage class",
 		},
@@ -2586,8 +2697,8 @@ func TestConfigValidateAcceptsResolvableFailoverClass(t *testing.T) {
 	cfg.Storage.Backends = nil
 	cfg.Storage.DefaultClass = "hot-v1"
 	cfg.Storage.Classes = map[string]StorageClassConfig{
-		"hot-v1": {Type: "s3", Bucket: "blocks", FailoverClass: "hot-v2"},
-		"hot-v2": {Type: "s3", Bucket: "blocks-2"},
+		"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1", FailoverClass: "hot-v2"},
+		"hot-v2": {Type: "s3", Bucket: "blocks-2", Region: "us-east-1"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want nil for a resolvable failover chain", err)
@@ -2604,5 +2715,304 @@ func TestIsCanonicalStorageClassName(t *testing.T) {
 		if IsCanonicalStorageClassName(name) {
 			t.Errorf("IsCanonicalStorageClassName(%q) = true, want false", name)
 		}
+	}
+}
+
+// R23b freezes storage_class as the permanent name of a physical namespace. The
+// endpoint+bucket key is only a conservative canonical-collision detector: matching
+// keys must be rejected, but they are not an exhaustive proof of physical identity.
+//
+// A matching key is not cosmetic. Storage keys are content addressed and carry no class component
+// (hashToKey → blocks/<org>/<h0:2>/<h2:4>/<hash>), so two classes over one bucket
+// share an org's key space exactly: work authorized under one class name operates
+// on objects the other class also names.
+func TestConfigValidateRejectsMatchingNamespaceCollisionKeys(t *testing.T) {
+	newConfig := func() *Config {
+		cfg := DefaultConfig()
+		cfg.Auth.DevMode = true
+		cfg.Storage.Backends = nil
+		cfg.Storage.DefaultClass = "hot-v1"
+		cfg.Storage.Classes = map[string]StorageClassConfig{
+			"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000"},
+		}
+		return cfg
+	}
+
+	if err := newConfig().Validate(); err != nil {
+		t.Fatalf("Validate() returned error for a single class: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "two modern classes",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
+				}
+			},
+		},
+		{
+			name: "modern class and legacy backend",
+			mutate: func(c *Config) {
+				c.Storage.Backends = map[string]BackendConfig{
+					"hot": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000"},
+				}
+			},
+		},
+		{
+			name: "implicit AWS endpoint and explicit regional endpoint",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "",
+				}
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1",
+					Endpoint: "https://s3.us-east-1.amazonaws.com",
+				}
+			},
+		},
+		{
+			name: "implicit AWS endpoint and explicit China regional endpoint",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "cn-north-1", Endpoint: "",
+				}
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "cn-north-1",
+					Endpoint: "https://s3.cn-north-1.amazonaws.com.cn",
+				}
+			},
+		},
+		{
+			name: "implicit AWS endpoint and explicit GovCloud regional endpoint",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-gov-west-1", Endpoint: "",
+				}
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-gov-west-1",
+					Endpoint: "https://s3.us-gov-west-1.amazonaws.com",
+				}
+			},
+		},
+		{
+			name: "custom endpoint default port",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:80",
+				}
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio",
+				}
+			},
+		},
+		{
+			name: "custom endpoint region is signing configuration only",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v1"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
+				}
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "eu-west-1", Endpoint: "http://minio:9000",
+				}
+			},
+		},
+		{
+			name: "endpoint spelled with a trailing slash and different case",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://MinIO:9000/",
+				}
+			},
+		},
+		{
+			// The detector intentionally ignores fields it cannot interpret. Credentials
+			// may carry account/tenant scope, but cannot make this duplicate declaration
+			// safe to accept without a stronger namespace proof.
+			name: "same collision key with different opaque fields",
+			mutate: func(c *Config) {
+				c.Storage.Classes["hot-v2"] = StorageClassConfig{
+					Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio:9000",
+					Tier: "cold", AccessKey: "other", SecretKey: "other",
+					ServerSideEncryption: "AES256", FailoverClass: "hot-v1",
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newConfig()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "namespace collision key") {
+				t.Fatalf("Validate() error = %v, want a shared-namespace rejection", err)
+			}
+		})
+	}
+}
+
+// The check must reject aliasing, not multi-backend deployments: every shipped
+// multi-region config declares several classes, and they must keep validating.
+func TestConfigValidateAcceptsDistinctNamespaceCollisionKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		classes map[string]StorageClassConfig
+	}{
+		{
+			name: "different buckets on one endpoint",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks-a", Region: "us-east-1", Endpoint: "http://minio:9000"},
+				"hot-v2": {Type: "s3", Bucket: "blocks-b", Region: "us-east-1", Endpoint: "http://minio:9000"},
+			},
+		},
+		{
+			name: "same bucket name on different endpoints",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio-a:9000"},
+				"hot-v2": {Type: "s3", Bucket: "blocks", Region: "us-east-1", Endpoint: "http://minio-b:9000"},
+			},
+		},
+		{
+			name: "same bucket in commercial AWS and China",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+				"hot-v2": {Type: "s3", Bucket: "blocks", Region: "cn-north-1"},
+			},
+		},
+		{
+			name: "same bucket in commercial AWS and GovCloud",
+			classes: map[string]StorageClassConfig{
+				"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+				"hot-v2": {Type: "s3", Bucket: "blocks", Region: "us-gov-west-1"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth.DevMode = true
+			cfg.Storage.Backends = nil
+			cfg.Storage.DefaultClass = "hot-v1"
+			cfg.Storage.Classes = tc.classes
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v, want nil for distinct namespaces", err)
+			}
+		})
+	}
+}
+
+func TestAWSPartitionForRegion(t *testing.T) {
+	cases := map[string]string{
+		"us-east-1":       "aws",
+		"cn-north-1":      "aws-cn",
+		"us-gov-west-1":   "aws-us-gov",
+		"us-iso-east-1":   "aws-iso",
+		"us-isob-east-1":  "aws-iso-b",
+		"eu-isoe-west-1":  "aws-iso-e",
+		"us-isof-south-1": "aws-iso-f",
+	}
+	for region, want := range cases {
+		t.Run(region, func(t *testing.T) {
+			if got := awsPartitionForRegion(region); got != want {
+				t.Fatalf("awsPartitionForRegion(%q) = %q, want %q", region, got, want)
+			}
+		})
+	}
+}
+
+func TestCanonicalPhysicalEndpointCustomHTTPHosts(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"DNS root dot with port", "http://MinIO.:9000", "http://minio:9000"},
+		{"DNS root dot with default port", "http://minio.:80", "http://minio"},
+		{"IPv4 root dot with port", "http://127.0.0.1.:9000", "http://127.0.0.1:9000"},
+		{"IPv6 literal with port", "http://[2001:DB8::1]:9000", "http://[2001:db8::1]:9000"},
+		{"IPv6 literal with default port", "http://[2001:db8::1]:80", "http://[2001:db8::1]"},
+		{"path case and escape preserved", "http://minio.:9000/Tenant/%2FBlocks/", "http://minio:9000/Tenant/%2FBlocks"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalPhysicalEndpoint(tc.raw, "us-east-1"); got != tc.want {
+				t.Fatalf("canonicalPhysicalEndpoint(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalPhysicalEndpointKeepsDistinctCustomEndpoints(t *testing.T) {
+	cases := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{"different DNS names", "http://minio-a:9000", "http://minio-b:9000"},
+		{"path case", "http://minio:9000/Tenant", "http://minio:9000/tenant"},
+		{"escaped path", "http://minio:9000/a%2Fb", "http://minio:9000/a/b"},
+		{"non-default port", "http://minio", "http://minio:9000"},
+		{"invalid double terminal dot", "http://minio.:9000", "http://minio..:9000"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			left := canonicalPhysicalEndpoint(tc.left, "us-east-1")
+			right := canonicalPhysicalEndpoint(tc.right, "us-east-1")
+			if left == right {
+				t.Fatalf("canonicalPhysicalEndpoint(%q) and canonicalPhysicalEndpoint(%q) both = %q, want distinct identities", tc.left, tc.right, left)
+			}
+		})
+	}
+}
+
+func TestCanonicalPhysicalEndpointMatchesImplicitAWSPartition(t *testing.T) {
+	cases := []struct {
+		region   string
+		endpoint string
+	}{
+		{"us-east-1", "https://s3.us-east-1.amazonaws.com"},
+		{"cn-north-1", "https://s3.cn-north-1.amazonaws.com.cn"},
+		{"us-gov-west-1", "https://s3.us-gov-west-1.amazonaws.com"},
+		{"us-iso-east-1", "https://s3.us-iso-east-1.c2s.ic.gov"},
+		{"us-isob-east-1", "https://s3.us-isob-east-1.sc2s.sgov.gov"},
+		{"eu-isoe-west-1", "https://s3.eu-isoe-west-1.cloud.adc-e.uk"},
+		{"us-isof-south-1", "https://s3.us-isof-south-1.csp.hci.ic.gov"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.region, func(t *testing.T) {
+			implicit := canonicalPhysicalEndpoint("", tc.region)
+			for _, endpoint := range []string{tc.endpoint, tc.endpoint + "."} {
+				explicit := canonicalPhysicalEndpoint(endpoint, tc.region)
+				if explicit != implicit {
+					t.Fatalf("canonicalPhysicalEndpoint(%q, %q) = %q, want implicit identity %q", endpoint, tc.region, explicit, implicit)
+				}
+			}
+		})
+	}
+}
+
+// A legacy backend the manager will skip declares no namespace, so it cannot
+// alias one. initStorageManager skips an s3 backend with an empty bucket; the
+// validator must agree, or a shipped config that relies on that skip stops booting.
+func TestConfigValidateIgnoresUnregistrableLegacyBackendForNamespaceAliasing(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.Storage.DefaultClass = "hot-v1"
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-v1": {Type: "s3", Bucket: "blocks", Region: "us-east-1"},
+	}
+	cfg.Storage.Backends = map[string]BackendConfig{
+		"hot": {Type: "s3", Bucket: "", Region: ""},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil: an unregistrable backend names no namespace", err)
 	}
 }

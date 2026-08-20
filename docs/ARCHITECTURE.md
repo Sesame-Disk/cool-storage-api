@@ -169,7 +169,26 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 
 #### Storage Config Formats
 
-The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path.
+The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. `docker-compose.yaml` is only the local development/integration profile; it intentionally carries both formats, with modern classes on regional MinIO buckets and legacy `hot` on a separate compatibility bucket. Local Compose defaults the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1` and lets `.env` override them; pointing `S3_BUCKET` back at the default class's bucket is refused by `Config.Validate` at startup rather than silently aliased. Note which bucket each variable names: the generic `S3_*` set configures the LEGACY backend only, while the `default_class` the server actually writes through takes `S3_CLASS_HOT_MINIO_LOCAL_*` overrides over the values `config.docker.yaml` declares. Anything verifying local block objects directly must follow the latter. Production behavior is defined by `docker-compose.prod.yml` and `configs/config.prod.yaml`, with environment overrides applied last.
+
+**Storage namespace contract.** In this greenfield deployment, a `storage_class`
+name is append-only, permanently bound to exactly one physical namespace, and never
+reused. Credentials, account/tenant or provider scope, region, endpoint and bucket may
+change only when the resulting configuration still addresses exactly that same
+namespace. This is especially important for multi-tenant S3-compatible services:
+account/tenant scope is immutable contract state even when it cannot be inferred from
+configuration. A new physical placement receives a new class name.
+
+Configuration's canonical `(endpoint, bucket)` key is only a conservative collision
+detector, not an exhaustive physical identity. It rejects matching declarations after
+folding host case, default ports, trailing slashes, equivalent AWS spellings, one
+terminal DNS dot and bucket case. It does not resolve DNS, inspect credentials or
+discover provider account/tenant scope; endpoint paths and queries also have provider-
+specific semantics. The conservative equivalence may reject exotic configurations at
+startup, which is safe but does not prove universal identity. Operators must use one
+canonical endpoint spelling per service and independently preserve the full namespace
+contract. A durable fingerprint is optional hardening against a historical rebind within one metadata history: the same Cassandra remembers what `hot-v1` meant, so a repoint between boots can be caught. It cannot help a fresh install, whose binding table is empty and which therefore has no memory of what a class name meant elsewhere. A namespace claim marker is the cross-install one: written inside the physical namespace, it lets a foreign or fresh install discover that the namespace is already owned. Neither is part of R23, R24 or X1, and neither belongs on the request hot path. Greenfield scope means there is no migration,
+claim-marker or preflight requirement for historical class values.
 
 **`classes:` - multi-region production default**
 
@@ -198,9 +217,9 @@ storage:
     eu:  { hot: hot-s3-eu }
 ```
 
-**`backends:` - single-region compatibility**
+**`backends:` - legacy/single-region compatibility**
 
-Used only when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for this mode. Empty legacy S3 backends are skipped so a multi-region node cannot accidentally route writes to an unconfigured `hot` bucket.
+This is the primary format when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for single-region mode. Production single-region deployments use those ordinary `S3_*` variables directly; the fixed values above are specific to local Compose. A profile may also carry a configured legacy backend alongside modern classes for compatibility, as the Docker profile does, when their physical namespaces are distinct. Every class or backend with a non-empty bucket must declare a region; startup fails rather than inventing a signing region. Empty legacy S3 backends are skipped, and empty modern classes remain inactive placeholders in single mode.
 
 ```yaml
 storage:
@@ -340,6 +359,20 @@ Endpoint region mapping ──▶ Find hot class for region
       ▼
 Store block + record storage_class in DB
 ```
+
+The library placement lookup is tri-state. A successful non-empty
+`libraries.storage_class` selects that class; a successful empty value permits the
+hostname/region/default policy above; any Cassandra read error is UNKNOWN and fails
+closed. Sync, SeafHTTP, v2 block/file and OnlyOffice paths do not route, probe, or
+write through a default backend after a failed placement read.
+
+A missing `libraries` row is part of that third state, not the second. Every caller
+reaches this lookup with an org/library pair an access token or upload session already
+validated, so an absent row is dangling metadata — a permanent delete that raced the
+request, a partial write, cross-DC lag — and not a statement that default routing is
+allowed. This matches how the repository treats an absent row behind a validated
+reference elsewhere (see `findValidatedEntryInDir`). Callers therefore surface it as
+their storage-unavailable response rather than as a 404.
 
 **Endpoint-to-Region Mapping**:
 ```yaml

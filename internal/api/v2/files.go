@@ -333,23 +333,18 @@ func (h *FileHandler) SetGCEnqueuer(enqueuer GCEnqueuer) {
 	h.gcEnqueuer = enqueuer
 }
 
-func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) (string, error) {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
-		return ""
+		return "", nil
 	}
-
-	var storageClass string
-	if err := h.db.Session().Query(`
-		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
-		return ""
-	}
-
-	return storageClass
+	return lookupLibraryStorageClass(h.db, orgID, repoID)
 }
 
 func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	libraryClass, err := h.lookupLibraryStorageClass(orgID, repoID)
+	if err != nil {
+		return nil, "", err
+	}
 	if h.storageManager != nil {
 		preferredClass, err := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
 		if err != nil {

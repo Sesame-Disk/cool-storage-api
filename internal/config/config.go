@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1451,6 +1453,8 @@ func DefaultConfig() *Config {
 				"hot": {
 					Type:   "s3",
 					Bucket: "sesamefs-blocks",
+					// This is a declared development default for this backend, not a
+					// runtime fallback for arbitrary storage entries.
 					Region: "us-east-1",
 				},
 			},
@@ -3414,6 +3418,229 @@ func IsCanonicalStorageClassName(name string) bool {
 		storageClassNamePattern.MatchString(name)
 }
 
+// EffectiveEndpoint returns the endpoint the S3 client will actually be built
+// with. It only trims: an endpoint can carry a path, and paths are case and
+// slash sensitive, so this must not rewrite what the runtime dials.
+func (c StorageClassConfig) EffectiveEndpoint() string {
+	return strings.TrimSpace(c.Endpoint)
+}
+
+// StorageClassConfig converts a legacy backend entry into the class config the
+// storage manager registers it as. Shared with initStorageManager so a legacy
+// backend is validated as exactly the thing that gets built.
+func (b BackendConfig) StorageClassConfig() StorageClassConfig {
+	return StorageClassConfig{
+		Label:                b.Label,
+		Type:                 b.Type,
+		Bucket:               b.Bucket,
+		Region:               b.Region,
+		Endpoint:             b.Endpoint,
+		AccessKey:            b.AccessKey,
+		SecretKey:            b.SecretKey,
+		ServerSideEncryption: b.ServerSideEncryption,
+		SSEKMSKeyID:          b.SSEKMSKeyID,
+	}
+}
+
+// namespaceCollisionKey conservatively identifies configurations that may address
+// the same object collection. It is not an exhaustive physical identity: credentials
+// can select an account or tenant scope that configuration cannot infer, and provider
+// scope, region, endpoint and bucket changes are valid only when they still address
+// exactly the same physical namespace.
+//
+// The endpoint is canonicalized more aggressively than the runtime: hosts are
+// folded to lowercase, default ports and trailing slashes are removed, and the
+// implicit AWS S3 endpoint is grouped with explicit regional AWS endpoints. Erring
+// toward "these collide" can only produce a startup rejection, never a silent alias
+// -- the right direction for a name that authorizes deletes. In particular, bucket
+// case folding and ignoring endpoint query spelling may over-reject exotic providers;
+// that conservative failure does not prove universal physical identity.
+//
+// The declared `type` is not part of the key. initStorageClass builds an S3Store
+// for every registrable entry regardless of what type says, so including it would
+// let `type: glacier` and `type: s3` over one bucket read as two namespaces while
+// the runtime opens the same one.
+func (c StorageClassConfig) namespaceCollisionKey() string {
+	return fmt.Sprintf("endpoint=%q bucket=%q",
+		canonicalPhysicalEndpoint(c.EffectiveEndpoint(), c.Region),
+		strings.ToLower(strings.TrimSpace(c.Bucket)),
+	)
+}
+
+// canonicalPhysicalEndpoint normalizes endpoint spellings that the S3 client
+// treats as the same service endpoint. Unknown custom hosts remain distinct: a
+// DNS alias cannot be proven from configuration alone, and conflating arbitrary
+// hosts would reject valid multi-provider deployments.
+func canonicalPhysicalEndpoint(raw, region string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		// An empty endpoint makes the AWS SDK select the regional S3 endpoint.
+		return "aws-s3:" + awsPartitionForRegion(region)
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if partition, ok := awsPartitionForS3Endpoint(parsed); ok {
+		// AWS bucket names are unique within a partition. Regional endpoint
+		// spelling and signing region do not create another bucket there.
+		return "aws-s3:" + partition
+	}
+
+	host := canonicalEndpointHostname(parsed)
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := parsed.Port()
+	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+
+	// BaseEndpoint paths are part of the object service namespace, but a final
+	// slash is only URL spelling. Preserve path case and internal slashes.
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	return parsed.Scheme + "://" + host + path
+}
+
+// canonicalEndpointHostname folds URL hostname spelling without resolving DNS.
+// A single terminal dot is the DNS root label, so it does not distinguish two
+// endpoints. IPv6 literals have no root dot and remain intact for re-bracketing
+// by canonicalPhysicalEndpoint.
+func canonicalEndpointHostname(endpoint *url.URL) string {
+	host := strings.ToLower(endpoint.Hostname())
+	if len(host) > 1 && strings.HasSuffix(host, ".") && !strings.HasSuffix(host, "..") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	return host
+}
+
+func awsPartitionForS3Endpoint(endpoint *url.URL) (string, bool) {
+	if endpoint == nil || endpoint.Scheme != "https" || (endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawQuery != "" {
+		return "", false
+	}
+	if port := endpoint.Port(); port != "" && port != "443" {
+		return "", false
+	}
+	host := canonicalEndpointHostname(endpoint)
+	if host == "s3.amazonaws.com" {
+		return "aws", true
+	}
+
+	partitionSuffixes := []struct {
+		partition string
+		suffix    string
+	}{
+		{"aws-cn", ".amazonaws.com.cn"},
+		{"aws-iso-b", ".sc2s.sgov.gov"},
+		{"aws-iso-e", ".cloud.adc-e.uk"},
+		{"aws-iso-f", ".csp.hci.ic.gov"},
+		{"aws-iso", ".c2s.ic.gov"},
+		{"aws", ".amazonaws.com"},
+	}
+	for _, candidate := range partitionSuffixes {
+		if !strings.HasSuffix(host, candidate.suffix) {
+			continue
+		}
+		serviceAndRegion := strings.TrimSuffix(host, candidate.suffix)
+		if !strings.HasPrefix(serviceAndRegion, "s3.") && !strings.HasPrefix(serviceAndRegion, "s3-") {
+			return "", false
+		}
+		if candidate.partition == "aws" {
+			// GovCloud shares the commercial DNS suffix, so its region label is
+			// what distinguishes the physical partition.
+			if strings.Contains(serviceAndRegion, "us-gov-") {
+				return "aws-us-gov", true
+			}
+			for _, isolated := range []string{"us-iso-", "us-isob-", "eu-isoe-", "us-isof-"} {
+				if strings.Contains(serviceAndRegion, isolated) {
+					return awsPartitionForRegion(isolated), true
+				}
+			}
+		}
+		return candidate.partition, true
+	}
+	return "", false
+}
+
+func awsPartitionForRegion(region string) string {
+	region = strings.ToLower(strings.TrimSpace(region))
+	switch {
+	case strings.HasPrefix(region, "cn-"):
+		return "aws-cn"
+	case strings.HasPrefix(region, "us-gov-"):
+		return "aws-us-gov"
+	case strings.HasPrefix(region, "us-isob-"):
+		return "aws-iso-b"
+	case strings.HasPrefix(region, "eu-isoe-"):
+		return "aws-iso-e"
+	case strings.HasPrefix(region, "us-isof-"):
+		return "aws-iso-f"
+	case strings.HasPrefix(region, "us-iso-"):
+		return "aws-iso"
+	default:
+		return "aws"
+	}
+}
+
+// validateStorageClassNamespaceAliasing rejects two storage class names whose
+// conservative collision keys match. This detects canonical aliases; it does not
+// establish an exhaustive physical namespace identity.
+//
+// It matters because storage keys carry no class component: hashToKey derives
+// blocks/<org_id>/<h[0:2]>/<h[2:4]>/<hash> and every BlockStore uses the same
+// "blocks/" prefix, so two classes over one bucket share an org's key space
+// exactly. Under derived keys that is a collision between identities that are
+// supposed to be independent; minted keys would remove the collision, but the two
+// names still would not be two namespaces, and R23 requires that they are.
+//
+// Unregistrable entries are skipped: initStorageManager skips a legacy s3 backend
+// with an empty bucket, so it names no namespace and cannot alias one. Declared
+// modern classes are already required to be registrable by the caller.
+func (c *Config) validateStorageClassNamespaceAliasing() error {
+	type declaration struct {
+		scope        string
+		collisionKey string
+	}
+	declarations := make([]declaration, 0, len(c.Storage.Classes)+len(c.Storage.Backends))
+	for name, classCfg := range c.Storage.Classes {
+		if !c.configuredStorageClass(name) {
+			continue
+		}
+		declarations = append(declarations, declaration{
+			scope:        "storage.classes." + name,
+			collisionKey: classCfg.namespaceCollisionKey(),
+		})
+	}
+	for name, backendCfg := range c.Storage.Backends {
+		if !c.configuredStorageClass(name) {
+			continue
+		}
+		declarations = append(declarations, declaration{
+			scope:        "storage.backends." + name,
+			collisionKey: backendCfg.StorageClassConfig().namespaceCollisionKey(),
+		})
+	}
+	// Map iteration order is not stable, and an error that names a different pair
+	// on every boot is an error nobody can act on.
+	sort.Slice(declarations, func(i, j int) bool { return declarations[i].scope < declarations[j].scope })
+
+	claimedBy := make(map[string]string, len(declarations))
+	for _, declared := range declarations {
+		if previousScope, ok := claimedBy[declared.collisionKey]; ok {
+			return fmt.Errorf(
+				"%s and %s have the same conservative namespace collision key %s; use one class name for configurations that may address the same physical namespace",
+				previousScope, declared.scope, declared.collisionKey)
+		}
+		claimedBy[declared.collisionKey] = declared.scope
+	}
+	return nil
+}
+
 // validateStorageClassIdentity protects the R23a contract that a persisted
 // storage_class is itself the immutable physical namespace identity.
 //
@@ -3431,18 +3658,34 @@ func (c *Config) validateStorageClassIdentity() error {
 	if err := validateStorageClassNames(c.Storage); err != nil {
 		return err
 	}
+	singleRegion := c.storageMode() == "single"
 	for name := range c.Storage.Classes {
 		if !c.configuredStorageClass(name) {
+			// The shared production config keeps empty modern-class placeholders
+			// while a single-region deployment uses the legacy hot backend. Those
+			// classes are inactive in this mode and must not block the legacy path.
+			if singleRegion {
+				continue
+			}
 			return fmt.Errorf("storage.classes.%s is declared but cannot be registered; configure a non-empty bucket", name)
 		}
+	}
+	if err := c.validateActiveStorageRegions(); err != nil {
+		return err
 	}
 	if err := c.validateStorageClassReference("storage.default_class", c.Storage.DefaultClass); err != nil {
 		return err
 	}
 	for name, classCfg := range c.Storage.Classes {
+		if !c.configuredStorageClass(name) && singleRegion {
+			continue
+		}
 		if err := c.validateStorageClassReference("storage.classes."+name+".failover_class", classCfg.FailoverClass); err != nil {
 			return err
 		}
+	}
+	if singleRegion {
+		return c.validateStorageClassNamespaceAliasing()
 	}
 	for region, regionConfig := range c.Storage.RegionClasses {
 		if err := c.validateStorageClassReference("storage.region_classes."+region+".hot", regionConfig.Hot); err != nil {
@@ -3450,6 +3693,44 @@ func (c *Config) validateStorageClassIdentity() error {
 		}
 		if err := c.validateStorageClassReference("storage.region_classes."+region+".cold", regionConfig.Cold); err != nil {
 			return err
+		}
+	}
+	return c.validateStorageClassNamespaceAliasing()
+}
+
+// validateActiveStorageRegions requires constructor inputs for every entry the
+// runtime will register. Empty-bucket legacy S3 entries remain valid inactive
+// placeholders; every other legacy type reaches the S3 constructor at runtime.
+func (c *Config) validateActiveStorageRegions() error {
+	type activeEntry struct {
+		scope  string
+		region string
+	}
+	entries := make([]activeEntry, 0, len(c.Storage.Classes)+len(c.Storage.Backends))
+	invalidBackends := make([]string, 0)
+	for name, classCfg := range c.Storage.Classes {
+		if strings.TrimSpace(classCfg.Bucket) != "" {
+			entries = append(entries, activeEntry{scope: "storage.classes." + name, region: classCfg.Region})
+		}
+	}
+	for name, backendCfg := range c.Storage.Backends {
+		scope := "storage.backends." + name
+		if strings.TrimSpace(backendCfg.Bucket) == "" {
+			if !strings.EqualFold(strings.TrimSpace(backendCfg.Type), "s3") {
+				invalidBackends = append(invalidBackends, scope)
+			}
+			continue
+		}
+		entries = append(entries, activeEntry{scope: scope, region: backendCfg.Region})
+	}
+	sort.Strings(invalidBackends)
+	if len(invalidBackends) > 0 {
+		return fmt.Errorf("%s.bucket must be set", invalidBackends[0])
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].scope < entries[j].scope })
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.region) == "" {
+			return fmt.Errorf("%s.region must be set when %s.bucket is non-empty", entry.scope, entry.scope)
 		}
 	}
 	return nil

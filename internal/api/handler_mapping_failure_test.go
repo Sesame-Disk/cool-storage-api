@@ -137,8 +137,8 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 		return fmt.Errorf("mapping failed: %w", v2.ErrBlockMappingWriteFailed)
 	}
-	lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) string {
-		return ""
+	lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) (string, error) {
+		return "", nil
 	}
 
 	r := setupSyncTestRouter()
@@ -205,8 +205,8 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 		registerCalls++
 		return nil
 	}
-	lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) string {
-		return ""
+	lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) (string, error) {
+		return "", nil
 	}
 
 	r := setupSyncTestRouter()

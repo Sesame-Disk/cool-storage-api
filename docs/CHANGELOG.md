@@ -8,6 +8,287 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-20 - R23b review closure: upgrade path, drift gate, exact-P sequence
+
+Six findings from an external review of the R23b follow-ups, all confirmed against
+the tree before acting on them.
+
+**The local upgrade path was broken and the reset recipe hid it.** Every `.env`
+copied from the pre-R23b `.env.example` carries `S3_BUCKET=sesamefs-blocks`, which
+now points the legacy `hot` name at `hot-minio-local`'s bucket — the alias
+`Config.Validate` refuses, and that validation is not dev-mode gated
+(`validateStorageClassIdentity` calls it on both the single and multi paths). The
+stack therefore fails to start for anyone with an existing `.env`, and the recipe as
+written ("wipe the volumes") could not fix it, because the collision is in the
+environment rather than the data. The recipe now leads with the `.env` edit and says
+why the volume wipe is a separate matter.
+
+**A missing `libraries` row is now pinned by a test, not only by prose.** The
+fail-closed placement tests asserted on a generic `errors.New`, so the documented
+claim that an absent row is UNKNOWN rested on reading `Scan`'s behavior. Both
+`TestSyncPutBlockPlacementLookupFailureSkipsStorage` and
+`TestSeafHTTPHandleUploadPlacementLookupFailureSkipsStorage` are now table-driven
+over a transport error and a wrapped `gocql.ErrNotFound`, each asserting the same
+`probe == 0 / put == 0` and 503.
+
+**The verification helper had the drift it was written to remove.**
+`defaultClassS3Config` repeats the class name and the location
+`configs/config.docker.yaml` declares, so editing that file alone would desync them
+and — as before — express the desync as a silent skip rather than a failure.
+`TestVerificationStoreMatchesShippedDefaultClass` reads the shipped profile and
+fails when the helper's defaults or its `S3_CLASS_*` class name stop matching. Its
+negative case was verified by temporarily repointing the shipped bucket.
+
+**Two overstatements corrected.** `minio-init` provisions the overridden `S3_BUCKET`
+only while the legacy backend still targets Compose MinIO: the initializer aliases
+`http://minio:9000` unconditionally, so an overridden `S3_ENDPOINT` points the
+backend at a namespace nobody provisioned. And `.env.example` claimed the generic
+`S3_*` set does not name a bucket the server writes to, which is false for a library
+explicitly placed on class `hot`; it names the DEFAULT placement bucket instead, and
+notes that per-class credentials override the shared ones.
+
+**The exact-`P` sequencing note was missing two requirements and started in the
+wrong place.** It listed eight properties and omitted R12 and R13 — the same
+document elsewhere states that "R8, R13 and R15 decide whether Option B is viable",
+so R13's absence from a sequence implementing Option B was substantive. R12 is a
+prerequisite rather than a member: mixing `LOCAL_SERIAL` and `SERIAL` conditional
+statements on the `blocks` partition leaves two quorum domains where one straggler
+invalidates every other guarantee, and closing that needs no minted key. The note
+also opened with "mint and persist `K`", which cannot be first: every path that
+must find those bytes still derives its locator through `hashToKey`, and no
+`storage_key` column exists, so minting before the locator is authoritative puts
+objects at `K1` while readers look elsewhere — unreachable bytes with GC disabled.
+The sequence is now **P0** R12 SERIAL domain; **P1** locator authority with the
+currently derived value; **P2** mint plus canonical install (R9, R24); **P3**
+condemned-incarnation writer safety (R10, R13, R17); **P4** exact-`P` destructive
+lifecycle (R14, R19, R20, R26), with R18/R27 attaching per recovery/retry
+resolution and an explicit warning against reading P0-P4 as exhaustive.
+
+The remaining HTTP inconsistency from the review is closed without changing the
+fail-closed storage behavior: session-mode `POST /api/v2/blocks/check` now maps
+placement/store-resolution failures to its existing `503 block storage not
+available` response, while metadata and physical-reader failures retain their
+existing classification. Regression coverage includes transport errors and a
+wrapped `gocql.ErrNotFound`, and asserts that no canonical storage reader is
+reached.
+
+A 503 there is not only a different number: the web uploader's
+`isRetriableControlPlaneError` treats 502/503/504 as retriable and everything else
+as terminal, so a failed placement read now gets backoff retries where it used to
+abort at once. That is right for a transport failure or an unhealthy backend, and
+harmless for an absent library -- the retries expire and the upload fails, later.
+`getBlockStoreForRepo` also logs the placement failure now, matching the two
+storage failures below it; without that line the new 503 left no trace at all.
+
+X1 remains OPEN and `GC_ENABLED=false` remains required; none of this closes any
+part of it.
+
+---
+
+## 2026-08-20 - R23b audit follow-ups: overridable local S3 config
+
+Local Compose no longer hardcodes the S3 values for the legacy `hot` backend.
+`S3_REGION`, `S3_ENDPOINT` and `S3_BUCKET` are back to `${VAR:-default}` on all
+four SesameFS services, with defaults that keep the legacy name off
+`hot-minio-local`'s bucket. The pin was redundant protection: pointing `S3_BUCKET`
+back at `sesamefs-blocks` is now refused by `Config.Validate` at startup with the
+colliding key named, so an operator gets a stated error instead of a silently
+aliased namespace. `minio-init` resolves `S3_BUCKET` with the same default and
+creates whatever bucket the services will actually use, so a custom value no longer
+fails on first write. That provisioning holds only while the legacy backend still
+targets the Compose MinIO: `minio-init` aliases `http://minio:9000` unconditionally,
+so overriding `S3_ENDPOINT` to another service leaves that namespace to be
+provisioned externally. Teaching the initializer to reach arbitrary S3 endpoints is
+deliberately not attempted.
+
+The integration verification stores stopped reading `S3_BUCKET`. That variable
+configures the LEGACY backend, while the server under test writes through
+`default_class` `hot-minio-local`, and the two now name different buckets — so the
+stores were checking a bucket nothing ever wrote to. `TestGC_BlockDeletion_RemovesObjectFromS3` and `TestGC_S3OrphanRecovery_DeletesLingeringObject` silently skipped
+on `discoverStorageClass`'s bucket-mismatch self-check, taking physical GC-deletion
+coverage with them, and `TestGC_CrossOrgIdenticalBlockDeleteIsolation` — which has
+no such check — failed its "physical object missing before GC" precondition.
+
+The fix keeps the bucket configurable rather than hardcoding it: a new
+`defaultClassS3Config` helper resolves the namespace with the same precedence the
+server applies to that class, reading `S3_CLASS_HOT_MINIO_LOCAL_BUCKET`/`_ENDPOINT`/
+`_REGION`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY` and falling back to the values
+`configs/config.docker.yaml` declares, with credentials falling back to the generic
+keys exactly as `applyStorageClassEnvOverrides` does. Both stores use it, so
+repointing the local default class through `.env` moves verification with it.
+
+`configs/config.prod.yaml`'s in-file single-region recipe now states the
+`STORAGE_MODE=single` requirement it omitted. The file hardcodes `mode: "multi"`
+and an explicit mode is never inferred away, so following the old recipe failed
+startup with `storage.classes.hot-s3-na is declared but cannot be registered` — an
+error that names the symptom rather than the cause.
+
+Follow-on documentation that still described the reverted pin or the pre-R23b
+bucket count was corrected in the same pass. `docs/ARCHITECTURE.md` and
+`docs/GC-X1-CLOSURE-OPTIONS.md` said local Compose "pins" the generic `S3_*` values
+over `.env`; they now say it defaults them and names startup validation, not the
+pin, as what prevents the alias. Both also spell out which variable names which
+bucket, since that confusion is what produced the verification-store defect.
+`.env.example` carries the same note next to `S3_BUCKET`. `docs/KNOWN_ISSUES.md`
+and `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` told operators to count residue
+across the dev stack's five buckets; there are six now that the legacy backend has
+its own, and an uncounted bucket is exactly how the earlier undercount happened.
+
+Documentation corrections. The placement-read tri-state now says explicitly that a
+missing `libraries` row belongs to UNKNOWN, not to default routing, with the reason
+(the caller already validated the library, so absence is dangling metadata) and the
+visible cost (storage-unavailable, not 404). `initStorageManager`'s note that a
+profile "may carry both formats" now records that production multi-region rejects a
+configured legacy hot backend outright, so coexistence is a single-mode and dev-mode
+arrangement only.
+
+Two review corrections to the X1 specification wording. First, "fingerprint or claim
+marker = cross-install hardening" conflated two different guards: a durable
+fingerprint catches a historical rebind within ONE metadata history (the same
+Cassandra remembers what a class name meant), and is useless to a fresh install whose
+binding table is empty; a namespace claim marker written inside the physical namespace
+is the cross-install one. Second, "exact `P` belongs exclusively to R24" understated
+the work. R24 keeps its own narrow meaning — single-use install identity and
+`install-uncertain` settlement — while minting `K` opens a series touching R9, R10,
+R12, R13, R14, R17, R19, R20, R24 and R26. `docs/GC-X1-CLOSURE-OPTIONS.md` now
+carries a sequencing note with a P0-P4 split.
+
+---
+
+## 2026-08-20 - R23 contract reconciliation and fail-closed placement reads
+
+The accepted R23 deployment contract is now stated consistently: a
+`storage_class` name is append-only, may never be rebound to another physical
+namespace, and may never be reused. New placement always receives a new class
+name. This is a greenfield deployment contract, so no migration or preflight of
+historical class values is required.
+
+The namespace contract includes every value that can change the addressed physical
+collection. Credentials, account/tenant or provider scope, region, endpoint and bucket
+may change only when they still reach exactly the same namespace; multi-tenant scope is
+immutable even when configuration cannot reveal it. The endpoint+bucket algorithm is
+therefore described only as a conservative canonical-collision key, not an exhaustive
+physical identity. Its path/query/bucket equivalences can safely over-reject exotic
+providers at startup without proving universal identity.
+
+The durable class-to-namespace fingerprint and namespace claim marker discussed in
+earlier analysis are optional cross-install hardening outside R23, R24 and X1. They do
+not participate in request routing and must not be added to the request hot path. The
+accepted contract plus conservative configuration collision detection is the current
+`B` guarantee. Minting a never-reused `storage_key` and forming `P=(storage_class, storage_key)` opens an exact-`P` SERIES, not one row. R24 keeps its own narrower meaning — install identity is single-use, and an ambiguous install becomes `install-uncertain` until serial settlement — and the mint touches R9 (SERIAL install winner), R10 (condemned-key repair), R14 (tuple-bound claim CAS), R17, R19, R20, R24 and R26 as separate properties. Minted keys make several of those races physically observable for the first time: today two writers derive the same key and store the same object, so a double accept is only conceptually wrong; with `W1 -> K1` and `W2 -> K2` it is two objects. The foundation slice must therefore persist `K` WITHOUT granting destructive authority based on the new `P`, or close the minimum install property that makes it safe in the same change.
+
+Configuration no-aliasing now canonicalizes one terminal DNS root dot in both
+custom and AWS S3 endpoints, in addition to host case, default ports, trailing
+URL slashes, and equivalent AWS endpoint spellings. It therefore catches
+canonically equivalent endpoint/bucket declarations, including
+`minio`/`minio.`, but it does not resolve DNS and cannot prove that arbitrary
+DNS names or IP addresses reach the same physical service. Operators must use
+one canonical endpoint spelling per service.
+
+Library placement reads now preserve three states instead of conflating them:
+a successful non-empty value selects the persisted class, a successful empty
+value permits hostname/default routing, and every Cassandra read error is
+UNKNOWN and fails closed. Sync, SeafHTTP, v2 block/file and OnlyOffice storage
+resolution propagate the error and perform no storage probe or write through a
+default backend; upload-facing paths return their existing storage-unavailable
+response.
+
+A missing `libraries` row is deliberately in the UNKNOWN state, not the
+default-routing one. Callers arrive with an org/library pair that an access token
+or upload session already validated, so an absent row means dangling metadata --
+a permanent delete racing the request, a partial write, cross-DC lag -- and the
+one thing that must not follow is a block write into whichever backend the
+default policy happens to name. This is the same rule `findValidatedEntryInDir`
+already applies to an absent row behind a validated reference. The visible cost
+is that such a request answers storage-unavailable rather than 404.
+
+`docker-compose.yaml` remains only the local development/integration stack.
+Production behavior and storage topology are defined by
+`docker-compose.prod.yml` together with `configs/config.prod.yaml` and their
+environment overrides.
+
+---
+
+## 2026-08-18 - R23b storage-class namespace contract freeze
+
+`storage_class` is now stated as the permanent identity of one physical namespace,
+and conservative canonical collisions are rejected. A used class name may never be
+repointed at another namespace and never reused for one; new placement takes a new
+name. Credentials, account/tenant or provider scope, region, endpoint and bucket may
+change only if they continue to address exactly the same namespace. Encryption, tier
+and failover policy may change only insofar as they do not retarget physical storage.
+
+`Config.Validate` rejects two storage class names with the same conservative
+canonical `(endpoint, bucket)` collision key, covering modern classes and legacy
+backends together. The key deliberately does not inspect credentials or infer
+provider account/tenant scope, so it is not an exhaustive namespace identity.
+Comparison folds host case, one terminal DNS root dot, default ports, trailing
+slashes and equivalent AWS endpoint spellings. This catches canonically equivalent
+declarations, but does not resolve DNS or prove that arbitrary DNS/IP aliases reach
+one service; path/query/bucket equivalences may also over-reject exotic providers and
+fail startup. Operators must use one canonical endpoint spelling per service. This
+is not hypothetical: storage keys carry no class component, so two classes that do
+reach one namespace share an org's key space exactly.
+
+`config.docker.yaml` had that defect. Its legacy `hot` backend named
+`http://minio:9000/sesamefs-blocks`, the same bucket as `hot-minio-local`, the
+docker `default_class` — two class identities over one namespace in the dev and
+integration stack. The legacy name remains selectable for compatibility, now over
+the separate `sesamefs-legacy-blocks` bucket, which the local MinIO initializer
+creates alongside the modern buckets.
+
+**Existing local stacks need a reset, and the first step is `.env`, not the
+volumes.** Every `.env` copied from the pre-R23b `.env.example` carries
+`S3_BUCKET=sesamefs-blocks`, which now points the legacy `hot` name at
+`hot-minio-local`'s bucket — exactly the alias `Config.Validate` refuses. Startup
+fails before anything else matters, and wiping volumes does not help because the
+collision is in the environment, not the data. So:
+
+1. Set `S3_BUCKET=sesamefs-legacy-blocks` in `.env` (or remove the line and take the
+   Compose default; any bucket other than `sesamefs-blocks` works).
+2. Then wipe the local Cassandra and MinIO volumes.
+
+The volumes need wiping for a separate reason. `config.docker.yaml` now declares
+`mode: multi`; before, the absence of `server.region` plus a configured
+`backends.hot` made it *infer* single mode, which forced `default_class` to `hot`.
+Libraries created under the old inference carry `storage_class: "hot"` and now
+resolve to the new, empty `sesamefs-legacy-blocks` bucket. The physical bucket for
+new local data is unchanged (`sesamefs-blocks`, via `hot-minio-local`) — only the
+class name stamped on rows changed — so do not expect old dev libraries to read.
+Greenfield scope, no migration.
+
+`StorageClassConfig.EffectiveEndpoint` and `BackendConfig.StorageClassConfig()` are
+shared by validation and the storage runtime, including the legacy singleton store.
+Region has no runtime fallback: every registrable class or backend must declare one,
+and the runtime trims and passes that value directly to the S3 client. The
+`us-east-1` on `DefaultConfig`'s legacy `hot` backend is an explicit development
+configuration value, not a default applied to arbitrary entries.
+
+The two storage formats remain deployment alternatives, not dev-only features.
+Production single-region mode accepts `backends.hot` and its `S3_*` overrides;
+when the shared production file retains empty modern-class placeholders, single
+mode ignores those inactive entries and initializes only the configured legacy
+backend. Multi-region mode still requires registrable modern classes and uses
+`S3_CLASS_<CLASS>_*` for class locations.
+
+Local Compose deterministically pins the generic `S3_*` variables consumed by
+the legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` /
+`us-east-1`. Its explicit service environment wins over stale `.env` values, so
+legacy `hot` cannot accidentally alias `hot-minio-local`. Production
+single-region deployments continue to use ordinary `S3_*` variables directly.
+
+Deliberately NOT included: a durable class-to-namespace fingerprint or namespace
+claim marker. Either can be optional cross-install hardening, outside R23, R24 and X1,
+and neither belongs on the request hot path. The minted `storage_key` work that
+advances exact `P` is a series spanning R9, R10, R12, R13, R14, R17, R19, R20, R24
+and R26;
+R24 alone remains the single-use install identity property.
+An in-place rebind between boots remains prohibited by deployment contract rather
+than runtime proof. This is a greenfield deployment, so no migration or preflight
+for historical `storage_class` values is required.
+
+---
+
 ## 2026-08-18 - R23a validation hardening and raw-identity consistency
 
 Storage-class references now require a class that can actually be registered,
@@ -73,10 +354,11 @@ buy nothing and would weaken unconditional validation at the resolution boundary
 into a cache-miss-only check, which is backwards for the contract this branch
 exists to certify.
 
-**Scope.** R23a is identity *hardening*; it does not prove the class-to-namespace
-binding. See the corrected 2026-08-17 note below and the R23 row in
-`docs/GC-X1-CLOSURE-OPTIONS.md`: both rebind and reuse silently retarget a persisted
-identity, and closing them needs R23b's durable per-class namespace fingerprint.
+**Historical scope, superseded by the current contract above.** R23a alone did not
+prove the class-to-namespace binding. R23 is closed by the accepted append-only/
+never-rebind/never-reuse greenfield deployment contract plus conservative
+configuration collision detection. A durable fingerprint or namespace claim marker
+is optional cross-install hardening outside R23, R24 and X1.
 
 **Deployment note.** Every class declared under `storage.classes` must now be
 registrable, not only the ones something references. `configs/config.prod.yaml`
@@ -111,8 +393,9 @@ Cassandra, so the garbage verdict still describes the same content and a misdire
 delete removes the same condemned bytes. That holds only while the new namespace
 answers to the same liveness authority — which is exactly what reuse breaks, and
 what a rebind onto another cluster's bucket breaks too. Both halves silently
-retarget a persisted identity and neither is prevented; R23b must record a durable
-per-class namespace fingerprint, re-checked fail-closed.
+retarget a persisted identity. **Superseded requirement:** R23b did not add a
+fingerprint; it closed this item by the accepted append-only, never-rebind and
+never-reuse deployment contract plus the configuration checks described above.
 
 The class/legacy collision check closes a rebind the code could produce by itself.
 Before R23a, a class whose initialization failed was skipped with a warning, after
@@ -129,8 +412,10 @@ definition of the canon, shared by configuration and the storage runtime and app
 to the raw value, so a name can no longer certify at one layer and fail at the other.
 
 No `backend_id` field, migration, storage-key change, or GC protocol change is
-introduced. R23b will persist the exact `storage_key` and form
-`P = (storage_class, storage_key)`.
+introduced. Minting the never-reused `storage_key` and forming
+`P = (storage_class, storage_key)` is the exact-`P` series that follows R23b — it
+spans R9, R10, R12, R13, R14, R17, R19, R20, R24 and R26, and R24 alone stays the single-use
+install identity property.
 
 ---
 

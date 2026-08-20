@@ -398,26 +398,34 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 		manager.SetDefaultClass(cfg.Storage.DefaultClass)
 	}
 
-	// Set endpoint to region mapping
-	if cfg.Storage.EndpointRegions != nil {
-		manager.SetEndpointRegions(cfg.Storage.EndpointRegions)
-	}
-	manager.SetLocalRegion(cfg.Server.Region)
-
-	// Set region to class mapping
-	if cfg.Storage.RegionClasses != nil {
-		regionClasses := make(map[string]storage.RegionClassConfig)
-		for region, classes := range cfg.Storage.RegionClasses {
-			regionClasses[region] = storage.RegionClassConfig{
-				Hot:  classes.Hot,
-				Cold: classes.Cold,
-			}
+	if cfg.StorageMode() != "single" {
+		// Set endpoint to region mapping
+		if cfg.Storage.EndpointRegions != nil {
+			manager.SetEndpointRegions(cfg.Storage.EndpointRegions)
 		}
-		manager.SetRegionClasses(regionClasses)
+		manager.SetLocalRegion(cfg.Server.Region)
+
+		// Set region to class mapping
+		if cfg.Storage.RegionClasses != nil {
+			regionClasses := make(map[string]storage.RegionClassConfig)
+			for region, classes := range cfg.Storage.RegionClasses {
+				regionClasses[region] = storage.RegionClassConfig{
+					Hot:  classes.Hot,
+					Cold: classes.Cold,
+				}
+			}
+			manager.SetRegionClasses(regionClasses)
+		}
 	}
 
 	// Initialize storage classes from config
 	for className, classCfg := range cfg.Storage.Classes {
+		if cfg.StorageMode() == "single" && strings.TrimSpace(classCfg.Bucket) == "" {
+			// Shared production config may retain empty modern placeholders while
+			// single-region mode uses the legacy hot backend.
+			slog.Info("Skipping inactive unconfigured storage class", "class", className)
+			continue
+		}
 		s3Store, err := initStorageClass(className, classCfg)
 		if err != nil {
 			panic(fmt.Errorf("initialize storage class %q: %w", className, err))
@@ -427,11 +435,14 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	}
 
 	// Legacy "backends:" support — register any backends not already covered by "classes:".
-	// The "backends:" format is used by single-region deployments (e.g. config.prod.yaml with
-	// a single AWS S3 bucket). Multi-region deployments use "classes:" instead.
+	// The format is the primary single-region deployment path (for example, config.prod.yaml
+	// with one AWS S3 bucket), while multi-region deployments normally use "classes:" instead.
 	// Both formats register backends under the same storage manager so the rest of the code
 	// (GetHealthyBlockStore, ResolveStorageClass, etc.) works identically regardless of which
-	// config format was used.
+	// config format was used. A profile may carry both formats when their namespaces are
+	// distinct, but only where Config.Validate allows it: single mode, or a dev-mode
+	// profile like config.docker.yaml. Production multi-region rejects a configured
+	// legacy hot backend outright, so this loop registers nothing there.
 	for name, backendCfg := range cfg.Storage.Backends {
 		if _, alreadyRegistered := manager.GetBackend(name); alreadyRegistered {
 			continue
@@ -440,16 +451,9 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 			slog.Info("Skipping unconfigured legacy storage backend", "backend", name)
 			continue
 		}
-		classCfg := config.StorageClassConfig{
-			Type:                 backendCfg.Type,
-			Bucket:               backendCfg.Bucket,
-			Region:               backendCfg.Region,
-			Endpoint:             backendCfg.Endpoint,
-			AccessKey:            backendCfg.AccessKey,
-			SecretKey:            backendCfg.SecretKey,
-			ServerSideEncryption: backendCfg.ServerSideEncryption,
-			SSEKMSKeyID:          backendCfg.SSEKMSKeyID,
-		}
+		// Shared with configuration validation so a legacy backend is checked as
+		// exactly the class config it gets registered as.
+		classCfg := backendCfg.StorageClassConfig()
 		s3Store, err := initStorageClass(name, classCfg)
 		if err != nil {
 			panic(fmt.Errorf("initialize legacy storage backend %q: %w", name, err))
@@ -474,10 +478,9 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 
 	region := strings.TrimSpace(cfg.Region)
 	if region == "" {
-		region = "us-east-1"
+		return nil, fmt.Errorf("storage class %s region is not configured", name)
 	}
-
-	endpoint := strings.TrimSpace(cfg.Endpoint)
+	endpoint := cfg.EffectiveEndpoint()
 	accessKey := strings.TrimSpace(cfg.AccessKey)
 	secretKey := strings.TrimSpace(cfg.SecretKey)
 	serverSideEncryption := strings.TrimSpace(cfg.ServerSideEncryption)
@@ -506,50 +509,16 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 
 // initS3Storage initializes the S3 storage backend (legacy, single backend)
 func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
-	var (
-		endpoint    string
-		bucket      string
-		region      string
-		accessKey   string
-		secretKey   string
-		sseMode     string
-		sseKMSKeyID string
-	)
-
-	// Fall back only to the legacy single-backend config.
 	// Do not derive the singleton store from storage.classes; multi-region nodes
 	// must use storageManager-backed resolution instead of a process-wide default.
-	if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
-		endpoint = strings.TrimSpace(hotBackend.Endpoint)
-		bucket = strings.TrimSpace(hotBackend.Bucket)
-		region = strings.TrimSpace(hotBackend.Region)
-		accessKey = strings.TrimSpace(hotBackend.AccessKey)
-		secretKey = strings.TrimSpace(hotBackend.SecretKey)
-		sseMode = strings.TrimSpace(hotBackend.ServerSideEncryption)
-		sseKMSKeyID = strings.TrimSpace(hotBackend.SSEKMSKeyID)
-	}
-
-	if bucket == "" {
+	hotBackend, ok := cfg.Storage.Backends["hot"]
+	if !ok || strings.TrimSpace(hotBackend.Bucket) == "" {
 		return nil, errLegacyS3NotConfigured
 	}
 
-	if region == "" {
-		region = "us-east-1"
-	}
-
-	s3Cfg := storage.S3Config{
-		Endpoint:             endpoint,
-		Bucket:               bucket,
-		Region:               region,
-		AccessKeyID:          accessKey,
-		SecretAccessKey:      secretKey,
-		ServerSideEncryption: sseMode,
-		SSEKMSKeyID:          sseKMSKeyID,
-		UsePathStyle:         endpoint != "", // Use path style for custom endpoints (MinIO)
-		AccessType:           storage.AccessImmediate,
-	}
-
-	return storage.NewS3Store(context.Background(), s3Cfg)
+	// Use the same constructor as manager registration so the legacy singleton
+	// receives exactly the explicitly configured region and cannot add a fallback.
+	return initStorageClass("hot", hotBackend.StorageClassConfig())
 }
 
 // setupRoutes configures all API routes

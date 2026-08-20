@@ -25,7 +25,7 @@ projection is counted after canonical deletion; because that cleanup currently
 returns success, an old stale row can fall behind the cursor overlap rather than
 necessarily holding the cursor. If it is encountered before the cursor passes its day,
 recovery still fails closed instead of skipping uncertain work. The reload is not a
-Paxos settlement or lifecycle lock; exact `P` binding remains open R20/R23/R26 work,
+Paxos settlement or lifecycle lock; exact `P` binding remains open R20/R26 work,
 and the writer publication gap R3 remains open. The R22 row below records the original
 defect and its remaining exact-identity requirements.
 
@@ -60,8 +60,8 @@ let the branch clear an unverified canonical state.
 adopts `storage_class` as the candidate backend namespace identity `B` and hardens
 every layer that declares, admits, persists or resolves a class so the value is
 preserved exactly. What R23a does NOT do is bind a class name durably to the
-namespace it was first used with; until R23b does, `B = storage_class` is a
-configuration contract asserted by operators, not a property the system enforces.
+namespace it was first used with; that history remains an operator contract, now
+stated and frozen by R23b below rather than proven at runtime.
 A class name that has stored objects is append-only:
 it must never be rebound to another bucket, account, provider namespace, or data
 set, and it must never be reused for a different backend. Moving new data to a
@@ -71,12 +71,14 @@ does not follow failover. Configuration is treated as a deployed contract, so
 runtime cannot discover a historical rebind. R23a adds canonical-name, reference
 and class/legacy-name collision validation. References must resolve to a class
 that can actually be registered, and runtime failover is cycle-guarded, without
-adding a new identity field or persisting `P`; R23b will persist the exact
-`storage_key` and form
-`P=(storage_class, storage_key)`.
+adding a new identity field or persisting `P`. Persisting the exact `storage_key`
+and forming `P=(storage_class, storage_key)` is the work AFTER R23b and is what
+actually closes the physical ABA — but it is a series of properties, not one row.
+See the sequencing note below.
 
-**Neither half is enforced, and an earlier version of this section justified the
-rebind half with an argument that does not hold.** That argument was: repointing a
+**The historical risk remains real even though the current greenfield deployment
+contract now prohibits both halves.** An earlier version of this section justified the
+rebind half with an argument that does not hold. That argument was: repointing a
 class that holds objects makes every block in it unreadable at once, so a rebind
 surfaces as a loud outage rather than a quiet GC hazard. It fails on the most likely
 shape of a rebind — copy bucket A to bucket B, then repoint `hot-v1` from A to B.
@@ -103,10 +105,60 @@ stale queue item) now resolves to a namespace governed by a different Cassandra,
 where key `K` can hold live content that no verdict here ever condemned. The same
 exposure exists for a rebind onto a bucket shared with another cluster.
 
-So the two halves do differ in how often they bite, but not in kind: **both silently
-retarget a persisted identity, and neither is prevented.** A namespace fingerprint
-recorded per class and re-checked fail-closed would close both. It belongs with
-R23b, and until it lands `B = storage_class` is asserted rather than certified.
+So the two halves do differ in how often they bite, but not in kind: both silently
+retarget a persisted identity if an operator violates the contract. A namespace
+fingerprint recorded per class and re-checked fail-closed could add runtime
+defense in depth within one keyspace, but R23b deliberately defers it. It is not a
+prerequisite for R23 or X1 and is not part of request routing or any request hot
+path. For this greenfield deployment, `B = storage_class` is accepted under the
+append-only, never-rebind and never-reuse contract; the next X1 priority is the
+minted `storage_key` that closes the physical ABA.
+
+**Sequencing the exact-`P` series.** Minting a never-reused `storage_key` and forming
+`P=(storage_class, storage_key)` opens an exact-`P` SERIES, not one row. R24 keeps its own
+narrower meaning — install identity is single-use, and an ambiguous install becomes
+`install-uncertain` until serial settlement — while the mint itself touches R9, R10, R12,
+R13, R14, R17, R19, R20, R24 and R26 as separate properties. Minted keys make several of
+those races physically observable for the first time: today two writers derive the same key
+and store the same object, so a double accept is only conceptually wrong; with `W1 -> K1`
+and `W2 -> K2` it is two objects.
+
+Two constraints shape the order, and an earlier draft of this note got both wrong by
+listing eight requirements and starting at the mint.
+
+**The mint cannot be the first slice.** Every path that has to *find* those bytes still
+derives its locator from the logical id (`hashToKey`, `internal/storage/blocks.go`), and no
+`storage_key` column exists yet. Mint `K1` while any reader still derives `K`, and the object
+sits at `K1` while readers look elsewhere: bytes unreachable with GC switched off entirely.
+So the locator must become authoritative BEFORE it becomes distinct — persist and consume
+`storage_key` across reads, HEAD/existence and repair while still storing the derived value,
+then change what the value is.
+
+**R12 is a prerequisite, not a member.** Raising some conditional statements on the `blocks`
+partition to `SERIAL` while others stay `LOCAL_SERIAL` leaves two quorum domains, and one
+straggler invalidates every other statement's guarantee — see R12's inventory of eleven
+statements. That must land before any install property depends on a serial round, and it
+needs no minted key to do so.
+
+A workable split, one property per PR as the R11/R22/R23 slices were:
+
+- **P0 — SERIAL domain (R12).** Every relevant `blocks` LWT on one consistency level. No
+  minted keys, no new identity.
+- **P1 — locator authority.** The persisted `storage_key` becomes the exact locator for
+  reads, existence checks and repair, still holding the currently derived value. Nothing
+  destructive changes; the deployment is observable before identity moves.
+- **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
+  canonical winner, single-use install identity with `install-uncertain` settlement, exact
+  losing-`P` cleanup.
+- **P3 — condemned-incarnation writer safety (R10, R13, R17).** Tuple-aware repair and writer
+  fence. R13 belongs here and not later: it is the data-loss path under B, where a live
+  `blocks(L) -> P1` names a tuple already authorized for retirement, so both repair and
+  install must block until the canonical row stops naming `P1`.
+- **P4 — exact-`P` destructive lifecycle (R14, R19, R20, R26).** Tuple-bound GC, orphan,
+  candidate and projection lifecycle.
+
+R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
+P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
 
 **The collision check closes a rebind the code could produce on its own, with no
 operator action.** Before R23a, a class whose `initStorageClass` failed was skipped
@@ -140,6 +192,83 @@ previous reference check trimmed before resolving, so a padded value certified a
 startup and failed at use time. `failover_class` is the sharp case: a typo there
 breaks nothing until the primary backend is down, which is precisely when it is
 needed, so startup validation is the only thing that can surface it in time.
+
+**R23b (2026-08-18). The namespace contract is frozen, and the half configuration
+can prove is now enforced.** R23b deliberately does NOT add the durable
+class-to-namespace fingerprint table this document previously assigned to it. That
+table answers one question: *did this name mean another bucket in the past?* It is
+deferred defense in depth, not a prerequisite for R23 or X1, and must not become a
+request-routing or request-hot-path lookup. The change that advances X1 is instead
+a minted, single-use `storage_key`. The accepted greenfield deployment contract is
+the current guarantee for `B`; no historical-value migration or preflight is part
+of R23.
+
+What R23b states instead is the contract itself, in the form R23 needs:
+
+> A `storage_class` name that has ever been used is permanent. Its namespace may go
+> offline or be destroyed, but the name may never be repointed at another namespace
+> and may never be reused for one. New placement uses a new name (`hot-v2`). Any change
+> to credentials, account/tenant or provider scope, region, endpoint or bucket is
+> allowed only when it still addresses exactly the same physical namespace. For a
+> multi-tenant S3-compatible service, account/tenant scope is immutable contract state
+> even when configuration cannot reveal it. Encryption, tier and failover policy may
+> change only insofar as they do not retarget storage. The class the PUT actually
+> landed in is the class that gets persisted.
+
+**And R23b conservatively detects one collision shape from current configuration.**
+R23 is usually read as *one name, two namespaces*, which needs history. The inverse
+shape — *two names with canonically matching endpoint+bucket declarations* — needs
+none, and it exposed a live defect rather than a hypothetical one. Storage keys carry no
+class component (`hashToKey` derives `blocks/<org_id>/<h[0:2]>/<h[2:4]>/<hash>`, and
+every `BlockStore` is built with the same `blocks/` prefix), so two classes over one
+bucket share an org's key space exactly. `Config.Validate` now rejects that: the
+namespace collision key is the canonical `(endpoint, bucket)`. It deliberately does
+not inspect credentials or infer account/tenant/provider scope, so excluded fields are
+not thereby declared irrelevant to physical identity. Endpoint comparison folds host case,
+one terminal DNS root dot, default ports, trailing slashes and equivalent AWS
+endpoint spellings. This detects canonically equivalent declarations, including
+terminal-dot variants, but does not resolve DNS and cannot prove that arbitrary
+hostnames or IP addresses reach one physical service. Its path/query/bucket
+equivalences may over-reject exotic providers and fail startup; that conservative
+result is not proof of universal physical identity. Operators must use one canonical
+endpoint spelling per service.
+
+**The collision key is derived from the same endpoint and bucket values the S3 client
+is built from.** `StorageClassConfig.EffectiveEndpoint` is shared by validation and
+`initStorageClass`, and `BackendConfig.StorageClassConfig()` is the single legacy
+conversion, so a legacy backend is checked from exactly the class config that gets
+registered. Region remains outside the collision key, not outside the immutable
+namespace contract. Every registrable entry must declare it explicitly;
+`initStorageClass` trims and passes it through without the old `us-east-1` runtime fallback.
+
+**The check immediately found the defect in a shipped file.** `config.docker.yaml`
+declared a legacy `hot` backend over `http://minio:9000/sesamefs-blocks` — the exact
+bucket `hot-minio-local`, the docker `default_class`, already named. The dev and
+integration stack was running two storage class identities over one physical
+namespace, and `hot` was selectable as an explicit `library.storage_class` through
+the normal admission path because it was a configured class. R23b keeps that legacy
+name over a separate `sesamefs-legacy-blocks` bucket, and `minio-init` creates both
+the legacy and modern buckets. The local Compose stack defaults its generic `S3_*`
+location variables to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`
+and lets `.env` override them; the collision check refuses a value that points the
+legacy name back at the default class's bucket, so the pin is no longer the thing
+preventing the alias. Modern classes retain their explicit class configuration,
+overridable per class through `S3_CLASS_*`. Production single-region deployments use ordinary `S3_*` directly.
+
+**Placement read failures are UNKNOWN, not empty placement.** The library-class
+lookup now returns `(value, error)` across Sync, SeafHTTP, v2 block/file and
+OnlyOffice resolution. A successful empty value alone permits hostname/default
+routing. Any Cassandra read error propagates and fails closed before storage probe
+or write; upload-facing handlers return their existing storage-unavailable response.
+
+**What R23b does NOT prove at runtime, stated plainly.** Configuration cannot detect
+an operator repointing a class between boots, and it cannot resolve arbitrary DNS/IP
+aliases. Those actions are prohibited by the accepted deployment contract. This
+repository targets a greenfield deployment, so R23 adds no migration, historical
+class preflight, binding-table bootstrap, or namespace claim-marker requirement.
+A durable fingerprint is optional hardening against a historical rebind within one metadata history: the same Cassandra remembers what `hot-v1` meant, so a repoint between boots can be caught. It cannot help a fresh install, whose binding table is empty and which therefore has no memory of what a class name meant elsewhere. A namespace claim marker is the cross-install one: written inside the physical namespace, it lets a foreign or fresh install discover that the namespace is already owned. Neither is part of R23, R24 or X1, and neither belongs on the request hot path. **R23 is closed by deployment contract plus a
+conservative detector for canonically colliding endpoint/bucket declarations, not by
+runtime proof of history or exhaustive physical identity.**
 
 **Historical R11a canonical-state characterization (2026-08-17, before R11b-1).**
 The canonical `external_sha1` and `representation_id` fields were no longer used
@@ -1091,6 +1220,18 @@ Assume: references stay `LOCAL_QUORUM`; GC's authorizing read is `EACH_QUORUM`; 
 fence is globally visible; every **new incarnation** mints a fresh key, while repairs of
 an active canonical incarnation preserve its key.
 
+**R23 row reconciliation (2026-08-20).** The R23 row below is historical rationale.
+The current requirement superseding earlier proposals is:
+R23 is closed for this greenfield deployment by the append-only, never-rebind and
+never-reuse contract plus conservative checks for canonically colliding endpoint/bucket
+declarations. Credentials, account/tenant/provider scope, region, endpoint and bucket
+may change only if the exact physical namespace remains unchanged. Validation includes
+one terminal DNS dot but cannot resolve arbitrary DNS/IP aliases or infer tenant scope;
+its equivalences can over-reject exotic configurations. A durable fingerprint is
+optional same-metadata historical-rebind hardening; a namespace claim marker is the
+cross-install ownership one. Both are outside R23, R24 and X1, and no historical
+migration, preflight, binding bootstrap, or claim marker is required.
+
 | # | Sequence | Required outcome |
 |---|---|---|
 | R1 | EU `up:` acked, then NA GC reads at `EACH_QUORUM` | GC sees the reference; no DELETE. Closed by X2. |
@@ -1103,7 +1244,7 @@ an active canonical incarnation preserve its key.
 | R8 | Who installs the next life, and with what CAS | `blocks` is one row per logical block and the install is `INSERT … IF NOT EXISTS`. **A+:** the writer waits until both the row and orphan are gone, then a plain insert creates `P2`. **B:** the writer waits only until GC drops the row, then may install `P2` while orphan `P1` remains. If the row still exists and is healthy, `NeedsPut` repairs the current `P` instead; it must not mint a losing second object. Neither needs a `P1→P2` successor CAS or a second generation table. |
 | R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos rounds can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. The losing writer still knows its exact key and should best-effort delete it, or persist that exact key for cleanup. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
 | R10 | Writer stalls after `Probe=Reusable(K1)`; GC fences, sees 0, authorizes `DELETE K1`; the writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT a condemned key. Confirmed live: the `Reusable` branch of `StoreUploadedBlockForProbe` (`upload_reuse.go:152-174`) does `ObjectExists` → repair-PUT with **no** fence re-check, and `EnsureReusableBlockPresent` passes `beforePut = nil` (`:205`). The one caller that supplies `beforePut` (`v2/blocks.go:996`) uses it for the staging cap, not for the fence. Under minted keys the clean rule is **repair an active current incarnation with its current key; never repair a condemned incarnation — wait and mint a new key after the row is free**. |
-| R11 | `K1`'s delete completes, `K2` is created and live, then stale `K1` cleanup runs | **CLOSED by R11a/B.3.** Physical GC no longer deletes `block_id_mappings`, so the mapping survives independently of the physical lifecycle. The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate pins that absence of physical-GC mapping-delete authority. `BlockExists` remains only in `pending_s3`, where it protects against repeating a physical S3 delete while a canonical block row exists; it is no longer consulted by `pending_mapping_cleanup`. This closes the mapping-loss race, but not the exact physical `P` identity problem tracked by R23/R26 and the remaining X1 work. |
+| R11 | `K1`'s delete completes, `K2` is created and live, then stale `K1` cleanup runs | **CLOSED by R11a/B.3.** Physical GC no longer deletes `block_id_mappings`, so the mapping survives independently of the physical lifecycle. The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate pins that absence of physical-GC mapping-delete authority. `BlockExists` remains only in `pending_s3`, where it protects against repeating a physical S3 delete while a canonical block row exists; it is no longer consulted by `pending_mapping_cleanup`. This closes the mapping-loss race, but not the exact physical `P` identity problem tracked by R26 and the remaining X1 work. |
 | R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. See the inventory below — it is **eleven** statements, not six. |
 | R13 | `INSERT orphan(L,P1)` succeeds, `DELETE blocks` row fails persistently, and a later candidate pass may release the claim once it is at least 15 minutes old | **New, and it is a data-loss path under B.** The row is now live, unclaimed, and pointing at a physical tuple already authorized for retirement. Today `ProbeBlockReuse` refuses it because `hasOrphan` outranks everything (`block_references.go:927`); B must replace that logical fence with a tuple-aware one. The corrected outcome is not to mint `P2` while `blocks(L) -> P1` still exists: both repair and install paths must block because the canonical tuple is condemned. Once the row is removed, `P2` may be minted. This makes step 6 of the naive protocol ("`P1` is irrevocably retired once the orphan is written") false: retirement completes when the canonical row stops naming `P1`. |
 | R14 | A candidate enqueued for `P1=(B1,K1)` is processed after `P1` died and `P2` was installed | The claim CAS must bind the physical tuple (`IF … AND backend_identity = B1 AND storage_key = K1`), or GC claims a life it never verified. The candidate/discovery work item must carry `P1` far enough for claim, finalize and candidate cleanup to reject stale work instead of touching `P2`. `processBlock` re-reads `GetBlockInfo` after the claim, which limits the damage, but the CAS should still name the life. |
@@ -1116,7 +1257,7 @@ an active canonical incarnation preserve its key.
 
 | R21 | A second API can create an orphan row, so the orphan cannot be trusted as an authorization certificate | **CLOSED by the R21 authority-surface PR.** `RecordS3Orphan` was removed from `GCStore`, `CassandraStore` and `MockStore`; all fixtures now enter through `StartBlockDeleteOrphan`, and failed-attempt state uses `UpdateS3OrphanAttempt`. The unused exported `DeleteBlockS3Orphan` helper was also removed. An untagged AST/source gate requires no forbidden production identifiers, exactly one production `INSERT INTO gc_s3_orphans`, conditional `UPDATE gc_s3_orphans` statements, and exactly one authorized production callsite in `Worker.processBlock`. This closes provenance of the orphan row only; it does not close X1, physical identity, publication fencing or lifecycle identity. |
 | R22 | Recovery destroys bytes using data read from the discovery projection, without re-reading the canonical orphan row | **Payload-authority half closed by R22a (2026-08-16) and made structural by R22b (2026-08-17); exact-`P` half still open.** The original defect: `RecoverS3Orphans` took its `S3OrphanInfo` straight from `ListS3OrphansByDay` and used those fields — `StorageClass` included — to resolve the backend and issue the delete, never reloading `gc_s3_orphans`, so a stale or diverged projection row could select the wrong backend for a physical delete or skip the physical delete entirely on a stale `pending_mapping_cleanup`. R22a removed the payload from the discovery type outright (`S3OrphanDiscoveryInfo` carries only `org_id`/`block_id`/`first_seen_at`), so the class is now a compile error rather than a rule; **R22b then dropped the four payload columns from `gc_s3_orphans_by_day` itself (migration 014), so the guarantee no longer rests on "no reader consults them" but on the columns not existing** — a re-wire is a Cassandra rejection, not a code review miss; recovery reloads canonical at `EACH_QUORUM` and re-reads it once more immediately before each irreversible action. R11a separately removes physical-GC authority over the logical forward mapping, so `pending_mapping_cleanup` now finalizes only the orphan row. **Still required and not delivered: an exact `P` match.** The correlation token is `first_seen_at`, which `StartBlockDeleteOrphan` reuses across a lifecycle reset, so matching tokens do not imply the same physical lifecycle; and the delete is still issued by logical block id plus storage class, not by an immutable `P=(B,K)`. A missing canonical row fails closed and retains the cursor when encountered, but repairing or dropping that projection entry remains gated on R20 because an ordinary read is not Paxos settlement. A discovery-token mismatch also fails closed and is conservatively deferred, but its identity/lifecycle resolution is not the same negative-authority problem and remains open under R23/R26. |
-| R23 | `storage_class` is rebound to a different bucket, account or backend namespace | **PARTIAL — R23a hardens the identity; the binding is still unproven.** R23a adopts `storage_class` as the candidate `B` and makes every layer preserve it exactly: canonical names are validated on the raw value from one shared definition, class/legacy-name collisions are rejected, references must resolve to a registrable class, and recovery uses the persisted class without following failover. What is NOT closed is the binding itself — R23a cannot detect an operator rebind or a reuse after deployment, so `B = storage_class` remains a contract operators assert, not one the system enforces. **Both halves silently retarget a persisted identity.** A migration rebind (copy A→B, then repoint) breaks no reads at all, and is survivable only by accident: keys are content addressed and liveness lives in Cassandra, so a misdirected delete removes the same condemned content — an accident that runs out as soon as the new namespace answers to a different liveness authority, which is exactly the reuse case. R23b must record a durable per-class namespace fingerprint, re-checked fail-closed, and persist the exact `storage_key` to form `P = (storage_class, storage_key)` before exact-P deletes can be authoritative. **Removing the orphan TTL makes this contract permanent rather than 90-day-bounded — which also means a stale identity survives indefinitely.** |
+| R23 | `storage_class` is rebound to a different bucket, account or backend namespace, or one namespace answers to two class names | **CLOSED BY CONTRACT, not by runtime proof — plus conservative collision detection.** R23a made every layer preserve the persisted class exactly: canonical names validated on the raw value from one shared definition, class/legacy-name collisions rejected, references required to resolve to a registrable class, recovery using the persisted class without following failover. **R23b freezes the contract** — a used class name is permanent, its namespace may die but the name may never be repointed or reused, and new placement takes a new name. Credentials, account/tenant/provider scope, region, endpoint and bucket may change only if they still address exactly the same physical namespace; multi-tenant scope remains immutable even when config cannot infer it. `Config.Validate` rejects two names with the same conservative canonical `(endpoint, bucket)` collision key. That key is not exhaustive identity: it cannot infer credentials or tenant scope, resolve arbitrary DNS/IP aliases, or establish universal path/query/bucket semantics, and may over-reject exotic configurations at startup. The check found the defect live in `config.docker.yaml`, where a legacy `hot` backend named the same MinIO bucket as the default class `hot-minio-local`; the dev profile now preserves both names over separate buckets. **Still not proven at runtime:** an in-place rebind between boots or reuse by a fresh install. A durable fingerprint is optional same-metadata historical-rebind hardening and a namespace claim marker is the cross-install ownership one; neither is required, and both sit outside R23, R24 and X1. **Removing the orphan TTL makes the contract permanent rather than 90-day-bounded — a stale identity then survives indefinitely.** |
 | R24 | An ambiguous install outcome is reused or cleaned before its status is settled | **The same ABA as X1, produced by the writer's own cleanup instead of by GC.** R9 has the losing writer best-effort delete its key; R17 forbids a stale *repair* from installing. Neither covers a stale **install**: `W2` loses the CAS to `W1`, schedules cleanup of `P2`, and that DELETE is slow; later GC removes `P1` and `blocks(L)` goes absent; a lingering retry of `W2` re-runs `INSERT … IF NOT EXISTS` with `P2`, which now applies — and the old cleanup DELETE lands on live bytes. **Rule: a minted `P` is a single-use installation identity.** A failed install whose outcome is known lost makes `P` burned and cleanup-eligible; an ambiguous outcome makes `P` **install-uncertain**: it is non-retryable, cannot be reused for another install, and is not cleanup-authorized until serial settlement proves it is not canonical. Settlement proving applied moves `P` to canonical; settlement proving another locator won moves `P` to burned and permits exact-key cleanup. If settlement cannot be established, `P` stays install-uncertain and the safe result is a possible X3 leak, not deletion. |
 | R25 | A promote path creates permanent `fs:` references without ever having staged a checked `pub:` | **FIXED structurally** — the published-head repair now stages the `pub:` rows with a fresh attempt ID before finalizing, gated by `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` and `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`. Before this fix, `repairPublishedSyncCommitBlockDelta` rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, bypassing the handshake. The repair now uses the same `StagePublishAttemptReferences` operation as first publication; its rollback is scoped to the fresh repair ID, so a partial repair cannot retract another attempt's liveness. The *primitive* half remains unchanged: `PromotePublishAttemptReferences` does not require a staged row, so a future promote caller can reintroduce the bypass. **R25 was the highest-severity item after R17, and it broke R3's argument as written.** R3 itself remains open: the post-stage canonical-incarnation check does not exist yet. **Reachability, stated precisely rather than as "any retry":** `repairPublishedSyncCommitBlockDelta` first consults `finalizedBlockDeltas`, a per-process two-generation set with 4096 entries per generation (up to 8192 retained pairs) (`sync.go:138-194`), marked only *after* a finalize fully succeeds (`sync.go — finalizeSyncCommitBlockDelta`). A warm same-instance retry therefore short-circuits. The path runs when the retry lands on **another instance**, when **the original finalize failed**, after a process restart, or after eviction. The normal sync path, the auto-merge path, the SeafHTTP path and the v2 path already establish the handshake. **Rule: every known path that can promote permanent `fs:` references must execute Stage before Promote; preservation of the established handshake against concurrent cleanup remains R29/R3.** R3's eventual post-stage check must be added to Stage. |
 | R26 | A stale lifecycle's clear removes another lifecycle's discovery row | **Liveness, not data loss — but under a removed TTL it is permanent.** R22 makes recovery *read* the projection non-authoritatively; nothing yet constrains *writes* to it. `DeleteS3Orphan` clears the canonical row and then deletes the projection by timestamp identity — `first_seen_day`/`bucket`/`first_seen_at`/`org`/`block` (`store_cassandra.go`) — and when the caller passes a zero `firstSeenAt` it *resolves that timestamp from whatever canonical row is current* (`store_cassandra.go`), which may already belong to `P2`. Making only the canonical clear conditional on `P` (B.1) therefore leaves the projection half unbound: a delayed `P1` cleanup can still erase `P2`'s discoverability while `P2`'s canonical orphan correctly keeps fencing the writer. The result is a fence recovery cannot enumerate — R19's failure mode reached by a different route. **Rule: every repair or delete of `_by_day` is scoped to the expected `P`, or `P` becomes part of the projection's identity. Prefer the second.** A conditional `DELETE … IF P = P1` buys a Paxos round on a structure that is explicitly *liveness, never authorization* — the wrong place to spend consensus. Fold `P` into the discovery row's identity instead and the problem disappears by construction: a stale `P1` clear simply cannot name `P2`'s row. That is the same reasoning that makes A+ attractive in the first place — an identity that is never reused beats a check that has to be remembered. `_by_day` is never authorization, but stale lifecycle work must never remove another lifecycle's recovery discoverability. |
@@ -1301,7 +1442,7 @@ A conceptual diff, not an implementation list.
 | `RegisterUploadedBlock` | Write `up:` then check the logical fence, then `UpsertBlockMetadata`; the provisional ref is **not** rolled back when the fence is found active (`fs_helpers.go:989-1003`) | Split repair from install (**R17**): a repair may only update a row that still names the same `P`, never create an absent one. Make the path tuple-aware: reuse/repair the active canonical `P`, block a condemned/deleting one, mint only for a genuine new incarnation. And settle what the surviving `up:` row does to recovery (**R18**) |
 | `UpdateS3OrphanAttempt` | Reads the expected `first_seen_at`, then performs `UPDATE … IF first_seen_at = ?` with a bound TTL; absent or differently-tokened rows are no-ops, while an existing-row lifecycle reset can still reuse the token | Guard the actual non-reusable lifecycle identity `P` and fail when the row is gone or reset to another lifecycle (**R19**) |
 | `RecordS3Orphan` | **Removed by the R21 authority-surface PR.** It was a second `INSERT … IF NOT EXISTS` creator of `gc_s3_orphans` with no production caller. | Test fixtures use `StartBlockDeleteOrphan` and `UpdateS3OrphanAttempt`; the untagged R21 gate requires exactly one production creator (**R21 closed**) |
-| `RecoverS3Orphans` discovery | **R22a implemented, R22b made structural:** `ListS3OrphansByDay` returns only `(org_id, block_id, first_seen_at)`, and migration 014 dropped the projection's payload columns so no other value exists to return; recovery reloads canonical state at `EACH_QUORUM` and uses it for phase and backend selection. R11a removes mapping deletion from both recovery phases. A second canonical reload guards each irreversible action or orphan finalization. | Missing/error canonical reads and discovery-token mismatches fail closed and retain the cursor when the row is encountered. Missing-canonical repair remains gated on R20's serial-settlement requirement; token-mismatch cleanup remains conservatively deferred until lifecycle/projection identity rules are finalized. This is not exact `P` matching or lifecycle exclusion; R20/R23/R26 remain open. |
+| `RecoverS3Orphans` discovery | **R22a implemented, R22b made structural:** `ListS3OrphansByDay` returns only `(org_id, block_id, first_seen_at)`, and migration 014 dropped the projection's payload columns so no other value exists to return; recovery reloads canonical state at `EACH_QUORUM` and uses it for phase and backend selection. R11a removes mapping deletion from both recovery phases. A second canonical reload guards each irreversible action or orphan finalization. | Missing/error canonical reads and discovery-token mismatches fail closed and retain the cursor when the row is encountered. Missing-canonical repair remains gated on R20's serial-settlement requirement; token-mismatch cleanup remains conservatively deferred until lifecycle/projection identity rules are finalized. This is not exact `P` matching or lifecycle exclusion; R20/R26 remain open. |
 | `DeleteS3Orphan` | The fence clear GC actually runs: unconditional `DELETE` (`store_cassandra.go`) from `processBlock` and all three recovery exits (`worker.go:1261, 1411, 1429, 1584`); its projection half deletes by timestamp identity and resolves a zero `firstSeenAt` from whatever canonical row is current | Condition the canonical clear on the expected `P`, so a delayed clear from `K1`'s lifecycle cannot lift a fence belonging to a later one (B.1) — **and bind the projection clear the same way** (**R26**), or the stale lifecycle still erases the newer one's discoverability |
 | `upsertS3OrphanProjection` | Always derives `first_seen_day` from the original `firstSeenAt` (`store_cassandra.go`), so a re-projection lands in the day the cursor already passed | Give retry scheduling its own mutable fact (`next_retry_at`), separate from the immutable `first_seen_at`; without it R18(a)'s "re-project and retry" has no mechanism (**R27**) |
 | `repairPublishedSyncCommitBlockDelta` | Before R25, rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, promoting `fs:` without establishing `pub:` | Rebuild → fresh-ID `StagePublishAttemptReferences` with rollback scoped to that repair → R3 post-check → promote (**R25**) |
@@ -1389,9 +1530,15 @@ decisions come first.
    projection mismatch repairs the index and never destroys. Symmetrically, every repair
    or delete *of* the index is scoped to the expected `P`, or a stale lifecycle's clear
    erases a newer lifecycle's discoverability.
-6. **R23 — immutable backend namespace.** Decide and write down whether a storage-class
-   name is contractually append-only, or persist a `backend_id` and redefine `P` on it.
-   Removing the orphan TTL makes this contract permanent.
+6. **R23 — immutable backend namespace (settled).** `storage_class` is the accepted
+   `B` under the greenfield append-only, never-rebind and never-reuse deployment
+   contract. Credentials, account/tenant/provider scope, region, endpoint and bucket
+   may change only if the same physical namespace remains addressed. Configuration's
+   endpoint+bucket key conservatively rejects canonical collisions; it is not exhaustive
+   identity and may over-reject exotic configurations. A durable fingerprint is optional
+   same-metadata historical-rebind hardening; a namespace claim marker is the cross-install
+   ownership one. Both are outside R23, R24 and X1. No `backend_id`, historical migration
+   or preflight is required.
 7. **R24 — install identity is single-use.** A minted `P` whose install is known lost is
    burned and cleanup-eligible; an ambiguous install becomes `install-uncertain`, cannot
    be reused or cleaned, and stays there until serial settlement proves applied or lost.

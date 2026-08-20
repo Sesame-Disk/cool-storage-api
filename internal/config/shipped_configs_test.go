@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,6 +231,17 @@ func TestShippedConfigsUseCanonicalStorageClassNames(t *testing.T) {
 	}
 }
 
+func TestShippedActiveStorageEntriesDeclareRegions(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			if err := cfg.validateActiveStorageRegions(); err != nil {
+				t.Fatalf("shipped active storage entry has no explicit region: %v", err)
+			}
+		})
+	}
+}
+
 // Every storage class a shipped config REFERENCES must resolve to one it
 // declares. A typo in failover_class is invisible until the primary backend is
 // down, so the repo's own files are the cheapest place to catch it.
@@ -242,5 +254,160 @@ func TestShippedConfigsResolveEveryStorageClassReference(t *testing.T) {
 				t.Fatalf("shipped configuration would refuse to start: %v", err)
 			}
 		})
+	}
+}
+
+// R23b makes a class name permanent for one physical namespace. The conservative
+// endpoint+bucket collision key rejects canonical aliases without claiming to infer
+// every provider, account or tenant scope. config.docker.yaml keeps both modern and
+// legacy names, but gives them distinct MinIO buckets and therefore distinct keys.
+//
+// Scope limit worth knowing: hydrateShippedStoragePlaceholders fills empty buckets
+// with a per-name placeholder, so classes whose bucket comes from the deployment
+// environment are made distinct here by construction. This test proves the shipped
+// FILES declare no alias; a deployment that points two of those env vars at one
+// bucket is caught by Config.Validate at startup, not here.
+func TestShippedConfigsHaveDistinctNamespaceCollisionKeys(t *testing.T) {
+	for _, path := range shippedConfigPaths(t) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg := loadShippedConfig(t, path)
+			hydrateShippedStoragePlaceholders(cfg)
+			if err := cfg.validateStorageClassNamespaceAliasing(); err != nil {
+				t.Fatalf("shipped configuration aliases a storage namespace: %v", err)
+			}
+		})
+	}
+}
+
+func TestDockerConfigKeepsLegacyBackendInSeparateBucket(t *testing.T) {
+	var dockerPath string
+	for _, path := range shippedConfigPaths(t) {
+		if filepath.Base(path) == "config.docker.yaml" {
+			dockerPath = path
+			break
+		}
+	}
+	if dockerPath == "" {
+		t.Fatal("config.docker.yaml was not found")
+	}
+
+	cfg := loadShippedConfig(t, dockerPath)
+	legacy, ok := cfg.Storage.Backends["hot"]
+	if !ok || strings.TrimSpace(legacy.Bucket) == "" {
+		t.Fatal("config.docker.yaml must keep a configured legacy hot backend")
+	}
+	modern, ok := cfg.Storage.Classes["hot-minio-local"]
+	if !ok || strings.TrimSpace(modern.Bucket) == "" {
+		t.Fatal("config.docker.yaml must keep the modern local storage class")
+	}
+	if legacy.Bucket == modern.Bucket && legacy.Endpoint == modern.Endpoint {
+		t.Fatalf("legacy hot and modern local class share a physical namespace: legacy=%#v modern=%#v", legacy, modern)
+	}
+	if err := cfg.validateStorageClassNamespaceAliasing(); err != nil {
+		t.Fatalf("config.docker.yaml aliases a storage namespace: %v", err)
+	}
+}
+
+type composeFile struct {
+	Services map[string]struct {
+		Build       any      `yaml:"build"`
+		EnvFile     []string `yaml:"env_file"`
+		Environment []string `yaml:"environment"`
+		Entrypoint  any      `yaml:"entrypoint"`
+	} `yaml:"services"`
+}
+
+// Compose accepts entrypoint in string or list form; flatten both so a caller
+// can just search the command text.
+func composeEntrypointText(entrypoint any) string {
+	switch typed := entrypoint.(type) {
+	case string:
+		return typed
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, part := range typed {
+			parts = append(parts, fmt.Sprint(part))
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
+}
+
+func loadDockerCompose(t *testing.T) composeFile {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "docker-compose.yaml"))
+	if err != nil {
+		t.Fatalf("read docker-compose.yaml: %v", err)
+	}
+	var compose composeFile
+	if err := yaml.Unmarshal(data, &compose); err != nil {
+		t.Fatalf("parse docker-compose.yaml: %v", err)
+	}
+	return compose
+}
+
+func composeServiceEnvironment(assignments []string) map[string]string {
+	environment := make(map[string]string, len(assignments))
+	for _, assignment := range assignments {
+		if key, value, ok := strings.Cut(assignment, "="); ok {
+			environment[key] = value
+		}
+	}
+	return environment
+}
+
+// The local SesameFS services stay overridable from .env, but their DEFAULT must
+// keep the legacy "hot" backend off hot-minio-local's bucket. A default that fell
+// back to sesamefs-blocks would put two class names on one namespace, which
+// Config.Validate then rejects at startup -- correct, but only after the stack is
+// already broken for anyone who never set S3_BUCKET.
+func TestDockerComposeDefaultsLocalSesameFSS3Namespace(t *testing.T) {
+	compose := loadDockerCompose(t)
+
+	want := map[string]string{
+		"S3_REGION":   "${S3_REGION:-us-east-1}",
+		"S3_ENDPOINT": "${S3_ENDPOINT:-http://minio:9000}",
+		"S3_BUCKET":   "${S3_BUCKET:-sesamefs-legacy-blocks}",
+	}
+	checked := 0
+	for name, service := range compose.Services {
+		if !strings.HasPrefix(name, "sesamefs") || service.Build == nil || len(service.EnvFile) == 0 {
+			continue
+		}
+		checked++
+		environment := composeServiceEnvironment(service.Environment)
+		for key, value := range want {
+			if got := environment[key]; got != value {
+				t.Errorf("services.%s.environment %s = %q, want %q", name, key, got, value)
+			}
+		}
+	}
+	if checked != 4 {
+		t.Fatalf("checked %d local SesameFS services, want 4", checked)
+	}
+}
+
+// minio-init must create whatever bucket the services resolve S3_BUCKET to,
+// using the same default. Hardcoding the bucket name here would leave a custom
+// S3_BUCKET without a bucket until the first write failed.
+func TestDockerComposeMinioInitCreatesConfiguredLegacyBucket(t *testing.T) {
+	compose := loadDockerCompose(t)
+	service, ok := compose.Services["minio-init"]
+	if !ok {
+		t.Fatal("docker-compose.yaml has no minio-init service")
+	}
+	environment := composeServiceEnvironment(service.Environment)
+	if got := environment["S3_BUCKET"]; got != "${S3_BUCKET:-sesamefs-legacy-blocks}" {
+		t.Errorf("minio-init S3_BUCKET = %q, want the same default the services use", got)
+	}
+	entrypoint := composeEntrypointText(service.Entrypoint)
+	// "$$" is compose's escape: the mc shell receives ${S3_BUCKET} and expands it
+	// from the service environment, so compose must NOT interpolate it here.
+	if !strings.Contains(entrypoint, "mc mb myminio/$${S3_BUCKET} --ignore-existing") {
+		t.Errorf("minio-init does not create the configured legacy bucket; entrypoint = %q", entrypoint)
+	}
+	if !strings.Contains(entrypoint, "mc mb myminio/sesamefs-blocks --ignore-existing") {
+		t.Errorf("minio-init does not create the default_class bucket; entrypoint = %q", entrypoint)
 	}
 }

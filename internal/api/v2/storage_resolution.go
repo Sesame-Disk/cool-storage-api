@@ -30,13 +30,18 @@ func relayPortFromRequest(c *gin.Context, cfg *config.Config) string {
 	return httputil.GetRelayPortFromRequest(c, configuredServerURL(cfg))
 }
 
-func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) string {
-	return lookupLibraryStorageClassContext(context.Background(), database, orgID, repoID)
+var lookupLibraryStorageClassContextFn = lookupLibraryStorageClassContext
+
+func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) (string, error) {
+	return lookupLibraryStorageClassContextFn(context.Background(), database, orgID, repoID)
 }
 
-func lookupLibraryStorageClassContext(ctx context.Context, database *db.DB, orgID, repoID string) string {
+func lookupLibraryStorageClassContext(ctx context.Context, database *db.DB, orgID, repoID string) (string, error) {
 	if database == nil || orgID == "" || repoID == "" {
-		return ""
+		return "", nil
+	}
+	if database.Session() == nil {
+		return "", fmt.Errorf("lookup library storage class: database session unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -46,10 +51,10 @@ func lookupLibraryStorageClassContext(ctx context.Context, database *db.DB, orgI
 	if err := database.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).WithContext(ctx).Scan(&storageClass); err != nil {
-		return ""
+		return "", fmt.Errorf("lookup library storage class: %w", err)
 	}
 
-	return storageClass
+	return storageClass, nil
 }
 
 func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, cfg *config.Config, storageManager *storage.Manager, libraryClass, defaultClass string) (string, error) {
@@ -70,7 +75,10 @@ func resolveLibraryBlockStoreForRequest(c *gin.Context, database *db.DB, cfg *co
 }
 
 func resolveLibraryBlockStoreForRequestContext(ctx context.Context, c *gin.Context, database *db.DB, cfg *config.Config, storageManager *storage.Manager, s3Store *storage.S3Store, orgID, repoID string) (*storage.BlockStore, string, error) {
-	libraryClass := lookupLibraryStorageClassContext(ctx, database, orgID, repoID)
+	libraryClass, err := lookupLibraryStorageClassContextFn(ctx, database, orgID, repoID)
+	if err != nil {
+		return nil, "", err
+	}
 	defaultClass := ""
 	if cfg != nil {
 		defaultClass = cfg.Storage.DefaultClass

@@ -31,6 +31,7 @@ database:
   # legacy-only fallback: CASSANDRA_REPLICATION_FACTOR when using SimpleStrategy
 
 storage:
+  mode: multi
   default_class: hot-minio-local
 
   # Multi-region storage classes (using MinIO buckets to simulate regions)
@@ -121,12 +122,18 @@ storage:
       hot: hot-minio-local
       cold: ""
 
-  # Legacy backends (kept for backwards compatibility)
+  # Keep the legacy name available for compatibility, but isolate it in its own
+  # MinIO bucket: hot-minio-local above owns sesamefs-blocks, and two class names
+  # over one bucket is exactly what R23b rejects. Local Compose defaults the
+  # generic S3_* variables consumed by this backend to the values below and lets
+  # .env override them; pointing S3_BUCKET back at sesamefs-blocks is refused at
+  # startup rather than silently aliased. Production single-region deployments use
+  # ordinary S3_* directly; modern classes use class-specific config.
   backends:
     hot:
       type: s3
       endpoint: "http://minio:9000"
-      bucket: sesamefs-blocks
+      bucket: sesamefs-legacy-blocks
       region: us-east-1
       server_side_encryption: ""
       sse_kms_key_id: ""
