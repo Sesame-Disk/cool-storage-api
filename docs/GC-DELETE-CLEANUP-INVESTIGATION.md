@@ -137,7 +137,7 @@ broader than the representation-stamping bug PR #123 fixes.
 ### Dev cluster access (for reproducing)
 
 - Cassandra: `docker exec sesamefs-cassandra-1 cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD"` (keyspace `sesamefs`). Creds in `.env` (`CASSANDRA_SUPERUSER_PASSWORD`, app user `sesamefs_app`).
-- MinIO: `docker exec sesamefs-minio-1 mc ...` (root creds in `$MINIO_ROOT_USER`/`$MINIO_ROOT_PASSWORD`). Buckets: `sesamefs-blocks/eu/usa/china/archive`.
+- MinIO: `docker exec sesamefs-minio-1 mc ...` (root creds in `$MINIO_ROOT_USER`/`$MINIO_ROOT_PASSWORD`). Buckets: `sesamefs-blocks/eu/usa/china/archive`, plus `sesamefs-legacy-blocks` since R23b moved the legacy `hot` backend off `sesamefs-blocks` — count all six when measuring residue.
 
 ### Observed residue after a clean-DB full test run (2026-07-09 ~22:06)
 

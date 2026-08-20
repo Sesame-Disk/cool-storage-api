@@ -209,10 +209,12 @@ integration stack was running two storage class identities over one physical
 namespace, and `hot` was selectable as an explicit `library.storage_class` through
 the normal admission path because it was a configured class. R23b keeps that legacy
 name over a separate `sesamefs-legacy-blocks` bucket, and `minio-init` creates both
-the legacy and modern buckets. The local Compose stack pins its generic `S3_*`
-location variables to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`,
-overriding stale `.env` values; modern classes retain their explicit class
-configuration. Production single-region deployments use ordinary `S3_*` directly.
+the legacy and modern buckets. The local Compose stack defaults its generic `S3_*`
+location variables to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1`
+and lets `.env` override them; the collision check refuses a value that points the
+legacy name back at the default class's bucket, so the pin is no longer the thing
+preventing the alias. Modern classes retain their explicit class configuration,
+overridable per class through `S3_CLASS_*`. Production single-region deployments use ordinary `S3_*` directly.
 
 **Placement read failures are UNKNOWN, not empty placement.** The library-class
 lookup now returns `(value, error)` across Sync, SeafHTTP, v2 block/file and

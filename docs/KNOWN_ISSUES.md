@@ -4975,17 +4975,19 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
     later. Teardown now hangs off that shared helper. `prov` went 1 → 0.
 
   **Measurement correction:** earlier residue numbers in this file undercounted S3. The dev stack
-  has **five** buckets (`sesamefs-blocks`, `-usa`, `-eu`, `-china`, `-archive`) and the script only
+  had **five** buckets (`sesamefs-blocks`, `-usa`, `-eu`, `-china`, `-archive`) and the script only
   counted `sesamefs-blocks`; libraries created with `storage_id: hot-s3-usa` (zip/region/history
   tests) write to `sesamefs-usa`, which had been accumulating blocks unseen across runs. Always
-  count every bucket.
+  count every bucket. **R23b added a sixth**, `sesamefs-legacy-blocks`: the legacy `hot` backend
+  moved off `sesamefs-blocks` so one namespace no longer answers to two class names, so a library
+  explicitly placed on class `hot` writes there.
 
   **Teardown contract — a missing `blocks` row means STOP.** `releaseStagedBlockForTest`
   deliberately does **not** delete the S3 object when the `blocks` row is gone. S3 keys are now
   org-scoped (`hashToKey` ⇒ `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`), so cross-org deletion is no
   longer the hazard — P10 makes that impossible by construction. The reason to stop is different:
   without the `blocks` row the helper knows neither the authoritative `storage_class`/bucket (one of
-  the five) the object lives in, nor can it prove the object belongs to *this* fixture. The zero-ref
+  the six) the object lives in, nor can it prove the object belongs to *this* fixture. The zero-ref
   check only proves *this* org is finished with the reference; the `blocks` row is the fixture's only
   evidence that it materialized the object here. Deleting without it would mean removing a hash we
   cannot prove we created, from a bucket we are guessing. So it must fail closed rather than delete

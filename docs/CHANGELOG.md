@@ -42,6 +42,17 @@ and an explicit mode is never inferred away, so following the old recipe failed
 startup with `storage.classes.hot-s3-na is declared but cannot be registered` — an
 error that names the symptom rather than the cause.
 
+Follow-on documentation that still described the reverted pin or the pre-R23b
+bucket count was corrected in the same pass. `docs/ARCHITECTURE.md` and
+`docs/GC-X1-CLOSURE-OPTIONS.md` said local Compose "pins" the generic `S3_*` values
+over `.env`; they now say it defaults them and names startup validation, not the
+pin, as what prevents the alias. Both also spell out which variable names which
+bucket, since that confusion is what produced the verification-store defect.
+`.env.example` carries the same note next to `S3_BUCKET`. `docs/KNOWN_ISSUES.md`
+and `docs/GC-DELETE-CLEANUP-INVESTIGATION.md` told operators to count residue
+across the dev stack's five buckets; there are six now that the legacy backend has
+its own, and an uncounted bucket is exactly how the earlier undercount happened.
+
 Documentation corrections. The placement-read tri-state now says explicitly that a
 missing `libraries` row belongs to UNKNOWN, not to default routing, with the reason
 (the caller already validated the library, so absence is dangling metadata) and the
