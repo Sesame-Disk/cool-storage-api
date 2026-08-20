@@ -700,7 +700,7 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 
 	blockStore, storageClass, err := h.getBlockStoreForRepo(c, session.OrgID, session.RepoID)
 	if err != nil {
-		return CheckBlocksResponse{}, err
+		return CheckBlocksResponse{}, fmt.Errorf("%w: %w", errSessionCheckBlockStoreUnavailable, err)
 	}
 	if blockStore == nil {
 		return CheckBlocksResponse{}, errSessionCheckBlockStoreUnavailable

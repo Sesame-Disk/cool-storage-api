@@ -21,6 +21,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -784,6 +785,87 @@ func TestUploadBlock_PlacementLookupErrorSkipsStorage(t *testing.T) {
 	}
 	if probeCalls != 0 {
 		t.Fatalf("storage probe calls = %d, want 0", probeCalls)
+	}
+}
+
+func TestCheckBlocks_PlacementLookupErrorReturnsServiceUnavailable(t *testing.T) {
+	oldGetSession := getBlockUploadSessionFn
+	oldLookup := lookupLibraryStorageClassContextFn
+	oldProbe := checkBlocksProbeReuseFn
+	oldReader := checkBlocksNewCanonicalReaderFn
+	t.Cleanup(func() {
+		getBlockUploadSessionFn = oldGetSession
+		lookupLibraryStorageClassContextFn = oldLookup
+		checkBlocksProbeReuseFn = oldProbe
+		checkBlocksNewCanonicalReaderFn = oldReader
+	})
+
+	const (
+		orgID     = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		userID    = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
+		sessionID = "sess-check-placement-error"
+	)
+	hash := strings.Repeat("a", 64)
+	getBlockUploadSessionFn = func(*db.DB, string) (db.BlockUploadSession, bool, error) {
+		return db.BlockUploadSession{SessionID: sessionID, OrgID: orgID, UserID: userID, RepoID: "repo-1"}, true, nil
+	}
+	checkBlocksProbeReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{Decision: db.BlockReuseReusable}, nil
+	}
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-default")
+	h := &BlockHandler{
+		db:             &db.DB{},
+		storageManager: manager,
+		config:         &config.Config{WebUploads: config.WebUploadsConfig{EnableWebBlockUpload: true}},
+	}
+
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "transport error", err: errors.New("cassandra unavailable")},
+		{name: "wrapped not found", err: fmt.Errorf("lookup: %w", gocql.ErrNotFound)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var lookupCalls atomic.Int32
+			lookupLibraryStorageClassContextFn = func(context.Context, *db.DB, string, string) (string, error) {
+				lookupCalls.Add(1)
+				return "", tt.err
+			}
+			var readerCalls atomic.Int32
+			checkBlocksNewCanonicalReaderFn = func(context.Context, *db.DB, *storage.Manager, string, []string, *storage.BlockStore, string) (streaming.CanonicalBlockReader, error) {
+				readerCalls.Add(1)
+				return nil, errors.New("canonical reader must not be reached")
+			}
+
+			r := gin.New()
+			r.Use(func(c *gin.Context) {
+				c.Set("org_id", orgID)
+				c.Set("user_id", userID)
+				c.Next()
+			})
+			r.POST("/api/v2/blocks/check", h.CheckBlocks)
+			body, err := json.Marshal(CheckBlocksRequest{Hashes: []string{hash}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/blocks/check", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Block-Upload-Session", sessionID)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusServiceUnavailable, w.Body.String())
+			}
+			if lookupCalls.Load() != 1 {
+				t.Fatalf("placement lookup calls = %d, want 1", lookupCalls.Load())
+			}
+			if readerCalls.Load() != 0 {
+				t.Fatalf("canonical reader calls = %d, want 0", readerCalls.Load())
+			}
+		})
 	}
 }
 

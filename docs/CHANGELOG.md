@@ -67,6 +67,14 @@ resolution and an explicit warning against reading P0-P4 as exhaustive.
 X1 remains OPEN and `GC_ENABLED=false` remains required; none of this closes any
 part of it.
 
+The remaining HTTP inconsistency from the review is closed without changing the
+fail-closed storage behavior: session-mode `POST /api/v2/blocks/check` now maps
+placement/store-resolution failures to its existing `503 block storage not
+available` response, while metadata and physical-reader failures retain their
+existing classification. Regression coverage includes transport errors and a
+wrapped `gocql.ErrNotFound`, and asserts that no canonical storage reader is
+reached.
+
 ---
 
 ## 2026-08-20 - R23b audit follow-ups: overridable local S3 config
