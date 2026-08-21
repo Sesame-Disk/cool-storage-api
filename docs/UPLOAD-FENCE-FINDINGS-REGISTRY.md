@@ -145,8 +145,9 @@ Those were abandoned and are retained only on the reference branch.
 The [X1/X4 upload hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 confirms that production already inherits `SERIAL` for the metadata LWT, so
 P0/R12 makes the domain explicit rather than introducing its production cost.
-It also records that SeafHTTP's metadata callback permit is one per process,
-that its two-minute final-file context starts after `eg.Wait()`, and that
+It also records that chunked SeafHTTP finalizations use one process-local
+metadata callback permit, while the non-chunked `HandleUpload` path bypasses
+that permit; its two-minute final-file context starts after `eg.Wait()`, and
 placement identity must be solved before removing the LWT. X4 remains open;
 this note records characterization requirements, not a runtime fix.
 

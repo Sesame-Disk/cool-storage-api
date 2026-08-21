@@ -20,7 +20,7 @@ The following facts are confirmed against the current tree:
 | Claim | Verdict | Required qualification |
 |---|---|---|
 | 1000 newly registered blocks can cause about 1000 metadata LWT attempts | Confirmed | This is for blocks that reach metadata registration. Deduplication preflight can bypass complete existing blocks; retries can add attempts. |
-| SeafHTTP runs S3 work concurrently but metadata materialization at concurrency 1 per process | Confirmed | The permit covers provisional-reference and metadata work, not only the LWT. |
+| Chunked SeafHTTP finalization runs S3 work concurrently but metadata materialization at concurrency 1 per process | Confirmed with scope | This applies to `finalizeUploadStreaming` and its chunked finalizations. Non-chunked `HandleUpload` registers uploads without this permit, so process-wide metadata materialization can exceed one. The permit covers provisional-reference and metadata work, not only the LWT. |
 | Production `SERIAL` is cross-DC/global | Confirmed | `configs/config.prod.yaml` already selects `SERIAL`; the metadata LWT inherits the session setting. |
 | P0 introduces 1000 global Paxos rounds into production | Incorrect | Production already pays them today. P0 would make the serial domain explicit and protect against a weaker session configuration, including `LOCAL_SERIAL` test profiles. |
 | The two-minute finalize context limits the 1000 block materializations | Incorrect | `eg.Wait()` completes first. The two-minute context starts afterward for final file metadata/lease work. |
@@ -117,12 +117,18 @@ The constants and their stated purpose are at
 The metadata permit is acquired after the S3 work and covers the registration
 callback at
 [`internal/api/seafhttp.go:3045-3054`](../internal/api/seafhttp.go#L3045-L3054).
+The non-chunked `HandleUpload` path registers at
+[`internal/api/seafhttp.go:2543-2549`](../internal/api/seafhttp.go#L2543-L2549)
+without acquiring this permit.
 
-This means one SeafHTTP process can have eight S3 operations in flight while
-serializing the metadata/ref/mapping callback one block at a time. The permit
-is a pressure valve against a Cassandra LWT stampede; it is not a cluster-wide
-serialization mechanism. Multiple processes can still issue metadata work
-concurrently.
+Within a chunked finalization, one SeafHTTP process can have eight S3 operations
+in flight while the process-local permit serializes the metadata/ref/mapping
+callback one block at a time. The permit is a pressure valve against a
+Cassandra LWT stampede; it is not a process-wide limit on every SeafHTTP upload:
+the non-chunked `HandleUpload` path calls registration without acquiring it.
+Non-chunked requests can therefore issue metadata work concurrently with a
+covered chunked-finalization callback, while concurrent chunked callbacks queue
+behind the permit. Multiple processes can also issue metadata work concurrently.
 
 The practical wall-clock model is therefore:
 

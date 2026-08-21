@@ -12,9 +12,10 @@ Session-by-session development history for SesameFS.
 
 The confirmed hot-path analysis records that production already runs the
 per-block metadata `INSERT ... IF NOT EXISTS` under global `SERIAL`; P0/R12
-would make that domain explicit rather than add the production cost. SeafHTTP
-still serializes the materialization callback at one permit per process, while
-the two-minute final-file context starts only after `eg.Wait()`. The companion
+would make that domain explicit rather than add the production cost. Chunked
+SeafHTTP finalizations serialize their materialization callback through one
+process-local permit, but the non-chunked `HandleUpload` path does not acquire
+that permit. The two-minute final-file context starts only after `eg.Wait()`. The companion
 [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md) keeps
 PR-11 deferred, rejects `LOCAL_SERIAL` as a production mitigation, and defines
 the placement/incarnation invariants required before removing the hot-path LWT.

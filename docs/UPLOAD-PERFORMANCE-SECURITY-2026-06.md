@@ -193,8 +193,9 @@ external.
 cross-DC Paxos today. P0/R12 would make the intended serial domain explicit; it
 would not introduce this production latency. The companion
 [X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
-also records that SeafHTTP's metadata permit is one per process and that the
-two-minute final-file context begins only after `eg.Wait()`.
+also records that chunked SeafHTTP finalizations use one process-local metadata
+permit, while non-chunked `HandleUpload` bypasses it, and that the two-minute
+final-file context begins only after `eg.Wait()`.
 
 **Severity: HIGH for general upload performance** (both governed upload modes, not block upload specifically)
 **Branch: pending — `perf/deterministic-block-storage-class`**

@@ -163,10 +163,12 @@ P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 
 **Hot-path/Paxos characterization (2026-08-20).** The companion
 [X1/X4 upload hot-path analysis](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 confirms that a metadata-registering block invocation already inherits global
-`SERIAL` under the production session, and that SeafHTTP serializes its
-metadata callback at one permit per process. P0 therefore does not introduce
-the production latency; it would make the serial-domain contract explicit and
-protect against weaker session settings. P0/R12 remains deferred while the
+`SERIAL` under the production session, and that chunked SeafHTTP finalizations
+serialize their metadata callback through one process-local permit. The
+non-chunked `HandleUpload` path does not acquire that permit, so this is not a
+process-wide concurrency bound. P0 therefore does not introduce the production
+latency; it would make the serial-domain contract explicit and protect against
+weaker session settings. P0/R12 remains deferred while the
 design evaluates whether ordinary installation can remove the per-block LWT
 without losing placement and incarnation authority. The two-minute final-file
 context is created after `eg.Wait()` and is not the timeout for block
