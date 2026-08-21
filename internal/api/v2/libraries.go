@@ -1113,7 +1113,9 @@ type ChangeStorageClassRequest struct {
 	StorageClass string `json:"storage_class" binding:"required"`
 }
 
-// ChangeStorageClass changes a library's storage class
+// ChangeStorageClass changes the library's mutable preference for future block
+// materialization. Existing blocks retain their canonical storage_class and
+// physical object; this endpoint does not migrate or reinterpret them.
 func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
@@ -1155,7 +1157,10 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		return
 	}
 
-	// TODO: Trigger background job to migrate blocks to new storage class
+	// TODO: An optional future migration operation may copy selected referenced
+	// blocks to the new class, report the bytes/cost, and clean up only after all
+	// references to the old physical copy are gone. It is separate from changing
+	// this preference and must not be made implicit here.
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

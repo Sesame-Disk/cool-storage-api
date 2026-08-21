@@ -151,6 +151,7 @@ started.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | HIGH | `UpdateLibrary`, `op=rename` and `ChangeStorageClass` have no permission gate: any authenticated org member can rename any library in the org, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. Only `GetLibrary` and `DeleteLibrary` check | Found auditing the storage-class characterization; runtime defect, negative tests still owed |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
@@ -170,6 +171,7 @@ started.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** under `strict` the endpoint must accept only an in-region hot class, and new materializations must not fail over across the region | Decided, not implemented. **Still open:** what `strict` promises about content placed before the policy took effect — the transition is ungated today. Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
 
 ## Low / latent / deferred hardening
 
@@ -191,7 +193,7 @@ started.
 
 | Item | Sev | One line |
 |---|---|---|
-| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation that reaches metadata registration; browser/sync preflight can bypass fully deduplicated blocks. **PR-11, not started** — need the per-statement production latency metric first (fix direction of record: `KNOWN_ISSUES.md`). |
+| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One `SERIAL` LWT/Paxos transaction per block invocation that reaches metadata registration when the effective setting is `SERIAL`; browser/sync preflight can bypass fully deduplicated blocks. The shipped default uses `SERIAL`, but env and topology determine effective WAN cost. **P0 is not an X4 performance fix**. **PR-11, not started** — characterize latency, permit wait, Paxos settings and placement identity first. See [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md). |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |
@@ -208,7 +210,7 @@ Not findings — things nobody has proven either way.
   topology-gate halves, and both consistency mutations. **X6 and the remaining cross-DC assumptions are still derived
   from the production consistency contract and have never been reproduced**, even
   though the instrument to do it is now checked in.
-- **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
+- **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`); the characterization is documented in [UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md), but no runtime measurement has landed.
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.
 - **PR-10 did not run the full Compose integration suite** (PR-2..PR-6 did).

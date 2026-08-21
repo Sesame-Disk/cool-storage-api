@@ -137,7 +137,8 @@ then change what the value is.
 **R12 is a prerequisite, not a member.** Raising some conditional statements on the `blocks`
 partition to `SERIAL` while others stay `LOCAL_SERIAL` leaves two quorum domains, and one
 straggler invalidates every other statement's guarantee — see R12's inventory of eleven
-statements. That must land before any install property depends on a serial round, and it
+statements. That must land before any install property depends on a `SERIAL` LWT/Paxos
+transaction, and it
 needs no minted key to do so.
 
 A workable split, one property per PR as the R11/R22/R23 slices were:
@@ -145,8 +146,14 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 - **P0 — SERIAL domain (R12).** Every relevant `blocks` LWT on one consistency level. No
   minted keys, no new identity.
 - **P1 — locator authority.** The persisted `storage_key` becomes the exact locator for
-  reads, existence checks and repair, still holding the currently derived value. Nothing
-  destructive changes; the deployment is observable before identity moves.
+  reads, existence checks, repair and physical delete, still holding the currently
+  derived value. It carries the delete chain that must exist before a key can differ:
+  an exact-key delete primitive, the durable orphan carrying `(storage_class,
+  storage_key)`, and recovery deleting that persisted key. **No destructive
+  authorization or lifecycle semantics change**: while persisted `K` still equals
+  `hashToKey(L)`, exact-key delete and recovery are observationally equivalent to
+  today's derived delete — same authorization, same object. The deployment is
+  observable before identity moves.
 - **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.
@@ -155,10 +162,280 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   `blocks(L) -> P1` names a tuple already authorized for retirement, so both repair and
   install must block until the canonical row stops naming `P1`.
 - **P4 — exact-`P` destructive lifecycle (R14, R19, R20, R26).** Tuple-bound GC, orphan,
-  candidate and projection lifecycle.
+  candidate and projection lifecycle: claim/finalize CAS naming `P`, and `_by_day`
+  identity including it. The orphan's *locator* handoff is not deferred to here — it
+  lands in P1, because recovery must stop deriving before any key is minted.
 
 R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
 P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
+
+**P1 scoping note (2026-08-21), verified against the tree.** P1 is the right next
+structural step, but the work is not where the one-line description suggests. The
+cost is concentrated in making every writer resolve, write and persist one key;
+the read paths largely already fetch what P1 needs. Three things
+have to be true before persisted `storage_key` can be the authority, and only the
+third is what the P1 line describes.
+
+*1. Most writers do not persist it.* `blocks.storage_key` is written empty by
+almost every materialization path. Verified call sites:
+
+| Call site | `storageKey` argument |
+|---|---|
+| `internal/api/seafhttp.go` `HandleUpload` | `""` |
+| `internal/api/seafhttp.go` `finalizeUploadStreaming` | `""` |
+| `internal/api/sync.go` block materialization | `""` |
+| `internal/api/v2/files.go` template materialization | `""` |
+| `internal/api/v2/files.go` upload materialization | `""` |
+| `internal/api/v2/onlyoffice.go` | real key |
+| `internal/api/v2/blocks.go` `UploadBlock` -> `materializeUploadedBlock` | real key |
+
+Seven relevant paths: five empty, two real. The web session funnel is easy to miss
+because it calls `RegisterWebUploadedBlockAndMapping`, not
+`RegisterUploadedBlockAndMapping`; it persists the key
+`StoreUploadedBlockForProbe` resolved through `StorageKeyForHash`. It is a
+production writer, so wherever a backfill runs at all it has to cope with a column
+that is populated for some rows and empty for others rather than empty everywhere.
+
+This is why every reader guards with `persistedKey != "" && persistedKey != derived`
+(`internal/api/v2/upload_reuse.go`,
+`internal/streaming/canonical_block_reader.go`): the empty case is the normal case,
+not an exception. A column that is empty for most rows cannot be made authoritative
+by flipping a branch.
+
+**The writer work is larger than that table suggests, because the register argument
+is not the only place a key is derived.** The two probe branches fail differently.
+Both statements below are about the **non-web** funnels, which call the two helpers
+directly; the web session funnel calls neither and is treated separately after them.
+
+In the `Reusable` branch the key is resolved correctly and then dropped:
+`EnsureReusableBlockPresent` returns the canonical key `StoreUploadedBlockForProbe`
+resolved, and every non-web funnel but OnlyOffice discards it and persists `""`
+(`seafhttp.go:2520`, `seafhttp.go:3031`, `sync.go:2026`, `files.go:1358`,
+`files.go:3452`; OnlyOffice keeps it at `onlyoffice.go:1224`).
+
+In the `NeedsPut` branch **every non-web funnel** discards it, OnlyOffice included.
+`ResolveNeedsPutBlockStore` returns the resolved key and all six call sites drop it
+(`seafhttp.go:2527`, `seafhttp.go:3034`, `sync.go:2035`, `files.go:1364`,
+`files.go:3455`, `onlyoffice.go:1227`), then write the bytes with
+`PutBlockAutoDirect(hash)`, which re-derives through `hashToKey`
+(`internal/storage/blocks.go`). OnlyOffice, the only one that persists anything on
+this branch, persists what that PUT returned — a second, independent derivation
+rather than the key it resolved. The two agree today only because both call
+`hashToKey`; under P2 nothing requires them to.
+
+Only the web session funnel already has the right shape, which is why it is excluded
+above: `StoreUploadedBlockForProbe` resolves `K` once, writes through
+`PutObjectAutoDirect(K)`, and returns that same `K` — `UploadBlock` keeps it
+(`v2/blocks.go:1013`) and hands it to `materializeUploadedBlock` to persist
+(`v2/blocks.go:1021`). Stated precisely, step 1 is **one resolution of `K` per
+block, the PUT issued against that `K`, and that same `K` persisted** — not "pass
+the key to the register call". A structural test asserting
+`storageKey != ""` at the materialization funnels pins the symptom, but would pass a
+funnel that persists a re-derived key.
+
+P1 therefore contains, in order: make every materialization path resolve, write and
+persist one key; backfill any deployment that already holds rows; only then invert
+the authority and harden empty from tolerated to an error. **Under the accepted
+greenfield production scope the middle step has no production instance to run
+against.** `blocks.storage_key TEXT` is already in `001_initial_schema.cql`, so a
+fresh install starts with the column present and corrected writers populate it from
+the first block. The backfill remains in scope as a compatibility path for an
+already-populated deployment, and fixtures and tests still have to be updated, but
+it is not a data migration this rollout has to perform.
+
+*2. P1 adds essentially no new Cassandra reads on production paths.*
+The canonical reader already performs one `blocks` read per unique block
+(`lookupCanonicalBlockLocation`, fanout `canonicalBlockLocationConcurrency = 32`),
+and `GetBlockStorageLocation` already selects `storage_key` alongside
+`storage_class`. Every consumer of the canonical reader — v2 file reads, SeafHTTP
+download, share-link and file-view raw serving — therefore pays **no additional
+read and fetches no additional column** when the locator becomes authoritative. It
+already has the value in hand and currently discards it in favour of the derived
+key.
+
+Two things make a naive inventory wrong here, and both were got wrong on the first
+pass.
+
+First, `blockStore` is frequently a parameter name of the interface type
+`streaming.BlockReader`, which the canonical reader implements, so most call sites
+spelled `blockStore.GetBlock(...)` already receive a canonical reader and already
+pay the read. `internal/streaming/streaming.go` (`PrefetchBlock`, `StreamBlocks`)
+and `internal/streaming/block_read_seeker.go` all take `BlockReader`, so they
+derive or not purely according to what the caller injects. Classify by injected
+type, not by identifier.
+
+Second, `internal/api/sync.go` guards its funnels with `if h.db != nil { ... } else
+{ legacy }`. The deriving calls sit in the `else`. Grepping for the call finds the
+fallback and misses the production branch directly above it.
+
+Already reading canonical metadata, so no new read:
+
+| Path | What already runs |
+|---|---|
+| SeafHTTP download | `seafHTTPNewCanonicalBlockReaderFn` |
+| SeafHTTP ZIP | `addDirToZip(..., canonicalReader, ...)`; the `blockStore` parameter inside `addFileToZip` is that reader |
+| sync `check-blocks` | `syncNewCanonicalBlockCheckReaderFn`, which dispatches an explicit `location` phase metered as `SyncCheckBlocksLookupsTotal{location}` before the existence phase |
+| sync block send | `syncNewCanonicalBlockReaderFn` |
+| v2 file view and raw serving | `streaming.NewCanonicalBlockReader` |
+| share-link raw serving | `streaming.NewCanonicalBlockReader` |
+
+Derive-based, but only on the `h.db == nil` legacy fallback, which no production
+deployment takes: `CheckBlocksParallel` in `check-blocks`, `syncBlockExistsFn` in
+`PutBlock`, and `GetBlockSize`/`GetBlockReader` in the block-send `else` branch.
+Making the locator authoritative there is a correctness cleanup, not a load change.
+
+Outside the canonical reader, two production surfaces genuinely derive the physical
+locator, and neither needs a new read.
+
+**Upload reuse, existence check and repair.** `internal/api/v2/upload_reuse.go`
+derives at three points — the first-writer branch, the `Reusable` branch's
+`ObjectExists`/repair-PUT, and `NeedsPut` — and every upload funnel reaches them
+(`seafhttp.go`, `sync.go`, `files.go` x2, `onlyoffice.go`, `v2/blocks.go`). This is
+where the canonical `P` is repaired, so it is precisely the path that must consume
+the authoritative locator rather than re-derive one. It needs no new read:
+`ProbeBlockReuse` already selects `storage_key` into `BlockReuseProbe.StorageKey`
+(`internal/db/block_references.go`), and the code currently uses that value only as
+a mismatch guard.
+
+**GC physical delete.** It needs no new read either. `internal/gc/worker.go`
+deletes through `deleteS3WithRetry` ->
+`BlockStoreDeleter.DeleteBlock`, which calls `hashToKey`. GC already point-reads
+the row: `GetBlockInfo` runs
+`SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?`
+and its own comment notes that reading another column of the same row "adds no
+extra query and no tombstone scan". P1's GC work is therefore to add `storage_key`
+to `BlockInfo` and to that existing SELECT, and to delete by exact key instead of a
+derived one — **an extra column on a read that already happens, plus an exact-key
+delete**. That is also exactly what X1 requires of the delete path regardless.
+
+P1's correctness inventory is therefore **canonical reader + upload
+reuse/existence/repair + GC delete**, not reader plus GC. The performance conclusion
+is unchanged: all three already hold the metadata the flip consumes.
+
+**The delete path is not finished when `deleteS3WithRetry` deletes by exact key.**
+Two requirements this document lists under "What both options must change" have to
+land with P1 — or at the very latest before P2 — rather than with P4's tuple-bound
+lifecycle:
+
+- **There is no exact-key delete primitive at all.** `BlockStore` has
+  `PutObjectAutoDirect`, `ObjectExists` and `Get*ByStorageKey`, but
+  `DeleteBlock(ctx, hash)` derives (`internal/storage/blocks.go`). It has to be
+  added, not merely called.
+- **The durable orphan does not carry the key.** `StartBlockDeleteOrphan(orgID,
+  blockID, storageClass, externalSHA1, now)` (`internal/gc/store.go`) takes no key,
+  `gc_s3_orphans` has no `storage_key` column and no migration adds one
+  (`001_initial_schema.cql`; 007, 009, 014 and 015 touch that table only for other
+  columns), and the row is written *before* `FinalizeBlockDelete`
+  removes `blocks(L)` (`internal/gc/worker.go`). Past that point the orphan is the
+  only durable record of what still has to be deleted — and `RecoverS3Orphans`
+  re-derives the key from the block id (`internal/gc/worker.go`).
+
+Leaving both to P4 opens a window between P2 and P4 in which minting is live but
+recovery still derives: the DELETE addresses a key nothing was ever written to,
+returns success as a no-op, and the orphan is cleared as though the object were
+gone — the exact S3 leak the durable record exists to prevent. The sequencing
+constraint is therefore **exact-key delete primitive + the canonical orphan row
+carrying `(storage_class, storage_key)` + recovery deleting that persisted key, all
+before the first minted key exists**. While `K = hashToKey(L)` still holds, the
+change is observably a no-op, which is why it belongs in the reversible slice rather
+than after the mint.
+
+**Persisting the key also makes it part of recovery's observed state, and that
+belongs in P1 too.** `RecoverS3Orphans` reloads the canonical orphan immediately
+before the irreversible step and refuses to continue when the reloaded row differs,
+via `s3OrphanRecoveryStateEqual` (`internal/gc/worker.go`) — which compares org,
+block, `first_seen_at`, `storage_class`, `external_sha1` and `recovery_phase`. It
+cannot compare the locator today because the row does not carry one. The moment P1
+adds `storage_key` to that row, **it must join the comparison and a difference must
+fail closed**, or the reload silently stops covering the thing P1 just made
+authoritative.
+
+That gap is not hypothetical once `K` can differ, because none of the six compared
+fields distinguishes two physical lifecycles of the same logical block.
+`StartBlockDeleteOrphan` is explicit about reusing the row: on `IF NOT EXISTS`
+failure it takes `effective_first_seen_at` **from the existing row** and then
+`UPDATE`s `storage_class`, `external_sha1` and `recovery_phase` back to
+`pending_s3` (`internal/gc/store_cassandra.go`). A second delete lifecycle for the
+same block therefore presents the *same* `first_seen_at`, the same class and the
+same phase as the first. Once the P2 slice mints, that is a recovery which loaded
+the first incarnation `(B, K1)`, passed its own reload against a row that now
+describes the second `(B, K2)`, and issues `DeleteExact(K2)` — the exact-`P`
+violation the reload exists to prevent, reached without any compared field
+changing. (`K1`/`K2` here are incarnations, not the P1/P2 slices.) Required gate:
+**a reload whose `storage_key` differs from the loaded one performs no DELETE**.
+
+*Compatibility note for the new orphan column.* The greenfield qualification above
+applies here as well. Rows written before P1 carry no key, and for them the derived
+value is by definition the right one, so a populated deployment needs an explicit
+compat path before recovery may reject an empty locator. **Prefer draining the live
+orphans before the flip.** A deployment that instead stamps the derived key onto
+existing rows must give the new cell a TTL aligned to that orphan's remaining
+original schedule, never a fresh table TTL: `default_time_to_live` applies per
+written value, so a plain `UPDATE … SET storage_key = …` would hand the locator a
+full new expiry while `storage_class`, `first_seen_at` and `recovery_phase` keep
+expiring on the original date — reintroducing exactly the partial-orphan TTL skew
+R28 describes and R28a's application-clock bound exists to prevent. Under the
+accepted greenfield production scope neither path runs: there are no live canonical
+orphans to convert.
+
+**The projection stays out of P1, and that is deliberate.** Migration 014 made
+`gc_s3_orphans_by_day` identity-only — every remaining column is part of
+`PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id)`, pinned by
+`TestR22bProjectionWriteIsInsert` — and its own note records that `gc_s3_orphans`
+keeps the payload because it is "the authority recovery reads". Recovery therefore
+gets the key from the canonical row it already loads, and P1 adds a regular column
+to one table. Folding `P` into the projection's *identity* (R26) is a different and
+larger change: a key column cannot be added by `ALTER`, so it means a new table and
+a revised identity contract. That belongs in P4, and nothing in P1 requires it.
+
+The honest summary is that P1's cost is concentrated in the writer work of step 1
+and in the delete-path plumbing above, not in read amplification. An earlier draft
+of this note claimed `check-blocks` would add N Cassandra reads per request; that was wrong — it
+described the location phase the production branch already performs.
+
+`check-blocks` is still worth attention, but as an **optimization opportunity, not
+a new cost**. Its accepted list is bounded by `check_blocks_max_ids`, whose default
+and validation ceiling are both the inherited 100k, and the production branch
+already dispatches one canonical-location lookup per unique internal id at
+`check_blocks_lookup_fanout`. Those per-id lookups exist today; P1 inherits them
+rather than creating them. Because the route is sync-hot and its node exposure is
+already the product `check_blocks_max_inflight_per_node` x
+`check_blocks_lookup_fanout` (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`), replacing the
+per-id lookups with a batched canonical-location read is worth doing — but as its
+own X5/X11 optimization, **not inside P1**. It would reduce current load rather than
+offset an increase, so it demonstrates nothing about locator authority, and folding
+it in only makes the one slice that has to stay reversible harder to review.
+
+Note that `internal/gc/worker.go`'s `w.store.BlockExists` is a Cassandra
+`blocks`-row check, not an S3 derive; only the `BlockStoreDeleter` path is
+derive-based physical work in GC.
+
+*3. Only then does the authority flip.* The exact-key variants the flip needs
+already exist and are the model: `ObjectExists`, `GetBlockByStorageKey`,
+`GetBlockReaderByStorageKey`, `GetBlockSizeByStorageKey`, `PutObjectAutoDirect`.
+What P1 adds is that callers resolve `P` first and use those, instead of handing a
+hash to `GetBlock`/`BlockExists`/`DeleteBlock` and letting `hashToKey` decide.
+
+*Ordering against P0.* The list above puts P0 first, and that remains correct for
+anything whose correctness depends on a single serial domain. But P1 does not
+change the `P` any writer produces — it keeps the derived value — so it establishes
+no new install property and can land before P0 without weakening one. What must not
+happen is minting in P2 before P0: that is where a global winner starts to matter.
+Read the order as a dependency graph, not a queue.
+
+**Hot-path/Paxos characterization (2026-08-20).** The companion
+[X1/X4 upload hot-path analysis](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+confirms that the shipped production default/example uses `SERIAL` for a
+metadata-registering block invocation, subject to the effective environment and
+replica topology, and that chunked SeafHTTP finalizations serialize their
+metadata callback through one process-local permit. The
+non-chunked `HandleUpload` path does not acquire that permit, so this is not a
+process-wide concurrency bound. P0 is not an X4 performance fix; its sequencing
+as correctness hardening remains open while the
+design evaluates whether ordinary installation can remove the per-block LWT
+without losing placement and incarnation authority. The two-minute final-file
+context is created after `eg.Wait()` and is not the timeout for block
+materialization.
 
 **The collision check closes a rebind the code could produce on its own, with no
 operator action.** Before R23a, a class whose `initStorageClass` failed was skipped
@@ -777,7 +1054,8 @@ which any incarnation satisfies, because of the byte-identity premise above.
 
 ### What both options must change, regardless of the A/B decision
 
-1. **A delete-by-exact-key surface.** `BlockStore` has exact-key `Put`
+1. **A delete-by-exact-key surface.** *Scheduled into P1 — see the P1 scoping note;
+   recovery must stop deriving before any key is minted.* `BlockStore` has exact-key `Put`
    (`PutObjectAutoDirect`), `Exists` (`ObjectExists`) and `Get`
    (`GetBlockByStorageKey`), but **no exact-key delete** — only
    `DeleteBlock(ctx, hash)`. Both destructive callers pass a logical block ID today:
@@ -786,7 +1064,11 @@ which any incarnation satisfies, because of the byte-identity premise above.
    format before selecting `backend(P).DeleteExact(storage_key)`; malformed persisted
    locators fail closed.
 2. **`gc_s3_orphans` carries the exact physical tuple**, on the canonical table and on
-   the `_by_day` projection, and recovery stops deriving. Both rows must be confirmed
+   the `_by_day` projection, and recovery stops deriving. *The canonical half —
+   the orphan row carrying the exact key, and recovery deleting it instead of
+   deriving — is scheduled into P1; see the P1 scoping note. The projection half is
+   a primary-key change against an identity-only table (migration 014) and stays
+   with P4/R26.* Both rows must be confirmed
    durable before `FinalizeBlockDelete` removes `blocks(L)`; a canonical orphan without
    its discovery projection can strand recovery behind the cursor.
 3. **The claim must name the physical locator.** `ClaimBlockDelete` is
@@ -1242,7 +1524,7 @@ migration, preflight, binding bootstrap, or claim marker is required.
 | R6 | A non-local `QUORUM` GC read (2 of 3), writer LQ in the DC not contacted | **Forbidden.** Empirically red on the three-DC harness. |
 | R7 | One DC down during the authorizing read | Fail closed; no DELETE. Already the shipped behaviour. |
 | R8 | Who installs the next life, and with what CAS | `blocks` is one row per logical block and the install is `INSERT … IF NOT EXISTS`. **A+:** the writer waits until both the row and orphan are gone, then a plain insert creates `P2`. **B:** the writer waits only until GC drops the row, then may install `P2` while orphan `P1` remains. If the row still exists and is healthy, `NeedsPut` repairs the current `P` instead; it must not mint a losing second object. Neither needs a `P1→P2` successor CAS or a second generation table. |
-| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos rounds can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. The losing writer still knows its exact key and should best-effort delete it, or persist that exact key for cleanup. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
+| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos transactions can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. The losing writer still knows its exact key and should best-effort delete it, or persist that exact key for cleanup. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
 | R10 | Writer stalls after `Probe=Reusable(K1)`; GC fences, sees 0, authorizes `DELETE K1`; the writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT a condemned key. Confirmed live: the `Reusable` branch of `StoreUploadedBlockForProbe` (`upload_reuse.go:152-174`) does `ObjectExists` → repair-PUT with **no** fence re-check, and `EnsureReusableBlockPresent` passes `beforePut = nil` (`:205`). The one caller that supplies `beforePut` (`v2/blocks.go:996`) uses it for the staging cap, not for the fence. Under minted keys the clean rule is **repair an active current incarnation with its current key; never repair a condemned incarnation — wait and mint a new key after the row is free**. |
 | R11 | `K1`'s delete completes, `K2` is created and live, then stale `K1` cleanup runs | **CLOSED by R11a/B.3.** Physical GC no longer deletes `block_id_mappings`, so the mapping survives independently of the physical lifecycle. The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate pins that absence of physical-GC mapping-delete authority. `BlockExists` remains only in `pending_s3`, where it protects against repeating a physical S3 delete while a canonical block row exists; it is no longer consulted by `pending_mapping_cleanup`. This closes the mapping-loss race, but not the exact physical `P` identity problem tracked by R26 and the remaining X1 work. |
 | R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. See the inventory below — it is **eleven** statements, not six. |
@@ -1260,7 +1542,7 @@ migration, preflight, binding bootstrap, or claim marker is required.
 | R23 | `storage_class` is rebound to a different bucket, account or backend namespace, or one namespace answers to two class names | **CLOSED BY CONTRACT, not by runtime proof — plus conservative collision detection.** R23a made every layer preserve the persisted class exactly: canonical names validated on the raw value from one shared definition, class/legacy-name collisions rejected, references required to resolve to a registrable class, recovery using the persisted class without following failover. **R23b freezes the contract** — a used class name is permanent, its namespace may die but the name may never be repointed or reused, and new placement takes a new name. Credentials, account/tenant/provider scope, region, endpoint and bucket may change only if they still address exactly the same physical namespace; multi-tenant scope remains immutable even when config cannot infer it. `Config.Validate` rejects two names with the same conservative canonical `(endpoint, bucket)` collision key. That key is not exhaustive identity: it cannot infer credentials or tenant scope, resolve arbitrary DNS/IP aliases, or establish universal path/query/bucket semantics, and may over-reject exotic configurations at startup. The check found the defect live in `config.docker.yaml`, where a legacy `hot` backend named the same MinIO bucket as the default class `hot-minio-local`; the dev profile now preserves both names over separate buckets. **Still not proven at runtime:** an in-place rebind between boots or reuse by a fresh install. A durable fingerprint is optional same-metadata historical-rebind hardening and a namespace claim marker is the cross-install ownership one; neither is required, and both sit outside R23, R24 and X1. **Removing the orphan TTL makes the contract permanent rather than 90-day-bounded — a stale identity then survives indefinitely.** |
 | R24 | An ambiguous install outcome is reused or cleaned before its status is settled | **The same ABA as X1, produced by the writer's own cleanup instead of by GC.** R9 has the losing writer best-effort delete its key; R17 forbids a stale *repair* from installing. Neither covers a stale **install**: `W2` loses the CAS to `W1`, schedules cleanup of `P2`, and that DELETE is slow; later GC removes `P1` and `blocks(L)` goes absent; a lingering retry of `W2` re-runs `INSERT … IF NOT EXISTS` with `P2`, which now applies — and the old cleanup DELETE lands on live bytes. **Rule: a minted `P` is a single-use installation identity.** A failed install whose outcome is known lost makes `P` burned and cleanup-eligible; an ambiguous outcome makes `P` **install-uncertain**: it is non-retryable, cannot be reused for another install, and is not cleanup-authorized until serial settlement proves it is not canonical. Settlement proving applied moves `P` to canonical; settlement proving another locator won moves `P` to burned and permits exact-key cleanup. If settlement cannot be established, `P` stays install-uncertain and the safe result is a possible X3 leak, not deletion. |
 | R25 | A promote path creates permanent `fs:` references without ever having staged a checked `pub:` | **FIXED structurally** — the published-head repair now stages the `pub:` rows with a fresh attempt ID before finalizing, gated by `TestRepairPublishedSyncCommitBlockDeltaEstablishesHandshakeBeforeFinalizing` and `TestPublishedSyncRepairPartialStageFailureDoesNotFinalize`. Before this fix, `repairPublishedSyncCommitBlockDelta` rebuilt the delta and called `finalizeSyncCommitBlockDelta` directly, bypassing the handshake. The repair now uses the same `StagePublishAttemptReferences` operation as first publication; its rollback is scoped to the fresh repair ID, so a partial repair cannot retract another attempt's liveness. The *primitive* half remains unchanged: `PromotePublishAttemptReferences` does not require a staged row, so a future promote caller can reintroduce the bypass. **R25 was the highest-severity item after R17, and it broke R3's argument as written.** R3 itself remains open: the post-stage canonical-incarnation check does not exist yet. **Reachability, stated precisely rather than as "any retry":** `repairPublishedSyncCommitBlockDelta` first consults `finalizedBlockDeltas`, a per-process two-generation set with 4096 entries per generation (up to 8192 retained pairs) (`sync.go:138-194`), marked only *after* a finalize fully succeeds (`sync.go — finalizeSyncCommitBlockDelta`). A warm same-instance retry therefore short-circuits. The path runs when the retry lands on **another instance**, when **the original finalize failed**, after a process restart, or after eviction. The normal sync path, the auto-merge path, the SeafHTTP path and the v2 path already establish the handshake. **Rule: every known path that can promote permanent `fs:` references must execute Stage before Promote; preservation of the established handshake against concurrent cleanup remains R29/R3.** R3's eventual post-stage check must be added to Stage. |
-| R26 | A stale lifecycle's clear removes another lifecycle's discovery row | **Liveness, not data loss — but under a removed TTL it is permanent.** R22 makes recovery *read* the projection non-authoritatively; nothing yet constrains *writes* to it. `DeleteS3Orphan` clears the canonical row and then deletes the projection by timestamp identity — `first_seen_day`/`bucket`/`first_seen_at`/`org`/`block` (`store_cassandra.go`) — and when the caller passes a zero `firstSeenAt` it *resolves that timestamp from whatever canonical row is current* (`store_cassandra.go`), which may already belong to `P2`. Making only the canonical clear conditional on `P` (B.1) therefore leaves the projection half unbound: a delayed `P1` cleanup can still erase `P2`'s discoverability while `P2`'s canonical orphan correctly keeps fencing the writer. The result is a fence recovery cannot enumerate — R19's failure mode reached by a different route. **Rule: every repair or delete of `_by_day` is scoped to the expected `P`, or `P` becomes part of the projection's identity. Prefer the second.** A conditional `DELETE … IF P = P1` buys a Paxos round on a structure that is explicitly *liveness, never authorization* — the wrong place to spend consensus. Fold `P` into the discovery row's identity instead and the problem disappears by construction: a stale `P1` clear simply cannot name `P2`'s row. That is the same reasoning that makes A+ attractive in the first place — an identity that is never reused beats a check that has to be remembered. `_by_day` is never authorization, but stale lifecycle work must never remove another lifecycle's recovery discoverability. |
+| R26 | A stale lifecycle's clear removes another lifecycle's discovery row | **Liveness, not data loss — but under a removed TTL it is permanent.** R22 makes recovery *read* the projection non-authoritatively; nothing yet constrains *writes* to it. `DeleteS3Orphan` clears the canonical row and then deletes the projection by timestamp identity — `first_seen_day`/`bucket`/`first_seen_at`/`org`/`block` (`store_cassandra.go`) — and when the caller passes a zero `firstSeenAt` it *resolves that timestamp from whatever canonical row is current* (`store_cassandra.go`), which may already belong to `P2`. Making only the canonical clear conditional on `P` (B.1) therefore leaves the projection half unbound: a delayed `P1` cleanup can still erase `P2`'s discoverability while `P2`'s canonical orphan correctly keeps fencing the writer. The result is a fence recovery cannot enumerate — R19's failure mode reached by a different route. **Rule: every repair or delete of `_by_day` is scoped to the expected `P`, or `P` becomes part of the projection's identity. Prefer the second.** A conditional `DELETE … IF P = P1` buys a conditional Paxos transaction on a structure that is explicitly *liveness, never authorization* — the wrong place to spend consensus. Fold `P` into the discovery row's identity instead and the problem disappears by construction: a stale `P1` clear simply cannot name `P2`'s row. That is the same reasoning that makes A+ attractive in the first place — an identity that is never reused beats a check that has to be remembered. `_by_day` is never authorization, but stale lifecycle work must never remove another lifecycle's recovery discoverability. |
 | R27 | R18(a) says "re-project and retry", but the current projection cannot schedule a retry into the future | **R18(a) is the recommended resolution and is not yet implementable.** `gc_s3_orphans_by_day` is partitioned by `(first_seen_day, bucket)` and clustered on `first_seen_at`, and `upsertS3OrphanProjection` always derives the day from the *original* `firstSeenAt` (`store_cassandra.go`). Re-projecting a deferred orphan therefore rewrites it into the same past day the cursor already passed, and the next sweep starts only `gcScanOverlapDays = 2` days back (`store_cassandra.go`). "Re-project and retry until the attempt TTLs expire" has no mechanism behind it. **Separate the two facts the code currently conflates:** `first_seen_at` is an immutable lifecycle fact, and retry scheduling needs a mutable `next_retry_at`. **The separation only works if the partition key derives from the mutable fact.** Adding `next_retry_at` as another clustering column under an immutable `first_seen_day` partition does nothing: the row still lives physically in the August partition, and a scanner working September never reads it. What is required is a discovery structure partitioned on `(next_retry_day, bucket)` and clustered on `(next_retry_at, org_id, block_id, …P)`, or a separate durable retry queue queried by retry time — which is arguably cleaner, since it stops overloading a first-seen index with scheduling. Holding the cursor instead is correct but lets one row block a whole day/partition. Until this exists, A+'s availability bound under R18(a) is not merely long — it is **unbounded**, because nothing automatically returns the orphan to the working set after the `pub:` TTL expires. |
 | R28 | A partial orphan appears with no upsert-after-clear, purely from per-value TTL expiry | **R28a MITIGATED for `UpdateS3OrphanAttempt`'s application-clock schedule; row-wide TTL alignment and expiry remain open.** `UpdateS3OrphanAttempt` no longer grants its diagnostic cells a fresh full table TTL; it bounds them to the remaining application-derived schedule. This does not observe Cassandra's coordinator expiry, and other orphan writers may still refresh selected cells. The gate is `TestGC_UpdateS3OrphanAttempt_AnchorsDiagnosticTTLOnFirstSeenAt`, whose red form measures the defect exactly — `TTL(last_error) = 7776000` where the application-derived `first_seen_at` schedule had 60 days remaining. Rewriting the identity columns to realign them was rejected: `representation_id`, `external_sha1` and `recovery_phase` all have other conditional writers, so echoing back a just-read value trades a TTL race for a lost-update race including a `recovery_phase` regression. **What remains is the TTL itself**: the row still expires, and expiry still destroys the durable record that an object needs deleting. Removing it is the four-change package below, and it cannot ship alone — `gcS3OrphanInitialScanLookbackDays = 90` is pinned to this same value, so dropping the TTL without redefining the cold-start horizon makes any orphan older than 90 days permanently invisible after a cursor loss, which is R27's unsolved partitioning problem. **The original finding, unchanged:** R19's failure mode has a second cause, and it explains why the TTL package is indivisible. Cassandra applies `default_time_to_live` per written value, and an `UPDATE` rewrites only the values it touches, with a fresh expiry. `UpdateS3OrphanAttempt` writes `last_attempt_at`/`retry_count`/`last_error` and leaves `storage_class`, `first_seen_at` and `recovery_phase` untouched. A retry on day 89 therefore pushes the diagnostic values to day 179 while the identity values still expire on day 90, and the `_by_day` projection — never rewritten — expires with them. Between those dates the row has a live primary key, no `storage_class`, no `first_seen_at` and no discovery entry. Both fence reads select only `block_id` (`block_references.go:851`, `1138`), which a partially expired row still returns, so the writer stays fenced while `GetBlockS3OrphanInfo` reads nulls. **Consequence for the wording elsewhere in this document: the 90-day TTL is not a ceiling on the row.** It bounds each value independently, and retries extend the diagnostic ones. **Consequence for R19:** partial orphan state arises both from an unconditional upsert after a clear *and* from per-value TTL skew, so making non-creating mutations conditional and removing the TTL are both required — neither alone closes it. |
 | R29 | A concurrent publisher can retract another publisher's `pub:` handshake | Sync previously used `targetCommitID` as the publication attempt ID, so concurrent requests for the same target shared `pub:<targetCommitID>`. A loser could delete the winner's row during CAS-conflict cleanup, and a partial `StagePublishAttemptReferences` rollback could do the same before CAS. The fix uses a fresh `publishAttemptID` per sync publication delta and retains refs for ambiguous CAS or post-CAS outcomes. **Required outcome:** cleanup may address only the current request's unique attempt; an uncertain CAS result retains its refs for retry, and a confirmed same-target winner enters idempotent repair. R25 remains structurally fixed, but preservation of an established handshake is an open X1/R3 criterion until this identity/outcome contract is evidenced in the integration leg. |

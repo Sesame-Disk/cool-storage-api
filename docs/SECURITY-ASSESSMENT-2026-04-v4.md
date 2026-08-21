@@ -11,13 +11,30 @@
 
 **Frontend update (2026-05-15):** M-10 is now partially remediated. Direct deprecated frontend packages were removed or replaced, local `npm.cmd run build` and Docker `docker compose build frontend` pass, and remaining deprecations/audit findings are major/transitive migrations rather than simple dead-package cleanup. Avoid blind `npm audit fix --force`; continue with targeted frontend upgrades.
 
-**All critical and high-severity security findings from v1-v3 have been resolved.** The remaining open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
+**All critical and high-severity security findings from v1-v3 have been resolved.** The remaining v1-v3 open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
+
+**A new HIGH was opened after v4 by the storage-class placement audit (2026-08-21):**
+three library mutation handlers (`UpdateLibrary`, `op=rename`, `ChangeStorageClass`)
+carry no permission gate, so any authenticated organization member can mutate any
+library in that organization — `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`.
+This section's "all HIGH resolved" statement applies to the v1-v3 series only.
 
 **NEW in v4:** Comprehensive multiregion storage analysis with code audit and testing. Key findings:
-- ✅ **Good news:** Upload/download paths DO use health-aware backend selection (`GetHealthyBlockStore()`)
-- ❌ **Critical gap:** No automated health monitoring - backends remain `HealthUnknown` until user requests fail
-- ⚠️ **Testing gap:** Failover logic exists but edge cases (chains, circular) untested; no integration tests for region failures
-- **Conclusion:** Architecture is solid, but missing automated health checks prevents proactive failover
+- ✅ **Good news:** New-materialization paths and selected fallback plumbing use
+  health-aware backend selection (`GetHealthyBlockStoreForOrg()`); canonical reads
+  resolve persisted block placement
+- ❌ **Critical gap:** No automated health monitoring - backends remain `HealthUnknown` until an explicit health probe updates them
+- ⚠️ **Testing gap:** Failover logic exists; multi-level/all-unhealthy chain cases
+  remain untested, while circular detection has unit coverage; no integration tests
+  for region failures
+- ⚠️ **Residency gap:** `strict` data residency binds new-library creation only.
+  `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement,
+  and `failover_class` is not policy-gated
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- **Conclusion:** Architecture is solid, but missing automated health checks prevent
+  proactive failover. Note the tension: adding them makes the configured cross-region
+  failover edges live for the first time, which hardens availability and weakens
+  strict residency unless placement is policy-gated in the same change
 
 ---
 
@@ -88,22 +105,29 @@
 
 **Files:** `internal/storage/storage.go` (CheckHealth, CheckAllHealth), `internal/api/server.go` (no background health checker initialization)
 
-The `Manager` has `CheckHealth()` and `CheckAllHealth()` methods that perform active health probes against storage backends (line 328-361), but **these are never called automatically**. Health status remains `HealthUnknown` until something fails and triggers an error path.
+The `Manager` has `CheckHealth()` and `CheckAllHealth()` methods that perform active health probes against storage backends, but **these are never called automatically**. Health status remains `HealthUnknown` until an explicit health probe updates it; ordinary PUT/GET errors do not update the health map.
 
 **Current behavior:**
 - Health checks exist (`Exists(ctx, "__health_check__")` with 5s timeout)
 - Health states are tracked (`HealthHealthy`, `HealthDegraded`, `HealthUnhealthy`, `HealthFailed`)
-- `GetHealthyBackend()` respects health status and triggers failover (line 219-246)
+- `GetHealthyBackend()` respects an already-recorded health status and follows configured failover (for `Unhealthy` or `Failed` classes)
 - **BUT:** No background goroutine runs periodic health checks
 
-**Risk:** A region can go down and the system won't know until a user request hits it. The first N requests to that region will fail (user-visible errors) before the failover logic kicks in. No proactive failover.
+**Risk:** A region can go down and the system won't know until an explicit health
+probe runs. Requests can continue to hit the preferred backend and fail because
+ordinary PUT/GET errors do not update the health map. There is no proactive
+failover.
 
 **Impact in production:**
 - EU S3 bucket becomes unreachable at 10:00 AM
 - Health status remains `HealthUnknown` (system assumes it's healthy)
-- User uploads file to EU library at 10:05 AM → timeout (30s), error returned to user
-- `GetHealthyBackend()` is never called because upload path uses library's pinned `storage_class` without health checking
-- EU remains marked as healthy; next user gets same error
+- A new materialization targeting the EU preference attempts the preferred backend
+  and can fail; the request does not update the health map
+- A later materialization is not guaranteed to fail over unless an independent
+  health probe has marked the class `Unhealthy` or `Failed`; existing canonical
+  blocks still resolve their persisted class
+- Existing reads do not reinterpret a canonical block from the current library
+  preference
 
 **Fix:**
 1. Add background health checker in `server.go` startup:
@@ -122,7 +146,8 @@ The `Manager` has `CheckHealth()` and `CheckAllHealth()` methods that perform ac
        }()
    }
    ```
-2. Call `GetHealthyBlockStore()` instead of `GetBlockStore()` in upload/download paths (storage_blocks.go:48, 89)
+2. Use `GetHealthyBlockStoreForOrg()` for new-materialization and fallback
+   plumbing; keep canonical readers bound to the persisted block class
 3. Expose health status via `/internal/storage/health` endpoint for monitoring
 
 **Tested:** No. No test verifies that health checks are called automatically or that failover happens without user-triggered errors.
@@ -135,63 +160,50 @@ The `Manager` has `CheckHealth()` and `CheckAllHealth()` methods that perform ac
 
 **Original claim:** Upload and download paths don't use health-aware backend selection.
 
-**Actual finding:** This claim was **INCORRECT**. Code audit shows `GetHealthyBlockStore()` IS used in production paths:
+**Actual finding:** This claim was **INCORRECT**. Code audit shows
+`GetHealthyBlockStoreForOrg()` is used in current new-materialization and fallback
+paths:
 
-**Evidence:**
-```bash
-$ grep -rn "GetHealthyBlockStore" internal/api/
-internal/api/v2/files.go:149:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/onlyoffice.go:152:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/blocks.go:74:	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
-internal/api/v2/storage_resolution.go:53:		return storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/seafhttp.go:749:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:773:			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
-internal/api/sync.go:892:		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-```
+**Evidence:** Current call sites use `GetHealthyBlockStoreForOrg` through the
+preferred-store and fallback helpers in `blocks.go`, `files.go`, `onlyoffice.go`,
+`storage_resolution.go`, `seafhttp.go` and `sync.go`. The sync lookup helper
+tries the persisted class exactly first, then may prepare a health-aware fallback
+before the canonical reader is constructed.
 
-**Conclusion:** Health-aware backend selection **IS implemented** in upload/download paths. The failover logic exists and is used.
+**Conclusion:** Health-aware backend selection **is implemented for new block
+materialization and selected fallback plumbing**. Existing canonical resolution,
+reuse and repair must continue using the persisted block class rather than the
+mutable library preference or a failover class.
 
-**Remaining issue:** Failover only works if health status is updated. Without automated health monitoring (see HIGH issue above), backends remain `HealthUnknown` until an actual error occurs, meaning first user request after a failure will still hit the failed backend.
+**Remaining issue:** Failover only works if health status is updated. Without automated health monitoring (see HIGH issue above), backends remain `HealthUnknown` after an outage unless an explicit probe runs, so a request can continue to hit the failed backend.
 
 ---
 
 #### HIGH: Failover chains are untested end-to-end
 
-**Files:** `internal/storage/storage.go` (GetHealthyBackend line 236-240), `internal/storage/manager_test.go` (TestManagerGetHealthyBackend line 195-209)
+**Files:** `internal/storage/storage.go` (`GetHealthyBackend`), `internal/storage/manager_test.go` (`TestManagerGetHealthyBackend`)
 
-The failover logic is **recursive** (line 240: `return m.GetHealthyBackend(health.FailoverClass)`), allowing chains like:
+The failover logic now walks iteratively with a visited set, allowing chains like:
 - `hot-s3-eu` → `hot-s3-usa` → `hot-s3-asia`
 
 **Existing test coverage:**
 - ✅ Unit test: single-level failover (EU → USA)
 - ❌ Missing: multi-level chain (EU → USA → Asia)
-- ❌ Missing: circular failover detection (EU → USA → EU would infinite loop)
+- ✅ Circular failover detection regression coverage: `TestManagerGetHealthyBackendRejectsFailoverCycle` (EU → USA → EU)
 - ❌ Missing: all backends in chain unhealthy (should return error, not crash)
 
-**Risk:**
-1. **Circular failover loop:** If misconfigured with `hot-s3-usa.failover_class: hot-s3-eu` and `hot-s3-eu.failover_class: hot-s3-usa`, the system will infinite loop and stack overflow
-2. **Incomplete chain:** If USA is also down and has no failover configured, error is returned but no attempt to find any healthy backend
+**Current behavior and remaining risk:**
+1. A circular configuration returns an explicit cycle error instead of looping;
+   `TestManagerGetHealthyBackendRejectsFailoverCycle` covers this behavior.
+2. If every backend in a chain is unhealthy, the resolver returns an error; the
+   multi-level/all-unhealthy cases still need dedicated tests.
 
-**Fix:**
-1. Add visited-set tracking in `GetHealthyBackend()` to detect cycles:
-   ```go
-   func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error) {
-       return m.getHealthyBackendRecursive(preferredClass, make(map[string]bool))
-   }
+**Remaining verification:**
+1. Add unit coverage for a 3-region chain with the middle region down.
+2. Add coverage for all backends in a chain being unhealthy.
 
-   func (m *Manager) getHealthyBackendRecursive(class string, visited map[string]bool) (...) {
-       if visited[class] {
-           return nil, "", fmt.Errorf("circular failover detected: %s", class)
-       }
-       visited[class] = true
-       // ... existing logic
-   }
-   ```
-2. Add integration test: 3-region chain with middle region down
-3. Add integration test: circular failover returns error instead of looping
-
-**Tested:** Partially. Single-level failover tested; chains untested.
+**Tested:** Partially. Single-level failover and circular rejection are tested;
+multi-level and all-unhealthy chains remain untested.
 
 ---
 
@@ -202,8 +214,10 @@ The failover logic is **recursive** (line 240: `return m.GetHealthyBackend(healt
 **Existing integration tests:**
 - ✅ `sharelink_region_test.go` — creates library at `eu.sesamefs.local` with storage override
 - ✅ `org_storage_policy_test.go` — tests strict/flexible policy enforcement
-- ❌ Missing: upload to EU library, mark EU backend unhealthy, verify download succeeds via failover
-- ❌ Missing: create library when primary region is down, verify it lands in failover region
+- ❌ Missing: new materialization with EU preferred, mark EU backend unhealthy,
+  verify the block is written to and recorded in the failover class
+- ❌ Missing: existing canonical download after its class fails, verify it fails
+  closed rather than silently using the mutable library preference
 - ❌ Missing: simultaneous requests to EU and USA libraries while one region is degraded
 - ❌ Missing: region fails during multipart upload (100MB file), verify recovery
 
@@ -229,17 +243,19 @@ func TestMultiregionFailover(t *testing.T) {
         // 5. Verify file is retrievable
     })
 
-    t.Run("download from failed region uses failover", func(t *testing.T) {
+    t.Run("download from failed canonical region fails closed", func(t *testing.T) {
         // 1. Upload file to EU (while healthy)
         // 2. Mark EU as HealthFailed
         // 3. Download file
-        // 4. Verify download used USA failover and succeeded
+        // 4. Verify the reader does not reinterpret the block through USA;
+        //    an explicit migration/replica path is required for availability
     })
 
-    t.Run("library creation when primary region down", func(t *testing.T) {
+    t.Run("new materialization when preferred region is down", func(t *testing.T) {
         // 1. Mark EU backend as HealthFailed
-        // 2. Request to eu.sesamefs.local creates library
-        // 3. Verify library assigned to hot-s3-usa (failover), not hot-s3-eu
+        // 2. Create a library with an EU preference and materialize a new block
+        // 3. Verify the library preference remains EU while the block's
+        //    canonical row records hot-s3-usa after health-aware failover
     })
 
     t.Run("health check detects failure and enables failover", func(t *testing.T) {
@@ -309,16 +325,16 @@ func TestMultiregionFailover(t *testing.T) {
 
 #### MEDIUM: Degraded state (5s response time) still serves traffic
 
-**Files:** `internal/storage/storage.go` (CheckHealth line 351-358, GetHealthyBackend line 232)
+**Files:** `internal/storage/storage.go` (`CheckHealth`, `GetHealthyBackend`)
 
 **Current behavior:**
 ```go
-// Line 351-358: CheckHealth marks backend as Degraded if response time > 5s
+// CheckHealth marks backend as Degraded if response time > 5s
 if elapsed > 5*time.Second {
     status = HealthDegraded
 }
 
-// Line 232: GetHealthyBackend accepts Degraded backends
+// GetHealthyBackend accepts Degraded backends
 if health.Status == HealthHealthy || health.Status == HealthUnknown || health.Status == HealthDegraded {
     return store, preferredClass, nil
 }
@@ -337,61 +353,45 @@ if health.Status == HealthHealthy || health.Status == HealthUnknown || health.St
 2. **Threshold-based:** After 3 consecutive degraded checks (15 seconds of slow responses), promote to `Unhealthy` and trigger failover
 3. **Circuit breaker pattern:** Open circuit after N slow responses, close after M fast probes
 
-**Fix (option 2 — threshold-based):**
-```go
-const (
-    DegradedThreshold = 3 // 3 consecutive slow responses → failover
-)
-
-// In GetHealthyBackend:
-if health.Status == HealthDegraded && health.ConsecutiveFails >= DegradedThreshold {
-    if health.FailoverClass != "" {
-        log.Printf("Storage class %s degraded for %d checks, trying failover to %s",
-            preferredClass, health.ConsecutiveFails, health.FailoverClass)
-        return m.GetHealthyBackend(health.FailoverClass)
-    }
-}
-```
+**Fix (option 2 — threshold-based, not implemented):** Add a policy that promotes a
+class after repeated slow health probes and then follows its configured failover.
+The current iterative resolver intentionally continues serving `Degraded` classes.
 
 **Tested:** No. No test verifies behavior when backend is slow but not failing.
 
 ---
 
-#### MEDIUM: Library storage class migration not implemented
+#### MEDIUM: Explicit library data migration not implemented
 
-**Files:** `internal/api/v2/storage_blocks.go` (commented TODO at line 156-160)
+**Files:** `internal/api/v2/libraries.go` (`ChangeStorageClass`)
 
 **Current code:**
 ```go
-// TODO: if we want to support changing storage class for existing libraries,
-// we need to:
-// 1. Copy all blocks from old storage to new storage
-// 2. Update library.storage_class in the database
-// 3. Clean up old blocks (via GC after ref counts drop to zero)
+// ChangeStorageClass updates the library's mutable preference for future
+// materialization. Existing blocks retain their canonical storage_class and
+// physical object; this endpoint does not migrate or reinterpret them.
 ```
 
-**Impact:** Once a library is assigned to a storage class (e.g., `hot-s3-eu`), it's **permanently pinned** to that class. If EU region is retired or needs maintenance:
-- Cannot bulk-migrate libraries from EU → USA
-- Manual process: admin must create new library, copy files, delete old library
-- Downtime required for large libraries
+**Impact:** Changing a library from `hot-s3-eu` to `hot-s3-usa` is cheap, but it
+does not move existing bytes. A library can reference canonical blocks that were
+materialized under different classes over time. If EU is retired or needs
+maintenance, the repository still lacks a durable operation to migrate all
+referenced physical blocks safely.
 
 **Scenario:**
 1. EU datacenter announces shutdown in 90 days
-2. 500 libraries assigned to `hot-s3-eu` (total 50TB)
+2. 500 libraries reference blocks currently canonical in `hot-s3-eu` (total 50TB)
 3. No automated migration tool exists
 4. Admin options:
    - Manual: create new lib, copy files, update share links (error-prone, slow)
    - OR: leave data in EU until shutdown, then lose access (unacceptable)
 
 **Fix:**
-1. Add `ChangeStorageClass` endpoint (admin-only):
-   - Input: `library_id`, `new_storage_class`
-   - Creates background migration job
-   - Updates `library.storage_class` in DB
-   - Copies all blocks from old class to new class
-   - GC cleans up old blocks after migration complete
-2. Add `/api/v2.1/admin/libraries/:id/migrate-storage` handler
-3. Add migration status tracking (Cassandra table or in-memory job queue)
+1. Keep `ChangeStorageClass` as the preference update only.
+2. Add a separate explicit migration operation with a durable job and progress
+   state; estimate bytes and transfer cost before starting.
+3. Copy referenced canonical blocks, preserve their identity/representation
+   rules, and clean up old physical copies only after all references are safe.
 
 **Tested:** No. Migration logic doesn't exist.
 
@@ -408,7 +408,7 @@ if health.Status == HealthDegraded && health.ConsecutiveFails >= DegradedThresho
 
 **Attack scenario:**
 1. Attacker discovers EU endpoint (`eu.sesamefs.com`)
-2. Creates 100 accounts, each creates libraries pinned to `hot-s3-eu`
+2. Creates 100 accounts, each creates libraries preferring `hot-s3-eu`
 3. Uploads 20GB files to each library (100 × 20GB = 2TB)
 4. EU S3 bucket fills up, legitimate users can't upload
 5. EU region becomes unavailable due to resource exhaustion
@@ -435,7 +435,7 @@ if health.Status == HealthDegraded && health.ConsecutiveFails >= DegradedThresho
 
 #### LOW: Health check timeout is global (5s), not configurable per region
 
-**Files:** `internal/storage/s3.go` (S3Store client config), `internal/storage/storage.go` (CheckHealth line 337)
+**Files:** `internal/storage/s3.go` (S3Store client config), `internal/storage/storage.go` (`CheckHealth`)
 
 **Current behavior:**
 - Health check has hardcoded 5-second timeout context
@@ -461,19 +461,15 @@ if health.Status == HealthDegraded && health.ConsecutiveFails >= DegradedThresho
 
 #### LOW: No notification mechanism when region failover occurs
 
-**Files:** `internal/storage/storage.go` (GetHealthyBackend triggers failover but only logs)
+**Files:** `internal/storage/storage.go` (`GetHealthyBackend` triggers failover but only logs)
 
-**Current behavior:**
-```go
-// Line 238-239
-log.Printf("Storage class %s is %s, trying failover to %s", ...)
-return m.GetHealthyBackend(health.FailoverClass)
-```
+**Current behavior:** `GetHealthyBackend` logs the selected failover class and
+walks the chain iteratively with a visited set.
 
 **Impact:**
 - Failover happens silently (only server logs show it)
 - Users don't know their files landed in a different region
-- Compliance/legal issue: user uploads to EU endpoint expecting EU data residency, but file stored in USA due to failover
+- Compliance/legal issue: user uploads to EU endpoint expecting EU data residency, but file stored in USA due to failover. Latent today — `CheckHealth` is the only thing that marks a class `Unhealthy`/`Failed` and nothing calls it automatically, so failover never fires — and live the moment automated health monitoring lands
 
 **Fix:**
 1. Add webhook/SNS notification on failover events:
@@ -516,9 +512,9 @@ return m.GetHealthyBackend(health.FailoverClass)
 | Gap | Risk | What to add |
 |-----|------|-------------|
 | Automated health monitoring | High | Background health checker goroutine + verify it runs |
-| Upload/download failover | High | Upload to healthy region, mark primary unhealthy, upload fails over |
+| New-materialization failover | High | Prefer a healthy region, mark the preferred class unhealthy, materialize a new block and verify the failover class is persisted |
 | Multi-level failover chain | High | 3-region chain (EU → USA → Asia) + middle region down |
-| Circular failover detection | High | EU → USA → EU returns error, not infinite loop |
+| Multi-level/all-unhealthy failover coverage | High | 3-region chain and all-unhealthy chain return the expected result without looping or misrouting |
 | Health check after real backend failure | High | Stop MinIO container, verify health check detects failure |
 | Cross-region file access | Medium | Upload to EU, download from USA endpoint, verify content matches |
 | Degraded backend behavior | Medium | Simulate 6s latency, verify degraded state handling |
@@ -532,18 +528,18 @@ return m.GetHealthyBackend(health.FailoverClass)
 | Practice | Status | Notes |
 |----------|--------|-------|
 | **Multiregion architecture** | ✅ Yes | Region-to-class mapping, endpoint-based routing |
-| **Health-aware failover** | ⚠️ Partial | Logic exists but not used in upload/download paths |
+| **Health-aware selection and fallback plumbing** | ✅ Yes | Logic is used for new placement and selected fallback; canonical reads resolve persisted placement without reinterpretation |
 | **Automated health monitoring** | ❌ No | Manual `CheckHealth()` only; no background goroutine |
-| **Failover chains** | ⚠️ Partial | Recursive logic exists; circular detection missing |
+| **Failover chains** | ⚠️ Partial | Visited-set cycle detection is covered; multi-level/all-unhealthy tests are missing |
 | **Degraded state handling** | ⚠️ Partial | Degraded detected (>5s) but still serves traffic |
 | **Cross-region testing** | ❌ No | Zero integration tests for failover scenarios |
-| **Storage class migration** | ❌ No | TODO comment in code; feature not implemented |
+| **Storage class migration** | ❌ No | `ChangeStorageClass` updates preference only; explicit data migration is not implemented |
 | **Region quotas** | ❌ No | Global quotas only; no per-region limits |
 | **Failover notifications** | ❌ No | Server logs only; no webhooks/alerts |
 | **Per-region metrics** | ❌ No | `/metrics` exists but no per-backend health gauges |
 | **Geographic latency handling** | ⚠️ Partial | Global 5s timeout; not configurable per region |
-| **Data residency compliance** | ✅ Yes | Strict org policy enforces region pinning |
-| **Failover config validation** | ❌ No | Can configure circular failover without error |
+| **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
+| **Failover config validation & runtime safety** | ⚠️ Partial | Startup validates that every `failover_class` names a registrable class (`Config.Validate`); at runtime `GetHealthyBackend`'s visited-set walk fails closed on an exhausted or fully unhealthy chain. **Cycles are supported configuration, not a misconfiguration** — `config.prod.yaml` ships `hot-s3-na` and `hot-s3-eu` pointing at each other so either region can be primary — so rejecting them at startup is not a requirement. Open: policy gating, since a `strict` organization must not fail over across regions (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus multi-level and all-unhealthy edge-case coverage |
 
 ---
 
@@ -602,20 +598,22 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
    - Background goroutine calling `CheckAllHealth()` every 30s
    - Update health status based on probe results
    - Increment `ConsecutiveFails` on errors
-   - **Critical:** Without this, failover only happens AFTER first user request fails
+   - **Critical:** Without this, failover cannot be proactive; a user request may fail and failover is only available after an independent health probe updates the status
 
-2. **Add circular failover detection**
-   - Track visited backends in recursive `GetHealthyBackend()` calls
-   - Return error instead of infinite loop
+2. **Add multi-level and all-unhealthy failover regression coverage**
+   - The current `GetHealthyBackend()` already tracks visited backends iteratively
+   - Add tests for a 3-region chain and a chain with no healthy backend
 
 3. **Test failover with real backend failures**
    - Stop MinIO container, verify health check detects failure
-   - Upload when primary unhealthy → verify automatic failover succeeds
-   - Download from failed region → verify failover retrieves data
+    - New materialization when preferred class is unhealthy → verify automatic
+      failover and persisted actual class
+    - Existing canonical download from failed class → verify fail-closed behavior
 
 4. **Add cross-region integration tests**
-   - Upload when primary down → verify failover
-   - Download from failed region → verify failover retrieves data
+    - New materialization when primary down → verify failover
+    - Existing canonical download from failed class → verify no preference-based
+      reinterpretation
    - 3-region chain with middle down → verify skip to end of chain
 
 5. **Expose health status in observability**
@@ -624,9 +622,10 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 
 ### Should-fix soon (MEDIUM priority)
 
-6. **Implement storage class migration**
-   - Admin endpoint: `POST /api/v2.1/admin/libraries/:id/migrate-storage`
-   - Background job: copy blocks, update DB, trigger GC
+6. **Implement explicit storage class migration**
+   - Keep `ChangeStorageClass` as a preference update
+   - Add a separate durable job with byte/cost estimate, copy, verification and
+     reference-safe cleanup
 
 7. **Add degraded state threshold**
    - After 3 consecutive >5s responses, trigger failover even without errors
@@ -655,30 +654,48 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 **Multiregion resilience:** ⚠️ **Not production-ready without automated health monitoring**.
 
 **What was verified:**
-- ✅ Code audit confirmed `GetHealthyBlockStore()` IS used in upload/download paths (original claim was incorrect)
+- ✅ Code audit confirmed `GetHealthyBlockStoreForOrg()` is used for new-materialization and selected fallback paths; canonical reads use persisted placement
 - ✅ Health check logic exists (`CheckHealth()`, `CheckAllHealth()`)
-- ✅ Failover logic exists and is recursive
+- ✅ Failover logic exists and uses an iterative visited-set walk
 - ❌ No automated background health monitoring found in startup code
 - ❌ No integration tests for failover scenarios
 - ❌ No storage health metrics exposed
 
 **Corrected findings:**
-1. **FALSE CLAIM RETRACTED:** "Upload/download don't use health-aware selection" → They DO use `GetHealthyBlockStore()`
-2. **TRUE:** No automated health monitoring - backends stay `HealthUnknown` until errors occur
-3. **TRUE:** Failover chains untested (no circular detection, no multi-level tests)
+1. **FALSE CLAIM RETRACTED:** "Upload/download don't use health-aware selection" → New-materialization and selected fallback paths use `GetHealthyBlockStoreForOrg()`; canonical reads retain persisted placement
+2. **TRUE:** No automated health monitoring - backends stay `HealthUnknown` until an explicit health probe updates them
+3. **TRUE:** Failover chain edge cases lack coverage; runtime cycle detection exists but multi-level/all-unhealthy tests are missing
 4. **TRUE:** No cross-region integration tests
 5. **TRUE:** No Prometheus metrics for storage health
 
-**Key insight:** The architecture and implementation are actually solid. The main gap is the missing **automated health monitoring background goroutine**. Without it, failover only triggers after a user request fails (reactive, not proactive).
+**Key insight:** The architecture and implementation are actually solid. The main gap is the missing **automated health monitoring background goroutine**. Without it, failover cannot be proactive and a user request can continue to hit a backend whose status remains `HealthUnknown`.
 
-**Recommendation:** Multiregion production deployment safe AFTER implementing automated health monitoring (item #1). The failover logic already exists and is used correctly.
+**Recommendation (corrected 2026-08-21):** automated health monitoring is
+necessary but **not sufficient** for a multiregion production deployment. It closes
+the availability half only, and it makes the configured cross-region
+`failover_class` edges reachable for the first time — so on its own it hardens
+availability while weakening strict residency. A multiregion deployment that
+carries a residency commitment also needs the placement policy gated
+(`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`) and the missing library permission gate
+closed (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). The earlier "safe AFTER
+item #1" wording predated those findings and is withdrawn.
 
-**Timeline estimate:**
+**Timeline estimate** (availability items only; excludes the residency and
+authorization work above):
 - Must-fix items (1-5): 2-3 days development + 2 days testing = **5 days**
 - Should-fix items (6-8): 3-4 days development + 1 day testing = **5 days**
-- **Total: 10 days to production-ready multiregion deployment**
+- **Total: 10 days for the availability half of a multiregion deployment**
 
-**Single-region deployments:** Safe to proceed now with external monitoring.
+**Single-region deployments:** this section is about storage topology only, and
+from that angle a single-region deployment does not need the multiregion failover
+and residency work above — external monitoring covers the availability half. **It
+is not an overall production-readiness statement.** The missing library permission
+gate (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) is a HIGH that does not
+depend on topology at all: any authenticated member of an organization can mutate
+another member's library through `UpdateLibrary`, `op=rename` and
+`ChangeStorageClass` in a single-region install exactly as in a multiregion one.
+That and the other applicable security blockers still have to close before any
+deployment proceeds.
 
 ---
 

@@ -909,10 +909,33 @@ during the parse rather than after materialization. The `internal/api`,
 
 ---
 
-### PR-11 (deferred) — Remove the per-block Paxos
+### PR-11 (deferred) — Re-evaluate the per-block Paxos
 
-**Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
-first-writer `INSERT ... IF NOT EXISTS` can be dropped.
+**Historical candidate scope:** make `storage_class` deterministic per
+`(org_id, block_id)` so the first-writer `INSERT ... IF NOT EXISTS` might be
+dropped. This is not the current product decision and must not be started as a
+mechanical performance change.
+
+The full option comparison and the required initial schema, reference, GC and
+failover analysis are in
+[STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md).
+
+The companion [X1/X4 upload hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+corrects the decision boundary for this PR. The shipped production
+default/example uses `serial_consistency: SERIAL`; environment overrides and
+the effective replica topology still determine the runtime serial domain and
+WAN cost. PR-11 does not introduce the current `SERIAL` LWT/Paxos transaction
+latency to deployments already using `SERIAL`. The current reference remains
+mutable library preference plus an org-global canonical block row whose
+persisted `storage_class` controls existing reads, reuse, repair and GC. A
+future deterministic placement option would remove library placement authority;
+a class-scoped option would change deduplication and require a broader identity,
+locator and liveness redesign. **P0/R12 is a correctness prerequisite, not an
+optional extra**: raising some conditional statements on the `blocks` partition to
+`SERIAL` while others stay `LOCAL_SERIAL` leaves two quorum domains, so it must land
+before any minted-key install property depends on a single serial domain — that is,
+before P2 in the `GC-X1-CLOSURE-OPTIONS.md` split, though P1 does not need it. It is
+not a performance fix by itself and must not be scheduled as one.
 
 **Not in scope: merging the lifecycle observations.** An earlier draft proposed
 merging the pre-store probe and post-reference fence reads. That ordering is the mutual
@@ -924,8 +947,10 @@ but never reuse one point to answer another.
 
 **Deliberately last, and deliberately not designed yet.** This is the item most
 likely to be superseded by a better idea, and it is the one with real performance
-stakes: under `SERIAL` and a multi-DC posture the current LWT is one *global*
-consensus round per block, ~128 cross-region rounds per GB at the 8 MB block size.
+stakes: under effective `SERIAL` and a multi-DC posture the current LWT is one
+`SERIAL` LWT/Paxos transaction per block, ~128 such transactions per GB at the
+8 MB block size. The number of network round-trips depends on Cassandra's
+Paxos variant.
 It is **pre-existing on `main`** (`e3883aa5d`, 2026-05-28), not introduced by this
 series. `13e01263a` later made the same write representation-aware; it did not
 introduce the LWT.
@@ -933,9 +958,9 @@ introduce the LWT.
 **Correction worth carrying:** an earlier revision of this plan said the legacy
 resumable path "does not pay" this. That is false. `finalizeUploadStreaming` splits a
 resumable upload into 8 MB blocks and calls `RegisterUploadedBlock` per block, so it
-pays the same ~128 LWTs per GB when it reaches metadata registration. The cost is
+pays the same ~128 LWT/Paxos transactions per GB when it reaches metadata registration. The cost is
 shared by governed upload modes, but browser and sync dedup preflight can classify a
-fully deduplicated block before `RegisterUploadedBlock`. The ~128 rounds/GB figure is
+fully deduplicated block before `RegisterUploadedBlock`. The ~128 transactions/GB figure is
 therefore new-content sensitivity, not a universal per-file charge. The correction is
 also relevant to X1: if future code mints physical keys, the first-writer LWT remains
 the canonical-winner decision and cannot be dropped casually.
@@ -943,6 +968,15 @@ the canonical-winner decision and cannot be dropped casually.
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
+
+The block materialization chain is awaited by `eg.Wait()` before
+`newSeafHTTPUploadMetadataFinalizeContext()` is created. The two-minute context
+therefore limits final file metadata/lease publication, not the preceding
+per-block LWT queue. Large uploads can still be slow because the metadata permit
+is one process-local slot for chunked finalizations, and workers retain their
+eight-slot worker capacity while waiting for it; non-chunked `HandleUpload`
+bypasses that permit. This context is not their 120-second materialization
+deadline.
 
 ---
 

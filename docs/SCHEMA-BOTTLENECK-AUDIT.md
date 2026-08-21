@@ -395,8 +395,9 @@ scans (item H) onto the projections, since the projections are now complete.
 per-org Paxos partition, and to push org-wide reads onto projections.
 
 **Why deferred**: the deployment runs `serial_consistency = SERIAL` for global
-linearizability. Under SERIAL every head CAS already pays a global cross-DC
-Paxos round-trip, which **dominates** latency; per-org ballot contention is only
+linearizability. Under SERIAL every head CAS already pays cross-DC Paxos/LWT
+transaction latency when the replica topology spans DCs, with round-trip count
+determined by the Paxos variant; that **dominates** latency. Per-org ballot contention is only
 a secondary effect that bites under concurrent commits to different libraries of
 the *same* org. The marginal win does not justify restructuring the most
 correctness-critical table (the commit-publish path) and re-pointing six

@@ -1463,7 +1463,9 @@ What already works in the backend/frontend stack:
 - when no `storage_id` is provided, the backend can derive the default region from the request hostname or, for the shared global hostname, from `SERVER_REGION`
 - orgs can now persist `storage_policy` with `data_residency: strict|flexible`; `default_region` is an org fallback in `flexible` mode and is required in `strict` mode
 - new-library create flows honor org policy for personal libraries, group-owned libraries, org-admin group-owned libraries, and superadmin-created libraries
-- later writes and reads follow the persisted library `storage_class` instead of the request host default
+- new block materializations prefer the library `storage_class`; existing reads,
+  reuse and repairs follow each block's persisted canonical `blocks.storage_class`
+  instead of reinterpreting it from the current library preference or request host
 - focused integration tests cover create-library, raw serving, historic reads, and share-link raw serving
 
 What the stock production deploy does **not** provide by itself yet:
@@ -1476,7 +1478,7 @@ What the stock production deploy does **not** provide by itself yet:
 
 For production multi-region, treat this feature as requiring operator-provided topology plus the shared config and `.env` values below.
 
-### Step M2.1 — Required config for region-pinned libraries
+### Step M2.1 — Required config for region-preferred library placement
 
 In production multi-region, `configs/config.prod.yaml` must define all of these:
 
@@ -1557,6 +1559,39 @@ Notes:
 - in `flexible`, `default_region` is only a fallback after hostname-based resolution
 - in `strict`, `default_region` is required; invalid strict configs make create requests fail explicitly so operators can correct the org policy
 - this slice affects only **new** libraries; existing libraries keep their persisted `storage_class`
+- `strict` constrains the class selected during library creation, but it does not
+  constrain a later block-store `failover_class`; a new block may be persisted in
+  the configured failover class if the preferred class is already unhealthy.
+  The marking logic exists in `CheckHealth`, but nothing calls it automatically,
+  so no class is ever marked unhealthy in a running server and this stays latent
+  until a periodic health checker exists
+- `ChangeStorageClass` updates the library preference and administrative read
+  model only. It does not revalidate strict residency, does not re-apply the
+  hot-tier requirement that library creation enforces, does not migrate existing
+  blocks, and does not start a migration job — a `strict` org can move an existing
+  library outside its allowed region, or onto a cold class, this way
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- **decided, not yet implemented:** under `data_residency: strict` the endpoint
+  must accept only a hot class inside the organization's `default_region` and
+  reject anything outside it, and new materializations must never fail over across
+  the region — same-region failover only, otherwise fail closed. Until that lands,
+  do not rely on `strict` to keep an existing library's future blocks in its region
+- **still undecided:** what `strict` promises about content placed *before* the
+  policy took effect. `validateOrgStoragePolicy` never inspects existing libraries
+  or blocks, so an org can switch `flexible -> strict`, or move `default_region`,
+  with its canonical blocks elsewhere
+- **weaker than it looks:** today `strict` binds only the class chosen at library
+  **creation**. No placement resolver consults the organization's policy —
+  `ResolveStorageClass` honours `library.storage_class` unconditionally — so a
+  library created under `flexible` with an out-of-region class keeps materializing
+  new blocks there after the switch to `strict`. Do not describe the current
+  behaviour as "future placement follows the policy"; it does not
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- that same endpoint has **no permission gate**: any authenticated member of the
+  organization can call it for any library in the organization, as can
+  `PUT /repos/:repo_id` and `POST /repos/:repo_id?op=rename`
+  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). Do not treat org-level
+  residency as enforced against org members until that is fixed
 
 ### Step M3 — Firewall (private network)
 
@@ -1861,7 +1896,7 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
 # every DC).
 ```
 
-### Step M6 — Verify region-pinned library behavior
+### Step M6 — Verify library placement preference and canonical block reads
 
 After deploying the multi-region config, verify the behavior that matters for data integrity.
 These are post-deploy validation checks from a test-capable workspace or CI environment, not the primary rollout mechanism on the production node:
@@ -1962,4 +1997,8 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
   and early production. For HA, deploy multi-region (see above).
 - **No Cassandra backup** configured — set up snapshots before storing
   important data.
-- **Existing-library migration is still manual** — the current feature set safely pins new libraries and preserves consistent reads/writes, but does not yet provide a production migration workflow for moving already-populated libraries between storage classes or regions.
+- **Existing-library migration is still manual** — the current feature set stores a
+  mutable preference for new materializations and resolves historical reads,
+  reuse and repairs from each block's canonical class, but does not yet provide
+  a production workflow for moving already-populated libraries between storage
+  classes or regions.

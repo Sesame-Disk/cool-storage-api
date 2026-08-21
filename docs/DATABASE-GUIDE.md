@@ -1288,7 +1288,7 @@ Set appropriate consistency levels per operation:
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
 | Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
-| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (production default) | Pins one canonical storage class/key per `(org_id, block_id)`; one global Paxos round per metadata-registering uploaded block |
+| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (production default) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
 | Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (production default) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
 | GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (production default) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
 | GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (production default) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
@@ -1297,8 +1297,9 @@ Set appropriate consistency levels per operation:
 
 The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
 test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the
-production configuration. They therefore do not reproduce the production cross-DC
-`SERIAL` contract and cannot validate global first-writer serialization.
+shipped production default. The effective application environment can override
+the YAML setting, and a single-region deployment does not incur WAN latency from
+`SERIAL`. A multi-DC benchmark must record the actual serial setting and topology.
 
 **Implementation in config.yaml:**
 ```yaml

@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-17
+**Last Updated**: 2026-08-21
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -23,6 +23,7 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
+| **Library mutations have no permission gate** | 🔴 Open | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` run behind `authMiddleware` only and never consult the caller's library permission, so any authenticated member of an organization can rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. `GetLibrary` and `DeleteLibrary` do gate; these three do not. Negative tests are still owed. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -1279,10 +1280,14 @@ before any S3 HEAD or repair PUT.
 
 #### Why it is not a live bug (yet)
 
-`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today: 4 of the 5
-upload paths register the block with `storage_key=""` (`seafhttp.go` ×2, `sync.go`,
-`files.go`/`UploadFile`); only OnlyOffice persists a non-empty value, and that value
-is the hash-derived key. So `hashToKey(hash)` is always a correct locator, and
+`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today.
+Corrected inventory (2026-08-21): 5 of the 7 materialization paths register the block
+with `storage_key=""` — `seafhttp.go` x2, `sync.go`, and `files.go` for both the
+template and the upload path. Two persist a non-empty value: OnlyOffice, and the web
+session funnel (`v2/blocks.go` `materializeUploadedBlock`, reached through
+`RegisterWebUploadedBlockAndMapping` rather than `RegisterUploadedBlockAndMapping`,
+which is why earlier inventories missed it). Both non-empty values are the
+hash-derived key, so the conclusion below is unchanged. So `hashToKey(hash)` is always a correct locator, and
 `EnsureReusableBlockPresent` always uses `StorageKeyForHash(blockID)` and validates a
 non-empty column against it. API reads and verify/repair therefore resolve to the same
 object; GC joined that contract in P10 PR-3.
@@ -2504,16 +2509,16 @@ destructive-GC blockers above.
 - Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
 **Multi-region deployment note (updated 2026-08-14):**
-While X1 remains open, running GC in even one DC is unsafe: keep it disabled in all DCs. After X1 closes, restricting participants to a single DC is **critical**. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
+While X1 remains open, running GC in even one DC is unsafe: keep it disabled in all DCs. After X1 closes, restricting participants to a single DC is **critical**. The shipped default uses `SERIAL` for LWT operations (a global serial phase relative to the effective replica set); an environment override can change that. Running GC on multiple DCs would cause:
 - `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
 - Scanner in both DCs enqueueing duplicate orphans
-- Unnecessary cross-DC Paxos contention on every LWT
+- Unnecessary cross-DC Paxos transaction contention on every LWT
 
 Post-X1 topology is `GC_ENABLED=true` only on designated replicas in one DC and `GC_ENABLED=false` everywhere else. Until X1 closes, the topology is `GC_ENABLED=false` everywhere. The lease provides failover only among designated replicas in that one DC.
 
 Block-level conditional operations include first-writer metadata creation, GC claim,
 claim release/finalize, and orphan lifecycle transitions; production defaults these
-LWTs to `SERIAL` (global Paxos). Do not change production to `LOCAL_SERIAL`. This
+LWTs to `SERIAL` (global serial phase). Do not change a multi-DC deployment to `LOCAL_SERIAL`. This
 still does not serialize ordinary `LOCAL_QUORUM` `block_references` writes, which is
 the separate visibility blocker documented above.
 
@@ -7567,25 +7572,38 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 ---
 
-### ISSUE-UPLOAD-PER-BLOCK-PAXOS-01: One global Paxos LWT per block on upload
+### ISSUE-UPLOAD-PER-BLOCK-PAXOS-01: One `SERIAL` LWT/Paxos transaction per block on upload
 
 **Status**: 🟡 Open — deferred PR-11 pending measurement
 **Severity**: High (perf), not a correctness blocker
 **Affected**: metadata-registering upload paths (`UpsertBlockMetadata` / LWT)
-**Source of record**: registry **X4**; readiness UP-2; P-4
+**Source of record**: registry **X4**; readiness UP-2; P-4; [X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 
 #### Problem
 
-Each block invocation that reaches metadata registration pays one global Paxos round
-under multi-DC `SERIAL`. New content/full registration is ~128 cross-region rounds
-per GiB at 8 MiB blocks; browser/sync preflight may bypass fully deduplicated blocks.
+Each block invocation that reaches metadata registration pays one `SERIAL`
+LWT/Paxos transaction when the effective serial setting is `SERIAL`. The shipped
+production default/example uses `SERIAL`, but an environment override can select
+`LOCAL_SERIAL`, and a single-region deployment has no WAN leg. New content/full
+registration is ~128 such transactions per GiB at 8 MiB blocks in a spanning
+multi-DC topology; browser/sync preflight may bypass fully deduplicated blocks.
 This is a shared cost of governed upload paths when they reach registration, not a
 universal per-file cost.
 
 #### Fix Direction
 
-Do not start PR-11 until a per-statement production latency metric exists.
-See registry X4 design notes.
+Do not start PR-11 until per-statement production latency, metadata-permit wait
+and placement proposals are characterized. Do not switch production to
+`LOCAL_SERIAL` as a mitigation.
+
+**Removing the LWT is not the goal.** Under A-prime it performs the first-writer
+arbitration that keeps one canonical physical placement per `(org_id, block_id)`
+while preserving org-global deduplication. Keeping it is a legitimate outcome if
+measurement shows the cost is acceptable. Any removal must first supply an
+equivalent global arbiter without changing A-prime semantics.
+
+See [registry X4 design notes](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
+and the [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md).
 
 ---
 
@@ -7787,6 +7805,329 @@ transient 404/503, false-missing `check-blocks`, needless re-uploads. Safe
 
 Document as expected under RF-1-per-DC, or extend retry / use a stronger read
 for hot post-upload paths. Multi-DC tests still missing.
+
+---
+
+### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: `ChangeStorageClass` does not revalidate strict data residency
+
+**Status**: 🟡 Open
+**Severity**: Medium (policy / compliance)
+**Affected**: `LibraryHandler.ChangeStorageClass` (`internal/api/v2/libraries.go`)
+**Source of record**: [storage-class placement options](./STORAGE-CLASS-PLACEMENT-OPTIONS.md) - "Residency policy, failover and preference changes"
+
+#### Problem
+
+Library creation enforces the organization's residency policy through
+`resolveCreateStorageClassForOrg` (`internal/api/v2/storage_policy.go`): under
+`data_residency: strict` the requested class must be configured, hot-tier and
+mapped to the organization's `default_region`.
+
+`ChangeStorageClass` does not repeat that check. It validates only
+`isKnownStorageClass(req.StorageClass)` — canonical name plus configured — and
+then writes `libraries.storage_class` together with the administrative read model
+in one logged batch. An organization configured as `strict` can therefore move an
+existing library's preference to **any** class known to the serving endpoint,
+including one outside the region its own policy allows. The creation-time
+constraint is bypassable by a later edit.
+
+**The tier requirement is dropped as well.** Creation routes the requested class
+through `validateRequestedCreateStorageClass`, which rejects a cold class with
+`storage class must use hot tier` via `isHotStorageClass`. `isKnownStorageClass`
+performs no tier check, so `ChangeStorageClass` accepts a configured cold class
+that creation would have refused. Both halves of the create-time contract —
+region and tier — are missing from the change path.
+
+**Scope of the cold half, stated precisely so it is not over-read.** Cold storage
+is nominal in the current tree, not implemented:
+
+- `initStorageClass` maps `tier: cold` to `storage.AccessDelayed`
+  (`internal/api/server.go`), but nothing acts on that value. `accessType` is read
+  only by `GetAccessType` and by the guard inside `S3Store.InitiateRestore`
+  (`internal/storage/s3.go`).
+- No PUT path sets an S3 storage class. `PutObjectInput` never carries
+  `StorageClass`, so a class labelled cold writes ordinary objects into an
+  ordinary bucket and they stay immediately readable.
+- The restore API is a stub: `RestoreHandler.InitiateRestore`
+  (`internal/api/v2/restore.go`) carries four TODOs, records an empty
+  `BlockIDs`, never calls the storage layer, and returns a placeholder job.
+- `Manager.GetHotBackends` / `GetColdBackends` are inventory helpers with no
+  caller in the read or write path.
+
+So pointing a library at a cold class today does **not** make its future blocks
+unreadable or subject them to a retrieval delay. The defect is coherence: create
+refuses cold deliberately, because "cold-tier primary placement remains future
+design work" (`DEPLOY.md`), while change accepts it — leaving a library able to
+prefer a placement mode that has no design behind it. Treat this as a policy gap
+to close before cold is implemented, not as a live data-availability risk.
+
+This is a placement-policy hole, not data movement: existing canonical blocks keep
+their persisted `blocks.storage_class`, physical object and derived key. The
+consequence is that **future** first materializations for that library prefer a
+class the residency policy was meant to forbid.
+
+A second, narrower path to the same outcome is separately noted: strict policy does
+not constrain `failover_class` either, so a new block can be persisted outside the
+allowed region when the preferred class is already marked `Unhealthy` or `Failed`.
+That path is currently unreachable at runtime - `CheckHealth` holds the marking
+logic but has no automatic caller, so no class is ever marked unhealthy in a
+running server - while this one is reachable through the ordinary API. Note that
+automating health monitoring would make the failover path live, so it hardens
+availability and weakens residency at the same time; the two must be decided
+together.
+
+**Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** the same
+endpoint has no permission gate, so the caller need not even own the library
+whose residency they move.
+
+#### Fix Direction
+
+**Decided semantics (2026-08-21):** `strict` constrains placement, not only the
+create-time default. It is a promise about **where future bytes land**, and it is
+enforced by region, not by forbidding the operation:
+
+```text
+flexible:
+    library.storage_class may change to any configured hot class.
+    cross-region failover permitted per configuration.
+
+strict(region = R):
+    library.storage_class may change, but only to a hot class in R.
+        a request naming a class outside R is rejected.
+
+    new materialization:
+        preferred class in R
+        -> same-region failover allowed
+        -> cross-region failover forbidden
+        -> no healthy backend in R: fail closed, do not place outside R
+
+    existing canonical blocks:
+        never reinterpreted or moved automatically.
+```
+
+An earlier draft of this entry made `ChangeStorageClass` a `flexible`-only
+operation. That was rejected as more restrictive than residency requires: moving a
+library from one in-region hot class to another in-region hot class breaks no
+residency promise, and forbidding it removes a legitimate feature to buy nothing.
+
+**The in-region case is not merely empty today — it is currently inexpressible,
+and that is a prerequisite this rule depends on.** `storageClassRegion` attributes
+a region to a class only by finding it as the `hot` or `cold` entry of some
+`region_classes` mapping, and `RegionClassConfig` holds exactly one `Hot` and one
+`Cold` string per region. A second hot class in the same region therefore resolves
+to no region at all, so the strict check would reject `hot-eu-a -> hot-eu-b` today
+rather than allow it. Implementing this rule as written requires the region
+attribution to admit more than one hot class per region.
+
+**The class's own `region` field cannot supply that attribution.** An earlier draft
+of this entry offered it as an alternative; it is not one. `StorageClassConfig.Region`
+is the provider region — `internal/config/config.go` documents it as "AWS region" —
+and every shipped profile uses it as such, against logical region names that are not
+the same strings. `configs/config.prod.yaml` keys `region_classes` on `na`/`eu`/`asia`
+while the corresponding classes carry `region: us-east-1`, `eu-west-1` and
+`ap-southeast-1`; `configs/config.example.yaml` and `configs/config.docker.yaml` key
+on `usa`/`eu`/`china` against `us-east-1`, `eu-west-1` and `cn-north-1`. Residency is
+asserted over the logical name, so deriving it from the provider field would compare
+the wrong domain — and would also collapse distinct logical regions that happen to
+share a provider region.
+
+The decisive case is `cold-glacier-usa`: in every profile that defines a cold class
+at all (`config.example.yaml`, `config.docker.yaml` and the four regional/cluster
+profiles) it is the `cold` entry of **both** `usa` and `eu`. Class-to-logical-region
+is therefore not even a function today, so no per-class scalar field can encode it.
+The workable shapes are `region_classes` gaining a membership list
+(`eu: {hot: [hot-eu-a, hot-eu-b]}`), or a new explicit logical field on the class
+(`placement_region: eu`) kept separate from the provider `region` — and as long as one
+class may serve two logical regions, the membership list is the honest model. That change
+belongs with the rule, not after it.
+
+Implementation shape:
+
+1. Read the organization's policy with `readOrgStoragePolicy`. Under
+   `orgDataResidencyStrict`, require the requested class to resolve to
+   `policy.DefaultRegion` — the check `resolveStrictCreateStorageClass` already
+   performs with `storageClassRegion`.
+2. Route the request through the same validation creation uses rather than a
+   second copy of the rule — reuse `resolveCreateStorageClassForOrg`, or extract
+   its policy half, so both doors answer identically. This restores the hot-tier
+   requirement at the same time; region and tier were one contract at creation and
+   should stay one contract.
+3. Cover with tests: strict accepts an in-region hot class, rejects an
+   out-of-region one and rejects a cold one; flexible accepts any hot class and
+   rejects a cold one.
+
+4. Give the placement resolver the policy as well. Gating the endpoint alone
+   leaves a library whose stored class is already out of region — from before the
+   switch to `strict`, or from a `flexible` period — materializing new blocks
+   outside it, because `ResolveStorageClass` honours `library.storage_class`
+   unconditionally.
+
+**The failover half is now decided too, because it follows from the same promise.**
+A block belonging to a strict organization must never fail over to a class outside
+the allowed region. `GetHealthyBackend` must therefore receive the policy, restrict
+the walk to in-region classes, and return an error rather than crossing the region
+when the in-region chain is exhausted. Saying "strict constrains placement" while
+leaving failover free to cross the region would make the promise void. This is
+latent today only because nothing calls `CheckHealth` automatically; it becomes
+live with the health checker, so the two must land together.
+
+**Still undecided: the transition into strict.** Neither this rule nor the failover
+rule makes historical content resident. `admin.go` updates an organization's
+`storage_config` after `validateOrgStoragePolicy`, which checks only that a strict
+policy carries a `default_region` and that the region has a configured hot class.
+It never inspects existing libraries or blocks, so an organization can flip
+`flexible -> strict`, or move its `default_region`, while its canonical blocks sit
+elsewhere. Three candidate rules, none chosen:
+
+1. **Reject the transition** while any library or canonical block resolves outside
+   the target region. Strongest, and needs an enumeration the schema does not make
+   cheap.
+2. **Accept and require migration**, tracking the organization as non-compliant
+   until an explicit migration job moves the referenced bytes. Depends on the
+   migration feature that is still a TODO.
+3. **Define strict as forward-only** — it governs materializations after the
+   policy takes effect and makes no claim about content already placed. Weakest
+   promise and cheapest, but still **not** what the code does today.
+
+**None of the three is implemented, including option 3.** An earlier draft of this
+entry said option 3 was "what the code does by omission". That is wrong. Forward-only
+would require materialization to consult the policy, and no placement resolver does:
+`Manager.ResolveStorageClass` returns `library.storage_class` first and never falls
+back or re-checks (`internal/storage/storage.go`), and the request chain that feeds
+it — `resolveLibraryBlockStoreForRequestContext` ->
+`lookupLibraryStorageClassContextFn` -> `resolvePreferredLibraryStorageClassForRequest`
+(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy
+either: `readOrgStoragePolicy` has no caller outside the creation path in
+`storage_policy.go`.
+
+What the code actually implements is narrower than any of the three: `strict` binds
+only the class **chosen at library creation**, and nothing re-checks it afterwards.
+A library created while the organization was `flexible`, holding an out-of-region
+class, keeps materializing new blocks into that class after the switch to `strict`.
+
+Two consequences for the fix:
+
+- Gating `ChangeStorageClass` is **not sufficient** even for option 3. The
+  placement resolver has to receive the policy too, so a stored out-of-region class
+  cannot keep placing new blocks outside the region. That is the same plumbing the
+  decided failover rule needs, and it should land as one change.
+- The decision still has to be made and stated wherever `strict` is described to a
+  customer, because "strict data residency" reads as option 1. This connects the
+  commercial meaning of `strict` to A-prime and to the future chargeable migration;
+  do not let it be settled by default — and do not describe the current behaviour as
+  forward-only, because it is weaker than that.
+
+**The same undecided question governs deduplicated reuse, which is where `strict`
+and A-prime actually meet.** Everything above concerns where a *new* object lands.
+Reuse never writes a new object, and under A-prime that is deliberate: a block is
+canonical per `(org, hash)`, and the placement report states the consequence as
+designed behaviour rather than a defect — "a library that now prefers EU reuses a
+hash already canonical in NA on purpose"
+([STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md)). So an
+organization that flips to `strict(EU)` and then uploads content whose hash is
+already canonical in NA takes the `Reusable` branch: `ProbeBlockReuse` returns the
+canonical class, `ResolveCanonicalBlockStore` resolves NA, and the upload succeeds
+with **no new bytes outside EU** while the content a strict library now references
+keeps living in NA. Gating `ChangeStorageClass`, gating the placement resolver and
+gating failover do not touch this path at all — the reuse decision is read from
+`blocks.storage_class`, never from the policy.
+
+Each candidate rule therefore has to state its reuse semantics explicitly:
+
+1. **Reject the transition** — the enumeration this option needs *is* the set of
+   canonical blocks the organization references, so it already answers the reuse
+   question: after a transition, nothing referenced sits outside the region.
+2. **Accept and require migration** — reuse stays allowed while the organization is
+   marked non-compliant, and the migration job is what eventually makes referenced
+   content resident.
+3. **Forward-only** — reuse stays allowed indefinitely. The promise is "new bytes
+   land in R", explicitly not "referenced bytes live in R".
+
+There is a fourth position that must not be adopted silently: **residency of
+referenced content**, where a strict library may not publish a reference to
+canonical bytes outside R until they are replicated or migrated into R. It is the
+reading a customer is most likely to give `data_residency: strict`, it is the most
+expensive, and it is in direct tension with org-global deduplication as A-prime
+defines it — one of the two has to give. Whichever is chosen belongs next to the
+transition rule wherever `strict` is described commercially.
+
+Do not couple this to block migration. Changing the preference and moving bytes are
+separate operations; the migration TODO in the same handler stays out of scope.
+
+---
+
+### ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01: Three library mutation handlers have no permission gate
+
+**Status**: 🔴 Open — runtime defect, fix belongs in its own PR
+**Severity**: High (authorization / configuration integrity)
+**Affected**: `UpdateLibrary`, `LibraryOperation` → `RenameLibrary`, `ChangeStorageClass` (`internal/api/v2/libraries.go`)
+
+#### Problem
+
+Library routes are registered on a group whose only middleware is
+`authMiddleware` (`internal/api/server_routes.go`, `protected.Use(s.authMiddleware())`),
+under both the `/api/v2` and `/api2` prefixes. This project's convention is that
+library-level authorization is checked **inside** each handler, and most handlers
+do exactly that:
+
+| Handler | Route | Gate |
+|---|---|---|
+| `GetLibrary` | `GET /:repo_id` | `GetLibraryPermission` → 403 |
+| `DeleteLibrary` | `DELETE /:repo_id` | `IsLibraryOwner` → 403 |
+| `UpdateLibrary` | `PUT /:repo_id` | **none** |
+| `LibraryOperation` (`op=rename`) | `POST /:repo_id` | **none** |
+| `ChangeStorageClass` | `POST /:repo_id/storage-class` | **none** |
+
+The three unguarded handlers never read `user_id` and never call
+`h.permMiddleware`. Their only library-scoped read is
+`readLiveLibraryStateFn(session, orgID, repoID)` → `db.ReadLiveLibraryState`,
+which is an existence/liveness check partitioned by `(org_id, library_id)`. It
+blocks cross-organization access; it does not establish that the caller may
+mutate this library. The `libraries` writes are scoped `WHERE org_id = ? AND
+library_id = ?`, and the `libraries_by_id` companion write is keyed by
+`library_id` alone; no statement in any of the three carries an owner predicate.
+
+Consequence: any authenticated member of an organization can mutate any library
+in that organization, including libraries they have no permission to read.
+
+- `UpdateLibrary` changes `name`, `description` and `version_ttl_days`. The last
+  one is written through `AddUpsertLibraryPolicyQuery` /
+  `AddDeleteLibraryPolicyQuery`, so an unauthorized caller can shorten another
+  library's version retention.
+- `RenameLibrary` changes `name` in `libraries` and `libraries_by_id`.
+- `ChangeStorageClass` changes the library's future-placement preference; the
+  effect on residency policy is tracked separately as
+  `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`.
+
+Existing canonical blocks are not moved or reinterpreted by any of the three, so
+this is a configuration-integrity and authorization defect, not data loss.
+
+#### Verification still owed
+
+No negative test covers any of the three. In
+`internal/api/v2/library_live_write_fence_test.go`, every invocation of
+`UpdateLibrary`, `RenameLibrary` and `ChangeStorageClass` sets only `org_id`,
+while other tests in the same file do set `user_id` for the handlers that read it.
+The asymmetry inside one file is itself evidence that these three run without a
+caller identity. Each handler needs a red test of the shape:
+
+```text
+user B, no permission on library A
+PUT /repos/A            → expect 403
+POST /repos/A?op=rename → expect 403
+POST /repos/A/storage-class → expect 403
+```
+
+#### Fix Direction
+
+Do not paste `IsLibraryOwner` into three handlers. Decide the required permission
+level per operation (owner versus write permission), then apply it in one shared
+place — either a route-level middleware for the mutating library routes or a
+single helper the handlers call — so a fourth mutation handler cannot be added
+without one. This is the same "centralize the mandatory check inside one
+function" rule the write helpers already follow.
+
+Land the fix and its negative tests as a separate PR; documenting the gap does
+not close it.
 
 ---
 

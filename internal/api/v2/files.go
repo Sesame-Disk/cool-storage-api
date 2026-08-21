@@ -340,6 +340,9 @@ func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) (string, e
 	return lookupLibraryStorageClass(h.db, orgID, repoID)
 }
 
+// resolveLibraryBlockStore returns the library-preferred store for new writes
+// and fallback plumbing. Canonical readers resolve each block's persisted
+// storage_class independently.
 func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass, err := h.lookupLibraryStorageClass(orgID, repoID)
 	if err != nil {

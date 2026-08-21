@@ -1848,8 +1848,9 @@ that no live references remain.
 `internal/api/seafhttp.go` now gates chunked finalize block-metadata writes with
 `finalizeUploadBlockMetadataConcurrency = 1`. This directly targets the prod
 incident class where one finalize wave fans out many concurrent
-`IncrementOrCreateBlock` Paxos rounds and triggers Cassandra slow-query / CAS
-timeout logs.
+`RegisterUploadedBlockAndMapping` LWT/Paxos transactions and triggers Cassandra
+slow-query / CAS timeout logs. (The older `IncrementOrCreateBlock` name this
+section used no longer exists; the row-per-reference model replaced it.)
 
 That gate is intentionally narrow:
 

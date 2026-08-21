@@ -549,13 +549,15 @@ func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, bloc
 // block_references — so it is safe to call on every (deduplicated) upload of the
 // same content.
 //
-// Uses INSERT ... IF NOT EXISTS (a per-block LWT) deliberately. storage_class and
-// storage_key are NOT globally fixed per block: uploads pick the class per library
-// and per routing region (see resolveLibraryBlockStore), so two writers of the
-// same content can carry different classes. First-writer-wins pins ONE canonical
-// physical location so reads and GC resolve the backend where the block actually
-// landed; a plain last-writer-wins INSERT could repoint metadata at a class that
-// holds no copy, breaking downloads and making GC act on the wrong physical copy.
+// Uses INSERT ... IF NOT EXISTS (a per-block LWT) deliberately. For an absent
+// block, storage_class and storage_key are not globally fixed by the hash: a
+// mutable library preference or request routing can lead different writers to
+// propose different classes (see resolveLibraryBlockStore). Existing canonical
+// rows retain their persisted class regardless of later preference changes.
+// First-writer-wins pins ONE canonical physical location so reads and GC resolve
+// the backend where the block actually landed; a plain last-writer-wins INSERT
+// could repoint metadata at a class that holds no copy, breaking downloads and
+// making GC act on the wrong physical copy.
 // This LWT is scoped to the (org, block) partition, so writers for different
 // blocks never contend — it is NOT globally serialized (the old process-wide
 // concurrency permit that did serialize it has been removed).

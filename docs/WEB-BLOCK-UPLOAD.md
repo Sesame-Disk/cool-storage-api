@@ -1058,7 +1058,7 @@ flag were on*.
 
    **Residual note — slot-claim cost (audit 2026-07-04).** `claimBlockUploadSessionSlot`
    probes slots `0..cap-1` with sequential LWTs, so a user already at the cap costs up
-   to `cap` Paxos rounds before the `429`. Trivial at the default `cap=8` and only on
+   to `cap` LWT/Paxos transactions before the `429`. Trivial at the default `cap=8` and only on
    the (cold) session-create path, but it grows linearly — operators who raise
    `max_uncommitted_block_sessions_per_user` substantially should note the create-time
    latency floor under contention (a randomized start slot or a small counter would cap
