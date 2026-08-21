@@ -7916,10 +7916,29 @@ a region to a class only by finding it as the `hot` or `cold` entry of some
 `Cold` string per region. A second hot class in the same region therefore resolves
 to no region at all, so the strict check would reject `hot-eu-a -> hot-eu-b` today
 rather than allow it. Implementing this rule as written requires the region
-attribution to admit more than one hot class per region — either `region_classes`
-gaining a membership list, or `storageClassRegion` deriving the region from the
-class's own `region` field instead. That change belongs with the rule, not after
-it.
+attribution to admit more than one hot class per region.
+
+**The class's own `region` field cannot supply that attribution.** An earlier draft
+of this entry offered it as an alternative; it is not one. `StorageClassConfig.Region`
+is the provider region — `internal/config/config.go` documents it as "AWS region" —
+and every shipped profile uses it as such, against logical region names that are not
+the same strings. `configs/config.prod.yaml` keys `region_classes` on `na`/`eu`/`asia`
+while the corresponding classes carry `region: us-east-1`, `eu-west-1` and
+`ap-southeast-1`; `configs/config.example.yaml` and `configs/config.docker.yaml` key
+on `usa`/`eu`/`china` against `us-east-1`, `eu-west-1` and `cn-north-1`. Residency is
+asserted over the logical name, so deriving it from the provider field would compare
+the wrong domain — and would also collapse distinct logical regions that happen to
+share a provider region.
+
+The decisive case is `cold-glacier-usa`: in every profile that defines a cold class
+at all (`config.example.yaml`, `config.docker.yaml` and the four regional/cluster
+profiles) it is the `cold` entry of **both** `usa` and `eu`. Class-to-logical-region
+is therefore not even a function today, so no per-class scalar field can encode it.
+The workable shapes are `region_classes` gaining a membership list
+(`eu: {hot: [hot-eu-a, hot-eu-b]}`), or a new explicit logical field on the class
+(`placement_region: eu`) kept separate from the provider `region` — and as long as one
+class may serve two logical regions, the membership list is the honest model. That change
+belongs with the rule, not after it.
 
 Implementation shape:
 

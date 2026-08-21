@@ -146,8 +146,11 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 - **P0 — SERIAL domain (R12).** Every relevant `blocks` LWT on one consistency level. No
   minted keys, no new identity.
 - **P1 — locator authority.** The persisted `storage_key` becomes the exact locator for
-  reads, existence checks and repair, still holding the currently derived value. Nothing
-  destructive changes; the deployment is observable before identity moves.
+  reads, existence checks, repair and physical delete, still holding the currently
+  derived value. It carries the delete chain that must exist before a key can differ:
+  an exact-key delete primitive, the durable orphan carrying `(storage_class,
+  storage_key)`, and recovery deleting that persisted key. Nothing destructive
+  changes; the deployment is observable before identity moves.
 - **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.
@@ -156,15 +159,17 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   `blocks(L) -> P1` names a tuple already authorized for retirement, so both repair and
   install must block until the canonical row stops naming `P1`.
 - **P4 — exact-`P` destructive lifecycle (R14, R19, R20, R26).** Tuple-bound GC, orphan,
-  candidate and projection lifecycle.
+  candidate and projection lifecycle: claim/finalize CAS naming `P`, and `_by_day`
+  identity including it. The orphan's *locator* handoff is not deferred to here — it
+  lands in P1, because recovery must stop deriving before any key is minted.
 
 R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
 P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
 
 **P1 scoping note (2026-08-21), verified against the tree.** P1 is the right next
 structural step, but the work is not where the one-line description suggests. The
-cost is concentrated in making every writer persist the key and backfilling what is
-already stored; the read paths largely already fetch what P1 needs. Three things
+cost is concentrated in making every writer resolve, write and persist one key;
+the read paths largely already fetch what P1 needs. Three things
 have to be true before persisted `storage_key` can be the authority, and only the
 third is what the P1 line describes.
 
@@ -185,17 +190,55 @@ Seven relevant paths: five empty, two real. The web session funnel is easy to mi
 because it calls `RegisterWebUploadedBlockAndMapping`, not
 `RegisterUploadedBlockAndMapping`; it persists the key
 `StoreUploadedBlockForProbe` resolved through `StorageKeyForHash`. It is a
-production writer, so the backfill has to cope with a column that is populated for
-some rows and empty for others rather than empty everywhere.
+production writer, so wherever a backfill runs at all it has to cope with a column
+that is populated for some rows and empty for others rather than empty everywhere.
 
 This is why every reader guards with `persistedKey != "" && persistedKey != derived`
 (`internal/api/v2/upload_reuse.go`,
 `internal/streaming/canonical_block_reader.go`): the empty case is the normal case,
 not an exception. A column that is empty for most rows cannot be made authoritative
-by flipping a branch. P1 therefore contains, in order: make every materialization
-path persist the key it actually used; backfill existing rows; only then invert the
-authority and harden empty from tolerated to an error. That is three changes and a
-data migration, not one branch.
+by flipping a branch.
+
+**The writer work is larger than that table suggests, because the register argument
+is not the only place a key is derived.** The two probe branches fail differently.
+Both statements below are about the **non-web** funnels, which call the two helpers
+directly; the web session funnel calls neither and is treated separately after them.
+
+In the `Reusable` branch the key is resolved correctly and then dropped:
+`EnsureReusableBlockPresent` returns the canonical key `StoreUploadedBlockForProbe`
+resolved, and every non-web funnel but OnlyOffice discards it and persists `""`
+(`seafhttp.go:2520`, `seafhttp.go:3031`, `sync.go:2026`, `files.go:1358`,
+`files.go:3452`; OnlyOffice keeps it at `onlyoffice.go:1224`).
+
+In the `NeedsPut` branch **every non-web funnel** discards it, OnlyOffice included.
+`ResolveNeedsPutBlockStore` returns the resolved key and all six call sites drop it
+(`seafhttp.go:2527`, `seafhttp.go:3034`, `sync.go:2035`, `files.go:1364`,
+`files.go:3455`, `onlyoffice.go:1227`), then write the bytes with
+`PutBlockAutoDirect(hash)`, which re-derives through `hashToKey`
+(`internal/storage/blocks.go`). OnlyOffice, the only one that persists anything on
+this branch, persists what that PUT returned — a second, independent derivation
+rather than the key it resolved. The two agree today only because both call
+`hashToKey`; under P2 nothing requires them to.
+
+Only the web session funnel already has the right shape, which is why it is excluded
+above: `StoreUploadedBlockForProbe` resolves `K` once, writes through
+`PutObjectAutoDirect(K)`, and returns that same `K` — `UploadBlock` keeps it
+(`v2/blocks.go:1013`) and hands it to `materializeUploadedBlock` to persist
+(`v2/blocks.go:1021`). Stated precisely, step 1 is **one resolution of `K` per
+block, the PUT issued against that `K`, and that same `K` persisted** — not "pass
+the key to the register call". A structural test asserting
+`storageKey != ""` at the materialization funnels pins the symptom, but would pass a
+funnel that persists a re-derived key.
+
+P1 therefore contains, in order: make every materialization path resolve, write and
+persist one key; backfill any deployment that already holds rows; only then invert
+the authority and harden empty from tolerated to an error. **Under the accepted
+greenfield production scope the middle step has no production instance to run
+against.** `blocks.storage_key TEXT` is already in `001_initial_schema.cql`, so a
+fresh install starts with the column present and corrected writers populate it from
+the first block. The backfill remains in scope as a compatibility path for an
+already-populated deployment, and fixtures and tests still have to be updated, but
+it is not a data migration this rollout has to perform.
 
 *2. P1 adds essentially no new Cassandra reads on production paths.*
 The canonical reader already performs one `blocks` read per unique block
@@ -238,8 +281,21 @@ deployment takes: `CheckBlocksParallel` in `check-blocks`, `syncBlockExistsFn` i
 `PutBlock`, and `GetBlockSize`/`GetBlockReader` in the block-send `else` branch.
 Making the locator authoritative there is a correctness cleanup, not a load change.
 
-That leaves one production path that genuinely derives, and it does not need a new
-read either. `internal/gc/worker.go` deletes through `deleteS3WithRetry` ->
+Outside the canonical reader, two production surfaces genuinely derive the physical
+locator, and neither needs a new read.
+
+**Upload reuse, existence check and repair.** `internal/api/v2/upload_reuse.go`
+derives at three points — the first-writer branch, the `Reusable` branch's
+`ObjectExists`/repair-PUT, and `NeedsPut` — and every upload funnel reaches them
+(`seafhttp.go`, `sync.go`, `files.go` x2, `onlyoffice.go`, `v2/blocks.go`). This is
+where the canonical `P` is repaired, so it is precisely the path that must consume
+the authoritative locator rather than re-derive one. It needs no new read:
+`ProbeBlockReuse` already selects `storage_key` into `BlockReuseProbe.StorageKey`
+(`internal/db/block_references.go`), and the code currently uses that value only as
+a mismatch guard.
+
+**GC physical delete.** It needs no new read either. `internal/gc/worker.go`
+deletes through `deleteS3WithRetry` ->
 `BlockStoreDeleter.DeleteBlock`, which calls `hashToKey`. GC already point-reads
 the row: `GetBlockInfo` runs
 `SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?`
@@ -249,9 +305,51 @@ to `BlockInfo` and to that existing SELECT, and to delete by exact key instead o
 derived one — **an extra column on a read that already happens, plus an exact-key
 delete**. That is also exactly what X1 requires of the delete path regardless.
 
-The honest summary is that P1's cost is concentrated in the writer/backfill work of
-step 1, not in read amplification. An earlier draft of this note claimed
-`check-blocks` would add N Cassandra reads per request; that was wrong — it
+P1's correctness inventory is therefore **canonical reader + upload
+reuse/existence/repair + GC delete**, not reader plus GC. The performance conclusion
+is unchanged: all three already hold the metadata the flip consumes.
+
+**The delete path is not finished when `deleteS3WithRetry` deletes by exact key.**
+Two requirements this document lists under "What both options must change" have to
+land with P1 — or at the very latest before P2 — rather than with P4's tuple-bound
+lifecycle:
+
+- **There is no exact-key delete primitive at all.** `BlockStore` has
+  `PutObjectAutoDirect`, `ObjectExists` and `Get*ByStorageKey`, but
+  `DeleteBlock(ctx, hash)` derives (`internal/storage/blocks.go`). It has to be
+  added, not merely called.
+- **The durable orphan does not carry the key.** `StartBlockDeleteOrphan(orgID,
+  blockID, storageClass, externalSHA1, now)` (`internal/gc/store.go`) takes no key,
+  `gc_s3_orphans` has no `storage_key` column and no migration adds one
+  (`001_initial_schema.cql`; 007, 009, 014 and 015 touch that table only for other
+  columns), and the row is written *before* `FinalizeBlockDelete`
+  removes `blocks(L)` (`internal/gc/worker.go`). Past that point the orphan is the
+  only durable record of what still has to be deleted — and `RecoverS3Orphans`
+  re-derives the key from the block id (`internal/gc/worker.go`).
+
+Leaving both to P4 opens a window between P2 and P4 in which minting is live but
+recovery still derives: the DELETE addresses a key nothing was ever written to,
+returns success as a no-op, and the orphan is cleared as though the object were
+gone — the exact S3 leak the durable record exists to prevent. The sequencing
+constraint is therefore **exact-key delete primitive + the canonical orphan row
+carrying `(storage_class, storage_key)` + recovery deleting that persisted key, all
+before the first minted key exists**. While `K = hashToKey(L)` still holds, the
+change is observably a no-op, which is why it belongs in the reversible slice rather
+than after the mint.
+
+**The projection stays out of P1, and that is deliberate.** Migration 014 made
+`gc_s3_orphans_by_day` identity-only — every remaining column is part of
+`PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id)`, pinned by
+`TestR22bProjectionWriteIsInsert` — and its own note records that `gc_s3_orphans`
+keeps the payload because it is "the authority recovery reads". Recovery therefore
+gets the key from the canonical row it already loads, and P1 adds a regular column
+to one table. Folding `P` into the projection's *identity* (R26) is a different and
+larger change: a key column cannot be added by `ALTER`, so it means a new table and
+a revised identity contract. That belongs in P4, and nothing in P1 requires it.
+
+The honest summary is that P1's cost is concentrated in the writer work of step 1
+and in the delete-path plumbing above, not in read amplification. An earlier draft
+of this note claimed `check-blocks` would add N Cassandra reads per request; that was wrong — it
 described the location phase the production branch already performs.
 
 `check-blocks` is still worth attention, but as an **optimization opportunity, not
@@ -262,8 +360,10 @@ already dispatches one canonical-location lookup per unique internal id at
 rather than creating them. Because the route is sync-hot and its node exposure is
 already the product `check_blocks_max_inflight_per_node` x
 `check_blocks_lookup_fanout` (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`), replacing the
-per-id lookups with a batched canonical-location read is worth scoping inside P1 —
-it would reduce current load, not offset an increase.
+per-id lookups with a batched canonical-location read is worth doing — but as its
+own X5/X11 optimization, **not inside P1**. It would reduce current load rather than
+offset an increase, so it demonstrates nothing about locator authority, and folding
+it in only makes the one slice that has to stay reversible harder to review.
 
 Note that `internal/gc/worker.go`'s `w.store.BlockExists` is a Cassandra
 `blocks`-row check, not an S3 derive; only the `BlockStoreDeleter` path is
@@ -913,7 +1013,8 @@ which any incarnation satisfies, because of the byte-identity premise above.
 
 ### What both options must change, regardless of the A/B decision
 
-1. **A delete-by-exact-key surface.** `BlockStore` has exact-key `Put`
+1. **A delete-by-exact-key surface.** *Scheduled into P1 — see the P1 scoping note;
+   recovery must stop deriving before any key is minted.* `BlockStore` has exact-key `Put`
    (`PutObjectAutoDirect`), `Exists` (`ObjectExists`) and `Get`
    (`GetBlockByStorageKey`), but **no exact-key delete** — only
    `DeleteBlock(ctx, hash)`. Both destructive callers pass a logical block ID today:
@@ -922,7 +1023,11 @@ which any incarnation satisfies, because of the byte-identity premise above.
    format before selecting `backend(P).DeleteExact(storage_key)`; malformed persisted
    locators fail closed.
 2. **`gc_s3_orphans` carries the exact physical tuple**, on the canonical table and on
-   the `_by_day` projection, and recovery stops deriving. Both rows must be confirmed
+   the `_by_day` projection, and recovery stops deriving. *The canonical half —
+   the orphan row carrying the exact key, and recovery deleting it instead of
+   deriving — is scheduled into P1; see the P1 scoping note. The projection half is
+   a primary-key change against an identity-only table (migration 014) and stays
+   with P4/R26.* Both rows must be confirmed
    durable before `FinalizeBlockDelete` removes `blocks(L)`; a canonical orphan without
    its discovery projection can strand recovery behind the cursor.
 3. **The claim must name the physical locator.** `ClaimBlockDelete` is

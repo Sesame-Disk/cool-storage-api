@@ -837,7 +837,10 @@ or explicitly change the deduplication product semantics. It must also prove:
 
 1. exact physical tuple identity `P = (storage_class, storage_key)`;
 2. non-reused physical keys for new incarnations;
-3. locator-authoritative reads and existence checks;
+3. locator-authoritative reads, existence checks, repair and physical deletes,
+   recovery included: orphan recovery must delete the exact persisted key instead
+   of deriving one from the block id, and the durable `gc_s3_orphans` row does not
+   carry that key today;
 4. install and repair are separate operations;
 5. stale writers cannot reinstall retired lives;
 6. claims and finalization are tuple-bound;
