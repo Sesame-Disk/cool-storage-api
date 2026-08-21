@@ -235,6 +235,7 @@ type mockBlock struct {
 	BlockID             string
 	StorageClass        string
 	StorageClassPresent bool
+	StorageKey          string
 	CreatedAt           *time.Time
 	GCState             string
 	GCClaimID           string
@@ -615,6 +616,7 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		BlockID:             blockID,
 		StorageClass:        storageClass,
 		StorageClassPresent: true,
+		StorageKey:          blockID,
 		RepresentationID:    db.PlainBlockRepresentationID,
 		CreatedAt:           &createdAt,
 	}
@@ -1254,7 +1256,7 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, StorageKey: block.StorageKey, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -3759,7 +3761,7 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
-func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) error {
+func (d *mockBlockDeleter) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
 	d.provider.mu.Lock()
 	defer d.provider.mu.Unlock()
 	if d.provider.failAlways {
@@ -3769,11 +3771,11 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 		d.provider.failTimes--
 		return d.provider.failErr
 	}
-	d.provider.DeletedKeys = append(d.provider.DeletedKeys, blockID)
+	d.provider.DeletedKeys = append(d.provider.DeletedKeys, storageKey)
 	d.provider.ScopedDeletes = append(d.provider.ScopedDeletes, ScopedBlockDelete{
 		OrgID:        d.orgID,
 		StorageClass: d.storageClass,
-		BlockID:      blockID,
+		BlockID:      storageKey,
 	})
 	return nil
 }
@@ -3807,7 +3809,11 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 	return info, true, nil
 }
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
+	storageKey = strings.TrimSpace(storageKey)
+	if storageKey == "" {
+		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -3819,6 +3825,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 		existing.StorageClass = storageClass
+		existing.StorageKey = strings.TrimSpace(storageKey)
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3831,6 +3838,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
+		StorageKey:    strings.TrimSpace(storageKey),
 		ExternalSHA1:  strings.TrimSpace(externalSHA1),
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),

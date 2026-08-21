@@ -287,8 +287,16 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 // DeleteBlock removes a block from storage
 // Note: Should only be called after verifying no references exist
 func (bs *BlockStore) DeleteBlock(ctx context.Context, hash string) error {
-	key := bs.hashToKey(hash)
-	return bs.s3.Delete(ctx, key)
+	return bs.DeleteBlockByStorageKey(ctx, bs.hashToKey(hash))
+}
+
+// DeleteBlockByStorageKey removes an object from its explicit canonical key.
+// Destructive callers must use this form after loading the persisted locator.
+func (bs *BlockStore) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
+	if strings.TrimSpace(storageKey) == "" {
+		return fmt.Errorf("block storage key is empty")
+	}
+	return bs.s3.Delete(ctx, storageKey)
 }
 
 // PutBlocks stores multiple blocks and returns the hashes of successfully stored blocks

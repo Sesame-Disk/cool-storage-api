@@ -122,7 +122,7 @@ func TestStore_StartBlockDeleteOrphan_ResetRaceDoesNotResurrectRow(t *testing.T)
 	seedS3Orphan(t, store, orgID, "orph-reset-race", "hot", "sha1-old", "prev", firstSeenAt)
 	store.SetStartBlockDeleteOrphanResetRaceForTest(true)
 
-	if _, err := store.StartBlockDeleteOrphan(orgID, "orph-reset-race", "cold", "sha1-new", time.Now().UTC()); err == nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, "orph-reset-race", "cold", "orph-reset-race", "sha1-new", time.Now().UTC()); err == nil {
 		t.Fatal("StartBlockDeleteOrphan error = nil, want reset-race error")
 	}
 	if got := store.S3OrphanCount(); got != 0 {
@@ -147,7 +147,7 @@ func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testin
 		t.Fatalf("MarkS3OrphanMappingCleanupPending failed: %v", err)
 	}
 
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", "sha1-new", time.Now().UTC())
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", "orph-reset", "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan failed: %v", err)
 	}

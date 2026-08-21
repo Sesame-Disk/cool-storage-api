@@ -498,7 +498,7 @@ func seedCanonicalCheckRows(t *testing.T, orgID string, ids []string, storageCla
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
 	const batchSize = 50
-	insert := `INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, ?)`
+	insert := `INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, created_at) VALUES (?, ?, ?, ?, ?, ?)`
 	delete := `DELETE FROM blocks WHERE org_id = ? AND block_id = ?`
 	createdAt := time.Now().UTC()
 	t.Cleanup(func() {
@@ -530,7 +530,7 @@ func seedCanonicalCheckRows(t *testing.T, orgID string, ids []string, storageCla
 		}
 		batch := session.Batch(gocql.UnloggedBatch)
 		for _, id := range ids[start:end] {
-			batch.Query(insert, orgID, id, 1, storageClass, createdAt)
+			batch.Query(insert, orgID, id, 1, storageClass, fmt.Sprintf("blocks/%s/aa/aa/%s", orgID, id), createdAt)
 		}
 		flush(batch, "insert")
 	}

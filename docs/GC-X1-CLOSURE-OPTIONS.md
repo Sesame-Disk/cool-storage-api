@@ -1,7 +1,8 @@
 # X1 — Closure Options for the Physical-Delete ABA
 
-**Status:** Analysis and option comparison. **No option is accepted. Nothing is
-implemented. This is not an ADR.**
+**Status:** Analysis and option comparison. **No X1 option is accepted. This is
+not an ADR.** P1's locator-authority foundation is implemented separately; it
+does not close X1 or authorize destructive GC.
 
 Even a future verified X1 implementation would not enable destructive GC by itself;
 removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
@@ -75,6 +76,17 @@ adding a new identity field or persisting `P`. Persisting the exact `storage_key
 and forming `P=(storage_class, storage_key)` is the work AFTER R23b and is what
 actually closes the physical ABA — but it is a series of properties, not one row.
 See the sequencing note below.
+
+**P1 locator authority (2026-08-21).** New materializations resolve the
+org-scoped key `K = hashToKey(L)` once and pass the returned key through the
+physical PUT, metadata registration, canonical read/reuse/repair, GC orphan
+row, recovery reload and physical DELETE. `blocks.storage_key` and the
+canonical `gc_s3_orphans.storage_key` are required; an empty key fails closed.
+The `_by_day` table remains an identity-only discovery projection. The exact
+locator prevents a caller from silently deriving a different target, but it
+does not create a never-reused physical incarnation or solve the X1
+publication-fence and per-attempt claim-ownership races. Destructive GC remains
+disabled in production.
 
 **The historical risk remains real even though the current greenfield deployment
 contract now prohibits both halves.** An earlier version of this section justified the
@@ -1701,7 +1713,9 @@ never revisited. Under B that branch changes meaning entirely (B.1).
 
 ## Call-site inventory
 
-A conceptual diff, not an implementation list.
+A conceptual diff, not an implementation list. The **Today** column is the
+pre-P1 baseline used by the option analysis; the P1 locator-authority delta is
+recorded above and does not change the open X1 requirements.
 
 | Surface | Today | What minted keys need |
 |---|---|---|

@@ -28,8 +28,12 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
 	})
 
-	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+	probeUploadedBlockReuseForUploadFn = func(_ *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseNeedsPut,
+			StorageClass: "hot",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
@@ -191,9 +195,17 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	syncProbeUploadedBlockReuseFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 		probeCalls++
 		if probeCalls == 1 {
-			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+			return db.BlockReuseProbe{
+				Decision:     db.BlockReuseNeedsPut,
+				StorageClass: "hot",
+				StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+			}, nil
 		}
-		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"}, nil
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseReusable,
+			StorageClass: "hot",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 	ensureCalls := 0
 	syncEnsureReusableBlockPresentFn = func(context.Context, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string) (string, error) {

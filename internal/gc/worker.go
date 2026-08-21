@@ -1167,6 +1167,13 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
 	}
+	storageKey := strings.TrimSpace(blockInfo.StorageKey)
+	if storageKey == "" {
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return relErr
+		}
+		return fmt.Errorf("block %s has empty canonical storage key", item.ItemID)
+	}
 	if item.StorageClass != "" && item.StorageClass != storageClass {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
@@ -1198,7 +1205,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
 	}
 
-	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, blockInfo.Sha1, w.clock().UTC())
+	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, storageKey, blockInfo.Sha1, w.clock().UTC())
 	if err != nil {
 		return w.failClosedIfUnavailable("failed to record pending S3 delete", item.ItemID, err)
 	}
@@ -1220,7 +1227,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		if err != nil {
 			return fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, err)
 		}
-		if delErr := w.deleteS3WithRetry(ctx, blockStore, item.ItemID); delErr != nil {
+		if delErr := w.deleteS3WithRetry(ctx, blockStore, storageKey); delErr != nil {
 			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v (recording for scanner recovery)", item.ItemID, delErr)
 			if recErr := w.store.UpdateS3OrphanAttempt(item.OrgID, item.ItemID, orphanFirstSeenAt, delErr.Error(), w.clock()); recErr != nil {
 				log.Printf("[GC Worker] ERROR: Failed to update S3 orphan %s: %v", item.ItemID, recErr)
@@ -1262,14 +1269,14 @@ func blockDeleteClaimID(candidateAt time.Time) string {
 // deleteS3WithRetry attempts to delete a block from S3 with exponential backoff.
 // It is cancellable via the context. Returns nil on success; the last error
 // otherwise. Retries are NOT applied to context cancellation.
-func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDeleter, blockID string) error {
+func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDeleter, storageKey string) error {
 	var lastErr error
 	attempts := len(s3DeleteRetryDelays) + 1 // 1 initial try + N retries
 	for i := 0; i < attempts; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := blockStore.DeleteBlock(ctx, blockID); err == nil {
+		if err := blockStore.DeleteBlockByStorageKey(ctx, storageKey); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -1404,6 +1411,14 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					log.Printf("[GC Worker] S3 orphan recovery: discovery token does not match canonical orphan for org=%s block=%s; retaining cursor", discovery.OrgID, discovery.BlockID)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("discovery token mismatch for canonical S3 orphan org=%s block=%s", discovery.OrgID, discovery.BlockID)
+					}
+					continue
+				}
+				if strings.TrimSpace(canonical.StorageKey) == "" {
+					metrics.GCErrorsTotal.WithLabelValues("s3_orphan_empty_storage_key").Inc()
+					log.Printf("[GC Worker] S3 orphan recovery: canonical row has empty storage key for org=%s block=%s; retaining cursor", canonical.OrgID, canonical.BlockID)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("canonical S3 orphan has empty storage key for org=%s block=%s", canonical.OrgID, canonical.BlockID)
 					}
 					continue
 				}
@@ -1592,7 +1607,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := blockStore.DeleteBlock(ctx, canonicalCommit.BlockID); err != nil {
+				if err := blockStore.DeleteBlockByStorageKey(ctx, canonicalCommit.StorageKey); err != nil {
 					if updErr := w.store.UpdateS3OrphanAttempt(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, err.Error(), w.clock()); updErr != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", canonicalCommit.BlockID, updErr)
 						if phaseErr == nil {
@@ -1667,6 +1682,7 @@ func s3OrphanRecoveryStateEqual(left, right S3OrphanInfo) bool {
 		left.BlockID == right.BlockID &&
 		normalizeS3OrphanRecoveryTime(left.FirstSeenAt).Equal(normalizeS3OrphanRecoveryTime(right.FirstSeenAt)) &&
 		left.StorageClass == right.StorageClass &&
+		left.StorageKey == right.StorageKey &&
 		left.ExternalSHA1 == right.ExternalSHA1 &&
 		left.RecoveryPhase == right.RecoveryPhase
 }

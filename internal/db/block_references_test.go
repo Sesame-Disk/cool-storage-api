@@ -14,6 +14,7 @@ func completeIdentityRepairRow(representationID, sha1 string) blockIdentityRepai
 		Sha1:                sha1,
 		StorageClass:        "hot",
 		StorageClassPresent: true,
+		StorageKey:          "key",
 		CreatedAt:           &createdAt,
 	}
 }
@@ -23,6 +24,7 @@ func completeProbeMetadataRow(storageClass string) blockReuseMetadataRow {
 	return blockReuseMetadataRow{
 		StorageClass:        storageClass,
 		StorageClassPresent: true,
+		StorageKey:          "canonical-key",
 		CreatedAt:           &createdAt,
 	}
 }

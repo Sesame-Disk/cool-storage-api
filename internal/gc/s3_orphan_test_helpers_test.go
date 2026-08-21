@@ -13,7 +13,7 @@ import (
 func seedS3Orphan(t *testing.T, store GCStore, orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, firstSeenAt time.Time) time.Time {
 	t.Helper()
 	firstSeenAt = firstSeenAt.UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, externalSHA1, firstSeenAt)
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, blockID, externalSHA1, firstSeenAt)
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}

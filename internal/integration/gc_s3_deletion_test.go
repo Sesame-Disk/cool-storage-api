@@ -392,9 +392,9 @@ func seedSyntheticBlock(t *testing.T, storageClass string) (uuid.UUID, string, *
 
 	session := shareProjectionDBForTest(t).Session()
 	if err := session.Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, orgID.String(), blockID, len(content), storageClass, time.Now().UTC()).Exec(); err != nil {
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, orgID.String(), blockID, len(content), storageClass, bs.StorageKeyForHash(blockID), time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("seed canonical blocks row: %v", err)
 	}
 	return orgID, blockID, bs
@@ -502,7 +502,7 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 		_ = siblingStore.DeleteBlock(ctx, blockID)
 	})
 
-	seedS3Orphan(t, store, orgID, blockID, storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC())
+	seedS3OrphanWithStorageKey(t, store, orgID, blockID, bs.StorageKeyForHash(blockID), storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC())
 	if _, found, err := shareProjectionDBForTest(t).GetBlockS3OrphanInfo(orgID.String(), blockID); err != nil || !found {
 		t.Fatalf("orphan fence not recorded (found=%v err=%v)", found, err)
 	}

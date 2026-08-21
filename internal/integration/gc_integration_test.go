@@ -1105,10 +1105,14 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	repairGCSnapshotsForTest(t, orgID)
 }
 
+func syntheticCanonicalStorageKeyForTest(orgID uuid.UUID, blockID string) string {
+	return fmt.Sprintf("blocks/%s/aa/aa/%s", orgID, blockID)
+}
+
 func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string) {
 	t.Helper()
 	database := shareProjectionDBForTest(t)
-	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, ""); err != nil {
+	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, syntheticCanonicalStorageKeyForTest(orgID, blockID)); err != nil {
 		t.Fatalf("failed to seed block metadata for %s/%s: %v", orgID, blockID, err)
 	}
 	t.Cleanup(func() {
@@ -1669,7 +1673,7 @@ func TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete(t *testing.T) {
 
 	// Real zero-ref canonical row carrying blocks.sha1 = externalSHA1 (what every
 	// materialization path writes), plus the forward mapping it resolves to.
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, blockID)); err != nil {
 		t.Fatalf("seed block with sha1: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, db.PlainBlockRepresentationID, externalSHA1, blockID, time.Now().UTC()); err != nil {
@@ -1728,10 +1732,10 @@ func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, plainBlockID)); err != nil {
 		t.Fatalf("seed plain block: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, encBlockID)); err != nil {
 		t.Fatalf("seed encrypted block: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
@@ -1802,10 +1806,10 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, plainBlockID)); err != nil {
 		t.Fatalf("seed plain block: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, encBlockID)); err != nil {
 		t.Fatalf("seed encrypted block: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
@@ -2164,7 +2168,7 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		}
 	})
 
-	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "sha1-new", time.Now().UTC())
+	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", blockID, "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
@@ -2892,7 +2896,7 @@ func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 
 	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference, the
 	// fs_object that owns that reference, and the pre-existing gc_block_candidate.
-	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID, blockID)); err != nil {
 		t.Fatalf("seed blocks row: %v", err)
 	}
 	if err := database.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {

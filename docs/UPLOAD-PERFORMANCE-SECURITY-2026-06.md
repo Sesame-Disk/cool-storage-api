@@ -146,8 +146,7 @@ so a metadata write is never counted as `probe` (closes F14).
   needs-put path (no pre-PUT legacy HEAD, 1 direct PUT, ref/mapping registered, then
   canonical confirmation); plus `store`-phase fence retry.
 - `internal/api/v2/upload_reuse_test.go` — `EnsureReusableBlockPresent` exists-skip
-  (honors `probe.StorageKey`) and missing-repair (derives the key from the hash when
-  `storage_key` is empty) paths.
+  and missing-repair paths, both using the persisted `probe.StorageKey`.
 - `internal/api/v2/upload_reuse_test.go` — shared retry helper and probe errors.
 - `internal/api/handler_mapping_failure_test.go` — sync needs-put uses a direct PUT,
   not the legacy Exists+PUT, and then performs the required canonical confirmation.
@@ -158,12 +157,11 @@ blocks at different positions in one upload produce separate probes/PUTs. The
 Cassandra probe now provides cross-upload dedup (a previously-stored block is
 reused), which the old S3 HEAD also did — so no dedup regression.
 
-**Caveat 2 (updated by P10 PR-2 — derived-key invariant):**
-API reads and `EnsureReusableBlockPresent` derive the deterministic org-scoped key
-through `BlockStore`. Reuse accepts `storage_key` only when empty or exactly equal to
-that derivation and otherwise fails closed before S3 access. Arbitrary relocated keys
-remain unsupported. P10 PR-3 moved GC delete and orphan recovery to the same
-org-scoped derivation and removed the org-less storage APIs. See
+**Caveat 2 (updated by P1 locator authority):**
+API reads and `EnsureReusableBlockPresent` use the persisted deterministic
+org-scoped key through `BlockStore`. Reuse rejects an empty or conflicting key
+before S3 access. Arbitrary relocated keys remain unsupported. GC delete and
+orphan recovery use the same persisted exact key. See
 `docs/KNOWN_ISSUES.md` (ISSUE-BLOCK-STORAGE-KEY-READS-01).
 
 **Caveat 3 (minor — new failure surface on reuse):** because the `Reusable` path now

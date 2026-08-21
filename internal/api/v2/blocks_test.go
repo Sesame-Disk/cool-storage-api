@@ -915,12 +915,16 @@ func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
 		return nil
 	}
 	probeCalls := 0
-	probeUploadedBlockReuseFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
+	probeUploadedBlockReuseFn = func(_ *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 		probeCalls++
 		if probeCalls < 3 {
 			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 		}
-		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "legacy"}, nil
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseReusable,
+			StorageClass: "legacy",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 	putCalls := 0
 	repairCanonicalBlockDirectFn = func(_ context.Context, _ *storage.BlockStore, key string, _ []byte) (string, error) {

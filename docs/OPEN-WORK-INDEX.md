@@ -139,8 +139,9 @@ new incarnation is created. Closure criteria are in Registry X1.
 
 **Closure options are compared in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md)** (2026-08-14), which replaces the
-abandoned generational-fence ADR. Nothing there is accepted and no implementation has
-started.
+abandoned generational-fence ADR. Nothing there is accepted and no X1
+implementation has started; the separate P1 locator-authority foundation does
+not satisfy the X1 closure criteria.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|

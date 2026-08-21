@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-21 - P1 locator authority foundation
+
+Materialization funnels now resolve one org-scoped `storage_key`, use that exact
+key for the physical PUT, and persist the same value in canonical metadata.
+Canonical reads, reuse/repair, GC orphan recovery and destructive delete paths
+consume the persisted key and fail closed on missing or conflicting values.
+Migration `016_gc_s3_orphans_storage_key.cql` adds the recovery locator to the
+canonical orphan table; the day projection remains identity-only. This is a
+greenfield foundation slice and does not close X1 or enable destructive GC.
+
+---
+
 ## 2026-08-20 - X1/X4 upload hot-path Paxos characterization
 
 The confirmed hot-path analysis records that the shipped production

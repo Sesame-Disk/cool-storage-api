@@ -329,7 +329,8 @@ func TestCanonicalBlockReaderBoundsUniqueLocationLookups(t *testing.T) {
 	var active atomic.Int32
 	var maximum atomic.Int32
 	var calls atomic.Int32
-	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, _ string) (db.BlockStorageLocation, bool, error) {
+	store := canonicalReaderTestStore(t)
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
 		calls.Add(1)
 		current := active.Add(1)
 		for {
@@ -347,10 +348,9 @@ func TestCanonicalBlockReaderBoundsUniqueLocationLookups(t *testing.T) {
 		}
 		<-release
 		active.Add(-1)
-		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+		return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 	}
 	result := make(chan error, 1)
-	store := canonicalReaderTestStore(t)
 	go func() {
 		_, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback")
 		result <- err
@@ -401,7 +401,7 @@ func TestCanonicalBlockCheckReaderBoundsConfiguredFanoutAcrossPhases(t *testing.
 		}
 		<-locationRelease
 		locationActive.Add(-1)
-		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+		return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 	}
 
 	readerDone := make(chan error, 1)
@@ -529,9 +529,9 @@ func TestCanonicalBlockCheckReaderCancellationStopsBothPhases(t *testing.T) {
 
 	t.Run("existence", func(t *testing.T) {
 		var locationCalls atomic.Int32
-		canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+		canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
 			locationCalls.Add(1)
-			return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+			return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 		}
 		reader, err := NewCanonicalBlockCheckReaderWithFanout(context.Background(), nil, nil, canonicalReaderTestOrg, blockIDs, store, "fallback", fanout)
 		if err != nil {
@@ -592,13 +592,13 @@ func TestCanonicalBlockReaderRejectsCancellationAfterLookupsFinish(t *testing.T)
 	started := make(chan struct{})
 	var calls atomic.Int32
 	var once sync.Once
-	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, _ string) (db.BlockStorageLocation, bool, error) {
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
 		if calls.Add(1) == fanout {
 			once.Do(func() { close(started) })
 		}
 		// Deliberately ignore cancellation to isolate the constructor's final check.
 		<-release
-		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+		return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 	}
 
 	type result struct {
@@ -697,8 +697,8 @@ func TestCanonicalBlockReaderExistenceBackendErrorFailsClosed(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	blockID := canonicalReaderTestID(800)
 	store := canonicalReaderTestStore(t)
-	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
-		return db.BlockStorageLocation{StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
+		return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 	}
 	backendErr := errors.New("HEAD failed")
 	var calls atomic.Int32
@@ -719,12 +719,12 @@ func TestCanonicalBlockReaderExistenceBackendErrorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestCanonicalBlockReaderDerivesEmptyKeyAndUsesCachedSizes(t *testing.T) {
+func TestCanonicalBlockReaderUsesPersistedKeyAndCachedSizes(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	blockID := canonicalReaderTestID(900)
 	store := canonicalReaderTestStore(t)
-	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
-		return db.BlockStorageLocation{SizeBytes: 99, StorageClass: "fallback", CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+	canonicalBlockLocationLookup = func(_ context.Context, _ *db.DB, _ string, blockID string) (db.BlockStorageLocation, bool, error) {
+		return db.BlockStorageLocation{SizeBytes: 99, StorageClass: "fallback", StorageKey: store.StorageKeyForHash(blockID), CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
 	}
 	canonicalBlockGetSize = func(context.Context, *storage.BlockStore, string) (int64, error) {
 		return 0, errors.New("cached size should avoid HEAD")

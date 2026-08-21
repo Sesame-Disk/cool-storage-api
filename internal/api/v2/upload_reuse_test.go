@@ -20,7 +20,7 @@ type fastClearTestBlockStore struct {
 	objectPresent *atomic.Bool
 }
 
-func (s fastClearTestBlockStore) DeleteBlock(context.Context, string) error {
+func (s fastClearTestBlockStore) DeleteBlockByStorageKey(context.Context, string) error {
 	s.objectPresent.Store(false)
 	return nil
 }
@@ -676,7 +676,7 @@ func TestEnsureReusableBlockPresentRepairsMissingCanonicalObject(t *testing.T) {
 	key, err := EnsureReusableBlockPresent(context.Background(), blockID, db.BlockReuseProbe{
 		Decision:     db.BlockReuseReusable,
 		StorageClass: "hot-s3",
-		StorageKey:   "",
+		StorageKey:   wantKey,
 	}, []byte("repair-me"), nil, canonicalStore, "hot-s3", orgID)
 	if err != nil {
 		t.Fatalf("EnsureReusableBlockPresent() error = %v, want nil", err)
@@ -965,7 +965,7 @@ func TestStoreUploadedBlockForProbePreservesTransientStorageCause(t *testing.T) 
 	}
 
 	_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
-		Decision: db.BlockReuseReusable, StorageClass: "archive",
+		Decision: db.BlockReuseReusable, StorageClass: "archive", StorageKey: canonical.StorageKeyForHash("abcd1234"),
 	}, []byte("data"), nil, canonical, "preferred", "org-1", nil)
 	if !errors.Is(err, ErrBlockMaterializationTransient) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want transient sentinel and context cancellation cause", err)
@@ -1000,6 +1000,7 @@ func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T
 		if attempt == 1 {
 			probe.StorageClass = "archive"
 		}
+		probe.StorageKey = canonical.StorageKeyForHash("abcd1234")
 		_, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(nil, preferred, "preferred", probe, orgID, "abcd1234")
 		if resolveErr == nil {
 			placementClass = resolvedClass

@@ -106,6 +106,7 @@ type blockIdentityRepairRow struct {
 	Sha1                string
 	StorageClass        string
 	StorageClassPresent bool
+	StorageKey          string
 	GCState             string
 	GCClaimID           string
 	GCClaimedAt         *time.Time
@@ -176,13 +177,14 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 	var row blockIdentityRepairRow
 	var storageClass *string
 	err := database.Session().Query(`
-		SELECT representation_id, sha1, storage_class, gc_state, gc_claim_id, gc_claimed_at, created_at
+		SELECT representation_id, sha1, storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at, created_at
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
 	`, orgID, blockID).Scan(
 		&row.RepresentationID,
 		&row.Sha1,
 		&storageClass,
+		&row.StorageKey,
 		&row.GCState,
 		&row.GCClaimID,
 		&row.GCClaimedAt,
@@ -584,6 +586,10 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	if storageClass == "" {
 		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
 	}
+	storageKey = strings.TrimSpace(storageKey)
+	if storageKey == "" {
+		return fmt.Errorf("%w: missing canonical storage key for block %s", ErrBlockMetadataPermanent, blockID)
+	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
 		return fmt.Errorf("%w: non-canonical storage class %q for block %s", ErrBlockMetadataPermanent, storageClass, blockID)
 	}
@@ -631,7 +637,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 			}
 			continue
 		}
-		return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, row)
+		return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, storageKey, row)
 	}
 	return fmt.Errorf("exhausted metadata stub repair for block %s", blockID)
 }
@@ -644,10 +650,10 @@ func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string)
 	if !found {
 		return fmt.Errorf("block metadata for %s disappeared before identity repair", blockID)
 	}
-	return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, row)
+	return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, "", row)
 }
 
-func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1 string, row blockIdentityRepairRow) error {
+func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1, storageKey string, row blockIdentityRepairRow) error {
 	activeClaim, repairClaim, ownershipErr := classifyBlockClaimOwnership(row.GCState, row.GCClaimID, row.GCClaimedAt)
 	if ownershipErr != nil {
 		// A malformed lifecycle/ownership combination is row corruption, not a
@@ -668,6 +674,13 @@ func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1 stri
 	// not transient: unlike a claim or a stub, a corrupt label never converges.
 	if !config.IsCanonicalStorageClassName(row.StorageClass) {
 		return fmt.Errorf("%w: block %s has non-canonical storage class %q", ErrBlockMetadataPermanent, blockID, row.StorageClass)
+	}
+	currentStorageKey := strings.TrimSpace(row.StorageKey)
+	if currentStorageKey == "" {
+		return fmt.Errorf("%w: block %s has empty canonical storage key", ErrBlockMetadataPermanent, blockID)
+	}
+	if storageKey != "" && currentStorageKey != storageKey {
+		return fmt.Errorf("%w: block %s already has conflicting storage key %q", ErrBlockMetadataPermanent, blockID, currentStorageKey)
 	}
 
 	currentRepresentationID := strings.TrimSpace(row.RepresentationID)
@@ -926,6 +939,9 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 	}
 	if !metadata.StorageClassPresent || probe.StorageClass == "" {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
+	}
+	if probe.StorageKey == "" {
+		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage key", blockID)
 	}
 	// A stored class that is not canonical cannot name a physical namespace, and the
 	// probe is what every reuse/repair path resolves through. Reject it here rather
