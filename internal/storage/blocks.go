@@ -145,23 +145,16 @@ func (bs *BlockStore) PutBlockAuto(ctx context.Context, hash string, data []byte
 	return key, nil
 }
 
-// PutBlockAutoDirect stores a block using PutAuto without a prior Exists/HEAD.
-// Callers must only use this when another source of truth has already decided
-// the block is not safely reusable as-is.
-func (bs *BlockStore) PutBlockAutoDirect(ctx context.Context, hash string, data []byte) (string, error) {
-	key := bs.hashToKey(hash)
-
-	reader := &bytesReader{data: data}
-	_, err := bs.s3.PutAuto(ctx, key, reader, int64(len(data)))
-	if err != nil {
-		return "", fmt.Errorf("failed to store block: %w", err)
-	}
-
-	return key, nil
-}
-
-// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior Exists/HEAD.
+// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior
+// Exists/HEAD. Callers must only use this when another source of truth has already
+// decided the block is not safely reusable as-is, and must supply the canonical
+// locator instead of letting the store derive one. There is deliberately no
+// hash-derived PUT variant left: minting a key here would let a writer store bytes
+// at a locator that never reaches `blocks.storage_key`.
 func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
+	if strings.TrimSpace(storageKey) == "" {
+		return "", fmt.Errorf("block storage key is empty")
+	}
 	reader := &bytesReader{data: data}
 	_, err := bs.s3.PutAuto(ctx, storageKey, reader, int64(len(data)))
 	if err != nil {
@@ -284,14 +277,11 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 	return result, nil
 }
 
-// DeleteBlock removes a block from storage
-// Note: Should only be called after verifying no references exist
-func (bs *BlockStore) DeleteBlock(ctx context.Context, hash string) error {
-	return bs.DeleteBlockByStorageKey(ctx, bs.hashToKey(hash))
-}
-
 // DeleteBlockByStorageKey removes an object from its explicit canonical key.
-// Destructive callers must use this form after loading the persisted locator.
+// This is the ONLY delete entry point on purpose: with no hash-derived variant, a
+// destructive caller cannot skip loading the persisted locator, and the compiler
+// enforces that rather than a review convention.
+// Note: Should only be called after verifying no references exist.
 func (bs *BlockStore) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
 	if strings.TrimSpace(storageKey) == "" {
 		return fmt.Errorf("block storage key is empty")

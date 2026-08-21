@@ -616,7 +616,7 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		BlockID:             blockID,
 		StorageClass:        storageClass,
 		StorageClassPresent: true,
-		StorageKey:          blockID,
+		StorageKey:          MockCanonicalStorageKey(orgID.String(), blockID),
 		RepresentationID:    db.PlainBlockRepresentationID,
 		CreatedAt:           &createdAt,
 	}
@@ -642,6 +642,17 @@ func (m *MockStore) AddStubBlockForTest(orgID uuid.UUID, blockID string) {
 		BlockID:          blockID,
 		RepresentationID: db.PlainBlockRepresentationID,
 		CreatedAt:        nil,
+	}
+}
+
+// SetBlockStorageKeyForTest overwrites a seeded block's persisted locator so a
+// test can model a row whose storage_key does not belong to its own org — the
+// corruption/bad-backfill case the destructive paths must refuse.
+func (m *MockStore) SetBlockStorageKeyForTest(orgID uuid.UUID, blockID, storageKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if block, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		block.StorageKey = storageKey
 	}
 }
 
@@ -739,6 +750,17 @@ func (m *MockStore) DeleteS3OrphanCanonicalForTest(orgID uuid.UUID, blockID stri
 }
 
 // SetGetS3OrphanGlobalErrForTest makes the canonical EACH_QUORUM read fail.
+// SetS3OrphanStorageKeyForTest rewrites a canonical orphan's locator after the
+// lifecycle entry point has refused to create it without one, so a test can model
+// a row that lost or never had a usable key.
+func (m *MockStore) SetS3OrphanStorageKeyForTest(orgID uuid.UUID, blockID, storageKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if orphan, ok := m.s3Orphans[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		orphan.StorageKey = storageKey
+	}
+}
+
 func (m *MockStore) SetGetS3OrphanGlobalErrForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3680,10 +3702,25 @@ type MockStorageProvider struct {
 	failErr error
 }
 
+// ScopedBlockDelete records one physical delete the way the backend saw it: the
+// org and class that selected the bucket, and the exact key handed to it. It
+// deliberately does NOT carry a block id — the delete API takes a locator, and a
+// mock that reconstructed an id would hide the very substitution these tests exist
+// to catch.
 type ScopedBlockDelete struct {
 	OrgID        string
 	StorageClass string
-	BlockID      string
+	StorageKey   string
+}
+
+// MockCanonicalStorageKey mirrors storage.BlockStore.hashToKey for the mock
+// backend. Tests seed and assert through it so a mock delete is only "correct"
+// when it targets the same org-scoped locator the real store would derive.
+func MockCanonicalStorageKey(orgID, hash string) string {
+	if len(hash) < 4 {
+		return fmt.Sprintf("blocks/%s/%s", orgID, hash)
+	}
+	return fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, hash[:2], hash[2:4], hash)
 }
 
 type ScopedBlockStoreRequest struct {
@@ -3761,6 +3798,10 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
+func (d *mockBlockDeleter) StorageKeyForHash(hash string) string {
+	return MockCanonicalStorageKey(d.orgID, hash)
+}
+
 func (d *mockBlockDeleter) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
 	d.provider.mu.Lock()
 	defer d.provider.mu.Unlock()
@@ -3775,7 +3816,7 @@ func (d *mockBlockDeleter) DeleteBlockByStorageKey(ctx context.Context, storageK
 	d.provider.ScopedDeletes = append(d.provider.ScopedDeletes, ScopedBlockDelete{
 		OrgID:        d.orgID,
 		StorageClass: d.storageClass,
-		BlockID:      storageKey,
+		StorageKey:   storageKey,
 	})
 	return nil
 }

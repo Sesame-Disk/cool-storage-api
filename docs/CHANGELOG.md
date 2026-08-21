@@ -15,8 +15,19 @@ key for the physical PUT, and persist the same value in canonical metadata.
 Canonical reads, reuse/repair, GC orphan recovery and destructive delete paths
 consume the persisted key and fail closed on missing or conflicting values.
 Migration `016_gc_s3_orphans_storage_key.cql` adds the recovery locator to the
-canonical orphan table; the day projection remains identity-only. This is a
-greenfield foundation slice and does not close X1 or enable destructive GC.
+canonical orphan table; the day projection remains identity-only.
+
+Because a `BlockStore` deletes whatever key it is handed, both destructive paths
+also check the persisted key against the key their own org-scoped store derives
+and refuse on a mismatch — `processBlock` resolves the store during the
+authorization phase, so a suspicious row is refused before any lifecycle write,
+and `RecoverS3Orphans` repeats the check after its canonical reload. The
+hash-derived `PutBlockAutoDirect` and `DeleteBlock` are gone from
+`storage.BlockStore`, leaving the locator-taking forms as the only PUT/DELETE
+entry points; both reject an empty key.
+
+This is a greenfield foundation slice and does not close X1 or enable
+destructive GC.
 
 ---
 

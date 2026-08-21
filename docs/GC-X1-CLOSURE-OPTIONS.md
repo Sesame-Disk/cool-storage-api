@@ -82,10 +82,13 @@ org-scoped key `K = hashToKey(L)` once and pass the returned key through the
 physical PUT, metadata registration, canonical read/reuse/repair, GC orphan
 row, recovery reload and physical DELETE. `blocks.storage_key` and the
 canonical `gc_s3_orphans.storage_key` are required; an empty key fails closed.
-The `_by_day` table remains an identity-only discovery projection. The exact
-locator prevents a caller from silently deriving a different target, but it
-does not create a never-reused physical incarnation or solve the X1
-publication-fence and per-attempt claim-ownership races. Destructive GC remains
+The `_by_day` table remains an identity-only discovery projection. Both
+destructive paths additionally verify the persisted key against the key their
+own org-scoped store derives and refuse the delete on a mismatch, since the
+store applies whatever key it is handed. The exact locator prevents a caller
+from silently deriving a different target, but it does not create a
+never-reused physical incarnation or solve the X1 publication-fence and
+per-attempt claim-ownership races. Destructive GC remains
 disabled in production.
 
 **The historical risk remains real even though the current greenfield deployment

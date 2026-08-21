@@ -413,7 +413,7 @@ func TestGC_BlockDeletion_RemovesObjectFromS3(t *testing.T) {
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 	orgID, blockID, bs := seedSyntheticBlock(t, storageClass)
 	t.Cleanup(func() {
-		_ = bs.DeleteBlock(ctx, blockID)
+		_ = bs.DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(blockID))
 		_ = shareProjectionDBForTest(t).Session().Query(
 			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
 	})
@@ -498,8 +498,8 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 		t.Fatalf("seed orphan object not present in S3 (exists=%v err=%v)", exists, err)
 	}
 	t.Cleanup(func() {
-		_ = bs.DeleteBlock(ctx, blockID)
-		_ = siblingStore.DeleteBlock(ctx, blockID)
+		_ = bs.DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(blockID))
+		_ = siblingStore.DeleteBlockByStorageKey(ctx, siblingStore.StorageKeyForHash(blockID))
 	})
 
 	seedS3OrphanWithStorageKey(t, store, orgID, blockID, bs.StorageKeyForHash(blockID), storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC())

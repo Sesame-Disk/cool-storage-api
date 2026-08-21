@@ -324,6 +324,106 @@ func TestUpsertBlockMetadataRejectsNonCanonicalStorageClassOnTheExistingRow(t *t
 	}
 }
 
+// The persisted storage_key is what GC hands to S3 and what reads resolve, so a
+// row must never be created without one. Empty is refused BEFORE the insert, not
+// normalized: a row minted here with no locator would have to be repaired by
+// deriving a key later, which is exactly the derivation authority P1 removed.
+func TestUpsertBlockMetadataRejectsEmptyStorageKeyBeforeInsert(t *testing.T) {
+	oldPlainInsert := upsertBlockMetadataInsertFn
+	oldRepresentationInsert := upsertBlockMetadataInsertWithRepresentationFn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldPlainInsert
+		upsertBlockMetadataInsertWithRepresentationFn = oldRepresentationInsert
+	})
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("plain insert must not run without a canonical storage key")
+		return false, nil
+	}
+	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
+		t.Fatal("representation insert must not run without a canonical storage key")
+		return false, nil
+	}
+
+	for _, storageKey := range []string{"", "   "} {
+		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", storageKey)
+		if err == nil || !strings.Contains(err.Error(), "missing canonical storage key") {
+			t.Fatalf("UpsertBlockMetadata(%q) error = %v, want missing storage key error", storageKey, err)
+		}
+		if !errors.Is(err, ErrBlockMetadataPermanent) {
+			t.Fatalf("UpsertBlockMetadata(%q) error is not permanent: %v", storageKey, err)
+		}
+	}
+}
+
+// Losing the INSERT means inheriting the existing row's locator. A row with no
+// locator cannot be inherited into a successful upload: reads and GC would both
+// refuse it later, far from the cause.
+func TestUpsertBlockMetadataRejectsEmptyStorageKeyOnTheExistingRow(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
+		t.Fatal("must not repair identity on a row with no canonical locator")
+		return false, nil
+	}
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		return false, nil // the row already exists; converge on it
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
+		row.StorageKey = "  "
+		return row, true, nil
+	}
+
+	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+	if err == nil || !strings.Contains(err.Error(), "empty canonical storage key") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want empty storage key rejection", err)
+	}
+	if !errors.Is(err, ErrBlockMetadataPermanent) {
+		t.Fatalf("error is not permanent: %v", err)
+	}
+}
+
+// Two writers proposing different locators for the same content is a placement
+// conflict, not a race that converges: one of them PUT bytes somewhere the
+// canonical row does not name. Fail permanently rather than report success for a
+// locator the row never adopted.
+func TestUpsertBlockMetadataRejectsConflictingStorageKeyOnTheExistingRow(t *testing.T) {
+	oldInsert := upsertBlockMetadataInsertFn
+	oldRead := readBlockIdentityForRepairFn
+	oldBackfill := backfillBlockSHA1Fn
+	t.Cleanup(func() {
+		upsertBlockMetadataInsertFn = oldInsert
+		readBlockIdentityForRepairFn = oldRead
+		backfillBlockSHA1Fn = oldBackfill
+	})
+	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
+		t.Fatal("must not repair identity on a row whose locator disagrees with the writer")
+		return false, nil
+	}
+	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
+		return false, nil
+	}
+	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
+		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
+		row.StorageKey = "blocks/org-1/ab/cd/abcd1234"
+		return row, true, nil
+	}
+
+	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "blocks/org-2/ab/cd/abcd1234")
+	if err == nil || !strings.Contains(err.Error(), "conflicting storage key") {
+		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting storage key rejection", err)
+	}
+	if !errors.Is(err, ErrBlockMetadataPermanent) {
+		t.Fatalf("error is not permanent: %v", err)
+	}
+}
+
 func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
 	database := &DB{}
 	oldInsert := upsertBlockMetadataInsertFn
@@ -1217,6 +1317,45 @@ func TestProbeBlockReuseReturnsUnknownErrorForNonCanonicalStorageClass(t *testin
 		}
 		if probe.Decision != BlockReuseUnknownError {
 			t.Fatalf("ProbeBlockReuse(%q) decision = %v, want BlockReuseUnknownError", storageClass, probe.Decision)
+		}
+	}
+}
+
+// The probe is what every reuse/repair path resolves through, so it is where a
+// row with no locator has to stop. Returning Reusable here would send a caller to
+// verify an object it cannot name, and NeedsPut would let it invent one.
+func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageKey(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldReferences := probeBlockReuseHasReferencesFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasReferencesFn = oldReferences
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+	probeBlockReuseHasReferencesFn = func(*DB, string, string) (bool, error) {
+		t.Fatal("must not classify reuse for a row with no canonical locator")
+		return false, nil
+	}
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		t.Fatal("must not read the orphan fence for a row with no canonical locator")
+		return false, nil
+	}
+
+	for _, storageKey := range []string{"", "   "} {
+		probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
+			row := completeProbeMetadataRow("hot")
+			row.SizeBytes = 123
+			row.StorageKey = storageKey
+			return row, true, nil
+		}
+
+		probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+		if err == nil || !strings.Contains(err.Error(), "empty canonical storage key") {
+			t.Fatalf("ProbeBlockReuse(%q) error = %v, want empty storage key error", storageKey, err)
+		}
+		if probe.Decision != BlockReuseUnknownError {
+			t.Fatalf("ProbeBlockReuse(%q) decision = %v, want BlockReuseUnknownError", storageKey, probe.Decision)
 		}
 	}
 }

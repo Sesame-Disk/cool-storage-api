@@ -54,7 +54,7 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 		t.Errorf("BlocksDeleted=%d, want 1", stats.BlocksDeleted())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "block-retry"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-retry")}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -178,7 +178,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 		t.Errorf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "orph-1"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "orph-1")}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -559,7 +559,7 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 	}
 	want := map[string]bool{orgA.String(): false, orgB.String(): false}
 	for _, deletion := range sp.ScopedBlockDeletes() {
-		if deletion.StorageClass != "hot" || deletion.BlockID != "shared-hash" {
+		if deletion.StorageClass != "hot" || deletion.StorageKey != MockCanonicalStorageKey(deletion.OrgID, "shared-hash") {
 			t.Fatalf("unexpected scoped deletion: %+v", deletion)
 		}
 		if _, ok := want[deletion.OrgID]; !ok {
@@ -599,7 +599,7 @@ func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 		t.Fatal("forward mapping should survive S3 recovery")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "orph-map" {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "orph-map") {
 		t.Fatalf("expected one S3 delete for orph-map, got %v", deleted)
 	}
 }
@@ -654,7 +654,7 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", "blk-redelete", "sha1-new", time.Now().UTC()); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", MockCanonicalStorageKey(orgID.String(), "blk-redelete"), "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	if err := store.FinalizeBlockDelete(orgID, "blk-redelete", "claim-1"); err != nil {
@@ -675,7 +675,7 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "blk-redelete" {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "blk-redelete") {
 		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
 	}
 }
@@ -807,7 +807,7 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("first recovery error = nil, want failed orphan clear")
 	}
-	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
 	}
 	if !store.ForwardBlockMappingExists(orgID, sha1) {
@@ -848,7 +848,7 @@ func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("first recovery error = nil, want phase advance failure")
 	}
-	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
 	}
 	// The pending_s3 path checks BlockExists before deleting. This repeat case

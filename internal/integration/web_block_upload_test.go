@@ -111,7 +111,7 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 		}
 
 		if blockStore != nil {
-			if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
+			if err := blockStore.DeleteBlockByStorageKey(context.Background(), blockStore.StorageKeyForHash(blockID)); err != nil {
 				t.Errorf("cleanup S3 object for block %s: %v", blockID, err)
 			}
 		}
@@ -535,7 +535,7 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 		t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
 	}
 	if blockStore != nil {
-		if err := blockStore.DeleteBlock(context.Background(), blockID); err != nil {
+		if err := blockStore.DeleteBlockByStorageKey(context.Background(), blockStore.StorageKeyForHash(blockID)); err != nil {
 			t.Errorf("cleanup staged block %s/%s: delete S3 object: %v", orgID, blockID, err)
 		}
 	}
@@ -618,7 +618,7 @@ func TestNoSessionBlockEndpointsRejected(t *testing.T) {
 			t.Fatal("cannot verify the anti-orphan property: block store unavailable")
 		}
 		t.Cleanup(func() {
-			if err := store.DeleteBlock(context.Background(), hash); err != nil {
+			if err := store.DeleteBlockByStorageKey(context.Background(), store.StorageKeyForHash(hash)); err != nil {
 				t.Errorf("cleanup rejected-upload block %s: %v", hash, err)
 			}
 		})
@@ -727,7 +727,7 @@ func stageS3OnlyBlock(t *testing.T, orgID string, data []byte) {
 		t.Fatalf("stage S3-only block %s: %v", hash, err)
 	}
 	t.Cleanup(func() {
-		if err := blockStore.DeleteBlock(context.Background(), hash); err != nil {
+		if err := blockStore.DeleteBlockByStorageKey(context.Background(), blockStore.StorageKeyForHash(hash)); err != nil {
 			t.Errorf("cleanup S3-only block %s: %v", hash, err)
 		}
 	})

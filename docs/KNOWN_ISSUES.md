@@ -66,7 +66,7 @@ is right about why.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
@@ -1276,6 +1276,16 @@ to choose a physical target.
 `EnsureReusableBlockPresent` (`internal/api/v2/upload_reuse.go`) consumes the
 persisted key and verifies the current deterministic invariant. An empty or
 conflicting `storage_key` fails closed before any S3 HEAD or repair PUT.
+
+The destructive side verifies the same equality rather than trusting the row. A
+`BlockStore` is only a bucket client — it deletes whatever key it is handed,
+including one naming another org's prefix — so `processBlock` resolves the store
+during the authorization phase (before `StartBlockDeleteOrphan` and
+`FinalizeBlockDelete`) and refuses a key the store would not derive, and
+`RecoverS3Orphans` repeats the check on the reloaded canonical row. Neither path
+records a recovery row for a refused delete. `storage.BlockStore` no longer
+exposes hash-derived `PutBlockAutoDirect`/`DeleteBlock` at all, so the compiler,
+not a review convention, keeps a destructive caller from minting its own key.
 
 #### Why arbitrary relocation remains unsupported
 

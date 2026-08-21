@@ -267,6 +267,55 @@ func TestCanonicalBlockReaderRejectsStorageMetadataWithoutCreationTimestamp(t *t
 	}
 }
 
+// A canonical row with no persisted locator used to be served by deriving one
+// from the hash. P1 removed that authority: the read fails closed rather than
+// guess where the bytes are, and it does so before touching the backend.
+func TestCanonicalBlockReaderRejectsEmptyPersistedStorageKey(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	blockID := canonicalReaderTestID(404)
+	store := canonicalReaderTestStore(t)
+	canonicalBlockGet = func(context.Context, *storage.BlockStore, string) ([]byte, error) {
+		t.Fatal("a block with no canonical locator must not reach storage")
+		return nil, nil
+	}
+	canonicalBlockExists = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		t.Fatal("a block with no canonical locator must not reach storage")
+		return false, nil
+	}
+	for _, storageKey := range []string{"", "   "} {
+		canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+			return db.BlockStorageLocation{StorageClass: "fallback", StorageKey: storageKey, CreatedAt: canonicalReaderTestCreatedAt()}, true, nil
+		}
+		reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{blockID}, store, "fallback")
+		if reader != nil || err == nil || !strings.Contains(err.Error(), "canonical storage key is empty") {
+			t.Fatalf("storage key %q: NewCanonicalBlockReader() = (%v, %v), want empty-key error", storageKey, reader, err)
+		}
+	}
+}
+
+// A locator that does not belong to this org's store is corruption, not a
+// relocation: serving it would read across the org boundary the key encodes.
+func TestCanonicalBlockReaderRejectsForeignPersistedStorageKey(t *testing.T) {
+	resetCanonicalReaderHooks(t)
+	blockID := canonicalReaderTestID(405)
+	store := canonicalReaderTestStore(t)
+	canonicalBlockGet = func(context.Context, *storage.BlockStore, string) ([]byte, error) {
+		t.Fatal("a foreign canonical locator must not reach storage")
+		return nil, nil
+	}
+	canonicalBlockLocationLookup = func(context.Context, *db.DB, string, string) (db.BlockStorageLocation, bool, error) {
+		return db.BlockStorageLocation{
+			StorageClass: "fallback",
+			StorageKey:   "blocks/00000000-0000-0000-0000-0000000000ff/" + blockID[:2] + "/" + blockID[2:4] + "/" + blockID,
+			CreatedAt:    canonicalReaderTestCreatedAt(),
+		}, true, nil
+	}
+	reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{blockID}, store, "fallback")
+	if reader != nil || err == nil || !strings.Contains(err.Error(), "does not match derived org-scoped key") {
+		t.Fatalf("NewCanonicalBlockReader() = (%v, %v), want derived-key mismatch error", reader, err)
+	}
+}
+
 func TestCanonicalBlockReaderRejectsUnknownGCState(t *testing.T) {
 	resetCanonicalReaderHooks(t)
 	blockID := canonicalReaderTestID(403)
