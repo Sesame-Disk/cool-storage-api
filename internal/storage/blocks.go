@@ -148,9 +148,16 @@ func (bs *BlockStore) PutBlockAuto(ctx context.Context, hash string, data []byte
 // PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior
 // Exists/HEAD. Callers must only use this when another source of truth has already
 // decided the block is not safely reusable as-is, and must supply the canonical
-// locator instead of letting the store derive one. There is deliberately no
-// hash-derived PUT variant left: minting a key here would let a writer store bytes
-// at a locator that never reaches `blocks.storage_key`.
+// locator instead of letting the store derive one: minting a key here would let a
+// writer store bytes at a locator that never reaches `blocks.storage_key`.
+//
+// This is the only PUT the canonical materialization funnels use. The hash-derived
+// PutBlock/PutBlockData/PutBlockAuto/PutBlocks above still exist, but no funnel that
+// writes `blocks` reaches them — PutBlockData is left for the h.db == nil sync path,
+// which persists no metadata at all, and for test seeding. Unlike DeleteBlock, they
+// are not removed because they are still the ergonomic form for those callers; the
+// invariant they must not break is that nothing which registers canonical metadata
+// may use them.
 func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
 	if strings.TrimSpace(storageKey) == "" {
 		return "", fmt.Errorf("block storage key is empty")

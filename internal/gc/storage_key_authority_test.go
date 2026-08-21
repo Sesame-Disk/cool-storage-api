@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -85,6 +86,49 @@ func TestWorker_ProcessBlock_RefusesEmptyStorageKey(t *testing.T) {
 	}
 	if got := store.AllS3Orphans(); len(got) != 0 {
 		t.Fatalf("no recovery row may be recorded for a refused delete, got %+v", got)
+	}
+}
+
+// The store is resolved during authorization precisely so this case can fail
+// before the lifecycle writes. A class that will not resolve is the reachable
+// degenerate config (a manager with no backend registered for it), and the old
+// ordering — resolve after FinalizeBlockDelete — turned it into a deleted row
+// whose object nothing was left to remove.
+func TestWorker_ProcessBlock_UnresolvableStoreFailsClosedBeforeDeletingTheRow(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	sp.FailResolve(errors.New("storage class hot not found"))
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	const blockID = "blk-unresolvable-store"
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem() error = %v", err)
+	}
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce() error = %v", err)
+	}
+
+	if got := sp.BlockStoreRequests(); len(got) != 1 {
+		t.Fatalf("store resolution attempts = %d, want exactly 1 in the authorization phase", len(got))
+	}
+	block := store.GetBlock(orgID, blockID)
+	if block == nil {
+		t.Fatal("canonical row must survive: with no store there is nothing that can remove the object")
+	}
+	if block.GCState != "" || block.GCClaimID != "" {
+		t.Fatalf("claim must be released, got state=%q claim=%q", block.GCState, block.GCClaimID)
+	}
+	if got := store.AllS3Orphans(); len(got) != 0 {
+		t.Fatalf("no recovery row may be recorded when no store could be resolved, got %+v", got)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched, got %+v", got)
 	}
 }
 

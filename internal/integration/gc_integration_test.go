@@ -1105,8 +1105,17 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	repairGCSnapshotsForTest(t, orgID)
 }
 
+// syntheticCanonicalStorageKeyForTest mints the locator a real org-scoped
+// BlockStore would derive for this block. It must stay equal to the derivation,
+// not merely well-formed: GC verifies the persisted key against what its own
+// store derives before deleting, so a fixture with a plausible-but-wrong key
+// would seed rows that a storage-backed worker refuses — passing today only
+// because these tests run the worker with no storage provider.
 func syntheticCanonicalStorageKeyForTest(orgID uuid.UUID, blockID string) string {
-	return fmt.Sprintf("blocks/%s/aa/aa/%s", orgID, blockID)
+	if len(blockID) < 4 {
+		return fmt.Sprintf("blocks/%s/%s", orgID, blockID)
+	}
+	return fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID)
 }
 
 func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string) {
@@ -2155,7 +2164,11 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	blockID := fmt.Sprintf("orph-reset-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", "sha1-old", "seed", firstSeenAt)
+	// Seed a locator from a previous lifecycle so the reset below has something
+	// to overwrite. Without a differing value the storage_key assertion would
+	// pass whether or not the UPDATE carries the column at all.
+	staleStorageKey := syntheticCanonicalStorageKeyForTest(orgID, blockID+"-stale")
+	effectiveFirstSeenAt := seedS3OrphanWithStorageKey(t, store, orgID, blockID, staleStorageKey, "cold", "sha1-old", "seed", firstSeenAt)
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
@@ -2168,7 +2181,8 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		}
 	})
 
-	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", blockID, "sha1-new", time.Now().UTC())
+	wantStorageKey := syntheticCanonicalStorageKeyForTest(orgID, blockID)
+	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", wantStorageKey, "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
@@ -2176,14 +2190,19 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		t.Fatalf("reset first_seen_at = %v, want original %v", resetFirstSeenAt, firstSeenAt)
 	}
 
-	var storageClass, externalSHA1, recoveryPhase string
+	var storageClass, storageKey, externalSHA1, recoveryPhase string
 	var storedFirstSeenAt time.Time
 	if err := database.Session().Query(`
-		SELECT storage_class, external_sha1, recovery_phase, first_seen_at
+		SELECT storage_class, storage_key, external_sha1, recovery_phase, first_seen_at
 		FROM gc_s3_orphans
 		WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&storageClass, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
+	`, orgID.String(), blockID).Scan(&storageClass, &storageKey, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
 		t.Fatalf("read gc_s3_orphans: %v", err)
+	}
+	// The locator is what recovery hands to S3, so a reset that left the previous
+	// lifecycle's key in place would aim the next delete at a stale object.
+	if storageKey != wantStorageKey {
+		t.Fatalf("gc_s3_orphans.storage_key = %q, want %q (stale was %q)", storageKey, wantStorageKey, staleStorageKey)
 	}
 	if storageClass != "hot" {
 		t.Fatalf("gc_s3_orphans.storage_class = %q, want %q", storageClass, "hot")

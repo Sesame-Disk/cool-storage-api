@@ -14,7 +14,7 @@ import (
 // entry point. A failed initial delete is represented by the same follow-up
 // mutation the worker uses, rather than by a second row-creating API.
 func seedS3Orphan(t *testing.T, store gcpkg.GCStore, orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, firstSeenAt time.Time) time.Time {
-	return seedS3OrphanWithStorageKey(t, store, orgID, blockID, blockID, storageClass, externalSHA1, errMsg, firstSeenAt)
+	return seedS3OrphanWithStorageKey(t, store, orgID, blockID, syntheticCanonicalStorageKeyForTest(orgID, blockID), storageClass, externalSHA1, errMsg, firstSeenAt)
 }
 
 func seedS3OrphanWithStorageKey(t *testing.T, store gcpkg.GCStore, orgID uuid.UUID, blockID, storageKey, storageClass, externalSHA1, errMsg string, firstSeenAt time.Time) time.Time {

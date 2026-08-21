@@ -26,6 +26,10 @@ hash-derived `PutBlockAutoDirect` and `DeleteBlock` are gone from
 `storage.BlockStore`, leaving the locator-taking forms as the only PUT/DELETE
 entry points; both reject an empty key.
 
+The refusal is covered end to end: a Cassandra/MinIO test seeds a canonical row
+whose `storage_key` names another tenant object and asserts that object is still
+in the bucket afterwards. With the check disabled that test deletes it for real.
+
 This is a greenfield foundation slice and does not close X1 or enable
 destructive GC.
 

@@ -80,7 +80,7 @@ func TestGC_R22bProjectionRowIsIdentityOnly(t *testing.T) {
 	blockID := fmt.Sprintf("orph-r22b-identity-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", blockID, "sha1-r22b", firstSeenAt)
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID, blockID), "sha1-r22b", firstSeenAt)
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}

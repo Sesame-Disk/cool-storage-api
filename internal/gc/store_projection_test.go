@@ -143,11 +143,17 @@ func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testin
 	firstSeenAt := time.Now().Add(-48 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	seedS3Orphan(t, store, orgID, "orph-reset", "cold", "sha1-old", "prev", firstSeenAt)
+	// Overwrite the seeded locator with a stale one so the reset below has
+	// something to overwrite; with an identical value the storage_key assertion
+	// would hold whether or not the reset carries the column.
+	staleStorageKey := MockCanonicalStorageKey(orgID.String(), "orph-reset-stale")
+	store.SetS3OrphanStorageKeyForTest(orgID, "orph-reset", staleStorageKey)
 	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "orph-reset", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("MarkS3OrphanMappingCleanupPending failed: %v", err)
 	}
 
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", MockCanonicalStorageKey(orgID.String(), "orph-reset"), "sha1-new", time.Now().UTC())
+	wantStorageKey := MockCanonicalStorageKey(orgID.String(), "orph-reset")
+	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, "orph-reset", "hot", wantStorageKey, "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan failed: %v", err)
 	}
@@ -167,5 +173,10 @@ func TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup(t *testin
 	}
 	if orphans[0].StorageClass != "hot" {
 		t.Fatalf("storage class = %q, want %q", orphans[0].StorageClass, "hot")
+	}
+	// The locator is what recovery hands to S3: a reset that kept the previous
+	// lifecycle's key would aim the next delete at a stale object.
+	if orphans[0].StorageKey != wantStorageKey {
+		t.Fatalf("storage key = %q, want %q (stale was %q)", orphans[0].StorageKey, wantStorageKey, staleStorageKey)
 	}
 }

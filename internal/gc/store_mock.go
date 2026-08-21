@@ -3700,6 +3700,18 @@ type MockStorageProvider struct {
 	failAlways bool
 	// failErr is the error returned while failing.
 	failErr error
+	// resolveErr makes GetBlockStoreForOrg itself fail — an unregistered or
+	// misconfigured storage class, which is the reachable degenerate config. It is
+	// separate from failErr because the two land at opposite ends of the delete:
+	// one before the block row is touched, the other after.
+	resolveErr error
+}
+
+// FailResolve makes every GetBlockStoreForOrg call return err until cleared.
+func (p *MockStorageProvider) FailResolve(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.resolveErr = err
 }
 
 // ScopedBlockDelete records one physical delete the way the backend saw it: the
@@ -3742,7 +3754,11 @@ func (p *MockStorageProvider) GetBlockStoreForOrg(orgID, storageClass string) (B
 	}
 	p.mu.Lock()
 	p.ResolvedStores = append(p.ResolvedStores, ScopedBlockStoreRequest{OrgID: parsedOrgID.String(), StorageClass: storageClass})
+	resolveErr := p.resolveErr
 	p.mu.Unlock()
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
 	return &mockBlockDeleter{provider: p, orgID: parsedOrgID.String(), storageClass: storageClass}, nil
 }
 
