@@ -417,7 +417,8 @@ chooses canonical metadata.
 | Existing canonical block | Keeps its `blocks.storage_class`, derived key and physical object. |
 | Later upload of an already-canonical hash | Reuses or repairs the canonical class; it does not move to B. |
 | Later first materialization of an absent hash | Prefers B, subject to routing and health failover. |
-| Active upload session | No persisted class snapshot; each block request reads the current preference. |
+| Active web upload session | No persisted class snapshot; each absent-block request reads the current preference. |
+| SeafHTTP upload/finalization | Resolves the preferred health-aware store once per operation and reuses the selected class while processing its blocks. A later preference change does not affect that active operation. |
 | Optional migration | Not implemented; the code has a TODO for a separate future job. |
 
 The future migration must be explicit because a block may be referenced by more
@@ -433,9 +434,11 @@ against the derived value. It does not use the current library preference as the
 locator for historical blocks. This is true for v2 file reads, SeafHTTP,
 sync/download, share-link and ZIP paths that use the canonical reader.
 
-The current code does not persist a placement snapshot in a web upload session
-and does not enforce one class per committed file. A future session snapshot may
-be desirable, but it is not part of the current contract.
+The current code does not persist a placement snapshot in a web upload session or
+enforce one class per committed file. SeafHTTP instead holds the class selected
+when its upload/finalization operation resolves the store; that is an operation
+boundary, not a durable file-level snapshot. A future session snapshot may be
+desirable, but it is not part of the current contract.
 
 ### Verdict on A-prime
 

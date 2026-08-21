@@ -32,9 +32,10 @@ The system implements a sophisticated multiregion storage architecture:
    actual failover class is persisted when selected
 6. Existing reads, reuse and repairs resolve each block's persisted canonical
    `blocks.storage_class`, not the library preference
-7. If EU is unhealthy, only the new-materialization selection can use the
-   configured `failover_class`; changing the library preference does not move
-   existing bytes
+7. If EU is unhealthy, health-aware selection can use the configured
+   `failover_class` for new materialization and selected fallback plumbing;
+   changing the library preference or fallback choice does not move or
+   reinterpret an existing canonical block
 
 ---
 
@@ -72,7 +73,7 @@ First user sees the error. No proactive failover.
 
 ---
 
-### MEDIUM: New-materialization paths use health-aware backend selection (CLAIM WAS FALSE)
+### MEDIUM: New-materialization and fallback paths use health-aware backend selection (CLAIM WAS FALSE)
 
 **Files:** `internal/api/v2/files.go`, `internal/api/v2/blocks.go`, `internal/api/seafhttp.go`, `internal/api/sync.go`
 
@@ -80,28 +81,24 @@ First user sees the error. No proactive failover.
 
 **Test:**
 ```bash
-grep -rn "GetHealthyBlockStore" internal/api/
+grep -rn "GetHealthyBlockStoreForOrg" internal/api/
 ```
 
-**Result:**
-```
-internal/api/v2/files.go:149:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/onlyoffice.go:152:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/blocks.go:74:	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
-internal/api/v2/storage_resolution.go:53:		return storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/seafhttp.go:749:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:773:			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
-internal/api/sync.go:892:		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-```
+**Result:** Current call sites use `GetHealthyBlockStoreForOrg` through the
+preferred-store and fallback helpers in `blocks.go`, `files.go`, `onlyoffice.go`,
+`storage_resolution.go`, `seafhttp.go` and `sync.go`.
 
-**Verified:** ❌ **FALSE** — The code DOES use `GetHealthyBlockStore()` in most paths!
+**Verified:** ❌ **FALSE** — The code uses `GetHealthyBlockStoreForOrg()` for
+new-materialization and selected fallback paths.
 
-**Exception:** `internal/api/sync.go:769` uses `GetBlockStore()` but has fallback logic at line 773.
+**Canonical lookup qualification:** `internal/api/sync.go` first tries the
+persisted class with `GetBlockStoreForOrg`; if that exact store is unavailable,
+its lookup helper can prepare a health-aware fallback before the reader is built.
 
 **Conclusion:** Health-aware selection is implemented for new materialization and
-fallback paths. Existing canonical reads, reuse and repair resolve the persisted
-block class and do not silently reinterpret it through a failover class.
+selected fallback paths. Existing canonical resolution, reuse and repair resolve
+the persisted block class and do not silently reinterpret canonical metadata
+through a failover class.
 
 ---
 
@@ -112,23 +109,24 @@ block class and do not silently reinterpret it through a failover class.
 **Claim:** Failover chains and circular-detection edge cases are not fully tested.
 
 **Existing tests:**
-- ✅ Single-level failover (USA → EU) - line 195-209
+- ✅ Single-level failover (`TestManagerGetHealthyBackend`)
 - ❌ Multi-level chain (EU → USA → Asia)
-- ❌ Circular failover detection (EU → USA → EU) regression coverage
+- ✅ Circular failover detection (EU → USA → EU) — `TestManagerGetHealthyBackendRejectsFailoverCycle`
 - ❌ All backends in chain unhealthy
 
 **Test result:**
 ```bash
 go test -v ./internal/storage/... -run TestManagerGetHealthyBackend
-# PASS: Single failover works
-# No tests for chains or circular detection
+# PASS: Single failover and circular rejection are covered
+# No tests for multi-level chains or all backends unhealthy
 ```
 
 **Verified:** ⚠️ **PARTIALLY TRUE** — Basic failover tested; edge cases not tested.
 
 **Current code:** `GetHealthyBackend` now uses a visited set and returns a cycle
-error instead of recursing indefinitely. The remaining risk is insufficient
-regression coverage for the cycle, multi-level and all-unhealthy cases.
+error instead of recursing indefinitely. The cycle is covered by
+`TestManagerGetHealthyBackendRejectsFailoverCycle`; the remaining risk is
+insufficient regression coverage for multi-level and all-unhealthy cases.
 
 ---
 
@@ -310,9 +308,9 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 | Practice | Status | Notes |
 |----------|--------|-------|
 | **Multiregion architecture** | ✅ Yes | Region-to-class mapping, endpoint routing implemented |
-| **Health-aware new-materialization selection** | ✅ Yes | `GetHealthyBackend()` exists and is used; canonical reads do not fail over |
+| **Health-aware selection and fallback plumbing** | ✅ Yes | `GetHealthyBlockStoreForOrg()` is used for new placement and selected fallback; canonical reads do not reinterpret persisted placement |
 | **Automated health monitoring** | ❌ No | CheckHealth() exists but never called automatically |
-| **Failover chains** | ⚠️ Partial | Iterative visited-set detection exists; chain and cycle regression coverage is incomplete |
+| **Failover chains** | ⚠️ Partial | Iterative visited-set cycle detection is covered; multi-level/all-unhealthy coverage is incomplete |
 | **Cross-region testing** | ❌ No | Zero integration tests for failover scenarios |
 | **Storage class migration** | ❌ No | `ChangeStorageClass` updates preference only; explicit data migration is not implemented |
 | **Region quotas** | ❌ No | Global quotas only |
@@ -332,9 +330,9 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
    - Update health status based on probe results
    - Increment `ConsecutiveFails` on errors
 
-2. **Add circular failover regression coverage**
-   - Exercise the visited-set path in `GetHealthyBackend()`
-   - Verify a cycle returns an explicit error instead of looping
+2. **Add multi-level and all-unhealthy failover regression coverage**
+   - Exercise a 3-region chain with the middle region down
+   - Verify an all-unhealthy chain returns an error without looping
 
 3. **Add cross-region integration tests**
    - New materialization when primary down → verify failover and persisted actual class
@@ -370,9 +368,10 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 
 **Architecture:** ✅ Excellent design with multiregion support, failover chains, and health tracking.
 
-**Implementation:** ⚠️ Core logic exists and is mostly used correctly (GetHealthyBlockStore is used!), but critical gaps:
+**Implementation:** ⚠️ Core logic exists and is mostly used correctly
+(`GetHealthyBlockStoreForOrg` is used for new placement and selected fallback), but critical gaps:
 - No automated health monitoring (manual-only)
-- Untested failover edge cases (chains, circular)
+- Untested failover edge cases (multi-level and all-unhealthy chains; cycle rejection is covered)
 - No integration tests for failures
 
 **Testing:** ❌ Insufficient. Basic unit tests exist, but no failover integration tests.
@@ -382,7 +381,7 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 Single-region deployments with external monitoring are safe. Multiregion deployments should wait for items 1-4 above.
 
 **Corrections to v4 report:**
-- ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization; canonical reads use persisted placement
+- ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization and selected fallback plumbing; canonical reads use persisted placement
 - ✅ "No automated health monitoring" — **TRUE**
 - ⚠️ "Failover chains untested" — **PARTIALLY TRUE** (basic tested, edge cases not)
 - ✅ "No cross-region integration tests" — **TRUE**

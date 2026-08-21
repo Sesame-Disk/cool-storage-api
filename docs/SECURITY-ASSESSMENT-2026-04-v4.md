@@ -14,10 +14,13 @@
 **All critical and high-severity security findings from v1-v3 have been resolved.** The remaining open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
 
 **NEW in v4:** Comprehensive multiregion storage analysis with code audit and testing. Key findings:
-- ✅ **Good news:** New-materialization paths use health-aware backend selection
-  (`GetHealthyBlockStore()`); canonical reads resolve persisted block placement
+- ✅ **Good news:** New-materialization paths and selected fallback plumbing use
+  health-aware backend selection (`GetHealthyBlockStoreForOrg()`); canonical reads
+  resolve persisted block placement
 - ❌ **Critical gap:** No automated health monitoring - backends remain `HealthUnknown` until an explicit health probe updates them
-- ⚠️ **Testing gap:** Failover logic exists but edge cases (chains, circular) untested; no integration tests for region failures
+- ⚠️ **Testing gap:** Failover logic exists; multi-level/all-unhealthy chain cases
+  remain untested, while circular detection has unit coverage; no integration tests
+  for region failures
 - **Conclusion:** Architecture is solid, but missing automated health checks prevents proactive failover
 
 ---
@@ -106,9 +109,10 @@ failover.
 - EU S3 bucket becomes unreachable at 10:00 AM
 - Health status remains `HealthUnknown` (system assumes it's healthy)
 - A new materialization targeting the EU preference attempts the preferred backend
-  and can fail before the request-driven health state is updated
-- A subsequent new materialization can use the configured health-aware failover
-  path; existing canonical blocks still resolve their persisted class
+  and can fail; the request does not update the health map
+- A later materialization is not guaranteed to fail over unless an independent
+  health probe has marked the class `Unhealthy` or `Failed`; existing canonical
+  blocks still resolve their persisted class
 - Existing reads do not reinterpret a canonical block from the current library
   preference
 
@@ -129,7 +133,8 @@ failover.
        }()
    }
    ```
-2. Call `GetHealthyBlockStore()` instead of `GetBlockStore()` in upload/download paths (storage_blocks.go:48, 89)
+2. Use `GetHealthyBlockStoreForOrg()` for new-materialization and fallback
+   plumbing; keep canonical readers bound to the persisted block class
 3. Expose health status via `/internal/storage/health` endpoint for monitoring
 
 **Tested:** No. No test verifies that health checks are called automatically or that failover happens without user-triggered errors.
@@ -142,25 +147,20 @@ failover.
 
 **Original claim:** Upload and download paths don't use health-aware backend selection.
 
-**Actual finding:** This claim was **INCORRECT**. Code audit shows `GetHealthyBlockStore()` IS used in production paths:
+**Actual finding:** This claim was **INCORRECT**. Code audit shows
+`GetHealthyBlockStoreForOrg()` is used in current new-materialization and fallback
+paths:
 
-**Evidence:**
-```bash
-$ grep -rn "GetHealthyBlockStore" internal/api/
-internal/api/v2/files.go:149:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/onlyoffice.go:152:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/v2/blocks.go:74:	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
-internal/api/v2/storage_resolution.go:53:		return storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/seafhttp.go:749:		return h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:773:			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
-internal/api/sync.go:892:		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-```
+**Evidence:** Current call sites use `GetHealthyBlockStoreForOrg` through the
+preferred-store and fallback helpers in `blocks.go`, `files.go`, `onlyoffice.go`,
+`storage_resolution.go`, `seafhttp.go` and `sync.go`. The sync lookup helper
+tries the persisted class exactly first, then may prepare a health-aware fallback
+before the canonical reader is constructed.
 
 **Conclusion:** Health-aware backend selection **is implemented for new block
-materialization and fallback selection**. Existing canonical reads/reuse/repair
-must continue using the persisted block class rather than the mutable library
-preference.
+materialization and selected fallback plumbing**. Existing canonical resolution,
+reuse and repair must continue using the persisted block class rather than the
+mutable library preference or a failover class.
 
 **Remaining issue:** Failover only works if health status is updated. Without automated health monitoring (see HIGH issue above), backends remain `HealthUnknown` after an outage unless an explicit probe runs, so a request can continue to hit the failed backend.
 
@@ -176,22 +176,21 @@ The failover logic now walks iteratively with a visited set, allowing chains lik
 **Existing test coverage:**
 - ✅ Unit test: single-level failover (EU → USA)
 - ❌ Missing: multi-level chain (EU → USA → Asia)
-- ❌ Missing: circular failover detection regression coverage (EU → USA → EU)
+- ✅ Circular failover detection regression coverage: `TestManagerGetHealthyBackendRejectsFailoverCycle` (EU → USA → EU)
 - ❌ Missing: all backends in chain unhealthy (should return error, not crash)
 
 **Current behavior and remaining risk:**
 1. A circular configuration returns an explicit cycle error instead of looping;
-   regression coverage is still missing.
+   `TestManagerGetHealthyBackendRejectsFailoverCycle` covers this behavior.
 2. If every backend in a chain is unhealthy, the resolver returns an error; the
    multi-level/all-unhealthy cases still need dedicated tests.
 
 **Remaining verification:**
 1. Add unit coverage for a 3-region chain with the middle region down.
-2. Add unit coverage proving a circular failover returns an error instead of
-   looping.
-3. Add coverage for all backends in a chain being unhealthy.
+2. Add coverage for all backends in a chain being unhealthy.
 
-**Tested:** Partially. Single-level failover tested; chains untested.
+**Tested:** Partially. Single-level failover and circular rejection are tested;
+multi-level and all-unhealthy chains remain untested.
 
 ---
 
@@ -502,7 +501,7 @@ walks the chain iteratively with a visited set.
 | Automated health monitoring | High | Background health checker goroutine + verify it runs |
 | New-materialization failover | High | Prefer a healthy region, mark the preferred class unhealthy, materialize a new block and verify the failover class is persisted |
 | Multi-level failover chain | High | 3-region chain (EU → USA → Asia) + middle region down |
-| Circular failover detection coverage | High | EU → USA → EU returns an explicit cycle error, not an infinite loop |
+| Multi-level/all-unhealthy failover coverage | High | 3-region chain and all-unhealthy chain return the expected result without looping or misrouting |
 | Health check after real backend failure | High | Stop MinIO container, verify health check detects failure |
 | Cross-region file access | Medium | Upload to EU, download from USA endpoint, verify content matches |
 | Degraded backend behavior | Medium | Simulate 6s latency, verify degraded state handling |
@@ -516,9 +515,9 @@ walks the chain iteratively with a visited set.
 | Practice | Status | Notes |
 |----------|--------|-------|
 | **Multiregion architecture** | ✅ Yes | Region-to-class mapping, endpoint-based routing |
-| **Health-aware new-materialization selection** | ✅ Yes | Logic is used for new placement; canonical reads resolve persisted placement without failover |
+| **Health-aware selection and fallback plumbing** | ✅ Yes | Logic is used for new placement and selected fallback; canonical reads resolve persisted placement without reinterpretation |
 | **Automated health monitoring** | ❌ No | Manual `CheckHealth()` only; no background goroutine |
-| **Failover chains** | ⚠️ Partial | Visited-set cycle detection exists; chain/all-unhealthy tests are missing |
+| **Failover chains** | ⚠️ Partial | Visited-set cycle detection is covered; multi-level/all-unhealthy tests are missing |
 | **Degraded state handling** | ⚠️ Partial | Degraded detected (>5s) but still serves traffic |
 | **Cross-region testing** | ❌ No | Zero integration tests for failover scenarios |
 | **Storage class migration** | ❌ No | `ChangeStorageClass` updates preference only; explicit data migration is not implemented |
@@ -588,9 +587,9 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
    - Increment `ConsecutiveFails` on errors
    - **Critical:** Without this, failover cannot be proactive; a user request may fail and failover is only available after an independent health probe updates the status
 
-2. **Add circular failover regression coverage**
+2. **Add multi-level and all-unhealthy failover regression coverage**
    - The current `GetHealthyBackend()` already tracks visited backends iteratively
-   - Add a test that verifies a cycle returns an error instead of looping
+   - Add tests for a 3-region chain and a chain with no healthy backend
 
 3. **Test failover with real backend failures**
    - Stop MinIO container, verify health check detects failure
@@ -642,7 +641,7 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 **Multiregion resilience:** ⚠️ **Not production-ready without automated health monitoring**.
 
 **What was verified:**
-- ✅ Code audit confirmed `GetHealthyBlockStore()` is used for new-materialization and fallback paths; canonical reads use persisted placement
+- ✅ Code audit confirmed `GetHealthyBlockStoreForOrg()` is used for new-materialization and selected fallback paths; canonical reads use persisted placement
 - ✅ Health check logic exists (`CheckHealth()`, `CheckAllHealth()`)
 - ✅ Failover logic exists and uses an iterative visited-set walk
 - ❌ No automated background health monitoring found in startup code
@@ -650,7 +649,7 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 - ❌ No storage health metrics exposed
 
 **Corrected findings:**
-1. **FALSE CLAIM RETRACTED:** "Upload/download don't use health-aware selection" → New-materialization paths DO use `GetHealthyBlockStore()`; canonical reads retain persisted placement
+1. **FALSE CLAIM RETRACTED:** "Upload/download don't use health-aware selection" → New-materialization and selected fallback paths use `GetHealthyBlockStoreForOrg()`; canonical reads retain persisted placement
 2. **TRUE:** No automated health monitoring - backends stay `HealthUnknown` until an explicit health probe updates them
 3. **TRUE:** Failover chain edge cases lack coverage; runtime cycle detection exists but multi-level/all-unhealthy tests are missing
 4. **TRUE:** No cross-region integration tests

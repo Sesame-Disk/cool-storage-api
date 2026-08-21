@@ -341,7 +341,7 @@ storage:
 **Policies** determine which storage class to use when storing a new block.
 
 **Priority (highest to lowest)**:
-1. **Library Override** - Specific library configured to use a storage class
+1. **Library Preference** - Specific library configured with a preferred storage class for future materialization
 2. **Endpoint/Region** - Based on which API endpoint received the request
 3. **Organization Default** - Organization-level default
 4. **Global Default** - System-wide fallback
@@ -489,13 +489,17 @@ storage:
 ### File-Level Storage Consistency
 
 The current code does not enforce one storage class for every block of a file.
-Each new block materialization resolves the current library preference, or the
-request region/default policy when that preference is empty. An active session
-does not persist a storage-class snapshot, so successive blocks can be placed
-in different classes. Existing blocks are read and repaired from their
-canonical `blocks.storage_class`, independent of the library's current
-preference. A single-class-per-file guarantee would require a future session
-snapshot and commit-time validation.
+For web block sessions, each absent-block request resolves the current library
+preference, or the request region/default policy when that preference is empty.
+SeafHTTP differs: `HandleUpload` and `finalizeUploadStreaming` resolve the
+library-preferred, health-aware store once at the start of that upload operation
+and reuse the selected class while processing its blocks. A preference change
+after that resolution therefore does not affect the active SeafHTTP operation.
+Neither path persists a storage-class snapshot for the whole file, and successive
+operations can still materialize blocks in different classes. Existing blocks
+are read and repaired from their canonical `blocks.storage_class`, independent of
+the library's current preference. A single-class-per-file guarantee would require
+a future session snapshot and commit-time validation.
 
 ---
 
