@@ -670,12 +670,21 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 
 **Key insight:** The architecture and implementation are actually solid. The main gap is the missing **automated health monitoring background goroutine**. Without it, failover cannot be proactive and a user request can continue to hit a backend whose status remains `HealthUnknown`.
 
-**Recommendation:** Multiregion production deployment safe AFTER implementing automated health monitoring (item #1). The failover logic already exists and is used correctly.
+**Recommendation (corrected 2026-08-21):** automated health monitoring is
+necessary but **not sufficient** for a multiregion production deployment. It closes
+the availability half only, and it makes the configured cross-region
+`failover_class` edges reachable for the first time — so on its own it hardens
+availability while weakening strict residency. A multiregion deployment that
+carries a residency commitment also needs the placement policy gated
+(`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`) and the missing library permission gate
+closed (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). The earlier "safe AFTER
+item #1" wording predated those findings and is withdrawn.
 
-**Timeline estimate:**
+**Timeline estimate** (availability items only; excludes the residency and
+authorization work above):
 - Must-fix items (1-5): 2-3 days development + 2 days testing = **5 days**
 - Should-fix items (6-8): 3-4 days development + 1 day testing = **5 days**
-- **Total: 10 days to production-ready multiregion deployment**
+- **Total: 10 days for the availability half of a multiregion deployment**
 
 **Single-region deployments:** Safe to proceed now with external monitoring.
 

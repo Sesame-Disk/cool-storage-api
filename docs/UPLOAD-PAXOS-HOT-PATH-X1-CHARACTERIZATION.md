@@ -510,9 +510,17 @@ note is a hypothesis for safety ordering, not approval to implement P0-P4 as a
 single roadmap. The existing PR-11 entry remains deferred and is linked from
 [`GC-UPLOAD-FENCE-PR-PLAN.md`](./GC-UPLOAD-FENCE-PR-PLAN.md).
 
-## Next Characterization PR
+## Next X4 Performance Characterization PR
 
-The next PR should change neither identity semantics nor consistency levels. It
+**This benchmark is not a prerequisite for continuing X1.** It is what X4 needs
+before anyone decides what to do about per-block LWT cost. While A-prime and the
+current first-writer LWT are retained, the structural X1 work — the P0-P4 split and
+its P1 scoping note in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) — can proceed in parallel
+and does not depend on any number produced here. Do not read "measure first" as
+"X1 waits".
+
+The next X4 PR should change neither identity semantics nor consistency levels. It
 should answer these questions with instrumentation, tests and a real
 multi-DC-compatible benchmark:
 

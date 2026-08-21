@@ -161,6 +161,127 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
 P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
 
+**P1 scoping note (2026-08-21), verified against the tree.** P1 is the right next
+structural step, but the work is not where the one-line description suggests. The
+cost is concentrated in making every writer persist the key and backfilling what is
+already stored; the read paths largely already fetch what P1 needs. Three things
+have to be true before persisted `storage_key` can be the authority, and only the
+third is what the P1 line describes.
+
+*1. Most writers do not persist it.* `blocks.storage_key` is written empty by
+almost every materialization path. Verified call sites:
+
+| Call site | `storageKey` argument |
+|---|---|
+| `internal/api/seafhttp.go` `HandleUpload` | `""` |
+| `internal/api/seafhttp.go` `finalizeUploadStreaming` | `""` |
+| `internal/api/sync.go` block materialization | `""` |
+| `internal/api/v2/files.go` template materialization | `""` |
+| `internal/api/v2/files.go` upload materialization | `""` |
+| `internal/api/v2/onlyoffice.go` | real key |
+| `internal/api/v2/blocks.go` `UploadBlock` -> `materializeUploadedBlock` | real key |
+
+Seven relevant paths: five empty, two real. The web session funnel is easy to miss
+because it calls `RegisterWebUploadedBlockAndMapping`, not
+`RegisterUploadedBlockAndMapping`; it persists the key
+`StoreUploadedBlockForProbe` resolved through `StorageKeyForHash`. It is a
+production writer, so the backfill has to cope with a column that is populated for
+some rows and empty for others rather than empty everywhere.
+
+This is why every reader guards with `persistedKey != "" && persistedKey != derived`
+(`internal/api/v2/upload_reuse.go`,
+`internal/streaming/canonical_block_reader.go`): the empty case is the normal case,
+not an exception. A column that is empty for most rows cannot be made authoritative
+by flipping a branch. P1 therefore contains, in order: make every materialization
+path persist the key it actually used; backfill existing rows; only then invert the
+authority and harden empty from tolerated to an error. That is three changes and a
+data migration, not one branch.
+
+*2. P1 adds essentially no new Cassandra reads on production paths.*
+The canonical reader already performs one `blocks` read per unique block
+(`lookupCanonicalBlockLocation`, fanout `canonicalBlockLocationConcurrency = 32`),
+and `GetBlockStorageLocation` already selects `storage_key` alongside
+`storage_class`. Every consumer of the canonical reader — v2 file reads, SeafHTTP
+download, share-link and file-view raw serving — therefore pays **no additional
+read and fetches no additional column** when the locator becomes authoritative. It
+already has the value in hand and currently discards it in favour of the derived
+key.
+
+Two things make a naive inventory wrong here, and both were got wrong on the first
+pass.
+
+First, `blockStore` is frequently a parameter name of the interface type
+`streaming.BlockReader`, which the canonical reader implements, so most call sites
+spelled `blockStore.GetBlock(...)` already receive a canonical reader and already
+pay the read. `internal/streaming/streaming.go` (`PrefetchBlock`, `StreamBlocks`)
+and `internal/streaming/block_read_seeker.go` all take `BlockReader`, so they
+derive or not purely according to what the caller injects. Classify by injected
+type, not by identifier.
+
+Second, `internal/api/sync.go` guards its funnels with `if h.db != nil { ... } else
+{ legacy }`. The deriving calls sit in the `else`. Grepping for the call finds the
+fallback and misses the production branch directly above it.
+
+Already reading canonical metadata, so no new read:
+
+| Path | What already runs |
+|---|---|
+| SeafHTTP download | `seafHTTPNewCanonicalBlockReaderFn` |
+| SeafHTTP ZIP | `addDirToZip(..., canonicalReader, ...)`; the `blockStore` parameter inside `addFileToZip` is that reader |
+| sync `check-blocks` | `syncNewCanonicalBlockCheckReaderFn`, which dispatches an explicit `location` phase metered as `SyncCheckBlocksLookupsTotal{location}` before the existence phase |
+| sync block send | `syncNewCanonicalBlockReaderFn` |
+| v2 file view and raw serving | `streaming.NewCanonicalBlockReader` |
+| share-link raw serving | `streaming.NewCanonicalBlockReader` |
+
+Derive-based, but only on the `h.db == nil` legacy fallback, which no production
+deployment takes: `CheckBlocksParallel` in `check-blocks`, `syncBlockExistsFn` in
+`PutBlock`, and `GetBlockSize`/`GetBlockReader` in the block-send `else` branch.
+Making the locator authoritative there is a correctness cleanup, not a load change.
+
+That leaves one production path that genuinely derives, and it does not need a new
+read either. `internal/gc/worker.go` deletes through `deleteS3WithRetry` ->
+`BlockStoreDeleter.DeleteBlock`, which calls `hashToKey`. GC already point-reads
+the row: `GetBlockInfo` runs
+`SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?`
+and its own comment notes that reading another column of the same row "adds no
+extra query and no tombstone scan". P1's GC work is therefore to add `storage_key`
+to `BlockInfo` and to that existing SELECT, and to delete by exact key instead of a
+derived one — **an extra column on a read that already happens, plus an exact-key
+delete**. That is also exactly what X1 requires of the delete path regardless.
+
+The honest summary is that P1's cost is concentrated in the writer/backfill work of
+step 1, not in read amplification. An earlier draft of this note claimed
+`check-blocks` would add N Cassandra reads per request; that was wrong — it
+described the location phase the production branch already performs.
+
+`check-blocks` is still worth attention, but as an **optimization opportunity, not
+a new cost**. Its accepted list is bounded by `check_blocks_max_ids`, whose default
+and validation ceiling are both the inherited 100k, and the production branch
+already dispatches one canonical-location lookup per unique internal id at
+`check_blocks_lookup_fanout`. Those per-id lookups exist today; P1 inherits them
+rather than creating them. Because the route is sync-hot and its node exposure is
+already the product `check_blocks_max_inflight_per_node` x
+`check_blocks_lookup_fanout` (`ISSUE-RATE-LIMIT-UPLOAD-DOWNLOAD-01`), replacing the
+per-id lookups with a batched canonical-location read is worth scoping inside P1 —
+it would reduce current load, not offset an increase.
+
+Note that `internal/gc/worker.go`'s `w.store.BlockExists` is a Cassandra
+`blocks`-row check, not an S3 derive; only the `BlockStoreDeleter` path is
+derive-based physical work in GC.
+
+*3. Only then does the authority flip.* The exact-key variants the flip needs
+already exist and are the model: `ObjectExists`, `GetBlockByStorageKey`,
+`GetBlockReaderByStorageKey`, `GetBlockSizeByStorageKey`, `PutObjectAutoDirect`.
+What P1 adds is that callers resolve `P` first and use those, instead of handing a
+hash to `GetBlock`/`BlockExists`/`DeleteBlock` and letting `hashToKey` decide.
+
+*Ordering against P0.* The list above puts P0 first, and that remains correct for
+anything whose correctness depends on a single serial domain. But P1 does not
+change the `P` any writer produces — it keeps the derived value — so it establishes
+no new install property and can land before P0 without weakening one. What must not
+happen is minting in P2 before P0: that is where a global winner starts to matter.
+Read the order as a dependency graph, not a queue.
+
 **Hot-path/Paxos characterization (2026-08-20).** The companion
 [X1/X4 upload hot-path analysis](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 confirms that the shipped production default/example uses `SERIAL` for a

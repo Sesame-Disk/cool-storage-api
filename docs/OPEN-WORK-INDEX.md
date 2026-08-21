@@ -171,7 +171,7 @@ started.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
-| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** the endpoint must fail closed under `strict` and be `flexible`-only | Semantics decided, not implemented; affects future materializations only; compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** under `strict` the endpoint must accept only an in-region hot class, and new materializations must not fail over across the region | Decided, not implemented. **Still open:** what `strict` promises about content placed before the policy took effect — the transition is ungated today. Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
 
 ## Low / latent / deferred hardening
 

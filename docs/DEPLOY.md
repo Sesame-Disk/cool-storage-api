@@ -1571,11 +1571,22 @@ Notes:
   blocks, and does not start a migration job — a `strict` org can move an existing
   library outside its allowed region, or onto a cold class, this way
   (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
-- **decided, not yet implemented:** changing a library's storage class is a
-  `flexible`-only operation. Under `data_residency: strict` the endpoint must fail
-  closed, because `strict` is a residency guarantee for the life of the library,
-  not a create-time default. Until that lands, do not rely on `strict` to keep an
-  existing library's future blocks in its region
+- **decided, not yet implemented:** under `data_residency: strict` the endpoint
+  must accept only a hot class inside the organization's `default_region` and
+  reject anything outside it, and new materializations must never fail over across
+  the region — same-region failover only, otherwise fail closed. Until that lands,
+  do not rely on `strict` to keep an existing library's future blocks in its region
+- **still undecided:** what `strict` promises about content placed *before* the
+  policy took effect. `validateOrgStoragePolicy` never inspects existing libraries
+  or blocks, so an org can switch `flexible -> strict`, or move `default_region`,
+  with its canonical blocks elsewhere
+- **weaker than it looks:** today `strict` binds only the class chosen at library
+  **creation**. No placement resolver consults the organization's policy —
+  `ResolveStorageClass` honours `library.storage_class` unconditionally — so a
+  library created under `flexible` with an out-of-region class keeps materializing
+  new blocks there after the switch to `strict`. Do not describe the current
+  behaviour as "future placement follows the policy"; it does not
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
 - that same endpoint has **no permission gate**: any authenticated member of the
   organization can call it for any library in the organization, as can
   `PUT /repos/:repo_id` and `POST /repos/:repo_id?op=rename`

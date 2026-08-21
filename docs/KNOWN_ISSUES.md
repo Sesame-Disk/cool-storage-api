@@ -1280,10 +1280,14 @@ before any S3 HEAD or repair PUT.
 
 #### Why it is not a live bug (yet)
 
-`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today: 4 of the 5
-upload paths register the block with `storage_key=""` (`seafhttp.go` ×2, `sync.go`,
-`files.go`/`UploadFile`); only OnlyOffice persists a non-empty value, and that value
-is the hash-derived key. So `hashToKey(hash)` is always a correct locator, and
+`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today.
+Corrected inventory (2026-08-21): 5 of the 7 materialization paths register the block
+with `storage_key=""` — `seafhttp.go` x2, `sync.go`, and `files.go` for both the
+template and the upload path. Two persist a non-empty value: OnlyOffice, and the web
+session funnel (`v2/blocks.go` `materializeUploadedBlock`, reached through
+`RegisterWebUploadedBlockAndMapping` rather than `RegisterUploadedBlockAndMapping`,
+which is why earlier inventories missed it). Both non-empty values are the
+hash-derived key, so the conclusion below is unchanged. So `hashToKey(hash)` is always a correct locator, and
 `EnsureReusableBlockPresent` always uses `StorageKeyForHash(blockID)` and validates a
 non-empty column against it. API reads and verify/repair therefore resolve to the same
 object; GC joined that contract in P10 PR-3.
@@ -7877,32 +7881,121 @@ whose residency they move.
 
 #### Fix Direction
 
-**Decided semantics (2026-08-21):** `strict` means residency, not a create-time
-default. `ChangeStorageClass` must therefore **fail closed under
-`data_residency: strict`** — a strict organization cannot move an existing
-library's class at all, because the operation cannot honour a residency promise it
-was never designed to re-check. Changing the class is a `flexible`-only operation.
+**Decided semantics (2026-08-21):** `strict` constrains placement, not only the
+create-time default. It is a promise about **where future bytes land**, and it is
+enforced by region, not by forbidding the operation:
 
-That resolves the open question in favour of the stronger reading: `strict`
-constrains placement for the life of the library, not only at creation. It also
-avoids a partial rule that would still have to answer "which classes count as
-inside the region" on every future config change.
+```text
+flexible:
+    library.storage_class may change to any configured hot class.
+    cross-region failover permitted per configuration.
+
+strict(region = R):
+    library.storage_class may change, but only to a hot class in R.
+        a request naming a class outside R is rejected.
+
+    new materialization:
+        preferred class in R
+        -> same-region failover allowed
+        -> cross-region failover forbidden
+        -> no healthy backend in R: fail closed, do not place outside R
+
+    existing canonical blocks:
+        never reinterpreted or moved automatically.
+```
+
+An earlier draft of this entry made `ChangeStorageClass` a `flexible`-only
+operation. That was rejected as more restrictive than residency requires: moving a
+library from one in-region hot class to another in-region hot class breaks no
+residency promise, and forbidding it removes a legitimate feature to buy nothing.
+
+**The in-region case is not merely empty today — it is currently inexpressible,
+and that is a prerequisite this rule depends on.** `storageClassRegion` attributes
+a region to a class only by finding it as the `hot` or `cold` entry of some
+`region_classes` mapping, and `RegionClassConfig` holds exactly one `Hot` and one
+`Cold` string per region. A second hot class in the same region therefore resolves
+to no region at all, so the strict check would reject `hot-eu-a -> hot-eu-b` today
+rather than allow it. Implementing this rule as written requires the region
+attribution to admit more than one hot class per region — either `region_classes`
+gaining a membership list, or `storageClassRegion` deriving the region from the
+class's own `region` field instead. That change belongs with the rule, not after
+it.
 
 Implementation shape:
 
-1. Read the organization's policy with `readOrgStoragePolicy` and reject the
-   request when `DataResidency == orgDataResidencyStrict`.
-2. Under `flexible`, route the requested class through the same validation
-   creation uses rather than a second copy of the rule — reuse
-   `resolveCreateStorageClassForOrg`, or extract its policy half, so both doors
-   answer identically. This restores the hot-tier requirement at the same time;
-   region and tier were one contract at creation and should stay one contract.
-3. Cover both with tests: strict rejects, flexible accepts a hot in-policy class
-   and rejects a cold one.
+1. Read the organization's policy with `readOrgStoragePolicy`. Under
+   `orgDataResidencyStrict`, require the requested class to resolve to
+   `policy.DefaultRegion` — the check `resolveStrictCreateStorageClass` already
+   performs with `storageClassRegion`.
+2. Route the request through the same validation creation uses rather than a
+   second copy of the rule — reuse `resolveCreateStorageClassForOrg`, or extract
+   its policy half, so both doors answer identically. This restores the hot-tier
+   requirement at the same time; region and tier were one contract at creation and
+   should stay one contract.
+3. Cover with tests: strict accepts an in-region hot class, rejects an
+   out-of-region one and rejects a cold one; flexible accepts any hot class and
+   rejects a cold one.
 
-The failover half of the residency gap is not closed by this and is tracked in the
-same place: `failover_class` remains outside policy, and it becomes reachable as
-soon as automated health monitoring lands.
+4. Give the placement resolver the policy as well. Gating the endpoint alone
+   leaves a library whose stored class is already out of region — from before the
+   switch to `strict`, or from a `flexible` period — materializing new blocks
+   outside it, because `ResolveStorageClass` honours `library.storage_class`
+   unconditionally.
+
+**The failover half is now decided too, because it follows from the same promise.**
+A block belonging to a strict organization must never fail over to a class outside
+the allowed region. `GetHealthyBackend` must therefore receive the policy, restrict
+the walk to in-region classes, and return an error rather than crossing the region
+when the in-region chain is exhausted. Saying "strict constrains placement" while
+leaving failover free to cross the region would make the promise void. This is
+latent today only because nothing calls `CheckHealth` automatically; it becomes
+live with the health checker, so the two must land together.
+
+**Still undecided: the transition into strict.** Neither this rule nor the failover
+rule makes historical content resident. `admin.go` updates an organization's
+`storage_config` after `validateOrgStoragePolicy`, which checks only that a strict
+policy carries a `default_region` and that the region has a configured hot class.
+It never inspects existing libraries or blocks, so an organization can flip
+`flexible -> strict`, or move its `default_region`, while its canonical blocks sit
+elsewhere. Three candidate rules, none chosen:
+
+1. **Reject the transition** while any library or canonical block resolves outside
+   the target region. Strongest, and needs an enumeration the schema does not make
+   cheap.
+2. **Accept and require migration**, tracking the organization as non-compliant
+   until an explicit migration job moves the referenced bytes. Depends on the
+   migration feature that is still a TODO.
+3. **Define strict as forward-only** — it governs materializations after the
+   policy takes effect and makes no claim about content already placed. Weakest
+   promise and cheapest, but still **not** what the code does today.
+
+**None of the three is implemented, including option 3.** An earlier draft of this
+entry said option 3 was "what the code does by omission". That is wrong. Forward-only
+would require materialization to consult the policy, and no placement resolver does:
+`Manager.ResolveStorageClass` returns `library.storage_class` first and never falls
+back or re-checks (`internal/storage/storage.go`), and the request chain that feeds
+it — `resolveLibraryBlockStoreForRequestContext` ->
+`lookupLibraryStorageClassContextFn` -> `resolvePreferredLibraryStorageClassForRequest`
+(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy
+either: `readOrgStoragePolicy` has no caller outside the creation path in
+`storage_policy.go`.
+
+What the code actually implements is narrower than any of the three: `strict` binds
+only the class **chosen at library creation**, and nothing re-checks it afterwards.
+A library created while the organization was `flexible`, holding an out-of-region
+class, keeps materializing new blocks into that class after the switch to `strict`.
+
+Two consequences for the fix:
+
+- Gating `ChangeStorageClass` is **not sufficient** even for option 3. The
+  placement resolver has to receive the policy too, so a stored out-of-region class
+  cannot keep placing new blocks outside the region. That is the same plumbing the
+  decided failover rule needs, and it should land as one change.
+- The decision still has to be made and stated wherever `strict` is described to a
+  customer, because "strict data residency" reads as option 1. This connects the
+  commercial meaning of `strict` to A-prime and to the future chargeable migration;
+  do not let it be settled by default — and do not describe the current behaviour as
+  forward-only, because it is weaker than that.
 
 Do not couple this to block migration. Changing the preference and moving bytes are
 separate operations; the migration TODO in the same handler stays out of scope.
