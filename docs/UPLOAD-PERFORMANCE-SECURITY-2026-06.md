@@ -186,12 +186,14 @@ external.
 
 ---
 
-## P-4 — One global Paxos round per block on metadata-registering upload paths (2026-07-21)
+## P-4 — One `SERIAL` LWT/Paxos transaction per block on metadata-registering upload paths (2026-07-21)
 
-**2026-08-20 characterization correction:** production already configures
-`serial_consistency: SERIAL`, so the current metadata LWT inherits global
-cross-DC Paxos today. P0/R12 would make the intended serial domain explicit; it
-would not introduce this production latency. The companion
+**2026-08-20 characterization correction:** the shipped production
+default/example configures `serial_consistency: SERIAL`, so the current metadata
+LWT inherits that effective session setting when it is not overridden. The
+transaction is cross-DC only when the effective replica topology spans DCs.
+P0/R12 would make the intended serial domain explicit; it would not introduce
+this latency to deployments already using `SERIAL`. The companion
 [X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 also records that chunked SeafHTTP finalizations use one process-local metadata
 permit, while non-chunked `HandleUpload` bypasses it, and that the two-minute
@@ -206,13 +208,14 @@ later made that write representation-aware but did not introduce the LWT. Verifi
 from Git history and `main:internal/db/block_references.go`. Recording it here
 because it was found while auditing that branch and would otherwise be lost.
 
-### The Paxos
+### The LWT/Paxos transaction
 
 Every upload path that registers canonical block metadata — web session, seafhttp,
 sync `PutBlock`, OnlyOffice — ends in `UpsertBlockMetadata`, which is an
 `INSERT INTO blocks ... IF NOT EXISTS`
-([block_references.go:131](../internal/db/block_references.go#L131)): **one
-lightweight transaction per block**. The defective no-session legacy path tracked
+([`internal/db/block_references.go`](../internal/db/block_references.go),
+`upsertBlockMetadataInsertWithRepresentationFn`): **one lightweight transaction
+per block**. The defective no-session legacy path tracked
 as F8 used to be the production exception: it wrote only the S3 object and never
 reached metadata registration. PR-7 removed that path, so every remaining
 supported production upload surface registers metadata.
@@ -223,11 +226,15 @@ first-writer-wins pins one canonical physical location. Without it a
 last-writer-wins INSERT could repoint metadata at a class holding no copy, which
 breaks reads and makes GC act on the wrong object.
 
-**Why it costs more than it looks.** `configs/config.prod.yaml` commits
-`serial_consistency: SERIAL`, and the documented production posture is multi-DC
-(`dc-na:1,dc-eu:1,dc-asia:1`). That makes each of these a **global** Paxos round,
-not a DC-local one. At the default 8 MB CAS block size a 1 GB file is ~128
-cross-region consensus rounds. They parallelize with client upload concurrency.
+**Why it costs more than it looks.** The shipped production default/example
+sets `serial_consistency: SERIAL`, but `CASSANDRA_SERIAL_CONSISTENCY` can
+override it. When the effective setting is `SERIAL` and the replica topology is
+multi-DC, each registration is a cross-DC `SERIAL` LWT/Paxos transaction rather
+than a DC-local one. At the default 8 MB CAS block size a 1 GB file is ~128
+such transactions. The number of network round-trips depends on Cassandra's
+Paxos variant, and the transactions parallelize with client upload concurrency
+subject to the SeafHTTP worker slots retained while callbacks wait on the
+process-local metadata permit.
 
 **Correction (2026-07-21): this is NOT specific to block upload.** An earlier
 revision of this section said "the legacy resumable path pays none of them". That is
@@ -285,6 +292,10 @@ adding an unconditional stub-repair LWT to every new block.
    a plain last-writer-wins INSERT always writes the same class/key and the LWT can
    be dropped outright. This is a design change (routing must become a pure function
    of org+block, and existing rows must keep resolving), not a mechanical edit.
+
+   The detailed comparison of library-fixed, class-scoped and hash-home placement,
+   including the B schema and GC implications, is in
+   [STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md).
 2. ~~**Collapse the pre-store probe and post-reference fence reads into one**
    request-scoped fetch.~~ **Withdrawn — this would reintroduce F1.** These first two
    observations are not duplicated work; they occur at different times, and the
@@ -424,7 +435,7 @@ file-sharing protocols.
 | P-1 | Permit serialized S3 PUT                       | ✅ Confirmed   | CRITICAL   | **RESOLVED** |
 | P-2 | Double S3 RTT per block (Exists + PUT)         | ✅ Confirmed   | HIGH→MEDIUM| **RESOLVED** |
 | P-3 | Benchmarks 44–48 MB/s, no scaling              | ❓ Plausible   | —          | External     |
-| P-4 | 1 global Paxos/block on every metadata-registering governed upload invocation (F8 no-session exception removed in PR-7). Browser/sync dedup preflight may bypass registration for an individual block. (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
+| P-4 | 1 `SERIAL` LWT/Paxos transaction per metadata-registering governed upload invocation when the effective setting is `SERIAL` (F8 no-session exception removed in PR-7). Browser/sync dedup preflight may bypass registration for an individual block. (The pre-store and post-reference `blocks` reads are required observation points, and PR-5 adds a required post-materialization confirmation; none is part of the Paxos optimization.) | ✅ Confirmed | HIGH | Pending (pre-existing, not from the fence branch) |
 | S-1 | Chunk state node-local (multi-node blocker)    | ✅ Confirmed   | HIGH       | Pending      |
 | S-2 | max_upload_mb not enforced on chunked uploads  | ✅ Fixed       | MEDIUM     | Complete     |
 | S-3 | Full /tmp staging, no disk admission limit     | ✅ Mitigated   | MEDIUM     | Guard added; config still required |
@@ -444,4 +455,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
-| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one global Paxos round per metadata-registering block invocation. Both governed upload modes pay it when they reach registration; preflight-bypassed dedup blocks do not. Measure first. |
+| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one `SERIAL` LWT/Paxos transaction per metadata-registering block invocation. Both governed upload modes pay it when they reach registration; preflight-bypassed dedup blocks do not. Measure first. |

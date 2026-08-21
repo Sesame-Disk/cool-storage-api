@@ -2504,16 +2504,16 @@ destructive-GC blockers above.
 - Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
 **Multi-region deployment note (updated 2026-08-14):**
-While X1 remains open, running GC in even one DC is unsafe: keep it disabled in all DCs. After X1 closes, restricting participants to a single DC is **critical**. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
+While X1 remains open, running GC in even one DC is unsafe: keep it disabled in all DCs. After X1 closes, restricting participants to a single DC is **critical**. The shipped default uses `SERIAL` for LWT operations (a global serial phase relative to the effective replica set); an environment override can change that. Running GC on multiple DCs would cause:
 - `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
 - Scanner in both DCs enqueueing duplicate orphans
-- Unnecessary cross-DC Paxos contention on every LWT
+- Unnecessary cross-DC Paxos transaction contention on every LWT
 
 Post-X1 topology is `GC_ENABLED=true` only on designated replicas in one DC and `GC_ENABLED=false` everywhere else. Until X1 closes, the topology is `GC_ENABLED=false` everywhere. The lease provides failover only among designated replicas in that one DC.
 
 Block-level conditional operations include first-writer metadata creation, GC claim,
 claim release/finalize, and orphan lifecycle transitions; production defaults these
-LWTs to `SERIAL` (global Paxos). Do not change production to `LOCAL_SERIAL`. This
+LWTs to `SERIAL` (global serial phase). Do not change a multi-DC deployment to `LOCAL_SERIAL`. This
 still does not serialize ordinary `LOCAL_QUORUM` `block_references` writes, which is
 the separate visibility blocker documented above.
 
@@ -7567,7 +7567,7 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 ---
 
-### ISSUE-UPLOAD-PER-BLOCK-PAXOS-01: One global Paxos LWT per block on upload
+### ISSUE-UPLOAD-PER-BLOCK-PAXOS-01: One `SERIAL` LWT/Paxos transaction per block on upload
 
 **Status**: 🟡 Open — deferred PR-11 pending measurement
 **Severity**: High (perf), not a correctness blocker
@@ -7576,11 +7576,12 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 #### Problem
 
-Each block invocation that reaches metadata registration pays one global Paxos round
-under multi-DC `SERIAL`. The production profile already uses `SERIAL`, so this cost
-is pre-existing rather than introduced by P0/R12. New content/full registration is
-~128 cross-region rounds per GiB at 8 MiB blocks; browser/sync preflight may bypass
-fully deduplicated blocks.
+Each block invocation that reaches metadata registration pays one `SERIAL`
+LWT/Paxos transaction when the effective serial setting is `SERIAL`. The shipped
+production default/example uses `SERIAL`, but an environment override can select
+`LOCAL_SERIAL`, and a single-region deployment has no WAN leg. New content/full
+registration is ~128 such transactions per GiB at 8 MiB blocks in a spanning
+multi-DC topology; browser/sync preflight may bypass fully deduplicated blocks.
 This is a shared cost of governed upload paths when they reach registration, not a
 universal per-file cost.
 

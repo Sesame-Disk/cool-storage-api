@@ -9,7 +9,8 @@ This document preserves the investigation that connects the upload performance
 finding X4 / P-4 / UP-2 with the physical-delete ABA work in X1. It incorporates
 the two successive reviews of the original analysis. The first review is right
 that the hot path is expensive; it is wrong if read as saying that P0 would
-introduce production `SERIAL` latency. The second review correctly moves the
+introduce new `SERIAL` latency to deployments already using the shipped setting.
+The second review correctly moves the
 decision from "add more SERIAL" to "prove whether ordinary installation can
 have one deterministic physical identity without per-block Paxos".
 
@@ -21,25 +22,27 @@ The following facts are confirmed against the current tree:
 |---|---|---|
 | 1000 newly registered blocks can cause about 1000 metadata LWT attempts | Confirmed | This is for blocks that reach metadata registration. Deduplication preflight can bypass complete existing blocks; retries can add attempts. |
 | Chunked SeafHTTP finalization runs S3 work concurrently but metadata materialization at concurrency 1 per process | Confirmed with scope | This applies to `finalizeUploadStreaming` and its chunked finalizations. Non-chunked `HandleUpload` registers uploads without this permit, so process-wide metadata materialization can exceed one. The permit covers provisional-reference and metadata work, not only the LWT. |
-| Production `SERIAL` is cross-DC/global | Confirmed | `configs/config.prod.yaml` already selects `SERIAL`; the metadata LWT inherits the session setting. |
-| P0 introduces 1000 global Paxos rounds into production | Incorrect | Production already pays them today. P0 would make the serial domain explicit and protect against a weaker session configuration, including `LOCAL_SERIAL` test profiles. |
+| The shipped production YAML/example uses `SERIAL` | Confirmed | `configs/config.prod.yaml` and `.env.prod.example` select `SERIAL`, but `CASSANDRA_SERIAL_CONSISTENCY` can override it and `Validate()` accepts `LOCAL_SERIAL`. Whether the transaction crosses DCs depends on the effective replication topology; the same shipped config also supports single-region deployments. |
+| P0 introduces 1000 `SERIAL` LWT/Paxos transactions into deployments using the shipped setting | Incorrect | Those deployments already pay the LWT/Paxos transaction today. P0 would make the serial domain explicit and could change deployments whose environment overrides the setting to `LOCAL_SERIAL`. |
 | The two-minute finalize context limits the 1000 block materializations | Incorrect | `eg.Wait()` completes first. The two-minute context starts afterward for final file metadata/lease work. |
 | Generation-based deterministic keys are a promising direction | Candidate only | They can remove the need to choose between random keys for the same incarnation; this does not revive the abandoned r3 generational GC fence. |
 | Generation alone closes X1 | Incorrect | A stale writer can still attempt to install an old generation unless install is generation-aware or the schema makes old generations unable to become canonical. |
 | `storage_class` can differ for the same `(org_id, block_id)` | Confirmed | Explicit library placement is stable only while the library value is present and unchanged. Empty library placement is request-region dependent, and org-wide dedupe allows cross-library conflicts. |
 | Switching to `LOCAL_SERIAL` is a safe performance fix | Rejected | Two DCs can each accept a local Paxos decision. That is not a global winner and can diverge placement/lifecycle state. |
 
-The resulting decision is:
+The resulting characterization boundary is:
 
-> Do not implement P0/R12 or remove the metadata LWT until the placement and
-> incarnation protocol is characterized. Do not weaken production to
-> `LOCAL_SERIAL`. The next change should measure and specify the hot path, not
-> change its safety semantics.
+> Do not start P0/R12 merely as an X4 performance fix. Keep the shipped
+> `SERIAL` default, do not switch a multi-DC deployment to `LOCAL_SERIAL` as a
+> performance shortcut, and characterize placement and incarnation before
+> removing the metadata LWT. The sequencing of explicit P0/R12 correctness
+> hardening remains open.
 
 This does **not** discard R12. R12 remains a safety requirement for any
 conditional operations whose correctness depends on one global serial domain.
-It is not, by itself, a justification for adding new production latency: the
-current production metadata LWT already inherits `SERIAL`.
+It is not, by itself, a justification for adding new latency to deployments
+that already run the shipped `SERIAL` setting. A deployment whose environment
+overrides the setting to `LOCAL_SERIAL` would have different current behavior.
 
 ## Confirmed Current Path
 
@@ -57,10 +60,11 @@ IF NOT EXISTS
 ```
 
 The query is in
-[`internal/db/block_references.go:168-173`](../internal/db/block_references.go#L168-L173).
+[`internal/db/block_references.go`](../internal/db/block_references.go), in
+`upsertBlockMetadataInsertWithRepresentationFn`.
 `UpsertBlockMetadataWithRepresentationAndSHA1` calls it for every materialized
-block and retries only for the specific released-stub repair path
-([`internal/db/block_references.go:574-634`](../internal/db/block_references.go#L574-L634)).
+block and retries only for the specific released-stub repair path in the same
+file.
 
 For a new block, the normal materialization cost is one metadata LWT attempt.
 The surrounding operations are not all LWTs:
@@ -70,38 +74,50 @@ The surrounding operations are not all LWTs:
 | Reuse classification | Metadata, reference and orphan-fence reads | No |
 | Upload liveness | Provisional reference plus expiry/projection logged batch | No |
 | Fence authorization | `BlockDeleteFenceActive` reads | No |
-| Canonical metadata | `INSERT ... IF NOT EXISTS` on `blocks` | Yes, one per registration |
+| Canonical metadata | `INSERT ... IF NOT EXISTS` on `blocks` | Yes, one `SERIAL` LWT/Paxos transaction per registration |
 | Web SHA-1 mapping | Read-before-write checked mapping | No, by design |
 
-The "global" part of this Paxos cost is the `SERIAL` consistency domain. The
-LWTs for different `(org_id, block_id)` partitions do not share one Paxos log
-and do not contend on one Cassandra partition; each registering block still
-pays its own serial round.
+The "global" part, when the effective setting is `SERIAL` and the replica set
+spans DCs, is the serial consistency domain. The LWTs for different
+`(org_id, block_id)` partitions do not share one Paxos log and do not contend
+on one Cassandra partition; each registering block still pays its own
+`SERIAL` LWT/Paxos transaction.
 
-The provisional batch is documented at
-[`internal/db/provisional_block_ref_expiry.go:57-123`](../internal/db/provisional_block_ref_expiry.go#L57-L123).
+One LWT/Paxos transaction is not necessarily one network round-trip. Cassandra
+5 documents the Paxos variant as a material benchmark variable: compatible
+Paxos v1 expects about four round-trips for a write, while optimized v2 expects
+about two. The repository's Cassandra 5.0.9 Compose definitions do not pin
+`paxos_variant` or `paxos_state_purging`; the benchmark must record the actual
+server settings rather than infer them from the image tag. See the [Cassandra
+5.0 configuration documentation](https://cassandra.apache.org/doc/5.0.9/cassandra/managing/configuration/cass_yaml_file.html).
+
+The provisional batch is documented in
+[`internal/db/provisional_block_ref_expiry.go`](../internal/db/provisional_block_ref_expiry.go),
+in `AddProvisionalBlockReferenceWithExpiry`.
 The web mapping explicitly avoids a per-block LWT because of multi-DC latency
-and contention at
-[`internal/db/block_references.go:403-416`](../internal/db/block_references.go#L403-L416).
+and contention in `GetBlockIDMapping`/the mapping write path in
+[`internal/db/block_references.go`](../internal/db/block_references.go).
 
 Therefore, for 1000 new blocks that all reach registration, approximately 1000
 metadata LWT attempts is correct. At the current 8 MiB block size, a GiB of
 new/full content is approximately 128 such blocks and therefore approximately
-128 cross-DC serial rounds. It is not correct to call either number a cost for
+128 cross-DC `SERIAL` LWT/Paxos transactions when the effective replica set
+spans DCs. It is not correct to call either number a cost for
 every file unconditionally: fully deduplicated blocks can be classified before
 registration, while retries and GC races can make the actual count higher.
 
 ### Web block upload
 
-The session web path stores the block and then calls
-`materializeUploadedBlock`:
+The session web path stores the block and then calls `materializeUploadedBlock`
+in:
 
-- [`internal/api/v2/blocks.go:959-1021`](../internal/api/v2/blocks.go#L959-L1021)
-- [`internal/api/v2/fs_helpers.go:986-1023`](../internal/api/v2/fs_helpers.go#L986-L1023)
+- [`internal/api/v2/blocks.go`](../internal/api/v2/blocks.go)
+- [`internal/api/v2/fs_helpers.go`](../internal/api/v2/fs_helpers.go), through
+  `RegisterUploadedBlock`
 
 The per-user request limiter defaults to eight concurrent block uploads. This
 allows independent block partitions to overlap, but it does not reduce the
-number of Paxos rounds or the Cassandra capacity consumed by them.
+number of LWT/Paxos transactions or the Cassandra capacity consumed by them.
 
 ### SeafHTTP large-file upload
 
@@ -112,23 +128,27 @@ bounded worker pool:
 - Cassandra materialization permit:
   `finalizeUploadBlockMetadataConcurrency = 1`
 
-The constants and their stated purpose are at
-[`internal/api/seafhttp.go:1812-1830`](../internal/api/seafhttp.go#L1812-L1830).
+The constants and their stated purpose are in
+[`internal/api/seafhttp.go`](../internal/api/seafhttp.go).
 The metadata permit is acquired after the S3 work and covers the registration
 callback at
-[`internal/api/seafhttp.go:3045-3054`](../internal/api/seafhttp.go#L3045-L3054).
+`acquireFinalizeUploadBlockMetadataPermit`.
 The non-chunked `HandleUpload` path registers at
-[`internal/api/seafhttp.go:2543-2549`](../internal/api/seafhttp.go#L2543-L2549)
-without acquiring this permit.
+`HandleUpload` without acquiring this permit.
 
-Within a chunked finalization, one SeafHTTP process can have eight S3 operations
-in flight while the process-local permit serializes the metadata/ref/mapping
-callback one block at a time. The permit is a pressure valve against a
+Within a chunked finalization, the eight-slot worker pool can initially have up
+to eight S3 operations in flight. Once a worker reaches the process-local
+metadata permit, it serializes the metadata/ref/mapping callback one block at a
+time while retaining its worker slot. The permit is a pressure valve against a
 Cassandra LWT stampede; it is not a process-wide limit on every SeafHTTP upload:
 the non-chunked `HandleUpload` path calls registration without acquiring it.
-Non-chunked requests can therefore issue metadata work concurrently with a
-covered chunked-finalization callback, while concurrent chunked callbacks queue
-behind the permit. Multiple processes can also issue metadata work concurrently.
+The eight-slot worker semaphore is acquired before the goroutine starts S3 work
+and released only after the full callback returns. A worker waiting for the
+metadata permit therefore still occupies one of the eight slots; this is not an
+independent pipeline with eight S3 workers plus an unbounded metadata queue.
+Non-chunked requests can issue metadata work concurrently with a covered
+chunked-finalization callback, while concurrent chunked callbacks queue behind
+the permit. Multiple processes can also issue metadata work concurrently.
 
 The practical wall-clock model is therefore:
 
@@ -141,7 +161,7 @@ Web session path, idealized:
     plus queueing and Cassandra contention
 ```
 
-Neither model removes the total work of N Paxos rounds. The current code does
+Neither model removes the total work of N LWT/Paxos transactions. The current code does
 not provide a production per-statement latency metric, so no numeric latency
 claim should be treated as measured.
 
@@ -157,38 +177,42 @@ if err := eg.Wait(); err != nil {
 finalizeCtx, cancelFinalize := newSeafHTTPUploadMetadataFinalizeContext()
 ```
 
-This ordering is at
-[`internal/api/seafhttp.go:3071-3087`](../internal/api/seafhttp.go#L3071-L3087).
+This ordering is in `finalizeUploadStreaming` in
+[`internal/api/seafhttp.go`](../internal/api/seafhttp.go).
 The two-minute timeout governs final file metadata/lease publication, not the
 preceding chain of block materializations. A large upload can still be very
 slow, but this specific timeout does not abort it at 120 seconds.
 
 ## Serial Consistency and P0
 
-Production configuration is:
+The shipped application configuration is:
 
 ```yaml
 consistency: LOCAL_QUORUM
 serial_consistency: SERIAL
 ```
 
-at [`configs/config.prod.yaml:47-59`](../configs/config.prod.yaml#L47-L59).
-`newCluster` places that value on the gocql session at
-[`internal/db/db.go:91-119`](../internal/db/db.go#L91-L119). The metadata query
-does not call `.SerialConsistency(...)`, so it inherits the session-level value.
+at [`configs/config.prod.yaml`](../configs/config.prod.yaml), and
+`.env.prod.example` also sets `CASSANDRA_SERIAL_CONSISTENCY=SERIAL`.
+`CASSANDRA_SERIAL_CONSISTENCY` overrides the YAML value before validation;
+`Validate()` accepts both `SERIAL` and `LOCAL_SERIAL`. `newCluster` places the
+effective value on the gocql session in [`internal/db/db.go`](../internal/db/db.go).
+The metadata query does not call `.SerialConsistency(...)`, so it inherits the
+session-level value.
 
 The current effective behavior is therefore:
 
 ```text
 metadata INSERT IF NOT EXISTS
-    -> inherited session serial consistency
-    -> SERIAL under the production profile
+    -> inherited effective session serial consistency
+    -> SERIAL only when the runtime setting remains SERIAL
 ```
 
 The USA/EU cluster profiles intentionally use `LOCAL_SERIAL` for their test
-harnesses. The database code warns when local serial is used with multi-region
-replication at [`internal/db/db.go:164-171`](../internal/db/db.go#L164-L171).
-Those profiles do not model production global Paxos.
+harnesses. The database code warns, but does not reject, local serial when the
+effective replication is multi-region. `SERIAL` is a global serial domain only
+relative to the configured replica set; a single-region deployment does not
+turn it into WAN latency.
 
 P0/R12 would change implicit/configurable behavior into explicit statement
 behavior. It would:
@@ -198,9 +222,13 @@ behavior. It would:
 - make the relevant `blocks` LWT inventory auditable;
 - align test profiles with the intended global serial contract if they are
   meant to exercise that contract;
-- add no new `SERIAL` latency to the current production default.
+- add no new `SERIAL` latency to deployments currently using the shipped
+  `SERIAL` setting; it can change behavior and latency for an override using
+  `LOCAL_SERIAL`.
 
-P0 is still not ready to implement blindly. If the final design removes the
+P0/R12 is not required as a performance fix and should not be started merely
+to address X4. Its sequencing as correctness hardening remains open while the
+install design is evaluated. If the final design removes the
 ordinary metadata LWT, the P0 inventory must be split between hot-path install
 operations and background/destructive lifecycle operations. GC claims,
 conditional orphan transitions and ambiguous-outcome settlement cannot be
@@ -212,16 +240,17 @@ The current metadata comments explicitly state that `storage_class` and
 `storage_key` are not globally fixed by the block hash. First-writer-wins pins
 one physical location because writers can arrive with different classes:
 
-[`internal/db/block_references.go:547-561`](../internal/db/block_references.go#L547-L561)
+[`internal/db/block_references.go`](../internal/db/block_references.go), in the
+`UpsertBlockMetadata` placement contract comments.
 
 The resolver has two materially different modes:
 
 1. A non-empty library class is authoritative and is resolved exactly.
 2. An empty library class falls through to hostname/region/default routing.
 
-That behavior is implemented at
-[`internal/storage/storage.go:302-350`](../internal/storage/storage.go#L302-L350)
-[`internal/api/v2/storage_resolution.go:39-64`](../internal/api/v2/storage_resolution.go#L39-L64).
+That behavior is implemented by `ResolveStorageClass` in
+[`internal/storage/storage.go`](../internal/storage/storage.go) and the
+library lookup in [`internal/api/v2/storage_resolution.go`](../internal/api/v2/storage_resolution.go).
 
 The current logical block key is only `(org_id, block_id)`:
 
@@ -229,7 +258,7 @@ The current logical block key is only `(org_id, block_id)`:
 PRIMARY KEY ((org_id, block_id))
 ```
 
-at [`internal/db/migrations/001_initial_schema.cql:272-284`](../internal/db/migrations/001_initial_schema.cql#L272-L284).
+at [`internal/db/migrations/001_initial_schema.cql`](../internal/db/migrations/001_initial_schema.cql).
 
 This creates the unresolved placement case:
 
@@ -247,14 +276,24 @@ P1 = (B1, K)
 P2 = (B2, K)
 ```
 
-The current `ChangeStorageClass` endpoint also updates a library class without
-migrating existing blocks; its migration work is still a TODO at
-[`internal/api/v2/libraries.go:1116-1158`](../internal/api/v2/libraries.go#L1116-L1158).
-That means library-fixed placement is not yet an immutable contract.
+The current `ChangeStorageClass` endpoint changes the library preference but
+does not rewrite `storage_class` on existing `blocks` rows or migrate their
+objects; the migration work remains a TODO in
+[`internal/api/v2/libraries.go`](../internal/api/v2/libraries.go). A library
+can therefore reference blocks materialized under different classes over time,
+and a new preference can compete with an org-global canonical block when a
+logical block is not already present. This is a placement-policy problem, not
+a rebinding of the old class name or a silent rewrite of old block rows.
 
 ## Candidate Placement Domains
 
 These are candidates for investigation, not accepted designs.
+
+The detailed impact analysis is in
+[STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md). It
+covers the current schema, references, upload/read paths, GC, failover,
+storage cost, greenfield initial-schema requirements and the conditions for any
+future LWT removal.
 
 The first design decision is `B = storage_class`, not the deterministic key
 `K`. With the current request-dependent placement, two writers can still
@@ -287,8 +326,8 @@ are safe without a conditional operation.
 Any option also requires `storage_class` to remain an append-only physical
 namespace identity: a class must not be rebound to another backend and must
 not be reused for a different namespace. A library class change therefore
-needs an explicit migration/identity policy rather than silently changing the
-meaning of existing block rows.
+needs an explicit policy for future placement and any physical migration; it
+does not by itself change the meaning of existing block rows.
 
 ### A. Class fixed by library
 
@@ -312,8 +351,9 @@ same org + same SHA-256
 Because `blocks` is currently keyed by `(org, block_id)`, those libraries still
 compete to establish one canonical physical class. Library-fixed placement by
 itself therefore does not remove the LWT while dedupe remains org-global. The
-existing `ChangeStorageClass` endpoint also needs a real migration or an
-immutable-placement rule before this can be an authority.
+existing `ChangeStorageClass` endpoint needs an explicit policy for existing
+references and future placement before a library value can be the sole
+placement authority.
 
 ### B. Class included in logical identity
 
@@ -416,8 +456,8 @@ transition, but it does not itself provide the compare-and-set that prevents
 the stale install. This is the core relationship between the hot-path redesign
 and X1's R17/R24 requirements.
 
-The current physical locator is still derived by `hashToKey` at
-[`internal/storage/blocks.go:309-319`](../internal/storage/blocks.go#L309-L319).
+The current physical locator is still derived by `hashToKey` in
+[`internal/storage/blocks.go`](../internal/storage/blocks.go).
 The locator-authority phase must therefore precede any change to the key
 formula, as required by the X1 sequencing note.
 
@@ -428,8 +468,8 @@ This investigation does not close X1. It narrows the safe design space:
 - X1's physical-delete ABA still requires never-reused exact physical tuples.
 - R9 still requires one canonical identity for concurrent installation.
 - R12 still governs conditional operations that rely on one global serial
-  domain; it is not a reason to add another hot-path consensus round when the
-  current production session already uses `SERIAL`.
+  domain; it is not a reason to add another hot-path consensus transaction for a
+  deployment already using the shipped `SERIAL` setting.
 - R17 still requires condemned-incarnation writer safety.
 - R24 still requires single-use install identities and settlement of ambiguous
   outcomes.
@@ -451,24 +491,34 @@ multi-DC-compatible benchmark:
   new blocks?
 - What are LWT latency, `applied=true/false`, retries and timeout distributions?
 - How much time is spent waiting for `finalizeUploadBlockMetadataConcurrency`?
-- What happens at metadata concurrency 1, 2, 4 and 8?
+- What happens when `finalizeUploadConcurrency` is 1, 2, 4 and 8 with the
+  metadata permit fixed at 1, and when the permit is varied independently?
+- How much S3 launch delay is caused by worker slots held while waiting for the
+  metadata permit?
+- What are the actual Cassandra version, `paxos_variant`, Paxos state-purging
+  mode, effective serial consistency and replication topology/RF at benchmark
+  time? The repository pins the Cassandra 5.0.9 image but does not pin those
+  server-side Paxos settings.
 - Which upload paths pass `storage_key=""` or derive it again?
 - What `storage_class` can two concurrent writers propose for the same logical
   content across libraries and DCs?
 - What is the dedupe/storage cost of `(org, storage_class, content_hash)`?
-- Can a real race prove that an old writer cannot reinstall a retired
-  generation under the candidate schema?
+
+The candidate-schema stale-generation race, `INSTALL(G)`/`REPAIR(P)` split and
+old-writer rejection belong to the subsequent protocol prototype. This
+characterization PR should inventory the current identities and measure the
+current paths; it must not imply that a candidate schema already exists.
 
 The performance objective for the eventual design is:
 
 ```text
-ordinary new-block installation: no cross-DC Paxos per block
+ordinary new-block installation: no cross-DC `SERIAL` LWT/Paxos transaction per block
 retirement/reincarnation: global coordination only on exceptional GC transitions
 ```
 
 Until those invariants and measurements exist, keep the current metadata LWT,
-keep production `SERIAL`, do not use `LOCAL_SERIAL` as a production shortcut,
-and keep destructive GC disabled under X1.
+keep the shipped `SERIAL` default, do not use `LOCAL_SERIAL` as a multi-DC
+performance shortcut, and keep destructive GC disabled under X1.
 
 ## References
 
@@ -476,5 +526,5 @@ and keep destructive GC disabled under X1.
 - [Upload-fence PR split plan](./GC-UPLOAD-FENCE-PR-PLAN.md)
 - [Upload performance/security analysis, P-4](./UPLOAD-PERFORMANCE-SECURITY-2026-06.md)
 - [Open work index, X4](./OPEN-WORK-INDEX.md)
-- [Known issue: per-block Paxos](./KNOWN_ISSUES.md#issue-upload-per-block-paxos-01-one-global-paxos-lwt-per-block-on-upload)
+- [Known issue: per-block Paxos](./KNOWN_ISSUES.md#issue-upload-per-block-paxos-01-one-serial-lwtpaxos-transaction-per-block-on-upload)
 - [X1/X2 findings registry](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)

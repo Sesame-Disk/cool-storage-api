@@ -191,7 +191,7 @@ started.
 
 | Item | Sev | One line |
 |---|---|---|
-| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation that reaches metadata registration; browser/sync preflight can bypass fully deduplicated blocks. Production already inherits `SERIAL`; **P0 does not introduce this latency**. **PR-11, not started** — characterize latency, permit wait and placement identity first. See [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md). |
+| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One `SERIAL` LWT/Paxos transaction per block invocation that reaches metadata registration when the effective setting is `SERIAL`; browser/sync preflight can bypass fully deduplicated blocks. The shipped default uses `SERIAL`, but env and topology determine effective WAN cost. **P0 is not an X4 performance fix**. **PR-11, not started** — characterize latency, permit wait, Paxos settings and placement identity first. See [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md). |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |

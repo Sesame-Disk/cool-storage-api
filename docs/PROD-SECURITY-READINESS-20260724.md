@@ -72,7 +72,7 @@ X2 cross-DC reference visibility is closed under its stable-topology contract �
 | ID | Finding | Sev | Status as of 2026-07-25 | Issue id | Code ref |
 |----|---------|-----|-------------------------|----------|----------|
 | UP-1 | Chunk-upload state node-local → multi-region blocker without sticky-by-token — **B1** | HIGH | OPEN | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | `seafhttp.go` `var chunkManager` |
-| UP-2 | 1 global Paxos LWT per metadata-registering block invocation under multi-DC `SERIAL` (~128 cross-region rounds / 1 GB for new content/full registration). Browser/sync preflight may bypass fully deduplicated blocks. Pre-existing, both governed upload modes pay it when they register. Latency cost, not a blocker. **Same finding as X4 / P-4** — deferred PR-11. | HIGH (perf) | OPEN | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4) | `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` P-4 |
+| UP-2 | 1 `SERIAL` LWT/Paxos transaction per metadata-registering block invocation when the effective setting is `SERIAL` and the replica topology spans DCs (~128 transactions / 1 GB for new content/full registration). Browser/sync preflight may bypass fully deduplicated blocks. The shipped default uses `SERIAL`, but env and topology are runtime inputs. Pre-existing, both governed upload modes pay it when they register. Latency cost, not a blocker. **Same finding as X4 / P-4** — deferred PR-11. | HIGH (perf) | OPEN | `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4) | `UPLOAD-PERFORMANCE-SECURITY-2026-06.md` P-4 |
 | UP-3 | TOCTOU quota check across concurrent same-org uploads to different repos | MEDIUM | OPEN | `ISSUE-QUOTA-RESERVATION-01` | UPLOAD-… S-4 |
 | UP-4 | `/tmp` staging admission budget (`chunked_staging_max_bytes`) defaults to `0` = disabled. ⚠️ **Sharpened 2026-07-25:** *every* shipped config sets it to `0`, `config.prod.yaml` included, **and this field has no `.env` override** — unlike most prod settings it can only be changed by editing the YAML. | MEDIUM | GUARD ADDED, **YAML EDIT REQUIRED IN ALL PROFILES** | `ISSUE-UPLOAD-SIZE-GUARDS-BOTH-ZERO-01` | `configs/*.yaml`; `config.go` `applyEnvOverrides()` (absent) + `Validate()` |
 | UP-5 | Permission not re-checked during long chunked uploads (authorized at session start only) | MEDIUM | OPEN | `ISSUE-MID-OPERATION-REVOCATION-01` | UPLOAD-DOWNLOAD-ANALYSIS |
@@ -82,7 +82,7 @@ X2 cross-DC reference visibility is closed under its stable-topology contract �
 **2026-08-11 scope correction for UP-2:** the LWT is paid per block invocation that
 reaches metadata materialization. Browser/sync preflight can bypass fully deduplicated
 blocks; first content and other blocks reaching `RegisterUploadedBlock` still pay it.
-The ~128 rounds/1 GiB figure is a new-content/full-registration sensitivity, not a
+The ~128 LWT/Paxos transactions per GiB figure is a new-content/full-registration sensitivity, not a
 universal per-file cost.
 
 ---

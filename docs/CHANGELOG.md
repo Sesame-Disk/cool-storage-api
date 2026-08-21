@@ -10,12 +10,15 @@ Session-by-session development history for SesameFS.
 
 ## 2026-08-20 - X1/X4 upload hot-path Paxos characterization
 
-The confirmed hot-path analysis records that production already runs the
-per-block metadata `INSERT ... IF NOT EXISTS` under global `SERIAL`; P0/R12
-would make that domain explicit rather than add the production cost. Chunked
+The confirmed hot-path analysis records that the shipped production
+default/example uses `SERIAL` for the per-block metadata `INSERT ... IF NOT
+EXISTS`; an environment override can select `LOCAL_SERIAL`, and the WAN cost
+also depends on the effective replica topology. P0/R12 would make that domain
+explicit rather than add the cost to deployments already using `SERIAL`. Chunked
 SeafHTTP finalizations serialize their materialization callback through one
 process-local permit, but the non-chunked `HandleUpload` path does not acquire
-that permit. The two-minute final-file context starts only after `eg.Wait()`. The companion
+that permit. The two-minute final-file context starts only after `eg.Wait()`. The
+companion
 [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md) keeps
 PR-11 deferred, rejects `LOCAL_SERIAL` as a production mitigation, and defines
 the placement/incarnation invariants required before removing the hot-path LWT.
@@ -1310,7 +1313,7 @@ new relative to the withdrawn document:
   clear conditional still lets a delayed `P1` cleanup erase `P2`'s discoverability.
   Liveness, not data loss — but permanent once the TTL is removed. Preferred fix is to
   fold `P` into the discovery row's identity rather than to add `IF P = P1`: a conditional
-  spends a Paxos round on a structure that is explicitly liveness and never authorization,
+  spends a conditional Paxos transaction on a structure that is explicitly liveness and never authorization,
   while an identity that cannot be named by the wrong lifecycle closes it by construction.
 - **R27 — R18(a) had no mechanism behind it.** "Re-project and retry" cannot work on the
   current projection: `upsertS3OrphanProjection` always derives `first_seen_day` from the
@@ -1407,11 +1410,11 @@ merged before the branch that carried them.
   files (`docker-compose.cassandra-3dc.yaml` was already pinned); `VERSIONS.md`
   corrected (it still claimed Go 1.21, Echo, and Cassandra 4.1 — the project uses Gin).
 
-**X4 / UP-2 / P-4 scope correction (2026-08-11), carried over:** the per-block Paxos round
-is paid per block invocation that *reaches* metadata registration, not by every logical
-block of every upload — browser and sync preflight can classify a fully deduplicated block
-before `RegisterUploadedBlock`. The ~128 rounds/1 GiB figure is a new-content sensitivity
-at 8 MiB blocks, not a universal per-file charge. Recorded with a consequence for X1: if a
+**X4 / UP-2 / P-4 scope correction (2026-08-11), carried over:** one LWT/Paxos
+transaction is paid per block invocation that *reaches* metadata registration, not by
+every logical block of every upload — browser and sync preflight can classify a fully
+deduplicated block before `RegisterUploadedBlock`. The ~128 transactions/1 GiB figure
+is a new-content sensitivity at 8 MiB blocks, not a universal per-file charge. Recorded with a consequence for X1: if a
 future design mints storage keys, P-4's proposed fix (drop the first-writer LWT) stops
 being available, because that LWT becomes the only thing choosing one canonical
 incarnation across DCs.
