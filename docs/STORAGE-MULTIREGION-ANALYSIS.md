@@ -404,8 +404,13 @@ the failover half reachable.
   (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus the missing permission gate on
   the same endpoint (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`).
 
-Single-region deployments with external monitoring are safe. A multiregion deployment
-that must honour a residency commitment needs the residency items too, not only items 1-4.
+Single-region deployments with external monitoring do not need items 1-4: with one
+region there is no cross-region failover to gate and no residency edge to cross.
+That is a **storage-topology** statement and not a production-readiness verdict —
+the missing permission gate on the same endpoints
+(`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) is topology-independent and
+applies to a single-region install unchanged. A multiregion deployment that must
+honour a residency commitment needs the residency items too, not only items 1-4.
 
 **Corrections to v4 report:**
 - ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization and selected fallback plumbing; canonical reads use persisted placement

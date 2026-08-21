@@ -11,8 +11,15 @@ the two successive reviews of the original analysis. The first review is right
 that the hot path is expensive; it is wrong if read as saying that P0 would
 introduce new `SERIAL` latency to deployments already using the shipped setting.
 The second review correctly moves the
-decision from "add more SERIAL" to "prove whether ordinary installation can
-have one deterministic physical identity without per-block Paxos".
+decision away from "add more SERIAL" — but not to "remove the LWT". As this
+document establishes below, under A-prime the per-block LWT is not overhead: it is
+the first-writer arbitration that lets two concurrent materializations proposing
+different classes settle on one canonical placement while org-global dedupe is
+preserved. The open decision is therefore to **measure the current LWT and
+establish whether an equivalent global arbitration exists that could replace it
+without changing A-prime semantics — retaining it is a valid outcome**, and every
+catalogued alternative that removes the arbitration pays for it elsewhere
+(deduplication domain, or library placement authority).
 
 ## Executive Verdict
 

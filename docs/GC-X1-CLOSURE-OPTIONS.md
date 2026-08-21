@@ -149,8 +149,11 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   reads, existence checks, repair and physical delete, still holding the currently
   derived value. It carries the delete chain that must exist before a key can differ:
   an exact-key delete primitive, the durable orphan carrying `(storage_class,
-  storage_key)`, and recovery deleting that persisted key. Nothing destructive
-  changes; the deployment is observable before identity moves.
+  storage_key)`, and recovery deleting that persisted key. **No destructive
+  authorization or lifecycle semantics change**: while persisted `K` still equals
+  `hashToKey(L)`, exact-key delete and recovery are observationally equivalent to
+  today's derived delete — same authorization, same object. The deployment is
+  observable before identity moves.
 - **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.
@@ -336,6 +339,38 @@ carrying `(storage_class, storage_key)` + recovery deleting that persisted key, 
 before the first minted key exists**. While `K = hashToKey(L)` still holds, the
 change is observably a no-op, which is why it belongs in the reversible slice rather
 than after the mint.
+
+**Persisting the key also makes it part of recovery's observed state, and that
+belongs in P1 too.** `RecoverS3Orphans` reloads the canonical orphan immediately
+before the irreversible step and refuses to continue when the reloaded row differs,
+via `s3OrphanRecoveryStateEqual` (`internal/gc/worker.go`) — which compares org,
+block, `first_seen_at`, `storage_class`, `external_sha1` and `recovery_phase`. It
+cannot compare the locator today because the row does not carry one. The moment P1
+adds `storage_key` to that row, **it must join the comparison and a difference must
+fail closed**, or the reload silently stops covering the thing P1 just made
+authoritative.
+
+That gap is not hypothetical once `K` can differ, because none of the six compared
+fields distinguishes two physical lifecycles of the same logical block.
+`StartBlockDeleteOrphan` is explicit about reusing the row: on `IF NOT EXISTS`
+failure it takes `effective_first_seen_at` **from the existing row** and then
+`UPDATE`s `storage_class`, `external_sha1` and `recovery_phase` back to
+`pending_s3` (`internal/gc/store_cassandra.go`). A second delete lifecycle for the
+same block therefore presents the *same* `first_seen_at`, the same class and the
+same phase as the first. Once the P2 slice mints, that is a recovery which loaded
+the first incarnation `(B, K1)`, passed its own reload against a row that now
+describes the second `(B, K2)`, and issues `DeleteExact(K2)` — the exact-`P`
+violation the reload exists to prevent, reached without any compared field
+changing. (`K1`/`K2` here are incarnations, not the P1/P2 slices.) Required gate:
+**a reload whose `storage_key` differs from the loaded one performs no DELETE**.
+
+*Compatibility note for the new orphan column.* The greenfield qualification above
+applies here as well. Rows written before P1 carry no key, and for them the derived
+value is by definition the right one, so a populated deployment needs an explicit
+compat path — drain the live orphans before the flip, or stamp the derived key onto
+them at upgrade — before recovery may reject an empty locator. Under the accepted
+greenfield production scope neither runs: there are no live canonical orphans to
+convert.
 
 **The projection stays out of P1, and that is deliberate.** Migration 014 made
 `gc_s3_orphans_by_day` identity-only — every remaining column is part of

@@ -686,7 +686,16 @@ authorization work above):
 - Should-fix items (6-8): 3-4 days development + 1 day testing = **5 days**
 - **Total: 10 days for the availability half of a multiregion deployment**
 
-**Single-region deployments:** Safe to proceed now with external monitoring.
+**Single-region deployments:** this section is about storage topology only, and
+from that angle a single-region deployment does not need the multiregion failover
+and residency work above — external monitoring covers the availability half. **It
+is not an overall production-readiness statement.** The missing library permission
+gate (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) is a HIGH that does not
+depend on topology at all: any authenticated member of an organization can mutate
+another member's library through `UpdateLibrary`, `op=rename` and
+`ChangeStorageClass` in a single-region install exactly as in a multiregion one.
+That and the other applicable security blockers still have to close before any
+deployment proceeds.
 
 ---
 
