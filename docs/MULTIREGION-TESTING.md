@@ -228,7 +228,7 @@ docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
   gotest go test -tags integration \
   -run TestCreateLibraryStorageSelection -count=1 -v ./internal/integration/...
 
-# Read-path integrity for region-pinned libraries
+# Read-path integrity: canonical block class, not the library preference
 docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
   gotest go test -tags integration \
   -run 'TestRegionPinnedLibraryReadPaths|TestRegionPinnedHistoricReadPaths|TestRegionPinnedShareLinkRaw' \

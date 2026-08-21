@@ -1478,7 +1478,7 @@ What the stock production deploy does **not** provide by itself yet:
 
 For production multi-region, treat this feature as requiring operator-provided topology plus the shared config and `.env` values below.
 
-### Step M2.1 — Required config for region-pinned libraries
+### Step M2.1 — Required config for region-preferred library placement
 
 In production multi-region, `configs/config.prod.yaml` must define all of these:
 
@@ -1561,10 +1561,26 @@ Notes:
 - this slice affects only **new** libraries; existing libraries keep their persisted `storage_class`
 - `strict` constrains the class selected during library creation, but it does not
   constrain a later block-store `failover_class`; a new block may be persisted in
-  the configured failover class if the preferred class is already unhealthy
+  the configured failover class if the preferred class is already unhealthy.
+  The marking logic exists in `CheckHealth`, but nothing calls it automatically,
+  so no class is ever marked unhealthy in a running server and this stays latent
+  until a periodic health checker exists
 - `ChangeStorageClass` updates the library preference and administrative read
-  model only. It does not revalidate strict residency, migrate existing blocks,
-  or start a migration job
+  model only. It does not revalidate strict residency, does not re-apply the
+  hot-tier requirement that library creation enforces, does not migrate existing
+  blocks, and does not start a migration job — a `strict` org can move an existing
+  library outside its allowed region, or onto a cold class, this way
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- **decided, not yet implemented:** changing a library's storage class is a
+  `flexible`-only operation. Under `data_residency: strict` the endpoint must fail
+  closed, because `strict` is a residency guarantee for the life of the library,
+  not a create-time default. Until that lands, do not rely on `strict` to keep an
+  existing library's future blocks in its region
+- that same endpoint has **no permission gate**: any authenticated member of the
+  organization can call it for any library in the organization, as can
+  `PUT /repos/:repo_id` and `POST /repos/:repo_id?op=rename`
+  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). Do not treat org-level
+  residency as enforced against org members until that is fixed
 
 ### Step M3 — Firewall (private network)
 
@@ -1869,7 +1885,7 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
 # every DC).
 ```
 
-### Step M6 — Verify region-pinned library behavior
+### Step M6 — Verify library placement preference and canonical block reads
 
 After deploying the multi-region config, verify the behavior that matters for data integrity.
 These are post-deploy validation checks from a test-capable workspace or CI environment, not the primary rollout mechanism on the production node:

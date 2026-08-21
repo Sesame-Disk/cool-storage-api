@@ -151,6 +151,7 @@ started.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
+| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | HIGH | `UpdateLibrary`, `op=rename` and `ChangeStorageClass` have no permission gate: any authenticated org member can rename any library in the org, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. Only `GetLibrary` and `DeleteLibrary` check | Found auditing the storage-class characterization; runtime defect, negative tests still owed |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
@@ -170,6 +171,7 @@ started.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** the endpoint must fail closed under `strict` and be `flexible`-only | Semantics decided, not implemented; affects future materializations only; compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
 
 ## Low / latent / deferred hardening
 

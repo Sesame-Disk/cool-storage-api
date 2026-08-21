@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-17
+**Last Updated**: 2026-08-21
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -23,6 +23,7 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
+| **Library mutations have no permission gate** | 🔴 Open | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` run behind `authMiddleware` only and never consult the caller's library permission, so any authenticated member of an organization can rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. `GetLibrary` and `DeleteLibrary` do gate; these three do not. Negative tests are still owed. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -7589,7 +7590,15 @@ universal per-file cost.
 
 Do not start PR-11 until per-statement production latency, metadata-permit wait
 and placement proposals are characterized. Do not switch production to
-`LOCAL_SERIAL` as a mitigation. See [registry X4 design notes](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
+`LOCAL_SERIAL` as a mitigation.
+
+**Removing the LWT is not the goal.** Under A-prime it performs the first-writer
+arbitration that keeps one canonical physical placement per `(org_id, block_id)`
+while preserving org-global deduplication. Keeping it is a legitimate outcome if
+measurement shows the cost is acceptable. Any removal must first supply an
+equivalent global arbiter without changing A-prime semantics.
+
+See [registry X4 design notes](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
 and the [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md).
 
 ---
@@ -7792,6 +7801,187 @@ transient 404/503, false-missing `check-blocks`, needless re-uploads. Safe
 
 Document as expected under RF-1-per-DC, or extend retry / use a stronger read
 for hot post-upload paths. Multi-DC tests still missing.
+
+---
+
+### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: `ChangeStorageClass` does not revalidate strict data residency
+
+**Status**: 🟡 Open
+**Severity**: Medium (policy / compliance)
+**Affected**: `LibraryHandler.ChangeStorageClass` (`internal/api/v2/libraries.go`)
+**Source of record**: [storage-class placement options](./STORAGE-CLASS-PLACEMENT-OPTIONS.md) - "Residency policy, failover and preference changes"
+
+#### Problem
+
+Library creation enforces the organization's residency policy through
+`resolveCreateStorageClassForOrg` (`internal/api/v2/storage_policy.go`): under
+`data_residency: strict` the requested class must be configured, hot-tier and
+mapped to the organization's `default_region`.
+
+`ChangeStorageClass` does not repeat that check. It validates only
+`isKnownStorageClass(req.StorageClass)` — canonical name plus configured — and
+then writes `libraries.storage_class` together with the administrative read model
+in one logged batch. An organization configured as `strict` can therefore move an
+existing library's preference to **any** class known to the serving endpoint,
+including one outside the region its own policy allows. The creation-time
+constraint is bypassable by a later edit.
+
+**The tier requirement is dropped as well.** Creation routes the requested class
+through `validateRequestedCreateStorageClass`, which rejects a cold class with
+`storage class must use hot tier` via `isHotStorageClass`. `isKnownStorageClass`
+performs no tier check, so `ChangeStorageClass` accepts a configured cold class
+that creation would have refused. Both halves of the create-time contract —
+region and tier — are missing from the change path.
+
+**Scope of the cold half, stated precisely so it is not over-read.** Cold storage
+is nominal in the current tree, not implemented:
+
+- `initStorageClass` maps `tier: cold` to `storage.AccessDelayed`
+  (`internal/api/server.go`), but nothing acts on that value. `accessType` is read
+  only by `GetAccessType` and by the guard inside `S3Store.InitiateRestore`
+  (`internal/storage/s3.go`).
+- No PUT path sets an S3 storage class. `PutObjectInput` never carries
+  `StorageClass`, so a class labelled cold writes ordinary objects into an
+  ordinary bucket and they stay immediately readable.
+- The restore API is a stub: `RestoreHandler.InitiateRestore`
+  (`internal/api/v2/restore.go`) carries four TODOs, records an empty
+  `BlockIDs`, never calls the storage layer, and returns a placeholder job.
+- `Manager.GetHotBackends` / `GetColdBackends` are inventory helpers with no
+  caller in the read or write path.
+
+So pointing a library at a cold class today does **not** make its future blocks
+unreadable or subject them to a retrieval delay. The defect is coherence: create
+refuses cold deliberately, because "cold-tier primary placement remains future
+design work" (`DEPLOY.md`), while change accepts it — leaving a library able to
+prefer a placement mode that has no design behind it. Treat this as a policy gap
+to close before cold is implemented, not as a live data-availability risk.
+
+This is a placement-policy hole, not data movement: existing canonical blocks keep
+their persisted `blocks.storage_class`, physical object and derived key. The
+consequence is that **future** first materializations for that library prefer a
+class the residency policy was meant to forbid.
+
+A second, narrower path to the same outcome is separately noted: strict policy does
+not constrain `failover_class` either, so a new block can be persisted outside the
+allowed region when the preferred class is already marked `Unhealthy` or `Failed`.
+That path is currently unreachable at runtime - `CheckHealth` holds the marking
+logic but has no automatic caller, so no class is ever marked unhealthy in a
+running server - while this one is reachable through the ordinary API. Note that
+automating health monitoring would make the failover path live, so it hardens
+availability and weakens residency at the same time; the two must be decided
+together.
+
+**Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** the same
+endpoint has no permission gate, so the caller need not even own the library
+whose residency they move.
+
+#### Fix Direction
+
+**Decided semantics (2026-08-21):** `strict` means residency, not a create-time
+default. `ChangeStorageClass` must therefore **fail closed under
+`data_residency: strict`** — a strict organization cannot move an existing
+library's class at all, because the operation cannot honour a residency promise it
+was never designed to re-check. Changing the class is a `flexible`-only operation.
+
+That resolves the open question in favour of the stronger reading: `strict`
+constrains placement for the life of the library, not only at creation. It also
+avoids a partial rule that would still have to answer "which classes count as
+inside the region" on every future config change.
+
+Implementation shape:
+
+1. Read the organization's policy with `readOrgStoragePolicy` and reject the
+   request when `DataResidency == orgDataResidencyStrict`.
+2. Under `flexible`, route the requested class through the same validation
+   creation uses rather than a second copy of the rule — reuse
+   `resolveCreateStorageClassForOrg`, or extract its policy half, so both doors
+   answer identically. This restores the hot-tier requirement at the same time;
+   region and tier were one contract at creation and should stay one contract.
+3. Cover both with tests: strict rejects, flexible accepts a hot in-policy class
+   and rejects a cold one.
+
+The failover half of the residency gap is not closed by this and is tracked in the
+same place: `failover_class` remains outside policy, and it becomes reachable as
+soon as automated health monitoring lands.
+
+Do not couple this to block migration. Changing the preference and moving bytes are
+separate operations; the migration TODO in the same handler stays out of scope.
+
+---
+
+### ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01: Three library mutation handlers have no permission gate
+
+**Status**: 🔴 Open — runtime defect, fix belongs in its own PR
+**Severity**: High (authorization / configuration integrity)
+**Affected**: `UpdateLibrary`, `LibraryOperation` → `RenameLibrary`, `ChangeStorageClass` (`internal/api/v2/libraries.go`)
+
+#### Problem
+
+Library routes are registered on a group whose only middleware is
+`authMiddleware` (`internal/api/server_routes.go`, `protected.Use(s.authMiddleware())`),
+under both the `/api/v2` and `/api2` prefixes. This project's convention is that
+library-level authorization is checked **inside** each handler, and most handlers
+do exactly that:
+
+| Handler | Route | Gate |
+|---|---|---|
+| `GetLibrary` | `GET /:repo_id` | `GetLibraryPermission` → 403 |
+| `DeleteLibrary` | `DELETE /:repo_id` | `IsLibraryOwner` → 403 |
+| `UpdateLibrary` | `PUT /:repo_id` | **none** |
+| `LibraryOperation` (`op=rename`) | `POST /:repo_id` | **none** |
+| `ChangeStorageClass` | `POST /:repo_id/storage-class` | **none** |
+
+The three unguarded handlers never read `user_id` and never call
+`h.permMiddleware`. Their only library-scoped read is
+`readLiveLibraryStateFn(session, orgID, repoID)` → `db.ReadLiveLibraryState`,
+which is an existence/liveness check partitioned by `(org_id, library_id)`. It
+blocks cross-organization access; it does not establish that the caller may
+mutate this library. The `libraries` writes are scoped `WHERE org_id = ? AND
+library_id = ?`, and the `libraries_by_id` companion write is keyed by
+`library_id` alone; no statement in any of the three carries an owner predicate.
+
+Consequence: any authenticated member of an organization can mutate any library
+in that organization, including libraries they have no permission to read.
+
+- `UpdateLibrary` changes `name`, `description` and `version_ttl_days`. The last
+  one is written through `AddUpsertLibraryPolicyQuery` /
+  `AddDeleteLibraryPolicyQuery`, so an unauthorized caller can shorten another
+  library's version retention.
+- `RenameLibrary` changes `name` in `libraries` and `libraries_by_id`.
+- `ChangeStorageClass` changes the library's future-placement preference; the
+  effect on residency policy is tracked separately as
+  `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`.
+
+Existing canonical blocks are not moved or reinterpreted by any of the three, so
+this is a configuration-integrity and authorization defect, not data loss.
+
+#### Verification still owed
+
+No negative test covers any of the three. In
+`internal/api/v2/library_live_write_fence_test.go`, every invocation of
+`UpdateLibrary`, `RenameLibrary` and `ChangeStorageClass` sets only `org_id`,
+while other tests in the same file do set `user_id` for the handlers that read it.
+The asymmetry inside one file is itself evidence that these three run without a
+caller identity. Each handler needs a red test of the shape:
+
+```text
+user B, no permission on library A
+PUT /repos/A            → expect 403
+POST /repos/A?op=rename → expect 403
+POST /repos/A/storage-class → expect 403
+```
+
+#### Fix Direction
+
+Do not paste `IsLibraryOwner` into three handlers. Decide the required permission
+level per operation (owner versus write permission), then apply it in one shared
+place — either a route-level middleware for the mutating library routes or a
+single helper the handlers call — so a fourth mutation handler cannot be added
+without one. This is the same "centralize the mandatory check inside one
+function" rule the write helpers already follow.
+
+Land the fix and its negative tests as a separate PR; documenting the gap does
+not close it.
 
 ---
 

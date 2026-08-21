@@ -150,10 +150,12 @@ Non-chunked requests can issue metadata work concurrently with a covered
 chunked-finalization callback, while concurrent chunked callbacks queue behind
 the permit. Multiple processes can also issue metadata work concurrently.
 
-The practical wall-clock model is therefore:
+Two shapes are worth writing down, but only as bounds with an explicit premise —
+this document exists to argue for measurement, so it must not present an unmeasured
+formula as the wall-clock model:
 
 ```text
-SeafHTTP, one process:
+SeafHTTP, one process, IF serialized metadata dominates:
     approximately N × (metadata/ref path latency)
 
 Web session path, idealized:
@@ -161,8 +163,16 @@ Web session path, idealized:
     plus queueing and Cassandra contention
 ```
 
-Neither model removes the total work of N LWT/Paxos transactions. The current code does
-not provide a production per-statement latency metric, so no numeric latency
+The SeafHTTP shape holds only when the serialized metadata stage is the dominant
+bottleneck. The real path is a pipeline: up to eight S3 operations overlap while a
+single metadata permit serializes the callbacks, so throughput is governed by
+whichever of those two stages is slower, plus fill/drain at the edges and Cassandra
+contention. If S3 is the slower stage, `N × metadata latency` understates the
+total; if metadata is slower, it approaches it from below. Which one dominates is
+exactly what the benchmark in the next section has to establish.
+
+Neither shape removes the total work of N LWT/Paxos transactions. The current code
+does not provide a production per-statement latency metric, so no numeric latency
 claim should be treated as measured.
 
 ### The two-minute context correction
@@ -264,7 +274,13 @@ preferred class is already marked `Unhealthy` or `Failed`, its configured
 `failover_class` can therefore supply the actual class for a new block, which is
 then persisted on `blocks`. `Unknown`, `Healthy` and `Degraded` use the
 preferred class. No periodic production health checker was found, so failover
-depends on the health map already having been updated.
+depends on the health map already having been updated. It is not merely
+unscheduled: `UpdateHealth` has one caller, `CheckHealth`, and neither
+`CheckHealth` nor `CheckAllHealth` has any non-test caller in the tree. Ordinary
+PUT/GET errors do not update the map either, so in a running server every class
+stays `Unknown` and this failover branch cannot be taken. The residency
+consequence above is therefore latent today and becomes reachable as soon as a
+health checker is added.
 
 The current logical block key is only `(org_id, block_id)`:
 
@@ -522,12 +538,39 @@ old-writer rejection belong to the subsequent protocol prototype. This
 characterization PR should inventory the current identities and measure the
 current paths; it must not imply that a candidate schema already exists.
 
-The performance objective for the eventual design is:
+The performance objective for the eventual design is conditional, and the
+condition is not negotiable:
 
 ```text
-ordinary new-block installation: no cross-DC `SERIAL` LWT/Paxos transaction per block
-retirement/reincarnation: global coordination only on exceptional GC transitions
+ordinary new-block installation:
+    minimize or remove the per-block `SERIAL` LWT/Paxos transaction ONLY IF
+    equivalent global first-writer arbitration is provided without changing
+    A-prime semantics
+
+retirement/reincarnation:
+    global coordination only on exceptional GC transitions
 ```
+
+Stated unconditionally, that first line would contradict this document's own
+finding. Under A-prime the LWT is not overhead: it is the mechanism that lets two
+concurrent first materializations proposing different classes for the same
+`(org_id, block_id)` settle on one canonical physical placement while preserving
+org-global deduplication.
+
+Removing it naively does not shrink the deduplication domain — one row per
+`(org_id, block_id)` remains — it breaks the locator: a plain last-writer-wins
+INSERT can leave the canonical row naming a class where the winning writer never
+put the object, which breaks reads and points GC at the wrong physical copy. The
+alternatives that would remove the arbitration safely are the ones catalogued in
+[STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md), and
+each pays elsewhere: Option B changes the deduplication domain, Option C removes
+library placement authority. There is no version of this that is only a latency
+change.
+
+There is therefore no architectural obligation to eliminate it. If measurement
+shows the cost is acceptable — or that Cassandra's Paxos v2 makes it acceptable —
+keeping it is a legitimate outcome. "Measure, then decide" is the position; "remove
+the LWT" is not a goal this document endorses.
 
 Until those invariants and measurements exist, keep the current metadata LWT,
 keep the shipped `SERIAL` default, do not use `LOCAL_SERIAL` as a multi-DC

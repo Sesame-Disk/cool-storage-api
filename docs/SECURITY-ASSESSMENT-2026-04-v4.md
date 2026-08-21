@@ -11,7 +11,13 @@
 
 **Frontend update (2026-05-15):** M-10 is now partially remediated. Direct deprecated frontend packages were removed or replaced, local `npm.cmd run build` and Docker `docker compose build frontend` pass, and remaining deprecations/audit findings are major/transitive migrations rather than simple dead-package cleanup. Avoid blind `npm audit fix --force`; continue with targeted frontend upgrades.
 
-**All critical and high-severity security findings from v1-v3 have been resolved.** The remaining open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
+**All critical and high-severity security findings from v1-v3 have been resolved.** The remaining v1-v3 open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
+
+**A new HIGH was opened after v4 by the storage-class placement audit (2026-08-21):**
+three library mutation handlers (`UpdateLibrary`, `op=rename`, `ChangeStorageClass`)
+carry no permission gate, so any authenticated organization member can mutate any
+library in that organization — `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`.
+This section's "all HIGH resolved" statement applies to the v1-v3 series only.
 
 **NEW in v4:** Comprehensive multiregion storage analysis with code audit and testing. Key findings:
 - ✅ **Good news:** New-materialization paths and selected fallback plumbing use
@@ -21,7 +27,14 @@
 - ⚠️ **Testing gap:** Failover logic exists; multi-level/all-unhealthy chain cases
   remain untested, while circular detection has unit coverage; no integration tests
   for region failures
-- **Conclusion:** Architecture is solid, but missing automated health checks prevents proactive failover
+- ⚠️ **Residency gap:** `strict` data residency binds new-library creation only.
+  `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement,
+  and `failover_class` is not policy-gated
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- **Conclusion:** Architecture is solid, but missing automated health checks prevent
+  proactive failover. Note the tension: adding them makes the configured cross-region
+  failover edges live for the first time, which hardens availability and weakens
+  strict residency unless placement is policy-gated in the same change
 
 ---
 
@@ -456,7 +469,7 @@ walks the chain iteratively with a visited set.
 **Impact:**
 - Failover happens silently (only server logs show it)
 - Users don't know their files landed in a different region
-- Compliance/legal issue: user uploads to EU endpoint expecting EU data residency, but file stored in USA due to failover
+- Compliance/legal issue: user uploads to EU endpoint expecting EU data residency, but file stored in USA due to failover. Latent today — `CheckHealth` is the only thing that marks a class `Unhealthy`/`Failed` and nothing calls it automatically, so failover never fires — and live the moment automated health monitoring lands
 
 **Fix:**
 1. Add webhook/SNS notification on failover events:
@@ -525,7 +538,7 @@ walks the chain iteratively with a visited set.
 | **Failover notifications** | ❌ No | Server logs only; no webhooks/alerts |
 | **Per-region metrics** | ❌ No | `/metrics` exists but no per-backend health gauges |
 | **Geographic latency handling** | ⚠️ Partial | Global 5s timeout; not configurable per region |
-| **Data residency compliance** | ✅ Yes | Strict org policy controls new-library placement; it does not migrate existing data |
+| **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
 | **Failover config validation** | ⚠️ Partial | Runtime cycle detection fails closed; startup validation and full edge-case coverage remain open |
 
 ---

@@ -59,7 +59,7 @@ grep -r "CheckAllHealth\|CheckHealth.*goroutine\|ticker.*Health" internal/api/
 
 **Verified:** ✅ TRUE
 
-**Impact:** A region can go down and the system won't know until a user request or an explicit health probe reaches it. Health status remains `HealthUnknown` (treated as healthy) because ordinary storage errors do not update the health map.
+**Impact:** A region can go down and the system won't know until an explicit health probe updates the health state. A user request that fails against the dead backend does **not** update it: ordinary storage errors never call `UpdateHealth`, so the class stays `HealthUnknown` and is still treated as healthy.
 
 **Current behavior:**
 1. EU S3 bucket becomes unreachable at 10:00 AM
@@ -317,11 +317,27 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 | **Failover notifications** | ❌ No | Server logs only |
 | **Per-region metrics** | ❌ No | No Prometheus metrics for backend health |
 | **Geographic latency handling** | ❌ No | Global 5s timeout; not configurable |
-| **Data residency compliance** | ✅ Yes | Strict org policy controls new-library placement; it does not migrate existing data |
+| **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
 
 ---
 
 ## Recommendations
+
+**Two readiness questions, not one.** Availability/resilience readiness and strict
+residency enforcement are separate, and items 1-4 below only address the first:
+
+```text
+availability / resilience readiness   !=   strict residency enforcement
+```
+
+Automating health monitoring is the right fix for availability, but it makes the
+configured cross-region `failover_class` edges live for the first time — the marking
+logic exists in `CheckHealth`, but with no automatic caller no class is ever marked
+`Unhealthy` or `Failed`, so failover never fires today. Doing item 1
+without policy-gating placement therefore *increases* the chance that a `strict`
+organization's new bytes land outside its region. The residency items are tracked as
+`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` and must be decided alongside item 1, not
+after it.
 
 ### Must-fix before multiregion production (HIGH priority)
 
@@ -376,9 +392,20 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 
 **Testing:** ❌ Insufficient. Basic unit tests exist, but no failover integration tests.
 
-**Production readiness for multiregion:** **Not ready**.
+**Residency enforcement:** ⚠️ Partial — `strict` binds new-library creation only.
+`ChangeStorageClass` re-applies neither the region nor the hot-tier check, and
+`failover_class` is not policy-gated. Items 1-4 do not close this, and item 1 makes
+the failover half reachable.
 
-Single-region deployments with external monitoring are safe. Multiregion deployments should wait for items 1-4 above.
+**Production readiness for multiregion:** **Not ready**, on both counts:
+
+- *availability/resilience* — blocked on items 1-4 above;
+- *strict residency* — blocked on policy-gating `ChangeStorageClass` and failover
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus the missing permission gate on
+  the same endpoint (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`).
+
+Single-region deployments with external monitoring are safe. A multiregion deployment
+that must honour a residency commitment needs the residency items too, not only items 1-4.
 
 **Corrections to v4 report:**
 - ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization and selected fallback plumbing; canonical reads use persisted placement

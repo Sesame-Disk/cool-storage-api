@@ -27,7 +27,7 @@ The current product contract is:
 
 ```text
 canonical block row identity = (org_id, internal_sha256)
-representation_id = immutable conflict-checked metadata on that row
+representation_id = conflict-checked once established on that row
 
 library.storage_class
     = mutable preferred class for future first materialization
@@ -35,6 +35,13 @@ library.storage_class
 blocks.storage_class
     = actual canonical physical namespace selected for this block
 ```
+
+`representation_id` is deliberately not described as immutable. An empty stored
+value is backfilled: `ensureBlockIdentityRow` calls
+`backfillBlockRepresentationIDFn` when the canonical row carries none
+(`internal/db/block_references.go`). What the row refuses is a *different*
+non-empty value, which it rejects as a permanent conflict. The invariant is "once
+established, conflict-checked", not "never written".
 
 The current `blocks` table is keyed by `(org_id, block_id)`. A first writer with
 no canonical row proposes the class selected from the library preference,
@@ -200,7 +207,9 @@ strict residency policy, update `blocks`, modify `fs_objects` or references,
 copy/delete S3 objects, calculate cost, or enqueue a migration job. Therefore a
 strict organization can currently change an existing library to any known class
 accepted by that endpoint, even when that class is outside the organization's
-creation region. This is a confirmed policy boundary, not a migration feature.
+creation region. This is a confirmed policy boundary, not a migration feature,
+and it is tracked as `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` in
+[KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 For a new block, the handlers first resolve a preferred class and then call
 `GetHealthyBlockStoreForOrg`. `GetHealthyBackend` returns the preferred class
@@ -208,7 +217,10 @@ when its state is `Unknown`, `Healthy` or `Degraded`; it follows
 `failover_class` only for `Unhealthy` or `Failed`. The returned `actualClass`,
 not the library preference, is passed to metadata registration and persisted on
 the canonical block row. A failover can therefore cross the strict creation
-region for a new block while leaving `libraries.storage_class` unchanged.
+region for a new block while leaving `libraries.storage_class` unchanged. That
+branch is latent rather than live: as recorded below, no non-test caller marks a
+class `Unhealthy` or `Failed`, so no request can currently reach it. The
+reachable residency gap is the `ChangeStorageClass` one above.
 
 `CheckHealth` probes `Exists("__health_check__")`. A connection or other probe
 error sets the backend to `Unhealthy`; a response slower than five seconds sets
@@ -218,10 +230,14 @@ failover chain returns an error rather than marking a class automatically. The
 only production caller found for `UpdateHealth` is `CheckHealth`, and no
 periodic production caller of `CheckHealth` or `CheckAllHealth` exists. A normal
 S3 error in a PUT/GET path therefore does not itself update the health map or
-guarantee that the next request fails over. Runtime failover cycles are rejected
-by the visited-set walk in `GetHealthyBackend`; startup validates referenced
-class names but does not validate same-region policy, strict-policy compliance or
-cycles.
+guarantee that the next request fails over. A failover cycle is supported
+configuration, not a misconfiguration: `config.prod.yaml` ships `hot-s3-na` and
+`hot-s3-eu` pointing at each other precisely so either region can be primary. The
+requirement is that a fully unhealthy cycle fails closed rather than looping, and
+`GetHealthyBackend`'s visited-set walk does exactly that, returning a cycle error
+on revisit. Startup validates that referenced class names exist; it does not
+validate same-region policy or strict-policy compliance, and it is not expected to
+reject cycles.
 
 Legacy `storage.backends` entries are registered with an empty failover class,
 so that compatibility format has no configured fallback unless the deployment
@@ -720,8 +736,17 @@ current library preference to a hash function.
 | GC identity changes | Medium | High | High |
 | Sensitivity to class-set changes | Low | Low | High |
 | Storage duplication | None from placement | Up to number of classes | None from placement |
-| Regional locality | Good only after first-writer issue is removed | Good | Poor for large files |
+| Regional locality | Best-effort for new unique content; deduplicated reuse can stay in another class indefinitely | Good | Poor for large files |
 | Fit with current architecture | Reference model | Product-changing redesign | Weak |
+
+On the locality row: under A-prime this is the designed behaviour, not a defect
+awaiting the removal of the first-writer LWT. Global `(org, hash)` deduplication
+and per-request regional locality are in tension by construction, and A-prime
+resolves it in favour of deduplication. A library that now prefers EU reuses a
+hash already canonical in NA on purpose — reading it from NA is the correct
+outcome, not a placement failure. Only new unique content follows the preference.
+Removing the LWT would not change this; it would only change which writer wins the
+race to establish a class for content that is genuinely new.
 
 ## Recommended implementation sequence
 
