@@ -367,10 +367,16 @@ changing. (`K1`/`K2` here are incarnations, not the P1/P2 slices.) Required gate
 *Compatibility note for the new orphan column.* The greenfield qualification above
 applies here as well. Rows written before P1 carry no key, and for them the derived
 value is by definition the right one, so a populated deployment needs an explicit
-compat path — drain the live orphans before the flip, or stamp the derived key onto
-them at upgrade — before recovery may reject an empty locator. Under the accepted
-greenfield production scope neither runs: there are no live canonical orphans to
-convert.
+compat path before recovery may reject an empty locator. **Prefer draining the live
+orphans before the flip.** A deployment that instead stamps the derived key onto
+existing rows must give the new cell a TTL aligned to that orphan's remaining
+original schedule, never a fresh table TTL: `default_time_to_live` applies per
+written value, so a plain `UPDATE … SET storage_key = …` would hand the locator a
+full new expiry while `storage_class`, `first_seen_at` and `recovery_phase` keep
+expiring on the original date — reintroducing exactly the partial-orphan TTL skew
+R28 describes and R28a's application-clock bound exists to prevent. Under the
+accepted greenfield production scope neither path runs: there are no live canonical
+orphans to convert.
 
 **The projection stays out of P1, and that is deliberate.** Migration 014 made
 `gc_s3_orphans_by_day` identity-only — every remaining column is part of

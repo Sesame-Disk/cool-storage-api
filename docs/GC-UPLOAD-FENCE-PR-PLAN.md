@@ -930,9 +930,12 @@ mutable library preference plus an org-global canonical block row whose
 persisted `storage_class` controls existing reads, reuse, repair and GC. A
 future deterministic placement option would remove library placement authority;
 a class-scoped option would change deduplication and require a broader identity,
-locator and liveness redesign. P0/R12 may still be required for the
-background/destructive LWT domain, but it must not be treated as a performance fix
-by itself.
+locator and liveness redesign. **P0/R12 is a correctness prerequisite, not an
+optional extra**: raising some conditional statements on the `blocks` partition to
+`SERIAL` while others stay `LOCAL_SERIAL` leaves two quorum domains, so it must land
+before any minted-key install property depends on a single serial domain — that is,
+before P2 in the `GC-X1-CLOSURE-OPTIONS.md` split, though P1 does not need it. It is
+not a performance fix by itself and must not be scheduled as one.
 
 **Not in scope: merging the lifecycle observations.** An earlier draft proposed
 merging the pre-store probe and post-reference fence reads. That ordering is the mutual

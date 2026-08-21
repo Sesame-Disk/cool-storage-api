@@ -8016,6 +8016,40 @@ Two consequences for the fix:
   do not let it be settled by default — and do not describe the current behaviour as
   forward-only, because it is weaker than that.
 
+**The same undecided question governs deduplicated reuse, which is where `strict`
+and A-prime actually meet.** Everything above concerns where a *new* object lands.
+Reuse never writes a new object, and under A-prime that is deliberate: a block is
+canonical per `(org, hash)`, and the placement report states the consequence as
+designed behaviour rather than a defect — "a library that now prefers EU reuses a
+hash already canonical in NA on purpose"
+([STORAGE-CLASS-PLACEMENT-OPTIONS.md](./STORAGE-CLASS-PLACEMENT-OPTIONS.md)). So an
+organization that flips to `strict(EU)` and then uploads content whose hash is
+already canonical in NA takes the `Reusable` branch: `ProbeBlockReuse` returns the
+canonical class, `ResolveCanonicalBlockStore` resolves NA, and the upload succeeds
+with **no new bytes outside EU** while the content a strict library now references
+keeps living in NA. Gating `ChangeStorageClass`, gating the placement resolver and
+gating failover do not touch this path at all — the reuse decision is read from
+`blocks.storage_class`, never from the policy.
+
+Each candidate rule therefore has to state its reuse semantics explicitly:
+
+1. **Reject the transition** — the enumeration this option needs *is* the set of
+   canonical blocks the organization references, so it already answers the reuse
+   question: after a transition, nothing referenced sits outside the region.
+2. **Accept and require migration** — reuse stays allowed while the organization is
+   marked non-compliant, and the migration job is what eventually makes referenced
+   content resident.
+3. **Forward-only** — reuse stays allowed indefinitely. The promise is "new bytes
+   land in R", explicitly not "referenced bytes live in R".
+
+There is a fourth position that must not be adopted silently: **residency of
+referenced content**, where a strict library may not publish a reference to
+canonical bytes outside R until they are replicated or migrated into R. It is the
+reading a customer is most likely to give `data_residency: strict`, it is the most
+expensive, and it is in direct tension with org-global deduplication as A-prime
+defines it — one of the two has to give. Whichever is chosen belongs next to the
+transition rule wherever `strict` is described commercially.
+
 Do not couple this to block migration. Changing the preference and moving bytes are
 separate operations; the migration TODO in the same handler stays out of scope.
 

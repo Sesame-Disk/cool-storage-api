@@ -539,7 +539,7 @@ walks the chain iteratively with a visited set.
 | **Per-region metrics** | ❌ No | `/metrics` exists but no per-backend health gauges |
 | **Geographic latency handling** | ⚠️ Partial | Global 5s timeout; not configurable per region |
 | **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
-| **Failover config validation** | ⚠️ Partial | Runtime cycle detection fails closed; startup validation and full edge-case coverage remain open |
+| **Failover config validation & runtime safety** | ⚠️ Partial | Startup validates that every `failover_class` names a registrable class (`Config.Validate`); at runtime `GetHealthyBackend`'s visited-set walk fails closed on an exhausted or fully unhealthy chain. **Cycles are supported configuration, not a misconfiguration** — `config.prod.yaml` ships `hot-s3-na` and `hot-s3-eu` pointing at each other so either region can be primary — so rejecting them at startup is not a requirement. Open: policy gating, since a `strict` organization must not fail over across regions (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus multi-level and all-unhealthy edge-case coverage |
 
 ---
 
