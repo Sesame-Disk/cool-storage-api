@@ -2,14 +2,13 @@
 
 **Date:** 2026-08-20
 **Status:** Detailed analysis. No option is approved for implementation.
-**Priority:** Option B is the preferred candidate for the next design phase.
+**Priority:** The current reference model is mutable library preference plus
+org-global canonical blocks. Options B and C are deliberate product changes.
 
-**Deployment scope:** The target deployment is greenfield. There is no
-production data that must be preserved, so the Cassandra schema can be designed
-directly for the selected identity model and the service can be deployed from
-an empty database. The analysis still covers runtime compatibility because
-empty initial state does not remove races between concurrent writers, failover,
-or GC.
+**Deployment scope:** This analysis may be evaluated against a greenfield
+deployment, but that is a deployment assumption, not a runtime property proved
+by the code. If existing data must be preserved, any class-scoped identity
+requires an explicit migration/cutover plan.
 
 This document analyzes the three placement domains described in
 [UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md).
@@ -24,46 +23,111 @@ removed safely.
 
 ## Executive verdict
 
-Option B is the cleanest boundary if a storage class represents a genuinely
-different physical namespace:
+The current product contract is:
 
 ```text
-logical block = (org_id, storage_class, representation_id, sha256)
+canonical block row identity = (org_id, internal_sha256)
+representation_id = immutable conflict-checked metadata on that row
+
+library.storage_class
+    = mutable preferred class for future first materialization
+
+blocks.storage_class
+    = actual canonical physical namespace selected for this block
 ```
 
-The shorter form proposed in the hot-path analysis is also valid if the system
-first proves that `representation_id` is completely determined by the content
-hash:
+The current `blocks` table is keyed by `(org_id, block_id)`. A first writer with
+no canonical row proposes the class selected from the library preference,
+request routing, or health failover. The actual class returned by that selection
+is persisted on the canonical row. A concurrent writer proposing another class
+does not create a second canonical row: the first-writer LWT chooses the winner.
+
+When a canonical row already exists, the library preference does not relocate or
+reinterpret it. Reuse and repair resolve the row's persisted `storage_class` and
+derive the same org-scoped hash key. A normal reusable block therefore avoids a
+physical PUT; a missing canonical object is repaired in its existing canonical
+class. Upload paths that reach metadata registration still execute the metadata
+LWT even when the physical PUT was skipped.
+
+Changing `libraries.storage_class` is therefore a cheap preference change:
+existing block rows and objects remain where they were, while later first
+materializations prefer the new class. `ChangeStorageClass` currently updates
+the library row and its administrative read model in one logged batch. The code
+contains a TODO for a separate future migration operation; it does not move
+bytes today.
+
+The current physical key is still hash-derived:
 
 ```text
-logical block = (org_id, storage_class, sha256)
+blocks/<org_id>/<first-two-hash-chars>/<next-two-hash-chars>/<sha256>
 ```
 
-The current implementation does not make that assumption silently. The block
-metadata path persists `representation_id` and rejects a conflicting value for
-an existing hash. Therefore the preferred design must either include
-`representation_id` in the logical identity or make its determinism an
-explicit invariant before the install LWT is removed.
+`storage_key` is persisted as metadata but current readers and writers derive
+this key and reject a conflicting persisted value; it is not yet an arbitrary
+locator authority. The physical tuple today is therefore the canonical class
+plus the derived key, not a free-form `storage_key`.
 
 The recommendation is:
 
-1. Make library placement explicit and immutable.
-2. Scope block identity by `storage_class`.
-3. Keep the metadata LWT while the new identity and lifecycle protocol are
-   being designed and measured.
-4. Treat cross-class failover as a separate replication or migration feature,
-   not as transparent placement.
-5. Only evaluate removal of the normal install LWT after exact physical
-   identity, stale-writer safety and ambiguous-outcome settlement are proven.
+1. Keep `library.storage_class` mutable and document it as future-placement
+   preference only.
+2. Keep the current `(org_id, block_id)` global-deduplication domain unless a
+   product decision explicitly changes it.
+3. Keep the first-writer metadata LWT while that global arbitration is part of
+   the product contract; measure and optimize its cost instead of assuming it
+   is accidental.
+4. Keep canonical readers, reuse, repair and GC bound to `blocks.storage_class`.
+5. Treat data migration as a separate explicit operation that must account for
+   blocks shared by multiple libraries and report transferred GB/cost.
+6. Do not evaluate LWT removal until an alternative arbitration model and the
+   exact physical-incarnation protocol are both proven.
 
-Option A is a useful simplification only if the product accepts one placement
-class per organization. With per-library classes and org-global deduplication,
-it does not remove the placement race.
+Option B remains a technically clean alternative only if the product accepts
+class-scoped deduplication and the physical locator/liveness model is redesigned
+with it. It is not the current product reference because a preference change
+would otherwise cause a second materialization of content already present in
+another class.
 
-Option C preserves global deduplication, but it conflicts with the current
-invariant that every block of a file uses one storage class. It would also make
-regional placement a function of content rather than a library policy. It is a
-larger architectural change than B.
+Option C preserves global deduplication but removes library preference as the
+placement authority. It conflicts with regional library policy and the current
+file-level placement expectations, so it is also a product change.
+
+## Confirmed Product Contract
+
+The current code confirms the following split:
+
+```text
+library.storage_class
+    mutable preference for a new canonical materialization
+
+blocks.storage_class
+    immutable class recorded for the canonical block row
+
+existing canonical block
+    reused or repaired in blocks.storage_class, regardless of the library's
+    current preference
+
+ChangeStorageClass(A -> B)
+    changes future preference only; it does not rewrite old block rows or bytes
+```
+
+The class name itself remains an append-only physical namespace identity under
+R23b. A class name must not be rebound or reused for another bucket/backend.
+That namespace rule is independent from the mutability of a library's
+preference.
+
+The upload-session boundary is not fully implemented as a class snapshot. The
+web session schema has no `storage_class` field, and block requests read the
+library preference when resolving a preferred store. If the preference changes
+while a session is active, successive first materializations can therefore see
+different preferences; a single-class-per-file guarantee would require a future
+session snapshot and commit check. This document must not claim that snapshot is
+already enforced.
+
+The future migration TODO in `internal/api/v2/libraries.go` is intentionally
+separate. A UI may eventually offer an explicit "migrate existing data" option,
+estimate bytes and transfer cost, and run a durable job. Changing the preference
+alone must not copy, delete, or reinterpret shared canonical blocks.
 
 ## Verified current state
 
@@ -96,17 +160,85 @@ the representation-aware forward mapping in
 The current priority is:
 
 ```text
-library.storage_class != empty -> library class
-library.storage_class == empty   -> request hostname/region/default
+library.storage_class != empty -> library preferred class
+library.storage_class == empty   -> request hostname/region/default preference
 ```
 
 This is implemented by `Manager.ResolveStorageClass` and
 `resolveLibraryBlockStoreForRequestContext`.
 
 The empty value is therefore not equivalent to a fixed default. It means that
-the request can select a different class depending on the endpoint that
-received it. A Cassandra read error is a third state and is intended to fail
-closed, not to select a default backend.
+the request can select a different preferred class depending on the endpoint
+that received it. A Cassandra read error is a third state and is intended to
+fail closed, not to select a default backend.
+
+### Residency policy, failover and preference changes
+
+The organization residency policy and the storage-manager failover policy are
+separate controls:
+
+| Control | Current scope | Does not do |
+|---|---|---|
+| `organizations.storage_config.data_residency: flexible` | New-library creation: requested class, request hostname/region, organization `default_region`, then global hot default | Does not relocate existing libraries or blocks |
+| `organizations.storage_config.data_residency: strict` | New-library creation: requires `default_region`; a requested class must be configured, hot-tier and mapped to the allowed region | Does not make later block materialization fail closed or constrain backend failover |
+| `libraries.storage_class` | Mutable preferred class persisted for a concrete library | Does not identify the physical class of historical blocks |
+| `storage.classes.<name>.failover_class` | New-materialization backend selection after the preferred class is already marked `Unhealthy` or `Failed` | Is not inferred from residency, hostname, region mapping or the library value |
+
+The creation resolver is `resolveCreateStorageClassForOrg` in
+`internal/api/v2/storage_policy.go`. Flexible creation follows requested class,
+hostname region, organization `default_region`, then the global hot class.
+Strict creation requires a configured hot class for `default_region`; a
+requested class must resolve to that region, and no requested class selects the
+region's hot class. The resolved value is persisted in `libraries.storage_class`
+by the library and administrative create paths. The policy is not consulted by
+the block-store selector after creation.
+
+`ChangeStorageClass` in `internal/api/v2/libraries.go` validates that the class
+is known, reads the live library and updates `libraries.storage_class` together
+with the administrative read model. It does not revalidate the organization's
+strict residency policy, update `blocks`, modify `fs_objects` or references,
+copy/delete S3 objects, calculate cost, or enqueue a migration job. Therefore a
+strict organization can currently change an existing library to any known class
+accepted by that endpoint, even when that class is outside the organization's
+creation region. This is a confirmed policy boundary, not a migration feature.
+
+For a new block, the handlers first resolve a preferred class and then call
+`GetHealthyBlockStoreForOrg`. `GetHealthyBackend` returns the preferred class
+when its state is `Unknown`, `Healthy` or `Degraded`; it follows
+`failover_class` only for `Unhealthy` or `Failed`. The returned `actualClass`,
+not the library preference, is passed to metadata registration and persisted on
+the canonical block row. A failover can therefore cross the strict creation
+region for a new block while leaving `libraries.storage_class` unchanged.
+
+`CheckHealth` probes `Exists("__health_check__")`. A connection or other probe
+error sets the backend to `Unhealthy`; a response slower than five seconds sets
+it to `Degraded`; a not-found response is considered `Healthy`. The
+`HealthFailed` result is returned for an unknown backend name, while an exhausted
+failover chain returns an error rather than marking a class automatically. The
+only production caller found for `UpdateHealth` is `CheckHealth`, and no
+periodic production caller of `CheckHealth` or `CheckAllHealth` exists. A normal
+S3 error in a PUT/GET path therefore does not itself update the health map or
+guarantee that the next request fails over. Runtime failover cycles are rejected
+by the visited-set walk in `GetHealthyBackend`; startup validates referenced
+class names but does not validate same-region policy, strict-policy compliance or
+cycles.
+
+Legacy `storage.backends` entries are registered with an empty failover class,
+so that compatibility format has no configured fallback unless the deployment
+uses the modern `storage.classes` format.
+
+The production modern classes currently define these failover edges in
+`configs/config.prod.yaml`:
+
+| Preferred class | Configured failover class |
+|---|---|
+| `hot-s3-na` | `hot-s3-eu` |
+| `hot-s3-eu` | `hot-s3-na` |
+| `hot-s3-asia` | `hot-s3-eu` |
+
+The same file maps `na`, `eu` and `asia` to their corresponding hot classes.
+Those mappings select the preferred class; they do not infer or override the
+explicit `failover_class` edges.
 
 ### Physical locator
 
@@ -148,30 +280,33 @@ The repository records these current numbers:
 | Web upload per-user block concurrency | 8 by default |
 | Shipped serial consistency | `SERIAL` in `configs/config.prod.yaml`; runtime env and topology determine the effective setting and WAN scope |
 
-The numbers are for blocks that reach metadata registration. Existing complete
-deduplicated blocks can be classified before registration and avoid that LWT.
-The LWT count is not a single global Cassandra partition lock: different block
-partitions can run concurrently, but each registering block still pays its own
-`SERIAL` LWT/Paxos transaction when that is the effective setting. Network
-round-trip count depends on Cassandra's Paxos variant.
+The numbers are for blocks that reach metadata registration. Some web/sync
+preflight paths can classify a complete existing block before registration and
+avoid that metadata LWT, but a path that reaches registration still executes it
+even when the physical PUT is skipped. The LWT count is not a single global
+Cassandra partition lock: different block partitions can run concurrently, but
+each registering block still pays its own `SERIAL` LWT/Paxos transaction when
+that is the effective setting. Network round-trip count depends on Cassandra's
+Paxos variant.
 
 ### Existing file and client invariants
 
-The architecture documentation requires all blocks of one uploaded file to use
-the same storage class and says that the policy is evaluated at the start of the
-upload session. The current web block-upload session schema does not yet store a
-`storage_class` snapshot, and the upload handler resolves the library placement
-when handling block requests. A new design must freeze the placement on the
-session and verify it again at commit; the documented invariant is not enough
-if the implementation does not persist its value.
+The current web block-upload session schema does not store a `storage_class`
+snapshot. Each block request resolves the library preference, while an existing
+canonical block is resolved from its `blocks` metadata. A preference change or a
+health failover during an active session can therefore produce different actual
+classes for different first materializations unless a future session snapshot is
+introduced. The current code does not enforce one class per file.
 
 At the Seafile boundary, the internal SHA-256 layout must not leak into the
 desktop protocol for the v2 and SeafHTTP writers. The `RecvFS` desktop-sync
 path intentionally retains the legacy layout in which `fs_objects.block_ids`
 contains SHA-1 and `seafile_block_ids_sha1` is empty, because the client can
 send `recv-fs` before `put-block`. In every layout, the Seafile `fs_id` remains
-SHA-1-derived. A placement change must preserve both the canonical and legacy
-boundaries.
+SHA-1-derived. Readers resolve the internal block ID to the canonical
+`blocks.storage_class` and derived key, so a library may contain files whose
+canonical blocks were materialized in different classes; the current reader
+does not infer historical placement from the library's current preference.
 
 ### GC and X1 status
 
@@ -188,249 +323,272 @@ The destructive GC path remains disabled because X1 physical-delete ABA and
 related publication/claim races are not closed. Deterministic placement only
 removes one part of the normal install race. It is not a GC authorization.
 
-## Option A: class fixed by library
+## Option A-prime: mutable library preference + global canonical block
+
+This is the current product model and the reference option for this analysis.
 
 ### Definition
 
-The library is the complete placement authority:
-
 ```text
-library.storage_class = hot-s3-na
+logical/canonical block row = (org_id, internal_sha256)
+
+library.storage_class
+    = preferred class when that row has no canonical physical placement
+
+blocks.storage_class
+    = actual class selected by the first successful materialization
 ```
 
-Every block written through that library uses that class and never derives a
-class from the request hostname.
+The class selected for a first writer may come from the library preference,
+request routing when the preference is empty, or health failover. The actual
+class returned by the store resolver is persisted on `blocks`. Later readers,
+reuse and repair use that persisted class.
 
-### What A fixes
+### What A-prime preserves
 
-1. A single library no longer proposes NA on one request and EU on another
-   merely because traffic reached a different endpoint.
-2. File-level placement remains simple because a library already represents a
-   natural placement boundary.
-3. `fs_objects` can continue storing only block hashes if the library class is
-   immutable and every block in the file follows it.
-4. The schema change can be smaller than B if the organization is guaranteed to
-   use one class globally.
+1. A library can change its future-placement preference without rewriting old
+   `blocks` rows or physical objects.
+2. Existing content remains globally deduplicated within the organization.
+3. A library whose preference changed from NA to EU can reuse a canonical block
+   already in NA; no second object is required merely because the preference
+   changed.
+4. `fs_objects.block_ids` remains a content identity list. Readers resolve each
+   internal ID through canonical block metadata, so a library can contain files
+   whose blocks were materialized in different classes.
+5. A health failover for a new block is recorded as the actual canonical class;
+   an existing block is never re-resolved through health failover.
 
-### What A does not fix
+### Current writer and reader coverage
 
-With the current org-global deduplication, this race remains:
+The production writers converge on the same `probe -> store/repair -> metadata`
+contract. Their preferred-store resolution is not an assertion that the
+preferred class is canonical for an existing block:
+
+| Surface | New/absent block | Existing canonical block |
+|---|---|---|
+| V2 session `internal/api/v2/blocks.go` | Resolves the library preference, selects a healthy store and persists the returned class | Reuse/repair resolves the probe's persisted class |
+| V2 file/template `internal/api/v2/files.go` | Resolves a preferred healthy store, then `ResolveNeedsPutBlockStore` records the effective class | `EnsureReusableBlockPresent` verifies/repairs the canonical class |
+| Sync `internal/api/sync.go` | `resolvePreferredBlockStore` selects the preferred/failover class | A non-empty canonical metadata class is selected exactly; fallback routing is only for the lookup/missing-metadata boundary |
+| SeafHTTP `internal/api/seafhttp.go` | Resolves a preferred healthy store for upload/finalization | Canonical reader resolves the block metadata class before reading |
+| OnlyOffice `internal/api/v2/onlyoffice.go` | Resolves a preferred healthy store for edited content | Existing content follows the canonical block path |
+| Canonical reader `internal/streaming/canonical_block_reader.go` | Not a writer | Uses `blocks.storage_class`, the exact org-scoped store and the derived-key invariant; it never follows failover |
+
+This coverage is why changing the library preference can produce a file whose
+blocks span classes without making historical reads depend on the current
+preference. The remaining legacy/fallback branches are deliberately called out
+in the source comments and must not be used as evidence that canonical reads
+fail over.
+
+There is one availability qualification for upload/reuse callers: the current
+handlers resolve an initial preferred/fallback store before running the reuse
+probe. If that preferred class is already `Unhealthy` or `Failed` and has no
+usable failover, the request can fail before it reaches the canonical probe even
+when the block's canonical row is in another healthy class. This is an early
+writer-admission dependency, not a canonical-reader redirect; a dedicated
+future migration/replica design would be needed to remove it.
+
+### The real first-writer race
+
+Two libraries can propose different classes for the same absent org/hash:
 
 ```text
-library A -> hot-s3-na -> hashX
-library B -> hot-s3-eu -> hashX
+library A prefers hot-s3-na -> B1, K
+library B prefers hot-s3-eu -> B2, K
 ```
 
-Both libraries still address the same current Cassandra row:
+Both writers address the same `blocks` row:
 
 ```text
 PRIMARY KEY ((org_id, block_id))
 ```
 
-The writers still compete to establish the canonical class. The LWT remains
-necessary unless one of the following product rules is introduced:
+The first-writer `INSERT ... IF NOT EXISTS` is therefore not accidental. It
+chooses which physical namespace becomes canonical while preserving global
+deduplication. A plain last-writer-wins write could point the row at a class
+where the winning writer did not put the object. The losing writer's physical
+side effects remain part of the existing orphan/fence and X1 work; the LWT only
+chooses canonical metadata.
 
-1. one class is allowed for the entire organization;
-2. the block identity also includes the library;
-3. deduplication across libraries with different classes is disabled, which is
-   effectively a form of B.
+### What `ChangeStorageClass` does today
 
-Making the class fixed by library does not guarantee that a block used by an EU
-library is physically in EU. The first writer from another library can still
-win the org-global canonical row.
-
-### Required changes under A
-
-| Area | Required change |
+| Event | Current behavior |
 |---|---|
-| Library creation | Persist a non-empty class for every library. |
-| Empty class behavior | Remove hostname/default routing for block placement or define a one-time assignment at library creation. |
-| `ChangeStorageClass` | Make immutable or implement a complete block migration before changing the value. |
-| Failover | Do not silently persist a different physical class as the library's placement. |
-| Initial schema | Do not carry a legacy org/hash-only block schema into the greenfield deployment. |
-| LWT | Keep it if different libraries may still use different classes for the same org/hash. |
+| `ChangeStorageClass(A -> B)` | Updates `libraries.storage_class` and the administrative read model. |
+| Existing canonical block | Keeps its `blocks.storage_class`, derived key and physical object. |
+| Later upload of an already-canonical hash | Reuses or repairs the canonical class; it does not move to B. |
+| Later first materialization of an absent hash | Prefers B, subject to routing and health failover. |
+| Active upload session | No persisted class snapshot; each block request reads the current preference. |
+| Optional migration | Not implemented; the code has a TODO for a separate future job. |
 
-### Product effect
+The future migration must be explicit because a block may be referenced by more
+than one library. Moving a shared object for one library could break another;
+the safe feature may need a copy/replica or class-scoped physical incarnation,
+reference accounting, progress and recovery state, and a reported transfer cost.
 
-A is attractive when an organization should have one data-residency location.
-It is not sufficient for the current product model, which exposes per-library
-storage selection and multiple regional classes.
+### Reader and manifest behavior
 
-### Verdict on A
+The canonical reader loads `blocks.storage_class`, obtains that exact org-scoped
+backend, derives `hashToKey(block_id)`, and checks any persisted `storage_key`
+against the derived value. It does not use the current library preference as the
+locator for historical blocks. This is true for v2 file reads, SeafHTTP,
+sync/download, share-link and ZIP paths that use the canonical reader.
 
-A is a low-complexity partial fix. It is not a complete solution while
-deduplication remains org-global and libraries can select different classes.
+The current code does not persist a placement snapshot in a web upload session
+and does not enforce one class per committed file. A future session snapshot may
+be desirable, but it is not part of the current contract.
+
+### Verdict on A-prime
+
+A-prime is the only option here that preserves the stated product semantics:
+mutable future preference, global org/hash deduplication and canonical physical
+placement recorded per block. It also preserves the reason for the metadata LWT:
+concurrent first writers with different preferences need an arbitration winner.
 
 ## Option B: class included in logical identity
 
+B is a technically coherent but semantics-changing alternative. It is not the
+current reference model and is not preferred merely because it could remove the
+current class-election LWT.
+
 ### Definition
 
-The logical identity becomes:
+The base class-scoped domain would be:
 
 ```text
-L = (org_id, storage_class, content_hash)
+B-base logical block = (org_id, storage_class, internal_sha256)
 ```
 
-For the current representation-aware implementation, the safer complete form
-is:
+If representation is also made part of the logical identity, the stronger form
+would be:
 
 ```text
-L = (org_id, storage_class, representation_id, internal_sha256)
+B-representation logical block =
+    (org_id, storage_class, representation_id, internal_sha256)
 ```
 
-The class is part of the block identity, not just a mutable attribute on one
-org/hash row.
+B deliberately changes deduplication from `(org_id, hash)` to a class-scoped
+domain. A library preference change could therefore cause a second physical
+materialization of bytes that already exist in another class.
 
-### What B fixes
+### What B fixes and costs
 
 1. `hot-s3-na/hashX` and `hot-s3-eu/hashX` are different logical blocks.
-2. Writers for the same logical block necessarily propose the same class.
-3. A first writer in NA cannot force an EU library to reuse the NA object.
-4. Deduplication remains available between libraries using the same class.
-5. GC candidates, references and orphans can be scoped to the exact class.
-6. Regional storage policy becomes a property of the materialized block rather
-   than a race outcome.
-7. The design matches the repository's append-only storage namespace contract.
+2. Writers for the same class-scoped identity no longer elect between classes.
+3. References, candidates and orphan state can be scoped to a class-scoped life.
+4. Identical bytes used in two classes require two physical objects; three
+   active classes can reach 3x the physical storage in a deliberate worst case.
+5. The product loses the current global cross-class deduplication semantics.
 
-### What B costs
+This is a product decision, not a mechanical optimization. The existing
+`ChangeStorageClass` behavior is correct for A-prime, but B would require every
+reader and liveness path to carry enough class identity to distinguish rows.
 
-Identical bytes used in two classes require two physical objects. With three
-active classes, a corpus that must exist in all three can reach 3x the physical
-storage of global deduplication.
-
-Example:
+Example of the deliberate duplication cost:
 
 ```text
 1 GiB content = 128 blocks at 8 MiB
 same content in NA + EU + Asia = 384 class-scoped block materializations
 ```
 
-This is a worst-case or deliberate multi-class materialization cost. Content
-used only in one class has no additional cost. Content shared by many libraries
-within one class still deduplicates once.
+Content used only in one class has no additional cost. Content shared by many
+libraries within one class still deduplicates once.
+
+### Representation and physical-locator blocker
+
+The current locator does not contain `representation_id`:
+
+```text
+K = blocks/<org_id>/<hash-prefix>/<internal_sha256>
+```
+
+The current `blocks` row is unique on `(org_id, block_id)` and
+`ensureBlockIdentityRow` rejects a conflicting `representation_id` for that row.
+That exclusion currently prevents two independently managed representation rows
+from sharing one physical hash-derived locator.
+
+It is not safe to make `representation_id` part of a future Cassandra primary
+key while leaving the physical key unchanged. If two rows can exist for the same
+`(org_id, storage_class, internal_sha256)` with different representations, both
+can name the same `(storage_class, K)`. One row could then lose its references,
+authorize GC and delete bytes still live through the other row.
+
+Before representation-scoped rows are approved, the design must choose one of:
+
+1. Keep representation out of the physical lifecycle identity and retain an
+   explicit same-hash conflict/invariant. This is the safer B-base direction.
+2. Make the physical locator distinct as well, for example by including
+   representation and a non-reused incarnation in `K`, before creating
+   independently GC-able rows.
+3. Share one physical object and one liveness domain across representations. In
+   that case the rows are not independent physical lifecycles and GC must retain
+   shared ownership.
+
+The forbidden intermediate is two independently collectible logical rows with
+one physical `(storage_class, storage_key)` tuple. This rule must precede any
+schema split.
 
 ### Required schema changes
 
-The current block-partition tables cannot represent both class-scoped lives if
-`storage_class` remains only a regular column.
-
-If the complete representation-aware identity is selected, the conceptual keys
-become:
+If B-base is selected, the conceptual keys become:
 
 ```cql
 blocks:
-PRIMARY KEY ((org_id, storage_class, representation_id, block_id))
+PRIMARY KEY ((org_id, storage_class, block_id))
 
 block_references:
-PRIMARY KEY ((org_id, storage_class, representation_id, block_id), referrer)
+PRIMARY KEY ((org_id, storage_class, block_id), referrer)
 
 gc_block_candidates:
-PRIMARY KEY ((org_id, storage_class, representation_id, block_id))
+PRIMARY KEY ((org_id, storage_class, block_id))
 ```
 
-If a separate proof establishes that `representation_id` is a deterministic
-function of `(org_id, storage_class, block_id)`, it can be omitted from the
-partition key. That is a design decision that must be made before coding, not
-an assumption to hide in a migration.
-
-For a new deployment these keys can be adopted directly in the initial schema.
-An existing deployment would additionally need a backfill, dual-read or
-dual-write period, and an explicit cutover plan; no migration strategy is
-approved by this analysis.
-
-The exact CQL table names are an implementation decision, but the identity
-constraint is not. The following surfaces must carry the class, and the
-representation when it is part of the selected identity, as identity or as a
-verified immutable snapshot:
+If B-representation is selected, the same surfaces must also carry
+`representation_id`, and the physical locator rule above must be solved in the
+same change. A greenfield schema changes migration cost but does not remove this
+runtime safety requirement.
 
 | Surface | B requirement |
 |---|---|
-| `blocks` | Partition by org, class, representation and SHA-256, unless representation determinism is made an explicit invariant. |
-| `block_references` | A reference to class A must not keep class B alive, and vice versa. If representation is part of the identity, references carry it too. |
-| `gc_block_candidates` | Candidates for the same hash in two classes must coexist. |
-| `gc_block_candidates_by_day` | Discovery identity must distinguish class A from class B. |
-| `gc_provisional_block_refs` | Expiry tracking must be scoped to the class-scoped block. |
-| `gc_provisional_block_refs_by_day` | Discovery must preserve the same identity. |
-| `gc_s3_orphans` | Recovery must distinguish same-hash orphans in different classes. |
-| `gc_s3_orphans_by_day` | The projection must not collapse those identities. |
-| GC queue items | Block operations must carry class even where the queue primary key already includes time. |
-| Publish repair rows | Staged block IDs need a class snapshot or a reliable library placement snapshot. |
-| OnlyOffice pending rows | Pending blocks need class identity when they can outlive the request. |
+| `blocks` | Partition by org, class and hash; add representation only with a matching physical locator/liveness design. |
+| `block_references` | A reference to class A must not keep class B alive, and vice versa. |
+| `gc_block_candidates` and by-day projection | Candidate identity must distinguish class A from class B. |
+| `gc_provisional_block_refs` and by-day projection | Expiry identity must preserve the class. |
+| `gc_s3_orphans` and by-day projection | Recovery must distinguish same-hash classes and exact physical tuples. |
+| GC queue items | Block operations must carry the class and exact physical identity. |
+| Readers and reuse probes | A hash-only lookup is ambiguous; class must come from a durable file/block identity or equivalent canonical mapping. |
 
 ### `fs_objects` compatibility under B
 
-`fs_objects.block_ids` can remain a list of internal SHA-256 IDs only under a
-strong invariant:
-
-```text
-every library has one immutable storage_class
-every upload session stores that class as an immutable snapshot
-every block in every file of that library uses that class
-```
-
-Under that invariant, readers obtain the class from the library or the durable
-file/session snapshot and query the class-scoped block identity. The current
-web session model must be extended because it currently stores the repository
-but not the resolved class.
-
-If a library may contain blocks from multiple classes, `fs_objects` needs a
-parallel class list or another internal block identity representation. The
-class list must remain positional and must not be exposed as a Seafile block ID.
+Under the current A-prime schema, `fs_objects.block_ids` can remain a list of
+internal SHA-256 IDs because there is one canonical row per org/hash and that
+row records the actual class. Under B, multiple class rows for one hash make a
+hash-only manifest ambiguous. B would need a durable class-scoped block identity
+in the file/reference path, a canonical mapping that selects exactly one class
+for each file entry, or an equivalent representation. The current library's
+mutable preference is not sufficient to read historical blocks.
 
 ### `ChangeStorageClass` under B
 
-The current endpoint updates the library row and leaves block migration as a
-TODO. That behavior is unsafe under B.
-
-The supported choices are:
-
-| Choice | Result |
-|---|---|
-| Make placement immutable | Smallest safe product change. A class change returns a conflict unless a migration exists. |
-| Migrate blocks before cutover | Copy every referenced block, create class-scoped identities, update the library atomically, and retain rollback/recovery state. |
-| Add placement versions per file | More flexible, but requires class metadata for each file/block and broad reader/GC changes. |
-| Update only `libraries.storage_class` | Unsafe. Existing `fs_objects` continue pointing logically to blocks in the old class. |
-
-The preferred first implementation is immutable library placement.
+`ChangeStorageClass` may remain a mutable future-placement preference, but B must
+define how an existing file identifies its class-scoped blocks after the change.
+Making the library preference immutable is not required by the current product
+contract and is not a valid substitute for that identity design.
 
 ### Failover under B
 
-The current health-aware selector may return a failover class different from the
-preferred class. That is incompatible with deterministic class identity if the
-fallback is another physical namespace.
-
-B requires one of these contracts:
-
-1. Failover stays inside the same physical namespace, for example alternate
-   endpoints or credentials for one class.
-2. Writes fail when the canonical class is unavailable.
-3. A separate replication/migration operation creates a new class-scoped copy.
-4. The actual fallback class becomes a new explicit placement identity and is
-   recorded consistently for the whole affected library/file.
-
-The unsafe behavior is to let one writer use `hot-s3-na` and another use
-`hot-s3-eu` because health state differed, then claim placement is deterministic.
+For a first materialization, the current health-aware selector can return a
+failover class different from the preferred class; the actual returned class is
+persisted today. Under B, that actual class becomes part of the new logical
+identity and must be carried through the file, references and GC. Existing
+canonical blocks still resolve without failover.
 
 ### Does B remove the metadata LWT?
 
-B removes the reason for the LWT that chooses between different classes. It does
-not automatically remove every safety reason for conditional writes.
-
-The following conditions still have to be proven:
-
-1. All writers of one identity produce the same immutable metadata.
-2. `representation_id`, SHA-1, size and storage key cannot conflict for one
-   identity.
-3. A stale writer cannot recreate a retired incarnation after GC.
-4. Repairing an existing physical incarnation cannot recreate a missing
-   canonical row incorrectly.
-5. An ambiguous install timeout cannot cause key reuse or speculative cleanup.
-6. GC claims, orphan records and deletes refer to the same exact physical tuple.
-
-The current hash-derived key is reused across physical lives. Therefore B should
-first be implemented with the metadata LWT retained. Removing the LWT belongs
-after the exact-`P` protocol described in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) is designed and proven.
+B removes the specific cross-class election from an install only if every writer
+of one selected identity produces identical metadata. It does not remove the
+conditional operations needed for stale-writer, repair, GC and ambiguous-outcome
+safety. The representation/locator blocker must be closed before treating the
+LWT as removable.
 
 ### Product and storage effect
 
@@ -441,11 +599,11 @@ physical class.
 
 ### Verdict on B
 
-B is the preferred architecture if storage classes represent distinct physical
-namespaces and regional placement is a product requirement. In this greenfield
-deployment it is a direct initial-schema redesign, not a production data
-migration, but it remains a broad code-path change rather than a one-line
-optimization.
+B is technically clean for a product that explicitly wants class-scoped
+deduplication or explicit class-scoped replicas. It is not preferred for the
+current contract because it makes a mutable library preference alter the
+deduplication domain. Any future B design must sequence representation identity,
+physical locator identity and GC liveness together.
 
 ## Option C: home class derived from org and hash
 
@@ -470,8 +628,10 @@ Every library and writer for the same org/hash uses the same home class.
 
 ### File-level placement conflict
 
-The current architecture requires all blocks of one file to use one class.
-With three uniformly selected classes and a 128-block GiB file:
+The current product preference may be evaluated per materialization request, and
+the current web session does not persist a class snapshot. C would force a
+different rule: every hash has a home class. With three uniformly selected
+classes and a 128-block GiB file:
 
 ```text
 P(all 128 blocks in one class) = 3 * (1/3)^128 = 3^-127
@@ -481,7 +641,8 @@ That is effectively zero. A normal large file will be spread across regions.
 Approximately two-thirds of its blocks will be remote from any one region under
 uniform placement.
 
-To adopt C, the system would need to choose between:
+To adopt C while preserving a one-class-per-file product rule, the system would
+need to choose between:
 
 1. abandoning the one-class-per-file invariant;
 2. storing a class alongside every block ID in `fs_objects`;
@@ -538,26 +699,26 @@ the identity and recovery rules.
 
 ### Verdict on C
 
-C is appropriate only if global deduplication is more important than regional
-locality and file-level placement. It requires a larger redesign than B and is
-not compatible with the current file placement invariant without additional
-metadata.
+C is appropriate only if global deduplication is more important than library
+placement preference and the product accepts the file-level consequences. It
+requires a larger redesign than B and changes placement authority from the
+current library preference to a hash function.
 
 ## Cross-option comparison
 
-| Criterion | A: library fixed | B: class in identity | C: hash home |
+| Criterion | A-prime: mutable preference | B: class in identity | C: hash home |
 |---|---:|---:|---:|
 | Same hash can have distinct class lives | No | Yes | No |
-| Removes current cross-class placement race | No, unless one class per org | Yes | Yes, if function is stable |
+| Removes current cross-class placement race | No; first-writer arbitration is the contract | Yes | Yes, if function is stable |
 | Preserves cross-class deduplication | Yes | No | Yes |
-| Preserves one class per file | Yes if library is immutable | Yes if library is immutable | No |
-| Preserves library residency authority | Yes | Yes | No |
-| New schema scope | Low to medium | High | Medium to high |
+| Preserves one class per file | Not enforced by current session code | Requires class identity in file/reference path | No without extra design |
+| Preserves library preference authority | Yes | Only for new class-scoped lives | No |
+| New schema scope | Current schema | High | Medium to high |
 | GC identity changes | Medium | High | High |
 | Sensitivity to class-set changes | Low | Low | High |
 | Storage duplication | None from placement | Up to number of classes | None from placement |
 | Regional locality | Good only after first-writer issue is removed | Good | Poor for large files |
-| Fit with current architecture | Partial | Best for a greenfield schema redesign | Weak |
+| Fit with current architecture | Reference model | Product-changing redesign | Weak |
 
 ## Recommended implementation sequence
 
@@ -571,36 +732,41 @@ Instrument:
 3. `applied=true` and `applied=false` outcomes;
 4. retries and timeout distributions;
 5. classes proposed for the same org/hash across libraries and DCs;
-6. deduplication loss under `(org, storage_class, hash)`;
+6. current global-dedupe behavior versus the deliberate loss under
+   `(org, storage_class, hash)`;
 7. class changes during active upload;
 8. failover writes and the class actually persisted.
 
-### Phase 1: freeze placement semantics
+### Phase 1: preserve the current placement semantics
 
-1. Require a non-empty, canonical `storage_class` for each new library.
-2. Do not support an empty-class library in the new deployment schema.
-3. Make class changes immutable or route them through migration.
-4. Prevent cross-namespace health failover from silently changing canonical
-   placement.
+1. Keep `library.storage_class` mutable and treat it as future-placement
+   preference only.
+2. Keep the current empty-class fallback semantics unless a separate product
+   decision removes request-based preference selection.
+3. Keep `blocks.storage_class` as the actual canonical class and never rewrite it
+   merely because a library preference changes.
+4. Record the actual failover class for a first materialization; existing
+   canonical blocks must resolve without failover.
 5. Keep production `SERIAL` and keep destructive GC disabled.
 
-### Phase 2: introduce the class-scoped identity
+### Phase 2: only if the product chooses B
 
-1. Define the initial schema with class-scoped block, reference, candidate,
-   provisional-tracker and orphan identities.
-2. Include `representation_id` in those identities unless its determinism is
-   explicitly proven.
-3. Add `storage_class` to the upload-session admission snapshot.
-4. Validate that each newly committed file's blocks agree with its library and
-   session placement.
-5. Do not add backfill, dual-write or legacy-table compatibility code for the
-   empty greenfield database.
+1. Define class-scoped block, reference, candidate, provisional-tracker and
+   orphan identities together.
+2. Start with B-base unless representation determinism is explicitly proven.
+3. If representation is added to the identity, separate the physical locator or
+   preserve shared liveness in the same change; never split Cassandra identity
+   first and physical identity later.
+4. Add class identity to the file/reference path so readers do not use the
+   mutable library preference for historical blocks.
+5. Define migration/cutover behavior for any non-empty deployment; greenfield
+   scope changes cost, not the safety proof.
 
 ### Phase 3: migrate every block path
 
-There is no production data migration in this deployment. This phase is a code
-and contract migration: every path must construct and consume the new identity
-from its first write.
+This phase is a code and contract migration: every path must construct and
+consume the new identity from its first write, and an existing deployment would
+also need a data migration/cutover plan.
 
 Update the identity passed through:
 
@@ -618,25 +784,28 @@ Update the identity passed through:
 The SHA-1 to SHA-256 mapping remains a content mapping and must not become an
 accidental class lookup unless that is explicitly designed.
 
-### Phase 4: prove B while retaining the LWT
+### Phase 4: prove the chosen model while retaining the LWT
 
 Required tests:
 
 | Test | Expected result |
 |---|---|
-| Same org/hash/representation, same class, concurrent writers | One class-scoped canonical identity and one logical object. |
-| Same org/hash/representation, two classes | Two independent identities and two physical objects. |
-| Reuse from another library, same class | Reuse succeeds. |
-| Reuse from another library, different class | Reuse does not cross the class boundary. |
-| GC candidate in class A, live reference in class B | Class A operation cannot delete or clear class B state. |
-| Class A unavailable during write | No silent write to class B unless replication is explicit. |
-| Library class change during upload | Operation is rejected or follows a durable migration state. |
+| Existing hash canonical in NA, library preference changes to EU | Reuse/read stays in canonical NA; no second object is created by the preference change. |
+| Absent hash, concurrent NA/EU preferences | Exactly one canonical class wins through the current first-writer LWT. |
+| Existing metadata with missing object | Repair writes the persisted canonical class, not the current library preference. |
+| Library class change | Existing rows/objects remain unchanged; future absent hashes prefer the new class. |
+| Same org/hash/representation, same class under B | One class-scoped canonical identity and one logical object. |
+| Same org/hash/representation, two classes under B | Two physical identities only if B is explicitly selected. |
+| Same org/class/hash, different representation under B | Reject as conflict or use physically distinct keys; never two independently GC-able rows sharing P. |
+| GC candidate in class A, live reference in class B under B | Class A operation cannot delete or clear class B state. |
+| Class A unavailable during write | Persist the actual failover class and carry it through the selected identity. |
 | Seafile desktop client reads new data | SHA-1 block list and SHA-1-derived `fs_id` remain unchanged; the intentional `RecvFS` legacy layout still works. |
 
-### Phase 5: separately evaluate LWT removal
+### Phase 5: separately evaluate LWT optimization/removal
 
-Only after B is proven should the project evaluate removing the normal install
-LWT. That work must also prove:
+The current A-prime contract gives the first-writer LWT a semantic job. Any
+optimization or removal must first provide an equivalent arbitration mechanism
+or explicitly change the deduplication product semantics. It must also prove:
 
 1. exact physical tuple identity `P = (storage_class, storage_key)`;
 2. non-reused physical keys for new incarnations;
@@ -647,25 +816,27 @@ LWT. That work must also prove:
 7. ambiguous outcomes are settled before reuse or deletion.
 
 GC LWTs and other conditional lifecycle operations must not be weakened merely
-because normal block installation no longer uses Paxos.
+because a future normal-install arbitration mechanism no longer uses Paxos.
 
 ## Final decision proposal
 
-The next design decision should be:
+The current design decision should be:
 
 ```text
-Adopt B as the target logical identity, with immutable library placement,
-but do not remove the install LWT in the same change.
+Keep A-prime as the reference model: mutable library preference, global
+org/hash canonical identity, canonical block placement in metadata, and
+first-writer arbitration retained while X4 is measured.
 ```
 
 This separates two questions that are currently coupled:
 
-1. Which logical block is being addressed?
+1. Which logical block is being addressed under global deduplication?
 2. Which physical incarnation may be installed or destroyed?
 
-B answers the first question. X1, exact physical locators and the generation or
-incarnation protocol answer the second. Treating them as one mechanical LWT
-removal would create a safety regression.
+A-prime answers the first without introducing class-scoped duplicate logical
+blocks. X1, exact physical locators and the generation or incarnation protocol
+answer the second. Treating B, representation scoping and LWT removal as one
+mechanical change would create a safety regression.
 
 ## Source references
 
@@ -679,11 +850,17 @@ The analysis was checked against these current sources:
   consistency pins.
 - `internal/storage/storage.go`: class resolution and health failover.
 - `internal/storage/blocks.go`: hash-derived physical key and delete API.
+- `internal/config/config.go`: class registration and failover-reference validation.
+- `internal/api/server.go`: modern and legacy backend registration.
+- `internal/api/v2/storage_policy.go`: flexible/strict new-library placement.
 - `internal/api/v2/storage_resolution.go`: library/request placement resolution.
 - `internal/db/block_upload_sessions.go`: current web upload-session admission
   fields and the absence of a placement snapshot.
 - `internal/api/v2/blocks.go`: session block-store resolution and the returned
   actual class after health-aware selection.
+- `internal/api/v2/files.go`, `internal/api/seafhttp.go` and
+  `internal/api/v2/onlyoffice.go`: new-materialization writers and canonical
+  read plumbing.
 - `internal/api/sync.go`: intentional `RecvFS` legacy fs-object layout.
 - `internal/api/v2/libraries.go`: current `ChangeStorageClass` behavior.
 - `internal/api/v2/upload_reuse.go`: canonical class and derived-key checks.

@@ -246,7 +246,8 @@ func (h *BlockHandler) buildFallbackOrgBlockStore(orgID string) *storage.BlockSt
 	return bs
 }
 
-// lookupLibraryStorageClass reads the storage class a library's blocks live in.
+// lookupLibraryStorageClass reads the library's preferred class for future block
+// materialization. Existing canonical blocks use the class persisted on blocks.
 func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) (string, error) {
 	if h == nil || h.db == nil || orgID == "" || repoID == "" {
 		return "", nil
@@ -254,11 +255,11 @@ func (h *BlockHandler) lookupLibraryStorageClass(orgID, repoID string) (string, 
 	return lookupLibraryStorageClass(h.db, orgID, repoID)
 }
 
-// getBlockStoreForRepo resolves the BlockStore for a specific library, honoring
-// its storage class. The session upload path MUST use this (not the generic
-// hostname/"hot" getBlockStore), or it could store/materialize a block in a
-// different backend than the one file-from-blocks later verifies for that repo —
-// which would make the commit report the block missing even though it was sent.
+// getBlockStoreForRepo resolves the preferred BlockStore for a specific library.
+// The session upload path MUST use this (not the generic hostname/"hot" store)
+// when choosing a destination for a block with no canonical metadata. Existing
+// metadata is resolved separately by the canonical reader/reuse probe, so a
+// library preference change does not reinterpret an existing block.
 func (h *BlockHandler) getBlockStoreForRepo(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass, err := h.lookupLibraryStorageClass(orgID, repoID)
 	if err != nil {

@@ -190,8 +190,8 @@ purposes:
   Node 3 has deliberately squeezed block-PUT admission settings for deterministic
   refusal tests; use node 2 for shipped-default admission and memory measurements.
 - The dedicated `docker-compose-multiregion.yaml` stack remains the right place
-  for region-sensitive scenarios: hostname routing through nginx, persisted
-  region/storage-class behavior, and failover between region-pinned backends.
+  for region-sensitive scenarios: hostname routing through nginx, preference-based
+  new placement, canonical block reads, and failover between region backends.
 
 The legacy shell harnesses in `scripts/test-multiregion.sh` and
 `scripts/test-failover.sh` are still useful for connectivity, routing, and
@@ -213,8 +213,8 @@ compose-based multi-instance path should run GC. Secondary test nodes must keep
 share-link-expiration tests.
 
 For the current safe slice, the most important backend checks are the Go integration tests
-that verify region-pinned libraries keep reading and writing from the persisted storage
-class instead of the request host default.
+that verify new materializations honor the library/request preference while existing
+canonical reads resolve their persisted block class instead of the request host default.
 
 That safe slice now also includes org-level create-time policy for new libraries:
 
@@ -345,9 +345,14 @@ docker exec sesamefs-multiregion-minio-1 mc ls local/sesamefs-usa/
 
 Expected behavior in the current implementation:
 
-- A library created with explicit `storage_id` stays pinned to that storage class.
-- A library created without `storage_id` inherits the region mapped from the request hostname.
-- Later reads must follow the persisted library choice even if the request hits a different hostname.
+- A library created with explicit `storage_id` stores a preference for future
+  first materializations in that storage class.
+- A library created without `storage_id` derives its initial preference from the
+  region mapped from the request hostname.
+- Later reads, reuse and repairs resolve each block's persisted canonical class,
+  even if the request hits a different hostname or the library preference changes.
+- The current upload session does not snapshot the preference, so successive
+  absent blocks can use different actual classes.
 - Historic downloads/raw previews and raw share-link responses must behave the same way.
 
 What is not covered by this safe slice:

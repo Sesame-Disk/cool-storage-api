@@ -221,8 +221,9 @@ reached metadata registration. PR-7 removed that path, so every remaining
 supported production upload surface registers metadata.
 
 It is load-bearing, not incidental. `storage_class`/`storage_key` are not globally
-fixed per block — uploads pick a class per library and per routing region — so
-first-writer-wins pins one canonical physical location. Without it a
+fixed per block — a new materialization picks a preferred class from the library
+or request routing, while an existing canonical row retains its persisted class
+— so first-writer-wins pins one canonical physical location. Without it a
 last-writer-wins INSERT could repoint metadata at a class holding no copy, which
 breaks reads and makes GC act on the wrong object.
 
@@ -284,14 +285,20 @@ The provisional reference is an ordinary write; expiry and its by-day projection
 a separate logged batch. PR-2's explicit `RepairableStub` decision closed X7 without
 adding an unconditional stub-repair LWT to every new block.
 
-### Proposed fixes
+### Proposed fixes and current decision boundary
 
-1. **Remove the Paxos: make `storage_class` deterministic per `(org_id, block_id)`.**
-   Derive it from a stable routing function instead of the serving node's preferred
-   backend. If every writer computes the same value, there is nothing to serialize:
-   a plain last-writer-wins INSERT always writes the same class/key and the LWT can
-   be dropped outright. This is a design change (routing must become a pure function
-   of org+block, and existing rows must keep resolving), not a mechanical edit.
+The options below are historical candidates from the performance investigation.
+The current reference model remains mutable library preference plus the
+org-global `(org_id, block_id)` canonical row. No item below authorizes removing
+the first-writer LWT without a separately approved identity, locator and GC
+liveness design.
+
+1. **Do not remove the Paxos as a mechanical performance fix.** A deterministic
+   class derived per `(org_id, block_id)` is Option C, not the current product
+   contract: it removes library placement authority and requires a versioned
+   placement function, stable class membership, existing-row compatibility and
+   migration rules. Option B changes the deduplication identity instead. Either
+   option must be approved separately before the LWT can be reconsidered.
 
    The detailed comparison of library-fixed, class-scoped and hash-home placement,
    including the B schema and GC implications, is in
@@ -455,4 +462,4 @@ without a database connection.
 | 3 | S-1 | Sticky sessions at LB (immediate) or distributed chunk state (complete) | Required for multi-node topology |
 | 4 | S-2/S-3 | Roll out a real `chunked_staging_max_bytes` value per node | Operational hardening follow-through |
 | 5 | S-4 | Atomic quota reservation at upload start | Closes the concurrent over-quota window |
-| 6 | P-4 | Deterministic per-`(org, block)` storage class, then drop the first-writer LWT. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | Removes one `SERIAL` LWT/Paxos transaction per metadata-registering block invocation. Both governed upload modes pay it when they reach registration; preflight-bypassed dedup blocks do not. Measure first. |
+| 6 | P-4 | Measure the metadata LWT and characterize A-prime versus the explicit B/C alternatives. **Preserve the fresh post-reference fence read** — do not merge it with the pre-PUT probe. | The LWT currently arbitrates the global canonical class. Do not remove it until an approved alternative proves identity, locator, repair and GC safety. |

@@ -351,7 +351,7 @@ storage:
 Incoming Upload
       │
       ▼
-Library has override? ──yes──▶ Use library class
+Library has preference? ──yes──▶ Prefer library class
       │ no
       ▼
 Endpoint region mapping ──▶ Find hot class for region
@@ -361,10 +361,12 @@ Store block + record storage_class in DB
 ```
 
 The library placement lookup is tri-state. A successful non-empty
-`libraries.storage_class` selects that class; a successful empty value permits the
-hostname/region/default policy above; any Cassandra read error is UNKNOWN and fails
-closed. Sync, SeafHTTP, v2 block/file and OnlyOffice paths do not route, probe, or
-write through a default backend after a failed placement read.
+`libraries.storage_class` selects that class as the preferred destination for a
+new materialization; health-aware store selection may persist a failover class.
+A successful empty value permits the hostname/region/default policy above; any
+Cassandra read error is UNKNOWN and fails closed. Sync, SeafHTTP, v2 block/file
+and OnlyOffice paths do not route, probe, or write through a default backend after
+a failed placement read.
 
 A missing `libraries` row is part of that third state, not the second. Every caller
 reaches this lookup with an org/library pair an access token or upload session already
@@ -415,7 +417,10 @@ policies:
 
 ### Lifecycle Policies
 
-Blocks can be migrated between storage classes based on access patterns:
+An explicit future migration job may move referenced blocks between storage
+classes based on access patterns. Changing `libraries.storage_class` alone does
+not migrate bytes, because a canonical block can be shared by multiple
+libraries and its physical class is recorded on `blocks`.
 
 ```yaml
 lifecycle:
@@ -483,7 +488,14 @@ storage:
 
 ### File-Level Storage Consistency
 
-When a file is uploaded, **ALL blocks of that file** must use the same storage class. The policy is evaluated once at the start of the upload session, not per-block.
+The current code does not enforce one storage class for every block of a file.
+Each new block materialization resolves the current library preference, or the
+request region/default policy when that preference is empty. An active session
+does not persist a storage-class snapshot, so successive blocks can be placed
+in different classes. Existing blocks are read and repaired from their
+canonical `blocks.storage_class`, independent of the library's current
+preference. A single-class-per-file guarantee would require a future session
+snapshot and commit-time validation.
 
 ---
 

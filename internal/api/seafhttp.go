@@ -1781,6 +1781,9 @@ var lookupLibraryStorageClassForSeafHTTPFn = func(ctx context.Context, h *SeafHT
 	return h.lookupLibraryStorageClassContext(ctx, orgID, repoID)
 }
 
+// resolveLibraryBlockStore returns the library-preferred store for new
+// materialization and fallback plumbing. Canonical reads and repairs resolve the
+// persisted block storage_class instead of this mutable library preference.
 func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
 	return h.resolveLibraryBlockStoreContext(context.Background(), hostname, orgID, repoID)
 }

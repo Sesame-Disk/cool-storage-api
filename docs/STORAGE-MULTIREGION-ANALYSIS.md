@@ -26,9 +26,15 @@ The system implements a sophisticated multiregion storage architecture:
 1. Request arrives at `eu.sesamefs.com`
 2. Hostname mapped to region "eu"
 3. Region "eu" mapped to storage class "hot-s3-eu"
-4. Library created with `storage_class="hot-s3-eu"`
-5. File operations use `GetHealthyBlockStore("hot-s3-eu")`
-6. If EU unhealthy, failover to configured `failover_class`
+4. Library created with `storage_class="hot-s3-eu"` as a preference for future
+   first materializations
+5. New block writes use the preferred class and health-aware selection; an
+   actual failover class is persisted when selected
+6. Existing reads, reuse and repairs resolve each block's persisted canonical
+   `blocks.storage_class`, not the library preference
+7. If EU is unhealthy, only the new-materialization selection can use the
+   configured `failover_class`; changing the library preference does not move
+   existing bytes
 
 ---
 
@@ -52,21 +58,21 @@ grep -r "CheckAllHealth\|CheckHealth.*goroutine\|ticker.*Health" internal/api/
 
 **Verified:** ✅ TRUE
 
-**Impact:** A region can go down and the system won't know until a user request hits it. Health status remains `HealthUnknown` (treated as healthy) until an actual error occurs.
+**Impact:** A region can go down and the system won't know until a user request or an explicit health probe reaches it. Health status remains `HealthUnknown` (treated as healthy) because ordinary storage errors do not update the health map.
 
 **Current behavior:**
 1. EU S3 bucket becomes unreachable at 10:00 AM
 2. Health status stays `HealthUnknown` (system assumes healthy)
 3. User uploads file to EU library at 10:05 AM
-4. Upload fails with timeout/error
-5. `UpdateHealth()` is called, status becomes `Unhealthy`
-6. **Next** upload triggers failover
+4. Upload can fail with timeout/error
+5. The storage error does not call `UpdateHealth()`
+6. A later request is not guaranteed to fail over unless an explicit health probe has marked the class `Unhealthy` or `Failed`
 
 First user sees the error. No proactive failover.
 
 ---
 
-### MEDIUM: Upload/download paths use health-aware backend selection (CLAIM WAS FALSE)
+### MEDIUM: New-materialization paths use health-aware backend selection (CLAIM WAS FALSE)
 
 **Files:** `internal/api/v2/files.go`, `internal/api/v2/blocks.go`, `internal/api/seafhttp.go`, `internal/api/sync.go`
 
@@ -93,7 +99,9 @@ internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBloc
 
 **Exception:** `internal/api/sync.go:769` uses `GetBlockStore()` but has fallback logic at line 773.
 
-**Conclusion:** This is actually **implemented correctly**. Upload/download paths DO use health-aware selection.
+**Conclusion:** Health-aware selection is implemented for new materialization and
+fallback paths. Existing canonical reads, reuse and repair resolve the persisted
+block class and do not silently reinterpret it through a failover class.
 
 ---
 
@@ -101,12 +109,12 @@ internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBloc
 
 **Files:** `internal/storage/manager_test.go` (TestManagerGetHealthyBackend)
 
-**Claim:** Failover logic is recursive but circular detection and multi-level chains are untested.
+**Claim:** Failover chains and circular-detection edge cases are not fully tested.
 
 **Existing tests:**
 - ✅ Single-level failover (USA → EU) - line 195-209
 - ❌ Multi-level chain (EU → USA → Asia)
-- ❌ Circular failover detection (EU → USA → EU)
+- ❌ Circular failover detection (EU → USA → EU) regression coverage
 - ❌ All backends in chain unhealthy
 
 **Test result:**
@@ -118,7 +126,9 @@ go test -v ./internal/storage/... -run TestManagerGetHealthyBackend
 
 **Verified:** ⚠️ **PARTIALLY TRUE** — Basic failover tested; edge cases not tested.
 
-**Risk:** If misconfigured with circular failover, the system will infinite loop and stack overflow.
+**Current code:** `GetHealthyBackend` now uses a visited set and returns a cycle
+error instead of recursing indefinitely. The remaining risk is insufficient
+regression coverage for the cycle, multi-level and all-unhealthy cases.
 
 ---
 
@@ -131,9 +141,10 @@ go test -v ./internal/storage/... -run TestManagerGetHealthyBackend
 **Existing tests:**
 - ✅ `sharelink_region_test.go` — Creates library at EU endpoint
 - ✅ `org_storage_policy_test.go` — Tests strict/flexible policy
-- ❌ Upload when primary region unhealthy
-- ❌ Download from failed region via failover
-- ❌ Library creation when primary down
+- ❌ New materialization when preferred region is unhealthy
+- ❌ Existing canonical download from a failed region, which should fail closed
+  unless an explicit migration/replica path exists
+- ❌ New block materialization after library creation when the preferred class is down
 
 **Test:**
 ```bash
@@ -149,7 +160,7 @@ find internal/integration -name "*region*test.go" -o -name "*failover*test.go" -
 
 ### LOW: Health check timeout is global (5s), not configurable
 
-**Files:** `internal/storage/storage.go` (CheckHealth line 337)
+**Files:** `internal/storage/storage.go` (`CheckHealth`)
 
 **Code:**
 ```go
@@ -211,10 +222,10 @@ curl -s http://localhost:8082/metrics | grep storage
 | Gap | Risk | What to add |
 |-----|------|-------------|
 | **Automated health monitoring** | High | Verify background goroutine calls CheckAllHealth every 30s |
-| **Upload failover integration test** | High | Upload when primary unhealthy → verify failover succeeds |
-| **Download failover integration test** | High | Download from failed region → verify failover retrieves data |
+| **New-materialization failover integration test** | High | New block with unhealthy preferred class → verify the actual failover class is persisted |
+| **Canonical-read failure integration test** | High | Existing block with failed canonical class → verify no preference-based reinterpretation and a fail-closed response |
 | **Multi-level failover chain** | Medium | 3-region chain (EU → USA → Asia) with middle down |
-| **Circular failover detection** | Medium | EU → USA → EU returns error, not infinite loop |
+| **Circular failover detection regression** | Medium | EU → USA → EU returns an explicit cycle error |
 
 ---
 
@@ -251,8 +262,8 @@ curl -X POST http://localhost:8082/seafhttp/upload-api/$REPO \
 # 5. Stop MinIO to simulate region failure
 docker stop cool-storage-api-minio-1
 
-# 6. Try upload again
-# Expected: Should use failover if configured
+# 6. Try a new block upload again
+# Expected: Should use failover if configured, and persist the actual class
 # Actual: Will fail because no automated health monitoring
 
 # 7. Restart MinIO
@@ -299,16 +310,16 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 | Practice | Status | Notes |
 |----------|--------|-------|
 | **Multiregion architecture** | ✅ Yes | Region-to-class mapping, endpoint routing implemented |
-| **Health-aware failover logic** | ✅ Yes | `GetHealthyBackend()` exists and is used |
+| **Health-aware new-materialization selection** | ✅ Yes | `GetHealthyBackend()` exists and is used; canonical reads do not fail over |
 | **Automated health monitoring** | ❌ No | CheckHealth() exists but never called automatically |
-| **Failover chains** | ⚠️ Partial | Recursive logic exists; circular detection missing |
+| **Failover chains** | ⚠️ Partial | Iterative visited-set detection exists; chain and cycle regression coverage is incomplete |
 | **Cross-region testing** | ❌ No | Zero integration tests for failover scenarios |
-| **Storage class migration** | ❌ No | TODO comment in code; feature not implemented |
+| **Storage class migration** | ❌ No | `ChangeStorageClass` updates preference only; explicit data migration is not implemented |
 | **Region quotas** | ❌ No | Global quotas only |
 | **Failover notifications** | ❌ No | Server logs only |
 | **Per-region metrics** | ❌ No | No Prometheus metrics for backend health |
 | **Geographic latency handling** | ❌ No | Global 5s timeout; not configurable |
-| **Data residency compliance** | ✅ Yes | Strict org policy enforces region pinning |
+| **Data residency compliance** | ✅ Yes | Strict org policy controls new-library placement; it does not migrate existing data |
 
 ---
 
@@ -321,13 +332,13 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
    - Update health status based on probe results
    - Increment `ConsecutiveFails` on errors
 
-2. **Add circular failover detection**
-   - Track visited backends in recursive `GetHealthyBackend()` calls
-   - Return error instead of infinite loop
+2. **Add circular failover regression coverage**
+   - Exercise the visited-set path in `GetHealthyBackend()`
+   - Verify a cycle returns an explicit error instead of looping
 
 3. **Add cross-region integration tests**
-   - Upload when primary down → verify failover
-   - Download from failed region → verify data retrieved via failover
+   - New materialization when primary down → verify failover and persisted actual class
+   - Existing canonical download from failed class → verify fail-closed behavior
    - 3-region chain with middle down → verify skip to end
 
 4. **Expose health status in observability**
@@ -336,9 +347,10 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 
 ### Should-fix soon (MEDIUM priority)
 
-5. **Implement storage class migration**
-   - Admin endpoint: `POST /api/v2.1/admin/libraries/:id/migrate-storage`
-   - Background job: copy blocks, update DB, trigger GC
+5. **Implement explicit storage class migration**
+   - Keep `ChangeStorageClass` as a preference update
+   - Add a separate durable job with byte/cost estimate, copy, verification and
+     reference-safe cleanup
 
 6. **Add per-region quotas**
    - Config: `region_quotas.{region}.max_total_gb`
@@ -370,7 +382,7 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 Single-region deployments with external monitoring are safe. Multiregion deployments should wait for items 1-4 above.
 
 **Corrections to v4 report:**
-- ❌ "Upload/download paths don't use health-aware selection" — **FALSE**, they DO use it
+- ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization; canonical reads use persisted placement
 - ✅ "No automated health monitoring" — **TRUE**
 - ⚠️ "Failover chains untested" — **PARTIALLY TRUE** (basic tested, edge cases not)
 - ✅ "No cross-region integration tests" — **TRUE**

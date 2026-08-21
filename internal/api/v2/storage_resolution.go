@@ -32,6 +32,8 @@ func relayPortFromRequest(c *gin.Context, cfg *config.Config) string {
 
 var lookupLibraryStorageClassContextFn = lookupLibraryStorageClassContext
 
+// lookupLibraryStorageClass reads the library's mutable future-placement
+// preference. It is not the locator for existing canonical blocks.
 func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) (string, error) {
 	return lookupLibraryStorageClassContextFn(context.Background(), database, orgID, repoID)
 }

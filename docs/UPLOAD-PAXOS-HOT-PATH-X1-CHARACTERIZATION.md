@@ -27,7 +27,7 @@ The following facts are confirmed against the current tree:
 | The two-minute finalize context limits the 1000 block materializations | Incorrect | `eg.Wait()` completes first. The two-minute context starts afterward for final file metadata/lease work. |
 | Generation-based deterministic keys are a promising direction | Candidate only | They can remove the need to choose between random keys for the same incarnation; this does not revive the abandoned r3 generational GC fence. |
 | Generation alone closes X1 | Incorrect | A stale writer can still attempt to install an old generation unless install is generation-aware or the schema makes old generations unable to become canonical. |
-| `storage_class` can differ for the same `(org_id, block_id)` | Confirmed | Explicit library placement is stable only while the library value is present and unchanged. Empty library placement is request-region dependent, and org-wide dedupe allows cross-library conflicts. |
+| `storage_class` can differ for the same `(org_id, block_id)` | Confirmed | A mutable library preference, empty request-region routing and org-wide dedupe let concurrent/new materializations propose different classes; an existing canonical row retains the class won by the first writer. |
 | Switching to `LOCAL_SERIAL` is a safe performance fix | Rejected | Two DCs can each accept a local Paxos decision. That is not a global winner and can diverge placement/lifecycle state. |
 
 The resulting characterization boundary is:
@@ -243,14 +243,28 @@ one physical location because writers can arrive with different classes:
 [`internal/db/block_references.go`](../internal/db/block_references.go), in the
 `UpsertBlockMetadata` placement contract comments.
 
-The resolver has two materially different modes:
+The resolver has three materially different cases:
 
-1. A non-empty library class is authoritative and is resolved exactly.
+1. A non-empty library class is the preferred class for a new materialization and
+   is resolved exactly before health-aware selection. The actual selected class
+   is persisted on the canonical block row.
 2. An empty library class falls through to hostname/region/default routing.
+3. An existing canonical block bypasses this preference and resolves from its
+   persisted `blocks.storage_class` for reads, reuse and repair.
 
 That behavior is implemented by `ResolveStorageClass` in
 [`internal/storage/storage.go`](../internal/storage/storage.go) and the
 library lookup in [`internal/api/v2/storage_resolution.go`](../internal/api/v2/storage_resolution.go).
+
+The residency policy is enforced separately by
+`resolveCreateStorageClassForOrg` during library creation. `strict` constrains
+the requested/new-library class to the organization's allowed region, but the
+later `GetHealthyBlockStoreForOrg` selection does not receive that policy. If a
+preferred class is already marked `Unhealthy` or `Failed`, its configured
+`failover_class` can therefore supply the actual class for a new block, which is
+then persisted on `blocks`. `Unknown`, `Healthy` and `Degraded` use the
+preferred class. No periodic production health checker was found, so failover
+depends on the health map already having been updated.
 
 The current logical block key is only `(org_id, block_id)`:
 
@@ -329,18 +343,18 @@ not be reused for a different namespace. A library class change therefore
 needs an explicit policy for future placement and any physical migration; it
 does not by itself change the meaning of existing block rows.
 
-### A. Class fixed by library
+### A-prime. Mutable library preference with org-global canonical identity
 
-The library carries the complete placement authority:
+The library carries a mutable preference for future placement:
 
 ```text
 library.storage_class = hot-na
 ```
 
-and block writes from that library never derive the class from the request
-hostname. This is simple for one library, but insufficient while the same
-`(org, block_id)` is deduplicated across libraries that can request different
-classes:
+Existing canonical blocks are not moved or reinterpreted when this preference
+changes. New block materializations from libraries that have different
+preferences can still compete while the same `(org, block_id)` is deduplicated
+across the organization:
 
 ```text
 library A -> hot-na
@@ -348,12 +362,11 @@ library B -> hot-eu
 same org + same SHA-256
 ```
 
-Because `blocks` is currently keyed by `(org, block_id)`, those libraries still
-compete to establish one canonical physical class. Library-fixed placement by
-itself therefore does not remove the LWT while dedupe remains org-global. The
-existing `ChangeStorageClass` endpoint needs an explicit policy for existing
-references and future placement before a library value can be the sole
-placement authority.
+Because `blocks` is currently keyed by `(org, block_id)`, those libraries compete
+to establish one canonical physical class and the first-writer LWT remains the
+arbitration mechanism. `ChangeStorageClass` therefore changes future preference
+only; a separate migration operation would be required to copy existing
+referenced bytes.
 
 ### B. Class included in logical identity
 
@@ -385,9 +398,9 @@ each storage class is a genuinely different physical namespace and materialized
 life. It requires a broad audit of block references, mappings, file manifests,
 readers and GC, and it is not yet a schema decision.
 
-This is the first candidate worth characterizing because it matches R23b's
-meaning of a storage class as a permanent physical namespace. It is not yet a
-schema decision.
+This is a candidate worth characterizing because it matches R23b's meaning of a
+storage class as a permanent physical namespace. It is not yet a schema
+decision or the current product recommendation.
 
 ### C. Home class derived from `(org_id, content_hash)`
 

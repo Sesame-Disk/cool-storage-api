@@ -909,10 +909,12 @@ during the parse rather than after materialization. The `internal/api`,
 
 ---
 
-### PR-11 (deferred) — Remove the per-block Paxos
+### PR-11 (deferred) — Re-evaluate the per-block Paxos
 
-**Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
-first-writer `INSERT ... IF NOT EXISTS` can be dropped.
+**Historical candidate scope:** make `storage_class` deterministic per
+`(org_id, block_id)` so the first-writer `INSERT ... IF NOT EXISTS` might be
+dropped. This is not the current product decision and must not be started as a
+mechanical performance change.
 
 The full option comparison and the required initial schema, reference, GC and
 failover analysis are in
@@ -923,12 +925,14 @@ corrects the decision boundary for this PR. The shipped production
 default/example uses `serial_consistency: SERIAL`; environment overrides and
 the effective replica topology still determine the runtime serial domain and
 WAN cost. PR-11 does not introduce the current `SERIAL` LWT/Paxos transaction
-latency to deployments already using `SERIAL`. It remains deferred because the
-real question is whether the
-normal install can stop needing a global winner at all, while preserving
-`storage_class` and exact-incarnation authority. P0/R12 may still be required
-for the background/destructive LWT domain, but it must not be treated as a
-performance fix by itself.
+latency to deployments already using `SERIAL`. The current reference remains
+mutable library preference plus an org-global canonical block row whose
+persisted `storage_class` controls existing reads, reuse, repair and GC. A
+future deterministic placement option would remove library placement authority;
+a class-scoped option would change deduplication and require a broader identity,
+locator and liveness redesign. P0/R12 may still be required for the
+background/destructive LWT domain, but it must not be treated as a performance fix
+by itself.
 
 **Not in scope: merging the lifecycle observations.** An earlier draft proposed
 merging the pre-store probe and post-reference fence reads. That ordering is the mutual

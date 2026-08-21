@@ -299,10 +299,10 @@ func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error
 	return nil, "", fmt.Errorf("no healthy backend available for class %s", preferredClass)
 }
 
-// ResolveStorageClass determines the storage class based on context.
-// Priority: library override > endpoint region > default. An explicit library
-// class is persisted placement metadata, so it must be registered exactly as
-// stored; only an empty library class may use routing/default selection.
+// ResolveStorageClass determines the preferred class for a new materialization
+// based on context. Priority: library preference > endpoint region > default.
+// The library value is mutable policy for future placement; existing canonical
+// blocks are resolved from their blocks.storage_class metadata instead.
 func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier string) (string, error) {
 	if m == nil {
 		return "", fmt.Errorf("storage manager is nil")

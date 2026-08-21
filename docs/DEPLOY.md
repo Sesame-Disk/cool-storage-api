@@ -1463,7 +1463,9 @@ What already works in the backend/frontend stack:
 - when no `storage_id` is provided, the backend can derive the default region from the request hostname or, for the shared global hostname, from `SERVER_REGION`
 - orgs can now persist `storage_policy` with `data_residency: strict|flexible`; `default_region` is an org fallback in `flexible` mode and is required in `strict` mode
 - new-library create flows honor org policy for personal libraries, group-owned libraries, org-admin group-owned libraries, and superadmin-created libraries
-- later writes and reads follow the persisted library `storage_class` instead of the request host default
+- new block materializations prefer the library `storage_class`; existing reads,
+  reuse and repairs follow each block's persisted canonical `blocks.storage_class`
+  instead of reinterpreting it from the current library preference or request host
 - focused integration tests cover create-library, raw serving, historic reads, and share-link raw serving
 
 What the stock production deploy does **not** provide by itself yet:
@@ -1557,6 +1559,12 @@ Notes:
 - in `flexible`, `default_region` is only a fallback after hostname-based resolution
 - in `strict`, `default_region` is required; invalid strict configs make create requests fail explicitly so operators can correct the org policy
 - this slice affects only **new** libraries; existing libraries keep their persisted `storage_class`
+- `strict` constrains the class selected during library creation, but it does not
+  constrain a later block-store `failover_class`; a new block may be persisted in
+  the configured failover class if the preferred class is already unhealthy
+- `ChangeStorageClass` updates the library preference and administrative read
+  model only. It does not revalidate strict residency, migrate existing blocks,
+  or start a migration job
 
 ### Step M3 — Firewall (private network)
 
@@ -1962,4 +1970,8 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
   and early production. For HA, deploy multi-region (see above).
 - **No Cassandra backup** configured — set up snapshots before storing
   important data.
-- **Existing-library migration is still manual** — the current feature set safely pins new libraries and preserves consistent reads/writes, but does not yet provide a production migration workflow for moving already-populated libraries between storage classes or regions.
+- **Existing-library migration is still manual** — the current feature set stores a
+  mutable preference for new materializations and resolves historical reads,
+  reuse and repairs from each block's canonical class, but does not yet provide
+  a production workflow for moving already-populated libraries between storage
+  classes or regions.
