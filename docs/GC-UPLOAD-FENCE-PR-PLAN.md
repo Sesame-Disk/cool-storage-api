@@ -914,6 +914,15 @@ during the parse rather than after materialization. The `internal/api`,
 **Scope:** make `storage_class` deterministic per `(org_id, block_id)` so the
 first-writer `INSERT ... IF NOT EXISTS` can be dropped.
 
+The companion [X1/X4 upload hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+corrects the decision boundary for this PR. Production already configures
+`serial_consistency: SERIAL`, so PR-11 does not introduce the current global
+Paxos latency. It remains deferred because the real question is whether the
+normal install can stop needing a global winner at all, while preserving
+`storage_class` and exact-incarnation authority. P0/R12 may still be required
+for the background/destructive LWT domain, but it must not be treated as a
+performance fix by itself.
+
 **Not in scope: merging the lifecycle observations.** An earlier draft proposed
 merging the pre-store probe and post-reference fence reads. That ordering is the mutual
 exclusion that makes the protocol work: serving the fence result from the cached probe
@@ -943,6 +952,13 @@ the canonical-winner decision and cannot be dropped casually.
 **Do not start this before measuring.** There is no per-statement latency metric for
 that INSERT yet; add it, get the production number, then decide. Full analysis: P-4
 in `UPLOAD-PERFORMANCE-SECURITY-2026-06.md`.
+
+The block materialization chain is awaited by `eg.Wait()` before
+`newSeafHTTPUploadMetadataFinalizeContext()` is created. The two-minute context
+therefore limits final file metadata/lease publication, not the preceding
+per-block LWT queue. Large uploads can still be slow because the metadata permit
+is one per process, but this context is not their 120-second materialization
+deadline.
 
 ---
 

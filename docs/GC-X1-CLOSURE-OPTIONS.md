@@ -160,6 +160,18 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 R18 and R27 may attach to P2 or P3 depending on how recovery/retry is resolved. Do not read
 P0-P4 as an exhaustive closure list, and do not let "`K` is unique" read as "X1 solved".
 
+**Hot-path/Paxos characterization (2026-08-20).** The companion
+[X1/X4 upload hot-path analysis](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+confirms that a metadata-registering block invocation already inherits global
+`SERIAL` under the production session, and that SeafHTTP serializes its
+metadata callback at one permit per process. P0 therefore does not introduce
+the production latency; it would make the serial-domain contract explicit and
+protect against weaker session settings. P0/R12 remains deferred while the
+design evaluates whether ordinary installation can remove the per-block LWT
+without losing placement and incarnation authority. The two-minute final-file
+context is created after `eg.Wait()` and is not the timeout for block
+materialization.
+
 **The collision check closes a rebind the code could produce on its own, with no
 operator action.** Before R23a, a class whose `initStorageClass` failed was skipped
 with only a warning (`internal/api/server.go`), and the legacy `backends:` loop then

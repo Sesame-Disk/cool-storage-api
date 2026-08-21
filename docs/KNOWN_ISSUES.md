@@ -7572,20 +7572,24 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 **Status**: 🟡 Open — deferred PR-11 pending measurement
 **Severity**: High (perf), not a correctness blocker
 **Affected**: metadata-registering upload paths (`UpsertBlockMetadata` / LWT)
-**Source of record**: registry **X4**; readiness UP-2; P-4
+**Source of record**: registry **X4**; readiness UP-2; P-4; [X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 
 #### Problem
 
 Each block invocation that reaches metadata registration pays one global Paxos round
-under multi-DC `SERIAL`. New content/full registration is ~128 cross-region rounds
-per GiB at 8 MiB blocks; browser/sync preflight may bypass fully deduplicated blocks.
+under multi-DC `SERIAL`. The production profile already uses `SERIAL`, so this cost
+is pre-existing rather than introduced by P0/R12. New content/full registration is
+~128 cross-region rounds per GiB at 8 MiB blocks; browser/sync preflight may bypass
+fully deduplicated blocks.
 This is a shared cost of governed upload paths when they reach registration, not a
 universal per-file cost.
 
 #### Fix Direction
 
-Do not start PR-11 until a per-statement production latency metric exists.
-See registry X4 design notes.
+Do not start PR-11 until per-statement production latency, metadata-permit wait
+and placement proposals are characterized. Do not switch production to
+`LOCAL_SERIAL` as a mitigation. See [registry X4 design notes](./UPLOAD-FENCE-FINDINGS-REGISTRY.md)
+and the [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md).
 
 ---
 

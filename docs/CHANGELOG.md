@@ -8,6 +8,19 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-20 - X1/X4 upload hot-path Paxos characterization
+
+The confirmed hot-path analysis records that production already runs the
+per-block metadata `INSERT ... IF NOT EXISTS` under global `SERIAL`; P0/R12
+would make that domain explicit rather than add the production cost. SeafHTTP
+still serializes the materialization callback at one permit per process, while
+the two-minute final-file context starts only after `eg.Wait()`. The companion
+[X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md) keeps
+PR-11 deferred, rejects `LOCAL_SERIAL` as a production mitigation, and defines
+the placement/incarnation invariants required before removing the hot-path LWT.
+
+---
+
 ## 2026-08-20 - R23b review closure: upgrade path, drift gate, exact-P sequence
 
 Six findings from an external review of the R23b follow-ups, all confirmed against

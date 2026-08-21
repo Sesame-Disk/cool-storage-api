@@ -188,6 +188,14 @@ external.
 
 ## P-4 — One global Paxos round per block on metadata-registering upload paths (2026-07-21)
 
+**2026-08-20 characterization correction:** production already configures
+`serial_consistency: SERIAL`, so the current metadata LWT inherits global
+cross-DC Paxos today. P0/R12 would make the intended serial domain explicit; it
+would not introduce this production latency. The companion
+[X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+also records that SeafHTTP's metadata permit is one per process and that the
+two-minute final-file context begins only after `eg.Wait()`.
+
 **Severity: HIGH for general upload performance** (both governed upload modes, not block upload specifically)
 **Branch: pending — `perf/deterministic-block-storage-class`**
 **Pre-existing: yes.** This is **not** introduced by the upload-fence work. The

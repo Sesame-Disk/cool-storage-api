@@ -191,7 +191,7 @@ started.
 
 | Item | Sev | One line |
 |---|---|---|
-| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation that reaches metadata registration; browser/sync preflight can bypass fully deduplicated blocks. **PR-11, not started** — need the per-statement production latency metric first (fix direction of record: `KNOWN_ISSUES.md`). |
+| `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01` (= X4 / P-4 / UP-2) | HIGH (perf) | One global Paxos round per block invocation that reaches metadata registration; browser/sync preflight can bypass fully deduplicated blocks. Production already inherits `SERIAL`; **P0 does not introduce this latency**. **PR-11, not started** — characterize latency, permit wait and placement identity first. See [X1/X4 characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md). |
 | `ISSUE-CANONICAL-READ-FANOUT-01` (= X5) | MEDIUM | Canonical read fan-out never validated against a real cluster |
 | `ISSUE-DOWNLOAD-BYTE-RATE-SHAPING-01` | MEDIUM (deferred) | D bounds aggregate accepted work, not bytes per second; measure node egress at D6 before choosing shaping |
 | `ISSUE-READ-AFTER-WRITE-CROSS-DC-01` (= X6) | MEDIUM | Read-after-write across DCs; 3×25 ms retry covers local lag only |
@@ -208,7 +208,7 @@ Not findings — things nobody has proven either way.
   topology-gate halves, and both consistency mutations. **X6 and the remaining cross-DC assumptions are still derived
   from the production consistency contract and have never been reproduced**, even
   though the instrument to do it is now checked in.
-- **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`).
+- **No production latency measurement** for the per-block LWT (X4 / `ISSUE-UPLOAD-PER-BLOCK-PAXOS-01`); the characterization is documented in [UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md), but no runtime measurement has landed.
 - **The six older upload funnels** have never been driven individually under a
   live fence; coverage proves the three retry wrapper mechanisms instead.
 - **PR-10 did not run the full Compose integration suite** (PR-2..PR-6 did).
