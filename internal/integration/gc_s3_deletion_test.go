@@ -84,10 +84,11 @@ func newVerificationBlockStore(t *testing.T, orgID string) *storage.BlockStore {
 // the safety guard (the exact failure this test hit before — see
 // ISSUE-GC-CROSS-ORG-BLOCK-DELETE-01 test notes).
 type isolatedTenant struct {
-	orgID  string
-	userID string
-	email  string
-	client *testClient
+	orgID       string
+	userID      string
+	email       string
+	client      *testClient
+	adminClient *testClient
 }
 
 // provisionIsolatedTenant creates a real tenant org + owner user via the superadmin
@@ -143,8 +144,23 @@ func provisionIsolatedTenant(t *testing.T, label string) *isolatedTenant {
 			t.Logf("cleanup: revoke api key for %s: %v", email, err)
 		}
 	})
+	adminToken, adminKey, err := mgr.CreateKey(userUUID, orgUUID, "gc-iso-admin-"+label, apikeys.ScopeAdmin, nil)
+	if err != nil {
+		t.Fatalf("mint admin API key for %s: %v", email, err)
+	}
+	t.Cleanup(func() {
+		if err := mgr.RevokeKey(orgUUID, userUUID, adminKey.KeyHash); err != nil {
+			t.Logf("cleanup: revoke admin API key for %s: %v", email, err)
+		}
+	})
 
-	return &isolatedTenant{orgID: orgID, userID: userID, email: email, client: newTestClient(baseURL, rawToken)}
+	return &isolatedTenant{
+		orgID:       orgID,
+		userID:      userID,
+		email:       email,
+		client:      newTestClient(baseURL, rawToken),
+		adminClient: newTestClient(baseURL, adminToken),
+	}
 }
 
 func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
@@ -169,8 +185,8 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 
 	t.Cleanup(func() {
 		session := shareProjectionDBForTest(t).Session()
-		removeTestLibraryFully(t, orgA.client, session, orgA.orgID, repoA)
-		removeTestLibraryFully(t, orgB.client, session, orgB.orgID, repoB)
+		removeTestLibraryFully(t, orgA.adminClient, session, orgA.orgID, repoA)
+		removeTestLibraryFully(t, orgB.adminClient, session, orgB.orgID, repoB)
 	})
 	cleanupUploadedBlockArtifactsForTest(t, orgA.orgID, repoA, blockID, externalSHA1,
 		db.BlockReferrerForFSObject(repoA, fileFSID))
@@ -272,10 +288,10 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 		t.Fatalf("exclusive orgA queue unexpectedly non-empty before delete: %+v", queuedItems[0])
 	}
 
-	trash := orgA.client.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoA))
+	trash := orgA.adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoA))
 	expectStatus(t, trash, 200)
 	trash.Body.Close()
-	permanent := orgA.client.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoA))
+	permanent := orgA.adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoA))
 	expectStatus(t, permanent, 200)
 	permanent.Body.Close()
 

@@ -2659,9 +2659,9 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 
 	var libOrgIDStr, libraryOwnerIDStr string
 	var sizeBytes, fileCount int64
-	var deletedAt time.Time
+	var deletedAt *time.Time
 	for libIter.Scan(&libOrgIDStr, &libraryOwnerIDStr, &sizeBytes, &fileCount, &deletedAt) {
-		if !deletedAt.IsZero() {
+		if deletedAt != nil && !deletedAt.IsZero() {
 			continue
 		}
 
