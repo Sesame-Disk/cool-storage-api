@@ -409,8 +409,10 @@ policies:
 3. Server selects storage backend by class name and constructs an org-scoped
    BlockStore for `org_id`.
 
-4. Server derives `blocks/<org_id>/ab/c1/abc123`, retrieves it and returns it.
-   A persisted non-empty `storage_key` is an invariant check, not an arbitrary locator.
+4. Server uses the persisted `storage_key` to retrieve the object and returns it.
+   The current key remains deterministic (`blocks/<org_id>/ab/c1/abc123`); a
+   missing or conflicting persisted key fails closed rather than selecting a
+   replacement locator.
 ```
 
 ---
@@ -630,8 +632,8 @@ non-LWT; canonical metadata creation and lifecycle state transitions are separat
 - **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `StartBlockDeleteOrphan` → `DELETE blocks` → delete `blocks/<org_id>/...` through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
-- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, and uses only its `(org_id, storage_class)` to resolve the same physical key. An empty class, invalid org, missing canonical row, read error, or discovery-token mismatch fails closed, leaves discovery state untouched, and does not advance the recovery cursor past that row when it is encountered in the current sweep. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL. The reload narrows stale-read windows but is not lifecycle exclusion; exact physical identity remains open X1 work.
+- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and the persisted `storage_key` is checked against the key that store derives (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
+- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, and uses its `(org_id, storage_class, storage_key)` to issue the exact physical delete after checking that key against the one the resolved org-scoped store derives. An empty class/key, a key that is not this org's, an invalid org, a missing canonical row, a read error, or a discovery-token mismatch fails closed, leaves discovery state untouched, and does not advance the recovery cursor past that row when it is encountered in the current sweep. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL. The reload narrows stale-read windows but is not lifecycle exclusion; exact physical identity remains open X1 work.
 
 **Lifecycle**:
 ```

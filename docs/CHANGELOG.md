@@ -8,6 +8,36 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-21 - P1 locator authority foundation
+
+Materialization funnels now resolve one org-scoped `storage_key`, use that exact
+key for the physical PUT, and persist the same value in canonical metadata.
+Canonical reads, reuse/repair, GC orphan recovery and destructive delete paths
+consume the persisted key and fail closed on missing or conflicting values.
+Migration `016_gc_s3_orphans_storage_key.cql` adds the recovery locator to the
+canonical orphan table; the day projection remains identity-only.
+
+Because a `BlockStore` deletes whatever key it is handed, both destructive paths
+also check the persisted key against the key their own org-scoped store derives
+and refuse on a mismatch — `processBlock` resolves the store during the
+authorization phase, so a suspicious row is refused before any lifecycle write,
+and `RecoverS3Orphans` repeats the check after its canonical reload. `DeleteBlockByStorageKey` is now the only physical delete API on
+`storage.BlockStore` — the hash-derived `DeleteBlock` is gone — and
+`PutObjectAutoDirect` is the only direct PUT any canonical, metadata-producing
+funnel uses; the hash-derived `PutBlockAutoDirect` is gone, while
+`PutBlock`/`PutBlockData`/`PutBlockAuto`/`PutBlocks` remain for the
+no-metadata sync path and test seeding. Both locator-taking forms reject an
+empty key.
+
+The refusal is covered end to end: a Cassandra/MinIO test seeds a canonical row
+whose `storage_key` names another tenant object and asserts that object is still
+in the bucket afterwards. With the check disabled that test deletes it for real.
+
+This is a greenfield foundation slice and does not close X1 or enable
+destructive GC.
+
+---
+
 ## 2026-08-20 - X1/X4 upload hot-path Paxos characterization
 
 The confirmed hot-path analysis records that the shipped production

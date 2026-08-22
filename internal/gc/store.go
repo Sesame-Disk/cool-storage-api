@@ -188,7 +188,7 @@ type GCStore interface {
 	// deletion. It always resets recovery state to pending_s3 so a stale
 	// pending_mapping_cleanup row from an older delete cannot make recovery skip
 	// the physical object delete for this new lifecycle.
-	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error)
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error)
 	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
 	// destructive recovery path. It supplies recovery state and the physical
 	// backend selector; it is not a Paxos settlement read and does not authorize
@@ -381,6 +381,7 @@ type CommitInfo struct {
 type BlockInfo struct {
 	BlockID      string
 	StorageClass string
+	StorageKey   string
 	CreatedAt    *time.Time
 	// Sha1 is the block's external Seafile SHA-1 (blocks.sha1), retained for
 	// orphan recovery metadata and legacy diagnostics. Empty for legacy/pre-PR2
@@ -476,6 +477,7 @@ type S3OrphanInfo struct {
 	OrgID         uuid.UUID
 	BlockID       string
 	StorageClass  string
+	StorageKey    string
 	ExternalSHA1  string
 	RecoveryPhase string
 	FirstSeenAt   time.Time
@@ -700,7 +702,19 @@ const (
 // BlockStoreDeleter is a minimal interface for S3 block deletion.
 // Allows mocking the storage layer in tests.
 type BlockStoreDeleter interface {
-	DeleteBlock(ctx context.Context, blockID string) error
+	// StorageKeyForHash returns the canonical org-scoped locator this store would
+	// mint for a block id. Destructive callers compare the PERSISTED key against it
+	// and refuse the delete on a mismatch.
+	//
+	// The persisted key is authoritative for WHICH object to destroy, but the store
+	// is only a bucket client: it applies whatever key it is handed. So a row whose
+	// storage_key names another org's prefix — corruption, a bad backfill, a future
+	// writer that mints keys — would otherwise aim an org's delete at another org's
+	// bytes, which is exactly the cross-org delete P10 closed at the code level. The
+	// writers already refuse a non-derived key; this is the same refusal on the side
+	// that destroys.
+	StorageKeyForHash(hash string) string
+	DeleteBlockByStorageKey(ctx context.Context, storageKey string) error
 }
 
 // StorageProvider returns a BlockStoreDeleter bound to one org and exact storage

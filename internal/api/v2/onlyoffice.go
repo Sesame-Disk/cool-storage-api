@@ -1224,13 +1224,13 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 			storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
 			return ensureErr
 		case db.BlockReuseNeedsPut:
-			putStore, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, internalBlockID)
+			putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, internalBlockID)
 			if resolveErr != nil {
 				return resolveErr
 			}
 			materializedStorageClass = resolvedClass
 			var putErr error
-			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, putStore, internalBlockID, content)
+			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, putStore, resolvedKey, content)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}

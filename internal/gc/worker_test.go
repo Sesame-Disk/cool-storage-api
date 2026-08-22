@@ -79,7 +79,7 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 
 	// Block should be deleted from S3
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "block-1"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-1")}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 
@@ -350,7 +350,7 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 		t.Fatalf("AllS3Orphans() len = %d, want 0 after cleanup completes", len(orphans))
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier", BlockID: "block-canonical-cold"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-canonical-cold")}) {
 		t.Fatalf("delete used queued rather than canonical scope: %+v", deletes)
 	}
 }

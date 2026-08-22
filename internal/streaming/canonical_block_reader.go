@@ -237,9 +237,13 @@ dispatchLocations:
 				return fmt.Errorf("no block store available for block %s", blockID)
 			}
 
-			storageKey := store.StorageKeyForHash(blockID)
-			if persistedKey := strings.TrimSpace(metadata.StorageKey); persistedKey != "" && persistedKey != storageKey {
-				return fmt.Errorf("canonical storage key %q for block %s does not match derived org-scoped key %q", persistedKey, blockID, storageKey)
+			storageKey := strings.TrimSpace(metadata.StorageKey)
+			if storageKey == "" {
+				return fmt.Errorf("canonical storage key is empty for block %s", blockID)
+			}
+			derivedKey := store.StorageKeyForHash(blockID)
+			if storageKey != derivedKey {
+				return fmt.Errorf("canonical storage key %q for block %s does not match derived org-scoped key %q", storageKey, blockID, derivedKey)
 			}
 
 			mu.Lock()

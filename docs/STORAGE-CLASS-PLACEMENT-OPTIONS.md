@@ -69,10 +69,12 @@ The current physical key is still hash-derived:
 blocks/<org_id>/<first-two-hash-chars>/<next-two-hash-chars>/<sha256>
 ```
 
-`storage_key` is persisted as metadata but current readers and writers derive
-this key and reject a conflicting persisted value; it is not yet an arbitrary
-locator authority. The physical tuple today is therefore the canonical class
-plus the derived key, not a free-form `storage_key`.
+`storage_key` is the canonical locator authority. New writers resolve
+`K=hashToKey(L)` once and persist the returned key; readers, reuse, repair and
+GC use that persisted key and reject an empty or conflicting value. It remains
+deterministic rather than arbitrary: the physical tuple is the canonical class
+plus `K`, not a free-form locator. This P1 invariant does not close X1's
+physical-incarnation and publication-fence races.
 
 The recommendation is:
 

@@ -392,9 +392,9 @@ func seedSyntheticBlock(t *testing.T, storageClass string) (uuid.UUID, string, *
 
 	session := shareProjectionDBForTest(t).Session()
 	if err := session.Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, orgID.String(), blockID, len(content), storageClass, time.Now().UTC()).Exec(); err != nil {
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, orgID.String(), blockID, len(content), storageClass, bs.StorageKeyForHash(blockID), time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("seed canonical blocks row: %v", err)
 	}
 	return orgID, blockID, bs
@@ -413,7 +413,7 @@ func TestGC_BlockDeletion_RemovesObjectFromS3(t *testing.T) {
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 	orgID, blockID, bs := seedSyntheticBlock(t, storageClass)
 	t.Cleanup(func() {
-		_ = bs.DeleteBlock(ctx, blockID)
+		_ = bs.DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(blockID))
 		_ = shareProjectionDBForTest(t).Session().Query(
 			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
 	})
@@ -498,11 +498,11 @@ func TestGC_S3OrphanRecovery_DeletesLingeringObject(t *testing.T) {
 		t.Fatalf("seed orphan object not present in S3 (exists=%v err=%v)", exists, err)
 	}
 	t.Cleanup(func() {
-		_ = bs.DeleteBlock(ctx, blockID)
-		_ = siblingStore.DeleteBlock(ctx, blockID)
+		_ = bs.DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(blockID))
+		_ = siblingStore.DeleteBlockByStorageKey(ctx, siblingStore.StorageKeyForHash(blockID))
 	})
 
-	seedS3Orphan(t, store, orgID, blockID, storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC())
+	seedS3OrphanWithStorageKey(t, store, orgID, blockID, bs.StorageKeyForHash(blockID), storageClass, "", "seed: simulated S3 delete failure", time.Now().UTC())
 	if _, found, err := shareProjectionDBForTest(t).GetBlockS3OrphanInfo(orgID.String(), blockID); err != nil || !found {
 		t.Fatalf("orphan fence not recorded (found=%v err=%v)", found, err)
 	}

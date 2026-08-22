@@ -66,7 +66,7 @@ is right about why.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
-| **Read Paths Ignore `storage_key`** | ✅ Fixed by derived-key invariant | Reads, reuse/repair, normal GC delete, and orphan recovery derive the deterministic org-scoped key; reuse fails closed if a non-empty `storage_key` differs. The column is not an arbitrary locator, so non-derived layouts remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
@@ -1182,7 +1182,7 @@ and the `gc_s3_orphans` fence to return one of:
 
 - `BlockReuseReusable` → `EnsureReusableBlockPresent`: verify the canonical object
   exists (HEAD on the declared key) and repair it (direct PUT) only if missing
-- `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
+- `BlockReuseNeedsPut` → `PutObjectAutoDirect` at the resolved locator (direct PUT, no HEAD)
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
 - `BlockReuseUnknownError` → fail closed before S3 PUT
 
@@ -1255,42 +1255,48 @@ failing phase (`probe` = store phase, `materialization` = metadata materialize p
 
 - `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — P-2
 - `docs/TECHNICAL-DEBT.md` §25
-- ISSUE-BLOCK-STORAGE-KEY-READS-01 below — read paths still ignore `storage_key`
+- ISSUE-BLOCK-STORAGE-KEY-READS-01 below — P1 locator-authority follow-up
 
 ---
 
 ### ISSUE-BLOCK-STORAGE-KEY-READS-01: Read Paths Ignore `storage_key` (key derived from hash)
 
-**Status**: ✅ Fixed by P10 PR-3's derived-key invariant (2026-07-16)
+**Status**: ✅ Fixed by P1 locator authority (2026-08-21); arbitrary relocation remains unsupported
 **Severity**: Low (becomes High the moment any block is stored at a non-hash-derived key)
 **Affected**: `internal/storage/blocks.go` read methods; GC delete path
 
 #### Problem
 
 The `blocks` table has a `storage_key` column recording where a block's object
-lives. Every read path derives the S3 key purely from the content hash instead:
-`GetBlock`, `GetBlockReader`, `GetBlockSize`, `BlockExists`, etc. all call
-`hashToKey(hash)` and never consult `storage_key`. GC's `DeleteBlock` deletes the
-hash-derived key too.
+lives. P1 now resolves that persisted key for canonical reads, reuse/repair and
+GC deletion. The low-level hash-based methods remain deterministic convenience
+APIs for legacy/no-metadata callers; canonical production paths do not use them
+to choose a physical target.
 
-As of P10 PR-2, `EnsureReusableBlockPresent` (`internal/api/v2/upload_reuse.go`)
-always recomputes the deterministic org-scoped key. A non-empty `storage_key` is
-accepted only when it exactly matches that derived key; otherwise reuse fails closed
-before any S3 HEAD or repair PUT.
+`EnsureReusableBlockPresent` (`internal/api/v2/upload_reuse.go`) consumes the
+persisted key and verifies the current deterministic invariant. An empty or
+conflicting `storage_key` fails closed before any S3 HEAD or repair PUT.
 
-#### Why it is not a live bug (yet)
+The destructive side verifies the same equality rather than trusting the row. A
+`BlockStore` is only a bucket client — it deletes whatever key it is handed,
+including one naming another org's prefix — so `processBlock` resolves the store
+during the authorization phase (before `StartBlockDeleteOrphan` and
+`FinalizeBlockDelete`) and refuses a key the store would not derive, and
+`RecoverS3Orphans` repeats the check on the reloaded canonical row. Neither path
+records a recovery row for a refused delete. `storage.BlockStore` no longer
+exposes hash-derived `PutBlockAutoDirect`/`DeleteBlock` at all, so the storage
+layer never picks a delete target on a caller's behalf. That is the whole of what
+the signature guarantees: `StorageKeyForHash` is still public, so passing a
+derived key to `DeleteBlockByStorageKey` compiles. Where the key came from is
+pinned by tests, not by the compiler.
 
-`storage_key` is **either empty or equal to the org-scoped `hashToKey(hash)`** today.
-Corrected inventory (2026-08-21): 5 of the 7 materialization paths register the block
-with `storage_key=""` — `seafhttp.go` x2, `sync.go`, and `files.go` for both the
-template and the upload path. Two persist a non-empty value: OnlyOffice, and the web
-session funnel (`v2/blocks.go` `materializeUploadedBlock`, reached through
-`RegisterWebUploadedBlockAndMapping` rather than `RegisterUploadedBlockAndMapping`,
-which is why earlier inventories missed it). Both non-empty values are the
-hash-derived key, so the conclusion below is unchanged. So `hashToKey(hash)` is always a correct locator, and
-`EnsureReusableBlockPresent` always uses `StorageKeyForHash(blockID)` and validates a
-non-empty column against it. API reads and verify/repair therefore resolve to the same
-object; GC joined that contract in P10 PR-3.
+#### Why arbitrary relocation remains unsupported
+
+All current materialization paths persist a non-empty key returned by the same
+resolution used for the PUT. The key remains the deterministic org-scoped
+`hashToKey(hash)` under P1, so the persisted value and the derived invariant
+must agree. API reads, verify/repair and GC consume that persisted value; a
+missing value is no longer tolerated.
 
 #### The latent risk
 
@@ -1302,18 +1308,35 @@ a separate, explicit locator migration across reads, writes and GC.
 
 #### Resolution
 
-P10 PR-3 makes GC derive the same org-scoped key as API reads/writes. Keep
-`storage_key` as an invariant check, not an arbitrary caller-controlled locator.
+P1 makes `storage_key` authoritative on canonical paths and carries the exact
+value through PUT, metadata registration, reads, reuse/repair and GC recovery.
+Keep the deterministic equality check until a future locator-migration design
+explicitly supports arbitrary physical keys.
 
-**Resolution path (via P10):** the org-scoped-key fix resolves this **by construction** rather than
-by making `storage_key` authoritative. Once the key is `blocks/<org_id>/<h0:2>/<h2:4>/<hash>`, the org
-is baked into the `BlockStore` at construction (the method signature stays
-`blockStore.StorageKeyForHash(hash)` — the org is not passed per call), the derivation is
-deterministic, and every path (read, GC delete, reuse/verify) recomputes the same locator — no
-divergence is possible, and no extra DB read is added on the
-download hot path. `storage_key` may only be empty or **exactly** the derived key; `EnsureReusableBlockPresent`
-always recomputes and **fails closed** if a stored `storage_key` differs from the
-derived one, and no block method accepts an arbitrary caller-supplied S3 key. Closed alongside P10.
+**Resolution path (via P1):** the org-scoped-key invariant remains deterministic,
+but canonical consumers now use the value already resolved from Cassandra. The
+`BlockStore` is still org-scoped at construction, so P1 adds no metadata read on
+the download hot path. `storage_key` must be non-empty and exactly match the
+current deterministic layout.
+
+The locator-taking APIs (`PutObjectAutoDirect`, `GetBlockByStorageKey`,
+`DeleteBlockByStorageKey`, …) do accept a caller-supplied key — that is the
+point of them — and the `BlockStore` validates only that it is non-empty, not
+that it belongs to this org. What makes that safe is the callers, not the
+store: writers take K from placement resolution, canonical consumers take it
+from persisted metadata, and both destructive callers require it to equal the
+deterministic org-scoped key before handing it to the backend.
+
+**Requirement for P2.** A minted key is by definition not `hashToKey(L)`, so P2
+must drop that equality — and dropping it without a replacement re-opens
+handing `DeleteBlockByStorageKey` a key belonging to another org. The equality
+check is doing tenant-isolation work today, not only layout work. Before it is
+removed, org isolation has to become structural in the `BlockStore` itself (an
+exact key must begin with `blocks/<canonical-org-id>/` before any GET/PUT/HEAD/
+DELETE), so the guarantee does not depend on every future destructive caller
+remembering to check.
+
+Closed by P1, with arbitrary relocation still out of scope.
 
 #### Related
 
@@ -5204,8 +5227,11 @@ The fix ships as a small, sequential series of branches (each its own PR):
   same-org dedup across libraries and distinct physical keys plus byte-for-byte reads across the default
   and platform orgs. This intermediate state required GC to remain disabled until PR-3.
 - ✅ **PR-3 — GC own branch:** delete + orphan recovery resolve `(org_id, normalized canonical storage_class)`,
-  empty orphan classes fail closed, the legacy global APIs are removed as a compiler net, and the
-  cross-org Cassandra+MinIO regressions above pass.
+  empty orphan classes fail closed, and the legacy global APIs are removed so the
+  storage layer no longer derives a delete target on a caller's behalf. That is
+  not, by itself, a compiler proof that a caller loaded `blocks.storage_key` or
+  that an explicit locator belongs to the org; the cross-org Cassandra+MinIO
+  regressions above pin the production caller checks.
 - Broader multiregion/bucket coverage remains useful follow-up coverage, but it is not required to
   close P10's locator mismatch: the exact-class adapter contract and org-scoped physical isolation
   are covered in PR-3.

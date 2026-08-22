@@ -34,10 +34,15 @@ func normalizeOrgID(orgID string) (string, error) {
 	return parsed.String(), nil
 }
 
-// NewOrgBlockStore creates a block store whose physical S3 keys are org-scoped:
-// blocks/<org_id>/<h0:2>/<h2:4>/<hash>. This aligns physical ownership with the
-// per-org blocks/block_references tables and GC claims, so one org's delete can
-// never remove another org's content.
+// NewOrgBlockStore creates a block store whose DERIVED physical S3 keys are
+// org-scoped: blocks/<org_id>/<h0:2>/<h2:4>/<hash>. That aligns physical ownership
+// with the per-org blocks/block_references tables and GC claims.
+//
+// It is not itself a tenant boundary. The locator-taking APIs apply whatever key
+// they are given, including one naming another org, so cross-org isolation
+// currently rests on the callers validating the key first (see
+// ISSUE-BLOCK-STORAGE-KEY-READS-01 for why that has to move in here before P2
+// mints non-derived keys).
 //
 // It fails closed: an empty or invalid org id is rejected rather than silently
 // falling back to a global key. The org id is normalized to its canonical UUID
@@ -145,23 +150,23 @@ func (bs *BlockStore) PutBlockAuto(ctx context.Context, hash string, data []byte
 	return key, nil
 }
 
-// PutBlockAutoDirect stores a block using PutAuto without a prior Exists/HEAD.
-// Callers must only use this when another source of truth has already decided
-// the block is not safely reusable as-is.
-func (bs *BlockStore) PutBlockAutoDirect(ctx context.Context, hash string, data []byte) (string, error) {
-	key := bs.hashToKey(hash)
-
-	reader := &bytesReader{data: data}
-	_, err := bs.s3.PutAuto(ctx, key, reader, int64(len(data)))
-	if err != nil {
-		return "", fmt.Errorf("failed to store block: %w", err)
-	}
-
-	return key, nil
-}
-
-// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior Exists/HEAD.
+// PutObjectAutoDirect stores raw bytes at an explicit storage key without a prior
+// Exists/HEAD. Callers must only use this when another source of truth has already
+// decided the block is not safely reusable as-is, and must supply the canonical
+// locator instead of letting the store derive one: minting a key here would let a
+// writer store bytes at a locator that never reaches `blocks.storage_key`.
+//
+// This is the only PUT the canonical materialization funnels use. The hash-derived
+// PutBlock/PutBlockData/PutBlockAuto/PutBlocks above still exist, but no funnel that
+// writes `blocks` reaches them — PutBlockData is left for the h.db == nil sync path,
+// which persists no metadata at all, and for test seeding. Unlike DeleteBlock, they
+// are not removed because they are still the ergonomic form for those callers; the
+// invariant they must not break is that nothing which registers canonical metadata
+// may use them.
 func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
+	if strings.TrimSpace(storageKey) == "" {
+		return "", fmt.Errorf("block storage key is empty")
+	}
 	reader := &bytesReader{data: data}
 	_, err := bs.s3.PutAuto(ctx, storageKey, reader, int64(len(data)))
 	if err != nil {
@@ -284,11 +289,21 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 	return result, nil
 }
 
-// DeleteBlock removes a block from storage
-// Note: Should only be called after verifying no references exist
-func (bs *BlockStore) DeleteBlock(ctx context.Context, hash string) error {
-	key := bs.hashToKey(hash)
-	return bs.s3.Delete(ctx, key)
+// DeleteBlockByStorageKey removes an object from its explicit canonical key. It is
+// the only delete entry point on purpose: with no hash-derived variant, the storage
+// layer never picks the target, so a caller has to name it.
+//
+// That is all the signature proves. StorageKeyForHash is still public, so
+// DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(id)) compiles — the tests below
+// do exactly that for cleanup. Where the key came from is a property of the caller,
+// pinned by tests, not by the compiler: production GC loads it from persisted
+// metadata and refuses it unless it matches this store's derivation.
+// Note: Should only be called after verifying no references exist.
+func (bs *BlockStore) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
+	if strings.TrimSpace(storageKey) == "" {
+		return fmt.Errorf("block storage key is empty")
+	}
+	return bs.s3.Delete(ctx, storageKey)
 }
 
 // PutBlocks stores multiple blocks and returns the hashes of successfully stored blocks

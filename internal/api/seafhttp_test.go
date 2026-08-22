@@ -3276,8 +3276,12 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 
 	putStarted := make(chan struct{})
 	var putStartedOnce sync.Once
-	probeUploadedBlockReuseForUploadFn = func(*db.DB, string, string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+	probeUploadedBlockReuseForUploadFn = func(_ *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseNeedsPut,
+			StorageClass: "hot",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		putStartedOnce.Do(func() { close(putStarted) })
@@ -3422,9 +3426,17 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	var probeCalls atomic.Int32
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 		if probeCalls.Add(1) == 1 || decision.Decision == db.BlockReuseReusable {
-			return decision, nil
+			probe := decision
+			if probe.StorageClass != "" && probe.StorageKey == "" {
+				probe.StorageKey = fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID)
+			}
+			return probe, nil
 		}
-		return db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot"}, nil
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseReusable,
+			StorageClass: "hot",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 
 	directPuts = &atomic.Int32{}
@@ -3584,7 +3596,11 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		return true, nil
 	}
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
-		return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"}, nil
+		return db.BlockReuseProbe{
+			Decision:     db.BlockReuseNeedsPut,
+			StorageClass: "hot",
+			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+		}, nil
 	}
 
 	var putCalls, registerCalls, commitCalls atomic.Int32

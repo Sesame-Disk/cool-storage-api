@@ -1579,12 +1579,13 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 	var info S3OrphanInfo
 	var firstSeenAt time.Time
 	err := s.db.Session().Query(`
-		SELECT storage_class, external_sha1, recovery_phase,
+		SELECT storage_class, storage_key, external_sha1, recovery_phase,
 		       first_seen_at, last_attempt_at, retry_count, last_error
 		FROM gc_s3_orphans
 		WHERE org_id = ? AND block_id = ?
 	`, orgID.String(), blockID).Consistency(gocql.EachQuorum).Scan(
 		&info.StorageClass,
+		&info.StorageKey,
 		&info.ExternalSHA1,
 		&info.RecoveryPhase,
 		&firstSeenAt,
@@ -1609,13 +1610,17 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 // StartBlockDeleteOrphan records the durable recovery row for a NEW block
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
-func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, externalSHA1 string, now time.Time) (time.Time, error) {
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
+	storageKey = strings.TrimSpace(storageKey)
+	if storageKey == "" {
+		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+	}
 	externalSHA1 = strings.TrimSpace(externalSHA1)
 	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, storage_key, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
 	}
@@ -1632,10 +1637,10 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		updateState := map[string]interface{}{}
 		updated, err := s.db.Session().Query(`
 			UPDATE gc_s3_orphans
-			SET storage_class = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
+			SET storage_class = ?, storage_key = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveStorageClass, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveStorageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -2027,12 +2032,13 @@ func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInf
 	// Single-partition point read by the full ((org_id), block_id) key. sha1 is
 	// the same row, so reading it adds no extra query and no tombstone scan.
 	err := s.db.Session().Query(`
-		SELECT storage_class, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&info.StorageClass, &createdAt, &sha1)
+		SELECT storage_class, storage_key, created_at, sha1 FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass, &info.StorageKey, &createdAt, &sha1)
 	if err != nil {
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
+	info.StorageKey = strings.TrimSpace(info.StorageKey)
 	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }

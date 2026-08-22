@@ -39,7 +39,7 @@ func TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan(t *testing.T) {
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
 	// Establish a normal orphan through the canonical lifecycle entry point.
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "", firstSeenAt); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "", firstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	t.Cleanup(func() {
@@ -99,13 +99,13 @@ func TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken(t *testing.T) {
 	p1FirstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 	p2FirstSeenAt := p1FirstSeenAt.Add(time.Second)
 
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "sha1-p1", p1FirstSeenAt); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "sha1-p1", p1FirstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan P1: %v", err)
 	}
 	if err := store.DeleteS3Orphan(orgID, blockID, p1FirstSeenAt); err != nil {
 		t.Fatalf("DeleteS3Orphan P1: %v", err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "cold", "sha1-p2", p2FirstSeenAt); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "cold", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "sha1-p2", p2FirstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan P2: %v", err)
 	}
 	t.Cleanup(func() {
@@ -171,7 +171,7 @@ func TestGC_UpdateS3OrphanAttempt_AnchorsDiagnosticTTLOnFirstSeenAt(t *testing.T
 	blockID := fmt.Sprintf("orph-ttl-anchor-%d", time.Now().UnixNano())
 
 	firstSeenAt := time.Now().UTC().Add(-backdate).Truncate(time.Millisecond)
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "", firstSeenAt); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "", firstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	t.Cleanup(func() {
@@ -244,7 +244,7 @@ func TestGC_UpdateS3OrphanAttemptMatchesEffectiveTTL(t *testing.T) {
 	orgID := uuid.New()
 	blockID := fmt.Sprintf("orph-ttl-effective-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "", firstSeenAt); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "", firstSeenAt); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	t.Cleanup(func() {

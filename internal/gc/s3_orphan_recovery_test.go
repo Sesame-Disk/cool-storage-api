@@ -54,7 +54,7 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 		t.Errorf("BlocksDeleted=%d, want 1", stats.BlocksDeleted())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "block-retry"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-retry")}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -178,7 +178,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 		t.Errorf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", BlockID: "orph-1"}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "orph-1")}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -380,6 +380,91 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 }
 
+// s3OrphanRecoveryStateEqual is the reload comparison, and every field in it is
+// there because changing it changes which bytes recovery would destroy. Pinned
+// as a direct table because the end-to-end shape cannot isolate the locator
+// field today: under P1 any key other than the derived one is already refused
+// by the derived-key guard, so a flow test keeps passing with the reload
+// comparison removed — verified by mutation. The comparison becomes the only
+// defence in P2, when minted keys retire that guard.
+func TestS3OrphanRecoveryStateEqualComparesEveryDestructiveField(t *testing.T) {
+	orgID := uuid.New()
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	base := S3OrphanInfo{
+		OrgID:         orgID,
+		BlockID:       "orph-state-equal",
+		StorageClass:  "hot",
+		StorageKey:    MockCanonicalStorageKey(orgID.String(), "orph-state-equal"),
+		ExternalSHA1:  "sha1-base",
+		RecoveryPhase: S3OrphanPhasePendingS3,
+		FirstSeenAt:   firstSeenAt,
+	}
+	if !s3OrphanRecoveryStateEqual(base, base) {
+		t.Fatal("identical canonical state must compare equal or every reload fails closed forever")
+	}
+
+	for name, mutate := range map[string]func(info *S3OrphanInfo){
+		"org_id":        func(info *S3OrphanInfo) { info.OrgID = uuid.New() },
+		"block_id":      func(info *S3OrphanInfo) { info.BlockID = "orph-state-equal-other" },
+		"storage_class": func(info *S3OrphanInfo) { info.StorageClass = "cold" },
+		"storage_key": func(info *S3OrphanInfo) {
+			info.StorageKey = MockCanonicalStorageKey(orgID.String(), "orph-state-equal-reset")
+		},
+		"external_sha1":  func(info *S3OrphanInfo) { info.ExternalSHA1 = "sha1-changed" },
+		"recovery_phase": func(info *S3OrphanInfo) { info.RecoveryPhase = S3OrphanPhasePendingMappingCleanup },
+		"first_seen_at":  func(info *S3OrphanInfo) { info.FirstSeenAt = firstSeenAt.Add(time.Second) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if s3OrphanRecoveryStateEqual(base, changed) {
+				t.Fatalf("%s changed under the reload but compared equal; recovery would commit against stale state", name)
+			}
+		})
+	}
+}
+
+// The end-to-end shape: a row whose locator changed between the first canonical
+// read and the commit point destroys nothing and keeps its cursor. With the
+// comparison present, the commit-point reload is the defense that refuses it.
+// Removing storage_key from that comparison would still fail closed today at the
+// derived-key guard, so the flow test pins the outcome while the table above pins
+// the comparison itself.
+func TestWorker_RecoverS3Orphans_CanonicalStorageKeyChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	const blockID = "orph-canonical-reload-key"
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", time.Now())
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			// Everything else — org, block, first_seen_at, class, sha1, phase —
+			// stays exactly as the first read saw it.
+			info.StorageKey = MockCanonicalStorageKey(orgID.String(), blockID+"-reset")
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch for the changed storage key")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched when the locator changed under the reload, got %+v", got)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatal("orphan row must remain for the next sweep")
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced past a row whose locator changed: %v", err)
+	}
+}
+
 // This is the reachable canonical-state shape that would be lost if R11b
 // removed the external SHA-1 field. StartBlockDeleteOrphan preserves
 // first_seen_at when it resets an existing row, so phase and storage class can
@@ -559,7 +644,7 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 	}
 	want := map[string]bool{orgA.String(): false, orgB.String(): false}
 	for _, deletion := range sp.ScopedBlockDeletes() {
-		if deletion.StorageClass != "hot" || deletion.BlockID != "shared-hash" {
+		if deletion.StorageClass != "hot" || deletion.StorageKey != MockCanonicalStorageKey(deletion.OrgID, "shared-hash") {
 			t.Fatalf("unexpected scoped deletion: %+v", deletion)
 		}
 		if _, ok := want[deletion.OrgID]; !ok {
@@ -599,7 +684,7 @@ func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 		t.Fatal("forward mapping should survive S3 recovery")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "orph-map" {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "orph-map") {
 		t.Fatalf("expected one S3 delete for orph-map, got %v", deleted)
 	}
 }
@@ -654,7 +739,7 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", "sha1-new", time.Now().UTC()); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", MockCanonicalStorageKey(orgID.String(), "blk-redelete"), "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
 	if err := store.FinalizeBlockDelete(orgID, "blk-redelete", "claim-1"); err != nil {
@@ -675,7 +760,7 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != "blk-redelete" {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "blk-redelete") {
 		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
 	}
 }
@@ -807,7 +892,7 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("first recovery error = nil, want failed orphan clear")
 	}
-	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
 	}
 	if !store.ForwardBlockMappingExists(orgID, sha1) {
@@ -848,7 +933,7 @@ func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("first recovery error = nil, want phase advance failure")
 	}
-	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != blockID {
+	if got := sp.DeletedBlocks(); len(got) != 1 || got[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("first recovery S3 deletes = %v, want one delete", got)
 	}
 	// The pending_s3 path checks BlockExists before deleting. This repeat case

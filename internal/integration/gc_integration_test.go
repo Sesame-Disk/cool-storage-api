@@ -1045,23 +1045,37 @@ func deleteGCFailedItemsByIdentity(t *testing.T, orgID string, itemType string, 
 
 func deleteGCPendingBlockItems(t *testing.T, orgID uuid.UUID, blockID string) {
 	t.Helper()
+	deleteGCPendingItemsByIdentity(t, orgID, uuid.Nil, gcpkg.ItemBlock, blockID)
+}
+
+// deleteGCPendingItemsByIdentity removes the gc_pending_items rows for one queue
+// identity. It exists for the item types production never completes in a test —
+// FailItem and RequeueFailedItem both write this table, it has no TTL, and a
+// synthetic item that never succeeds leaves its row behind forever. Deleting the
+// queue and DLQ rows alone is not enough.
+func deleteGCPendingItemsByIdentity(t *testing.T, orgID, libraryID uuid.UUID, itemType gcpkg.ItemType, itemID string) {
+	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	bucket := gcpkg.PendingItemBucket(orgID, uuid.Nil, gcpkg.ItemBlock, blockID)
+	bucket := gcpkg.PendingItemBucket(orgID, libraryID, itemType, itemID)
 	iter := session.Query(`
 		SELECT identity_at FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
-	`, orgID.String(), bucket, "block", uuid.Nil.String(), blockID).Iter()
+	`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID).Iter()
+	var identityAts []time.Time
 	var identityAt time.Time
 	for iter.Scan(&identityAt) {
+		identityAts = append(identityAts, identityAt)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, itemID, err)
+	}
+	for _, at := range identityAts {
 		if err := session.Query(`
 			DELETE FROM gc_pending_items
 			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID.String(), bucket, "block", uuid.Nil.String(), blockID, identityAt).Exec(); err != nil {
-			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, blockID, err)
+		`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID, at).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, itemID, err)
 		}
-	}
-	if err := iter.Close(); err != nil {
-		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, blockID, err)
 	}
 }
 
@@ -1093,7 +1107,10 @@ func repairGCSnapshotsForTest(t *testing.T, orgID uuid.UUID) {
 	}
 }
 
-func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+// deleteGCBlockFixtureRowsForTest tears down the rows one synthetic block leaves
+// behind without changing org-wide coordination markers. This is also the safe
+// cleanup for a block created under a shared real org.
+func deleteGCBlockFixtureRowsForTest(t *testing.T, orgID uuid.UUID, blockID string) {
 	t.Helper()
 	deleteGCQueueItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
@@ -1102,13 +1119,63 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
 	}
+}
+
+func cleanupGCBlockRowsForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	deleteGCBlockFixtureRowsForTest(t, orgID, blockID)
 	repairGCSnapshotsForTest(t, orgID)
+}
+
+// cleanupGCBlockFixturesForTest tears down every row and coordination marker
+// one synthetic block leaves behind. Callers must own the org: clearing
+// gc_active_orgs or gc_dirty_orgs for a shared real org can hide unrelated work.
+//
+// The ordering matches purgeDisposableLibraryDeleteResiduals and is not
+// interchangeable: the marker was written by EnqueueItem/RequeueItem, while
+// the row deletions above are raw CQL and do not create markers. Remove the
+// fixture rows first, then clear the markers, then recompute dirty_orgs_total;
+// otherwise the snapshot can count a marker this teardown just removed. The
+// fence is captured before the clears so their conditional deletes cannot
+// clobber a later enqueue, and active-set removal is gated on an empty queue so
+// a sibling block still queued for the org stays discoverable.
+func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	deleteGCBlockFixtureRowsForTest(t, orgID, blockID)
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	cleanupFence := time.Now().UTC()
+	stats, err := store.RecalculateOrgQueueStats(orgID)
+	if err != nil {
+		t.Fatalf("recalculate org queue stats for %s: %v", orgID, err)
+	}
+	if err := store.ClearDirtyOrg(orgID, cleanupFence); err != nil {
+		t.Fatalf("clear dirty org %s: %v", orgID, err)
+	}
+	if stats.QueueDepth == 0 {
+		if err := store.RemoveOrgFromActiveSet(orgID, cleanupFence); err != nil {
+			t.Fatalf("remove org %s from active set: %v", orgID, err)
+		}
+	}
+	repairGCSnapshotsForTest(t, orgID)
+}
+
+// syntheticCanonicalStorageKeyForTest mints the locator a real org-scoped
+// BlockStore would derive for this block. It must stay equal to the derivation,
+// not merely well-formed: GC verifies the persisted key against what its own
+// store derives before deleting, so a fixture with a plausible-but-wrong key
+// would seed rows that a storage-backed worker refuses — passing today only
+// because these tests run the worker with no storage provider.
+func syntheticCanonicalStorageKeyForTest(orgID, blockID string) string {
+	if len(blockID) < 4 {
+		return fmt.Sprintf("blocks/%s/%s", orgID, blockID)
+	}
+	return fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID)
 }
 
 func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string) {
 	t.Helper()
 	database := shareProjectionDBForTest(t)
-	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, ""); err != nil {
+	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)); err != nil {
 		t.Fatalf("failed to seed block metadata for %s/%s: %v", orgID, blockID, err)
 	}
 	t.Cleanup(func() {
@@ -1669,7 +1736,7 @@ func TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete(t *testing.T) {
 
 	// Real zero-ref canonical row carrying blocks.sha1 = externalSHA1 (what every
 	// materialization path writes), plus the forward mapping it resolves to.
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)); err != nil {
 		t.Fatalf("seed block with sha1: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, db.PlainBlockRepresentationID, externalSHA1, blockID, time.Now().UTC()); err != nil {
@@ -1728,10 +1795,10 @@ func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)); err != nil {
 		t.Fatalf("seed plain block: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)); err != nil {
 		t.Fatalf("seed encrypted block: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
@@ -1802,10 +1869,10 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)); err != nil {
 		t.Fatalf("seed plain block: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)); err != nil {
 		t.Fatalf("seed encrypted block: %v", err)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
@@ -1981,7 +2048,7 @@ func TestGC_ReleasedBlockStub_ProbeRepairAndMaterialize(t *testing.T) {
 	if err := database.Session().Query(`INSERT INTO blocks (org_id, block_id) VALUES (?, ?)`, orgID, blockID).Exec(); err != nil {
 		t.Fatalf("reseed released stub: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", "blocks/"+orgID+"/aa/aa/"+blockID); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", syntheticCanonicalStorageKeyForTest(orgID, blockID)); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1(stub backstop): %v", err)
 	}
 	if err := database.AddBlockReference(orgID, blockID, "test:live", uuid.New().String(), 0); err != nil {
@@ -2151,7 +2218,11 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	blockID := fmt.Sprintf("orph-reset-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	effectiveFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", "sha1-old", "seed", firstSeenAt)
+	// Seed a locator from a previous lifecycle so the reset below has something
+	// to overwrite. Without a differing value the storage_key assertion would
+	// pass whether or not the UPDATE carries the column at all.
+	staleStorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-stale")
+	effectiveFirstSeenAt := seedS3OrphanWithStorageKey(t, store, orgID, blockID, staleStorageKey, "cold", "sha1-old", "seed", firstSeenAt)
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
 	}
@@ -2164,7 +2235,8 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		}
 	})
 
-	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", "sha1-new", time.Now().UTC())
+	wantStorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)
+	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", wantStorageKey, "sha1-new", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
@@ -2172,14 +2244,19 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 		t.Fatalf("reset first_seen_at = %v, want original %v", resetFirstSeenAt, firstSeenAt)
 	}
 
-	var storageClass, externalSHA1, recoveryPhase string
+	var storageClass, storageKey, externalSHA1, recoveryPhase string
 	var storedFirstSeenAt time.Time
 	if err := database.Session().Query(`
-		SELECT storage_class, external_sha1, recovery_phase, first_seen_at
+		SELECT storage_class, storage_key, external_sha1, recovery_phase, first_seen_at
 		FROM gc_s3_orphans
 		WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&storageClass, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
+	`, orgID.String(), blockID).Scan(&storageClass, &storageKey, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
 		t.Fatalf("read gc_s3_orphans: %v", err)
+	}
+	// The locator is what recovery hands to S3, so a reset that left the previous
+	// lifecycle's key in place would aim the next delete at a stale object.
+	if storageKey != wantStorageKey {
+		t.Fatalf("gc_s3_orphans.storage_key = %q, want %q (stale was %q)", storageKey, wantStorageKey, staleStorageKey)
 	}
 	if storageClass != "hot" {
 		t.Fatalf("gc_s3_orphans.storage_class = %q, want %q", storageClass, "hot")
@@ -2640,6 +2717,9 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 		_ = session.Query(`
 			DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 		`, orgID.String(), failedAt, "unknown_type", itemID).Exec()
+		// FailItem writes gc_pending_items on the way to the DLQ, and this item
+		// type never completes, so nothing else removes that row.
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemID)
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		repairGCSnapshotsForTest(t, orgID)
@@ -2715,6 +2795,11 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtB, "unknown_type", itemIDB).Exec()
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDA)
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDB)
+		// The admin requeue below moves a DLQ row back through the canonical
+		// enqueue path, which also writes gc_pending_items. This item type never
+		// completes, so that row outlives the queue and DLQ rows deleted above.
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemIDA)
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemIDB)
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_org_stats WHERE org_id = ?`, orgID.String()).Exec()
@@ -2892,7 +2977,7 @@ func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 
 	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference, the
 	// fs_object that owns that reference, and the pre-existing gc_block_candidate.
-	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", ""); err != nil {
+	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)); err != nil {
 		t.Fatalf("seed blocks row: %v", err)
 	}
 	if err := database.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {

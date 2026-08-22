@@ -104,17 +104,17 @@ func TestNeedsPutUsesCanonicalMinIOBucket(t *testing.T) {
 		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
 			t.Errorf("cleanup block metadata: %v", err)
 		}
-		if err := preferredStore.DeleteBlock(ctx, blockID); err != nil {
+		if err := preferredStore.DeleteBlockByStorageKey(ctx, preferredStore.StorageKeyForHash(blockID)); err != nil {
 			t.Errorf("cleanup preferred object: %v", err)
 		}
-		if err := canonicalStore.DeleteBlock(ctx, blockID); err != nil {
+		if err := canonicalStore.DeleteBlockByStorageKey(ctx, canonicalStore.StorageKeyForHash(blockID)); err != nil {
 			t.Errorf("cleanup canonical object: %v", err)
 		}
 	})
-	if err := preferredStore.DeleteBlock(ctx, blockID); err != nil {
+	if err := preferredStore.DeleteBlockByStorageKey(ctx, preferredStore.StorageKeyForHash(blockID)); err != nil {
 		t.Fatalf("remove stale preferred object: %v", err)
 	}
-	if err := canonicalStore.DeleteBlock(ctx, blockID); err != nil {
+	if err := canonicalStore.DeleteBlockByStorageKey(ctx, canonicalStore.StorageKeyForHash(blockID)); err != nil {
 		t.Fatalf("remove stale canonical object: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestNeedsPutUsesCanonicalMinIOBucket(t *testing.T) {
 	// Recreate the original session regression: metadata remains pinned to USA,
 	// its canonical object disappears, and the library still prefers EU. The web
 	// session must repair USA, verify USA at commit, and remain readable afterward.
-	if err := canonicalStore.DeleteBlock(ctx, blockID); err != nil {
+	if err := canonicalStore.DeleteBlockByStorageKey(ctx, canonicalStore.StorageKeyForHash(blockID)); err != nil {
 		t.Fatalf("remove canonical object before session repair: %v", err)
 	}
 	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(data)))

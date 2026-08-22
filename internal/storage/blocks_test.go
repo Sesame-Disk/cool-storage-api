@@ -466,3 +466,21 @@ func TestHashSharding(t *testing.T) {
 		t.Errorf("Hashes starting with 'abcd' and 'efgh' should have different first level")
 	}
 }
+
+// The canonical direct PUT and the only physical DELETE both take an explicit
+// locator, so an empty key must be refused here rather than forwarded to S3. The
+// hash-derived PutBlock/PutBlockData/PutBlockAuto/PutBlocks still exist for
+// no-metadata paths and test seeding; they derive a key and cannot be empty. A nil S3Store makes the
+// test itself the proof: reaching the backend would panic instead of returning.
+func TestObjectAPIsRejectEmptyStorageKey(t *testing.T) {
+	bs := mustNewTestOrgBlockStore(t, "blocks/")
+
+	for _, storageKey := range []string{"", "   "} {
+		if _, err := bs.PutObjectAutoDirect(context.Background(), storageKey, []byte("data")); err == nil {
+			t.Fatalf("PutObjectAutoDirect(%q) error = nil, want empty storage key error", storageKey)
+		}
+		if err := bs.DeleteBlockByStorageKey(context.Background(), storageKey); err == nil {
+			t.Fatalf("DeleteBlockByStorageKey(%q) error = nil, want empty storage key error", storageKey)
+		}
+	}
+}

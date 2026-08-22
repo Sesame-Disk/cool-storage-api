@@ -45,8 +45,8 @@ const (
 var probeUploadedBlockReuseFn = ProbeUploadedBlockReuse
 var prepareUploadedBlockProbeFn = PrepareUploadedBlockProbe
 
-var putUploadedBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
-	return blockStore.PutBlockAutoDirect(ctx, hash, data)
+var putUploadedBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, storageKey string, data []byte) (string, error) {
+	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
 }
 var repairReleasedBlockStubForUploadFn = func(database *db.DB, orgID, blockID string) (bool, error) {
 	return database.RepairReleasedBlockStub(orgID, blockID)
@@ -150,9 +150,13 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 	if err != nil {
 		return nil, "", "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
 	}
-	storageKey := canonicalStore.StorageKeyForHash(blockID)
-	if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
-		return nil, "", "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+	storageKey := strings.TrimSpace(probe.StorageKey)
+	if storageKey == "" {
+		return nil, "", "", fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
+	}
+	derivedKey := canonicalStore.StorageKeyForHash(blockID)
+	if storageKey != derivedKey {
+		return nil, "", "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storageKey, derivedKey)
 	}
 	return canonicalStore, canonicalClass, storageKey, nil
 }
@@ -170,9 +174,13 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 		if resolveErr != nil {
 			return "", canonicalClass, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
 		}
-		storageKey = canonicalStore.StorageKeyForHash(blockID)
-		if storedKey := strings.TrimSpace(probe.StorageKey); storedKey != "" && storedKey != storageKey {
-			return "", canonicalClass, false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storedKey, storageKey)
+		storageKey = strings.TrimSpace(probe.StorageKey)
+		if storageKey == "" {
+			return "", canonicalClass, false, fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
+		}
+		derivedKey := canonicalStore.StorageKeyForHash(blockID)
+		if storageKey != derivedKey {
+			return "", canonicalClass, false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storageKey, derivedKey)
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {

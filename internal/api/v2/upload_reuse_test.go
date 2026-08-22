@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,20 +18,29 @@ import (
 )
 
 type fastClearTestBlockStore struct {
+	orgID         string
 	objectPresent *atomic.Bool
 }
 
-func (s fastClearTestBlockStore) DeleteBlock(context.Context, string) error {
+// The worker checks the persisted locator against what this store would derive
+// before it deletes, so the stub has to derive the same org-scoped key the mock
+// store seeded — otherwise the delete is refused and the race under test never
+// happens.
+func (s fastClearTestBlockStore) StorageKeyForHash(hash string) string {
+	return gc.MockCanonicalStorageKey(s.orgID, hash)
+}
+
+func (s fastClearTestBlockStore) DeleteBlockByStorageKey(context.Context, string) error {
 	s.objectPresent.Store(false)
 	return nil
 }
 
 type fastClearTestStorageProvider struct {
-	store fastClearTestBlockStore
+	objectPresent *atomic.Bool
 }
 
-func (p fastClearTestStorageProvider) GetBlockStoreForOrg(string, string) (gc.BlockStoreDeleter, error) {
-	return p.store, nil
+func (p fastClearTestStorageProvider) GetBlockStoreForOrg(orgID, _ string) (gc.BlockStoreDeleter, error) {
+	return fastClearTestBlockStore{orgID: orgID, objectPresent: p.objectPresent}, nil
 }
 
 // fastBlockMaterializationRetries shrinks the shared retry backoff to keep tests
@@ -405,7 +415,7 @@ func TestRetryUploadedBlockMaterializationWithWorkerFastClear(t *testing.T) {
 	})
 
 	var objectPresent atomic.Bool
-	provider := fastClearTestStorageProvider{store: fastClearTestBlockStore{objectPresent: &objectPresent}}
+	provider := fastClearTestStorageProvider{objectPresent: &objectPresent}
 	worker := gc.NewWorker(store, provider, gc.NewQueue(store), 1, 0, false, &gc.Stats{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -676,7 +686,7 @@ func TestEnsureReusableBlockPresentRepairsMissingCanonicalObject(t *testing.T) {
 	key, err := EnsureReusableBlockPresent(context.Background(), blockID, db.BlockReuseProbe{
 		Decision:     db.BlockReuseReusable,
 		StorageClass: "hot-s3",
-		StorageKey:   "",
+		StorageKey:   wantKey,
 	}, []byte("repair-me"), nil, canonicalStore, "hot-s3", orgID)
 	if err != nil {
 		t.Fatalf("EnsureReusableBlockPresent() error = %v, want nil", err)
@@ -820,6 +830,35 @@ func TestResolveNeedsPutBlockStoreRefusesNonCanonicalFirstWriterClass(t *testing
 	}
 }
 
+// An existing canonical row is immutable placement state. With no persisted
+// locator there is nothing to place against, and deriving a replacement is the
+// authority P1 removed — so this refuses instead of falling back to the hash.
+func TestResolveNeedsPutBlockStoreRefusesExistingRowWithoutPersistedKey(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	t.Cleanup(func() { resolveCanonicalBlockStoreFn = oldResolve })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonical, nil
+	}
+
+	for _, storageKey := range []string{"", "   "} {
+		gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, canonical, "preferred", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: storageKey,
+		}, orgID, "abcd1234")
+		if err == nil || !strings.Contains(err.Error(), "empty persisted storage key") {
+			t.Fatalf("storage key %q: error = %v, want empty persisted key refusal", storageKey, err)
+		}
+		if gotStore != nil || gotClass != "" || gotKey != "" {
+			t.Fatalf("storage key %q: refusal must return no placement, got %p/%q/%q", storageKey, gotStore, gotClass, gotKey)
+		}
+	}
+}
+
 func TestResolveNeedsPutBlockStoreUsesExistingCanonicalPlacement(t *testing.T) {
 	oldResolve := resolveCanonicalBlockStoreFn
 	t.Cleanup(func() { resolveCanonicalBlockStoreFn = oldResolve })
@@ -884,6 +923,28 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 		}, []byte("data"), nil, &storage.BlockStore{}, "preferred", "org-1", nil)
 		if err == nil || putCalls != 0 {
 			t.Fatalf("error/putCalls = %v/%d, want error/0", err, putCalls)
+		}
+	})
+
+	t.Run("existing canonical row with no persisted key", func(t *testing.T) {
+		const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+		canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+			return canonical, nil
+		}
+		for _, decision := range []db.BlockReuseDecision{db.BlockReuseNeedsPut, db.BlockReuseReusable} {
+			_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
+				Decision: decision, StorageClass: "archive", StorageKey: "   ",
+			}, []byte("data"), nil, canonical, "preferred", orgID, nil)
+			if err == nil || !strings.Contains(err.Error(), "empty persisted storage key") {
+				t.Fatalf("decision %v: error = %v, want empty persisted key refusal", decision, err)
+			}
+			if putCalls != 0 {
+				t.Fatalf("decision %v: putCalls = %d, want 0", decision, putCalls)
+			}
 		}
 	})
 
@@ -965,7 +1026,7 @@ func TestStoreUploadedBlockForProbePreservesTransientStorageCause(t *testing.T) 
 	}
 
 	_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "abcd1234", db.BlockReuseProbe{
-		Decision: db.BlockReuseReusable, StorageClass: "archive",
+		Decision: db.BlockReuseReusable, StorageClass: "archive", StorageKey: canonical.StorageKeyForHash("abcd1234"),
 	}, []byte("data"), nil, canonical, "preferred", "org-1", nil)
 	if !errors.Is(err, ErrBlockMaterializationTransient) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want transient sentinel and context cancellation cause", err)
@@ -1000,6 +1061,7 @@ func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T
 		if attempt == 1 {
 			probe.StorageClass = "archive"
 		}
+		probe.StorageKey = canonical.StorageKeyForHash("abcd1234")
 		_, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(nil, preferred, "preferred", probe, orgID, "abcd1234")
 		if resolveErr == nil {
 			placementClass = resolvedClass

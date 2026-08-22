@@ -265,7 +265,7 @@ The pre-PUT S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)`
 (`internal/db/block_references.go`), which reads `blocks` metadata,
 `block_references`, and the `gc_s3_orphans` fence and returns
 reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
-`PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
+`PutObjectAutoDirect` at the resolved locator (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
 unknown-error fails closed before S3 PUT. Wired into all seven governed upload funnels
@@ -312,10 +312,13 @@ stores may retain orphaned MPU parts until an explicit abort or lifecycle sweep.
 
 ### Remaining Debt
 
-- **Block reads ignore `storage_key`** (pre-existing, surfaced by P-2). Every read
-  in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`, `GetBlockSize`,
-  `BlockExists`, …) derives the S3 key from the content hash via `hashToKey(hash)`
-  and never consults the canonical `storage_key` column; GC deletes the same way.
+- **Legacy block APIs still derive storage keys.** The hash-based convenience
+  methods in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`,
+  `GetBlockSize`, `BlockExists`, `PutBlock`, and related methods) remain for
+  metadata-free callers and derive keys through `hashToKey(hash)`. Canonical
+  production reads, reuse/repair, orphan recovery and GC now load and validate
+  the persisted `storage_key`; arbitrary relocation remains unsupported until
+  the legacy APIs and their callers are made locator-aware.
 
 ---
 

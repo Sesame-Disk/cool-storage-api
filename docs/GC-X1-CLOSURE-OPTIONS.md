@@ -1,7 +1,8 @@
 # X1 — Closure Options for the Physical-Delete ABA
 
-**Status:** Analysis and option comparison. **No option is accepted. Nothing is
-implemented. This is not an ADR.**
+**Status:** Analysis and option comparison. **No X1 option is accepted. This is
+not an ADR.** P1's locator-authority foundation is implemented separately; it
+does not close X1 or authorize destructive GC.
 
 Even a future verified X1 implementation would not enable destructive GC by itself;
 removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
@@ -75,6 +76,26 @@ adding a new identity field or persisting `P`. Persisting the exact `storage_key
 and forming `P=(storage_class, storage_key)` is the work AFTER R23b and is what
 actually closes the physical ABA — but it is a series of properties, not one row.
 See the sequencing note below.
+
+**P1 locator authority (2026-08-21).** New materializations resolve the
+org-scoped key `K = hashToKey(L)` once and pass the returned key through the
+physical PUT, metadata registration, canonical read/reuse/repair, GC orphan
+row, recovery reload and physical DELETE. `blocks.storage_key` and the
+canonical `gc_s3_orphans.storage_key` are required; an empty key fails closed.
+The `_by_day` table remains an identity-only discovery projection. Both
+destructive paths additionally verify the persisted key against the key their
+own org-scoped store derives and refuse the delete on a mismatch, since the
+store applies whatever key it is handed. Successful destructive authorization is
+unchanged, but failure ordering is not: resolving the store during the
+authorization phase means an unresolvable backend or an invalid locator is now
+refused before any destructive lifecycle state is written, where it previously
+could be discovered after the canonical row was already gone. The exact locator
+prevents a caller from silently deriving a different target, but it does not
+create a never-reused physical incarnation or solve the X1 publication-fence
+and per-attempt claim-ownership races. The equality check it relies on is also
+carrying tenant isolation, so P2 cannot simply delete it when keys stop being
+derived (see ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains
+disabled in production.
 
 **The historical risk remains real even though the current greenfield deployment
 contract now prohibits both halves.** An earlier version of this section justified the
@@ -213,7 +234,8 @@ resolved, and every non-web funnel but OnlyOffice discards it and persists `""`
 (`seafhttp.go:2520`, `seafhttp.go:3031`, `sync.go:2026`, `files.go:1358`,
 `files.go:3452`; OnlyOffice keeps it at `onlyoffice.go:1224`).
 
-In the `NeedsPut` branch **every non-web funnel** discards it, OnlyOffice included.
+*(Pre-P1 baseline; P1 fixed exactly this — see the locator-authority note above.)*
+In the `NeedsPut` branch **every non-web funnel** discarded it, OnlyOffice included.
 `ResolveNeedsPutBlockStore` returns the resolved key and all six call sites drop it
 (`seafhttp.go:2527`, `seafhttp.go:3034`, `sync.go:2035`, `files.go:1364`,
 `files.go:3455`, `onlyoffice.go:1227`), then write the bytes with
@@ -1701,7 +1723,9 @@ never revisited. Under B that branch changes meaning entirely (B.1).
 
 ## Call-site inventory
 
-A conceptual diff, not an implementation list.
+A conceptual diff, not an implementation list. The **Today** column is the
+pre-P1 baseline used by the option analysis; the P1 locator-authority delta is
+recorded above and does not change the open X1 requirements.
 
 | Surface | Today | What minted keys need |
 |---|---|---|
