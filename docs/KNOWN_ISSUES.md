@@ -5227,8 +5227,11 @@ The fix ships as a small, sequential series of branches (each its own PR):
   same-org dedup across libraries and distinct physical keys plus byte-for-byte reads across the default
   and platform orgs. This intermediate state required GC to remain disabled until PR-3.
 - ✅ **PR-3 — GC own branch:** delete + orphan recovery resolve `(org_id, normalized canonical storage_class)`,
-  empty orphan classes fail closed, the legacy global APIs are removed as a compiler net, and the
-  cross-org Cassandra+MinIO regressions above pass.
+  empty orphan classes fail closed, and the legacy global APIs are removed so the
+  storage layer no longer derives a delete target on a caller's behalf. That is
+  not, by itself, a compiler proof that a caller loaded `blocks.storage_key` or
+  that an explicit locator belongs to the org; the cross-org Cassandra+MinIO
+  regressions above pin the production caller checks.
 - Broader multiregion/bucket coverage remains useful follow-up coverage, but it is not required to
   close P10's locator mismatch: the exact-class adapter contract and org-scoped physical isolation
   are covered in PR-3.

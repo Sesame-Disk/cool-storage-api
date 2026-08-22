@@ -425,9 +425,11 @@ func TestS3OrphanRecoveryStateEqualComparesEveryDestructiveField(t *testing.T) {
 }
 
 // The end-to-end shape: a row whose locator changed between the first canonical
-// read and the commit point destroys nothing and keeps its cursor. Today the
-// derived-key guard is what refuses it — see the note above — so this pins the
-// outcome, not which defence produced it.
+// read and the commit point destroys nothing and keeps its cursor. With the
+// comparison present, the commit-point reload is the defense that refuses it.
+// Removing storage_key from that comparison would still fail closed today at the
+// derived-key guard, so the flow test pins the outcome while the table above pins
+// the comparison itself.
 func TestWorker_RecoverS3Orphans_CanonicalStorageKeyChangeBeforeCommitFailsClosed(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -447,7 +449,7 @@ func TestWorker_RecoverS3Orphans_CanonicalStorageKeyChangeBeforeCommitFailsClose
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
-		t.Fatal("RecoverS3Orphans() error = nil, want the changed locator refused (derived-key guard today, reload comparison once P2 retires it)")
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch for the changed storage key")
 	}
 	if recovered != 0 {
 		t.Fatalf("recovered=%d, want 0", recovered)

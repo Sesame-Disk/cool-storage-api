@@ -1107,20 +1107,10 @@ func repairGCSnapshotsForTest(t *testing.T, orgID uuid.UUID) {
 	}
 }
 
-// cleanupGCBlockFixturesForTest tears down every row one synthetic block leaves
-// behind. Every caller passes an org minted with uuid.New() for its own test, so
-// clearing that org's coordination markers here is safe and saves each caller
-// repeating the ordering below — which is easy to get backwards.
-//
-// The ordering matches purgeDisposableLibraryDeleteResiduals and is not
-// interchangeable: the row deletions above can re-mark the org dirty, so the
-// markers come down after them; dirty_orgs_total is derived from ListDirtyOrgs,
-// so the snapshot is recomputed after THAT, or the global counter keeps counting
-// a marker this teardown just removed. The fence is captured before the clears so
-// their conditional deletes cannot clobber markers from an enqueue that starts
-// during teardown, and the active-set removal is gated on an empty queue so a
-// sibling block still queued for the same org stays discoverable.
-func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+// deleteGCBlockFixtureRowsForTest tears down the rows one synthetic block leaves
+// behind without changing org-wide coordination markers. This is also the safe
+// cleanup for a block created under a shared real org.
+func deleteGCBlockFixtureRowsForTest(t *testing.T, orgID uuid.UUID, blockID string) {
 	t.Helper()
 	deleteGCQueueItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
@@ -1129,6 +1119,30 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
 	}
+}
+
+func cleanupGCBlockRowsForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	deleteGCBlockFixtureRowsForTest(t, orgID, blockID)
+	repairGCSnapshotsForTest(t, orgID)
+}
+
+// cleanupGCBlockFixturesForTest tears down every row and coordination marker
+// one synthetic block leaves behind. Callers must own the org: clearing
+// gc_active_orgs or gc_dirty_orgs for a shared real org can hide unrelated work.
+//
+// The ordering matches purgeDisposableLibraryDeleteResiduals and is not
+// interchangeable: the marker was written by EnqueueItem/RequeueItem, while
+// the row deletions above are raw CQL and do not create markers. Remove the
+// fixture rows first, then clear the markers, then recompute dirty_orgs_total;
+// otherwise the snapshot can count a marker this teardown just removed. The
+// fence is captured before the clears so their conditional deletes cannot
+// clobber a later enqueue, and active-set removal is gated on an empty queue so
+// a sibling block still queued for the org stays discoverable.
+func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	deleteGCBlockFixtureRowsForTest(t, orgID, blockID)
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 	cleanupFence := time.Now().UTC()
 	stats, err := store.RecalculateOrgQueueStats(orgID)
 	if err != nil {

@@ -312,10 +312,13 @@ stores may retain orphaned MPU parts until an explicit abort or lifecycle sweep.
 
 ### Remaining Debt
 
-- **Block reads ignore `storage_key`** (pre-existing, surfaced by P-2). Every read
-  in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`, `GetBlockSize`,
-  `BlockExists`, …) derives the S3 key from the content hash via `hashToKey(hash)`
-  and never consults the canonical `storage_key` column; GC deletes the same way.
+- **Legacy block APIs still derive storage keys.** The hash-based convenience
+  methods in `internal/storage/blocks.go` (`GetBlock`, `GetBlockReader`,
+  `GetBlockSize`, `BlockExists`, `PutBlock`, and related methods) remain for
+  metadata-free callers and derive keys through `hashToKey(hash)`. Canonical
+  production reads, reuse/repair, orphan recovery and GC now load and validate
+  the persisted `storage_key`; arbitrary relocation remains unsupported until
+  the legacy APIs and their callers are made locator-aware.
 
 ---
 

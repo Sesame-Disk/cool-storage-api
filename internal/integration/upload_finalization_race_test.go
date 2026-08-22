@@ -883,9 +883,9 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	if err != nil {
 		t.Fatalf("failed to parse org ID %q: %v", orgID, err)
 	}
-	cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+	cleanupGCBlockRowsForTest(t, orgUUID, blockID)
 	t.Cleanup(func() {
-		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+		cleanupGCBlockRowsForTest(t, orgUUID, blockID)
 	})
 
 	status, body := uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[:len(fileContent)/2], fmt.Sprintf("bytes %d-%d/%d", 0, len(fileContent)/2-1, len(fileContent)))
