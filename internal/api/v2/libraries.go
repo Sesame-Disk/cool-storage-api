@@ -1206,18 +1206,17 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		return
 	}
 
-	// Validate storage class
-	if !h.isKnownStorageClass(req.StorageClass) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage class"})
-		return
-	}
-
 	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
 		writeLiveLibraryStateError(c, err)
 		return
 	}
 
 	if !h.requireLibraryConfigAuthority(c, "ChangeStorageClass", orgID, repoID) {
+		return
+	}
+
+	if !h.isKnownStorageClass(req.StorageClass) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage class"})
 		return
 	}
 

@@ -116,9 +116,9 @@ func TestLibraryMutations_RejectNonOwnerWithWriteAccess(t *testing.T) {
 		middleware.PermissionCloudEdit,
 		middleware.PermissionPreview,
 		middleware.PermissionNone,
-		// PermissionAdmin is a distinct constant that GetLibraryPermission never
-		// returns today (org admins resolve to PermissionOwner). Pinned anyway so a
-		// future change that starts returning it cannot quietly widen the gate.
+		// PermissionAdmin can come from a standard share. It is intentionally
+		// insufficient for configuration authority: only canonical ownership or
+		// org-admin authority may change library configuration.
 		middleware.PermissionAdmin,
 	} {
 		for _, m := range guardedLibraryMutations() {

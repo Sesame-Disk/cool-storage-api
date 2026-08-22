@@ -2,6 +2,7 @@ package gc
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,6 +62,9 @@ func TestService_ManualTriggersRefusedWhenNotStarted(t *testing.T) {
 	if svc.TriggerScanner() {
 		t.Error("TriggerScanner() = true before Start(), want false")
 	}
+	if !errors.Is(svc.ManualTriggerError(), ErrGCNotRunning) {
+		t.Fatalf("ManualTriggerError() = %v, want ErrGCNotRunning", svc.ManualTriggerError())
+	}
 }
 
 func TestService_ManualTriggersAcceptedWhenEnabledAndStarted(t *testing.T) {
@@ -106,6 +110,34 @@ func TestService_ManualTriggersRefusedAfterStop(t *testing.T) {
 	if svc.TriggerWorker() {
 		t.Error("TriggerWorker() = true after Stop(), want false")
 	}
+	if !errors.Is(svc.ManualTriggerError(), ErrGCNotRunning) {
+		t.Fatalf("ManualTriggerError() = %v, want ErrGCNotRunning", svc.ManualTriggerError())
+	}
+}
+
+func TestService_ManualTriggersRefusedWithoutLeadership(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	svc.lease = &fakeLeaderLease{allowed: false}
+	svc.Start()
+	defer svc.Stop()
+
+	if !errors.Is(svc.ManualTriggerError(), ErrNotLeader) {
+		t.Fatalf("ManualTriggerError() = %v, want ErrNotLeader", svc.ManualTriggerError())
+	}
+	if svc.AcceptsManualTriggers() {
+		t.Fatal("AcceptsManualTriggers() = true on a follower, want false")
+	}
+	if svc.TriggerWorker() || svc.TriggerScanner() {
+		t.Fatal("follower accepted a manual trigger")
+	}
 }
 
 func TestService_NilServiceRefusesManualTriggers(t *testing.T) {
@@ -133,15 +165,14 @@ func TestService_StopDoesNotDeadlockAgainstTrigger(t *testing.T) {
 	svc := NewService(NewMockStore(), nil, cfg, nil)
 	svc.Start()
 
-	// Stand in for the scanner goroutine: counted in s.wg, and it triggers partway
-	// through its pass. The sleep is what makes the reproduction deterministic —
-	// the trigger has to land WHILE Stop() holds s.mu inside wg.Wait(), not before
-	// Stop has taken the lock. Without it the goroutine finishes first and the
-	// mutex version passes, proving nothing.
+	// Stand in for the scanner goroutine: counted in s.wg, and held until Stop()
+	// has closed acceptingWork. This makes the trigger land while Stop() holds
+	// s.mu inside wg.Wait(), without relying on scheduler timing.
 	svc.wg.Add(1)
+	trigger := make(chan struct{})
 	go func() {
 		defer svc.wg.Done()
-		time.Sleep(250 * time.Millisecond)
+		<-trigger
 		svc.TriggerWorker()
 		svc.TriggerScanner()
 	}()
@@ -151,6 +182,16 @@ func TestService_StopDoesNotDeadlockAgainstTrigger(t *testing.T) {
 		svc.Stop()
 		close(done)
 	}()
+
+	deadline := time.Now().Add(time.Second)
+	for svc.acceptingWork.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if svc.acceptingWork.Load() {
+		close(trigger)
+		t.Fatal("Stop() did not close trigger admission")
+	}
+	close(trigger)
 
 	select {
 	case <-done:
@@ -194,6 +235,62 @@ func TestService_StartDrainsStaleTriggerTokens(t *testing.T) {
 	}
 }
 
+func TestService_TriggerBlockedDuringStopCannotLeakIntoRestart(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	svc.Start()
+
+	// Hold the trigger admission lock so a concurrent trigger is paused between
+	// the caller and the lifecycle transition. Stop must clear acceptingWork and
+	// complete its drain before the trigger can proceed; otherwise that token can
+	// land after the next Start() drain and fire an unrequested run.
+	svc.triggerMu.Lock()
+	triggerDone := make(chan bool, 1)
+	go func() {
+		triggerDone <- svc.TriggerWorker()
+	}()
+
+	stopDone := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stopDone)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for svc.acceptingWork.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if svc.acceptingWork.Load() {
+		svc.triggerMu.Unlock()
+		t.Fatal("Stop() did not close trigger admission")
+	}
+	svc.triggerMu.Unlock()
+
+	if accepted := <-triggerDone; accepted {
+		t.Error("trigger accepted after Stop() closed trigger admission")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop() did not complete after trigger admission was released")
+	}
+
+	svc.Start()
+	defer svc.Stop()
+	select {
+	case <-svc.triggerWorker:
+		t.Fatal("a trigger racing Stop()/Start() leaked into the restarted service")
+	default:
+	}
+}
+
 func TestService_DLQMutationsRefusedWhenDisabled(t *testing.T) {
 	// Same kill switch, sibling admin surface. These call
 	// tryClaimLeadershipForAdmin, which CLAIMS the lease — so an operator on a
@@ -214,15 +311,10 @@ func TestService_DLQMutationsRefusedWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestService_DLQMutationsDoNotRequireStarted(t *testing.T) {
-	// The DLQ gate is deliberately WEAKER than the trigger gate. A trigger needs a
-	// consumer loop to be honest; a DLQ mutation does its store work inline and
-	// needs none, so requiring `started` here would refuse a legitimate requeue on
-	// a GC node that has simply not booted its loops yet.
-	//
-	// This is pinned because collapsing the two predicates into one broke five
-	// pre-existing DLQ tests — the mistake is easy to repeat when someone reads
-	// "one kill switch" as "one predicate".
+func TestService_DLQMutationsRefusedBeforeStart(t *testing.T) {
+	// An enabled but not-started service is not a useful admin target. Refusing
+	// here prevents a node that has not entered its lifecycle from claiming the
+	// lease through a synchronous DLQ mutation.
 	svc := NewService(NewMockStore(), nil, config.GCConfig{Enabled: true, BatchSize: 10}, nil)
 
 	if svc.AcceptsManualTriggers() {
@@ -232,10 +324,102 @@ func TestService_DLQMutationsDoNotRequireStarted(t *testing.T) {
 	orgID := uuid.New()
 	failedAt := time.Now().UTC()
 
-	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1"); errors.Is(err, ErrGCDisabled) {
-		t.Error("DeleteFailedItem refused as ErrGCDisabled on an enabled but unstarted service")
+	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCNotRunning) {
+		t.Errorf("DeleteFailedItem error = %v, want ErrGCNotRunning", err)
 	}
-	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1"); errors.Is(err, ErrGCDisabled) {
-		t.Error("RequeueFailedItem refused as ErrGCDisabled on an enabled but unstarted service")
+	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCNotRunning) {
+		t.Errorf("RequeueFailedItem error = %v, want ErrGCNotRunning", err)
+	}
+}
+
+func TestService_DLQMutationsRefusedAfterStopWithoutReclaimingLease(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	lease := &fakeLeaderLease{allowed: true}
+	svc.lease = lease
+	svc.Start()
+	svc.Stop()
+
+	callsAfterStop := atomic.LoadInt32(&lease.calls)
+	orgID := uuid.New()
+	failedAt := time.Now().UTC()
+	for _, op := range []struct {
+		name string
+		fn   func() error
+	}{
+		{name: "delete", fn: func() error {
+			return svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1")
+		}},
+		{name: "requeue", fn: func() error {
+			return svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1")
+		}},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			if err := op.fn(); !errors.Is(err, ErrGCNotRunning) {
+				t.Fatalf("error = %v, want ErrGCNotRunning", err)
+			}
+			if got := atomic.LoadInt32(&lease.calls); got != callsAfterStop {
+				t.Fatalf("lease calls after stopped DLQ %s = %d, want unchanged at %d", op.name, got, callsAfterStop)
+			}
+		})
+	}
+}
+
+func TestService_StopWaitsForInFlightDLQClaimBeforeReleasingLease(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	lease := &fakeLeaderLease{allowed: true}
+	svc.lease = lease
+	svc.Start()
+
+	baselineCalls := atomic.LoadInt32(&lease.calls)
+	lease.leader.Store(false)
+	lease.delay = 100 * time.Millisecond
+	dlqDone := make(chan struct{})
+	go func() {
+		_ = svc.RequeueFailedItem(uuid.New(), time.Now().UTC(), ItemBlock, "block-1")
+		close(dlqDone)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt32(&lease.calls) == baselineCalls && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if atomic.LoadInt32(&lease.calls) == baselineCalls {
+		t.Fatal("DLQ operation did not reach lease claim")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-dlqDone:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight DLQ operation did not complete")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop() did not complete after the in-flight DLQ operation")
+	}
+	if lease.leader.Load() {
+		t.Fatal("stopped service retained or reacquired GC leadership")
 	}
 }

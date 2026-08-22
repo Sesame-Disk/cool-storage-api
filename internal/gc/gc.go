@@ -121,11 +121,14 @@ const (
 
 var ErrNotLeader = errors.New("gc leadership required")
 
-// ErrGCDisabled is returned by the superadmin DLQ mutations when GC is disabled
-// or not started on this node. It is distinct from ErrNotLeader on purpose: "not
-// the leader" invites the caller to retry elsewhere, while this node will never
-// serve the request under its current configuration.
-var ErrGCDisabled = errors.New("gc is disabled or not started on this node")
+// ErrGCDisabled is returned when GC is disabled on this node. It is distinct
+// from ErrGCNotRunning and ErrNotLeader so callers can distinguish configuration
+// shutdown, lifecycle shutdown, and leadership routing.
+var ErrGCDisabled = errors.New("gc is disabled on this node")
+
+// ErrGCNotRunning is returned when GC is enabled in configuration but this
+// service is not currently inside its running lifecycle.
+var ErrGCNotRunning = errors.New("gc is not running on this node")
 
 // Service is the top-level GC orchestrator.
 // It starts and manages the worker and scanner goroutines.
@@ -155,7 +158,9 @@ type Service struct {
 
 	// dlqOpsMu serializes admin DLQ mutations (requeue/delete) so the
 	// non-atomic SELECT+INSERT+DELETE in RequeueFailedItem cannot duplicate
-	// queue rows under concurrent admin requests on the same leader.
+	// queue rows under concurrent admin requests on the same leader. Stop also
+	// drains this gate before releasing leadership, so an in-flight mutation
+	// cannot reclaim the lease after shutdown begins.
 	dlqOpsMu sync.Mutex
 
 	// reconcilePasses counts serialized reconcile runs so we can do occasional
@@ -170,6 +175,9 @@ type Service struct {
 	// Channels for manual triggers
 	triggerWorker  chan struct{}
 	triggerScanner chan struct{}
+	// triggerMu serializes trigger admission with lifecycle transitions. It must
+	// never be held across wg.Wait(), because scanner shutdown can call a trigger.
+	triggerMu sync.Mutex
 
 	// acceptingWork mirrors "config.Enabled && started" for readers that must NOT
 	// take s.mu. It is deliberately an atomic and not a guarded field: Stop() holds
@@ -240,17 +248,16 @@ func (s *Service) Start() {
 		}
 	}
 
-	// Discard any trigger token that raced in against a Stop(). Draining here — not
-	// on the Stop side — is what makes "an unrequested run never fires at enable
-	// time" an invariant rather than best effort: a trigger that passed the
-	// acceptingWork check just before Stop() cleared it can still land in the
-	// buffered channel afterwards, and only the next Start() is downstream of all
-	// such races.
+	// Discard any trigger token that raced in against a Stop(). Serialize this
+	// drain with TriggerWorker/TriggerScanner so a trigger that passed the
+	// acceptingWork check cannot land in the channel after this drain and before
+	// the new lifecycle is enabled.
+	s.triggerMu.Lock()
 	drainTriggerChannel(s.triggerWorker)
 	drainTriggerChannel(s.triggerScanner)
-
 	s.started = true
 	s.acceptingWork.Store(true)
+	s.triggerMu.Unlock()
 
 	// Start worker goroutine
 	s.wg.Add(1)
@@ -306,6 +313,15 @@ func (s *Service) Stop() {
 	// which is where the goroutines being waited on would otherwise still be told
 	// "yes, the service accepts work".
 	s.acceptingWork.Store(false)
+	// Drain in-flight DLQ leadership claims before releasing the lease. The HTTP
+	// server is shut down after this method, so a request can still be entering
+	// here while Stop runs.
+	s.dlqOpsMu.Lock()
+	s.dlqOpsMu.Unlock()
+	s.triggerMu.Lock()
+	drainTriggerChannel(s.triggerWorker)
+	drainTriggerChannel(s.triggerScanner)
+	s.triggerMu.Unlock()
 	s.cancel()
 	s.wg.Wait()
 
@@ -323,7 +339,7 @@ func (s *Service) Stop() {
 }
 
 // AcceptsManualTriggers reports whether a manual worker/scanner trigger can
-// actually reach a consumer goroutine right now.
+// actually reach a consumer goroutine that will execute it right now.
 //
 // This is defence in depth for the GC kill switch, not decoration. A disabled
 // service is still CONSTRUCTED by the API server and its superadmin endpoint
@@ -340,36 +356,52 @@ func (s *Service) Stop() {
 // size-1 buffered channel would have fired one unrequested run the moment GC was
 // later enabled.
 //
-// Reads acceptingWork rather than taking s.mu — see that field's comment; a
-// mutex here deadlocks Stop().
+// Reads lifecycle state atomically and checks the cached lease state without
+// taking s.mu; a mutex here deadlocks Stop().
 func (s *Service) AcceptsManualTriggers() bool {
 	return s.acceptsManualTriggers()
 }
 
-// acceptsManualTriggers is the predicate for the ASYNCHRONOUS admin surface: a
-// trigger is only honest if a consumer loop exists to act on it, which needs both
-// halves.
-func (s *Service) acceptsManualTriggers() bool {
+// ManualTriggerError reports why a manual trigger cannot be accepted. A trigger
+// is only honest when the service is running and this node currently owns the
+// GC lease; a follower's loop will otherwise consume the token and immediately
+// return without doing work.
+func (s *Service) ManualTriggerError() error {
 	if s == nil {
-		return false
+		return ErrGCNotRunning
 	}
-	return s.acceptingWork.Load()
+	if !s.acceptingWork.Load() {
+		if !s.config.Enabled {
+			return ErrGCDisabled
+		}
+		return ErrGCNotRunning
+	}
+	if s.lease != nil && !s.lease.IsLeader() {
+		return ErrNotLeader
+	}
+	return nil
 }
 
-// gcEnabledHere is the predicate for the SYNCHRONOUS admin surface — the DLQ
-// mutations, which do their store work inline and need no worker loop.
-//
-// Deliberately weaker than acceptsManualTriggers: requiring `started` here would
-// refuse a legitimate requeue on a GC node that simply has not booted its loops
-// yet, and "not started" is a transient state on a node that does run GC. What
-// must be refused is the DISABLED node, because DeleteFailedItem and
-// RequeueFailedItem call tryClaimLeadershipForAdmin, which claims the lease.
-//
-// config.Enabled is written once in NewService, before any goroutine exists, and
-// never mutated (SetDryRun touches DryRun only), so this needs no
-// synchronization.
-func (s *Service) gcEnabledHere() bool {
-	return s != nil && s.config.Enabled
+func (s *Service) acceptsManualTriggers() bool {
+	return s.ManualTriggerError() == nil
+}
+
+// gcAdminMutationError gates the SYNCHRONOUS admin surface. DLQ mutations do
+// their store work inline and do not require leadership before entering this
+// check, but they must still be inside the service lifecycle: Stop() releases
+// the lease before HTTP shutdown completes, so accepting work on a merely
+// Enabled service could let a draining node reclaim leadership.
+func (s *Service) gcAdminMutationError() error {
+	if s == nil {
+		return ErrGCNotRunning
+	}
+	if !s.config.Enabled {
+		return ErrGCDisabled
+	}
+	if !s.acceptingWork.Load() {
+		return ErrGCNotRunning
+	}
+	return nil
 }
 
 // drainTriggerChannel empties a size-1 trigger channel without blocking.
@@ -381,9 +413,13 @@ func drainTriggerChannel(ch chan struct{}) {
 }
 
 // TriggerWorker triggers an immediate worker run. It reports whether the trigger
-// was accepted; false means GC is disabled or not started and nothing was queued.
+// was accepted; false means the service is disabled, not running, or not the
+// current leader, and nothing was queued.
 func (s *Service) TriggerWorker() bool {
-	if !s.AcceptsManualTriggers() {
+	s.triggerMu.Lock()
+	defer s.triggerMu.Unlock()
+
+	if err := s.ManualTriggerError(); err != nil {
 		return false
 	}
 	select {
@@ -395,9 +431,13 @@ func (s *Service) TriggerWorker() bool {
 }
 
 // TriggerScanner triggers an immediate scanner run. It reports whether the
-// trigger was accepted; false means GC is disabled or not started.
+// trigger was accepted; false means the service is disabled, not running, or
+// not the current leader.
 func (s *Service) TriggerScanner() bool {
-	if !s.AcceptsManualTriggers() {
+	s.triggerMu.Lock()
+	defer s.triggerMu.Unlock()
+
+	if err := s.ManualTriggerError(); err != nil {
 		return false
 	}
 	select {
@@ -1175,18 +1215,19 @@ func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	s.dlqOpsMu.Lock()
+	defer s.dlqOpsMu.Unlock()
+
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
 	// production only one datacenter runs GC; without this an operator on any
 	// disabled replica takes the lease away from the datacenter that actually
 	// drains the queue, causing a GC outage from a node that cannot do the work.
-	if !s.gcEnabledHere() {
-		return ErrGCDisabled
+	if err := s.gcAdminMutationError(); err != nil {
+		return err
 	}
 	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
 	err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID)
 	if err != nil {
 		return err
@@ -1198,12 +1239,15 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 }
 
 func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	s.dlqOpsMu.Lock()
+	defer s.dlqOpsMu.Unlock()
+
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
 	// production only one datacenter runs GC; without this an operator on any
 	// disabled replica takes the lease away from the datacenter that actually
 	// drains the queue, causing a GC outage from a node that cannot do the work.
-	if !s.gcEnabledHere() {
-		return ErrGCDisabled
+	if err := s.gcAdminMutationError(); err != nil {
+		return err
 	}
 	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_requeue") {
 		return ErrNotLeader
@@ -1214,8 +1258,6 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	// INSERT into gc_queue (with different queued_at), and the second DELETE
 	// would no-op — leaving a duplicated queue row that the worker would
 	// process twice.
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
 	err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, time.Now().UTC())
 	if err != nil {
 		return err

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -634,21 +635,26 @@ func newLibraryHandlerForLiveFenceTests() *LibraryHandler {
 }
 
 func TestChangeStorageClassRejectsNonCanonicalReference(t *testing.T) {
-	r := gin.New()
-	handler := newLibraryHandlerForLiveFenceTests()
-	r.POST("/repos/:repo_id/storage-class", func(c *gin.Context) {
-		c.Set("org_id", "00000000-0000-0000-0000-000000000001")
-		handler.ChangeStorageClass(c)
+	withLiveLibraryStateStub(t, func() {
+		withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+			r := gin.New()
+			handler := newLibraryHandlerForLiveFenceTests()
+			r.POST("/repos/:repo_id/storage-class", func(c *gin.Context) {
+				c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+				c.Set("user_id", authTestUserID)
+				handler.ChangeStorageClass(c)
+			})
+
+			req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/storage-class", strings.NewReader(`{"storage_class":" standard "}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+			}
+		})
 	})
-
-	req := httptest.NewRequest("POST", "/repos/11111111-1111-1111-1111-111111111111/storage-class", strings.NewReader(`{"storage_class":" standard "}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
-	}
 }
 
 func TestUpdateLibrary_DeletedLibraryReturnsNotFound(t *testing.T) {

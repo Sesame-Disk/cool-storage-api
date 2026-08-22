@@ -510,6 +510,7 @@ func TestService_DeleteFailedItem_RequiresLeadership(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: false},
 	}
+	svc.acceptingWork.Store(true)
 
 	err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "blocked")
 	if !errors.Is(err, ErrNotLeader) {
@@ -932,6 +933,7 @@ func TestService_DLQOps_SerializeUnderConcurrency(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	var inFlight atomic.Int32
 	var maxInFlight atomic.Int32
@@ -1013,6 +1015,7 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	if err := svc.RequeueFailedItem(orgID, failedAt, ItemLibraryCascade, itemID); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)
@@ -1071,6 +1074,7 @@ func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.
 				config: config.GCConfig{Enabled: true},
 				lease:  &fakeLeaderLease{allowed: true},
 			}
+			svc.acceptingWork.Store(true)
 
 			err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID)
 			if err == nil {
@@ -1140,6 +1144,7 @@ func TestService_AdminFailedItemOps_RefreshSnapshotImmediately(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	if err := svc.RequeueFailedItem(orgID, failedAtA, ItemBlock, "admin-requeue"); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)

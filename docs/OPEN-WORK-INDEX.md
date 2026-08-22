@@ -81,7 +81,7 @@ posture issue and the sync public-link token auth gap 2026-08-07;
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md)
 (dated snapshot) and
 [PROD-READINESS-VERIFICATION-20260822.md](./PROD-READINESS-VERIFICATION-20260822.md)
-(re-verification at `a1570b186`).
+(baseline re-verification at `a1570b186`, with follow-up fixes at `e58b42b23`).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|

@@ -2350,16 +2350,14 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		req.Type = "worker"
 	}
 
-	// A disabled GC service is still constructed and this route is still
-	// registered, so refuse here rather than reporting a run that no consumer
-	// goroutine exists to perform. In production only one datacenter runs GC;
-	// every other node serves this endpoint with GC_ENABLED=false and must say so
-	// instead of answering {"started":true}. Checked before the dry-run override so
-	// a disabled node's admin surface is inert end to end.
-	if !s.gcService.AcceptsManualTriggers() {
+	// Refuse before the dry-run override when this node is disabled, stopped, or
+	// not the current GC leader. A follower has consumer goroutines, but they
+	// discard the run at the leadership check, so reporting success would be
+	// misleading and would make the admin surface operationally ambiguous.
+	if err := s.gcService.ManualTriggerError(); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"started": false,
-			"error":   "GC is disabled or not started on this node; manual triggers are refused",
+			"error":   err.Error(),
 		})
 		return
 	}
@@ -2377,7 +2375,11 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC scanner triggered"})
 	default:
 		if !s.gcService.TriggerWorker() {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": "GC worker is not accepting triggers"})
+			err := s.gcService.ManualTriggerError()
+			if err == nil {
+				err = errors.New("GC worker is not accepting triggers")
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
@@ -2511,9 +2513,9 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.RequeueFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		// Neither "not the leader" nor "GC is off here" is a server fault: both mean
-		// this node will not serve the request, so 503 rather than 500.
-		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) {
+		// Neither leadership nor lifecycle refusal is a server fault: this node will
+		// not serve the request, so return 503 rather than 500.
+		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
@@ -2534,9 +2536,9 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		// Neither "not the leader" nor "GC is off here" is a server fault: both mean
-		// this node will not serve the request, so 503 rather than 500.
-		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) {
+		// Neither leadership nor lifecycle refusal is a server fault: this node will
+		// not serve the request, so return 503 rather than 500.
+		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}

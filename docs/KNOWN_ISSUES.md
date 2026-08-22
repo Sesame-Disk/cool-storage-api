@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-21
+**Last Updated**: 2026-08-22
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -8185,7 +8185,7 @@ case fails and the handler proceeds into the database.
 
 ### ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01: Manual GC trigger APIs were not gated on `GC.Enabled`
 
-**Status**: ✅ **Fixed 2026-08-22** — gated on `Service.AcceptsManualTriggers`, guard tests landed
+**Status**: ✅ **Fixed 2026-08-22** — manual triggers gated on `Service.ManualTriggerError`, DLQ lifecycle gate and regressions landed
 **Severity**: Low as shipped (never a live bypass), but it protected the barrier the entire X1 programme runs behind
 **Affected**: `gc.Service.TriggerWorker`, `gc.Service.TriggerScanner`, `Server.handleGCRun`
 
@@ -8248,24 +8248,24 @@ One kill switch, but **two predicates**, because the surfaces differ in kind:
 
 | Surface | Predicate | Why |
 |---|---|---|
-| Manual triggers (async) | `Enabled && started` | A trigger is only honest if a consumer loop exists to act on it |
-| DLQ requeue/delete (sync) | `Enabled` | The store work happens inline and needs no loop; refusing on `!started` would reject a legitimate requeue on a GC node that has merely not booted yet |
+| Manual triggers (async) | `Enabled && started && leader` | A follower's loop would consume the token and return without doing work |
+| DLQ requeue/delete (sync) | `Enabled && started` | The store work is inline and can claim leadership itself, but a stopped or never-started node must not reclaim the lease during shutdown |
 
-Collapsing these into one predicate is a live trap: the first attempt did exactly
-that and broke five pre-existing DLQ tests, because they exercise an enabled
-service that never calls `Start()`. `TestService_DLQMutationsDoNotRequireStarted`
-pins the distinction.
+Collapsing these into one predicate is still a live trap: DLQ does not require
+current leadership, while a manual trigger does. Lifecycle tests pin the active
+requirement for both surfaces.
 
 #### Fix (2026-08-22)
 
-`Service.acceptsManualTriggers` (exported to the API layer as
-`AcceptsManualTriggers`) gates the triggers; `Service.gcEnabledHere` gates the DLQ
-mutations. `TriggerWorker` and `TriggerScanner` now return a `bool`, so a refused
-trigger is a value the caller must handle rather than a silent no-op.
-`DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` **before**
-`tryClaimLeadershipForAdmin`, so a disabled replica cannot take the lease. Both
-DLQ HTTP handlers map `ErrGCDisabled` to `503` alongside `ErrNotLeader`: neither
-is a server fault.
+`Service.ManualTriggerError` (exported to the API layer) gates manual triggers on
+active lifecycle and current leadership; `Service.gcAdminMutationError` gates
+the DLQ mutations on active lifecycle without requiring current leadership.
+`TriggerWorker` and `TriggerScanner` now return a `bool`, so a refused trigger is
+a value the caller must handle rather than a silent no-op.
+`DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` or
+`ErrGCNotRunning` **before** `tryClaimLeadershipForAdmin`, so a disabled or
+stopped replica cannot take the lease. Both DLQ HTTP handlers map those lifecycle
+errors to `503` alongside `ErrNotLeader`: neither is a server fault.
 
 `handleGCRun` checks it up front and answers `503` with `{"started": false}` —
 **before** applying the optional `dry_run` override, so a disabled node's admin
@@ -8281,11 +8281,11 @@ Stop's lock; `Server.Shutdown` hung. It now reads an `atomic.Bool` written only 
 `Start`/`Stop`. `config.Enabled` is set once in `NewService` and never mutated
 (`SetDryRun` touches `DryRun` only), so one flag captures both conditions.
 
-`Start()` also drains the trigger channels before launching the loops. A trigger
-that passed the check just before `Stop()` cleared it can still land in the
-size-1 buffer; draining on the *Start* side is what makes "no unrequested run
-fires at enable time" an invariant rather than best effort, because only the next
-Start is downstream of every such race.
+`Start()` and `Stop()` drain the trigger channels under `triggerMu`, which also
+serializes the check-and-send path. A trigger that is already admitted is
+drained before shutdown or restart; a trigger that arrives after the lifecycle
+flag closes is refused. That makes "no unrequested run fires at enable time" an
+invariant without holding a mutex across `wg.Wait()`.
 
 #### Verification
 
@@ -8302,8 +8302,9 @@ Start is downstream of every such race.
   against the atomic
 - `Start()` discards a stale token left by a trigger that raced `Stop()`
 - DLQ requeue/delete on a disabled service → `ErrGCDisabled`
-- DLQ requeue/delete on an **enabled but unstarted** service → **not** refused
-  (the two predicates are not the same, and must not be merged)
+- DLQ requeue/delete on an **enabled but unstarted** service → `ErrGCNotRunning`
+- DLQ requeue/delete after `Stop()` → `ErrGCNotRunning` without a lease claim
+- manual triggers on an active follower → `ErrNotLeader` and no queued token
 
 `internal/api/gc_run_gate_test.go` pins the HTTP contract, which is where an
 operator actually meets this: disabled node → `503` with `started:false` for

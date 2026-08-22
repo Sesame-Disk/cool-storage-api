@@ -76,23 +76,24 @@ initial predicate read `Enabled && started` under `s.mu` and reintroduced a
 written only by `Start`/`Stop`; a guard on a shutdown path has to be lock-free.
 Second, `DeleteFailedItem` and `RequeueFailedItem` had the same gap with a worse
 consequence — they call `tryClaimLeadershipForAdmin`, which *claims the lease*, so
-an operator on a disabled replica could take GC leadership away from the one
-datacenter that drains the queue. Both now refuse with `ErrGCDisabled` before
-claiming, and both HTTP handlers map that to `503` rather than `500`. The real
-defect was never "manual triggers are ungated" but "the kill switch is honoured on
-some superadmin GC surfaces and not others".
+an operator on a disabled or stopping replica could take GC leadership away from
+the one datacenter that drains the queue. Both now refuse with
+`ErrGCDisabled`/`ErrGCNotRunning` before claiming, and both HTTP handlers map those
+states to `503` rather than `500`. The real defect was never "manual triggers are
+ungated" but "the kill switch is honoured on some superadmin GC surfaces and not
+others".
 
-One kill switch, two predicates: triggers need `Enabled && started` because a
-trigger is only honest if a consumer loop exists; the DLQ mutations need only
-`Enabled` because their store work happens inline. Collapsing them broke five
-pre-existing DLQ tests before the distinction was drawn, so it is now pinned by a
-test of its own.
+One kill switch, two predicates: triggers need `Enabled && started` plus current
+leadership because a follower's loop would consume the token and return without
+doing work; DLQ mutations need `Enabled && started` but may run on a follower
+because their store work is inline and the operation can claim leadership. The
+distinction is pinned by lifecycle and follower tests.
 
 `Start()` additionally drains the trigger channels before launching the loops, so
 a token that raced `Stop()` cannot fire an unrequested run at the next enable.
 
 **New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
-re-verification at `a1570b186`: ten defects (six HIGH), what #181 did and did not
+re-verification at `a1570b186`: ten defects (five HIGH), what #181 did and did not
 deliver, and the corrections to the draft it replaces — a nonexistent source
 document, a miscount, `internal/metrics` (not `internal/gc/metrics`), 409,200
 rather than "~400k" `pack-fs` ids, the full three-surface scope of

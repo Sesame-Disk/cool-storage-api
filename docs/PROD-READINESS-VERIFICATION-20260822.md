@@ -1,7 +1,8 @@
 # Production Readiness Verification — post PR #181
 
 **Date:** 2026-08-22
-**HEAD verified:** `a1570b186` (Merge PR #181, `feat/p1-locator-authority`)
+**Baseline HEAD:** `a1570b186` (Merge PR #181, `feat/p1-locator-authority`)
+**Follow-up fixes verified:** `e58b42b23` (this readiness correction)
 **Scope:** independent code-level re-verification of **selected** production-readiness
 findings — what PR #181 delivered, plus the audit-arc findings listed in §B. Every
 claim below was re-confirmed by reading the code at this HEAD.
@@ -83,8 +84,8 @@ ordinary CI unit pass and a future refactor cannot silently reintroduce
 #181 changed which value is authoritative, not whether the value is recomputable —
 the guard compares persisted against derived precisely because they should agree.
 It therefore cannot discriminate two different physical lives at the same address.
-That discrimination is P2/R12's job and is not merged. **P1 is not progress against
-any of X1's four closure criteria.**
+That discrimination is P2/R12's job and is not merged. **P1 does not by itself
+satisfy any of X1's four closure criteria.**
 
 Schema: migration `016_gc_s3_orphans_storage_key.cql`.
 
@@ -115,9 +116,9 @@ emergent property of `Start`'s control flow, not on a stated invariant. This
 mattered operationally: **only one datacenter runs GC in production; every other
 node serves that endpoint with `GC_ENABLED=false`** and answered
 `{"started": true}` for runs that never happened. Now gated on
-`Service.AcceptsManualTriggers`, with `handleGCRun` returning `503` before the
-`dry_run` override. Never a live bypass; hardened before a refactor could make it
-one.
+`Service.ManualTriggerError`, with `handleGCRun` returning `503` before the
+`dry_run` override for disabled, stopped, or non-leader nodes. Never a live
+bypass; hardened before a refactor could make it one.
 
 Review of that fix widened it twice, and both are worth recording because they
 are the same lesson:
@@ -129,19 +130,18 @@ are the same lesson:
   atomic. A guard placed on a hot shutdown path has to be lock-free.
 - **`Service.DeleteFailedItem` and `RequeueFailedItem` had the same gap**, and a
   worse consequence: they call `tryClaimLeadershipForAdmin`, which *claims the
-  lease*. An operator on any disabled replica could take GC leadership away from
-  the one datacenter that drains the queue. Both now refuse with `ErrGCDisabled`
-  before claiming. The original finding was scoped to "manual triggers"; the
-  actual defect was "the kill switch is honoured on some admin surfaces and not
-  others".
+  lease*. An operator on any disabled or stopping replica could take GC leadership
+  away from the one datacenter that drains the queue. Both now refuse with
+  `ErrGCDisabled`/`ErrGCNotRunning` before claiming. The original finding was
+  scoped to "manual triggers"; the actual defect was "the kill switch is honoured
+  on some admin surfaces and not others".
 
-  One kill switch, but **two predicates** — and this is where the fix went wrong
-  once. The DLQ mutations were first given the trigger predicate
-  (`Enabled && started`) and that broke five pre-existing tests: a trigger needs
-  a consumer loop to be honest, whereas a DLQ mutation does its store work inline
-  and needs none, so requiring `started` refuses a legitimate requeue on a GC node
-  that has merely not booted its loops yet. Triggers use `Enabled && started`; the
-  DLQ uses `Enabled`.
+  One kill switch, but **two predicates**. Manual triggers use
+  `Enabled && started && leader`: a follower's loop would consume the token and
+  return without doing work. DLQ requeue/delete use `Enabled && started` but do
+  not require current leadership, because their store work is inline and the
+  operation can claim leadership itself. Requiring the active lifecycle prevents
+  a stopped node from reclaiming the lease during HTTP shutdown.
 
 ### B.2 Library configuration mutations have no permission gate — HIGH → ✅ Fixed 2026-08-22
 
@@ -317,7 +317,8 @@ Not tracked as blockers.
 3. [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md) — the security readiness snapshot (dated; do not retro-edit its verdict).
 4. [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — the one-screen live index.
 5. [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — status of record per `ISSUE-*` id.
-6. This document — dated re-verification at `a1570b186`.
+6. This document — dated re-verification from baseline `a1570b186`, with the
+   follow-up fixes verified at `e58b42b23`.
 
 ---
 
