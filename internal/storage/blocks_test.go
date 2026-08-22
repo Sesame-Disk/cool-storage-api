@@ -467,8 +467,10 @@ func TestHashSharding(t *testing.T) {
 	}
 }
 
-// The locator-taking APIs are the only PUT/DELETE entry points left, so an empty
-// key must be refused here rather than forwarded to S3. A nil S3Store makes the
+// The canonical direct PUT and the only physical DELETE both take an explicit
+// locator, so an empty key must be refused here rather than forwarded to S3. The
+// hash-derived PutBlock/PutBlockData/PutBlockAuto/PutBlocks still exist for
+// no-metadata paths and test seeding; they derive a key and cannot be empty. A nil S3Store makes the
 // test itself the proof: reaching the backend would panic instead of returning.
 func TestObjectAPIsRejectEmptyStorageKey(t *testing.T) {
 	bs := mustNewTestOrgBlockStore(t, "blocks/")

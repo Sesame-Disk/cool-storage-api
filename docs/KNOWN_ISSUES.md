@@ -1284,8 +1284,11 @@ during the authorization phase (before `StartBlockDeleteOrphan` and
 `FinalizeBlockDelete`) and refuses a key the store would not derive, and
 `RecoverS3Orphans` repeats the check on the reloaded canonical row. Neither path
 records a recovery row for a refused delete. `storage.BlockStore` no longer
-exposes hash-derived `PutBlockAutoDirect`/`DeleteBlock` at all, so the compiler,
-not a review convention, keeps a destructive caller from minting its own key.
+exposes hash-derived `PutBlockAutoDirect`/`DeleteBlock` at all, so the storage
+layer never picks a delete target on a caller's behalf. That is the whole of what
+the signature guarantees: `StorageKeyForHash` is still public, so passing a
+derived key to `DeleteBlockByStorageKey` compiles. Where the key came from is
+pinned by tests, not by the compiler.
 
 #### Why arbitrary relocation remains unsupported
 

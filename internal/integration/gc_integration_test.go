@@ -1045,23 +1045,37 @@ func deleteGCFailedItemsByIdentity(t *testing.T, orgID string, itemType string, 
 
 func deleteGCPendingBlockItems(t *testing.T, orgID uuid.UUID, blockID string) {
 	t.Helper()
+	deleteGCPendingItemsByIdentity(t, orgID, uuid.Nil, gcpkg.ItemBlock, blockID)
+}
+
+// deleteGCPendingItemsByIdentity removes the gc_pending_items rows for one queue
+// identity. It exists for the item types production never completes in a test —
+// FailItem and RequeueFailedItem both write this table, it has no TTL, and a
+// synthetic item that never succeeds leaves its row behind forever. Deleting the
+// queue and DLQ rows alone is not enough.
+func deleteGCPendingItemsByIdentity(t *testing.T, orgID, libraryID uuid.UUID, itemType gcpkg.ItemType, itemID string) {
+	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	bucket := gcpkg.PendingItemBucket(orgID, uuid.Nil, gcpkg.ItemBlock, blockID)
+	bucket := gcpkg.PendingItemBucket(orgID, libraryID, itemType, itemID)
 	iter := session.Query(`
 		SELECT identity_at FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
-	`, orgID.String(), bucket, "block", uuid.Nil.String(), blockID).Iter()
+	`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID).Iter()
+	var identityAts []time.Time
 	var identityAt time.Time
 	for iter.Scan(&identityAt) {
+		identityAts = append(identityAts, identityAt)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, itemID, err)
+	}
+	for _, at := range identityAts {
 		if err := session.Query(`
 			DELETE FROM gc_pending_items
 			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID.String(), bucket, "block", uuid.Nil.String(), blockID, identityAt).Exec(); err != nil {
-			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, blockID, err)
+		`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID, at).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, itemID, err)
 		}
-	}
-	if err := iter.Close(); err != nil {
-		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, blockID, err)
 	}
 }
 
@@ -1994,7 +2008,7 @@ func TestGC_ReleasedBlockStub_ProbeRepairAndMaterialize(t *testing.T) {
 	if err := database.Session().Query(`INSERT INTO blocks (org_id, block_id) VALUES (?, ?)`, orgID, blockID).Exec(); err != nil {
 		t.Fatalf("reseed released stub: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", "blocks/"+orgID+"/aa/aa/"+blockID); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", syntheticCanonicalStorageKeyForTest(orgID, blockID)); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1(stub backstop): %v", err)
 	}
 	if err := database.AddBlockReference(orgID, blockID, "test:live", uuid.New().String(), 0); err != nil {
@@ -2663,6 +2677,9 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 		_ = session.Query(`
 			DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 		`, orgID.String(), failedAt, "unknown_type", itemID).Exec()
+		// FailItem writes gc_pending_items on the way to the DLQ, and this item
+		// type never completes, so nothing else removes that row.
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemID)
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		repairGCSnapshotsForTest(t, orgID)
@@ -2738,6 +2755,11 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtB, "unknown_type", itemIDB).Exec()
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDA)
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDB)
+		// The admin requeue below moves a DLQ row back through the canonical
+		// enqueue path, which also writes gc_pending_items. This item type never
+		// completes, so that row outlives the queue and DLQ rows deleted above.
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemIDA)
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemIDB)
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_org_stats WHERE org_id = ?`, orgID.String()).Exec()

@@ -39,6 +39,23 @@ func gcQueueRetryCountForTest(t *testing.T, orgID uuid.UUID, itemType gcpkg.Item
 	return 0, false
 }
 
+func gcFailedItemExistsForTest(t *testing.T, orgID uuid.UUID, itemType gcpkg.ItemType, itemID string) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	iter := session.Query(`SELECT item_type, item_id FROM gc_failed_items WHERE org_id = ?`, orgID.String()).Iter()
+	var gotType, gotID string
+	for iter.Scan(&gotType, &gotID) {
+		if gotType == string(itemType) && gotID == itemID {
+			_ = iter.Close()
+			return true
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("scan gc_failed_items: %v", err)
+	}
+	return false
+}
+
 // TestGC_BlockDeletion_RefusesForeignStorageKey is the end-to-end half of the
 // locator-authority guard: real Cassandra, real MinIO, real BlockStores.
 //
@@ -70,15 +87,29 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	}
 
 	// Registered BEFORE anything is created: a failure between the two PUTs or at
-	// the INSERT would otherwise strand objects in the bucket. The queue item here
-	// never completes (that is the point), so gc_pending_items has no writer left
-	// to remove it — cleanupGCBlockFixturesForTest clears queue, DLQ, pending and
-	// candidate rows by identity, which a queue-only cleanup would miss. The org
-	// leaves gc_active_orgs on its own: the worker drops it once its queue drains.
+	// the INSERT would otherwise strand objects in the bucket.
+	//
+	// This test leaves more behind than a passing one would, so it cleans more.
+	// Its queue item never completes by design, so nothing removes the
+	// gc_pending_items row (that table has no TTL) — cleanupGCBlockFixturesForTest
+	// clears queue, DLQ, pending and candidate by identity. EnqueueItem also marks
+	// the org in gc_active_orgs and gc_dirty_orgs, and neither is self-healing
+	// here: the worker only drops an org from the active set when a batch comes
+	// back short (`len(items) < batchSize`), and with batchSize=1 the retried item
+	// keeps every batch full, while nothing in this path clears the dirty mark at
+	// all. Both are removed explicitly, with a future bound so the conditional
+	// deletes apply.
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgID, blockID)
 		if err := session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
 			t.Fatalf("cleanup blocks row: %v", err)
+		}
+		bound := time.Now().Add(time.Hour).UTC()
+		if err := store.RemoveOrgFromActiveSet(orgID, bound); err != nil {
+			t.Fatalf("cleanup gc_active_orgs: %v", err)
+		}
+		if err := store.ClearDirtyOrg(orgID, bound); err != nil {
+			t.Fatalf("cleanup gc_dirty_orgs: %v", err)
 		}
 		_ = collected.DeleteBlockByStorageKey(ctx, ownKey)
 		_ = victim.DeleteBlockByStorageKey(ctx, foreignKey)
@@ -113,13 +144,14 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 		if _, err := worker.ProcessOrgOnce(ctx, orgID); err != nil {
 			t.Fatalf("ProcessOrgOnce: %v", err)
 		}
-		retryCount, found := gcQueueRetryCountForTest(t, orgID, gcpkg.ItemBlock, blockID)
-		if !found {
-			// Retry-capped items leave the queue for the DLQ; either way the worker
-			// reached this item.
+		if retryCount, found := gcQueueRetryCountForTest(t, orgID, gcpkg.ItemBlock, blockID); found && retryCount > 0 {
 			return true
 		}
-		return retryCount > 0
+		// A retry-capped item leaves the queue for the DLQ. Checking that explicitly
+		// rather than treating "absent from the queue" as success keeps a vanished
+		// item — never enqueued, cleaned up by something else — from counting as a
+		// refusal the worker actually performed.
+		return gcFailedItemExistsForTest(t, orgID, gcpkg.ItemBlock, blockID)
 	})
 	if !attempted {
 		t.Fatal("GC worker never processed the queued block; the assertions below would prove nothing")
