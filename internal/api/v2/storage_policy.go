@@ -165,6 +165,22 @@ func validateRequestedCreateStorageClass(cfg *config.Config, requestedClass stri
 	return nil
 }
 
+func validateMutableStorageClass(cfg *config.Config, policy orgStoragePolicy, requestedClass string) error {
+	if !isKnownStorageClass(cfg, requestedClass) {
+		return fmt.Errorf("invalid storage class")
+	}
+	if policy.DataResidency != orgDataResidencyStrict {
+		return nil
+	}
+	if !isHotStorageClass(cfg, requestedClass) {
+		return fmt.Errorf("storage class must use hot tier for strict data residency")
+	}
+	if !strings.EqualFold(storageClassRegion(cfg, requestedClass), policy.DefaultRegion) {
+		return fmt.Errorf("storage class is not allowed by organization data residency policy")
+	}
+	return nil
+}
+
 func validateOrgStoragePolicy(cfg *config.Config, policy orgStoragePolicy) error {
 	if policy.DataResidency == orgDataResidencyStrict && policy.DefaultRegion == "" {
 		return fmt.Errorf("strict data residency requires a default_region")

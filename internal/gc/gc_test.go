@@ -222,7 +222,7 @@ func TestNewService_ConfigPropagation(t *testing.T) {
 	if svc.config.DryRun != true {
 		t.Error("config.DryRun should be true")
 	}
-	if svc.worker.dryRun != true {
+	if !svc.worker.dryRun.Load() {
 		t.Error("worker.dryRun should propagate from config")
 	}
 }
@@ -245,7 +245,7 @@ func TestService_SetDryRun(t *testing.T) {
 	if !svc.config.DryRun {
 		t.Error("config.DryRun should be true after SetDryRun(true)")
 	}
-	if !svc.worker.dryRun {
+	if !svc.worker.dryRun.Load() {
 		t.Error("worker.dryRun should be true after SetDryRun(true)")
 	}
 
@@ -1204,7 +1204,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		lease:  &fakeLeaderLease{allowed: true},
 	}
 
-	if retried := svc.retryAutoRecoverableFailedItems(); retried != 1 {
+	if retried := svc.retryAutoRecoverableFailedItems(context.Background()); retried != 1 {
 		t.Fatalf("retryAutoRecoverableFailedItems retried %d items, want 1", retried)
 	}
 

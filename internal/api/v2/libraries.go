@@ -769,8 +769,8 @@ var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, us
 // Content write access is deliberately not sufficient. A user with an "rw" share
 // may change what is IN a library; deciding what the library is called, how long
 // its versions are kept, and where its future blocks are placed is the owner's
-// (or an org admin's). GetLibraryPermission already collapses library owner and
-// org admin/superadmin onto PermissionOwner, so that single comparison covers
+// (or an org owner/admin/superadmin's). GetLibraryPermission already collapses
+// library owner and org owner/admin/superadmin onto PermissionOwner, so that single comparison covers
 // both legitimate callers without a second lookup.
 //
 // Callers run this AFTER the live-library fence, matching DeleteLibrary. That
@@ -824,6 +824,30 @@ func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, o
 		return false
 	}
 	return true
+}
+
+// requireLibraryOwnerCredential rejects credentials whose transport scope is
+// narrower than library administration before the owner lookup. Ownership is a
+// property of the user, but credential scope is a separate ceiling.
+func requireLibraryOwnerCredential(c *gin.Context) bool {
+	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
+		c.JSON(http.StatusForbidden, gin.H{"error": "repo API tokens cannot administer library configuration"})
+		return false
+	}
+	if !middleware.APIKeyScopeAllowsLibraryPermission(c, middleware.PermissionOwner) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "API key scope does not permit library administration"})
+		return false
+	}
+	return true
+}
+
+// updateLiveLibrary conditionally mutates the canonical row. The preceding
+// live read is useful for validation, but only this LWT closes the delete race.
+func updateLiveLibrary(session *gocql.Session, orgID, repoID string, assignments []string, values ...interface{}) (bool, error) {
+	query := "UPDATE libraries SET " + strings.Join(assignments, ", ") +
+		" WHERE org_id = ? AND library_id = ? IF deleted_at = null"
+	values = append(values, orgID, repoID)
+	return session.Query(query, values...).MapScanCAS(map[string]interface{}{})
 }
 
 // GetLibrary returns a single library by ID
@@ -1020,19 +1044,17 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 	now := time.Now()
 	updates = append(updates, "updated_at = ?")
 	values = append(values, now)
-	values = append(values, orgID, repoID) // Use strings for UUIDs
-
-	query := "UPDATE libraries SET "
-	for i, u := range updates {
-		if i > 0 {
-			query += ", "
-		}
-		query += u
+	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID, updates, values...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		return
 	}
-	query += " WHERE org_id = ? AND library_id = ?"
+	if !applied {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(query, values...)
 	if req.VersionTTLDays != nil {
 		if *req.VersionTTLDays > 0 {
 			db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, *req.VersionTTLDays, libraryState.HeadCommitID, now)
@@ -1080,6 +1102,9 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 
 	if repoID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing repo_id"})
+		return
+	}
+	if !requireLibraryOwnerCredential(c) {
 		return
 	}
 
@@ -1161,6 +1186,16 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 	}
 
 	now := time.Now()
+	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID,
+		[]string{"name = ?", "updated_at = ?"}, req.RepoName, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
+		return
+	}
+	if !applied {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
@@ -1170,10 +1205,6 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 	projectionRow.Name = req.RepoName
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries SET name = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.RepoName, now, orgID, repoID)
 	batch.Query(`
 		UPDATE libraries_by_id SET name = ?
 		WHERE library_id = ?
@@ -1215,12 +1246,27 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		return
 	}
 
-	if !h.isKnownStorageClass(req.StorageClass) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage class"})
+	policy, err := readOrgStoragePolicy(h.db, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read organization storage policy"})
+		return
+	}
+	if err := validateMutableStorageClass(h.config, policy, req.StorageClass); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	now := time.Now()
+	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID,
+		[]string{"storage_class = ?", "updated_at = ?"}, req.StorageClass, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
+		return
+	}
+	if !applied {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
@@ -1230,10 +1276,6 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	projectionRow.StorageClass = req.StorageClass
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries SET storage_class = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.StorageClass, now, orgID, repoID)
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})

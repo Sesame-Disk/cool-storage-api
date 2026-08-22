@@ -94,6 +94,9 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, s
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return "", "", "", false
 	}
+	if !requireLibraryOwnerCredential(c) {
+		return "", "", "", false
+	}
 
 	if h.db != nil {
 		if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {

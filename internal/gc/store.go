@@ -357,6 +357,15 @@ type GCStore interface {
 	LoadGCStats(key string) (string, error)
 }
 
+// GCAdminContextStore is implemented by stores whose synchronous admin
+// mutations can be cancelled when service shutdown begins. The base GCStore
+// remains context-free for the worker hot path; the service uses this optional
+// interface only for the DLQ endpoints.
+type GCAdminContextStore interface {
+	DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
+	RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
+}
+
 // ItemType constants for new GC item types
 const (
 	ItemShare      ItemType = "share"

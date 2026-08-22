@@ -158,10 +158,12 @@ type Service struct {
 
 	// dlqOpsMu serializes admin DLQ mutations (requeue/delete) so the
 	// non-atomic SELECT+INSERT+DELETE in RequeueFailedItem cannot duplicate
-	// queue rows under concurrent admin requests on the same leader. Stop also
-	// drains this gate before releasing leadership, so an in-flight mutation
-	// cannot reclaim the lease after shutdown begins.
-	dlqOpsMu sync.Mutex
+	// queue rows under concurrent admin requests on the same leader. A channel is
+	// used instead of sync.Mutex so shutdown can wait with its context.
+	dlqOpsMu    chan struct{}
+	dlqOpsOnce  sync.Once
+	dlqActiveMu sync.Mutex
+	dlqCancel   context.CancelFunc
 
 	// reconcilePasses counts serialized reconcile runs so we can do occasional
 	// full drift checks without paying that cost on every pass.
@@ -188,6 +190,10 @@ type Service struct {
 	// only), so Start/Stop are the only writers and a single flag captures both
 	// conditions.
 	acceptingWork atomic.Bool
+	// dryRun is the runtime value used by status and the worker. The config field
+	// remains the startup default; runtime changes must be atomic because the API
+	// can update them while a worker is processing a batch.
+	dryRun atomic.Bool
 }
 
 // NewService creates a new GC service using the provided store and storage provider.
@@ -203,7 +209,7 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 	scanner := NewScanner(store, queue, stats, cfg)
 	scanner.SetOrphanRecoverer(worker)
 
-	return &Service{
+	service := &Service{
 		store:          store,
 		storage:        storage,
 		config:         cfg,
@@ -216,6 +222,8 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 		triggerWorker:  make(chan struct{}, 1),
 		triggerScanner: make(chan struct{}, 1),
 	}
+	service.dryRun.Store(cfg.DryRun)
+	return service
 }
 
 // Start begins the worker and scanner goroutines.
@@ -295,11 +303,51 @@ func (s *Service) Start() {
 
 	log.Printf("[GC] Started (worker every %v, scanner every %v, grace %v, batch %d, dry_run=%v)",
 		s.config.WorkerInterval, s.config.ScanInterval, s.config.GracePeriod,
-		s.config.BatchSize, s.config.DryRun)
+		s.config.BatchSize, s.dryRun.Load())
 }
 
-// Stop gracefully stops the GC service.
+func (s *Service) initDLQOpsGate() {
+	s.dlqOpsOnce.Do(func() {
+		s.dlqOpsMu = make(chan struct{}, 1)
+		s.dlqOpsMu <- struct{}{}
+	})
+}
+
+func (s *Service) cancelActiveDLQOperation() {
+	s.dlqActiveMu.Lock()
+	cancel := s.dlqCancel
+	s.dlqActiveMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Service) waitForDLQDrain(ctx context.Context) bool {
+	s.initDLQOpsGate()
+	select {
+	case <-s.dlqOpsMu:
+		s.dlqOpsMu <- struct{}{}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Stop gracefully stops the GC service using an uncancelable context for
+// callers that need the historical blocking shutdown behavior.
 func (s *Service) Stop() {
+	s.StopWithContext(context.Background())
+}
+
+// StopWithContext stops the service without allowing an in-flight DLQ request
+// to make shutdown wait forever. If the context expires before the DLQ gate or
+// worker goroutines drain, leadership is deliberately not released; the lease
+// TTL is safer than releasing it while a canceled admin mutation may still be
+// finishing.
+func (s *Service) StopWithContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -316,26 +364,48 @@ func (s *Service) Stop() {
 	// Drain in-flight DLQ leadership claims before releasing the lease. The HTTP
 	// server is shut down after this method, so a request can still be entering
 	// here while Stop runs.
-	s.dlqOpsMu.Lock()
-	s.dlqOpsMu.Unlock()
+	s.cancelActiveDLQOperation()
+	dlqDrained := s.waitForDLQDrain(ctx)
 	s.triggerMu.Lock()
 	drainTriggerChannel(s.triggerWorker)
 	drainTriggerChannel(s.triggerScanner)
 	s.triggerMu.Unlock()
 	s.cancel()
-	s.wg.Wait()
+	workersDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-ctx.Done():
+		log.Printf("[GC] Shutdown context expired while waiting for workers")
+	}
 
 	// Release leadership so another replica can take over without waiting
 	// for TTL expiry. Best-effort — if it fails, TTL handles it.
-	if s.lease != nil {
+	if dlqDrained && isClosed(workersDone) && s.lease != nil {
 		s.lease.Release(context.Background())
+	} else if s.lease != nil {
+		log.Printf("[GC] Retaining leadership lease for TTL after incomplete shutdown")
 	}
 
 	// Persist stats to database before shutdown
-	s.persistStats()
+	if isClosed(workersDone) {
+		s.persistStats()
+	}
 
 	s.started = false
 	log.Println("[GC] Stopped")
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // AcceptsManualTriggers reports whether a manual worker/scanner trigger can
@@ -416,11 +486,25 @@ func drainTriggerChannel(ch chan struct{}) {
 // was accepted; false means the service is disabled, not running, or not the
 // current leader, and nothing was queued.
 func (s *Service) TriggerWorker() bool {
+	return s.triggerWorkerWithDryRun(nil)
+}
+
+// TriggerWorkerWithDryRun atomically admits a worker trigger and applies an
+// optional runtime mode override. A rejected trigger never commits the override.
+func (s *Service) TriggerWorkerWithDryRun(dryRun *bool) bool {
+	return s.triggerWorkerWithDryRun(dryRun)
+}
+
+func (s *Service) triggerWorkerWithDryRun(dryRun *bool) bool {
 	s.triggerMu.Lock()
 	defer s.triggerMu.Unlock()
 
 	if err := s.ManualTriggerError(); err != nil {
 		return false
+	}
+	if dryRun != nil {
+		s.dryRun.Store(*dryRun)
+		s.worker.dryRun.Store(*dryRun)
 	}
 	select {
 	case s.triggerWorker <- struct{}{}:
@@ -434,11 +518,25 @@ func (s *Service) TriggerWorker() bool {
 // trigger was accepted; false means the service is disabled, not running, or
 // not the current leader.
 func (s *Service) TriggerScanner() bool {
+	return s.triggerScannerWithDryRun(nil)
+}
+
+// TriggerScannerWithDryRun atomically admits a scanner trigger and applies an
+// optional runtime mode override. A rejected trigger never commits the override.
+func (s *Service) TriggerScannerWithDryRun(dryRun *bool) bool {
+	return s.triggerScannerWithDryRun(dryRun)
+}
+
+func (s *Service) triggerScannerWithDryRun(dryRun *bool) bool {
 	s.triggerMu.Lock()
 	defer s.triggerMu.Unlock()
 
 	if err := s.ManualTriggerError(); err != nil {
 		return false
+	}
+	if dryRun != nil {
+		s.dryRun.Store(*dryRun)
+		s.worker.dryRun.Store(*dryRun)
 	}
 	select {
 	case s.triggerScanner <- struct{}{}:
@@ -503,7 +601,7 @@ func (s *Service) Status() GCStatus {
 
 	return GCStatus{
 		Enabled:            s.config.Enabled,
-		DryRun:             s.config.DryRun,
+		DryRun:             s.dryRun.Load(),
 		LastWorkerRun:      formatTime(lastWorker),
 		LastScanRun:        formatTime(lastScanAttempt),
 		LastScanAttempt:    formatTime(lastScanAttempt),
@@ -852,7 +950,7 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 
 	start := time.Now()
 	err := s.scanner.ScanOnce(ctx)
-	retried := s.retryAutoRecoverableFailedItems()
+	retried := s.retryAutoRecoverableFailedItems(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("[GC Scanner] Error: %v", err)
 		s.stats.SetLastScanError(err.Error())
@@ -869,50 +967,55 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
 }
 
-func (s *Service) retryAutoRecoverableFailedItems() int {
-	orgs, err := s.store.ListOrgsWithFailedItems(gcAutoRetryFailedOrgLimit)
-	if err != nil {
-		log.Printf("[GC Scanner] Failed to list orgs with failed items for auto-retry: %v", err)
-		return 0
-	}
-
+func (s *Service) retryAutoRecoverableFailedItems(ctx context.Context) int {
 	retried := 0
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
-
-	for _, org := range orgs {
-		if retried >= gcAutoRetryFailedItemLimit {
-			break
-		}
-
-		items, err := s.store.ListFailedItems(org.OrgID, s.FailedItemsPageSize())
+	_ = s.withDLQOperation(ctx, func(ctx context.Context) error {
+		orgs, err := s.store.ListOrgsWithFailedItems(gcAutoRetryFailedOrgLimit)
 		if err != nil {
-			log.Printf("[GC Scanner] Failed to list failed items for org %s: %v", org.OrgID, err)
-			continue
+			log.Printf("[GC Scanner] Failed to list orgs with failed items for auto-retry: %v", err)
+			return nil
 		}
 
-		for _, item := range items {
+		for _, org := range orgs {
 			if retried >= gcAutoRetryFailedItemLimit {
 				break
 			}
 
-			eligible, err := s.isAutoRecoverableFailedItem(item)
+			items, err := s.store.ListFailedItems(org.OrgID, s.FailedItemsPageSize())
 			if err != nil {
-				log.Printf("[GC Scanner] Failed to classify DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
-				continue
-			}
-			if !eligible {
+				log.Printf("[GC Scanner] Failed to list failed items for org %s: %v", org.OrgID, err)
 				continue
 			}
 
-			if err := s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, time.Now().UTC()); err != nil {
-				log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
-				continue
+			for _, item := range items {
+				if retried >= gcAutoRetryFailedItemLimit {
+					break
+				}
+
+				eligible, err := s.isAutoRecoverableFailedItem(item)
+				if err != nil {
+					log.Printf("[GC Scanner] Failed to classify DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+					continue
+				}
+				if !eligible {
+					continue
+				}
+
+				queuedAt := time.Now().UTC()
+				if store, ok := s.store.(GCAdminContextStore); ok {
+					err = store.RequeueFailedItemContext(ctx, item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt)
+				} else {
+					err = s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt)
+				}
+				if err != nil {
+					log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+					continue
+				}
+				retried++
 			}
-			retried++
 		}
-	}
-
+		return nil
+	})
 	return retried
 }
 
@@ -1215,8 +1318,40 @@ func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
+	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (s *Service) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	return s.withDLQOperation(ctx, func(ctx context.Context) error {
+		return s.deleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+	})
+}
+
+func (s *Service) withDLQOperation(ctx context.Context, fn func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.initDLQOpsGate()
+	select {
+	case <-s.dlqOpsMu:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	opCtx, cancel := context.WithCancel(ctx)
+	s.dlqActiveMu.Lock()
+	s.dlqCancel = cancel
+	s.dlqActiveMu.Unlock()
+	defer func() {
+		cancel()
+		s.dlqActiveMu.Lock()
+		s.dlqCancel = nil
+		s.dlqActiveMu.Unlock()
+		s.dlqOpsMu <- struct{}{}
+	}()
+	return fn(opCtx)
+}
+
+func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
 	// production only one datacenter runs GC; without this an operator on any
@@ -1225,11 +1360,15 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 	if err := s.gcAdminMutationError(); err != nil {
 		return err
 	}
-	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_delete") {
+	if !s.tryClaimLeadershipForAdmin(ctx, "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
-	err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID)
-	if err != nil {
+	if store, ok := s.store.(GCAdminContextStore); ok {
+		err := store.DeleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+		if err != nil {
+			return err
+		}
+	} else if err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
@@ -1239,8 +1378,16 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 }
 
 func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
+	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (s *Service) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	return s.withDLQOperation(ctx, func(ctx context.Context) error {
+		return s.requeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+	})
+}
+
+func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
 	// production only one datacenter runs GC; without this an operator on any
@@ -1249,7 +1396,7 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	if err := s.gcAdminMutationError(); err != nil {
 		return err
 	}
-	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_requeue") {
+	if !s.tryClaimLeadershipForAdmin(ctx, "admin_failed_item_requeue") {
 		return ErrNotLeader
 	}
 	// Serialize DLQ admin mutations: RequeueFailedItem performs a non-atomic
@@ -1258,8 +1405,12 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	// INSERT into gc_queue (with different queued_at), and the second DELETE
 	// would no-op — leaving a duplicated queue row that the worker would
 	// process twice.
-	err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, time.Now().UTC())
-	if err != nil {
+	queuedAt := time.Now().UTC()
+	if store, ok := s.store.(GCAdminContextStore); ok {
+		if err := store.RequeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, queuedAt); err != nil {
+			return err
+		}
+	} else if err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, queuedAt); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
@@ -1348,10 +1499,11 @@ func (s *Service) runLeaseRenewalLoop(ctx context.Context) {
 
 // SetDryRun changes the dry run mode at runtime (for admin API).
 func (s *Service) SetDryRun(dryRun bool) {
+	s.dryRun.Store(dryRun)
+	s.worker.dryRun.Store(dryRun)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config.DryRun = dryRun
-	s.worker.dryRun = dryRun
 }
 
 // rolloverInterval is how often the rollover loop checks for expired billing

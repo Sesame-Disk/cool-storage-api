@@ -2043,7 +2043,7 @@ func (s *Server) Run() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	// Stop GC service first
 	if s.gcService != nil {
-		s.gcService.Stop()
+		s.gcService.StopWithContext(ctx)
 	}
 	if s.authRateLimiter != nil {
 		s.authRateLimiter.Stop()
@@ -2362,19 +2362,15 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		return
 	}
 
-	if req.DryRun != nil {
-		s.gcService.SetDryRun(*req.DryRun)
-	}
-
 	switch req.Type {
 	case "scanner":
-		if !s.gcService.TriggerScanner() {
+		if !s.gcService.TriggerScannerWithDryRun(req.DryRun) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": "GC scanner is not accepting triggers"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC scanner triggered"})
 	default:
-		if !s.gcService.TriggerWorker() {
+		if !s.gcService.TriggerWorkerWithDryRun(req.DryRun) {
 			err := s.gcService.ManualTriggerError()
 			if err == nil {
 				err = errors.New("GC worker is not accepting triggers")
@@ -2512,7 +2508,7 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.RequeueFailedItem(orgID, failedAt, itemType, itemID); err != nil {
+	if err := s.gcService.RequeueFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
 		// Neither leadership nor lifecycle refusal is a server fault: this node will
 		// not serve the request, so return 503 rather than 500.
 		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {
@@ -2535,7 +2531,7 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
+	if err := s.gcService.DeleteFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
 		// Neither leadership nor lifecycle refusal is a server fault: this node will
 		// not serve the request, so return 503 rather than 500.
 		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {

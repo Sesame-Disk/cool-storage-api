@@ -140,7 +140,7 @@ func TestLibraryMutations_RejectNonOwnerWithWriteAccess(t *testing.T) {
 }
 
 func TestLibraryMutations_AllowOwnerAndOrgAdmin(t *testing.T) {
-	// GetLibraryPermission collapses library owner and org admin/superadmin onto
+	// GetLibraryPermission collapses library owner and org owner/admin/superadmin onto
 	// PermissionOwner, so one allow case covers both callers who legitimately
 	// administer a library. Asserted at the gate rather than through the handler:
 	// past the gate the handlers write to Cassandra, which these unit tests do not

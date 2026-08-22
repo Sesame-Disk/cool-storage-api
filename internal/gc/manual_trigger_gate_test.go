@@ -140,6 +140,29 @@ func TestService_ManualTriggersRefusedWithoutLeadership(t *testing.T) {
 	}
 }
 
+func TestService_RejectedDryRunOverrideIsNotCommitted(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	svc.lease = &fakeLeaderLease{allowed: false}
+	svc.Start()
+	defer svc.Stop()
+
+	dryRun := false
+	if svc.TriggerWorkerWithDryRun(&dryRun) {
+		t.Fatal("follower accepted a trigger with a dry-run override")
+	}
+	if !svc.dryRun.Load() || !svc.worker.dryRun.Load() {
+		t.Fatal("rejected trigger committed its dry-run override")
+	}
+}
+
 func TestService_NilServiceRefusesManualTriggers(t *testing.T) {
 	var svc *Service
 	if svc.AcceptsManualTriggers() {
