@@ -2350,16 +2350,36 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		req.Type = "worker"
 	}
 
+	// A disabled GC service is still constructed and this route is still
+	// registered, so refuse here rather than reporting a run that no consumer
+	// goroutine exists to perform. In production only one datacenter runs GC;
+	// every other node serves this endpoint with GC_ENABLED=false and must say so
+	// instead of answering {"started":true}. Checked before the dry-run override so
+	// a disabled node's admin surface is inert end to end.
+	if !s.gcService.AcceptsManualTriggers() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"started": false,
+			"error":   "GC is disabled or not started on this node; manual triggers are refused",
+		})
+		return
+	}
+
 	if req.DryRun != nil {
 		s.gcService.SetDryRun(*req.DryRun)
 	}
 
 	switch req.Type {
 	case "scanner":
-		s.gcService.TriggerScanner()
+		if !s.gcService.TriggerScanner() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": "GC scanner is not accepting triggers"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC scanner triggered"})
 	default:
-		s.gcService.TriggerWorker()
+		if !s.gcService.TriggerWorker() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": "GC worker is not accepting triggers"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
 	}
 }

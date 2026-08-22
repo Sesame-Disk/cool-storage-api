@@ -23,7 +23,7 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
-| **Library mutations have no permission gate** | 🔴 Open | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` run behind `authMiddleware` only and never consult the caller's library permission, so any authenticated member of an organization can rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. `GetLibrary` and `DeleteLibrary` do gate; these three do not. Negative tests are still owed. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint. |
+| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's library permission, so any authenticated member of an organization could rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. All three now gate on `requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org admin/superadmin) and refuses repo API tokens; content `rw` no longer carries configuration authority. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint, which remains open. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -66,6 +66,7 @@ is right about why.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
@@ -7901,9 +7902,12 @@ automating health monitoring would make the failover path live, so it hardens
 availability and weakens residency at the same time; the two must be decided
 together.
 
-**Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** the same
-endpoint has no permission gate, so the caller need not even own the library
-whose residency they move.
+**Narrowed 2026-08-22 by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** that
+endpoint now requires `PermissionOwner`, so the caller must be the library owner
+or an org admin. That shrinks the population who can move residency; it does not
+close this issue, because the residency contract itself is still unenforced on
+the transition — an owner acting in good faith can still move a `strict` org's
+library out of region.
 
 #### Fix Direction
 
@@ -8083,7 +8087,7 @@ separate operations; the migration TODO in the same handler stays out of scope.
 
 ### ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01: Three library mutation handlers have no permission gate
 
-**Status**: 🔴 Open — runtime defect, fix belongs in its own PR
+**Status**: ✅ **Fixed 2026-08-22** — gated on `LibraryHandler.requireLibraryConfigAuthority`, negative tests landed
 **Severity**: High (authorization / configuration integrity)
 **Affected**: `UpdateLibrary`, `LibraryOperation` → `RenameLibrary`, `ChangeStorageClass` (`internal/api/v2/libraries.go`)
 
@@ -8127,33 +8131,138 @@ in that organization, including libraries they have no permission to read.
 Existing canonical blocks are not moved or reinterpreted by any of the three, so
 this is a configuration-integrity and authorization defect, not data loss.
 
-#### Verification still owed
+#### Additional evidence: this is a route surface, not three stray functions
 
-No negative test covers any of the three. In
-`internal/api/v2/library_live_write_fence_test.go`, every invocation of
-`UpdateLibrary`, `RenameLibrary` and `ChangeStorageClass` sets only `org_id`,
-while other tests in the same file do set `user_id` for the handlers that read it.
-The asymmetry inside one file is itself evidence that these three run without a
-caller identity. Each handler needs a red test of the shape:
+`RegisterLibraryRoutesWithToken` constructs a `PermissionMiddleware` and hands it
+to the handler, but applies it to **no** route in the `repos` group. The affected
+handlers are reachable through **five** registrations — `PUT /:repo_id`,
+`PUT /:repo_id/`, `POST /:repo_id`, `POST /:repo_id/` and
+`POST /:repo_id/storage-class` — and the group is registered under both the
+`/api/v2` and `/api2` prefixes. That shaped the fix: the gate had to live in the
+handler, because a per-route middleware would have to be repeated five times and
+the sixth registration would forget it.
 
-```text
-user B, no permission on library A
-PUT /repos/A            → expect 403
-POST /repos/A?op=rename → expect 403
-POST /repos/A/storage-class → expect 403
-```
+#### Fix (2026-08-22)
 
-#### Fix Direction
+One shared gate, `LibraryHandler.requireLibraryConfigAuthority`, called by all
+three handlers immediately after the live-library fence:
 
-Do not paste `IsLibraryOwner` into three handlers. Decide the required permission
-level per operation (owner versus write permission), then apply it in one shared
-place — either a route-level middleware for the mutating library routes or a
-single helper the handlers call — so a fourth mutation handler cannot be added
-without one. This is the same "centralize the mandatory check inside one
-function" rule the write helpers already follow.
+- **Required level: `PermissionOwner`.** `GetLibraryPermission` already collapses
+  library owner and org admin/superadmin onto that value, so a single comparison
+  admits both legitimate administrators without a second lookup. Content `rw` is
+  deliberately **not** sufficient: an `rw` share decides what is *in* a library,
+  not what it is called, how long its versions are kept, or where its future
+  blocks are placed.
+- **Repo API tokens are refused outright**, before the permission lookup. Such a
+  token is a content credential scoped to one library and mints at most `rw`;
+  letting the minting user's own permissions answer for it would hand the token a
+  reach it was never issued.
+- **Empty `user_id` fails closed** rather than resolving permissions for `""`.
+- **Lookup errors return 500**, never a silent allow.
 
-Land the fix and its negative tests as a separate PR; documenting the gap does
-not close it.
+Ordered after the liveness fence to match `DeleteLibrary`. That leaves the same
+within-org existence signal `DeleteLibrary` already accepts (an unauthorized
+caller can still distinguish a live library in their own org from a deleted one);
+closing it is a separate decision that should move all four handlers at once
+rather than leave the pair inconsistent.
+
+#### Verification
+
+`internal/api/v2/library_mutation_authority_test.go` runs every case against all
+three handlers, driving rename through `LibraryOperation` the way the route
+actually dispatches:
+
+- `rw`, `r`, `cloud-edit`, `preview` and no-permission callers → 403 (15 cases)
+- owner/org-admin → gate returns true
+- missing `user_id` → 403
+- repo API token → 403
+- permission-lookup error → 500
+
+Confirmed red before the fix: with the three gate call sites removed, the `rw`
+case fails and the handler proceeds into the database.
+
+---
+
+### ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01: Manual GC trigger APIs were not gated on `GC.Enabled`
+
+**Status**: ✅ **Fixed 2026-08-22** — gated on `Service.AcceptsManualTriggers`, guard tests landed
+**Severity**: Low as shipped (never a live bypass), but it protected the barrier the entire X1 programme runs behind
+**Affected**: `gc.Service.TriggerWorker`, `gc.Service.TriggerScanner`, `Server.handleGCRun`
+
+#### Problem
+
+`GC_ENABLED=false` is the kill switch that keeps destructive GC off while X1 is
+open. It is pinned in `docker-compose.prod.yml` and defaults to false in
+`config.DefaultConfig`. Re-verifying it after PR #181 surfaced that the *runtime*
+surface was never checked, only the config surface.
+
+Three facts together:
+
+1. `NewServer` constructs `gcService` unconditionally — the constructor is guarded
+   by `database != nil`, not by `cfg.GC.Enabled`. A node with GC disabled still
+   has a live `*gc.Service`.
+2. The superadmin route `POST /api/v2.1/admin/gc/run` is registered
+   unconditionally and reaches that service.
+3. `TriggerWorker` and `TriggerScanner` checked neither `config.Enabled` nor
+   `started`. They only wrote to a size-1 buffered channel.
+
+What made it safe in practice is that `Service.Start` returns early when
+`!s.config.Enabled`, before launching `runWorkerLoop` and `runScannerLoop`, so no
+goroutine existed to consume the token.
+
+**That is the problem.** The kill switch rested on "a disabled service happens to
+have no consumer for this channel" — an emergent property of `Start`'s control
+flow — rather than on a stated invariant at the point of decision. Any future
+refactor that launched those loops unconditionally (or started them before the
+`Enabled` check, or added a second consumer) would have silently promoted the
+admin endpoint into a live bypass of `GC_ENABLED=false`, with no test failing.
+
+This matters more than the severity suggests because of the production posture:
+**only one datacenter runs GC; every other node runs with `GC_ENABLED=false`**
+and still serves this endpoint. The disabled majority of the fleet was exactly
+the population relying on the emergent guarantee.
+
+Two smaller defects fell out of the same gap:
+
+- The endpoint answered `{"started": true, "message": "GC worker triggered"}` on
+  a disabled node, for a run that no goroutine existed to perform. An operator
+  could not tell a triggered run from a silently discarded one.
+- The token was left parked in the buffered channel. Had GC later been enabled on
+  that process, the first loop iteration would have consumed it and performed one
+  run nobody asked for.
+
+#### Fix (2026-08-22)
+
+`Service.AcceptsManualTriggers` reports whether a trigger can actually reach a
+consumer — `config.Enabled && started`, read under `s.mu` (the same mutex
+`SetDryRun` already uses to mutate `config`). `TriggerWorker` and
+`TriggerScanner` consult it first and now return a `bool`, so a refused trigger
+is a value the caller must handle rather than a silent no-op.
+
+`handleGCRun` checks `AcceptsManualTriggers` up front and answers
+`503` with `{"started": false}` — **before** applying the optional `dry_run`
+override, so a disabled node's admin surface is inert end to end rather than
+accepting a config mutation for a service that will not run.
+
+The internal caller in `runScannerOnce` is unaffected: it only runs inside a
+started, enabled service.
+
+#### Verification
+
+`internal/gc/manual_trigger_gate_test.go`:
+
+- disabled service → `AcceptsManualTriggers` false, both triggers refused, **and
+  both buffered channels asserted empty** (the parked-token regression)
+- enabled but not started → refused
+- enabled and started → accepted
+- after `Stop()` → refused
+- nil service → refused
+
+#### Why this is not `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
+
+X1 is about whether destructive GC is *correct* when enabled. This is about
+whether "disabled" is enforced where it is decided. They are independent, and
+this fix is not progress against any of X1's four closure criteria.
 
 ---
 

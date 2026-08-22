@@ -1587,11 +1587,13 @@ Notes:
   new blocks there after the switch to `strict`. Do not describe the current
   behaviour as "future placement follows the policy"; it does not
   (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
-- that same endpoint has **no permission gate**: any authenticated member of the
-  organization can call it for any library in the organization, as can
-  `PUT /repos/:repo_id` and `POST /repos/:repo_id?op=rename`
-  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). Do not treat org-level
-  residency as enforced against org members until that is fixed
+- that endpoint gained a permission gate on 2026-08-22
+  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`, fixed): it, `PUT /repos/:repo_id`
+  and `POST /repos/:repo_id?op=rename` now require the library owner or an org
+  admin, so an arbitrary org member can no longer move a library's residency.
+  Do not read that as residency being enforced: the class change itself is still
+  unvalidated against the org's region, so an **owner or org admin** can move a
+  `strict` org's library out of region
 
 ### Step M3 — Firewall (private network)
 

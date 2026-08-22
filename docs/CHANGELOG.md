@@ -8,6 +8,75 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-22 - Readiness record correction + two bounded fixes
+
+Documentation/source-of-record pass following the independent re-verification of
+`main` at `a1570b186`, plus the two bounded runtime fixes that re-verification
+turned up. No X1 work: nothing here is progress against any of X1's four closure
+criteria, and P0/R12 remains the next X1 tranche.
+
+**Readiness posture corrected.** `OPEN-WORK-INDEX.md` claimed "no single-node
+go-live blockers remain" a few lines above its own table of open HIGH rows, and
+`CURRENT_WORK.md` called X1 "the sole blocker" without saying which gate. Both now
+separate three gates explicitly: activating destructive GC (X1 alone), single-node
+go-live (independent resource/late-failure findings), and multi-instance operation
+(the two node-local state issues). "X1 is the only blocker for enabling destructive
+GC" is still true; "X1 is the only blocker for production" was not.
+
+**`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` — fixed.** `UpdateLibrary`,
+`RenameLibrary` (via `LibraryOperation` `op=rename`) and `ChangeStorageClass` ran
+behind `authMiddleware` alone and never consulted the caller's library permission,
+so any authenticated org member could rename any library in the org, rewrite its
+description, shorten its `version_ttl_days` retention, or move its storage-class
+preference. All three now call one shared gate,
+`LibraryHandler.requireLibraryConfigAuthority`, requiring `PermissionOwner` —
+library owner or org admin/superadmin, which `GetLibraryPermission` already
+collapses onto that single value. Content `rw` is deliberately insufficient: an
+`rw` share decides what is *in* a library, not what it is called or where its
+future blocks are placed. Repo API tokens are refused before the lookup, an empty
+`user_id` fails closed, and lookup errors return 500.
+
+One gate rather than three checks because the defect was precisely a per-handler
+check three handlers lacked: `RegisterLibraryRoutesWithToken` builds a
+`PermissionMiddleware` and applies it to no route in the group, and the handlers
+are reachable through five registrations under two prefixes. Ordered after the
+live-library fence to match `DeleteLibrary`.
+
+**`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` — found and fixed.** The `GC_ENABLED=false`
+kill switch was enforced on the config surface but not the runtime one:
+`gcService` is constructed unconditionally, `POST /api/v2.1/admin/gc/run` is
+registered unconditionally, and `TriggerWorker`/`TriggerScanner` checked neither
+`Enabled` nor `started`. Nothing ran only because `Service.Start` returns before
+launching its loops when disabled — so the switch rested on an emergent property
+of `Start`'s control flow rather than a check where the decision is made, and any
+refactor launching those loops unconditionally would have turned that endpoint
+into a live bypass with no test failing. It also answered `{"started":true}` for
+runs that never happened, on exactly the nodes that matter: in production only one
+datacenter runs GC and every other node serves this endpoint disabled.
+
+Now gated on `Service.AcceptsManualTriggers` (`Enabled && started`, read under the
+mutex `SetDryRun` already uses). The triggers return `bool`, so a refusal is a
+value the caller must handle; `handleGCRun` answers `503` **before** applying the
+optional `dry_run` override. Never a live bypass — hardened before it could become
+one.
+
+**New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
+re-verification at `a1570b186`: ten defects (six HIGH), what #181 did and did not
+deliver, and the corrections to the draft it replaces — a nonexistent source
+document, a miscount, `internal/metrics` (not `internal/gc/metrics`), 409,200
+rather than "~400k" `pack-fs` ids, the full three-surface scope of
+`ISSUE-BLOCK-CROSS-LIBRARY-READ-01`, migration 016 in the binary/schema invariant,
+and fence observability being partial (a `gc_fence` retry label) rather than
+absent. It cites code by symbol name per the index's rule 3.
+
+**Files**: `internal/gc/gc.go`, `internal/gc/manual_trigger_gate_test.go`,
+`internal/api/server.go`, `internal/api/v2/libraries.go`,
+`internal/api/v2/library_mutation_authority_test.go`, `CURRENT_WORK.md`,
+`docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`,
+`docs/PROD-READINESS-VERIFICATION-20260822.md`, `docs/CHANGELOG.md`
+
+---
+
 ## 2026-08-21 - P1 locator authority foundation
 
 Materialization funnels now resolve one org-scoped `storage_key`, use that exact

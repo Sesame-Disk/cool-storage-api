@@ -754,6 +754,65 @@ var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, us
 	return pm.GetLibraryPermission(orgID, userID, repoID)
 }
 
+// requireLibraryConfigAuthority gates the library CONFIGURATION mutations —
+// rename, description, version_ttl_days retention, and the storage-class
+// preference — behind owner-or-org-admin authority, answering the response itself
+// and reporting false when the caller must be refused.
+//
+// One helper rather than three inline checks, because the defect it closes
+// (ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01) was exactly a per-handler check
+// that three handlers did not have. The routes are registered five times, with
+// and without a trailing slash, under both the /api/v2 and /api2 prefixes, so the
+// gate has to sit in the handler: any registration that forgets middleware still
+// inherits it here.
+//
+// Content write access is deliberately not sufficient. A user with an "rw" share
+// may change what is IN a library; deciding what the library is called, how long
+// its versions are kept, and where its future blocks are placed is the owner's
+// (or an org admin's). GetLibraryPermission already collapses library owner and
+// org admin/superadmin onto PermissionOwner, so that single comparison covers
+// both legitimate callers without a second lookup.
+//
+// Callers run this AFTER the live-library fence, matching DeleteLibrary. That
+// order means a caller without authority can still tell a live library in their
+// own org from a deleted one — the same within-org existence signal DeleteLibrary
+// already accepts. Closing it is a separate decision that should move all four
+// handlers at once rather than leave the pair inconsistent.
+func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, orgID, repoID string) bool {
+	// A repo API token is a content credential scoped to one library and mints at
+	// most "rw"; it never carries owner authority. Refuse before the lookup, so the
+	// minting user's own permissions cannot answer for a token that was never
+	// issued this reach.
+	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
+		log.Printf("[%s] Permission denied: repo API tokens cannot modify library configuration (library %q)", logTag, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+
+	userID := c.GetString("user_id")
+	if userID == "" {
+		// authMiddleware always sets user_id. Reaching here means an unauthenticated
+		// route was wired to a mutation handler; resolving permissions for "" would
+		// quietly ask the wrong question, so fail closed instead.
+		log.Printf("[%s] Permission denied: no authenticated user on a library mutation for %q", logTag, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+
+	perm, err := getLibraryPermissionFn(h.permMiddleware, orgID, userID, repoID)
+	if err != nil {
+		log.Printf("[%s] Failed to check permissions: %v", logTag, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+		return false
+	}
+	if perm != middleware.PermissionOwner {
+		log.Printf("[%s] Permission denied: user %q has %q on library %q, which does not carry configuration authority", logTag, userID, perm, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+	return true
+}
+
 // GetLibrary returns a single library by ID
 // This endpoint uses the api2 format expected by Seafile desktop client
 func (h *LibraryHandler) GetLibrary(c *gin.Context) {
@@ -941,6 +1000,10 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 		return
 	}
 
+	if !h.requireLibraryConfigAuthority(c, "UpdateLibrary", orgID, repoID) {
+		return
+	}
+
 	now := time.Now()
 	updates = append(updates, "updated_at = ?")
 	values = append(values, now)
@@ -1080,6 +1143,10 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		return
 	}
 
+	if !h.requireLibraryConfigAuthority(c, "RenameLibrary", orgID, repoID) {
+		return
+	}
+
 	now := time.Now()
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
@@ -1134,6 +1201,10 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 
 	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
 		writeLiveLibraryStateError(c, err)
+		return
+	}
+
+	if !h.requireLibraryConfigAuthority(c, "ChangeStorageClass", orgID, repoID) {
 		return
 	}
 

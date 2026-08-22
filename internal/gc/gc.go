@@ -291,21 +291,57 @@ func (s *Service) Stop() {
 	log.Println("[GC] Stopped")
 }
 
-// TriggerWorker triggers an immediate worker run.
-func (s *Service) TriggerWorker() {
+// AcceptsManualTriggers reports whether a manual worker/scanner trigger can
+// actually reach a consumer goroutine right now.
+//
+// This is defence in depth for the GC kill switch, not decoration. A disabled
+// service is still CONSTRUCTED by the API server and its superadmin endpoint
+// (POST /api/v2.1/admin/gc/run) is still registered; Start() merely declines to
+// launch runWorkerLoop/runScannerLoop. So before this guard existed the kill
+// switch rested on "a disabled service has no consumer for the trigger channel",
+// which is an accident of Start()'s control flow rather than a stated invariant.
+// Any refactor that launched those loops unconditionally would have silently
+// promoted that endpoint into a live bypass of GC_ENABLED=false. The check
+// belongs where the decision is.
+//
+// Two smaller consequences it also removes: the endpoint answered
+// {"started":true} for a run that never happened, and the parked token in the
+// size-1 buffered channel would have fired one unrequested run the moment GC was
+// later enabled.
+func (s *Service) AcceptsManualTriggers() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config.Enabled && s.started
+}
+
+// TriggerWorker triggers an immediate worker run. It reports whether the trigger
+// was accepted; false means GC is disabled or not started and nothing was queued.
+func (s *Service) TriggerWorker() bool {
+	if !s.AcceptsManualTriggers() {
+		return false
+	}
 	select {
 	case s.triggerWorker <- struct{}{}:
 	default:
 		// Already triggered
 	}
+	return true
 }
 
-// TriggerScanner triggers an immediate scanner run.
-func (s *Service) TriggerScanner() {
+// TriggerScanner triggers an immediate scanner run. It reports whether the
+// trigger was accepted; false means GC is disabled or not started.
+func (s *Service) TriggerScanner() bool {
+	if !s.AcceptsManualTriggers() {
+		return false
+	}
 	select {
 	case s.triggerScanner <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 // SetOnlyOfficeReconciler wires the OnlyOffice pending-blocks reconciler into

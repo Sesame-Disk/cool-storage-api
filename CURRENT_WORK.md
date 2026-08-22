@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-08-14
-**Session**: X1 closure options — r3 generational fence abandoned; production `GC_ENABLED=false` pinned
+**Last Updated**: 2026-08-22
+**Session**: Post-#181 readiness record — P1 locator authority merged; two bounded fixes; readiness posture corrected
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -15,10 +15,24 @@
 
 **PROJECT STATUS**: ~85-90% production ready (see `docs/IMPLEMENTATION_STATUS.md`)
 
+### ⚠️ Read this distinction before quoting any blocker count
+
+Two different gates get confused constantly, and conflating them is how "X1 is
+the only blocker" turns into "X1 closed → ship it":
+
+| Gate | Blocked by | Status |
+|---|---|---|
+| **Activating destructive GC** (`GC_ENABLED=true`) | **X1 alone.** X2 closed 2026-08-14. | X1 open, no accepted design |
+| **Putting SesameFS in production at all** | **Independent security / resource findings that have nothing to do with GC** | Several open — see below |
+
+X1 is the sole blocker for the *first* row **only**. It is not the sole
+production blocker, and no status document should say that it is.
+
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA, now the sole blocker: X2 cross-DC reference visibility closed 2026-08-14 (destructive liveness at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster). Keep `GC_ENABLED=false` on every replica in every DC; the implementation and lease exist but are not permission to activate deletion.
+2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA — the sole blocker *for activating deletion*: X2 cross-DC reference visibility closed 2026-08-14 (destructive liveness at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster). Keep `GC_ENABLED=false` on every replica in every DC; the implementation and lease exist but are not permission to activate deletion.
 3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
+4. **Non-GC readiness findings** - 🔴 **OPEN**, independent of X1. Canonical status per id in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md), one-screen list in [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md). Single-node HIGHs still open: `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`, `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`, `ISSUE-ZIP-STREAM-LATEFAIL-01`. Multi-instance additionally requires `ISSUE-UPLOAD-CHUNK-MULTINODE-01` and `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01`. (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` closed 2026-08-22.)
 
 **Then review**:
 1. **"What's Next"** → Top priorities (work on #1 unless user specifies)
@@ -27,11 +41,12 @@
 
 ### Quick Context
 1. **Sync Protocol**: Baseline-verified for the current desktop sync hardening scope. Do not treat it as frozen; compatibility-sensitive follow-up coverage still exists.
-2. **Backend API**: ~98% complete - OIDC ✅, GC implementation present; destructive activation blocked by X1 alone (X2 closed 2026-08-14), Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
+2. **Backend API**: ~98% complete by surface count, which is not the same as ready — see blocker #4 for the open authorization/resource findings. OIDC ✅, GC implementation present; destructive activation blocked by X1 alone (X2 closed 2026-08-14), Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
-5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the activation gate now genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it.
+5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the *deletion-activation* gate genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it. **Product go-live is a different gate** and is not held by X1: see the table above and blocker #4.
 6. **X1 design state**: **no accepted design.** The r3 generational fence was abandoned 2026-08-14 (PR #166 closed unmerged; branch `docs/gc-x1-x2-generation-fence-final` kept as investigative reference only). Closure options, race matrix and open questions are in [`docs/GC-X1-CLOSURE-OPTIONS.md`](docs/GC-X1-CLOSURE-OPTIONS.md) — analysis, not a decision. `GC_ENABLED=false` is now pinned explicitly in `docker-compose.prod.yml`.
+7. **P1 locator authority merged 2026-08-21** (PR #181, migration `016_gc_s3_orphans_storage_key.cql`). The persisted `storage_key` is now the authority end to end: both destructive paths verify it against the key their own org-scoped store derives and fail closed on a mismatch, proven against real Cassandra + MinIO. **P1 does not close X1** and is not progress against its four closure criteria — the next X1 tranche is P0/R12 (SERIAL domain), which must land before P2. `storage_key` remains *deterministic*: P1 changed which value is authoritative, not whether the value is recomputable, so it still cannot discriminate two physical lives at the same address.
 
 ### Inter-session Update (2026-05-21)
 

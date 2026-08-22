@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-22
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -57,19 +57,38 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**No single-node go-live blockers remain under the current production posture,
-which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
-2026-08-04; the object-storage posture issue and the sync public-link token auth
-gap both closed 2026-08-07. This is not the same as "nothing is left": X1
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) remains open and still blocks
-*enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
-B5. See
-[PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
+**Single-node go-live still has open HIGH findings, and they are independent of
+X1.** Corrected 2026-08-22: this summary previously read "no single-node go-live
+blockers remain", which contradicted the HIGH rows in this document's own
+High/Medium table a few lines below. Do not restore that claim.
+
+Three gates, kept separate on purpose:
+
+- **Enabling destructive GC** — blocked by X1
+  (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) **alone**; X2 closed 2026-08-14.
+  See the GC section below.
+- **Single-node go-live** — blocked by the resource-amplification and
+  late-failure findings below (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`,
+  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`, `ISSUE-ZIP-STREAM-LATEFAIL-01`).
+  Nothing about GC gates these, and closing X1 does not close them.
+- **Multi-instance operation** — additionally blocked by the two node-local
+  state issues in the table below.
+
+What genuinely closed: NF-1 2026-07-25; B4 2026-08-04; the object-storage
+posture issue and the sync public-link token auth gap 2026-08-07;
+`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` 2026-08-22. See
+[PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md)
+(dated snapshot) and
+[PROD-READINESS-VERIFICATION-20260822.md](./PROD-READINESS-VERIFICATION-20260822.md)
+(re-verification at `a1570b186`).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
+
+The single-node HIGH rows are **not duplicated here**; their canonical rows live
+in the High/Medium table below, per rule 4.
 
 ### Recently closed
 
@@ -152,10 +171,11 @@ not satisfy the X1 closure criteria.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | HIGH | `UpdateLibrary`, `op=rename` and `ChangeStorageClass` have no permission gate: any authenticated org member can rename any library in the org, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. Only `GetLibrary` and `DeleteLibrary` check | Found auditing the storage-class characterization; runtime defect, negative tests still owed |
+| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | ✅ Closed 2026-08-22 | The three handlers now gate on `LibraryHandler.requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org admin/superadmin); content `rw` no longer carries configuration authority. Negative tests cover all three handlers | [known issue](./KNOWN_ISSUES.md) |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
+| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | Manual GC trigger APIs did not check `GC.Enabled`; the kill switch rested on a disabled service having no consumer goroutine, and the admin endpoint answered `{"started":true}` regardless. Now gated on `Service.AcceptsManualTriggers` | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
 | `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
@@ -172,7 +192,7 @@ not satisfy the X1 closure criteria.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
-| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** under `strict` the endpoint must accept only an in-region hot class, and new materializations must not fail over across the region | Decided, not implemented. **Still open:** what `strict` promises about content placed before the policy took effect — the transition is ungated today. Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** under `strict` the endpoint must accept only an in-region hot class, and new materializations must not fail over across the region | Decided, not implemented. **Still open:** what `strict` promises about content placed before the policy took effect — the transition is ungated today. Narrowed 2026-08-22 by the closure of `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`: the residency transition is now reachable only by a library owner or org admin, not by any org member. Still ungated on residency itself |
 
 ## Low / latent / deferred hardening
 
