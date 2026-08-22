@@ -265,7 +265,7 @@ The pre-PUT S3 HEAD is replaced by `DB.ProbeBlockReuse(orgID, blockID)`
 (`internal/db/block_references.go`), which reads `blocks` metadata,
 `block_references`, and the `gc_s3_orphans` fence and returns
 reusable / needs-put / blocked-by-GC / unknown-error. Needs-put blocks use
-`PutBlockAutoDirect` (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
+`PutObjectAutoDirect` at the resolved locator (no HEAD); reusable blocks run `EnsureReusableBlockPresent`
 (verify the canonical object via HEAD on the declared key, repair via direct PUT
 only if missing); blocked-by-GC returns `ErrBlockDeleteInProgress` to retry;
 unknown-error fails closed before S3 PUT. Wired into all seven governed upload funnels

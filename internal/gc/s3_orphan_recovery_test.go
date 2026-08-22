@@ -447,7 +447,7 @@ func TestWorker_RecoverS3Orphans_CanonicalStorageKeyChangeBeforeCommitFailsClose
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
-		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch on storage key")
+		t.Fatal("RecoverS3Orphans() error = nil, want the changed locator refused (derived-key guard today, reload comparison once P2 retires it)")
 	}
 	if recovered != 0 {
 		t.Fatalf("recovered=%d, want 0", recovered)

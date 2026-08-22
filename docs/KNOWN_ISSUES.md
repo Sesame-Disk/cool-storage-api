@@ -1182,7 +1182,7 @@ and the `gc_s3_orphans` fence to return one of:
 
 - `BlockReuseReusable` → `EnsureReusableBlockPresent`: verify the canonical object
   exists (HEAD on the declared key) and repair it (direct PUT) only if missing
-- `BlockReuseNeedsPut` → `PutBlockAutoDirect` (direct PUT, no HEAD)
+- `BlockReuseNeedsPut` → `PutObjectAutoDirect` at the resolved locator (direct PUT, no HEAD)
 - `BlockReuseBlockedByGC` → `ErrBlockDeleteInProgress` (retry/back-off)
 - `BlockReuseUnknownError` → fail closed before S3 PUT
 

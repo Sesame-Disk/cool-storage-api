@@ -73,7 +73,7 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	session := database.Session()
 	store := gcpkg.NewCassandraStore(database)
 
-	content := []byte(fmt.Sprintf("gc-foreign-locator-%s\n", uuid.NewString()))
+	content := fmt.Appendf(nil, "gc-foreign-locator-%s\n", uuid.NewString())
 	blockID := sha256hex(content)
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
@@ -89,27 +89,16 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	// Registered BEFORE anything is created: a failure between the two PUTs or at
 	// the INSERT would otherwise strand objects in the bucket.
 	//
-	// This test leaves more behind than a passing one would, so it cleans more.
-	// Its queue item never completes by design, so nothing removes the
-	// gc_pending_items row (that table has no TTL) — cleanupGCBlockFixturesForTest
-	// clears queue, DLQ, pending and candidate by identity. EnqueueItem also marks
-	// the org in gc_active_orgs and gc_dirty_orgs, and neither is self-healing
-	// here: the worker only drops an org from the active set when a batch comes
-	// back short (`len(items) < batchSize`), and with batchSize=1 the retried item
-	// keeps every batch full, while nothing in this path clears the dirty mark at
-	// all. Both are removed explicitly, with a future bound so the conditional
-	// deletes apply.
+	// This test leaves more behind than a passing one would. Its queue item never
+	// completes by design, so nothing removes the gc_pending_items row (no TTL on
+	// that table), and the org keeps its gc_active_orgs/gc_dirty_orgs markers: the
+	// worker only drops an org from the active set when a batch comes back short
+	// (`len(items) < batchSize`), and with batchSize=1 the retried item keeps every
+	// batch full. cleanupGCBlockFixturesForTest covers all of it.
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgID, blockID)
 		if err := session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
 			t.Fatalf("cleanup blocks row: %v", err)
-		}
-		bound := time.Now().Add(time.Hour).UTC()
-		if err := store.RemoveOrgFromActiveSet(orgID, bound); err != nil {
-			t.Fatalf("cleanup gc_active_orgs: %v", err)
-		}
-		if err := store.ClearDirtyOrg(orgID, bound); err != nil {
-			t.Fatalf("cleanup gc_dirty_orgs: %v", err)
 		}
 		_ = collected.DeleteBlockByStorageKey(ctx, ownKey)
 		_ = victim.DeleteBlockByStorageKey(ctx, foreignKey)

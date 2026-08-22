@@ -234,7 +234,8 @@ resolved, and every non-web funnel but OnlyOffice discards it and persists `""`
 (`seafhttp.go:2520`, `seafhttp.go:3031`, `sync.go:2026`, `files.go:1358`,
 `files.go:3452`; OnlyOffice keeps it at `onlyoffice.go:1224`).
 
-In the `NeedsPut` branch **every non-web funnel** discards it, OnlyOffice included.
+*(Pre-P1 baseline; P1 fixed exactly this — see the locator-authority note above.)*
+In the `NeedsPut` branch **every non-web funnel** discarded it, OnlyOffice included.
 `ResolveNeedsPutBlockStore` returns the resolved key and all six call sites drop it
 (`seafhttp.go:2527`, `seafhttp.go:3034`, `sync.go:2035`, `files.go:1364`,
 `files.go:3455`, `onlyoffice.go:1227`), then write the bytes with

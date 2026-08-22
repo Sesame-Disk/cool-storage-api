@@ -57,12 +57,13 @@ Cassandra probe — `DB.ProbeBlockReuse(orgID, blockID)` in
 | Decision             | Meaning                                              | Action in upload path        |
 |----------------------|------------------------------------------------------|------------------------------|
 | `BlockReuseReusable` | canonical metadata + live references, no GC fence    | `EnsureReusableBlockPresent`: verify the canonical object (HEAD on the declared key) and repair (direct PUT) only if missing |
-| `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | `PutBlockAutoDirect` (no HEAD)|
+| `BlockReuseNeedsPut` | no metadata, or metadata with no live references     | `PutObjectAutoDirect` at the resolved locator (no HEAD)|
 | `BlockReuseBlockedByGC` | `gc_state='deleting'` or a `gc_s3_orphans` fence  | return `ErrBlockDeleteInProgress` → retry/back-off |
 | `BlockReuseUnknownError` | Cassandra read failed / corrupt metadata         | fail closed before S3 PUT |
 
-`PutBlockAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
-without the prior HEAD. The probe is wired into all seven governed upload funnels:
+`PutObjectAutoDirect` (`internal/storage/blocks.go`) issues a direct `PutAuto`
+at the caller-supplied locator without the prior HEAD. It replaced the
+hash-deriving `PutBlockAutoDirect` in P1. The probe is wired into all seven governed upload funnels:
 `HandleUpload` + `finalizeUploadStreaming` (`seafhttp.go`), `SyncHandler.PutBlock`
 (`sync.go`), `FileHandler.CreateFile` template + `UploadFile` (`files.go`), and
 `OnlyOffice.saveEditedDocument` (`onlyoffice.go`), plus session-mode

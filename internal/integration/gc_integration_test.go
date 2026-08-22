@@ -1107,6 +1107,19 @@ func repairGCSnapshotsForTest(t *testing.T, orgID uuid.UUID) {
 	}
 }
 
+// cleanupGCBlockFixturesForTest tears down every row one synthetic block leaves
+// behind. Every caller passes an org minted with uuid.New() for its own test, so
+// clearing that org's coordination markers here is safe and saves each caller
+// repeating the ordering below — which is easy to get backwards.
+//
+// The ordering matches purgeDisposableLibraryDeleteResiduals and is not
+// interchangeable: the row deletions above can re-mark the org dirty, so the
+// markers come down after them; dirty_orgs_total is derived from ListDirtyOrgs,
+// so the snapshot is recomputed after THAT, or the global counter keeps counting
+// a marker this teardown just removed. The fence is captured before the clears so
+// their conditional deletes cannot clobber markers from an enqueue that starts
+// during teardown, and the active-set removal is gated on an empty queue so a
+// sibling block still queued for the same org stays discoverable.
 func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
 	t.Helper()
 	deleteGCQueueItemsByIdentity(t, orgID.String(), "block", blockID)
@@ -1115,6 +1128,19 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
+	}
+	cleanupFence := time.Now().UTC()
+	stats, err := store.RecalculateOrgQueueStats(orgID)
+	if err != nil {
+		t.Fatalf("recalculate org queue stats for %s: %v", orgID, err)
+	}
+	if err := store.ClearDirtyOrg(orgID, cleanupFence); err != nil {
+		t.Fatalf("clear dirty org %s: %v", orgID, err)
+	}
+	if stats.QueueDepth == 0 {
+		if err := store.RemoveOrgFromActiveSet(orgID, cleanupFence); err != nil {
+			t.Fatalf("remove org %s from active set: %v", orgID, err)
+		}
 	}
 	repairGCSnapshotsForTest(t, orgID)
 }
