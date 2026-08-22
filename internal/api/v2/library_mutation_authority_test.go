@@ -116,6 +116,10 @@ func TestLibraryMutations_RejectNonOwnerWithWriteAccess(t *testing.T) {
 		middleware.PermissionCloudEdit,
 		middleware.PermissionPreview,
 		middleware.PermissionNone,
+		// PermissionAdmin is a distinct constant that GetLibraryPermission never
+		// returns today (org admins resolve to PermissionOwner). Pinned anyway so a
+		// future change that starts returning it cannot quietly widen the gate.
+		middleware.PermissionAdmin,
 	} {
 		for _, m := range guardedLibraryMutations() {
 			t.Run(m.name+"/"+string(perm), func(t *testing.T) {
@@ -211,6 +215,72 @@ func TestLibraryMutations_PermissionLookupErrorFailsClosed(t *testing.T) {
 						t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 					}
 					assertJSONError(t, w.Body, "failed to check permissions")
+				})
+			})
+		})
+	}
+}
+
+func TestLibraryMutations_RejectNonAdminAPIKeyScope(t *testing.T) {
+	// An API key carries a scope ceiling independent of the user's own authority.
+	// GetLibraryPermission reads the role and owner column from Cassandra and knows
+	// nothing about the credential, so a read/read-write key minted by the library
+	// OWNER still resolves to PermissionOwner — the stub below reproduces exactly
+	// that. Only the admin scope may reach library configuration.
+	for _, scope := range []string{"read", "read-write", "", "bogus"} {
+		for _, m := range guardedLibraryMutations() {
+			t.Run(m.name+"/"+scope, func(t *testing.T) {
+				withLiveLibraryStateStub(t, func() {
+					withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+						w := runMutation(t, m, func(c *gin.Context) {
+							c.Set("user_id", authTestUserID)
+							c.Set("api_key_scope", scope)
+						})
+						if w.Code != http.StatusForbidden {
+							t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+						}
+						assertJSONError(t, w.Body, "you do not have permission to modify this library")
+					})
+				})
+			})
+		}
+	}
+}
+
+func TestLibraryMutations_AllowAdminAPIKeyScope(t *testing.T) {
+	// The admin scope clears the ceiling; the permission lookup still decides.
+	for _, m := range guardedLibraryMutations() {
+		t.Run(m.name, func(t *testing.T) {
+			withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+				h := newLibraryHandlerForLiveFenceTests()
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Set("org_id", authTestOrgID)
+				c.Set("user_id", authTestUserID)
+				c.Set("api_key_scope", "admin")
+				c.Params = gin.Params{{Key: "repo_id", Value: authTestRepoID}}
+
+				if !h.requireLibraryConfigAuthority(c, m.name, authTestOrgID, authTestRepoID) {
+					t.Fatal("requireLibraryConfigAuthority = false for admin-scoped key with PermissionOwner, want true")
+				}
+			})
+		})
+	}
+}
+
+func TestLibraryMutations_AdminAPIKeyScopeDoesNotSubstituteForPermission(t *testing.T) {
+	// The scope ceiling is a ceiling, not a grant: an admin-scoped key belonging to
+	// a user with only rw on the library is still refused.
+	for _, m := range guardedLibraryMutations() {
+		t.Run(m.name, func(t *testing.T) {
+			withLiveLibraryStateStub(t, func() {
+				withLibraryPermissionStub(t, middleware.PermissionRW, nil, func() {
+					w := runMutation(t, m, func(c *gin.Context) {
+						c.Set("user_id", authTestUserID)
+						c.Set("api_key_scope", "admin")
+					})
+					if w.Code != http.StatusForbidden {
+						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+					}
 				})
 			})
 		})

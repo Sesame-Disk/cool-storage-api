@@ -27,9 +27,14 @@ Cassandra + MinIO integration test (§A). Destructive GC remains disabled by
 config, and that switch is now enforced at its decision point rather than by
 accident (§B.1).
 
-**The system is not production-ready as-is.** Of the ten defects verified below,
-**six are HIGH** and four are medium/low. Two closed on 2026-08-22 in the same
-change as this document; eight remain open.
+**The system is not production-ready as-is.** Ten defects are verified below
+(B.2–B.11): **five HIGH** and five medium/low. **One** of them — B.2 — closed on
+2026-08-22 in the same change as this document; **nine remain open**.
+
+Hardening gaps found while writing this were fixed in that same change
+(`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01`, §B.1). They are recorded under B.1 and
+deliberately **not** counted among the ten: B.1 is a positive verification of the
+kill switch, not a readiness defect.
 
 Two gates must not be conflated, because doing so is how "X1 closed" becomes
 "ship it":
@@ -87,8 +92,12 @@ Schema: migration `016_gc_s3_orphans_storage_key.cql`.
 
 ## B. Findings (code-verified 2026-08-22)
 
-Ten defects. Six HIGH (B.2–B.7), four medium/low (B.8–B.11). B.1 is a positive
-verification of the kill switch, not a defect, and is not counted.
+Ten defects: five HIGH (B.2–B.6), five medium/low (B.7–B.11). B.1 is a positive
+verification of the kill switch and is not counted among them.
+
+Severities follow [KNOWN_ISSUES.md](./KNOWN_ISSUES.md), the registry of record.
+An earlier draft of this document rated B.7 HIGH; the registry has it Medium, and
+the registry wins.
 
 ### B.1 GC destructive kill-switch — pinned OFF and now enforced at the decision point ✓
 
@@ -109,6 +118,30 @@ node serves that endpoint with `GC_ENABLED=false`** and answered
 `Service.AcceptsManualTriggers`, with `handleGCRun` returning `503` before the
 `dry_run` override. Never a live bypass; hardened before a refactor could make it
 one.
+
+Review of that fix widened it twice, and both are worth recording because they
+are the same lesson:
+
+- **The first guard reintroduced a shutdown deadlock.** Reading
+  `config.Enabled && started` under `s.mu` collided with `Service.Stop`, which
+  holds `s.mu` across `s.wg.Wait()` while `runScannerOnce` calls `TriggerWorker`
+  from inside a goroutine that `Wait` is waiting for. The predicate now reads an
+  atomic. A guard placed on a hot shutdown path has to be lock-free.
+- **`Service.DeleteFailedItem` and `RequeueFailedItem` had the same gap**, and a
+  worse consequence: they call `tryClaimLeadershipForAdmin`, which *claims the
+  lease*. An operator on any disabled replica could take GC leadership away from
+  the one datacenter that drains the queue. Both now refuse with `ErrGCDisabled`
+  before claiming. The original finding was scoped to "manual triggers"; the
+  actual defect was "the kill switch is honoured on some admin surfaces and not
+  others".
+
+  One kill switch, but **two predicates** — and this is where the fix went wrong
+  once. The DLQ mutations were first given the trigger predicate
+  (`Enabled && started`) and that broke five pre-existing tests: a trigger needs
+  a consumer loop to be honest, whereas a DLQ mutation does its store work inline
+  and needs none, so requiring `started` refuses a legitimate requeue on a GC node
+  that has merely not booted its loops yet. Triggers use `Enabled && started`; the
+  DLQ uses `Enabled`.
 
 ### B.2 Library configuration mutations have no permission gate — HIGH → ✅ Fixed 2026-08-22
 
@@ -132,6 +165,18 @@ Fixed by `LibraryHandler.requireLibraryConfigAuthority`, requiring
 already collapses both onto that value). Content `rw` is deliberately insufficient.
 Repo API tokens are refused outright. Negative tests in
 `internal/api/v2/library_mutation_authority_test.go`, confirmed red before the fix.
+
+**The first version of this fix was incomplete**, and the gap is worth recording
+because it is easy to repeat. `GetLibraryPermission` answers only *"what is this
+USER's authority over this library"* — it reads the org role and the owner column
+from Cassandra and knows nothing about the credential the request arrived on. So
+an API key with `read` scope, minted by the library's own owner, resolved to
+`PermissionOwner` and passed the gate. The middleware paths never had this problem
+because they apply `apiKeyScopeAllowsLibraryPermission` (where `PermissionOwner`
+requires `scope == "admin"`) *in addition to* the lookup. Any handler that enforces
+a permission level itself owes both questions, not one; the scope check is now
+exported as `middleware.APIKeyScopeAllowsLibraryPermission` so there is a single
+source of truth rather than a second copy of the ceiling.
 
 `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` — the residency half of
 `ChangeStorageClass` — **remains open**; it is narrowed, not closed, by the above.
@@ -174,7 +219,7 @@ times triggers ~409k Cassandra point reads and ~409k marshals behind
 `PermissionR`. The byte cap bounds the parse, not the work it triggers. `CheckFS`
 shares the fan-out.
 
-### B.7 ZIP download late-fail — HIGH
+### B.7 ZIP download late-fail — MEDIUM
 
 `ISSUE-ZIP-STREAM-LATEFAIL-01`
 

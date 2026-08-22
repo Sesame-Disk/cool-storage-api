@@ -2511,7 +2511,9 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.RequeueFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		if errors.Is(err, gc.ErrNotLeader) {
+		// Neither "not the leader" nor "GC is off here" is a server fault: both mean
+		// this node will not serve the request, so 503 rather than 500.
+		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
@@ -2532,7 +2534,9 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		if errors.Is(err, gc.ErrNotLeader) {
+		// Neither "not the leader" nor "GC is off here" is a server fault: both mean
+		// this node will not serve the request, so 503 rather than 500.
+		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}

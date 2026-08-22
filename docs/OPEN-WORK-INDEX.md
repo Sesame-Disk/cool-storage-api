@@ -67,10 +67,11 @@ Three gates, kept separate on purpose:
 - **Enabling destructive GC** — blocked by X1
   (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) **alone**; X2 closed 2026-08-14.
   See the GC section below.
-- **Single-node go-live** — blocked by the resource-amplification and
-  late-failure findings below (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`,
-  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`, `ISSUE-ZIP-STREAM-LATEFAIL-01`).
-  Nothing about GC gates these, and closing X1 does not close them.
+- **Single-node go-live** — blocked by the resource-amplification findings
+  below (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`,
+  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`). Nothing about GC gates these, and
+  closing X1 does not close them. `ISSUE-ZIP-STREAM-LATEFAIL-01` is Medium per
+  the registry, not a go-live blocker.
 - **Multi-instance operation** — additionally blocked by the two node-local
   state issues in the table below.
 
@@ -175,11 +176,11 @@ not satisfy the X1 closure criteria.
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
-| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | Manual GC trigger APIs did not check `GC.Enabled`; the kill switch rested on a disabled service having no consumer goroutine, and the admin endpoint answered `{"started":true}` regardless. Now gated on `Service.AcceptsManualTriggers` | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
+| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | The superadmin GC surfaces did not check `GC.Enabled`: manual triggers answered `{"started":true}` on nodes where nothing ran, and the DLQ requeue/delete path *claimed the GC lease* from a disabled replica. All now share one predicate | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
 | `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
-| `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
+| `ISSUE-ZIP-STREAM-LATEFAIL-01` | MEDIUM | ZIP download can truncate after `200 OK` | Readiness DL-2. Severity corrected 2026-08-22 to match [KNOWN_ISSUES.md](./KNOWN_ISSUES.md), which has rated it Medium since the 2026-05-27 preflight narrowing — truncated/retryable download, not corruption |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
 | `ISSUE-SYNC-METADATA-CONCURRENCY-01` | MEDIUM | Sync metadata routes bound one body, not N — 16 concurrent `recv-fs` ≈ 2 GiB | Successor to X9; X10's equivalent for the block routes is closed |

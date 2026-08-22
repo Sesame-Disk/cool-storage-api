@@ -121,6 +121,12 @@ const (
 
 var ErrNotLeader = errors.New("gc leadership required")
 
+// ErrGCDisabled is returned by the superadmin DLQ mutations when GC is disabled
+// or not started on this node. It is distinct from ErrNotLeader on purpose: "not
+// the leader" invites the caller to retry elsewhere, while this node will never
+// serve the request under its current configuration.
+var ErrGCDisabled = errors.New("gc is disabled or not started on this node")
+
 // Service is the top-level GC orchestrator.
 // It starts and manages the worker and scanner goroutines.
 type Service struct {
@@ -164,6 +170,16 @@ type Service struct {
 	// Channels for manual triggers
 	triggerWorker  chan struct{}
 	triggerScanner chan struct{}
+
+	// acceptingWork mirrors "config.Enabled && started" for readers that must NOT
+	// take s.mu. It is deliberately an atomic and not a guarded field: Stop() holds
+	// s.mu across s.wg.Wait(), and the scanner goroutine calls TriggerWorker() from
+	// inside runScannerOnce, so a mutex read on that path deadlocks shutdown —
+	// Stop waits for the scanner, the scanner waits for Stop's lock. config.Enabled
+	// is written once in NewService and never mutated (SetDryRun touches DryRun
+	// only), so Start/Stop are the only writers and a single flag captures both
+	// conditions.
+	acceptingWork atomic.Bool
 }
 
 // NewService creates a new GC service using the provided store and storage provider.
@@ -224,7 +240,17 @@ func (s *Service) Start() {
 		}
 	}
 
+	// Discard any trigger token that raced in against a Stop(). Draining here — not
+	// on the Stop side — is what makes "an unrequested run never fires at enable
+	// time" an invariant rather than best effort: a trigger that passed the
+	// acceptingWork check just before Stop() cleared it can still land in the
+	// buffered channel afterwards, and only the next Start() is downstream of all
+	// such races.
+	drainTriggerChannel(s.triggerWorker)
+	drainTriggerChannel(s.triggerScanner)
+
 	s.started = true
+	s.acceptingWork.Store(true)
 
 	// Start worker goroutine
 	s.wg.Add(1)
@@ -275,6 +301,11 @@ func (s *Service) Stop() {
 	}
 
 	log.Println("[GC] Stopping...")
+	// Refuse further admin work before draining, so a trigger cannot be accepted
+	// for loops that are already on their way out. This must precede wg.Wait(),
+	// which is where the goroutines being waited on would otherwise still be told
+	// "yes, the service accepts work".
+	s.acceptingWork.Store(false)
 	s.cancel()
 	s.wg.Wait()
 
@@ -308,13 +339,45 @@ func (s *Service) Stop() {
 // {"started":true} for a run that never happened, and the parked token in the
 // size-1 buffered channel would have fired one unrequested run the moment GC was
 // later enabled.
+//
+// Reads acceptingWork rather than taking s.mu — see that field's comment; a
+// mutex here deadlocks Stop().
 func (s *Service) AcceptsManualTriggers() bool {
+	return s.acceptsManualTriggers()
+}
+
+// acceptsManualTriggers is the predicate for the ASYNCHRONOUS admin surface: a
+// trigger is only honest if a consumer loop exists to act on it, which needs both
+// halves.
+func (s *Service) acceptsManualTriggers() bool {
 	if s == nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.config.Enabled && s.started
+	return s.acceptingWork.Load()
+}
+
+// gcEnabledHere is the predicate for the SYNCHRONOUS admin surface — the DLQ
+// mutations, which do their store work inline and need no worker loop.
+//
+// Deliberately weaker than acceptsManualTriggers: requiring `started` here would
+// refuse a legitimate requeue on a GC node that simply has not booted its loops
+// yet, and "not started" is a transient state on a node that does run GC. What
+// must be refused is the DISABLED node, because DeleteFailedItem and
+// RequeueFailedItem call tryClaimLeadershipForAdmin, which claims the lease.
+//
+// config.Enabled is written once in NewService, before any goroutine exists, and
+// never mutated (SetDryRun touches DryRun only), so this needs no
+// synchronization.
+func (s *Service) gcEnabledHere() bool {
+	return s != nil && s.config.Enabled
+}
+
+// drainTriggerChannel empties a size-1 trigger channel without blocking.
+func drainTriggerChannel(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+	}
 }
 
 // TriggerWorker triggers an immediate worker run. It reports whether the trigger
@@ -1112,6 +1175,13 @@ func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
+	// production only one datacenter runs GC; without this an operator on any
+	// disabled replica takes the lease away from the datacenter that actually
+	// drains the queue, causing a GC outage from a node that cannot do the work.
+	if !s.gcEnabledHere() {
+		return ErrGCDisabled
+	}
 	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
@@ -1128,6 +1198,13 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 }
 
 func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
+	// production only one datacenter runs GC; without this an operator on any
+	// disabled replica takes the lease away from the datacenter that actually
+	// drains the queue, causing a GC outage from a node that cannot do the work.
+	if !s.gcEnabledHere() {
+		return ErrGCDisabled
+	}
 	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_requeue") {
 		return ErrNotLeader
 	}

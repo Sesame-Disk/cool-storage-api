@@ -42,6 +42,15 @@ check three handlers lacked: `RegisterLibraryRoutesWithToken` builds a
 are reachable through five registrations under two prefixes. Ordered after the
 live-library fence to match `DeleteLibrary`.
 
+Review caught that the first version enforced only half the question.
+`GetLibraryPermission` answers "what is this USER's authority over this library"
+from Cassandra and knows nothing about the credential the request arrived on, so
+an API key with `read` scope minted by the library's owner still resolved to
+`PermissionOwner`. The middleware paths never had this problem because they apply
+the scope ceiling as well. The check is now exported as
+`middleware.APIKeyScopeAllowsLibraryPermission` and applied in the gate, keeping
+one source of truth for "PermissionOwner requires the admin scope".
+
 **`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` — found and fixed.** The `GC_ENABLED=false`
 kill switch was enforced on the config surface but not the runtime one:
 `gcService` is constructed unconditionally, `POST /api/v2.1/admin/gc/run` is
@@ -54,11 +63,33 @@ into a live bypass with no test failing. It also answered `{"started":true}` for
 runs that never happened, on exactly the nodes that matter: in production only one
 datacenter runs GC and every other node serves this endpoint disabled.
 
-Now gated on `Service.AcceptsManualTriggers` (`Enabled && started`, read under the
-mutex `SetDryRun` already uses). The triggers return `bool`, so a refusal is a
+Now gated explicitly. The triggers return `bool`, so a refusal is a
 value the caller must handle; `handleGCRun` answers `503` **before** applying the
 optional `dry_run` override. Never a live bypass — hardened before it could become
 one.
+
+Review widened this twice, and both corrections are the same lesson. First, the
+initial predicate read `Enabled && started` under `s.mu` and reintroduced a
+**shutdown deadlock**: `Stop()` holds `s.mu` across `s.wg.Wait()`, and
+`runScannerOnce` calls `TriggerWorker` from a goroutine `Wait` is waiting for, so
+`Server.Shutdown` could hang forever. The predicate now reads an `atomic.Bool`
+written only by `Start`/`Stop`; a guard on a shutdown path has to be lock-free.
+Second, `DeleteFailedItem` and `RequeueFailedItem` had the same gap with a worse
+consequence — they call `tryClaimLeadershipForAdmin`, which *claims the lease*, so
+an operator on a disabled replica could take GC leadership away from the one
+datacenter that drains the queue. Both now refuse with `ErrGCDisabled` before
+claiming, and both HTTP handlers map that to `503` rather than `500`. The real
+defect was never "manual triggers are ungated" but "the kill switch is honoured on
+some superadmin GC surfaces and not others".
+
+One kill switch, two predicates: triggers need `Enabled && started` because a
+trigger is only honest if a consumer loop exists; the DLQ mutations need only
+`Enabled` because their store work happens inline. Collapsing them broke five
+pre-existing DLQ tests before the distinction was drawn, so it is now pinned by a
+test of its own.
+
+`Start()` additionally drains the trigger channels before launching the loops, so
+a token that raced `Stop()` cannot fire an unrequested run at the next enable.
 
 **New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
 re-verification at `a1570b186`: ten defects (six HIGH), what #181 did and did not
@@ -69,10 +100,21 @@ rather than "~400k" `pack-fs` ids, the full three-surface scope of
 and fence observability being partial (a `gc_fence` retry label) rather than
 absent. It cites code by symbol name per the index's rule 3.
 
+Two further count/severity corrections came out of review: the ten defects are
+**five HIGH and five medium/low**, of which **one** (library mutation) closed here
+and **nine** remain open — the earlier "six HIGH / eight open" double-counted the
+GC hardening fix, which the same document declares is not one of the ten. And
+`ISSUE-ZIP-STREAM-LATEFAIL-01` is **Medium**: `KNOWN_ISSUES.md` has rated it Medium
+since the 2026-05-27 preflight narrowing, while `OPEN-WORK-INDEX.md` still carried
+HIGH. The index now matches the registry, per its own rule that the registry owns
+severity.
+
 **Files**: `internal/gc/gc.go`, `internal/gc/manual_trigger_gate_test.go`,
-`internal/api/server.go`, `internal/api/v2/libraries.go`,
-`internal/api/v2/library_mutation_authority_test.go`, `CURRENT_WORK.md`,
-`docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`,
+`internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
+`internal/api/v2/libraries.go`,
+`internal/api/v2/library_mutation_authority_test.go`,
+`internal/middleware/permissions.go`, `CURRENT_WORK.md`,
+`docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`, `docs/DEPLOY.md`,
 `docs/PROD-READINESS-VERIFICATION-20260822.md`, `docs/CHANGELOG.md`
 
 ---

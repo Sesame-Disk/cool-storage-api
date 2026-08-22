@@ -789,6 +789,19 @@ func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, o
 		return false
 	}
 
+	// An API key carries a scope ceiling that is independent of the user's own
+	// authority, and PermissionOwner requires the admin scope. This has to be
+	// checked separately: GetLibraryPermission answers only "what is this USER's
+	// authority over this library", reading the role and the owner column straight
+	// from Cassandra, so a read or read-write key minted by the library's owner
+	// still resolves to PermissionOwner. The middleware paths apply this ceiling;
+	// a handler enforcing its own level must too.
+	if !middleware.APIKeyScopeAllowsLibraryPermission(c, middleware.PermissionOwner) {
+		log.Printf("[%s] Permission denied: API key scope does not permit library configuration changes (library %q)", logTag, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+
 	userID := c.GetString("user_id")
 	if userID == "" {
 		// authMiddleware always sets user_id. Reaching here means an unauthenticated

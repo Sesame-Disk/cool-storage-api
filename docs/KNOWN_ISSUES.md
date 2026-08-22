@@ -8231,21 +8231,61 @@ Two smaller defects fell out of the same gap:
   that process, the first loop iteration would have consumed it and performed one
   run nobody asked for.
 
+#### Wider than "manual triggers" — the DLQ path too
+
+Review of the first fix found `Service.DeleteFailedItem` and
+`Service.RequeueFailedItem` carrying the same gap with a worse consequence. Both
+call `tryClaimLeadershipForAdmin`, which does not merely check leadership — it
+**claims the lease**. A superadmin acting on any GC-disabled replica could
+therefore take GC leadership away from the one datacenter that actually drains
+the queue, causing a GC outage from a node incapable of doing the work. They now
+refuse with `ErrGCDisabled` before claiming.
+
+So the real defect was never "manual triggers are ungated"; it was **"the kill
+switch is honoured on some superadmin GC surfaces and not others"**.
+
+One kill switch, but **two predicates**, because the surfaces differ in kind:
+
+| Surface | Predicate | Why |
+|---|---|---|
+| Manual triggers (async) | `Enabled && started` | A trigger is only honest if a consumer loop exists to act on it |
+| DLQ requeue/delete (sync) | `Enabled` | The store work happens inline and needs no loop; refusing on `!started` would reject a legitimate requeue on a GC node that has merely not booted yet |
+
+Collapsing these into one predicate is a live trap: the first attempt did exactly
+that and broke five pre-existing DLQ tests, because they exercise an enabled
+service that never calls `Start()`. `TestService_DLQMutationsDoNotRequireStarted`
+pins the distinction.
+
 #### Fix (2026-08-22)
 
-`Service.AcceptsManualTriggers` reports whether a trigger can actually reach a
-consumer — `config.Enabled && started`, read under `s.mu` (the same mutex
-`SetDryRun` already uses to mutate `config`). `TriggerWorker` and
-`TriggerScanner` consult it first and now return a `bool`, so a refused trigger
-is a value the caller must handle rather than a silent no-op.
+`Service.acceptsManualTriggers` (exported to the API layer as
+`AcceptsManualTriggers`) gates the triggers; `Service.gcEnabledHere` gates the DLQ
+mutations. `TriggerWorker` and `TriggerScanner` now return a `bool`, so a refused
+trigger is a value the caller must handle rather than a silent no-op.
+`DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` **before**
+`tryClaimLeadershipForAdmin`, so a disabled replica cannot take the lease. Both
+DLQ HTTP handlers map `ErrGCDisabled` to `503` alongside `ErrNotLeader`: neither
+is a server fault.
 
-`handleGCRun` checks `AcceptsManualTriggers` up front and answers
-`503` with `{"started": false}` — **before** applying the optional `dry_run`
-override, so a disabled node's admin surface is inert end to end rather than
-accepting a config mutation for a service that will not run.
+`handleGCRun` checks it up front and answers `503` with `{"started": false}` —
+**before** applying the optional `dry_run` override, so a disabled node's admin
+surface is inert end to end rather than accepting a config mutation for a service
+that will not run.
 
-The internal caller in `runScannerOnce` is unaffected: it only runs inside a
-started, enabled service.
+**The predicate must not take `s.mu`.** The first version read
+`config.Enabled && started` under the mutex and reintroduced a shutdown deadlock:
+`Stop()` holds `s.mu` across `s.wg.Wait()`, and `runScannerOnce` — running in a
+goroutine that `Wait` is waiting for — calls `TriggerWorker` after auto-requeuing
+recoverable failed items. Stop waited for the scanner; the scanner waited for
+Stop's lock; `Server.Shutdown` hung. It now reads an `atomic.Bool` written only by
+`Start`/`Stop`. `config.Enabled` is set once in `NewService` and never mutated
+(`SetDryRun` touches `DryRun` only), so one flag captures both conditions.
+
+`Start()` also drains the trigger channels before launching the loops. A trigger
+that passed the check just before `Stop()` cleared it can still land in the
+size-1 buffer; draining on the *Start* side is what makes "no unrequested run
+fires at enable time" an invariant rather than best effort, because only the next
+Start is downstream of every such race.
 
 #### Verification
 
@@ -8257,6 +8297,19 @@ started, enabled service.
 - enabled and started → accepted
 - after `Stop()` → refused
 - nil service → refused
+- **`Stop()` concurrent with a trigger completes** — the deadlock regression,
+  verified red against the mutex version (hangs the full 15s budget) and green
+  against the atomic
+- `Start()` discards a stale token left by a trigger that raced `Stop()`
+- DLQ requeue/delete on a disabled service → `ErrGCDisabled`
+- DLQ requeue/delete on an **enabled but unstarted** service → **not** refused
+  (the two predicates are not the same, and must not be merged)
+
+`internal/api/gc_run_gate_test.go` pins the HTTP contract, which is where an
+operator actually meets this: disabled node → `503` with `started:false` for
+worker, scanner, defaulted and unparseable bodies; a `dry_run` override on a
+disabled node **does not reach `SetDryRun`**; enabled+started → `200` with
+`started:true`; no service → `503`.
 
 #### Why this is not `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
 
