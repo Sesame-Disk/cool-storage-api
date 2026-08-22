@@ -30,7 +30,7 @@ so any authenticated org member could rename any library in the org, rewrite its
 description, shorten its `version_ttl_days` retention, or move its storage-class
 preference. All three now call one shared gate,
 `LibraryHandler.requireLibraryConfigAuthority`, requiring `PermissionOwner` —
-library owner or org admin/superadmin, which `GetLibraryPermission` already
+library owner or org owner/admin/superadmin, which `GetLibraryPermission` already
 collapses onto that single value. Content `rw` is deliberately insufficient: an
 `rw` share decides what is *in* a library, not what it is called or where its
 future blocks are placed. Repo API tokens are refused before the lookup, an empty

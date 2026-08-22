@@ -23,7 +23,7 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
-| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's library permission, so any authenticated member of an organization could rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. All three now gate on `requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org admin/superadmin) and refuses repo API tokens; content `rw` no longer carries configuration authority. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint, which remains open. |
+| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's library permission, so any authenticated member of an organization could rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. All three now gate on `requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org owner/admin/superadmin) and refuses repo API tokens; content `rw` no longer carries configuration authority. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint, which remains open. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -8218,8 +8218,8 @@ refactor that launched those loops unconditionally (or started them before the
 admin endpoint into a live bypass of `GC_ENABLED=false`, with no test failing.
 
 This matters more than the severity suggests because of the production posture:
-**only one datacenter runs GC; every other node runs with `GC_ENABLED=false`**
-and still serves this endpoint. The disabled majority of the fleet was exactly
+**the current readiness posture keeps `GC_ENABLED=false` on every replica in every
+datacenter** and still serves this endpoint. The disabled fleet was exactly
 the population relying on the emergent guarantee.
 
 Two smaller defects fell out of the same gap:
@@ -8270,7 +8270,8 @@ errors to `503` alongside `ErrNotLeader`: neither is a server fault.
 `handleGCRun` checks it up front and answers `503` with `{"started": false}` —
 **before** applying the optional `dry_run` override, so a disabled node's admin
 surface is inert end to end rather than accepting a config mutation for a service
-that will not run.
+that will not run. On an active node, admission and the optional override commit
+together; a refused trigger does not change the runtime mode.
 
 **The predicate must not take `s.mu`.** The first version read
 `config.Enabled && started` under the mutex and reintroduced a shutdown deadlock:

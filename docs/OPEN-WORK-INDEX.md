@@ -81,7 +81,7 @@ posture issue and the sync public-link token auth gap 2026-08-07;
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md)
 (dated snapshot) and
 [PROD-READINESS-VERIFICATION-20260822.md](./PROD-READINESS-VERIFICATION-20260822.md)
-(baseline re-verification at `a1570b186`, with follow-up fixes at `e58b42b23`).
+(baseline re-verification at `a1570b186`, with follow-up fixes at `913c3892c`).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
@@ -172,11 +172,11 @@ not satisfy the X1 closure criteria.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | ✅ Closed 2026-08-22 | The three handlers now gate on `LibraryHandler.requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org admin/superadmin); content `rw` no longer carries configuration authority. Negative tests cover all three handlers | [known issue](./KNOWN_ISSUES.md) |
+| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | ✅ Closed 2026-08-22 | The three handlers now gate on `LibraryHandler.requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org owner/admin/superadmin); content `rw` no longer carries configuration authority. Negative tests cover all three handlers | [known issue](./KNOWN_ISSUES.md) |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
-| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | The superadmin GC surfaces did not check `GC.Enabled`: manual triggers answered `{"started":true}` on nodes where nothing ran, and the DLQ requeue/delete path *claimed the GC lease* from a disabled replica. All now share one predicate | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
+| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | The superadmin GC surfaces did not check `GC.Enabled`: manual triggers answered `{"started":true}` on nodes where nothing ran, and the DLQ requeue/delete path *claimed the GC lease* from a disabled replica. All are now explicitly lifecycle-gated; manual triggers additionally require current leadership | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
 | `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |

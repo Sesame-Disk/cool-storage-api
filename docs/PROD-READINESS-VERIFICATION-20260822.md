@@ -2,10 +2,10 @@
 
 **Date:** 2026-08-22
 **Baseline HEAD:** `a1570b186` (Merge PR #181, `feat/p1-locator-authority`)
-**Follow-up fixes verified:** `e58b42b23` (this readiness correction)
+**Follow-up fixes verified:** `913c3892c` (code/tests commit immediately preceding this documentation update)
 **Scope:** independent code-level re-verification of **selected** production-readiness
 findings — what PR #181 delivered, plus the audit-arc findings listed in §B. Every
-claim below was re-confirmed by reading the code at this HEAD.
+claim below was re-confirmed by reading the code at `913c3892c`.
 
 **This is not a sweep of everything open.** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md)
 carries roughly twice as many open rows in its High/Medium table as appear here;
@@ -113,8 +113,10 @@ registered unconditionally, and `Service.TriggerWorker`/`TriggerScanner` checked
 neither `Enabled` nor `started`. Nothing ran only because `Service.Start` returns
 before launching its loops when disabled — so the kill switch rested on an
 emergent property of `Start`'s control flow, not on a stated invariant. This
-mattered operationally: **only one datacenter runs GC in production; every other
-node serves that endpoint with `GC_ENABLED=false`** and answered
+mattered operationally: **the current readiness posture keeps `GC_ENABLED=false`
+on every replica in every datacenter; once destructive GC is approved, only the
+designated activation location will enable it and every other node will remain
+disabled**. Disabled nodes served that endpoint and answered
 `{"started": true}` for runs that never happened. Now gated on
 `Service.ManualTriggerError`, with `handleGCRun` returning `503` before the
 `dry_run` override for disabled, stopped, or non-leader nodes. Never a live
@@ -161,7 +163,7 @@ without trailing slash) under **two** prefixes (`/api/v2`, `/api2`) — so this 
 route surface, not three stray functions, and the gate had to live in the handler.
 
 Fixed by `LibraryHandler.requireLibraryConfigAuthority`, requiring
-`PermissionOwner` (library owner or org admin/superadmin — `GetLibraryPermission`
+`PermissionOwner` (library owner or org owner/admin/superadmin — `GetLibraryPermission`
 already collapses both onto that value). Content `rw` is deliberately insufficient.
 Repo API tokens are refused outright. Negative tests in
 `internal/api/v2/library_mutation_authority_test.go`, confirmed red before the fix.
@@ -304,9 +306,10 @@ Not tracked as blockers.
 
 4. **`GCConfig.DryRun` is runtime-mutable.** `Service.SetDryRun` is reachable from
    `handleGCRun` via the optional `dry_run` field, so the prod `false` is a
-   default rather than an immutable pin. It can only make GC *less* destructive,
-   and since 2026-08-22 the endpoint refuses before applying it on a disabled
-   node. If a staged rollout ever uses it, document ordering and observability.
+   default rather than an immutable pin. Setting it to `true` suppresses destructive
+   execution; setting it back to `false` restores normal destructive behavior once
+   GC is otherwise enabled and authorized. The trigger admission and override now
+   commit together, so a refused trigger does not change the runtime mode.
 
 ---
 
@@ -318,7 +321,7 @@ Not tracked as blockers.
 4. [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — the one-screen live index.
 5. [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — status of record per `ISSUE-*` id.
 6. This document — dated re-verification from baseline `a1570b186`, with the
-   follow-up fixes verified at `e58b42b23`.
+   follow-up fixes verified at `913c3892c`.
 
 ---
 
