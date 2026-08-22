@@ -85,10 +85,16 @@ canonical `gc_s3_orphans.storage_key` are required; an empty key fails closed.
 The `_by_day` table remains an identity-only discovery projection. Both
 destructive paths additionally verify the persisted key against the key their
 own org-scoped store derives and refuse the delete on a mismatch, since the
-store applies whatever key it is handed. The exact locator prevents a caller
-from silently deriving a different target, but it does not create a
-never-reused physical incarnation or solve the X1 publication-fence and
-per-attempt claim-ownership races. Destructive GC remains
+store applies whatever key it is handed. Successful destructive authorization is
+unchanged, but failure ordering is not: resolving the store during the
+authorization phase means an unresolvable backend or an invalid locator is now
+refused before any destructive lifecycle state is written, where it previously
+could be discovered after the canonical row was already gone. The exact locator
+prevents a caller from silently deriving a different target, but it does not
+create a never-reused physical incarnation or solve the X1 publication-fence
+and per-attempt claim-ownership races. The equality check it relies on is also
+carrying tenant isolation, so P2 cannot simply delete it when keys stop being
+derived (see ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains
 disabled in production.
 
 **The historical risk remains real even though the current greenfield deployment

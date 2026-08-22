@@ -3799,13 +3799,14 @@ func (p *MockStorageProvider) FailAlways(err error) {
 	p.failErr = err
 }
 
-// ClearFailures stops injecting failures.
+// ClearFailures stops injecting failures, resolution failures included.
 func (p *MockStorageProvider) ClearFailures() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.failTimes = 0
 	p.failAlways = false
 	p.failErr = nil
+	p.resolveErr = nil
 }
 
 type mockBlockDeleter struct {

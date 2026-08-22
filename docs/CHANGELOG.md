@@ -21,10 +21,13 @@ Because a `BlockStore` deletes whatever key it is handed, both destructive paths
 also check the persisted key against the key their own org-scoped store derives
 and refuse on a mismatch — `processBlock` resolves the store during the
 authorization phase, so a suspicious row is refused before any lifecycle write,
-and `RecoverS3Orphans` repeats the check after its canonical reload. The
-hash-derived `PutBlockAutoDirect` and `DeleteBlock` are gone from
-`storage.BlockStore`, leaving the locator-taking forms as the only PUT/DELETE
-entry points; both reject an empty key.
+and `RecoverS3Orphans` repeats the check after its canonical reload. `DeleteBlockByStorageKey` is now the only physical delete API on
+`storage.BlockStore` — the hash-derived `DeleteBlock` is gone — and
+`PutObjectAutoDirect` is the only direct PUT any canonical, metadata-producing
+funnel uses; the hash-derived `PutBlockAutoDirect` is gone, while
+`PutBlock`/`PutBlockData`/`PutBlockAuto`/`PutBlocks` remain for the
+no-metadata sync path and test seeding. Both locator-taking forms reject an
+empty key.
 
 The refusal is covered end to end: a Cassandra/MinIO test seeds a canonical row
 whose `storage_key` names another tenant object and asserts that object is still

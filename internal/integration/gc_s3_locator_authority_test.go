@@ -39,37 +39,6 @@ func gcQueueRetryCountForTest(t *testing.T, orgID uuid.UUID, itemType gcpkg.Item
 	return 0, false
 }
 
-func deleteGCQueueItemsForOrgForTest(t *testing.T, orgID uuid.UUID) {
-	t.Helper()
-	session := shareProjectionDBForTest(t).Session()
-	type queueKey struct {
-		queuedAt time.Time
-		itemType string
-		itemID   string
-	}
-	for bucket := 0; bucket < 32; bucket++ {
-		var keys []queueKey
-		iter := session.Query(`
-			SELECT queued_at, item_type, item_id FROM gc_queue WHERE org_id = ? AND bucket = ?
-		`, orgID.String(), bucket).Iter()
-		var queuedAt time.Time
-		var itemType, itemID string
-		for iter.Scan(&queuedAt, &itemType, &itemID) {
-			keys = append(keys, queueKey{queuedAt: queuedAt, itemType: itemType, itemID: itemID})
-		}
-		if err := iter.Close(); err != nil {
-			t.Fatalf("scan gc_queue bucket %d for cleanup: %v", bucket, err)
-		}
-		for _, key := range keys {
-			if err := session.Query(`
-				DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-			`, orgID.String(), bucket, key.queuedAt, key.itemType, key.itemID).Exec(); err != nil {
-				t.Fatalf("cleanup gc_queue row: %v", err)
-			}
-		}
-	}
-}
-
 // TestGC_BlockDeletion_RefusesForeignStorageKey is the end-to-end half of the
 // locator-authority guard: real Cassandra, real MinIO, real BlockStores.
 //
@@ -100,6 +69,21 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 		t.Fatal("precondition failed: org-scoped keys for the two orgs are equal")
 	}
 
+	// Registered BEFORE anything is created: a failure between the two PUTs or at
+	// the INSERT would otherwise strand objects in the bucket. The queue item here
+	// never completes (that is the point), so gc_pending_items has no writer left
+	// to remove it — cleanupGCBlockFixturesForTest clears queue, DLQ, pending and
+	// candidate rows by identity, which a queue-only cleanup would miss. The org
+	// leaves gc_active_orgs on its own: the worker drops it once its queue drains.
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgID, blockID)
+		if err := session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
+			t.Fatalf("cleanup blocks row: %v", err)
+		}
+		_ = collected.DeleteBlockByStorageKey(ctx, ownKey)
+		_ = victim.DeleteBlockByStorageKey(ctx, foreignKey)
+	})
+
 	for label, blockStore := range map[string]*storage.BlockStore{"victim": victim, "collected": collected} {
 		if _, err := blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content, Size: int64(len(content))}); err != nil {
 			t.Fatalf("seed %s object: %v", label, err)
@@ -113,15 +97,6 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	`, orgID.String(), blockID, len(content), storageClass, foreignKey, time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("seed corrupt canonical blocks row: %v", err)
 	}
-	t.Cleanup(func() {
-		deleteGCQueueItemsForOrgForTest(t, orgID)
-		deleteGCFailedItemsByIdentity(t, orgID.String(), string(gcpkg.ItemBlock), blockID)
-		if err := session.Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
-			t.Fatalf("cleanup blocks row: %v", err)
-		}
-		_ = collected.DeleteBlockByStorageKey(ctx, ownKey)
-		_ = victim.DeleteBlockByStorageKey(ctx, foreignKey)
-	})
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	if err := store.EnqueueItem(orgID, queuedAt, gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {

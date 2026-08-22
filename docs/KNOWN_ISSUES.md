@@ -1314,8 +1314,26 @@ explicitly supports arbitrary physical keys.
 but canonical consumers now use the value already resolved from Cassandra. The
 `BlockStore` is still org-scoped at construction, so P1 adds no metadata read on
 the download hot path. `storage_key` must be non-empty and exactly match the
-current deterministic layout; no block method accepts an arbitrary caller-
-supplied S3 key. Closed by P1, with arbitrary relocation still out of scope.
+current deterministic layout.
+
+The locator-taking APIs (`PutObjectAutoDirect`, `GetBlockByStorageKey`,
+`DeleteBlockByStorageKey`, …) do accept a caller-supplied key — that is the
+point of them — and the `BlockStore` validates only that it is non-empty, not
+that it belongs to this org. What makes that safe is the callers, not the
+store: writers take K from placement resolution, canonical consumers take it
+from persisted metadata, and both destructive callers require it to equal the
+deterministic org-scoped key before handing it to the backend.
+
+**Requirement for P2.** A minted key is by definition not `hashToKey(L)`, so P2
+must drop that equality — and dropping it without a replacement re-opens
+handing `DeleteBlockByStorageKey` a key belonging to another org. The equality
+check is doing tenant-isolation work today, not only layout work. Before it is
+removed, org isolation has to become structural in the `BlockStore` itself (an
+exact key must begin with `blocks/<canonical-org-id>/` before any GET/PUT/HEAD/
+DELETE), so the guarantee does not depend on every future destructive caller
+remembering to check.
+
+Closed by P1, with arbitrary relocation still out of scope.
 
 #### Related
 

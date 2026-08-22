@@ -380,6 +380,89 @@ func TestWorker_RecoverS3Orphans_CanonicalStateChangeBeforeCommitFailsClosed(t *
 	}
 }
 
+// s3OrphanRecoveryStateEqual is the reload comparison, and every field in it is
+// there because changing it changes which bytes recovery would destroy. Pinned
+// as a direct table because the end-to-end shape cannot isolate the locator
+// field today: under P1 any key other than the derived one is already refused
+// by the derived-key guard, so a flow test keeps passing with the reload
+// comparison removed — verified by mutation. The comparison becomes the only
+// defence in P2, when minted keys retire that guard.
+func TestS3OrphanRecoveryStateEqualComparesEveryDestructiveField(t *testing.T) {
+	orgID := uuid.New()
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	base := S3OrphanInfo{
+		OrgID:         orgID,
+		BlockID:       "orph-state-equal",
+		StorageClass:  "hot",
+		StorageKey:    MockCanonicalStorageKey(orgID.String(), "orph-state-equal"),
+		ExternalSHA1:  "sha1-base",
+		RecoveryPhase: S3OrphanPhasePendingS3,
+		FirstSeenAt:   firstSeenAt,
+	}
+	if !s3OrphanRecoveryStateEqual(base, base) {
+		t.Fatal("identical canonical state must compare equal or every reload fails closed forever")
+	}
+
+	for name, mutate := range map[string]func(info *S3OrphanInfo){
+		"org_id":        func(info *S3OrphanInfo) { info.OrgID = uuid.New() },
+		"block_id":      func(info *S3OrphanInfo) { info.BlockID = "orph-state-equal-other" },
+		"storage_class": func(info *S3OrphanInfo) { info.StorageClass = "cold" },
+		"storage_key": func(info *S3OrphanInfo) {
+			info.StorageKey = MockCanonicalStorageKey(orgID.String(), "orph-state-equal-reset")
+		},
+		"external_sha1":  func(info *S3OrphanInfo) { info.ExternalSHA1 = "sha1-changed" },
+		"recovery_phase": func(info *S3OrphanInfo) { info.RecoveryPhase = S3OrphanPhasePendingMappingCleanup },
+		"first_seen_at":  func(info *S3OrphanInfo) { info.FirstSeenAt = firstSeenAt.Add(time.Second) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if s3OrphanRecoveryStateEqual(base, changed) {
+				t.Fatalf("%s changed under the reload but compared equal; recovery would commit against stale state", name)
+			}
+		})
+	}
+}
+
+// The end-to-end shape: a row whose locator changed between the first canonical
+// read and the commit point destroys nothing and keeps its cursor. Today the
+// derived-key guard is what refuses it — see the note above — so this pins the
+// outcome, not which defence produced it.
+func TestWorker_RecoverS3Orphans_CanonicalStorageKeyChangeBeforeCommitFailsClosed(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	const blockID = "orph-canonical-reload-key"
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", time.Now())
+	store.SetGetS3OrphanGlobalHookForTest(func(_ uuid.UUID, _ string, call int, info S3OrphanInfo) (S3OrphanInfo, error) {
+		if call == 2 {
+			// Everything else — org, block, first_seen_at, class, sha1, phase —
+			// stays exactly as the first read saw it.
+			info.StorageKey = MockCanonicalStorageKey(orgID.String(), blockID+"-reset")
+		}
+		return info, nil
+	})
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want canonical reload mismatch on storage key")
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered=%d, want 0", recovered)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched when the locator changed under the reload, got %+v", got)
+	}
+	if store.S3OrphanCount() != 1 {
+		t.Fatal("orphan row must remain for the next sweep")
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced past a row whose locator changed: %v", err)
+	}
+}
+
 // This is the reachable canonical-state shape that would be lost if R11b
 // removed the external SHA-1 field. StartBlockDeleteOrphan preserves
 // first_seen_at when it resets an existing row, so phase and storage class can

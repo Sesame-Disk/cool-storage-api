@@ -530,7 +530,7 @@ func seedCanonicalCheckRows(t *testing.T, orgID string, ids []string, storageCla
 		}
 		batch := session.Batch(gocql.UnloggedBatch)
 		for _, id := range ids[start:end] {
-			batch.Query(insert, orgID, id, 1, storageClass, fmt.Sprintf("blocks/%s/aa/aa/%s", orgID, id), createdAt)
+			batch.Query(insert, orgID, id, 1, storageClass, syntheticCanonicalStorageKeyForTest(orgID, id), createdAt)
 		}
 		flush(batch, "insert")
 	}
