@@ -191,7 +191,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 	}
 }
 
-func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonicalLibraryStats(t *testing.T) {
+func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonicalLibraryStatsWithNullDeletedAt(t *testing.T) {
 	name := fmt.Sprintf("inttest-lib-storage-canonical-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 	database := shareProjectionDBForTest(t)
@@ -201,6 +201,13 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonica
 	var ownerID string
 	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
 		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+	var deletedAt *time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&deletedAt); err != nil {
+		t.Fatalf("failed to scan nullable deleted_at for repo %s: %v", repoID, err)
+	}
+	if deletedAt != nil {
+		t.Fatalf("active repo %s deleted_at = %v, want Cassandra NULL", repoID, deletedAt)
 	}
 
 	platformScope := traffic.PlatformStorageScope()

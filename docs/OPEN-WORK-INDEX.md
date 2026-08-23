@@ -69,9 +69,10 @@ Three gates, kept separate on purpose:
   See the GC section below.
 - **Single-node go-live** — blocked by the resource-amplification findings
   below (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`,
-  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`). Nothing about GC gates these, and
-  closing X1 does not close them. `ISSUE-ZIP-STREAM-LATEFAIL-01` is Medium per
-  the registry, not a go-live blocker.
+  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`) and the API-key mutation-scope bypass
+  (`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`). Nothing about GC gates
+  these, and closing X1 does not close them. `ISSUE-ZIP-STREAM-LATEFAIL-01` is
+  Medium per the registry, not a go-live blocker.
 - **Multi-instance operation** — additionally blocked by the two node-local
   state issues in the table below.
 
@@ -81,7 +82,9 @@ posture issue and the sync public-link token auth gap 2026-08-07;
 [PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md)
 (dated snapshot) and
 [PROD-READINESS-VERIFICATION-20260822.md](./PROD-READINESS-VERIFICATION-20260822.md)
-(baseline re-verification at `a1570b186`, with follow-up fixes at `913c3892c`).
+(baseline re-verification at `a1570b186`, with the selected findings last verified
+at committed snapshot `05197691c`; later corrections are outside that snapshot's
+provenance boundary).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
@@ -173,6 +176,7 @@ not satisfy the X1 closure criteria.
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | ✅ Closed 2026-08-22 | The three handlers now distinguish canonical ownership from organization owner/admin/superadmin overrides; owner API keys require `read-write`, role overrides require `admin`, and content shares/repo tokens remain insufficient. Negative tests cover all three handlers | [known issue](./KNOWN_ISSUES.md) |
+| `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` | HIGH | Six upload-link and file-share mutation handlers apply the user's underlying library authority or creator identity without applying the current credential's API-key scope; a `read` key can exceed its advertised authority | Verified preexisting 2026-08-22; direct API keys and derived sessions are affected. See [known issue](./KNOWN_ISSUES.md) and [technical debt](./TECHNICAL-DEBT.md#14-api-key-scope-hardening-follow-up-2026-04-04) |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
@@ -193,7 +197,7 @@ not satisfy the X1 closure criteria.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
-| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | **Preference transition fixed 2026-08-22:** `ChangeStorageClass` now rejects cold classes for every policy and, under `strict`, rejects classes outside `default_region`. **Still open:** policy-gated failover/materialization for already-persisted preferences, the meaning of a `flexible -> strict` transition for historical/reused content, and explicit migration | Partial: endpoint gate implemented and tested; runtime placement/failover and historical-content semantics remain open |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | **Preference validation improved 2026-08-22:** `ChangeStorageClass` rejects cold classes and rejects a class outside the currently read strict region. **Still open:** the endpoint read/write TOCTOU, policy-authoritative placement for stale preferences across v2/Sync/SeafHTTP, policy-gated failover, historical/reused content semantics and migration | Partial: endpoint validation is not a concurrency or placement fence |
 
 ## Low / latent / deferred hardening
 

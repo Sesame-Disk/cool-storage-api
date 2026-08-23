@@ -2661,7 +2661,7 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	var sizeBytes, fileCount int64
 	var deletedAt *time.Time
 	for libIter.Scan(&libOrgIDStr, &libraryOwnerIDStr, &sizeBytes, &fileCount, &deletedAt) {
-		if deletedAt != nil && !deletedAt.IsZero() {
+		if !isActiveLibraryForStorageReconciliation(deletedAt) {
 			continue
 		}
 
@@ -2723,6 +2723,10 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	}
 
 	return reconciled, firstErr
+}
+
+func isActiveLibraryForStorageReconciliation(deletedAt *time.Time) bool {
+	return deletedAt == nil || deletedAt.IsZero()
 }
 
 // --- Version TTL ---

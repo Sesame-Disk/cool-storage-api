@@ -8,7 +8,68 @@ Session-by-session development history for SesameFS.
 
 ---
 
-## 2026-08-22 - Readiness record correction + two bounded fixes
+## 2026-08-22 - Final readiness review corrections
+
+**`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` — verified preexisting,
+open.** The April API-key hardening preserves `api_key_scope` for direct API-key
+authentication and derived sessions, but six existing mutation handlers do not
+consume that ceiling. Upload-link creation and file-share administration call
+bare `HasLibraryAccess`; upload-link update/delete use creator identity only. A
+`read` key belonging to an otherwise privileged user can therefore exceed its
+advertised scope. This branch does not change those routes; the issue registry
+records the finding, impact, fix direction and required scope matrix.
+
+**API-key defaults narrowed without making ordinary clients read-only.** Both
+self-service and sysadmin creation now default to `read-write`; `admin` remains
+selectable only for an authorized target and is never preselected. Accounts still
+requires an explicitly selected admin-scoped key for its dedicated platform
+service account.
+
+**Settings compatibility restored.** The branch had made `GET history-limit` and
+`GET auto-delete` canonical-owner-only while adding mutation scope checks. Those
+two reads now retain `main`'s authenticated behavior; settings mutations, repo API
+token management and transfer continue to require the canonical owner and the
+appropriate credential scope.
+
+**Residency claim narrowed.** `ChangeStorageClass` still rejects cold classes and
+preferences outside the policy observed under `strict`, but that read-before-write
+check is not a concurrency fence. Policy-authoritative placement for stale
+preferences across v2, Sync and SeafHTTP, failover, historical/reused content and
+migration remain under `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`. No broad storage
+placement redesign is claimed in this bounded branch.
+
+**Documentation provenance corrected.** The readiness record now identifies
+`05197691c` as the last committed snapshot reviewed for its selected findings and
+describes the current `TriggerWorkerWithDryRun` / `TriggerScannerWithDryRun`
+mechanism. Subsequent corrections are explicitly outside that snapshot's
+provenance boundary. Runtime dry-run semantics remain the global behavior
+inherited from `main`.
+
+**Rejected scope wrapper removed; lateral fixes pinned.** The exported
+`APIKeyScopeAllowsLibraryPermission` wrapper belonged to an intermediate gate that
+collapsed canonical ownership and organization override into `PermissionOwner`.
+The final gate cannot use that model, and no production caller remained, so the
+wrapper is removed while the private ceiling used by `HasLibraryAccessCtx` stays
+tested. Focused regressions now prove that negative storage counters reconcile
+back to zero and that Cassandra `deleted_at = NULL` remains an active library for
+storage-counter reconstruction.
+
+**Files**: `internal/api/v2/library_settings.go`,
+`frontend/src/pages/sys-admin/users/user-api-keys.js`, `docs/API-REFERENCE.md`,
+`docs/ACCOUNTS-DASHBOARD-INTEGRATION.md`, `docs/KNOWN_ISSUES.md`,
+`docs/OPEN-WORK-INDEX.md`, `docs/TECHNICAL-DEBT.md`,
+`docs/PROD-READINESS-VERIFICATION-20260822.md`,
+`docs/STORAGE-CLASS-PLACEMENT-OPTIONS.md`,
+`docs/STORAGE-MULTIREGION-ANALYSIS.md`,
+`docs/SECURITY-ASSESSMENT-2026-04-v4.md`, `docs/DEPLOY.md`, `docs/CHANGELOG.md`,
+`internal/middleware/permissions.go`, `internal/middleware/permissions_test.go`,
+`internal/traffic/storage_sharding_test.go`, `internal/gc/store_cassandra.go`,
+`internal/gc/store_cassandra_storage_counter_test.go`,
+`internal/integration/library_projection_regression_test.go`
+
+---
+
+## 2026-08-22 - Bounded authorization, GC and readiness hardening
 
 Documentation/source-of-record pass following the independent re-verification of
 `main` at `a1570b186`, plus the two bounded runtime fixes that re-verification
@@ -103,6 +164,9 @@ lease. Lease renewal continues while a background finalizer waits for DLQ and
 worker drain; only then does it stop renewal, release leadership, persist stats and
 publish `stopped`. HTTP and GC shutdown begin
 concurrently under the same deadline, and their errors are joined.
+Main's 30-second shutdown deadline can hard-exit before finalizer release, leaving
+takeover to the remaining lease TTL; early release is intentionally avoided while
+old work may remain.
 
 **New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
 re-verification at `a1570b186`: ten defects (five HIGH), what #181 did and did not
@@ -122,13 +186,24 @@ since the 2026-05-27 preflight narrowing, while `OPEN-WORK-INDEX.md` still carri
 HIGH. The index now matches the registry, per its own rule that the registry owns
 severity.
 
-**Files**: `internal/gc/gc.go`, `internal/gc/manual_trigger_gate_test.go`,
-`internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
-`internal/api/v2/libraries.go`,
+**Runtime and tests**: `internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
+`internal/api/v2/libraries.go`, `internal/api/v2/library_live_write_fence_test.go`,
 `internal/api/v2/library_mutation_authority_test.go`,
-`internal/middleware/permissions.go`, `CURRENT_WORK.md`,
-`docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`, `docs/DEPLOY.md`,
-`docs/PROD-READINESS-VERIFICATION-20260822.md`, `docs/CHANGELOG.md`
+`internal/api/v2/library_settings.go`, `internal/api/v2/library_settings_test.go`,
+`internal/api/v2/storage_policy.go`, `internal/api/v2/storage_policy_test.go`,
+`internal/gc/gc.go`, `internal/gc/gc_test.go`,
+`internal/gc/manual_trigger_gate_test.go`, `internal/gc/store.go`,
+`internal/gc/store_cassandra.go`, `internal/gc/store_mock.go`,
+`internal/gc/worker.go`, `internal/gc/worker_test.go`,
+`internal/integration/check_blocks_admission_test.go`,
+`internal/integration/gc_s3_deletion_test.go`,
+`internal/integration/integration_test.go`, `internal/middleware/permissions.go`,
+`internal/traffic/storage.go`.
+
+**Frontend and records**: `frontend/src/components/user-settings/api-keys.js`,
+`CURRENT_WORK.md`, `docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`,
+`docs/DEPLOY.md`, `docs/PROD-READINESS-VERIFICATION-20260822.md`,
+`docs/CHANGELOG.md`.
 
 ---
 

@@ -174,3 +174,39 @@ func TestReconcileStorageScopeShardedDoesNotWriteBeforeReadPassSucceeds(t *testi
 		t.Fatalf("ReconcileStorageScopeSharded performed %d write(s) before read pass completed, want 0", writeCalls)
 	}
 }
+
+func TestReconcileStorageScopeRepairsNegativeCounters(t *testing.T) {
+	prevRead := readStorageSnapshotAtShardErrFn
+	prevWrite := storageUpdateErrFn
+	t.Cleanup(func() {
+		readStorageSnapshotAtShardErrFn = prevRead
+		storageUpdateErrFn = prevWrite
+	})
+
+	readStorageSnapshotAtShardErrFn = func(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
+		return StorageSnapshot{BytesUsed: -20, FileCount: -2}, nil
+	}
+
+	type update struct {
+		bytes int64
+		files int64
+	}
+	var updates []update
+	storageUpdateErrFn = func(session *gocql.Session, scope string, shard int, day time.Time, deltaBytes, deltaFiles int64) error {
+		updates = append(updates, update{bytes: deltaBytes, files: deltaFiles})
+		return nil
+	}
+
+	err := ReconcileStorageScope(nilDBSession{}, OrganizationStorageScope("00000000-0000-0000-0000-000000000123"), StorageSnapshot{})
+	if err != nil {
+		t.Fatalf("ReconcileStorageScope returned error: %v", err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("ReconcileStorageScope performed %d updates, want total and daily updates", len(updates))
+	}
+	for i, got := range updates {
+		if got.bytes != 20 || got.files != 2 {
+			t.Fatalf("update %d = (%d, %d), want (+20, +2)", i, got.bytes, got.files)
+		}
+	}
+}

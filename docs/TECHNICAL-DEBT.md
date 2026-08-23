@@ -801,7 +801,9 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 
 ### High Priority
 - [ ] **Device Flow / service-account auth follow-up** (Section 6) — user-scoped API keys are complete, but there is still no first-class userless automation flow.
-- [ ] **Persist and enforce API key scope in derived sessions** (Section 14) — `/api2/auth-token/` currently drops API key scope when minting a session.
+- [ ] **Close API-key scope bypasses in upload-link and file-share mutations**
+  (Section 14; `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`) — derived
+  sessions preserve scope, but six route-level mutation checks do not consume it.
 - [ ] **Define SeafHTTP upload-token contract and resumability for public links** (Section 15) — TTL, retries, cleanup, and resume semantics are still inconsistent.
 
 ### Short-Term (As Encountered)
@@ -1200,7 +1202,11 @@ Future fix options:
 
 ### Status
 
-Core hardening landed. Direct API key auth and sessions minted from API keys now preserve scope metadata, cap effective role by scope, and enforce scope in the central library/sync permission paths.
+Core hardening landed. Direct API key auth and sessions minted from API keys now
+preserve scope metadata, cap effective role by scope, and enforce scope in the
+central library/sync permission paths. A verified route-level residual remains in
+upload-link and file-share mutations:
+`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`.
 
 ### What Works Today
 
@@ -1221,7 +1227,12 @@ Core hardening landed. Direct API key auth and sessions minted from API keys now
 ### Remaining Debt
 
 - direct API key auth inside `authMiddleware` still has no dedicated application-level rate limit beyond edge protections
-- scope enforcement is still partly route-fragile for endpoints that rely only on bare authentication and do not pass through the central library/sync checks or an explicit `RequireScope(...)`
+- Verified defect: upload-link create uses bare `HasLibraryAccess`; upload-link
+  update/delete use creator-only checks; file-share create/update/delete use bare
+  `HasLibraryAccess`. None applies the request's API-key scope ceiling. Tracked as
+  `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`.
+- The adjacent route surface still needs a systematic matrix audit; fixing these
+  six handlers must not be treated as proof that every route consumes scope.
 - `admin` scope keys remain intentionally powerful and should be issued only to trusted tooling
 - some legacy handlers still compare raw `superadmin` role strings; any cross-org authority checks should be normalized to `IsPlatformSuperAdmin(...)` rather than relying on role text alone
 
@@ -1240,9 +1251,10 @@ Core hardening landed. Direct API key auth and sessions minted from API keys now
 
 ### Recommended Fix Path
 
-1. Add dedicated application-layer rate limiting for direct API key auth attempts, not only for `/api2/auth-token/`.
-2. Build an explicit route audit/test matrix for `read`, `read-write`, and `admin` API keys across the most sensitive endpoint families.
-3. Keep admin-scope key issuance narrow and document that these keys are equivalent to high-trust automation credentials.
+1. Close `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` and add direct-key and derived-session scope matrices for all six handlers.
+2. Add dedicated application-layer rate limiting for direct API key auth attempts, not only for `/api2/auth-token/`.
+3. Build an explicit route audit/test matrix for `read`, `read-write`, and `admin` API keys across the most sensitive endpoint families.
+4. Keep admin-scope key issuance narrow and document that these keys are equivalent to high-trust automation credentials.
 
 ### Non-Issues After Hardening
 

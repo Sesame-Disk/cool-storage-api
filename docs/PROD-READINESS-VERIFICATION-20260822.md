@@ -2,10 +2,10 @@
 
 **Date:** 2026-08-22
 **Baseline HEAD:** `a1570b186` (Merge PR #181, `feat/p1-locator-authority`)
-**Follow-up fixes verified:** `913c3892c` (code/tests commit immediately preceding this documentation update)
+**Last committed snapshot verified for the selected findings:** `05197691c`
 **Scope:** independent code-level re-verification of **selected** production-readiness
 findings — what PR #181 delivered, plus the audit-arc findings listed in §B. Every
-claim below was re-confirmed by reading the code at `913c3892c`.
+claim in §B was re-confirmed against the reviewed snapshot at `05197691c`.
 
 **This is not a sweep of everything open.** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md)
 carries roughly twice as many open rows in its High/Medium table as appear here;
@@ -13,6 +13,13 @@ notably `ISSUE-SYNC-METADATA-CONCURRENCY-01` (the aggregate-concurrency sibling 
 §B.5, ~2 GiB across 16 concurrent `recv-fs`) is open and **not** re-verified here.
 Status of record for every id stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md); this
 document is a dated snapshot, per the index's layering rules.
+
+**Post-verification note (2026-08-22):** subsequent work outside that provenance
+boundary restored settings-read compatibility, narrowed API-key defaults and
+residency claims, added storage-counter regressions, and verified the preexisting
+`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`. That issue was not one of the
+selected findings enumerated in section B. Current status and closure criteria
+live in `KNOWN_ISSUES.md`.
 
 **Citation convention:** code is cited by **symbol name**, per rule 3 of
 [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — line numbers rot, and an earlier draft
@@ -190,6 +197,13 @@ separately, then applies the corresponding API-key scope.
 organization's `default_region`. Runtime failover, already-persisted preferences,
 historical/reused content and migration remain open.
 
+The endpoint check is not a concurrency fence: it reads the organization policy
+before writing the library preference, so a concurrent policy transition can make
+that validated preference stale. This does not regress `main`, where the endpoint
+did not consult policy at all, but it means strict residency cannot be claimed from
+the endpoint guard. The authoritative safety boundary remains open at
+new-materialization placement across v2, Sync and SeafHTTP.
+
 ### B.3 Chunked upload state is node-local — HIGH, multi-instance only
 
 `ISSUE-UPLOAD-CHUNK-MULTINODE-01`
@@ -311,8 +325,9 @@ Not tracked as blockers.
    invariant now extends through **016** (`gc_s3_orphans.storage_key`), not just
    014/015. Currently a runbook responsibility.
 
-4. **`GCConfig.DryRun` is runtime-mutable.** `Service.SetDryRun` is reachable from
-   `handleGCRun` via the optional `dry_run` field, so the prod `false` is a
+4. **GC dry-run mode is runtime-mutable.** `handleGCRun` passes the optional
+   `dry_run` field through `TriggerWorkerWithDryRun` or
+   `TriggerScannerWithDryRun`, so the prod `false` is a
    default rather than an immutable pin. Setting it to `true` suppresses destructive
    execution; setting it back to `false` restores normal destructive behavior once
    GC is otherwise enabled and authorized. The trigger admission and override now
@@ -328,7 +343,7 @@ Not tracked as blockers.
 4. [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — the one-screen live index.
 5. [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — status of record per `ISSUE-*` id.
 6. This document — dated re-verification from baseline `a1570b186`, with the
-   follow-up fixes verified at `913c3892c`.
+   selected findings last verified at committed snapshot `05197691c`.
 
 ---
 

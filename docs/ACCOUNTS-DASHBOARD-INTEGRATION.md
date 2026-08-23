@@ -136,6 +136,10 @@ Accounts should authenticate to SesameFS with a dedicated platform service accou
 - role `superadmin`
 - an admin-scoped API key
 
+`admin` is intentionally not a UI default. The platform operator must select it
+explicitly when creating the dedicated Accounts credential; a self-service
+`read-write` key is not sufficient for this contract.
+
 Use the standard header:
 
 ```http

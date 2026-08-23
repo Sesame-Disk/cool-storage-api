@@ -868,20 +868,6 @@ func (m *PermissionMiddleware) HasLibraryAccessCtx(c interface {
 	return m.HasLibraryAccess(orgID, userID, repoID, requiredPermission)
 }
 
-// APIKeyScopeAllowsLibraryPermission is the exported form of the scope ceiling,
-// for handlers that resolve a permission themselves instead of going through
-// RequireLibraryPermission or HasLibraryAccess.
-//
-// It exists because the scope ceiling and the permission lookup are two separate
-// questions and only the middleware paths asked both. GetLibraryPermission
-// answers "what is this USER's authority over this library" from Cassandra; it
-// knows nothing about the credential the request arrived on, so an API key with
-// read scope minted by a library owner still resolves to PermissionOwner. Any
-// handler enforcing a permission level must apply this ceiling too.
-func APIKeyScopeAllowsLibraryPermission(c *gin.Context, requiredPermission LibraryPermission) bool {
-	return apiKeyScopeAllowsLibraryPermission(c, requiredPermission)
-}
-
 func apiKeyScopeAllowsLibraryPermission(c interface {
 	Get(any) (any, bool)
 }, requiredPermission LibraryPermission) bool {

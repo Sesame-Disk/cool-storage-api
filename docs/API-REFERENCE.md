@@ -117,6 +117,11 @@ Object data starts with a type byte:
 ### API Key Semantics
 
 - Scopes: `read`, `read-write`, `admin`
+- The self-service and sysadmin UI forms default to `read-write`, which supports
+  ordinary desktop, CLI, and API use without granting organization-administration
+  authority. API callers must always send an explicit valid `scope`.
+- `admin` is never a UI default. An authorized user or platform operator must
+  select it explicitly for trusted administration tooling.
 - Raw API keys are only returned on creation and are never persisted in plaintext
 - Revoking an API key also invalidates sync/API-token sessions minted from that key
 - If an API key has an expiry, the `/api2/auth-token/` session created from it cannot outlive that key
@@ -565,9 +570,9 @@ delete to another backend.
 
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
-| `/api2/repos/:id/history-limit/` | GET/PUT | ❌ | Library history retention settings |
-| `/api/v2.1/repos/:id/auto-delete/` | GET/PUT | ❌ | Auto-delete old files settings |
-| `/api/v2.1/repos/:id/repo-api-tokens/` | GET/POST/DELETE | ❌ | Per-repo API tokens |
+| `/api2/repos/:id/history-limit/` | GET/PUT | ✅ | Library history retention settings |
+| `/api/v2.1/repos/:id/auto-delete/` | GET/PUT | ✅ | Auto-delete old files settings |
+| `/api/v2.1/repos/:id/repo-api-tokens/` | GET/POST/PUT/DELETE | ✅ | Per-repo API tokens |
 
 ### File Viewer & Raw Access
 

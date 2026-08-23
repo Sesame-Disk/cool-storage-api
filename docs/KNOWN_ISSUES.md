@@ -24,6 +24,7 @@ is right about why.
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
 | **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's authority. All three now distinguish the canonical owner from organization-role overrides: owner API keys require `read-write`, organization owner/admin/superadmin overrides require `admin`, repo API tokens and content shares remain insufficient. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the remaining runtime-placement and historical-content residency scope. |
+| **API-key read scope bypasses upload-link and file-share mutations** | 🔴 Open — verified preexisting 2026-08-22 | Six authenticated mutation handlers resolve the user's underlying library authority or link ownership without applying the current credential's API-key scope. A `read` API key can create, update or delete upload links and, for an owner/admin user, create, update or delete user/group shares. Both direct API-key auth and derived sessions are affected. See ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -7837,9 +7838,9 @@ for hot post-upload paths. Multi-DC tests still missing.
 
 ### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: strict residency is not enforced through the full placement lifecycle
 
-**Status**: 🟡 Partial — preference transition fixed 2026-08-22; runtime placement, failover and historical content remain open
+**Status**: 🟡 Partial — endpoint preference validation improved 2026-08-22; concurrency, runtime placement, failover and historical content remain open
 **Severity**: Medium (policy / compliance)
-**Affected**: `LibraryHandler.ChangeStorageClass` (`internal/api/v2/libraries.go`)
+**Affected**: `LibraryHandler.ChangeStorageClass`; organization storage-policy updates; request-time placement in v2, Sync and SeafHTTP; storage-manager failover; canonical reuse and future migration semantics
 **Source of record**: [storage-class placement options](./STORAGE-CLASS-PLACEMENT-OPTIONS.md) - "Residency policy, failover and preference changes"
 
 #### Problem
@@ -7858,6 +7859,13 @@ calls `validateMutableStorageClass`. Every policy rejects cold primary placement
 under `strict`, the requested hot class must map to `default_region`. Canonical and
 administrative projections are then updated in the same logged batch. Focused tests
 cover same-region hot acceptance plus cross-region and cold rejection.
+
+**The endpoint validation is not a concurrency fence.** The policy read happens
+before the library write and Cassandra's logged batch does not isolate that prior
+read. A concurrent `flexible -> strict` transition can therefore commit between
+validation and the preference update, leaving a value that the new policy would
+reject. This is not a regression from `main`, where the endpoint did not consult
+policy, but it limits the claim to best-effort request validation.
 
 **Original tier defect.** Creation routes the requested class
 through `validateRequestedCreateStorageClass`, which rejects a cold class with
@@ -7891,7 +7899,9 @@ The fix is a placement-policy gate, not data movement: existing canonical blocks
 keep their persisted `blocks.storage_class`, physical object and derived key. A
 preference persisted before a later `flexible -> strict` transition can still be
 out of region and the materialization resolver still honors it without consulting
-the policy.
+the policy. The same preference-first pattern exists in the v2, Sync and SeafHTTP
+materialization paths, so strict residency must be enforced where each new
+destination is selected rather than inferred from this endpoint check.
 
 A second, narrower path to the same outcome is separately noted: strict policy does
 not constrain `failover_class` either, so a new block can be persisted outside the
@@ -8309,7 +8319,7 @@ invariant without holding a mutex across `wg.Wait()`.
 `internal/api/gc_run_gate_test.go` pins the HTTP contract, which is where an
 operator actually meets this: disabled node → `503` with `started:false` for
 worker, scanner, defaulted and unparseable bodies; a `dry_run` override on a
-disabled node **does not reach `SetDryRun`**; enabled+started → `200` with
+disabled node **does not commit the runtime override**; enabled+started → `200` with
 `started:true`; no service → `503`.
 
 #### Why this is not `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
@@ -8317,6 +8327,70 @@ disabled node **does not reach `SetDryRun`**; enabled+started → `200` with
 X1 is about whether destructive GC is *correct* when enabled. This is about
 whether "disabled" is enforced where it is decided. They are independent, and
 this fix is not progress against any of X1's four closure criteria.
+
+---
+
+### ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01: Read-scoped API keys can perform upload-link and file-share mutations
+
+**Status**: 🔴 Open — verified preexisting 2026-08-22
+**Severity**: High (authorization / least-privilege bypass)
+**Affected**: `UploadLinkHandler.CreateUploadLink`, `UpdateUploadLink`,
+`DeleteUploadLink`; `FileShareHandler.CreateShare`, `UpdateSharePermission`,
+`DeleteShare`
+
+#### Problem
+
+API-key scope is the authority of the current credential. Bare
+`PermissionMiddleware.HasLibraryAccess` instead resolves the underlying user's
+authority from Cassandra and cannot inspect request context. The affected upload
+and share handlers ask only the second question, or compare only
+`created_by == user_id`, without applying the credential ceiling.
+
+`HasLibraryAccessCtx` applies that ceiling through the middleware's private scope
+predicate; bare `HasLibraryAccess` does not. Creator identity likewise proves who
+owns an existing link, not whether the current credential is allowed to mutate it.
+
+This defect predates the 2026-08-22 readiness branch. That branch applies explicit
+scope checks to the bounded library-configuration fixes but does not claim to
+repair unrelated existing routes.
+
+#### Affected Paths
+
+- Upload-link creation requests `PermissionRW` through bare
+  `HasLibraryAccess`.
+- Upload-link update and delete use creator-only checks.
+- File-share create, update and delete request `PermissionAdmin` through bare
+  `HasLibraryAccess`.
+- `RequirePermFlagForRepo` does not replace the missing API-key scope ceiling.
+- Direct API keys and sessions derived through `/api2/auth-token/` are affected;
+  both preserve `api_key_scope`, but these handlers do not consume it.
+
+#### Impact
+
+A `read` key belonging to a user with stronger canonical authority can exceed its
+declared scope. An owner/admin user's read key can delegate, alter or revoke user
+or group access, and a read key can manage upload links created by that user. This
+violates the advertised `read` / `read-write` / `admin` contract.
+
+#### Fix Direction
+
+- Apply the context-aware API-key scope ceiling before every mutation.
+- Require at least `read-write` for upload-link create, update and delete.
+- Require `admin` for user/group share create, update and delete.
+- Keep library authority and creator ownership checks; scope is an additional
+  credential ceiling, not a replacement.
+- Decide explicitly whether repo API tokens may create upload links rather than
+  acquiring that behavior accidentally through a helper substitution.
+- Add direct-key and derived-session scope matrices for all six handlers.
+
+#### Verification Needed
+
+- `read` is denied on all six mutation handlers.
+- `read-write` is allowed only on upload-link operations for an otherwise
+  authorized caller.
+- `admin` is required for file-share administration.
+- Ordinary session behavior remains unchanged.
+- Revoked and expired derived credentials retain their existing failure behavior.
 
 ---
 

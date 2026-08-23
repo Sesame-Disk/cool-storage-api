@@ -135,8 +135,11 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context, requiredScope stri
 // GetHistoryLimit returns the history limit for a library
 // GET /api/v2.1/repos/:repo_id/history-limit/
 func (h *LibrarySettingsHandler) GetHistoryLimit(c *gin.Context) {
-	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeRead)
-	if !ok {
+	orgID := c.GetString("org_id")
+	repoID := c.Param("repo_id")
+
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
@@ -225,8 +228,11 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 // GetAutoDelete returns the auto-delete settings for a library
 // GET /api/v2.1/repos/:repo_id/auto-delete/
 func (h *LibrarySettingsHandler) GetAutoDelete(c *gin.Context) {
-	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeRead)
-	if !ok {
+	orgID := c.GetString("org_id")
+	repoID := c.Param("repo_id")
+
+	if orgID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 

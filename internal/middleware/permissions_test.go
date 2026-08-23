@@ -64,7 +64,7 @@ func TestRequireAuth_RejectsEmptyContext(t *testing.T) {
 	}
 }
 
-func TestAPIKeyScopeAllowsLibraryPermission(t *testing.T) {
+func TestAPIKeyScopeCeiling(t *testing.T) {
 	ctx := scopeOnlyContext{values: map[any]any{"api_key_scope": "read"}}
 	if !apiKeyScopeAllowsLibraryPermission(ctx, PermissionR) {
 		t.Fatal("read scope should allow read permission")

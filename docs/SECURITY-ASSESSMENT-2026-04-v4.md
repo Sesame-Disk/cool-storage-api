@@ -36,6 +36,13 @@ This section's "all HIGH resolved" statement applies to the v1-v3 series only.
   failover edges live for the first time, which hardens availability and weakens
   strict residency unless placement is policy-gated in the same change
 
+**Status note (2026-08-22):** `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`
+is fixed. `ChangeStorageClass` now rejects cold classes and preferences outside
+the currently read strict region. `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`
+remains open for the endpoint policy-transition race, request-time placement,
+failover, historical/reused content and migration. The dated v4 finding above is
+preserved as originally assessed.
+
 ---
 
 ## Progress Review: v1-v3 Findings
@@ -538,7 +545,7 @@ walks the chain iteratively with a visited set.
 | **Failover notifications** | ❌ No | Server logs only; no webhooks/alerts |
 | **Per-region metrics** | ❌ No | `/metrics` exists but no per-backend health gauges |
 | **Geographic latency handling** | ⚠️ Partial | Global 5s timeout; not configurable per region |
-| **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
+| **Data residency compliance** | ⚠️ Partial | **Historical v4 finding; superseded by the 2026-08-22 status note above.** At assessment time, `strict` constrained new-library creation only and `ChangeStorageClass` re-applied neither the region nor the hot-tier requirement. Current endpoint validation covers both against the policy it reads, while the policy-transition race, request-time placement, failover and migration remain open (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`) |
 | **Failover config validation & runtime safety** | ⚠️ Partial | Startup validates that every `failover_class` names a registrable class (`Config.Validate`); at runtime `GetHealthyBackend`'s visited-set walk fails closed on an exhausted or fully unhealthy chain. **Cycles are supported configuration, not a misconfiguration** — `config.prod.yaml` ships `hot-s3-na` and `hot-s3-eu` pointing at each other so either region can be primary — so rejecting them at startup is not a requirement. Open: policy gating, since a `strict` organization must not fail over across regions (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus multi-level and all-unhealthy edge-case coverage |
 
 ---
@@ -675,10 +682,13 @@ necessary but **not sufficient** for a multiregion production deployment. It clo
 the availability half only, and it makes the configured cross-region
 `failover_class` edges reachable for the first time — so on its own it hardens
 availability while weakening strict residency. A multiregion deployment that
-carries a residency commitment also needs the placement policy gated
-(`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`) and the missing library permission gate
-closed (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). The earlier "safe AFTER
-item #1" wording predated those findings and is withdrawn.
+carries a residency commitment also needs the remaining placement lifecycle gaps
+closed (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`). The library mutation permission
+gate (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) closed 2026-08-22; the
+topology-independent authorization blocker is now the API-key scope bypass in
+upload-link and file-share mutations
+(`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`). The earlier "safe AFTER item
+#1" wording predated those findings and is withdrawn.
 
 **Timeline estimate** (availability items only; excludes the residency and
 authorization work above):
@@ -689,13 +699,13 @@ authorization work above):
 **Single-region deployments:** this section is about storage topology only, and
 from that angle a single-region deployment does not need the multiregion failover
 and residency work above — external monitoring covers the availability half. **It
-is not an overall production-readiness statement.** The missing library permission
-gate (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) is a HIGH that does not
-depend on topology at all: any authenticated member of an organization can mutate
-another member's library through `UpdateLibrary`, `op=rename` and
-`ChangeStorageClass` in a single-region install exactly as in a multiregion one.
-That and the other applicable security blockers still have to close before any
-deployment proceeds.
+is not an overall production-readiness statement.** The library mutation
+permission gate closed 2026-08-22. The API-key scope bypass in upload-link and
+file-share mutations (`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`) is the
+current HIGH authorization blocker that does not depend on topology: a `read` key
+belonging to a sufficiently privileged user can exceed its advertised scope in a
+single-region install exactly as in a multiregion one. That and the other
+applicable security blockers still have to close before any deployment proceeds.
 
 ---
 

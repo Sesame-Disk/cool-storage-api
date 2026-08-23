@@ -1896,6 +1896,15 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
 # every DC).
 ```
 
+> This has no production effect while `GC_ENABLED=false`. After GC is enabled,
+> graceful process shutdown has a 30-second application deadline; if GC work has
+> not drained by then, the process exits without explicitly releasing the leader
+> lease, so takeover may wait for the remaining Cassandra lease TTL (up to
+> roughly 90 seconds at the minimum configured TTL of 90 seconds). This favors
+> exclusion and safety over immediate takeover. Do not manually delete the lease
+> while the old process might still be alive; confirm that process is gone before
+> intervening.
+
 ### Step M6 — Verify library placement preference and canonical block reads
 
 After deploying the multi-region config, verify the behavior that matters for data integrity.
