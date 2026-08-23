@@ -2374,20 +2374,27 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		return
 	}
 
+	// A trigger can still be refused at the admission gate after the precheck
+	// above: Stop() can win that race. Re-resolve the reason so the operator sees
+	// why, rather than a generic message that hides a leadership handover.
+	refuse := func(component string) {
+		err := s.gcService.ManualTriggerError()
+		if err == nil {
+			err = fmt.Errorf("GC %s is not accepting triggers", component)
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": err.Error()})
+	}
+
 	switch req.Type {
 	case "scanner":
 		if !s.gcService.TriggerScannerWithDryRun(req.DryRun) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": "GC scanner is not accepting triggers"})
+			refuse("scanner")
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC scanner triggered"})
 	default:
 		if !s.gcService.TriggerWorkerWithDryRun(req.DryRun) {
-			err := s.gcService.ManualTriggerError()
-			if err == nil {
-				err = errors.New("GC worker is not accepting triggers")
-			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": err.Error()})
+			refuse("worker")
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
@@ -2510,6 +2517,26 @@ func (s *Server) handleGCFailedItemOrgs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"organizations": orgs})
 }
 
+// isGCAdminMutationRefusal reports whether err means this node DECLINED to serve
+// the DLQ mutation, rather than tried and failed. Both cases must answer 503, not
+// 500, because neither is a server fault:
+//
+//   - leadership and lifecycle: another replica owns the work, or this one is
+//     disabled/not running.
+//   - context cancellation: shutdown cancels the in-flight DLQ operation while the
+//     HTTP server is still draining. The store binds ctx only to the read phase and
+//     re-checks it immediately before the write, and the LoggedBatch itself is
+//     deliberately not ctx-bound — so a ctx error here means the mutation never
+//     reached its commit point. Answering 503 is therefore honest: nothing was
+//     written, and a retry against the surviving leader is the correct next step.
+func isGCAdminMutationRefusal(err error) bool {
+	return errors.Is(err, gc.ErrNotLeader) ||
+		errors.Is(err, gc.ErrGCDisabled) ||
+		errors.Is(err, gc.ErrGCNotRunning) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 	if s.gcService == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
@@ -2521,9 +2548,7 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.RequeueFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
-		// Neither leadership nor lifecycle refusal is a server fault: this node will
-		// not serve the request, so return 503 rather than 500.
-		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {
+		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
@@ -2544,9 +2569,7 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 		return
 	}
 	if err := s.gcService.DeleteFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
-		// Neither leadership nor lifecycle refusal is a server fault: this node will
-		// not serve the request, so return 503 rather than 500.
-		if errors.Is(err, gc.ErrNotLeader) || errors.Is(err, gc.ErrGCDisabled) || errors.Is(err, gc.ErrGCNotRunning) {
+		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}

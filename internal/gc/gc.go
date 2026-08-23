@@ -230,7 +230,14 @@ func (s *Service) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.started || s.stopping {
+	if s.started {
+		return
+	}
+	if s.stopping {
+		// A restart is refused, not queued, while the previous run drains: reusing
+		// the WaitGroup here would overlap two lifecycles. Log it — otherwise a
+		// mis-sequenced restart leaves no trace at all.
+		log.Println("[GC] Start ignored: previous run is still draining")
 		return
 	}
 
@@ -1352,10 +1359,11 @@ func (s *Service) withDLQOperation(ctx context.Context, fn func(context.Context)
 
 func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 
-	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
-	// production only one datacenter runs GC; without this an operator on any
-	// disabled replica takes the lease away from the datacenter that actually
-	// drains the queue, causing a GC outage from a node that cannot do the work.
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
+	// GC is disabled fleet-wide today; once it is activated, only the designated GC
+	// location is expected to run it. Without this check an operator on any disabled
+	// replica takes the lease away from the location that actually drains the queue,
+	// causing a GC outage from a node that cannot do the work.
 	if err := s.gcAdminMutationError(); err != nil {
 		return err
 	}
@@ -1388,10 +1396,11 @@ func (s *Service) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID,
 
 func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 
-	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. In
-	// production only one datacenter runs GC; without this an operator on any
-	// disabled replica takes the lease away from the datacenter that actually
-	// drains the queue, causing a GC outage from a node that cannot do the work.
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
+	// GC is disabled fleet-wide today; once it is activated, only the designated GC
+	// location is expected to run it. Without this check an operator on any disabled
+	// replica takes the lease away from the location that actually drains the queue,
+	// causing a GC outage from a node that cannot do the work.
 	if err := s.gcAdminMutationError(); err != nil {
 		return err
 	}

@@ -8274,7 +8274,11 @@ a value the caller must handle rather than a silent no-op.
 `DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` or
 `ErrGCNotRunning` **before** `tryClaimLeadershipForAdmin`, so a disabled or
 stopped replica cannot take the lease. Both DLQ HTTP handlers map those lifecycle
-errors to `503` alongside `ErrNotLeader`: neither is a server fault.
+errors to `503` alongside `ErrNotLeader`: neither is a server fault. A cancelled
+request context maps to `503` for the same reason (corrected 2026-08-23, it
+previously answered `500`): the store binds `ctx` only to the read phase and
+re-checks it immediately before the commit, so a cancelled DLQ mutation — which is
+what shutdown produces while HTTP is still draining — wrote nothing.
 
 `handleGCRun` checks it up front and answers `503` with `{"started": false}` —
 **before** applying the optional `dry_run` override, so a disabled node's admin
@@ -8320,7 +8324,8 @@ invariant without holding a mutex across `wg.Wait()`.
 operator actually meets this: disabled node → `503` with `started:false` for
 worker, scanner, defaulted and unparseable bodies; a `dry_run` override on a
 disabled node **does not commit the runtime override**; enabled+started → `200` with
-`started:true`; no service → `503`.
+`started:true`; no service → `503`; and a cancelled request context on either DLQ
+mutation → `503`, not `500`.
 
 #### Why this is not `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
 
@@ -8391,6 +8396,89 @@ violates the advertised `read` / `read-write` / `admin` contract.
 - `admin` is required for file-share administration.
 - Ordinary session behavior remains unchanged.
 - Revoked and expired derived credentials retain their existing failure behavior.
+
+---
+
+### ISSUE-GC-DRYRUN-OVERRIDE-STICKY-01: A manual GC run can lower `GC_DRY_RUN` for the rest of the process's life
+
+**Status**: 🔴 Open — verified preexisting 2026-08-23 (not introduced by the 2026-08-22 readiness branch)
+**Severity**: Medium — currently unreachable in production, becomes live exactly when destructive GC is activated
+**Affected**: `Server.handleGCRun`, `gc.Service.TriggerWorkerWithDryRun`, `gc.Service.TriggerScannerWithDryRun`, `gc.Service.SetDryRun`
+
+#### Problem
+
+Destructive GC sits behind a two-rung ladder: `GC_ENABLED` decides whether GC runs
+at all, and `GC_DRY_RUN` decides whether a running GC deletes anything. After the
+2026-08-22 hardening the two rungs have very different strength.
+
+`GC_ENABLED` is read once in `NewService`, is never mutated at runtime, and is now
+enforced at the decision point of every superadmin GC surface
+(`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01`). No API call can raise it.
+
+`GC_DRY_RUN` is different. `POST /api/v2.1/admin/gc/run` accepts an optional
+`dry_run` boolean, and an **accepted** trigger stores it into `Service.dryRun` and
+`Worker.dryRun`. That value is not scoped to the run it accompanied: it replaces
+the runtime mode for the remaining life of the process. Nothing restores the
+configured value — `SetDryRun` has no production caller, and the only ways back are
+another `/gc/run` call carrying the opposite value or a process restart. The change
+is visible only as the `dry_run` field of `GET /api/v2.1/admin/gc/status`, and it
+is not written to the audit log.
+
+So a configured `GC_DRY_RUN=true` — the safety rung directly below the one the
+whole X1 programme runs behind — can be lowered by one superadmin request and stays
+lowered. The reverse is equally sticky: a single `{"dry_run": true}` parks that node
+in a non-deleting mode indefinitely, so trash never purges and storage grows with
+no error raised anywhere.
+
+The override is process-local and not persisted, so it affects only the node that
+served the request and does not survive a restart. That bounds the blast radius; it
+does not make the surface honest.
+
+#### Why this is not a defect of the 2026-08-22 branch
+
+`main` already behaved this way: `handleGCRun` called `Service.SetDryRun(*req.DryRun)`
+with exactly the same lifetime. The readiness branch changed two things and neither
+is the lifetime:
+
+- the override now commits **inside** the trigger admission gate, so a *refused*
+  trigger can no longer change the mode (that was a real defect, and it is fixed);
+- the flag became `atomic.Bool`, closing the data race against a running worker.
+
+The branch's own CHANGELOG states that runtime dry-run semantics remain the global
+behavior inherited from `main`. This entry records the surface that inheritance
+leaves open, so it is not rediscovered as "new" at activation time.
+
+#### Reachability
+
+Not reachable today: with `GC_ENABLED=false` fleet-wide, `ManualTriggerError`
+refuses the trigger **before** the override is applied, and the refusal path is
+pinned by `TestHandleGCRun_DisabledNodeDoesNotApplyDryRunOverride`. It becomes
+reachable on the designated GC location the moment destructive GC is activated —
+which is precisely the window in which `GC_DRY_RUN=true` is the intended brake.
+
+#### Fix Direction
+
+Pick one, in preference order:
+
+1. **Scope the override to its run.** Apply the value with the admitted trigger and
+   restore the configured mode when that run completes, so `dry_run` is a property
+   of the request rather than of the process.
+2. **Treat config as a floor.** Refuse `{"dry_run": false}` while `config.DryRun` is
+   true, and require a deliberate configuration change plus restart to lower the
+   rung — matching how `GC_ENABLED` behaves.
+3. **If a sticky runtime mode is genuinely wanted**, move it to its own explicit
+   endpoint with an audit-log entry naming the actor, rather than letting it ride
+   along on a "run once" request.
+
+#### Verification Needed
+
+- An accepted trigger carrying `dry_run` does not alter the mode observed by the
+  *next* run (option 1), or is refused when it would lower the configured rung
+  (option 2).
+- `GET /admin/gc/status` reflects the configured mode again after the triggered run
+  finishes.
+- A mode change, however it is finally expressed, appears in the audit log.
+- The existing invariant stays green: a refused trigger never commits an override.
 
 ---
 

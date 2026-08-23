@@ -50,7 +50,7 @@ Two gates must not be conflated, because doing so is how "X1 closed" becomes
 | Gate | Blocked by |
 |---|---|
 | Enabling destructive GC (`GC_ENABLED=true`) | **X1 alone** (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`); X2 closed 2026-08-14 |
-| Putting SesameFS in production at all | The independent findings in §B — **none of which X1 gates** |
+| Putting SesameFS in production at all | The **current** open readiness findings in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) / [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — **none of which X1 gates**. §B below is a dated, deliberately *selected* verification snapshot, not that list: at least one open HIGH (`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`) sits outside it |
 
 The most urgent open non-X1 blocker is
 **`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`** — HIGH, single-node, measured

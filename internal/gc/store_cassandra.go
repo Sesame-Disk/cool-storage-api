@@ -860,6 +860,21 @@ func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, i
 	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
 }
 
+// DeleteFailedItemContext is cancellable up to its commit point, and no further.
+//
+// The reads take ctx and there is a final ctx check immediately before the batch,
+// so a cancelled request (client disconnect, or shutdown cancelling the in-flight
+// DLQ operation) returns without having written anything. The LoggedBatch itself
+// is deliberately NOT ctx-bound, and binding it would be a regression rather than
+// hardening: Cassandra does not roll back a logged batch the coordinator has
+// accepted, so ctx cancellation there cannot undo the mutation — it can only
+// abort the client's wait and turn a definite outcome into an ambiguous one, with
+// the caller unable to tell whether gc_failed_items was cleared. Shutdown safety
+// does not depend on cancelling mid-batch either: Service.finishStop waits for the
+// DLQ gate with an uncancellable context and only then releases the lease, so a
+// committing mutation can never overlap a new leader's destructive work.
+//
+// RequeueFailedItemContext follows the same contract.
 func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 	row, err := s.failedItemInfoContext(ctx, orgID, failedAt, itemType, itemID)
 	if errors.Is(err, gocql.ErrNotFound) {
@@ -868,6 +883,8 @@ func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid
 	if err != nil {
 		return fmt.Errorf("load failed identity for delete %s/%s: %w", orgID, itemID, err)
 	}
+	// Last cancellation point, on purpose: everything above is a read, everything
+	// below is the commit.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -981,6 +998,9 @@ func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uui
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	// Last cancellation point, on purpose; the batch below is not ctx-bound. See
+	// DeleteFailedItemContext for why binding it would trade a definite outcome
+	// for an ambiguous one without buying any shutdown safety.
 	if err := ctx.Err(); err != nil {
 		return err
 	}

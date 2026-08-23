@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,42 @@ func TestHandleGCFailedItemMutations_DisabledNodeReturns503(t *testing.T) {
 				"&failed_at=" + url.QueryEscape(time.Now().UTC().Format(time.RFC3339Nano)) +
 				"&item_type=block&item_id=block-1"
 			req := httptest.NewRequest("POST", target, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d (body %s)", w.Code, http.StatusServiceUnavailable, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleGCFailedItemMutations_CancelledRequestReturns503(t *testing.T) {
+	// Shutdown cancels the in-flight DLQ operation while the HTTP server is still
+	// draining. The store binds ctx only to the read phase and re-checks it right
+	// before the commit, so a cancelled request wrote nothing — the operator must
+	// see 503 ("this node did not serve it, retry against the leader"), not a 500
+	// that reads like a failed mutation of unknown outcome.
+	s := newGCRunTestServer(t, true, true)
+
+	for _, tc := range []struct {
+		name    string
+		handler gin.HandlerFunc
+	}{
+		{"requeue", s.handleGCFailedItemRequeue},
+		{"delete", s.handleGCFailedItemDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			r := gin.New()
+			r.POST("/gc/failed", tc.handler)
+
+			target := "/gc/failed?org_id=" + uuid.New().String() +
+				"&failed_at=" + url.QueryEscape(time.Now().UTC().Format(time.RFC3339Nano)) +
+				"&item_type=block&item_id=block-1"
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req := httptest.NewRequest("POST", target, nil).WithContext(ctx)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 

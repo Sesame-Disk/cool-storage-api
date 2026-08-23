@@ -8,6 +8,68 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-23 - Merge-readiness pass: source-of-record repair and DLQ refusal contract
+
+Closing review follow-ups on the readiness branch. No behavior change to library
+authorization, GC lifecycle or storage placement.
+
+**Source-of-record contradiction fixed.** `CURRENT_WORK.md` listed two open
+single-node HIGHs while `OPEN-WORK-INDEX.md` listed three — it was missing
+`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`, the HIGH this same branch
+discovered and registered. That is exactly the class of drift the branch exists to
+correct, so the omission mattered more than its size. The
+`PROD-READINESS-VERIFICATION` verdict table no longer presents §B as the current
+blocker list either: §B is a dated, deliberately *selected* snapshot, and at least
+one open HIGH sits outside it. Readers are pointed at `KNOWN_ISSUES` /
+`OPEN-WORK-INDEX` for the live list.
+
+**DLQ mutations: a cancelled request is a refusal, not a server fault.** The two
+DLQ handlers mapped `ErrNotLeader` / `ErrGCDisabled` / `ErrGCNotRunning` to `503`
+but answered `500` for a cancelled context — which is what graceful shutdown
+produces, since GC stop cancels the in-flight DLQ operation while the HTTP server
+is still draining. Both now answer `503` through one predicate,
+`isGCAdminMutationRefusal`. This is sound only because of where cancellation can
+land: the store binds `ctx` to the read phase and re-checks it immediately before
+the commit, so a cancelled mutation wrote nothing.
+
+**The DLQ commit point is now documented where reviewers keep stopping.** Three
+successive reviews proposed binding the DLQ `LoggedBatch` to the request context.
+That would be a regression, not hardening: Cassandra does not roll back a logged
+batch its coordinator has accepted, so cancelling there cannot undo the mutation —
+it can only abort the client's wait and turn a definite outcome into an ambiguous
+one, leaving the operator unable to tell whether `gc_failed_items` was cleared.
+Shutdown safety does not depend on it either: `finishStop` waits for the DLQ gate
+with an uncancellable context before releasing the lease, so a committing mutation
+can never overlap a new leader's destructive work. The rationale now lives on
+`DeleteFailedItemContext` instead of in review threads.
+
+**New finding registered, deliberately not fixed here.**
+`ISSUE-GC-DRYRUN-OVERRIDE-STICKY-01` (MEDIUM): the `dry_run` field of
+`POST /admin/gc/run` is not scoped to the run it accompanies — an accepted trigger
+replaces the node's runtime mode for the life of the process. One superadmin call
+can lower a configured `GC_DRY_RUN=true`, the rung directly below `GC_ENABLED`, and
+it stays lowered, unaudited. Inherited from `main`; this branch only stopped a
+*refused* trigger from committing the override. Unreachable while GC is disabled
+fleet-wide, live from the moment destructive GC is activated — so it is registered
+now rather than rediscovered at activation.
+
+**Smaller corrections.** `Start()` logs when it refuses a restart during drain
+instead of returning silently. `handleGCRun` re-resolves the refusal reason for the
+scanner branch as it already did for the worker, so an operator sees a leadership
+handover rather than a generic message. `validateMutableStorageClass` is now built
+on `validateRequestedCreateStorageClass` so the two doors onto `storage_class`
+cannot drift on what counts as an admissible class. Two GC comments that read as if
+a datacenter were already running destructive GC now describe the post-activation
+posture.
+
+**Files**: `internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
+`internal/gc/gc.go`, `internal/gc/store_cassandra.go`,
+`internal/api/v2/storage_policy.go`, `CURRENT_WORK.md`, `docs/KNOWN_ISSUES.md`,
+`docs/OPEN-WORK-INDEX.md`, `docs/PROD-READINESS-VERIFICATION-20260822.md`,
+`docs/CHANGELOG.md`
+
+---
+
 ## 2026-08-22 - Final readiness review corrections
 
 **`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` — verified preexisting,
@@ -19,11 +81,14 @@ bare `HasLibraryAccess`; upload-link update/delete use creator identity only. A
 advertised scope. This branch does not change those routes; the issue registry
 records the finding, impact, fix direction and required scope matrix.
 
-**API-key defaults narrowed without making ordinary clients read-only.** Both
-self-service and sysadmin creation now default to `read-write`; `admin` remains
-selectable only for an authorized target and is never preselected. Accounts still
-requires an explicitly selected admin-scoped key for its dedicated platform
-service account.
+**API-key creation defaults normalized to `read-write`; `admin` is never
+preselected.** "Narrowed" would not describe this accurately: for an admin-capable
+user the default drops (`admin` → `read-write`), but for an ordinary user it rises
+(`read` → `read-write`). Both self-service and sysadmin creation now land on the
+same value — the scope an ordinary client actually needs to sync and to administer
+its own libraries — while `admin` remains selectable only for an authorized target
+and is never the preselected option. Accounts still requires an explicitly selected
+admin-scoped key for its dedicated platform service account.
 
 **Settings compatibility restored.** The branch had made `GET history-limit` and
 `GET auto-delete` canonical-owner-only while adding mutation scope checks. Those
