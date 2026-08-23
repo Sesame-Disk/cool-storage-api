@@ -127,9 +127,10 @@ are the same lesson:
 
 - **The first guard reintroduced a shutdown deadlock.** Reading
   `config.Enabled && started` under `s.mu` collided with `Service.Stop`, which
-  holds `s.mu` across `s.wg.Wait()` while `runScannerOnce` calls `TriggerWorker`
-  from inside a goroutine that `Wait` is waiting for. The predicate now reads an
-  atomic. A guard placed on a hot shutdown path has to be lock-free.
+  originally held `s.mu` across `s.wg.Wait()` while `runScannerOnce` called
+  `TriggerWorker` from inside a goroutine that `Wait` was waiting for. The
+  predicate now reads an atomic and shutdown no longer holds the lifecycle mutex
+  while draining. A guard placed on a hot shutdown path has to be lock-free.
 - **`Service.DeleteFailedItem` and `RequeueFailedItem` had the same gap**, and a
   worse consequence: they call `tryClaimLeadershipForAdmin`, which *claims the
   lease*. An operator on any disabled or stopping replica could take GC leadership
@@ -144,6 +145,13 @@ are the same lesson:
   not require current leadership, because their store work is inline and the
   operation can claim leadership itself. Requiring the active lifecycle prevents
   a stopped node from reclaiming the lease during HTTP shutdown.
+
+- **A shutdown timeout no longer publishes a false stopped state.** The service
+  remains `stopping`, refuses triggers and restart, and keeps the old run's
+  `WaitGroup` isolated until DLQ and workers actually drain. Lease renewal remains
+  active during that drain; only the finalizer stops renewal, releases leadership
+  and transitions to `stopped`. `StopWithContext` returns its context error to
+  `Server.Shutdown`.
 
 ### B.2 Library configuration mutations have no permission gate — HIGH → ✅ Fixed 2026-08-22
 
@@ -162,26 +170,25 @@ group. The three handlers are reachable through **five** registrations (with and
 without trailing slash) under **two** prefixes (`/api/v2`, `/api2`) — so this was a
 route surface, not three stray functions, and the gate had to live in the handler.
 
-Fixed by `LibraryHandler.requireLibraryConfigAuthority`, requiring
-`PermissionOwner` (library owner or org owner/admin/superadmin — `GetLibraryPermission`
-already collapses both onto that value). Content `rw` is deliberately insufficient.
-Repo API tokens are refused outright. Negative tests in
+Fixed by `LibraryHandler.requireLibraryConfigAuthority`, which compares the caller
+to the canonical owner before considering an explicit organization role. Owner
+credentials require API-key scope `read-write`; organization
+owner/admin/superadmin overrides require scope `admin`. Content shares remain
+insufficient and repo API tokens are refused outright. Negative tests in
 `internal/api/v2/library_mutation_authority_test.go`, confirmed red before the fix.
 
 **The first version of this fix was incomplete**, and the gap is worth recording
 because it is easy to repeat. `GetLibraryPermission` answers only *"what is this
 USER's authority over this library"* — it reads the org role and the owner column
-from Cassandra and knows nothing about the credential the request arrived on. So
-an API key with `read` scope, minted by the library's own owner, resolved to
-`PermissionOwner` and passed the gate. The middleware paths never had this problem
-because they apply `apiKeyScopeAllowsLibraryPermission` (where `PermissionOwner`
-requires `scope == "admin"`) *in addition to* the lookup. Any handler that enforces
-a permission level itself owes both questions, not one; the scope check is now
-exported as `middleware.APIKeyScopeAllowsLibraryPermission` so there is a single
-source of truth rather than a second copy of the ceiling.
+from Cassandra and collapses canonical ownership and organization-role override
+onto `PermissionOwner`. That model cannot express their different credential
+ceilings. The final gate checks canonical identity and organization role
+separately, then applies the corresponding API-key scope.
 
-`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` — the residency half of
-`ChangeStorageClass` — **remains open**; it is narrowed, not closed, by the above.
+`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` is now **partially closed**:
+`ChangeStorageClass` rejects cold primary placement and re-applies a strict
+organization's `default_region`. Runtime failover, already-persisted preferences,
+historical/reused content and migration remain open.
 
 ### B.3 Chunked upload state is node-local — HIGH, multi-instance only
 

@@ -18,14 +18,19 @@ import (
 )
 
 type fakeLeaderLease struct {
-	allowed  bool
-	err      error
-	delay    time.Duration
-	calls    int32
-	released atomic.Bool
-	leader   atomic.Bool
-	acquired chan struct{}
-	once     sync.Once
+	allowed         bool
+	err             error
+	delay           time.Duration
+	renewalInterval time.Duration
+	calls           int32
+	released        atomic.Bool
+	leader          atomic.Bool
+	acquired        chan struct{}
+	once            sync.Once
+}
+
+func (f *fakeLeaderLease) RenewalInterval() time.Duration {
+	return f.renewalInterval
 }
 
 func (f *fakeLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, error) {

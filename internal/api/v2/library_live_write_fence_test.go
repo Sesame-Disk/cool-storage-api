@@ -636,7 +636,7 @@ func newLibraryHandlerForLiveFenceTests() *LibraryHandler {
 
 func TestChangeStorageClassRejectsNonCanonicalReference(t *testing.T) {
 	withLiveLibraryStateStub(t, func() {
-		withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+		withOrgRoleStub(t, middleware.RoleAdmin, nil, func() {
 			r := gin.New()
 			handler := newLibraryHandlerForLiveFenceTests()
 			r.POST("/repos/:repo_id/storage-class", func(c *gin.Context) {

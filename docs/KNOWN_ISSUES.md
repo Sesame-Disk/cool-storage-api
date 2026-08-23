@@ -23,7 +23,7 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
-| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's library permission, so any authenticated member of an organization could rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. All three now gate on `requireLibraryConfigAuthority`, which requires `PermissionOwner` (library owner or org owner/admin/superadmin) and refuses repo API tokens; content `rw` no longer carries configuration authority. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint, which remains open. |
+| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's authority. All three now distinguish the canonical owner from organization-role overrides: owner API keys require `read-write`, organization owner/admin/superadmin overrides require `admin`, repo API tokens and content shares remain insufficient. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the remaining runtime-placement and historical-content residency scope. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -7835,9 +7835,9 @@ for hot post-upload paths. Multi-DC tests still missing.
 
 ---
 
-### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: `ChangeStorageClass` does not revalidate strict data residency
+### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: strict residency is not enforced through the full placement lifecycle
 
-**Status**: 🟡 Open
+**Status**: 🟡 Partial — preference transition fixed 2026-08-22; runtime placement, failover and historical content remain open
 **Severity**: Medium (policy / compliance)
 **Affected**: `LibraryHandler.ChangeStorageClass` (`internal/api/v2/libraries.go`)
 **Source of record**: [storage-class placement options](./STORAGE-CLASS-PLACEMENT-OPTIONS.md) - "Residency policy, failover and preference changes"
@@ -7849,15 +7849,17 @@ Library creation enforces the organization's residency policy through
 `data_residency: strict` the requested class must be configured, hot-tier and
 mapped to the organization's `default_region`.
 
-`ChangeStorageClass` does not repeat that check. It validates only
-`isKnownStorageClass(req.StorageClass)` — canonical name plus configured — and
-then writes `libraries.storage_class` together with the administrative read model
-in one logged batch. An organization configured as `strict` can therefore move an
-existing library's preference to **any** class known to the serving endpoint,
-including one outside the region its own policy allows. The creation-time
-constraint is bypassable by a later edit.
+`ChangeStorageClass` originally did not repeat that check. It validated only
+`isKnownStorageClass(req.StorageClass)`, allowing an existing library preference
+to bypass both region and tier constraints.
 
-**The tier requirement is dropped as well.** Creation routes the requested class
+**Fixed 2026-08-22:** the handler now reads the current organization policy and
+calls `validateMutableStorageClass`. Every policy rejects cold primary placement;
+under `strict`, the requested hot class must map to `default_region`. Canonical and
+administrative projections are then updated in the same logged batch. Focused tests
+cover same-region hot acceptance plus cross-region and cold rejection.
+
+**Original tier defect.** Creation routes the requested class
 through `validateRequestedCreateStorageClass`, which rejects a cold class with
 `storage class must use hot tier` via `isHotStorageClass`. `isKnownStorageClass`
 performs no tier check, so `ChangeStorageClass` accepts a configured cold class
@@ -7880,34 +7882,31 @@ is nominal in the current tree, not implemented:
 - `Manager.GetHotBackends` / `GetColdBackends` are inventory helpers with no
   caller in the read or write path.
 
-So pointing a library at a cold class today does **not** make its future blocks
-unreadable or subject them to a retrieval delay. The defect is coherence: create
-refuses cold deliberately, because "cold-tier primary placement remains future
-design work" (`DEPLOY.md`), while change accepts it — leaving a library able to
-prefer a placement mode that has no design behind it. Treat this as a policy gap
-to close before cold is implemented, not as a live data-availability risk.
+Pointing a library at a cold class would not currently make its future blocks
+subject to retrieval delay. Creation and preference changes now both reject that
+unsupported primary-placement mode; cold-tier primary placement remains future
+design work.
 
-This is a placement-policy hole, not data movement: existing canonical blocks keep
-their persisted `blocks.storage_class`, physical object and derived key. The
-consequence is that **future** first materializations for that library prefer a
-class the residency policy was meant to forbid.
+The fix is a placement-policy gate, not data movement: existing canonical blocks
+keep their persisted `blocks.storage_class`, physical object and derived key. A
+preference persisted before a later `flexible -> strict` transition can still be
+out of region and the materialization resolver still honors it without consulting
+the policy.
 
 A second, narrower path to the same outcome is separately noted: strict policy does
 not constrain `failover_class` either, so a new block can be persisted outside the
 allowed region when the preferred class is already marked `Unhealthy` or `Failed`.
 That path is currently unreachable at runtime - `CheckHealth` holds the marking
 logic but has no automatic caller, so no class is ever marked unhealthy in a
-running server - while this one is reachable through the ordinary API. Note that
+running server. Note that
 automating health monitoring would make the failover path live, so it hardens
 availability and weakens residency at the same time; the two must be decided
 together.
 
-**Narrowed 2026-08-22 by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** that
-endpoint now requires `PermissionOwner`, so the caller must be the library owner
-or an org admin. That shrinks the population who can move residency; it does not
-close this issue, because the residency contract itself is still unenforced on
-the transition — an owner acting in good faith can still move a `strict` org's
-library out of region.
+**Authorization fixed 2026-08-22:** canonical owners may use session or
+`read-write` API-key credentials; organization owner/admin/superadmin overrides
+require session or `admin` API-key credentials. Content shares and repo API tokens
+cannot change library configuration.
 
 #### Fix Direction
 
@@ -7939,8 +7938,7 @@ operation. That was rejected as more restrictive than residency requires: moving
 library from one in-region hot class to another in-region hot class breaks no
 residency promise, and forbidding it removes a legitimate feature to buy nothing.
 
-**The in-region case is not merely empty today — it is currently inexpressible,
-and that is a prerequisite this rule depends on.** `storageClassRegion` attributes
+**Multiple hot classes in one logical region remain inexpressible.** `storageClassRegion` attributes
 a region to a class only by finding it as the `hot` or `cold` entry of some
 `region_classes` mapping, and `RegionClassConfig` holds exactly one `Hot` and one
 `Cold` string per region. A second hot class in the same region therefore resolves
@@ -7970,22 +7968,20 @@ The workable shapes are `region_classes` gaining a membership list
 class may serve two logical regions, the membership list is the honest model. That change
 belongs with the rule, not after it.
 
-Implementation shape:
+Implementation status and remaining shape:
 
-1. Read the organization's policy with `readOrgStoragePolicy`. Under
+1. **Implemented:** read the organization's policy with `readOrgStoragePolicy`. Under
    `orgDataResidencyStrict`, require the requested class to resolve to
    `policy.DefaultRegion` — the check `resolveStrictCreateStorageClass` already
    performs with `storageClassRegion`.
-2. Route the request through the same validation creation uses rather than a
-   second copy of the rule — reuse `resolveCreateStorageClassForOrg`, or extract
-   its policy half, so both doors answer identically. This restores the hot-tier
-   requirement at the same time; region and tier were one contract at creation and
-   should stay one contract.
-3. Cover with tests: strict accepts an in-region hot class, rejects an
+2. **Implemented:** route the mutation through `validateMutableStorageClass`, which
+   restores the hot-tier requirement for flexible and strict policy and the region
+   requirement for strict policy.
+3. **Implemented:** focused tests prove strict accepts an in-region hot class, rejects an
    out-of-region one and rejects a cold one; flexible accepts any hot class and
    rejects a cold one.
 
-4. Give the placement resolver the policy as well. Gating the endpoint alone
+4. **Open:** give the placement resolver the policy as well. Gating the endpoint alone
    leaves a library whose stored class is already out of region — from before the
    switch to `strict`, or from a `flexible` period — materializing new blocks
    outside it, because `ResolveStorageClass` honours `library.storage_class`
@@ -8018,20 +8014,19 @@ elsewhere. Three candidate rules, none chosen:
    policy takes effect and makes no claim about content already placed. Weakest
    promise and cheapest, but still **not** what the code does today.
 
-**None of the three is implemented, including option 3.** An earlier draft of this
+**None of the three transition semantics is implemented, including option 3.** An earlier draft of this
 entry said option 3 was "what the code does by omission". That is wrong. Forward-only
 would require materialization to consult the policy, and no placement resolver does:
 `Manager.ResolveStorageClass` returns `library.storage_class` first and never falls
 back or re-checks (`internal/storage/storage.go`), and the request chain that feeds
 it — `resolveLibraryBlockStoreForRequestContext` ->
 `lookupLibraryStorageClassContextFn` -> `resolvePreferredLibraryStorageClassForRequest`
-(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy
-either: `readOrgStoragePolicy` has no caller outside the creation path in
-`storage_policy.go`.
+(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy.
 
-What the code actually implements is narrower than any of the three: `strict` binds
-only the class **chosen at library creation**, and nothing re-checks it afterwards.
-A library created while the organization was `flexible`, holding an out-of-region
+What the code implements is narrower than any of the three: `strict` gates the
+class chosen at library creation and a later explicit preference change, but it
+does not re-check an already-persisted preference when policy itself changes. A
+library created while the organization was `flexible`, holding an out-of-region
 class, keeps materializing new blocks into that class after the switch to `strict`.
 
 Two consequences for the fix:
@@ -8145,22 +8140,24 @@ the sixth registration would forget it.
 #### Fix (2026-08-22)
 
 One shared gate, `LibraryHandler.requireLibraryConfigAuthority`, called by all
-three handlers immediately after the live-library fence:
+three handlers immediately after the live-library check:
 
-- **Required level: `PermissionOwner`.** `GetLibraryPermission` already collapses
-  library owner and org admin/superadmin onto that value, so a single comparison
-  admits both legitimate administrators without a second lookup. Content `rw` is
-  deliberately **not** sufficient: an `rw` share decides what is *in* a library,
-  not what it is called, how long its versions are kept, or where its future
-  blocks are placed.
+- **Canonical owner:** session credentials or an API key with at least
+  `read-write` scope.
+- **Organization owner/admin/superadmin override:** session credentials or an API
+  key with `admin` scope. The role is read explicitly instead of inferred from an
+  aggregated library permission.
+- **Content shares are insufficient:** even `rw` or `admin` share labels decide
+  what is *in* a library, not what it is called, how long its versions are kept,
+  or where its future blocks are placed.
 - **Repo API tokens are refused outright**, before the permission lookup. Such a
   token is a content credential scoped to one library and mints at most `rw`;
   letting the minting user's own permissions answer for it would hand the token a
   reach it was never issued.
 - **Empty `user_id` fails closed** rather than resolving permissions for `""`.
-- **Lookup errors return 500**, never a silent allow.
+- **Organization-role lookup errors return 500**, never a silent allow.
 
-Ordered after the liveness fence to match `DeleteLibrary`. That leaves the same
+Ordered after the liveness check to match `DeleteLibrary`. That leaves the same
 within-org existence signal `DeleteLibrary` already accepts (an unauthorized
 caller can still distinguish a live library in their own org from a deleted one);
 closing it is a separate decision that should move all four handlers at once
@@ -8172,11 +8169,13 @@ rather than leave the pair inconsistent.
 three handlers, driving rename through `LibraryOperation` the way the route
 actually dispatches:
 
-- `rw`, `r`, `cloud-edit`, `preview` and no-permission callers → 403 (15 cases)
-- owner/org-admin → gate returns true
+- content-share callers without an administrative org role → 403
+- canonical owner session/`read-write` and org-admin session/`admin` → allowed
+- owner `read` and org-admin `read-write` API keys → 403
 - missing `user_id` → 403
 - repo API token → 403
-- permission-lookup error → 500
+- organization-role lookup error → 500
+- `DeleteLibrary` and library settings carry explicit scope matrices
 
 Confirmed red before the fix: with the three gate call sites removed, the `rw`
 case fails and the handler proceeds into the database.

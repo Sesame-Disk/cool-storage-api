@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -20,6 +21,10 @@ type LibrarySettingsHandler struct {
 	db             *db.DB
 	config         *config.Config
 	permMiddleware *middleware.PermissionMiddleware
+}
+
+var isLibraryOwnerFn = func(pm *middleware.PermissionMiddleware, orgID, userID, repoID string) (bool, error) {
+	return pm.IsLibraryOwner(orgID, userID, repoID)
 }
 
 // NewLibrarySettingsHandler creates a new LibrarySettingsHandler
@@ -80,7 +85,7 @@ func RegisterV21LibrarySettingsRoutes(rg *gin.RouterGroup, database *db.DB, cfg 
 }
 
 // requireOwner checks if the current user owns the library. Returns orgID, userID, repoID on success.
-func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, string, bool) {
+func (h *LibrarySettingsHandler) requireOwner(c *gin.Context, requiredScope string) (string, string, string, bool) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 	repoID := c.Param("repo_id")
@@ -94,7 +99,7 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, s
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return "", "", "", false
 	}
-	if !requireLibraryOwnerCredential(c) {
+	if !requireLibraryOwnerCredential(c, requiredScope) {
 		return "", "", "", false
 	}
 
@@ -109,7 +114,7 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, s
 		}
 	}
 
-	isOwner, err := h.permMiddleware.IsLibraryOwner(orgID, userID, repoID)
+	isOwner, err := isLibraryOwnerFn(h.permMiddleware, orgID, userID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check ownership"})
 		return "", "", "", false
@@ -130,11 +135,8 @@ func (h *LibrarySettingsHandler) requireOwner(c *gin.Context) (string, string, s
 // GetHistoryLimit returns the history limit for a library
 // GET /api/v2.1/repos/:repo_id/history-limit/
 func (h *LibrarySettingsHandler) GetHistoryLimit(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	repoID := c.Param("repo_id")
-
-	if orgID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeRead)
+	if !ok {
 		return
 	}
 
@@ -162,7 +164,7 @@ func (h *LibrarySettingsHandler) GetHistoryLimit(c *gin.Context) {
 // SetHistoryLimit sets the history limit for a library
 // PUT /api/v2.1/repos/:repo_id/history-limit/
 func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
-	orgID, _, repoID, ok := h.requireOwner(c)
+	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -181,7 +183,6 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 		return
 	}
 
-	// Store in version_ttl_days column
 	now := time.Now()
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
@@ -224,11 +225,8 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 // GetAutoDelete returns the auto-delete settings for a library
 // GET /api/v2.1/repos/:repo_id/auto-delete/
 func (h *LibrarySettingsHandler) GetAutoDelete(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	repoID := c.Param("repo_id")
-
-	if orgID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeRead)
+	if !ok {
 		return
 	}
 
@@ -248,7 +246,7 @@ func (h *LibrarySettingsHandler) GetAutoDelete(c *gin.Context) {
 // SetAutoDelete sets the auto-delete settings for a library
 // PUT /api/v2.1/repos/:repo_id/auto-delete/
 func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
-	orgID, _, repoID, ok := h.requireOwner(c)
+	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -316,7 +314,7 @@ type APITokenResponse struct {
 // ListAPITokens returns all API tokens for a library
 // GET /api/v2.1/repos/:repo_id/repo-api-tokens/
 func (h *LibrarySettingsHandler) ListAPITokens(c *gin.Context) {
-	_, _, repoID, ok := h.requireOwner(c)
+	_, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -355,7 +353,7 @@ func (h *LibrarySettingsHandler) ListAPITokens(c *gin.Context) {
 // CreateAPIToken creates a new API token for a library
 // POST /api/v2.1/repos/:repo_id/repo-api-tokens/
 func (h *LibrarySettingsHandler) CreateAPIToken(c *gin.Context) {
-	_, userID, repoID, ok := h.requireOwner(c)
+	_, userID, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -429,7 +427,7 @@ func (h *LibrarySettingsHandler) CreateAPIToken(c *gin.Context) {
 // DeleteAPIToken deletes an API token for a library
 // DELETE /api/v2.1/repos/:repo_id/repo-api-tokens/:app_name/
 func (h *LibrarySettingsHandler) DeleteAPIToken(c *gin.Context) {
-	_, _, repoID, ok := h.requireOwner(c)
+	_, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -458,7 +456,7 @@ func (h *LibrarySettingsHandler) DeleteAPIToken(c *gin.Context) {
 // UpdateAPIToken updates the permission of an API token
 // PUT /api/v2.1/repos/:repo_id/repo-api-tokens/:app_name/
 func (h *LibrarySettingsHandler) UpdateAPIToken(c *gin.Context) {
-	_, _, repoID, ok := h.requireOwner(c)
+	_, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}
@@ -504,7 +502,7 @@ func (h *LibrarySettingsHandler) UpdateAPIToken(c *gin.Context) {
 // TransferLibrary transfers a library to a new owner
 // PUT /api2/repos/:repo_id/owner/
 func (h *LibrarySettingsHandler) TransferLibrary(c *gin.Context) {
-	orgID, _, repoID, ok := h.requireOwner(c)
+	orgID, _, repoID, ok := h.requireOwner(c, apikeys.ScopeReadWrite)
 	if !ok {
 		return
 	}

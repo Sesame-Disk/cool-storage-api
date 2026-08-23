@@ -157,6 +157,18 @@ func TestValidateMutableStorageClassStrictPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateMutableStorageClassFlexibleRejectsColdTier(t *testing.T) {
+	cfg := testStoragePolicyConfig()
+	policy := orgStoragePolicy{DataResidency: orgDataResidencyFlexible}
+
+	if err := validateMutableStorageClass(cfg, policy, "hot-s3-usa"); err != nil {
+		t.Fatalf("flexible hot class rejected: %v", err)
+	}
+	if err := validateMutableStorageClass(cfg, policy, "cold-s3-eu"); err == nil {
+		t.Fatal("flexible policy accepted cold primary placement")
+	}
+}
+
 // Create is the other door onto the same field ChangeStorageClass guards, and both
 // must answer the same way about the same raw value. Normalizing the request here
 // would persist an identity the caller never named while the change endpoint

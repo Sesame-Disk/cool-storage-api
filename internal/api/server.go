@@ -2041,10 +2041,25 @@ func (s *Server) Run() error {
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
-	// Stop GC service first
+	// Stop accepting HTTP work while GC drains. Running both shutdowns together
+	// prevents a DLQ request admitted just before shutdown from making the two
+	// subsystems wait on each other serially under the same deadline.
+	var gcStopDone chan error
 	if s.gcService != nil {
-		s.gcService.StopWithContext(ctx)
+		gcStopDone = make(chan error, 1)
+		go func() {
+			gcStopDone <- s.gcService.StopWithContext(ctx)
+		}()
 	}
+	var httpErr error
+	if s.server != nil {
+		httpErr = s.server.Shutdown(ctx)
+	}
+	var gcErr error
+	if gcStopDone != nil {
+		gcErr = <-gcStopDone
+	}
+
 	if s.authRateLimiter != nil {
 		s.authRateLimiter.Stop()
 	}
@@ -2062,10 +2077,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.authHandler.GetOIDCClient().StopStateSweeper()
 	}
 
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
-	}
-	return nil
+	return errors.Join(httpErr, gcErr)
 }
 
 // handleEmptyActivities returns empty activities list (stub)

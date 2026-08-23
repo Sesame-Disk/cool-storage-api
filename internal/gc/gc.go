@@ -147,10 +147,14 @@ type Service struct {
 	// not on the GC queue.
 	dbSession *gocql.Session
 
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	started bool
-	mu      sync.Mutex
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	leaseCancel context.CancelFunc
+	leaseWG     sync.WaitGroup
+	started     bool
+	stopping    bool
+	stopDone    chan struct{}
+	mu          sync.Mutex
 
 	// reconcileMu serializes snapshot reconciliation so global gc_stats totals
 	// are not corrupted by concurrent read-modify-write cycles.
@@ -181,14 +185,9 @@ type Service struct {
 	// never be held across wg.Wait(), because scanner shutdown can call a trigger.
 	triggerMu sync.Mutex
 
-	// acceptingWork mirrors "config.Enabled && started" for readers that must NOT
-	// take s.mu. It is deliberately an atomic and not a guarded field: Stop() holds
-	// s.mu across s.wg.Wait(), and the scanner goroutine calls TriggerWorker() from
-	// inside runScannerOnce, so a mutex read on that path deadlocks shutdown —
-	// Stop waits for the scanner, the scanner waits for Stop's lock. config.Enabled
-	// is written once in NewService and never mutated (SetDryRun touches DryRun
-	// only), so Start/Stop are the only writers and a single flag captures both
-	// conditions.
+	// acceptingWork mirrors the active running state for readers that must not take
+	// s.mu. The scanner can call TriggerWorker from a run-owned goroutine while
+	// shutdown waits for that run, so trigger admission stays lock-free.
 	acceptingWork atomic.Bool
 	// dryRun is the runtime value used by status and the worker. The config field
 	// remains the startup default; runtime changes must be atomic because the API
@@ -231,7 +230,7 @@ func (s *Service) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.started {
+	if s.started || s.stopping {
 		return
 	}
 
@@ -285,10 +284,12 @@ func (s *Service) Start() {
 	// worker/scanner duration so long-running ProcessOnce or ScanOnce calls
 	// (which can exceed the TTL) don't cause the lease to lapse.
 	if s.lease != nil {
-		s.wg.Add(1)
+		leaseCtx, leaseCancel := context.WithCancel(context.Background())
+		s.leaseCancel = leaseCancel
+		s.leaseWG.Add(1)
 		go func() {
-			defer s.wg.Done()
-			s.runLeaseRenewalLoop(ctx)
+			defer s.leaseWG.Done()
+			s.runLeaseRenewalLoop(leaseCtx)
 		}()
 	}
 
@@ -339,73 +340,71 @@ func (s *Service) Stop() {
 	s.StopWithContext(context.Background())
 }
 
-// StopWithContext stops the service without allowing an in-flight DLQ request
-// to make shutdown wait forever. If the context expires before the DLQ gate or
-// worker goroutines drain, leadership is deliberately not released; the lease
-// TTL is safer than releasing it while a canceled admin mutation may still be
-// finishing.
-func (s *Service) StopWithContext(ctx context.Context) {
+// StopWithContext starts shutdown and waits for the current run to drain. A
+// timed-out caller does not make the service restartable: the lifecycle remains
+// stopping until every worker and DLQ mutation has exited, then releases the
+// lease and transitions to stopped.
+func (s *Service) StopWithContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.started {
-		return
+	if !s.started && !s.stopping {
+		s.mu.Unlock()
+		return nil
 	}
 
-	log.Println("[GC] Stopping...")
-	// Refuse further admin work before draining, so a trigger cannot be accepted
-	// for loops that are already on their way out. This must precede wg.Wait(),
-	// which is where the goroutines being waited on would otherwise still be told
-	// "yes, the service accepts work".
-	s.acceptingWork.Store(false)
-	// Drain in-flight DLQ leadership claims before releasing the lease. The HTTP
-	// server is shut down after this method, so a request can still be entering
-	// here while Stop runs.
-	s.cancelActiveDLQOperation()
-	dlqDrained := s.waitForDLQDrain(ctx)
-	s.triggerMu.Lock()
-	drainTriggerChannel(s.triggerWorker)
-	drainTriggerChannel(s.triggerScanner)
-	s.triggerMu.Unlock()
-	s.cancel()
-	workersDone := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(workersDone)
-	}()
+	if !s.stopping {
+		log.Println("[GC] Stopping...")
+		s.stopping = true
+		s.stopDone = make(chan struct{})
+		s.acceptingWork.Store(false)
+		s.cancelActiveDLQOperation()
+		s.triggerMu.Lock()
+		drainTriggerChannel(s.triggerWorker)
+		drainTriggerChannel(s.triggerScanner)
+		s.triggerMu.Unlock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		go s.finishStop(s.stopDone)
+	}
+	stopDone := s.stopDone
+	s.mu.Unlock()
+
 	select {
-	case <-workersDone:
+	case <-stopDone:
+		return nil
 	case <-ctx.Done():
-		log.Printf("[GC] Shutdown context expired while waiting for workers")
+		log.Printf("[GC] Shutdown context expired while waiting for drain: %v", ctx.Err())
+		return fmt.Errorf("stop gc service: %w", ctx.Err())
 	}
-
-	// Release leadership so another replica can take over without waiting
-	// for TTL expiry. Best-effort — if it fails, TTL handles it.
-	if dlqDrained && isClosed(workersDone) && s.lease != nil {
-		s.lease.Release(context.Background())
-	} else if s.lease != nil {
-		log.Printf("[GC] Retaining leadership lease for TTL after incomplete shutdown")
-	}
-
-	// Persist stats to database before shutdown
-	if isClosed(workersDone) {
-		s.persistStats()
-	}
-
-	s.started = false
-	log.Println("[GC] Stopped")
 }
 
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
+func (s *Service) finishStop(stopDone chan struct{}) {
+	// Once shutdown begins no new DLQ operation can pass its lifecycle check.
+	// Wait without the caller's deadline so a timeout cannot publish a false
+	// stopped state or permit WaitGroup reuse while this run is still draining.
+	s.waitForDLQDrain(context.Background())
+	s.wg.Wait()
+
+	if s.leaseCancel != nil {
+		s.leaseCancel()
+		s.leaseWG.Wait()
 	}
+	if s.lease != nil {
+		s.lease.Release(context.Background())
+	}
+	s.persistStats()
+
+	s.mu.Lock()
+	s.started = false
+	s.stopping = false
+	s.cancel = nil
+	s.leaseCancel = nil
+	close(stopDone)
+	s.mu.Unlock()
+	log.Println("[GC] Stopped")
 }
 
 // AcceptsManualTriggers reports whether a manual worker/scanner trigger can
@@ -1469,6 +1468,11 @@ func (s *Service) tryClaimLeadershipForAdmin(ctx context.Context, component stri
 func (s *Service) leaseRenewalInterval() time.Duration {
 	if s.lease == nil {
 		return time.Minute
+	}
+	if provider, ok := s.lease.(interface{ RenewalInterval() time.Duration }); ok {
+		if interval := provider.RenewalInterval(); interval > 0 {
+			return interval
+		}
 	}
 	cl, ok := s.lease.(*cassandraLeaderLease)
 	if !ok {

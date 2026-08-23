@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -171,7 +172,7 @@ func TestService_NilServiceRefusesManualTriggers(t *testing.T) {
 }
 
 func TestService_StopDoesNotDeadlockAgainstTrigger(t *testing.T) {
-	// Regression: AcceptsManualTriggers once took s.mu, and Stop() holds s.mu across
+	// Regression: AcceptsManualTriggers once took s.mu while Stop held it across
 	// s.wg.Wait(). The scanner goroutine calls TriggerWorker() from inside
 	// runScannerOnce after auto-requeuing recoverable failed items, so shutdown
 	// could hang forever: Stop waits for the scanner, the scanner waits for Stop's
@@ -189,8 +190,8 @@ func TestService_StopDoesNotDeadlockAgainstTrigger(t *testing.T) {
 	svc.Start()
 
 	// Stand in for the scanner goroutine: counted in s.wg, and held until Stop()
-	// has closed acceptingWork. This makes the trigger land while Stop() holds
-	// s.mu inside wg.Wait(), without relying on scheduler timing.
+	// has closed acceptingWork. This reproduces the dependency without relying on
+	// scheduler timing.
 	svc.wg.Add(1)
 	trigger := make(chan struct{})
 	go func() {
@@ -221,6 +222,94 @@ func TestService_StopDoesNotDeadlockAgainstTrigger(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Stop() deadlocked against a concurrent trigger; shutdown would hang Server.Shutdown()")
 	}
+}
+
+func TestService_StopTimeoutBlocksRestartUntilRunDrains(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    time.Hour,
+		DryRun:         true,
+	}
+	lease := &fakeLeaderLease{allowed: true, renewalInterval: 2 * time.Millisecond}
+	svc := NewService(NewMockStore(), nil, cfg, nil)
+	svc.lease = lease
+	svc.Start()
+
+	// Model one run-owned goroutine that observes cancellation slowly. Start must
+	// not reuse the WaitGroup or reacquire leadership while it is still present.
+	blocker := make(chan struct{})
+	blockerClosed := false
+	defer func() {
+		if !blockerClosed {
+			close(blocker)
+		}
+		svc.Stop()
+	}()
+	svc.wg.Add(1)
+	go func() {
+		defer svc.wg.Done()
+		<-blocker
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := svc.StopWithContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StopWithContext error = %v, want context deadline exceeded", err)
+	}
+	if lease.released.Load() {
+		t.Fatal("leadership lease released before the old run drained")
+	}
+
+	svc.mu.Lock()
+	started, stopping := svc.started, svc.stopping
+	stopDone := svc.stopDone
+	svc.mu.Unlock()
+	if !started || !stopping {
+		t.Fatalf("lifecycle after timeout = started:%v stopping:%v, want true/true", started, stopping)
+	}
+
+	callsBeforeRenewal := atomic.LoadInt32(&lease.calls)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for atomic.LoadInt32(&lease.calls) == callsBeforeRenewal && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&lease.calls); got == callsBeforeRenewal {
+		t.Fatal("leadership lease was not renewed while the old run was draining")
+	}
+
+	svc.Start()
+	svc.mu.Lock()
+	started, stopping = svc.started, svc.stopping
+	sameStopDone := svc.stopDone == stopDone
+	svc.mu.Unlock()
+	if !started || !stopping || !sameStopDone {
+		t.Fatalf("Start during drain changed lifecycle: started:%v stopping:%v same stop channel:%v", started, stopping, sameStopDone)
+	}
+
+	close(blocker)
+	blockerClosed = true
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("service did not finish stopping after the old run drained")
+	}
+	if !lease.released.Load() {
+		t.Fatal("leadership lease was not released after a complete drain")
+	}
+
+	svc.mu.Lock()
+	started, stopping = svc.started, svc.stopping
+	svc.mu.Unlock()
+	if started || stopping {
+		t.Fatalf("final lifecycle = started:%v stopping:%v, want false/false", started, stopping)
+	}
+
+	// A genuinely stopped service remains restartable.
+	svc.Start()
+	svc.Stop()
 }
 
 func TestService_StartDrainsStaleTriggerTokens(t *testing.T) {

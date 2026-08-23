@@ -24,11 +24,7 @@ class APIKeys extends React.Component {
             isSubmitting: false,
             keyToRevoke: null,
             createdToken: '',
-            createForm: {
-                label: '',
-                scope: 'read',
-                expiration: '90'
-            }
+            createForm: this.getDefaultCreateForm()
         };
     }
 
@@ -39,7 +35,7 @@ class APIKeys extends React.Component {
     getDefaultCreateForm = () => {
         return {
             label: '',
-            scope: this.canGrantAdminScope() ? 'admin' : 'read',
+            scope: 'read-write',
             expiration: '90'
         };
     };

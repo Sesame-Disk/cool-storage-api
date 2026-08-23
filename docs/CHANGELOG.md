@@ -29,9 +29,8 @@ behind `authMiddleware` alone and never consulted the caller's library permissio
 so any authenticated org member could rename any library in the org, rewrite its
 description, shorten its `version_ttl_days` retention, or move its storage-class
 preference. All three now call one shared gate,
-`LibraryHandler.requireLibraryConfigAuthority`, requiring `PermissionOwner` —
-library owner or org owner/admin/superadmin, which `GetLibraryPermission` already
-collapses onto that single value. Content `rw` is deliberately insufficient: an
+`LibraryHandler.requireLibraryConfigAuthority`, which distinguishes the canonical
+owner from organization owner/admin/superadmin overrides. Content `rw` shares are deliberately insufficient: an
 `rw` share decides what is *in* a library, not what it is called or where its
 future blocks are placed. Repo API tokens are refused before the lookup, an empty
 `user_id` fails closed, and lookup errors return 500.
@@ -40,16 +39,21 @@ One gate rather than three checks because the defect was precisely a per-handler
 check three handlers lacked: `RegisterLibraryRoutesWithToken` builds a
 `PermissionMiddleware` and applies it to no route in the group, and the handlers
 are reachable through five registrations under two prefixes. Ordered after the
-live-library fence to match `DeleteLibrary`.
+live-library check to match `DeleteLibrary`.
+
+The attempted follow-up `UPDATE ... IF deleted_at = null` was withdrawn after
+review. In Cassandra that predicate can apply to an absent row and create a
+partial canonical record; executing projections afterward also splits one logical
+mutation into two independently failing commits. This bounded fix therefore keeps
+canonical, policy and read-model updates in their prior logged batch and makes no
+new claim about fully serializing a concurrent library delete. A general
+canonical-to-projection repair protocol remains separate architecture work.
 
 Review caught that the first version enforced only half the question.
-`GetLibraryPermission` answers "what is this USER's authority over this library"
-from Cassandra and knows nothing about the credential the request arrived on, so
-an API key with `read` scope minted by the library's owner still resolved to
-`PermissionOwner`. The middleware paths never had this problem because they apply
-the scope ceiling as well. The check is now exported as
-`middleware.APIKeyScopeAllowsLibraryPermission` and applied in the gate, keeping
-one source of truth for "PermissionOwner requires the admin scope".
+`GetLibraryPermission` collapses canonical ownership and organization-role
+override onto `PermissionOwner`, but their credential ceilings differ. The final
+gate checks identity and role separately: canonical owners may use `read-write`,
+while organization-role overrides require `admin`. Repo API tokens remain denied.
 
 **`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` — found and fixed.** The `GC_ENABLED=false`
 kill switch was enforced on the config surface but not the runtime one:
@@ -70,10 +74,10 @@ one.
 
 Review widened this twice, and both corrections are the same lesson. First, the
 initial predicate read `Enabled && started` under `s.mu` and reintroduced a
-**shutdown deadlock**: `Stop()` holds `s.mu` across `s.wg.Wait()`, and
-`runScannerOnce` calls `TriggerWorker` from a goroutine `Wait` is waiting for, so
-`Server.Shutdown` could hang forever. The predicate now reads an `atomic.Bool`
-written only by `Start`/`Stop`; a guard on a shutdown path has to be lock-free.
+**shutdown deadlock**: the original `Stop()` held `s.mu` across `s.wg.Wait()`, and
+`runScannerOnce` calls `TriggerWorker` from a goroutine `Wait` is waiting for. The
+predicate now reads an `atomic.Bool`; a guard on a shutdown path has to be
+lock-free.
 Second, `DeleteFailedItem` and `RequeueFailedItem` had the same gap with a worse
 consequence — they call `tryClaimLeadershipForAdmin`, which *claims the lease*, so
 an operator on a disabled or stopping replica could take GC leadership away from
@@ -91,6 +95,14 @@ distinction is pinned by lifecycle and follower tests.
 
 `Start()` additionally drains the trigger channels before launching the loops, so
 a token that raced `Stop()` cannot fire an unrequested run at the next enable.
+
+The bounded shutdown path now has explicit `running -> stopping -> stopped`
+semantics. If `StopWithContext` times out, it returns the context error but leaves
+the service in `stopping`; `Start` cannot reuse the `WaitGroup` or reacquire the
+lease. Lease renewal continues while a background finalizer waits for DLQ and
+worker drain; only then does it stop renewal, release leadership, persist stats and
+publish `stopped`. HTTP and GC shutdown begin
+concurrently under the same deadline, and their errors are joined.
 
 **New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
 re-verification at `a1570b186`: ten defects (five HIGH), what #181 did and did not

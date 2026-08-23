@@ -38,12 +38,26 @@ const (
 // The permission seam itself is stubbed with withLibraryPermissionStub, shared
 // with library_not_found_test.go.
 func withLiveLibraryStateStub(t *testing.T, fn func()) {
+	withLibraryOwnerStateStub(t, "someone-else", fn)
+}
+
+func withLibraryOwnerStateStub(t *testing.T, ownerID string, fn func()) {
 	t.Helper()
 	original := readLiveLibraryStateFn
 	readLiveLibraryStateFn = func(_ *gocql.Session, _, _ string) (dbpkg.LibraryState, error) {
-		return dbpkg.LibraryState{OwnerID: "someone-else", HeadCommitID: "head"}, nil
+		return dbpkg.LibraryState{OwnerID: ownerID, HeadCommitID: "head"}, nil
 	}
 	defer func() { readLiveLibraryStateFn = original }()
+	fn()
+}
+
+func withOrgRoleStub(t *testing.T, role middleware.OrganizationRole, stubErr error, fn func()) {
+	t.Helper()
+	original := getUserOrgRoleFn
+	getUserOrgRoleFn = func(_ *middleware.PermissionMiddleware, _, _ string) (middleware.OrganizationRole, error) {
+		return role, stubErr
+	}
+	defer func() { getUserOrgRoleFn = original }()
 	fn()
 }
 
@@ -108,57 +122,54 @@ func runMutation(t *testing.T, m libraryMutation, setup func(*gin.Context)) *htt
 }
 
 func TestLibraryMutations_RejectNonOwnerWithWriteAccess(t *testing.T) {
-	// "rw" is the interesting case: it is real write access to CONTENT, and it must
-	// still not carry authority over library configuration.
-	for _, perm := range []middleware.LibraryPermission{
-		middleware.PermissionRW,
-		middleware.PermissionR,
-		middleware.PermissionCloudEdit,
-		middleware.PermissionPreview,
-		middleware.PermissionNone,
-		// PermissionAdmin can come from a standard share. It is intentionally
-		// insufficient for configuration authority: only canonical ownership or
-		// org-admin authority may change library configuration.
-		middleware.PermissionAdmin,
-	} {
-		for _, m := range guardedLibraryMutations() {
-			t.Run(m.name+"/"+string(perm), func(t *testing.T) {
-				withLiveLibraryStateStub(t, func() {
-					withLibraryPermissionStub(t, perm, nil, func() {
-						w := runMutation(t, m, func(c *gin.Context) {
-							c.Set("user_id", authTestUserID)
-						})
-						if w.Code != http.StatusForbidden {
-							t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
-						}
-						assertJSONError(t, w.Body, "you do not have permission to modify this library")
-					})
+	// Shares are content authority only. Even a share labelled "admin" cannot
+	// substitute for canonical ownership or an organization administrator role.
+	for _, m := range guardedLibraryMutations() {
+		t.Run(m.name, func(t *testing.T) {
+			withLiveLibraryStateStub(t, func() {
+				withOrgRoleStub(t, middleware.RoleUser, nil, func() {
+					w := runMutation(t, m, func(c *gin.Context) { c.Set("user_id", authTestUserID) })
+					if w.Code != http.StatusForbidden {
+						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+					}
+					assertJSONError(t, w.Body, "you do not have permission to modify this library")
 				})
 			})
-		}
+		})
 	}
 }
 
 func TestLibraryMutations_AllowOwnerAndOrgAdmin(t *testing.T) {
-	// GetLibraryPermission collapses library owner and org owner/admin/superadmin onto
-	// PermissionOwner, so one allow case covers both callers who legitimately
-	// administer a library. Asserted at the gate rather than through the handler:
-	// past the gate the handlers write to Cassandra, which these unit tests do not
-	// have.
-	for _, m := range guardedLibraryMutations() {
-		t.Run(m.name, func(t *testing.T) {
-			withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
-				h := newLibraryHandlerForLiveFenceTests()
-				c, _ := gin.CreateTestContext(httptest.NewRecorder())
-				c.Set("org_id", authTestOrgID)
-				c.Set("user_id", authTestUserID)
-				c.Params = gin.Params{{Key: "repo_id", Value: authTestRepoID}}
+	tests := []struct {
+		name    string
+		ownerID string
+		role    middleware.OrganizationRole
+		scope   string
+	}{
+		{name: "canonical owner session", ownerID: authTestUserID, role: middleware.RoleUser},
+		{name: "canonical owner read-write key", ownerID: authTestUserID, role: middleware.RoleUser, scope: "read-write"},
+		{name: "org admin session", ownerID: "someone-else", role: middleware.RoleAdmin},
+		{name: "org admin admin key", ownerID: "someone-else", role: middleware.RoleAdmin, scope: "admin"},
+	}
+	for _, tc := range tests {
+		for _, m := range guardedLibraryMutations() {
+			t.Run(tc.name+"/"+m.name, func(t *testing.T) {
+				withOrgRoleStub(t, tc.role, nil, func() {
+					h := newLibraryHandlerForLiveFenceTests()
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Set("org_id", authTestOrgID)
+					c.Set("user_id", authTestUserID)
+					if tc.scope != "" {
+						c.Set("api_key_scope", tc.scope)
+					}
+					c.Params = gin.Params{{Key: "repo_id", Value: authTestRepoID}}
 
-				if !h.requireLibraryConfigAuthority(c, m.name, authTestOrgID, authTestRepoID) {
-					t.Fatal("requireLibraryConfigAuthority = false for PermissionOwner, want true")
-				}
+					if !h.requireLibraryConfigAuthority(c, m.name, authTestOrgID, authTestRepoID, tc.ownerID) {
+						t.Fatal("requireLibraryConfigAuthority = false, want true")
+					}
+				})
 			})
-		})
+		}
 	}
 }
 
@@ -168,9 +179,7 @@ func TestLibraryMutations_RejectMissingUserID(t *testing.T) {
 	for _, m := range guardedLibraryMutations() {
 		t.Run(m.name, func(t *testing.T) {
 			withLiveLibraryStateStub(t, func() {
-				// Owner permission on purpose: the empty user_id must be refused
-				// before the lookup can be asked anything.
-				withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+				withOrgRoleStub(t, middleware.RoleAdmin, nil, func() {
 					w := runMutation(t, m, nil)
 					if w.Code != http.StatusForbidden {
 						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
@@ -187,7 +196,7 @@ func TestLibraryMutations_RejectRepoAPIToken(t *testing.T) {
 	for _, m := range guardedLibraryMutations() {
 		t.Run(m.name, func(t *testing.T) {
 			withLiveLibraryStateStub(t, func() {
-				withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
+				withOrgRoleStub(t, middleware.RoleAdmin, nil, func() {
 					w := runMutation(t, m, func(c *gin.Context) {
 						c.Set("user_id", authTestUserID)
 						c.Set("repo_api_token", true)
@@ -207,7 +216,7 @@ func TestLibraryMutations_PermissionLookupErrorFailsClosed(t *testing.T) {
 	for _, m := range guardedLibraryMutations() {
 		t.Run(m.name, func(t *testing.T) {
 			withLiveLibraryStateStub(t, func() {
-				withLibraryPermissionStub(t, middleware.PermissionNone, errors.New("cassandra unavailable"), func() {
+				withOrgRoleStub(t, middleware.RoleGuest, errors.New("cassandra unavailable"), func() {
 					w := runMutation(t, m, func(c *gin.Context) {
 						c.Set("user_id", authTestUserID)
 					})
@@ -221,47 +230,38 @@ func TestLibraryMutations_PermissionLookupErrorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestLibraryMutations_RejectNonAdminAPIKeyScope(t *testing.T) {
-	// An API key carries a scope ceiling independent of the user's own authority.
-	// GetLibraryPermission reads the role and owner column from Cassandra and knows
-	// nothing about the credential, so a read/read-write key minted by the library
-	// OWNER still resolves to PermissionOwner — the stub below reproduces exactly
-	// that. Only the admin scope may reach library configuration.
-	for _, scope := range []string{"read", "read-write", "", "bogus"} {
+func TestLibraryMutations_OwnerAPIKeyScope(t *testing.T) {
+	for _, scope := range []string{"read", "", "bogus"} {
 		for _, m := range guardedLibraryMutations() {
 			t.Run(m.name+"/"+scope, func(t *testing.T) {
-				withLiveLibraryStateStub(t, func() {
-					withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
-						w := runMutation(t, m, func(c *gin.Context) {
-							c.Set("user_id", authTestUserID)
-							c.Set("api_key_scope", scope)
-						})
-						if w.Code != http.StatusForbidden {
-							t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
-						}
-						assertJSONError(t, w.Body, "you do not have permission to modify this library")
+				withLibraryOwnerStateStub(t, authTestUserID, func() {
+					w := runMutation(t, m, func(c *gin.Context) {
+						c.Set("user_id", authTestUserID)
+						c.Set("api_key_scope", scope)
 					})
+					if w.Code != http.StatusForbidden {
+						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+					}
+					assertJSONError(t, w.Body, "you do not have permission to modify this library")
 				})
 			})
 		}
 	}
 }
 
-func TestLibraryMutations_AllowAdminAPIKeyScope(t *testing.T) {
-	// The admin scope clears the ceiling; the permission lookup still decides.
+func TestLibraryMutations_OrgAdminRequiresAdminAPIKeyScope(t *testing.T) {
 	for _, m := range guardedLibraryMutations() {
 		t.Run(m.name, func(t *testing.T) {
-			withLibraryPermissionStub(t, middleware.PermissionOwner, nil, func() {
-				h := newLibraryHandlerForLiveFenceTests()
-				c, _ := gin.CreateTestContext(httptest.NewRecorder())
-				c.Set("org_id", authTestOrgID)
-				c.Set("user_id", authTestUserID)
-				c.Set("api_key_scope", "admin")
-				c.Params = gin.Params{{Key: "repo_id", Value: authTestRepoID}}
-
-				if !h.requireLibraryConfigAuthority(c, m.name, authTestOrgID, authTestRepoID) {
-					t.Fatal("requireLibraryConfigAuthority = false for admin-scoped key with PermissionOwner, want true")
-				}
+			withLiveLibraryStateStub(t, func() {
+				withOrgRoleStub(t, middleware.RoleAdmin, nil, func() {
+					w := runMutation(t, m, func(c *gin.Context) {
+						c.Set("user_id", authTestUserID)
+						c.Set("api_key_scope", "read-write")
+					})
+					if w.Code != http.StatusForbidden {
+						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+					}
+				})
 			})
 		})
 	}
@@ -269,11 +269,11 @@ func TestLibraryMutations_AllowAdminAPIKeyScope(t *testing.T) {
 
 func TestLibraryMutations_AdminAPIKeyScopeDoesNotSubstituteForPermission(t *testing.T) {
 	// The scope ceiling is a ceiling, not a grant: an admin-scoped key belonging to
-	// a user with only rw on the library is still refused.
+	// a regular user with only content access is still refused.
 	for _, m := range guardedLibraryMutations() {
 		t.Run(m.name, func(t *testing.T) {
 			withLiveLibraryStateStub(t, func() {
-				withLibraryPermissionStub(t, middleware.PermissionRW, nil, func() {
+				withOrgRoleStub(t, middleware.RoleUser, nil, func() {
 					w := runMutation(t, m, func(c *gin.Context) {
 						c.Set("user_id", authTestUserID)
 						c.Set("api_key_scope", "admin")
@@ -282,6 +282,61 @@ func TestLibraryMutations_AdminAPIKeyScopeDoesNotSubstituteForPermission(t *test
 						t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
 					}
 				})
+			})
+		})
+	}
+}
+
+func TestDeleteLibrary_CredentialScopeMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		scope      string
+		repoToken  bool
+		ownerID    string
+		wantStatus int
+		wantDelete bool
+	}{
+		{name: "owner session", ownerID: authTestUserID, wantStatus: http.StatusOK, wantDelete: true},
+		{name: "owner read-write key", scope: "read-write", ownerID: authTestUserID, wantStatus: http.StatusOK, wantDelete: true},
+		{name: "owner admin key", scope: "admin", ownerID: authTestUserID, wantStatus: http.StatusOK, wantDelete: true},
+		{name: "owner read key", scope: "read", ownerID: authTestUserID, wantStatus: http.StatusForbidden},
+		{name: "owner repo token", repoToken: true, ownerID: authTestUserID, wantStatus: http.StatusForbidden},
+		{name: "non-owner admin key", scope: "admin", ownerID: "someone-else", wantStatus: http.StatusForbidden},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withLibraryOwnerStateStub(t, tc.ownerID, func() {
+				original := softDeleteLibraryFn
+				deleted := false
+				softDeleteLibraryFn = func(_ interface{ Session() *gocql.Session }, _, _, _, _ string) error {
+					deleted = true
+					return nil
+				}
+				defer func() { softDeleteLibraryFn = original }()
+
+				r := gin.New()
+				h := newLibraryHandlerForLiveFenceTests()
+				r.DELETE("/repos/:repo_id", func(c *gin.Context) {
+					c.Set("org_id", authTestOrgID)
+					c.Set("user_id", authTestUserID)
+					if tc.scope != "" {
+						c.Set("api_key_scope", tc.scope)
+					}
+					if tc.repoToken {
+						c.Set("repo_api_token", true)
+					}
+					h.DeleteLibrary(c)
+				})
+
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/repos/"+authTestRepoID, nil))
+				if w.Code != tc.wantStatus {
+					t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+				}
+				if deleted != tc.wantDelete {
+					t.Fatalf("soft delete called = %v, want %v", deleted, tc.wantDelete)
+				}
 			})
 		})
 	}

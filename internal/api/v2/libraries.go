@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -57,6 +58,8 @@ type LibraryHandler struct {
 	permMiddleware *middleware.PermissionMiddleware
 	gcEnqueuer     LibraryGCEnqueuer
 }
+
+var softDeleteLibraryFn = softDeleteLibrary
 
 // SetGCEnqueuer sets the GC enqueuer for library deletion cleanup.
 func (h *LibraryHandler) SetGCEnqueuer(enqueuer LibraryGCEnqueuer) {
@@ -754,6 +757,19 @@ var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, us
 	return pm.GetLibraryPermission(orgID, userID, repoID)
 }
 
+var getUserOrgRoleFn = func(pm *middleware.PermissionMiddleware, orgID, userID string) (middleware.OrganizationRole, error) {
+	return pm.GetUserOrgRole(orgID, userID)
+}
+
+func apiKeyScopeAllows(c *gin.Context, required string) bool {
+	scope, exists := c.Get("api_key_scope")
+	if !exists {
+		return true
+	}
+	scopeString, _ := scope.(string)
+	return apikeys.ScopeAllows(scopeString, required)
+}
+
 // requireLibraryConfigAuthority gates the library CONFIGURATION mutations —
 // rename, description, version_ttl_days retention, and the storage-class
 // preference — behind owner-or-org-admin authority, answering the response itself
@@ -769,35 +785,20 @@ var getLibraryPermissionFn = func(pm *middleware.PermissionMiddleware, orgID, us
 // Content write access is deliberately not sufficient. A user with an "rw" share
 // may change what is IN a library; deciding what the library is called, how long
 // its versions are kept, and where its future blocks are placed is the owner's
-// (or an org owner/admin/superadmin's). GetLibraryPermission already collapses
-// library owner and org owner/admin/superadmin onto PermissionOwner, so that single comparison covers
-// both legitimate callers without a second lookup.
+// (or an org owner/admin/superadmin's).
 //
-// Callers run this AFTER the live-library fence, matching DeleteLibrary. That
+// Callers run this after the live-library check, matching DeleteLibrary. That
 // order means a caller without authority can still tell a live library in their
 // own org from a deleted one — the same within-org existence signal DeleteLibrary
 // already accepts. Closing it is a separate decision that should move all four
 // handlers at once rather than leave the pair inconsistent.
-func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, orgID, repoID string) bool {
+func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, orgID, repoID, ownerID string) bool {
 	// A repo API token is a content credential scoped to one library and mints at
 	// most "rw"; it never carries owner authority. Refuse before the lookup, so the
 	// minting user's own permissions cannot answer for a token that was never
 	// issued this reach.
 	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
 		log.Printf("[%s] Permission denied: repo API tokens cannot modify library configuration (library %q)", logTag, repoID)
-		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
-		return false
-	}
-
-	// An API key carries a scope ceiling that is independent of the user's own
-	// authority, and PermissionOwner requires the admin scope. This has to be
-	// checked separately: GetLibraryPermission answers only "what is this USER's
-	// authority over this library", reading the role and the owner column straight
-	// from Cassandra, so a read or read-write key minted by the library's owner
-	// still resolves to PermissionOwner. The middleware paths apply this ceiling;
-	// a handler enforcing its own level must too.
-	if !middleware.APIKeyScopeAllowsLibraryPermission(c, middleware.PermissionOwner) {
-		log.Printf("[%s] Permission denied: API key scope does not permit library configuration changes (library %q)", logTag, repoID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
 		return false
 	}
@@ -812,14 +813,28 @@ func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, o
 		return false
 	}
 
-	perm, err := getLibraryPermissionFn(h.permMiddleware, orgID, userID, repoID)
+	if userID == ownerID {
+		if apiKeyScopeAllows(c, apikeys.ScopeReadWrite) {
+			return true
+		}
+		log.Printf("[%s] Permission denied: API key scope does not permit owner configuration changes (library %q)", logTag, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+
+	role, err := getUserOrgRoleFn(h.permMiddleware, orgID, userID)
 	if err != nil {
 		log.Printf("[%s] Failed to check permissions: %v", logTag, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
 		return false
 	}
-	if perm != middleware.PermissionOwner {
-		log.Printf("[%s] Permission denied: user %q has %q on library %q, which does not carry configuration authority", logTag, userID, perm, repoID)
+	if role != middleware.RoleSuperAdmin && role != middleware.RoleOwner && role != middleware.RoleAdmin {
+		log.Printf("[%s] Permission denied: user %q has org role %q on library %q", logTag, userID, role, repoID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
+		return false
+	}
+	if !apiKeyScopeAllows(c, apikeys.ScopeAdmin) {
+		log.Printf("[%s] Permission denied: API key scope does not permit org-admin configuration changes (library %q)", logTag, repoID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to modify this library"})
 		return false
 	}
@@ -829,25 +844,16 @@ func (h *LibraryHandler) requireLibraryConfigAuthority(c *gin.Context, logTag, o
 // requireLibraryOwnerCredential rejects credentials whose transport scope is
 // narrower than library administration before the owner lookup. Ownership is a
 // property of the user, but credential scope is a separate ceiling.
-func requireLibraryOwnerCredential(c *gin.Context) bool {
+func requireLibraryOwnerCredential(c *gin.Context, requiredScope string) bool {
 	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
 		c.JSON(http.StatusForbidden, gin.H{"error": "repo API tokens cannot administer library configuration"})
 		return false
 	}
-	if !middleware.APIKeyScopeAllowsLibraryPermission(c, middleware.PermissionOwner) {
+	if !apiKeyScopeAllows(c, requiredScope) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "API key scope does not permit library administration"})
 		return false
 	}
 	return true
-}
-
-// updateLiveLibrary conditionally mutates the canonical row. The preceding
-// live read is useful for validation, but only this LWT closes the delete race.
-func updateLiveLibrary(session *gocql.Session, orgID, repoID string, assignments []string, values ...interface{}) (bool, error) {
-	query := "UPDATE libraries SET " + strings.Join(assignments, ", ") +
-		" WHERE org_id = ? AND library_id = ? IF deleted_at = null"
-	values = append(values, orgID, repoID)
-	return session.Query(query, values...).MapScanCAS(map[string]interface{}{})
 }
 
 // GetLibrary returns a single library by ID
@@ -1037,24 +1043,26 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 		return
 	}
 
-	if !h.requireLibraryConfigAuthority(c, "UpdateLibrary", orgID, repoID) {
+	if !h.requireLibraryConfigAuthority(c, "UpdateLibrary", orgID, repoID, libraryState.OwnerID) {
 		return
 	}
 
 	now := time.Now()
 	updates = append(updates, "updated_at = ?")
 	values = append(values, now)
-	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID, updates, values...)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
-		return
+	values = append(values, orgID, repoID)
+
+	query := "UPDATE libraries SET "
+	for i, update := range updates {
+		if i > 0 {
+			query += ", "
+		}
+		query += update
 	}
-	if !applied {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
+	query += " WHERE org_id = ? AND library_id = ?"
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(query, values...)
 	if req.VersionTTLDays != nil {
 		if *req.VersionTTLDays > 0 {
 			db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, *req.VersionTTLDays, libraryState.HeadCommitID, now)
@@ -1104,11 +1112,12 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing repo_id"})
 		return
 	}
-	if !requireLibraryOwnerCredential(c) {
+	if !requireLibraryOwnerCredential(c, apikeys.ScopeReadWrite) {
 		return
 	}
 
-	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID)
+	if err != nil {
 		writeLiveLibraryStateError(c, err)
 		return
 	}
@@ -1116,14 +1125,7 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 	// ========================================================================
 	// PERMISSION CHECK: Require library ownership to delete
 	// ========================================================================
-	isOwner, err := h.permMiddleware.IsLibraryOwner(orgID, userID, repoID)
-	if err != nil {
-		log.Printf("[DeleteLibrary] Failed to check ownership: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
-		return
-	}
-
-	if !isOwner {
+	if libraryState.OwnerID != userID {
 		log.Printf("[DeleteLibrary] Permission denied: user %q is not owner of library %q", userID, repoID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "only library owner can delete the library"})
 		return
@@ -1133,7 +1135,7 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 	// Soft-delete: set deleted_at + adjust storage counters.
 	// ownerID = userID here because the permission check above ensures only the
 	// owner can delete.
-	if err := softDeleteLibrary(h.db, orgID, userID, userID, repoID); err != nil {
+	if err := softDeleteLibraryFn(h.db, orgID, userID, userID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}
@@ -1176,26 +1178,17 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		return
 	}
 
-	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID)
+	if err != nil {
 		writeLiveLibraryStateError(c, err)
 		return
 	}
 
-	if !h.requireLibraryConfigAuthority(c, "RenameLibrary", orgID, repoID) {
+	if !h.requireLibraryConfigAuthority(c, "RenameLibrary", orgID, repoID, libraryState.OwnerID) {
 		return
 	}
 
 	now := time.Now()
-	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID,
-		[]string{"name = ?", "updated_at = ?"}, req.RepoName, now)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
-		return
-	}
-	if !applied {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
@@ -1205,6 +1198,10 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 	projectionRow.Name = req.RepoName
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET name = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.RepoName, now, orgID, repoID)
 	batch.Query(`
 		UPDATE libraries_by_id SET name = ?
 		WHERE library_id = ?
@@ -1237,12 +1234,13 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		return
 	}
 
-	if _, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID); err != nil {
+	libraryState, err := readLiveLibraryStateFn(h.db.Session(), orgID, repoID)
+	if err != nil {
 		writeLiveLibraryStateError(c, err)
 		return
 	}
 
-	if !h.requireLibraryConfigAuthority(c, "ChangeStorageClass", orgID, repoID) {
+	if !h.requireLibraryConfigAuthority(c, "ChangeStorageClass", orgID, repoID, libraryState.OwnerID) {
 		return
 	}
 
@@ -1257,16 +1255,6 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	}
 
 	now := time.Now()
-	applied, err := updateLiveLibrary(h.db.Session(), orgID, repoID,
-		[]string{"storage_class = ?", "updated_at = ?"}, req.StorageClass, now)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
-		return
-	}
-	if !applied {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
 	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
@@ -1276,6 +1264,10 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	projectionRow.StorageClass = req.StorageClass
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET storage_class = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.StorageClass, now, orgID, repoID)
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
