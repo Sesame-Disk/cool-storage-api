@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-22
+**Last Updated**: 2026-08-23
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -8274,11 +8274,14 @@ a value the caller must handle rather than a silent no-op.
 `DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` or
 `ErrGCNotRunning` **before** `tryClaimLeadershipForAdmin`, so a disabled or
 stopped replica cannot take the lease. Both DLQ HTTP handlers map those lifecycle
-errors to `503` alongside `ErrNotLeader`: neither is a server fault. A cancelled
-request context maps to `503` for the same reason (corrected 2026-08-23, it
-previously answered `500`): the store binds `ctx` only to the read phase and
-re-checks it immediately before the commit, so a cancelled DLQ mutation — which is
-what shutdown produces while HTTP is still draining — wrote nothing.
+errors to `503` alongside `ErrNotLeader`: neither is a server fault. A context
+error maps to `503` for the same reason (corrected 2026-08-23, it previously
+answered `500`): the store binds `ctx` to the read phase and re-checks it
+immediately before the commit, so **if** the call returns a context error it did
+not reach its commit point and wrote nothing. The converse does not hold — a
+cancellation arriving after that last check is deliberately ignored and the call
+returns the batch's own definite outcome — which is exactly why the mapping is
+safe: `503` is never answered for a mutation that may have applied.
 
 `handleGCRun` checks it up front and answers `503` with `{"started": false}` —
 **before** applying the optional `dry_run` override, so a disabled node's admin

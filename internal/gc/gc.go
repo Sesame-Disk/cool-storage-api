@@ -230,14 +230,17 @@ func (s *Service) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.started {
+	// stopping is checked FIRST because it never appears alone: a draining service
+	// keeps started=true until finishStop clears both, so testing started first
+	// makes this branch unreachable exactly when it matters. A restart is refused,
+	// not queued, while the previous run drains — reusing the WaitGroup here would
+	// overlap two lifecycles — and it is logged, otherwise a mis-sequenced restart
+	// leaves no trace at all.
+	if s.stopping {
+		log.Println("[GC] Start ignored: previous run is still draining")
 		return
 	}
-	if s.stopping {
-		// A restart is refused, not queued, while the previous run drains: reusing
-		// the WaitGroup here would overlap two lifecycles. Log it — otherwise a
-		// mis-sequenced restart leaves no trace at all.
-		log.Println("[GC] Start ignored: previous run is still draining")
+	if s.started {
 		return
 	}
 

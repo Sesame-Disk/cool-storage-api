@@ -15,8 +15,9 @@ Status of record for every id stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md); thi
 document is a dated snapshot, per the index's layering rules.
 
 **Post-verification note (2026-08-22):** subsequent work outside that provenance
-boundary restored settings-read compatibility, narrowed API-key defaults and
-residency claims, added storage-counter regressions, and verified the preexisting
+boundary restored settings-read compatibility, normalized API-key creation defaults
+to `read-write` (never `admin`), narrowed residency claims, added storage-counter
+regressions, and verified the preexisting
 `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`. That issue was not one of the
 selected findings enumerated in section B. Current status and closure criteria
 live in `KNOWN_ISSUES.md`.

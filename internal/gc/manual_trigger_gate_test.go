@@ -1,8 +1,11 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,8 +15,10 @@ import (
 )
 
 // The GC kill switch is the barrier the whole X1 work programme runs behind, and
-// in production only one datacenter runs GC at all — every other node serves the
-// superadmin trigger endpoint with GC_ENABLED=false. These tests pin the guard
+// the current readiness posture keeps it disabled fleet-wide — while every one of
+// those nodes still serves the superadmin trigger endpoint. Once destructive GC is
+// activated, only the designated GC location is expected to enable it; the rest
+// stay disabled and keep serving that endpoint. These tests pin the guard
 // down at the Service boundary so the switch does not silently come to depend on
 // "a disabled service happens to have no consumer goroutine" again.
 
@@ -280,13 +285,25 @@ func TestService_StopTimeoutBlocksRestartUntilRunDrains(t *testing.T) {
 		t.Fatal("leadership lease was not renewed while the old run was draining")
 	}
 
+	// Capture the log too. A draining service holds started AND stopping, so a
+	// Start() that tested started first would refuse correctly and say nothing —
+	// the refusal would be invisible to whoever mis-sequenced the restart. The
+	// lifecycle assertions below cannot see that; only this can.
+	var startLog bytes.Buffer
+	previousLogOutput := log.Writer()
+	log.SetOutput(&startLog)
 	svc.Start()
+	log.SetOutput(previousLogOutput)
+
 	svc.mu.Lock()
 	started, stopping = svc.started, svc.stopping
 	sameStopDone := svc.stopDone == stopDone
 	svc.mu.Unlock()
 	if !started || !stopping || !sameStopDone {
 		t.Fatalf("Start during drain changed lifecycle: started:%v stopping:%v same stop channel:%v", started, stopping, sameStopDone)
+	}
+	if !strings.Contains(startLog.String(), "previous run is still draining") {
+		t.Fatalf("Start during drain logged %q, want the draining refusal", startLog.String())
 	}
 
 	close(blocker)

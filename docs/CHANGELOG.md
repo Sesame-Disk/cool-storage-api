@@ -10,8 +10,9 @@ Session-by-session development history for SesameFS.
 
 ## 2026-08-23 - Merge-readiness pass: source-of-record repair and DLQ refusal contract
 
-Closing review follow-ups on the readiness branch. No behavior change to library
-authorization, GC lifecycle or storage placement.
+Closing review follow-ups on the readiness branch. No change to the established
+library-authorization, GC-lifecycle or storage-placement invariants; this pass
+tightens operator-facing refusal semantics, observability and the source of record.
 
 **Source-of-record contradiction fixed.** `CURRENT_WORK.md` listed two open
 single-node HIGHs while `OPEN-WORK-INDEX.md` listed three — it was missing
@@ -27,10 +28,15 @@ one open HIGH sits outside it. Readers are pointed at `KNOWN_ISSUES` /
 DLQ handlers mapped `ErrNotLeader` / `ErrGCDisabled` / `ErrGCNotRunning` to `503`
 but answered `500` for a cancelled context — which is what graceful shutdown
 produces, since GC stop cancels the in-flight DLQ operation while the HTTP server
-is still draining. Both now answer `503` through one predicate,
-`isGCAdminMutationRefusal`. This is sound only because of where cancellation can
-land: the store binds `ctx` to the read phase and re-checks it immediately before
-the commit, so a cancelled mutation wrote nothing.
+is still draining, and a client disconnect produces the same error. Both now answer
+`503` through one predicate, `isGCAdminMutationRefusal`. This is sound because of a
+one-directional property worth stating precisely: **if** the store returns a
+context error it did not reach its commit point, so nothing was written. The
+converse does not hold — a cancellation landing after that last check is
+deliberately ignored and the call returns the batch's own definite outcome — which
+is what guarantees `503` is never answered for a mutation that may have applied.
+The store now reports cancellation as a context error rather than a wrapped driver
+error, so that classification does not depend on gocql preserving the cause.
 
 **The DLQ commit point is now documented where reviewers keep stopping.** Three
 successive reviews proposed binding the DLQ `LoggedBatch` to the request context.
@@ -53,20 +59,28 @@ it stays lowered, unaudited. Inherited from `main`; this branch only stopped a
 fleet-wide, live from the moment destructive GC is activated — so it is registered
 now rather than rediscovered at activation.
 
-**Smaller corrections.** `Start()` logs when it refuses a restart during drain
-instead of returning silently. `handleGCRun` re-resolves the refusal reason for the
+**`Start()` now really does log a refused restart.** The first version of this
+change tested `started` before `stopping` — and a draining service holds *both*,
+since only `finishStop` clears them together, so the new log line was unreachable
+in exactly the case it was written for. Refusal was still correct; it was silent,
+which is what the change existed to fix. Order swapped, and
+`TestService_StopTimeoutBlocksRestartUntilRunDrains` now captures the log: the
+lifecycle assertions it already carried could not see this class of regression at
+all. Mutation-verified — the assertion fails against the original ordering.
+
+**Smaller corrections.** `handleGCRun` re-resolves the refusal reason for the
 scanner branch as it already did for the worker, so an operator sees a leadership
 handover rather than a generic message. `validateMutableStorageClass` is now built
 on `validateRequestedCreateStorageClass` so the two doors onto `storage_class`
-cannot drift on what counts as an admissible class. Two GC comments that read as if
-a datacenter were already running destructive GC now describe the post-activation
+cannot drift on what counts as an admissible class. GC comments that read as if a
+datacenter were already running destructive GC now describe the post-activation
 posture.
 
 **Files**: `internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
 `internal/gc/gc.go`, `internal/gc/store_cassandra.go`,
-`internal/api/v2/storage_policy.go`, `CURRENT_WORK.md`, `docs/KNOWN_ISSUES.md`,
-`docs/OPEN-WORK-INDEX.md`, `docs/PROD-READINESS-VERIFICATION-20260822.md`,
-`docs/CHANGELOG.md`
+`internal/gc/manual_trigger_gate_test.go`, `internal/api/v2/storage_policy.go`,
+`CURRENT_WORK.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`,
+`docs/PROD-READINESS-VERIFICATION-20260822.md`, `docs/CHANGELOG.md`
 
 ---
 

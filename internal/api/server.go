@@ -2524,11 +2524,17 @@ func (s *Server) handleGCFailedItemOrgs(c *gin.Context) {
 //   - leadership and lifecycle: another replica owns the work, or this one is
 //     disabled/not running.
 //   - context cancellation: shutdown cancels the in-flight DLQ operation while the
-//     HTTP server is still draining. The store binds ctx only to the read phase and
-//     re-checks it immediately before the write, and the LoggedBatch itself is
-//     deliberately not ctx-bound — so a ctx error here means the mutation never
-//     reached its commit point. Answering 503 is therefore honest: nothing was
-//     written, and a retry against the surviving leader is the correct next step.
+//     HTTP server is still draining, and a client disconnect produces the same
+//     error. The store binds ctx to the read phase and re-checks it immediately
+//     before the write, while the LoggedBatch is deliberately not ctx-bound.
+//
+// The property that makes the cancellation case safe is one-directional, and worth
+// stating precisely: *if* the store RETURNS a context error, it did not reach its
+// commit point, so nothing was written. The converse does not hold — a
+// cancellation landing after that last check is deliberately ignored, and the call
+// then returns the batch's own definite outcome rather than a context error. So
+// 503 is never answered for a mutation that may have applied, and a retry against
+// the surviving leader is always the correct next step.
 func isGCAdminMutationRefusal(err error) bool {
 	return errors.Is(err, gc.ErrNotLeader) ||
 		errors.Is(err, gc.ErrGCDisabled) ||

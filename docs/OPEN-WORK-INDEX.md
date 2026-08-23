@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-22
+**Last updated:** 2026-08-23
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /

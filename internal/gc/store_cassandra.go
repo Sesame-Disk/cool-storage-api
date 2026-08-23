@@ -881,6 +881,14 @@ func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid
 		return nil
 	}
 	if err != nil {
+		// Report cancellation as a context error rather than a wrapped driver error,
+		// so callers can classify it with errors.Is without depending on whether the
+		// driver preserved the cause. gocql returns ctx.Err() here today; that is an
+		// implementation detail of a dependency, and the HTTP layer's 503 mapping
+		// should not rest on it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("load failed identity for delete %s/%s: %w", orgID, itemID, err)
 	}
 	// Last cancellation point, on purpose: everything above is a read, everything
@@ -996,6 +1004,11 @@ func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uui
 		FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 	`, orgID.String(), failedAt, string(itemType), itemID).WithContext(ctx).Scan(&failedQueuedAt, &identityAt, &expiresAt, &requiresLibraryDeletedCheck, &libraryGuardMode, &libraryIDStr, &blockRepresentationID, &storageClass)
 	if err != nil {
+		// Same reason as DeleteFailedItemContext: a cancelled read reports the
+		// context error, not a wrapped driver error.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
 	// Last cancellation point, on purpose; the batch below is not ctx-bound. See

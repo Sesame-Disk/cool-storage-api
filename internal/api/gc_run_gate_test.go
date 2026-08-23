@@ -177,10 +177,13 @@ func TestHandleGCFailedItemMutations_DisabledNodeReturns503(t *testing.T) {
 
 func TestHandleGCFailedItemMutations_CancelledRequestReturns503(t *testing.T) {
 	// Shutdown cancels the in-flight DLQ operation while the HTTP server is still
-	// draining. The store binds ctx only to the read phase and re-checks it right
-	// before the commit, so a cancelled request wrote nothing — the operator must
-	// see 503 ("this node did not serve it, retry against the leader"), not a 500
-	// that reads like a failed mutation of unknown outcome.
+	// draining. The store binds ctx to the read phase and re-checks it right before
+	// the commit, so a call that RETURNS a context error did not reach its commit
+	// point and wrote nothing. (A cancellation landing after that check is ignored
+	// and the call returns the batch's own outcome instead — which is why mapping
+	// context errors to 503 never covers a mutation that may have applied.) The
+	// operator must see 503 — "this node did not serve it, retry against the
+	// leader" — not a 500 that reads like a failed mutation of unknown outcome.
 	s := newGCRunTestServer(t, true, true)
 
 	for _, tc := range []struct {
