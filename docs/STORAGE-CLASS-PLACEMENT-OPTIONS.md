@@ -189,7 +189,7 @@ separate controls:
 | Control | Current scope | Does not do |
 |---|---|---|
 | `organizations.storage_config.data_residency: flexible` | New-library creation: requested class, request hostname/region, organization `default_region`, then global hot default | Does not relocate existing libraries or blocks |
-| `organizations.storage_config.data_residency: strict` | New-library creation: requires `default_region`; a requested class must be configured, hot-tier and mapped to the allowed region | Does not make later block materialization fail closed or constrain backend failover |
+| `organizations.storage_config.data_residency: strict` | New-library creation requires `default_region` and an allowed hot class; preference changes also validate hot tier and the currently read strict region | Does not fence concurrent policy changes, make later block materialization fail closed or constrain backend failover |
 | `libraries.storage_class` | Mutable preferred class persisted for a concrete library | Does not identify the physical class of historical blocks |
 | `storage.classes.<name>.failover_class` | New-materialization backend selection after the preferred class is already marked `Unhealthy` or `Failed` | Is not inferred from residency, hostname, region mapping or the library value |
 
@@ -202,15 +202,16 @@ region's hot class. The resolved value is persisted in `libraries.storage_class`
 by the library and administrative create paths. The policy is not consulted by
 the block-store selector after creation.
 
-`ChangeStorageClass` in `internal/api/v2/libraries.go` validates that the class
-is known, reads the live library and updates `libraries.storage_class` together
-with the administrative read model. It does not revalidate the organization's
-strict residency policy, update `blocks`, modify `fs_objects` or references,
-copy/delete S3 objects, calculate cost, or enqueue a migration job. Therefore a
-strict organization can currently change an existing library to any known class
-accepted by that endpoint, even when that class is outside the organization's
-creation region. This is a confirmed policy boundary, not a migration feature,
-and it is tracked as `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` in
+`ChangeStorageClass` in `internal/api/v2/libraries.go` now reads the current
+organization policy and calls `validateMutableStorageClass`: cold primary classes
+are rejected, and strict policy accepts only a configured hot class mapped to
+`default_region`. It then updates `libraries.storage_class` together with the
+administrative read model. This is request validation, not a concurrency fence:
+the policy read precedes the write, so a concurrent policy transition can make the
+validated preference stale. The endpoint also does not update `blocks`, modify
+`fs_objects` or references, copy/delete S3 objects, calculate cost, or enqueue a
+migration job. The remaining lifecycle gap is tracked as
+`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` in
 [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 For a new block, the handlers first resolve a preferred class and then call
@@ -221,8 +222,10 @@ not the library preference, is passed to metadata registration and persisted on
 the canonical block row. A failover can therefore cross the strict creation
 region for a new block while leaving `libraries.storage_class` unchanged. That
 branch is latent rather than live: as recorded below, no non-test caller marks a
-class `Unhealthy` or `Failed`, so no request can currently reach it. The
-reachable residency gap is the `ChangeStorageClass` one above.
+class `Unhealthy` or `Failed`, so no request can currently reach it. The reachable
+gap today is a stale out-of-region library preference after a policy transition:
+request-time placement in v2, Sync and SeafHTTP honors that preference without
+consulting the current strict policy.
 
 `CheckHealth` probes `Exists("__health_check__")`. A connection or other probe
 error sets the backend to `Unhealthy`; a response slower than five seconds sets

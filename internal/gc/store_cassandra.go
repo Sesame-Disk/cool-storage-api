@@ -493,13 +493,17 @@ type failedItemRow struct {
 }
 
 func (s *CassandraStore) failedItemInfo(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) (failedItemRow, error) {
+	return s.failedItemInfoContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (s *CassandraStore) failedItemInfoContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) (failedItemRow, error) {
 	var row failedItemRow
 	var libraryIDStr string
 	var blockRepresentationID string
 	err := s.db.Session().Query(`
 		SELECT queued_at, identity_at, expires_at, requires_library_deleted_check, library_guard_mode, library_id, block_representation_id, storage_class FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), failedAt, string(itemType), itemID).Scan(&row.QueuedAt, &row.IdentityAt, &row.ExpiresAt, &row.RequiresLibraryDeletedCheck, &row.LibraryGuardMode, &libraryIDStr, &blockRepresentationID, &row.StorageClass)
+	`, orgID.String(), failedAt, string(itemType), itemID).WithContext(ctx).Scan(&row.QueuedAt, &row.IdentityAt, &row.ExpiresAt, &row.RequiresLibraryDeletedCheck, &row.LibraryGuardMode, &libraryIDStr, &blockRepresentationID, &row.StorageClass)
 	if err != nil {
 		return failedItemRow{}, err
 	}
@@ -853,12 +857,44 @@ func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgIn
 }
 
 func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	row, err := s.failedItemInfo(orgID, failedAt, itemType, itemID)
+	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+// DeleteFailedItemContext is cancellable up to its commit point, and no further.
+//
+// The reads take ctx and there is a final ctx check immediately before the batch,
+// so a cancelled request (client disconnect, or shutdown cancelling the in-flight
+// DLQ operation) returns without having written anything. The LoggedBatch itself
+// is deliberately NOT ctx-bound, and binding it would be a regression rather than
+// hardening: Cassandra does not roll back a logged batch the coordinator has
+// accepted, so ctx cancellation there cannot undo the mutation — it can only
+// abort the client's wait and turn a definite outcome into an ambiguous one, with
+// the caller unable to tell whether gc_failed_items was cleared. Shutdown safety
+// does not depend on cancelling mid-batch either: Service.finishStop waits for the
+// DLQ gate with an uncancellable context and only then releases the lease, so a
+// committing mutation can never overlap a new leader's destructive work.
+//
+// RequeueFailedItemContext follows the same contract.
+func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	row, err := s.failedItemInfoContext(ctx, orgID, failedAt, itemType, itemID)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
+		// Report cancellation as a context error rather than a wrapped driver error,
+		// so callers can classify it with errors.Is without depending on whether the
+		// driver preserved the cause. gocql returns ctx.Err() here today; that is an
+		// implementation detail of a dependency, and the HTTP layer's 503 mapping
+		// should not rest on it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("load failed identity for delete %s/%s: %w", orgID, itemID, err)
+	}
+	// Last cancellation point, on purpose: everything above is a read, everything
+	// below is the commit.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	now := time.Now().UTC()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
@@ -949,6 +985,10 @@ func parseStoredQueueLibraryID(raw string) (uuid.UUID, string, error) {
 }
 
 func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
+	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt)
+}
+
+func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
 	var (
 		failedQueuedAt              time.Time
 		identityAt                  time.Time
@@ -962,9 +1002,20 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	err := s.db.Session().Query(`
 		SELECT queued_at, identity_at, expires_at, requires_library_deleted_check, library_guard_mode, library_id, block_representation_id, storage_class
 		FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), failedAt, string(itemType), itemID).Scan(&failedQueuedAt, &identityAt, &expiresAt, &requiresLibraryDeletedCheck, &libraryGuardMode, &libraryIDStr, &blockRepresentationID, &storageClass)
+	`, orgID.String(), failedAt, string(itemType), itemID).WithContext(ctx).Scan(&failedQueuedAt, &identityAt, &expiresAt, &requiresLibraryDeletedCheck, &libraryGuardMode, &libraryIDStr, &blockRepresentationID, &storageClass)
 	if err != nil {
+		// Same reason as DeleteFailedItemContext: a cancelled read reports the
+		// context error, not a wrapped driver error.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
+	}
+	// Last cancellation point, on purpose; the batch below is not ctx-bound. See
+	// DeleteFailedItemContext for why binding it would trade a definite outcome
+	// for an ambiguous one without buying any shutdown safety.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	// Interpret the stored library_id via parseStoredQueueLibraryID instead of
 	// parseUUID, which would silently coerce a corrupted value to uuid.Nil —
@@ -2641,9 +2692,9 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 
 	var libOrgIDStr, libraryOwnerIDStr string
 	var sizeBytes, fileCount int64
-	var deletedAt time.Time
+	var deletedAt *time.Time
 	for libIter.Scan(&libOrgIDStr, &libraryOwnerIDStr, &sizeBytes, &fileCount, &deletedAt) {
-		if !deletedAt.IsZero() {
+		if !isActiveLibraryForStorageReconciliation(deletedAt) {
 			continue
 		}
 
@@ -2705,6 +2756,10 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	}
 
 	return reconciled, firstErr
+}
+
+func isActiveLibraryForStorageReconciliation(deletedAt *time.Time) bool {
+	return deletedAt == nil || deletedAt.IsZero()
 }
 
 // --- Version TTL ---

@@ -29,7 +29,7 @@ func TestNewWorker(t *testing.T) {
 	if w.gracePeriod != 1*time.Hour {
 		t.Errorf("gracePeriod = %v, want 1h", w.gracePeriod)
 	}
-	if w.dryRun {
+	if w.dryRun.Load() {
 		t.Error("dryRun should be false")
 	}
 }
@@ -41,7 +41,7 @@ func TestNewWorker_DryRun(t *testing.T) {
 
 	w := NewWorker(store, nil, q, 50, 30*time.Minute, true, stats)
 
-	if !w.dryRun {
+	if !w.dryRun.Load() {
 		t.Error("dryRun should be true when passed true")
 	}
 	if w.batchSize != 50 {

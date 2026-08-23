@@ -317,7 +317,7 @@ curl -s https://sfs.nihaoshares.com/metrics | grep storage
 | **Failover notifications** | ❌ No | Server logs only |
 | **Per-region metrics** | ❌ No | No Prometheus metrics for backend health |
 | **Geographic latency handling** | ❌ No | Global 5s timeout; not configurable |
-| **Data residency compliance** | ⚠️ Partial | `strict` constrains **new-library creation** only. `ChangeStorageClass` re-applies neither the region nor the hot-tier requirement (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), configured `failover_class` edges are not policy-gated, and existing data is never migrated |
+| **Data residency compliance** | ⚠️ Partial | `strict` constrains creation and explicit preference changes against the policy read by the request. That endpoint read/write sequence is not a concurrency fence; request-time placement still honors stale preferences without consulting current policy, configured `failover_class` edges are not policy-gated, and existing data is never migrated (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`) |
 
 ---
 
@@ -392,25 +392,30 @@ after it.
 
 **Testing:** ❌ Insufficient. Basic unit tests exist, but no failover integration tests.
 
-**Residency enforcement:** ⚠️ Partial — `strict` binds new-library creation only.
-`ChangeStorageClass` re-applies neither the region nor the hot-tier check, and
+**Residency enforcement:** ⚠️ Partial — `strict` binds new-library creation and
+explicit preference changes against the policy observed by that request. The
+preference update is not fenced against a concurrent policy transition, runtime
+placement in v2/Sync/SeafHTTP does not revalidate stale preferences, and
 `failover_class` is not policy-gated. Items 1-4 do not close this, and item 1 makes
 the failover half reachable.
 
 **Production readiness for multiregion:** **Not ready**, on both counts:
 
 - *availability/resilience* — blocked on items 1-4 above;
-- *strict residency* — blocked on policy-gating `ChangeStorageClass` and failover
-  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`), plus the missing permission gate on
-  the same endpoint (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`).
+- *strict residency* — blocked on policy-authoritative new-materialization across
+  v2/Sync/SeafHTTP, concurrency-safe policy transitions, policy-gated failover and
+  the unresolved historical/reused-content semantics
+  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`). The endpoint's permission gate and
+  static region/hot-tier validation are fixed.
 
 Single-region deployments with external monitoring do not need items 1-4: with one
 region there is no cross-region failover to gate and no residency edge to cross.
-That is a **storage-topology** statement and not a production-readiness verdict —
-the missing permission gate on the same endpoints
-(`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`) is topology-independent and
-applies to a single-region install unchanged. A multiregion deployment that must
-honour a residency commitment needs the residency items too, not only items 1-4.
+That is a **storage-topology** statement and not a production-readiness verdict.
+The topology-independent library mutation permission gate is fixed, but the
+API-key scope bypass in upload-link and file-share mutations remains an independent
+production blocker (`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`). A
+multiregion deployment that must honour a residency commitment still needs the
+residency items, not only items 1-4.
 
 **Corrections to v4 report:**
 - ❌ "Upload/download paths don't use health-aware selection" — **FALSE** for new materialization and selected fallback plumbing; canonical reads use persisted placement

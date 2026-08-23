@@ -265,6 +265,8 @@ func clampNegativeStorageDelta(session *gocql.Session, scope string, shard int, 
 	return deltaBytes, deltaFiles
 }
 
+// readStorageSnapshotAtShardErr preserves raw counter values so reconciliation
+// can recover counters that drifted below zero; public reads clamp them later.
 func readStorageSnapshotAtShardErr(db DBSession, scope string, shard int, day time.Time) (StorageSnapshot, error) {
 	var bytesUsed, fileCount int64
 	err := db.Session().Query(
@@ -278,8 +280,8 @@ func readStorageSnapshotAtShardErr(db DBSession, scope string, shard int, day ti
 		return StorageSnapshot{}, err
 	}
 	return StorageSnapshot{
-		BytesUsed: max(bytesUsed, 0),
-		FileCount: max(fileCount, 0),
+		BytesUsed: bytesUsed,
+		FileCount: fileCount,
 	}, nil
 }
 
@@ -289,6 +291,8 @@ func readStorageSnapshotAtShard(db DBSession, scope string, shard int, day time.
 		log.Printf("[storage] read snapshot error scope=%s shard=%d day=%s: %v", scope, shard, day.Format("2006-01-02"), err)
 		return StorageSnapshot{}
 	}
+	snapshot.BytesUsed = max(snapshot.BytesUsed, 0)
+	snapshot.FileCount = max(snapshot.FileCount, 0)
 	return snapshot
 }
 

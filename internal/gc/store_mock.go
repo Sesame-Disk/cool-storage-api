@@ -1668,6 +1668,13 @@ func (m *MockStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, e
 }
 
 func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	return m.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (m *MockStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	hook := m.dlqOpHook
 	m.mu.RUnlock()
@@ -1712,6 +1719,13 @@ func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now t
 }
 
 func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
+	return m.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt)
+}
+
+func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	hook := m.dlqOpHook
 	m.mu.RUnlock()

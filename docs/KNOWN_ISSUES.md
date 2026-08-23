@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-21
+**Last Updated**: 2026-08-23
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -23,7 +23,8 @@ is right about why.
 | **Download admission has no bound before the first write** | ✅ Fixed (2026-08-03) | The idle interval now opens at the streaming phase change instead of at the first byte, and a deferred Gin status preserves it rather than clearing it. A stalled first storage read is cancelled by `idle_write_timeout` on both the D4 and D5 producers. See ISSUE-DOWNLOAD-ADMISSION-PRE-FIRST-WRITE-GAP-01. |
 | **Anonymous object-storage downloads** | ✅ Closed (2026-08-07) — never affected production | The `mc anonymous set download` lines existed only in the four development/test Compose files. Production deploys from `docker-compose.prod.yml`, which ships no MinIO, against provider-native S3 that is private by default. The lines are now removed; nothing depended on them, since every MinIO consumer authenticates. The original entry overstated the finding by not separating the dev Compose files from the production one. See ISSUE-OBJECT-STORAGE-ANONYMOUS-DOWNLOAD-01. |
 | **Chunked upload chunk state is node-local** | 🔴 Open — multi-instance only | `chunkManager` is process-local; non-sticky routing silently drops files. See ISSUE-UPLOAD-CHUNK-MULTINODE-01 (readiness B1). |
-| **Library mutations have no permission gate** | 🔴 Open | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` run behind `authMiddleware` only and never consult the caller's library permission, so any authenticated member of an organization can rename any library in it, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. `GetLibrary` and `DeleteLibrary` do gate; these three do not. Negative tests are still owed. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the residency half of the same endpoint. |
+| **Library mutations have no permission gate** | ✅ Fixed 2026-08-22 | `UpdateLibrary`, `POST /:repo_id?op=rename` and `ChangeStorageClass` ran behind `authMiddleware` only and never consulted the caller's authority. All three now distinguish the canonical owner from organization-role overrides: owner API keys require `read-write`, organization owner/admin/superadmin overrides require `admin`, repo API tokens and content shares remain insufficient. Negative tests cover all three handlers. See ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01, and ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01 for the remaining runtime-placement and historical-content residency scope. |
+| **API-key read scope bypasses upload-link and file-share mutations** | 🔴 Open — verified preexisting 2026-08-22 | Six authenticated mutation handlers resolve the user's underlying library authority or link ownership without applying the current credential's API-key scope. A `read` API key can create, update or delete upload links and, for an owner/admin user, create, update or delete user/group shares. Both direct API-key auth and derived sessions are affected. See ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
 | Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it now rests on X1 alone. Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
@@ -66,6 +67,7 @@ is right about why.
 | **Soft-deleted Libraries Still Accept Star Mutations** | 🟡 Pending | `StarFile` still treats a library as live if the canonical row exists, even when `deleted_at` is set. That leaves a real post-soft-delete write window and can reopen cleanup drift during library cascade. See ISSUE-LIB-DELETED-FENCE-01 below. |
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
+| **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
@@ -7834,11 +7836,11 @@ for hot post-upload paths. Multi-DC tests still missing.
 
 ---
 
-### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: `ChangeStorageClass` does not revalidate strict data residency
+### ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01: strict residency is not enforced through the full placement lifecycle
 
-**Status**: 🟡 Open
+**Status**: 🟡 Partial — endpoint preference validation improved 2026-08-22; concurrency, runtime placement, failover and historical content remain open
 **Severity**: Medium (policy / compliance)
-**Affected**: `LibraryHandler.ChangeStorageClass` (`internal/api/v2/libraries.go`)
+**Affected**: `LibraryHandler.ChangeStorageClass`; organization storage-policy updates; request-time placement in v2, Sync and SeafHTTP; storage-manager failover; canonical reuse and future migration semantics
 **Source of record**: [storage-class placement options](./STORAGE-CLASS-PLACEMENT-OPTIONS.md) - "Residency policy, failover and preference changes"
 
 #### Problem
@@ -7848,15 +7850,24 @@ Library creation enforces the organization's residency policy through
 `data_residency: strict` the requested class must be configured, hot-tier and
 mapped to the organization's `default_region`.
 
-`ChangeStorageClass` does not repeat that check. It validates only
-`isKnownStorageClass(req.StorageClass)` — canonical name plus configured — and
-then writes `libraries.storage_class` together with the administrative read model
-in one logged batch. An organization configured as `strict` can therefore move an
-existing library's preference to **any** class known to the serving endpoint,
-including one outside the region its own policy allows. The creation-time
-constraint is bypassable by a later edit.
+`ChangeStorageClass` originally did not repeat that check. It validated only
+`isKnownStorageClass(req.StorageClass)`, allowing an existing library preference
+to bypass both region and tier constraints.
 
-**The tier requirement is dropped as well.** Creation routes the requested class
+**Fixed 2026-08-22:** the handler now reads the current organization policy and
+calls `validateMutableStorageClass`. Every policy rejects cold primary placement;
+under `strict`, the requested hot class must map to `default_region`. Canonical and
+administrative projections are then updated in the same logged batch. Focused tests
+cover same-region hot acceptance plus cross-region and cold rejection.
+
+**The endpoint validation is not a concurrency fence.** The policy read happens
+before the library write and Cassandra's logged batch does not isolate that prior
+read. A concurrent `flexible -> strict` transition can therefore commit between
+validation and the preference update, leaving a value that the new policy would
+reject. This is not a regression from `main`, where the endpoint did not consult
+policy, but it limits the claim to best-effort request validation.
+
+**Original tier defect.** Creation routes the requested class
 through `validateRequestedCreateStorageClass`, which rejects a cold class with
 `storage class must use hot tier` via `isHotStorageClass`. `isKnownStorageClass`
 performs no tier check, so `ChangeStorageClass` accepts a configured cold class
@@ -7879,31 +7890,33 @@ is nominal in the current tree, not implemented:
 - `Manager.GetHotBackends` / `GetColdBackends` are inventory helpers with no
   caller in the read or write path.
 
-So pointing a library at a cold class today does **not** make its future blocks
-unreadable or subject them to a retrieval delay. The defect is coherence: create
-refuses cold deliberately, because "cold-tier primary placement remains future
-design work" (`DEPLOY.md`), while change accepts it — leaving a library able to
-prefer a placement mode that has no design behind it. Treat this as a policy gap
-to close before cold is implemented, not as a live data-availability risk.
+Pointing a library at a cold class would not currently make its future blocks
+subject to retrieval delay. Creation and preference changes now both reject that
+unsupported primary-placement mode; cold-tier primary placement remains future
+design work.
 
-This is a placement-policy hole, not data movement: existing canonical blocks keep
-their persisted `blocks.storage_class`, physical object and derived key. The
-consequence is that **future** first materializations for that library prefer a
-class the residency policy was meant to forbid.
+The fix is a placement-policy gate, not data movement: existing canonical blocks
+keep their persisted `blocks.storage_class`, physical object and derived key. A
+preference persisted before a later `flexible -> strict` transition can still be
+out of region and the materialization resolver still honors it without consulting
+the policy. The same preference-first pattern exists in the v2, Sync and SeafHTTP
+materialization paths, so strict residency must be enforced where each new
+destination is selected rather than inferred from this endpoint check.
 
 A second, narrower path to the same outcome is separately noted: strict policy does
 not constrain `failover_class` either, so a new block can be persisted outside the
 allowed region when the preferred class is already marked `Unhealthy` or `Failed`.
 That path is currently unreachable at runtime - `CheckHealth` holds the marking
 logic but has no automatic caller, so no class is ever marked unhealthy in a
-running server - while this one is reachable through the ordinary API. Note that
+running server. Note that
 automating health monitoring would make the failover path live, so it hardens
 availability and weakens residency at the same time; the two must be decided
 together.
 
-**Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`:** the same
-endpoint has no permission gate, so the caller need not even own the library
-whose residency they move.
+**Authorization fixed 2026-08-22:** canonical owners may use session or
+`read-write` API-key credentials; organization owner/admin/superadmin overrides
+require session or `admin` API-key credentials. Content shares and repo API tokens
+cannot change library configuration.
 
 #### Fix Direction
 
@@ -7935,8 +7948,7 @@ operation. That was rejected as more restrictive than residency requires: moving
 library from one in-region hot class to another in-region hot class breaks no
 residency promise, and forbidding it removes a legitimate feature to buy nothing.
 
-**The in-region case is not merely empty today — it is currently inexpressible,
-and that is a prerequisite this rule depends on.** `storageClassRegion` attributes
+**Multiple hot classes in one logical region remain inexpressible.** `storageClassRegion` attributes
 a region to a class only by finding it as the `hot` or `cold` entry of some
 `region_classes` mapping, and `RegionClassConfig` holds exactly one `Hot` and one
 `Cold` string per region. A second hot class in the same region therefore resolves
@@ -7966,22 +7978,20 @@ The workable shapes are `region_classes` gaining a membership list
 class may serve two logical regions, the membership list is the honest model. That change
 belongs with the rule, not after it.
 
-Implementation shape:
+Implementation status and remaining shape:
 
-1. Read the organization's policy with `readOrgStoragePolicy`. Under
+1. **Implemented:** read the organization's policy with `readOrgStoragePolicy`. Under
    `orgDataResidencyStrict`, require the requested class to resolve to
    `policy.DefaultRegion` — the check `resolveStrictCreateStorageClass` already
    performs with `storageClassRegion`.
-2. Route the request through the same validation creation uses rather than a
-   second copy of the rule — reuse `resolveCreateStorageClassForOrg`, or extract
-   its policy half, so both doors answer identically. This restores the hot-tier
-   requirement at the same time; region and tier were one contract at creation and
-   should stay one contract.
-3. Cover with tests: strict accepts an in-region hot class, rejects an
+2. **Implemented:** route the mutation through `validateMutableStorageClass`, which
+   restores the hot-tier requirement for flexible and strict policy and the region
+   requirement for strict policy.
+3. **Implemented:** focused tests prove strict accepts an in-region hot class, rejects an
    out-of-region one and rejects a cold one; flexible accepts any hot class and
    rejects a cold one.
 
-4. Give the placement resolver the policy as well. Gating the endpoint alone
+4. **Open:** give the placement resolver the policy as well. Gating the endpoint alone
    leaves a library whose stored class is already out of region — from before the
    switch to `strict`, or from a `flexible` period — materializing new blocks
    outside it, because `ResolveStorageClass` honours `library.storage_class`
@@ -8014,20 +8024,19 @@ elsewhere. Three candidate rules, none chosen:
    policy takes effect and makes no claim about content already placed. Weakest
    promise and cheapest, but still **not** what the code does today.
 
-**None of the three is implemented, including option 3.** An earlier draft of this
+**None of the three transition semantics is implemented, including option 3.** An earlier draft of this
 entry said option 3 was "what the code does by omission". That is wrong. Forward-only
 would require materialization to consult the policy, and no placement resolver does:
 `Manager.ResolveStorageClass` returns `library.storage_class` first and never falls
 back or re-checks (`internal/storage/storage.go`), and the request chain that feeds
 it — `resolveLibraryBlockStoreForRequestContext` ->
 `lookupLibraryStorageClassContextFn` -> `resolvePreferredLibraryStorageClassForRequest`
-(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy
-either: `readOrgStoragePolicy` has no caller outside the creation path in
-`storage_policy.go`.
+(`internal/api/v2/storage_resolution.go`) — never reads the organization's policy.
 
-What the code actually implements is narrower than any of the three: `strict` binds
-only the class **chosen at library creation**, and nothing re-checks it afterwards.
-A library created while the organization was `flexible`, holding an out-of-region
+What the code implements is narrower than any of the three: `strict` gates the
+class chosen at library creation and a later explicit preference change, but it
+does not re-check an already-persisted preference when policy itself changes. A
+library created while the organization was `flexible`, holding an out-of-region
 class, keeps materializing new blocks into that class after the switch to `strict`.
 
 Two consequences for the fix:
@@ -8083,7 +8092,7 @@ separate operations; the migration TODO in the same handler stays out of scope.
 
 ### ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01: Three library mutation handlers have no permission gate
 
-**Status**: 🔴 Open — runtime defect, fix belongs in its own PR
+**Status**: ✅ **Fixed 2026-08-22** — gated on `LibraryHandler.requireLibraryConfigAuthority`, negative tests landed
 **Severity**: High (authorization / configuration integrity)
 **Affected**: `UpdateLibrary`, `LibraryOperation` → `RenameLibrary`, `ChangeStorageClass` (`internal/api/v2/libraries.go`)
 
@@ -8127,33 +8136,352 @@ in that organization, including libraries they have no permission to read.
 Existing canonical blocks are not moved or reinterpreted by any of the three, so
 this is a configuration-integrity and authorization defect, not data loss.
 
-#### Verification still owed
+#### Additional evidence: this is a route surface, not three stray functions
 
-No negative test covers any of the three. In
-`internal/api/v2/library_live_write_fence_test.go`, every invocation of
-`UpdateLibrary`, `RenameLibrary` and `ChangeStorageClass` sets only `org_id`,
-while other tests in the same file do set `user_id` for the handlers that read it.
-The asymmetry inside one file is itself evidence that these three run without a
-caller identity. Each handler needs a red test of the shape:
+`RegisterLibraryRoutesWithToken` constructs a `PermissionMiddleware` and hands it
+to the handler, but applies it to **no** route in the `repos` group. The affected
+handlers are reachable through **five** registrations — `PUT /:repo_id`,
+`PUT /:repo_id/`, `POST /:repo_id`, `POST /:repo_id/` and
+`POST /:repo_id/storage-class` — and the group is registered under both the
+`/api/v2` and `/api2` prefixes. That shaped the fix: the gate had to live in the
+handler, because a per-route middleware would have to be repeated five times and
+the sixth registration would forget it.
 
-```text
-user B, no permission on library A
-PUT /repos/A            → expect 403
-POST /repos/A?op=rename → expect 403
-POST /repos/A/storage-class → expect 403
-```
+#### Fix (2026-08-22)
+
+One shared gate, `LibraryHandler.requireLibraryConfigAuthority`, called by all
+three handlers immediately after the live-library check:
+
+- **Canonical owner:** session credentials or an API key with at least
+  `read-write` scope.
+- **Organization owner/admin/superadmin override:** session credentials or an API
+  key with `admin` scope. The role is read explicitly instead of inferred from an
+  aggregated library permission.
+- **Content shares are insufficient:** even `rw` or `admin` share labels decide
+  what is *in* a library, not what it is called, how long its versions are kept,
+  or where its future blocks are placed.
+- **Repo API tokens are refused outright**, before the permission lookup. Such a
+  token is a content credential scoped to one library and mints at most `rw`;
+  letting the minting user's own permissions answer for it would hand the token a
+  reach it was never issued.
+- **Empty `user_id` fails closed** rather than resolving permissions for `""`.
+- **Organization-role lookup errors return 500**, never a silent allow.
+
+Ordered after the liveness check to match `DeleteLibrary`. That leaves the same
+within-org existence signal `DeleteLibrary` already accepts (an unauthorized
+caller can still distinguish a live library in their own org from a deleted one);
+closing it is a separate decision that should move all four handlers at once
+rather than leave the pair inconsistent.
+
+#### Verification
+
+`internal/api/v2/library_mutation_authority_test.go` runs every case against all
+three handlers, driving rename through `LibraryOperation` the way the route
+actually dispatches:
+
+- content-share callers without an administrative org role → 403
+- canonical owner session/`read-write` and org-admin session/`admin` → allowed
+- owner `read` and org-admin `read-write` API keys → 403
+- missing `user_id` → 403
+- repo API token → 403
+- organization-role lookup error → 500
+- `DeleteLibrary` and library settings carry explicit scope matrices
+
+Confirmed red before the fix: with the three gate call sites removed, the `rw`
+case fails and the handler proceeds into the database.
+
+---
+
+### ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01: Manual GC trigger APIs were not gated on `GC.Enabled`
+
+**Status**: ✅ **Fixed 2026-08-22** — manual triggers gated on `Service.ManualTriggerError`, DLQ lifecycle gate and regressions landed
+**Severity**: Low as shipped (never a live bypass), but it protected the barrier the entire X1 programme runs behind
+**Affected**: `gc.Service.TriggerWorker`, `gc.Service.TriggerScanner`, `Server.handleGCRun`
+
+#### Problem
+
+`GC_ENABLED=false` is the kill switch that keeps destructive GC off while X1 is
+open. It is pinned in `docker-compose.prod.yml` and defaults to false in
+`config.DefaultConfig`. Re-verifying it after PR #181 surfaced that the *runtime*
+surface was never checked, only the config surface.
+
+Three facts together:
+
+1. `NewServer` constructs `gcService` unconditionally — the constructor is guarded
+   by `database != nil`, not by `cfg.GC.Enabled`. A node with GC disabled still
+   has a live `*gc.Service`.
+2. The superadmin route `POST /api/v2.1/admin/gc/run` is registered
+   unconditionally and reaches that service.
+3. `TriggerWorker` and `TriggerScanner` checked neither `config.Enabled` nor
+   `started`. They only wrote to a size-1 buffered channel.
+
+What made it safe in practice is that `Service.Start` returns early when
+`!s.config.Enabled`, before launching `runWorkerLoop` and `runScannerLoop`, so no
+goroutine existed to consume the token.
+
+**That is the problem.** The kill switch rested on "a disabled service happens to
+have no consumer for this channel" — an emergent property of `Start`'s control
+flow — rather than on a stated invariant at the point of decision. Any future
+refactor that launched those loops unconditionally (or started them before the
+`Enabled` check, or added a second consumer) would have silently promoted the
+admin endpoint into a live bypass of `GC_ENABLED=false`, with no test failing.
+
+This matters more than the severity suggests because of the production posture:
+**the current readiness posture keeps `GC_ENABLED=false` on every replica in every
+datacenter** and still serves this endpoint. The disabled fleet was exactly
+the population relying on the emergent guarantee.
+
+Two smaller defects fell out of the same gap:
+
+- The endpoint answered `{"started": true, "message": "GC worker triggered"}` on
+  a disabled node, for a run that no goroutine existed to perform. An operator
+  could not tell a triggered run from a silently discarded one.
+- The token was left parked in the buffered channel. Had GC later been enabled on
+  that process, the first loop iteration would have consumed it and performed one
+  run nobody asked for.
+
+#### Wider than "manual triggers" — the DLQ path too
+
+Review of the first fix found `Service.DeleteFailedItem` and
+`Service.RequeueFailedItem` carrying the same gap with a worse consequence. Both
+call `tryClaimLeadershipForAdmin`, which does not merely check leadership — it
+**claims the lease**. A superadmin acting on any GC-disabled replica could
+therefore take GC leadership away from the one datacenter that actually drains
+the queue, causing a GC outage from a node incapable of doing the work. They now
+refuse with `ErrGCDisabled` before claiming.
+
+So the real defect was never "manual triggers are ungated"; it was **"the kill
+switch is honoured on some superadmin GC surfaces and not others"**.
+
+One kill switch, but **two predicates**, because the surfaces differ in kind:
+
+| Surface | Predicate | Why |
+|---|---|---|
+| Manual triggers (async) | `Enabled && started && leader` | A follower's loop would consume the token and return without doing work |
+| DLQ requeue/delete (sync) | `Enabled && started` | The store work is inline and can claim leadership itself, but a stopped or never-started node must not reclaim the lease during shutdown |
+
+Collapsing these into one predicate is still a live trap: DLQ does not require
+current leadership, while a manual trigger does. Lifecycle tests pin the active
+requirement for both surfaces.
+
+#### Fix (2026-08-22)
+
+`Service.ManualTriggerError` (exported to the API layer) gates manual triggers on
+active lifecycle and current leadership; `Service.gcAdminMutationError` gates
+the DLQ mutations on active lifecycle without requiring current leadership.
+`TriggerWorker` and `TriggerScanner` now return a `bool`, so a refused trigger is
+a value the caller must handle rather than a silent no-op.
+`DeleteFailedItem`/`RequeueFailedItem` refuse with `ErrGCDisabled` or
+`ErrGCNotRunning` **before** `tryClaimLeadershipForAdmin`, so a disabled or
+stopped replica cannot take the lease. Both DLQ HTTP handlers map those lifecycle
+errors to `503` alongside `ErrNotLeader`: neither is a server fault. A context
+error maps to `503` for the same reason (corrected 2026-08-23, it previously
+answered `500`): the store binds `ctx` to the read phase and re-checks it
+immediately before the commit, so **if** the call returns a context error it did
+not reach its commit point and wrote nothing. The converse does not hold — a
+cancellation arriving after that last check is deliberately ignored and the call
+returns the batch's own definite outcome — which is exactly why the mapping is
+safe: `503` is never answered for a mutation that may have applied.
+
+`handleGCRun` checks it up front and answers `503` with `{"started": false}` —
+**before** applying the optional `dry_run` override, so a disabled node's admin
+surface is inert end to end rather than accepting a config mutation for a service
+that will not run. On an active node, admission and the optional override commit
+together; a refused trigger does not change the runtime mode.
+
+**The predicate must not take `s.mu`.** The first version read
+`config.Enabled && started` under the mutex and reintroduced a shutdown deadlock:
+`Stop()` holds `s.mu` across `s.wg.Wait()`, and `runScannerOnce` — running in a
+goroutine that `Wait` is waiting for — calls `TriggerWorker` after auto-requeuing
+recoverable failed items. Stop waited for the scanner; the scanner waited for
+Stop's lock; `Server.Shutdown` hung. It now reads an `atomic.Bool` written only by
+`Start`/`Stop`. `config.Enabled` is set once in `NewService` and never mutated
+(`SetDryRun` touches `DryRun` only), so one flag captures both conditions.
+
+`Start()` and `Stop()` drain the trigger channels under `triggerMu`, which also
+serializes the check-and-send path. A trigger that is already admitted is
+drained before shutdown or restart; a trigger that arrives after the lifecycle
+flag closes is refused. That makes "no unrequested run fires at enable time" an
+invariant without holding a mutex across `wg.Wait()`.
+
+#### Verification
+
+`internal/gc/manual_trigger_gate_test.go`:
+
+- disabled service → `AcceptsManualTriggers` false, both triggers refused, **and
+  both buffered channels asserted empty** (the parked-token regression)
+- enabled but not started → refused
+- enabled and started → accepted
+- after `Stop()` → refused
+- nil service → refused
+- **`Stop()` concurrent with a trigger completes** — the deadlock regression,
+  verified red against the mutex version (hangs the full 15s budget) and green
+  against the atomic
+- `Start()` discards a stale token left by a trigger that raced `Stop()`
+- DLQ requeue/delete on a disabled service → `ErrGCDisabled`
+- DLQ requeue/delete on an **enabled but unstarted** service → `ErrGCNotRunning`
+- DLQ requeue/delete after `Stop()` → `ErrGCNotRunning` without a lease claim
+- manual triggers on an active follower → `ErrNotLeader` and no queued token
+
+`internal/api/gc_run_gate_test.go` pins the HTTP contract, which is where an
+operator actually meets this: disabled node → `503` with `started:false` for
+worker, scanner, defaulted and unparseable bodies; a `dry_run` override on a
+disabled node **does not commit the runtime override**; enabled+started → `200` with
+`started:true`; no service → `503`; and a cancelled request context on either DLQ
+mutation → `503`, not `500`.
+
+#### Why this is not `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
+
+X1 is about whether destructive GC is *correct* when enabled. This is about
+whether "disabled" is enforced where it is decided. They are independent, and
+this fix is not progress against any of X1's four closure criteria.
+
+---
+
+### ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01: Read-scoped API keys can perform upload-link and file-share mutations
+
+**Status**: 🔴 Open — verified preexisting 2026-08-22
+**Severity**: High (authorization / least-privilege bypass)
+**Affected**: `UploadLinkHandler.CreateUploadLink`, `UpdateUploadLink`,
+`DeleteUploadLink`; `FileShareHandler.CreateShare`, `UpdateSharePermission`,
+`DeleteShare`
+
+#### Problem
+
+API-key scope is the authority of the current credential. Bare
+`PermissionMiddleware.HasLibraryAccess` instead resolves the underlying user's
+authority from Cassandra and cannot inspect request context. The affected upload
+and share handlers ask only the second question, or compare only
+`created_by == user_id`, without applying the credential ceiling.
+
+`HasLibraryAccessCtx` applies that ceiling through the middleware's private scope
+predicate; bare `HasLibraryAccess` does not. Creator identity likewise proves who
+owns an existing link, not whether the current credential is allowed to mutate it.
+
+This defect predates the 2026-08-22 readiness branch. That branch applies explicit
+scope checks to the bounded library-configuration fixes but does not claim to
+repair unrelated existing routes.
+
+#### Affected Paths
+
+- Upload-link creation requests `PermissionRW` through bare
+  `HasLibraryAccess`.
+- Upload-link update and delete use creator-only checks.
+- File-share create, update and delete request `PermissionAdmin` through bare
+  `HasLibraryAccess`.
+- `RequirePermFlagForRepo` does not replace the missing API-key scope ceiling.
+- Direct API keys and sessions derived through `/api2/auth-token/` are affected;
+  both preserve `api_key_scope`, but these handlers do not consume it.
+
+#### Impact
+
+A `read` key belonging to a user with stronger canonical authority can exceed its
+declared scope. An owner/admin user's read key can delegate, alter or revoke user
+or group access, and a read key can manage upload links created by that user. This
+violates the advertised `read` / `read-write` / `admin` contract.
 
 #### Fix Direction
 
-Do not paste `IsLibraryOwner` into three handlers. Decide the required permission
-level per operation (owner versus write permission), then apply it in one shared
-place — either a route-level middleware for the mutating library routes or a
-single helper the handlers call — so a fourth mutation handler cannot be added
-without one. This is the same "centralize the mandatory check inside one
-function" rule the write helpers already follow.
+- Apply the context-aware API-key scope ceiling before every mutation.
+- Require at least `read-write` for upload-link create, update and delete.
+- Require `admin` for user/group share create, update and delete.
+- Keep library authority and creator ownership checks; scope is an additional
+  credential ceiling, not a replacement.
+- Decide explicitly whether repo API tokens may create upload links rather than
+  acquiring that behavior accidentally through a helper substitution.
+- Add direct-key and derived-session scope matrices for all six handlers.
 
-Land the fix and its negative tests as a separate PR; documenting the gap does
-not close it.
+#### Verification Needed
+
+- `read` is denied on all six mutation handlers.
+- `read-write` is allowed only on upload-link operations for an otherwise
+  authorized caller.
+- `admin` is required for file-share administration.
+- Ordinary session behavior remains unchanged.
+- Revoked and expired derived credentials retain their existing failure behavior.
+
+---
+
+### ISSUE-GC-DRYRUN-OVERRIDE-STICKY-01: A manual GC run can lower `GC_DRY_RUN` for the rest of the process's life
+
+**Status**: 🔴 Open — verified preexisting 2026-08-23 (not introduced by the 2026-08-22 readiness branch)
+**Severity**: Medium — currently unreachable in production, becomes live exactly when destructive GC is activated
+**Affected**: `Server.handleGCRun`, `gc.Service.TriggerWorkerWithDryRun`, `gc.Service.TriggerScannerWithDryRun`, `gc.Service.SetDryRun`
+
+#### Problem
+
+Destructive GC sits behind a two-rung ladder: `GC_ENABLED` decides whether GC runs
+at all, and `GC_DRY_RUN` decides whether a running GC deletes anything. After the
+2026-08-22 hardening the two rungs have very different strength.
+
+`GC_ENABLED` is read once in `NewService`, is never mutated at runtime, and is now
+enforced at the decision point of every superadmin GC surface
+(`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01`). No API call can raise it.
+
+`GC_DRY_RUN` is different. `POST /api/v2.1/admin/gc/run` accepts an optional
+`dry_run` boolean, and an **accepted** trigger stores it into `Service.dryRun` and
+`Worker.dryRun`. That value is not scoped to the run it accompanied: it replaces
+the runtime mode for the remaining life of the process. Nothing restores the
+configured value — `SetDryRun` has no production caller, and the only ways back are
+another `/gc/run` call carrying the opposite value or a process restart. The change
+is visible only as the `dry_run` field of `GET /api/v2.1/admin/gc/status`, and it
+is not written to the audit log.
+
+So a configured `GC_DRY_RUN=true` — the safety rung directly below the one the
+whole X1 programme runs behind — can be lowered by one superadmin request and stays
+lowered. The reverse is equally sticky: a single `{"dry_run": true}` parks that node
+in a non-deleting mode indefinitely, so trash never purges and storage grows with
+no error raised anywhere.
+
+The override is process-local and not persisted, so it affects only the node that
+served the request and does not survive a restart. That bounds the blast radius; it
+does not make the surface honest.
+
+#### Why this is not a defect of the 2026-08-22 branch
+
+`main` already behaved this way: `handleGCRun` called `Service.SetDryRun(*req.DryRun)`
+with exactly the same lifetime. The readiness branch changed two things and neither
+is the lifetime:
+
+- the override now commits **inside** the trigger admission gate, so a *refused*
+  trigger can no longer change the mode (that was a real defect, and it is fixed);
+- the flag became `atomic.Bool`, closing the data race against a running worker.
+
+The branch's own CHANGELOG states that runtime dry-run semantics remain the global
+behavior inherited from `main`. This entry records the surface that inheritance
+leaves open, so it is not rediscovered as "new" at activation time.
+
+#### Reachability
+
+Not reachable today: with `GC_ENABLED=false` fleet-wide, `ManualTriggerError`
+refuses the trigger **before** the override is applied, and the refusal path is
+pinned by `TestHandleGCRun_DisabledNodeDoesNotApplyDryRunOverride`. It becomes
+reachable on the designated GC location the moment destructive GC is activated —
+which is precisely the window in which `GC_DRY_RUN=true` is the intended brake.
+
+#### Fix Direction
+
+Pick one, in preference order:
+
+1. **Scope the override to its run.** Apply the value with the admitted trigger and
+   restore the configured mode when that run completes, so `dry_run` is a property
+   of the request rather than of the process.
+2. **Treat config as a floor.** Refuse `{"dry_run": false}` while `config.DryRun` is
+   true, and require a deliberate configuration change plus restart to lower the
+   rung — matching how `GC_ENABLED` behaves.
+3. **If a sticky runtime mode is genuinely wanted**, move it to its own explicit
+   endpoint with an audit-log entry naming the actor, rather than letting it ride
+   along on a "run once" request.
+
+#### Verification Needed
+
+- An accepted trigger carrying `dry_run` does not alter the mode observed by the
+  *next* run (option 1), or is refused when it would lower the configured rung
+  (option 2).
+- `GET /admin/gc/status` reflects the configured mode again after the triggered run
+  finishes.
+- A mode change, however it is finally expressed, appears in the audit log.
+- The existing invariant stays green: a refused trigger never commits an override.
 
 ---
 

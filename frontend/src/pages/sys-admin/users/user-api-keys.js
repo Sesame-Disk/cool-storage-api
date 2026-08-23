@@ -30,7 +30,7 @@ class UserAPIKeys extends Component {
             createdToken: '',
             createForm: {
                 label: '',
-                scope: 'read',
+                scope: 'read-write',
                 expiration: '90'
             },
             isSubmitting: false
@@ -70,7 +70,7 @@ class UserAPIKeys extends Component {
             isSubmitting: false,
             createForm: prevState.isCreateDialogOpen ? prevState.createForm : {
                 label: '',
-                scope: this.canGrantAdminScope() ? 'admin' : 'read',
+                scope: 'read-write',
                 expiration: '90'
             }
         }));
@@ -132,7 +132,7 @@ class UserAPIKeys extends Component {
                 isRevealDialogOpen: true,
                 createForm: {
                     label: '',
-                    scope: this.canGrantAdminScope() ? 'admin' : 'read',
+                    scope: 'read-write',
                     expiration: '90'
                 }
             }));

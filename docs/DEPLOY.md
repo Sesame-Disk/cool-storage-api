@@ -1565,33 +1565,33 @@ Notes:
   The marking logic exists in `CheckHealth`, but nothing calls it automatically,
   so no class is ever marked unhealthy in a running server and this stays latent
   until a periodic health checker exists
-- `ChangeStorageClass` updates the library preference and administrative read
-  model only. It does not revalidate strict residency, does not re-apply the
-  hot-tier requirement that library creation enforces, does not migrate existing
-  blocks, and does not start a migration job — a `strict` org can move an existing
-  library outside its allowed region, or onto a cold class, this way
-  (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
-- **decided, not yet implemented:** under `data_residency: strict` the endpoint
-  must accept only a hot class inside the organization's `default_region` and
-  reject anything outside it, and new materializations must never fail over across
-  the region — same-region failover only, otherwise fail closed. Until that lands,
-  do not rely on `strict` to keep an existing library's future blocks in its region
+- `ChangeStorageClass` revalidates the requested preference against the current
+  organization policy. All organizations may select only a configured hot class;
+  under `data_residency: strict`, that class must also map to the organization's
+  `default_region`. The endpoint does not migrate existing blocks or start a
+  migration job (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
+- **still open:** new materializations must never fail over across a strict
+  organization's region. Same-region failover is the decided behavior; when no
+  healthy in-region backend exists, placement must fail closed. This path remains
+  latent while no periodic health checker marks classes unhealthy
 - **still undecided:** what `strict` promises about content placed *before* the
   policy took effect. `validateOrgStoragePolicy` never inspects existing libraries
   or blocks, so an org can switch `flexible -> strict`, or move `default_region`,
   with its canonical blocks elsewhere
-- **weaker than it looks:** today `strict` binds only the class chosen at library
-  **creation**. No placement resolver consults the organization's policy —
-  `ResolveStorageClass` honours `library.storage_class` unconditionally — so a
-  library created under `flexible` with an out-of-region class keeps materializing
-  new blocks there after the switch to `strict`. Do not describe the current
-  behaviour as "future placement follows the policy"; it does not
+- **weaker than it looks:** create and preference-change transitions are policy
+  gated, but no placement resolver consults the organization's policy.
+  `ResolveStorageClass` honours an already-persisted `library.storage_class`
+  unconditionally, so a library created under `flexible` with an out-of-region
+  class can keep materializing new blocks there after the organization switches to
+  `strict`. Do not describe the current behaviour as "future placement follows the
+  policy"; it does not
   (`ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`)
-- that same endpoint has **no permission gate**: any authenticated member of the
-  organization can call it for any library in the organization, as can
-  `PUT /repos/:repo_id` and `POST /repos/:repo_id?op=rename`
-  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`). Do not treat org-level
-  residency as enforced against org members until that is fixed
+- that endpoint gained a permission gate on 2026-08-22
+  (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01`, fixed): it, `PUT /repos/:repo_id`
+  and `POST /repos/:repo_id?op=rename` now require the library owner or an org
+  admin, so an arbitrary org member can no longer move a library's residency. API
+  keys additionally require `read-write` for the canonical owner and `admin` for
+  an organization-role override
 
 ### Step M3 — Firewall (private network)
 
@@ -1895,6 +1895,15 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
 # the answer must be identical (it's the same Cassandra row, replicated to
 # every DC).
 ```
+
+> This has no production effect while `GC_ENABLED=false`. After GC is enabled,
+> graceful process shutdown has a 30-second application deadline; if GC work has
+> not drained by then, the process exits without explicitly releasing the leader
+> lease, so takeover may wait for the remaining Cassandra lease TTL (up to
+> roughly 90 seconds at the minimum configured TTL of 90 seconds). This favors
+> exclusion and safety over immediate takeover. Do not manually delete the lease
+> while the old process might still be alive; confirm that process is gone before
+> intervening.
 
 ### Step M6 — Verify library placement preference and canonical block reads
 

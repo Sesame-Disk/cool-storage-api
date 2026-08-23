@@ -2041,10 +2041,25 @@ func (s *Server) Run() error {
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
-	// Stop GC service first
+	// Stop accepting HTTP work while GC drains. Running both shutdowns together
+	// prevents a DLQ request admitted just before shutdown from making the two
+	// subsystems wait on each other serially under the same deadline.
+	var gcStopDone chan error
 	if s.gcService != nil {
-		s.gcService.Stop()
+		gcStopDone = make(chan error, 1)
+		go func() {
+			gcStopDone <- s.gcService.StopWithContext(ctx)
+		}()
 	}
+	var httpErr error
+	if s.server != nil {
+		httpErr = s.server.Shutdown(ctx)
+	}
+	var gcErr error
+	if gcStopDone != nil {
+		gcErr = <-gcStopDone
+	}
+
 	if s.authRateLimiter != nil {
 		s.authRateLimiter.Stop()
 	}
@@ -2062,10 +2077,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.authHandler.GetOIDCClient().StopStateSweeper()
 	}
 
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
-	}
-	return nil
+	return errors.Join(httpErr, gcErr)
 }
 
 // handleEmptyActivities returns empty activities list (stub)
@@ -2350,16 +2362,41 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		req.Type = "worker"
 	}
 
-	if req.DryRun != nil {
-		s.gcService.SetDryRun(*req.DryRun)
+	// Refuse before the dry-run override when this node is disabled, stopped, or
+	// not the current GC leader. A follower has consumer goroutines, but they
+	// discard the run at the leadership check, so reporting success would be
+	// misleading and would make the admin surface operationally ambiguous.
+	if err := s.gcService.ManualTriggerError(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"started": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// A trigger can still be refused at the admission gate after the precheck
+	// above: Stop() can win that race. Re-resolve the reason so the operator sees
+	// why, rather than a generic message that hides a leadership handover.
+	refuse := func(component string) {
+		err := s.gcService.ManualTriggerError()
+		if err == nil {
+			err = fmt.Errorf("GC %s is not accepting triggers", component)
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"started": false, "error": err.Error()})
 	}
 
 	switch req.Type {
 	case "scanner":
-		s.gcService.TriggerScanner()
+		if !s.gcService.TriggerScannerWithDryRun(req.DryRun) {
+			refuse("scanner")
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC scanner triggered"})
 	default:
-		s.gcService.TriggerWorker()
+		if !s.gcService.TriggerWorkerWithDryRun(req.DryRun) {
+			refuse("worker")
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
 	}
 }
@@ -2480,6 +2517,32 @@ func (s *Server) handleGCFailedItemOrgs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"organizations": orgs})
 }
 
+// isGCAdminMutationRefusal reports whether err means this node DECLINED to serve
+// the DLQ mutation, rather than tried and failed. Both cases must answer 503, not
+// 500, because neither is a server fault:
+//
+//   - leadership and lifecycle: another replica owns the work, or this one is
+//     disabled/not running.
+//   - context cancellation: shutdown cancels the in-flight DLQ operation while the
+//     HTTP server is still draining, and a client disconnect produces the same
+//     error. The store binds ctx to the read phase and re-checks it immediately
+//     before the write, while the LoggedBatch is deliberately not ctx-bound.
+//
+// The property that makes the cancellation case safe is one-directional, and worth
+// stating precisely: *if* the store RETURNS a context error, it did not reach its
+// commit point, so nothing was written. The converse does not hold — a
+// cancellation landing after that last check is deliberately ignored, and the call
+// then returns the batch's own definite outcome rather than a context error. So
+// 503 is never answered for a mutation that may have applied, and a retry against
+// the surviving leader is always the correct next step.
+func isGCAdminMutationRefusal(err error) bool {
+	return errors.Is(err, gc.ErrNotLeader) ||
+		errors.Is(err, gc.ErrGCDisabled) ||
+		errors.Is(err, gc.ErrGCNotRunning) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 	if s.gcService == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
@@ -2490,8 +2553,8 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.RequeueFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		if errors.Is(err, gc.ErrNotLeader) {
+	if err := s.gcService.RequeueFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
+		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
@@ -2511,8 +2574,8 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
-		if errors.Is(err, gc.ErrNotLeader) {
+	if err := s.gcService.DeleteFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID); err != nil {
+		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}

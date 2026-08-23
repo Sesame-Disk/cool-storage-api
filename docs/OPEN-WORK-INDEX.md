@@ -1,6 +1,6 @@
 # Open Work Index
 
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-23
 **Scope (narrowed 2026-07-25):** production blockers, recent readiness /
 upload-fence audit follow-ups, and leftovers from consolidating the parallel
 pending-work trackers. **This is not the entire product backlog.** Roadmap /
@@ -57,19 +57,42 @@ of them updated.
 
 ## Production blockers — must close before go-live
 
-**No single-node go-live blockers remain under the current production posture,
-which keeps destructive GC disabled.** NF-1 closed 2026-07-25; B4 closed
-2026-08-04; the object-storage posture issue and the sync public-link token auth
-gap both closed 2026-08-07. This is not the same as "nothing is left": X1
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) remains open and still blocks
-*enabling* destructive GC — see the GC section below. Multi-instance adds B1 and
-B5. See
-[PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md).
+**Single-node go-live still has open HIGH findings, and they are independent of
+X1.** Corrected 2026-08-22: this summary previously read "no single-node go-live
+blockers remain", which contradicted the HIGH rows in this document's own
+High/Medium table a few lines below. Do not restore that claim.
+
+Three gates, kept separate on purpose:
+
+- **Enabling destructive GC** — blocked by X1
+  (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) **alone**; X2 closed 2026-08-14.
+  See the GC section below.
+- **Single-node go-live** — blocked by the resource-amplification findings
+  below (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01`,
+  `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`) and the API-key mutation-scope bypass
+  (`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`). Nothing about GC gates
+  these, and closing X1 does not close them. `ISSUE-ZIP-STREAM-LATEFAIL-01` is
+  Medium per the registry, not a go-live blocker.
+- **Multi-instance operation** — additionally blocked by the two node-local
+  state issues in the table below.
+
+What genuinely closed: NF-1 2026-07-25; B4 2026-08-04; the object-storage
+posture issue and the sync public-link token auth gap 2026-08-07;
+`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` 2026-08-22. See
+[PROD-SECURITY-READINESS-20260724.md](./PROD-SECURITY-READINESS-20260724.md)
+(dated snapshot) and
+[PROD-READINESS-VERIFICATION-20260822.md](./PROD-READINESS-VERIFICATION-20260822.md)
+(baseline re-verification at `a1570b186`, with the selected findings last verified
+at committed snapshot `05197691c`; later corrections are outside that snapshot's
+provenance boundary).
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
 | `ISSUE-UPLOAD-CHUNK-MULTINODE-01` | HIGH | Chunked-upload state is node-local; non-sticky routing silently loses files | Readiness B1 — **multi-instance only** |
 | `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` | HIGH | Desktop-SSO pending token is in-memory per process | Readiness B5 — **multi-instance only** |
+
+The single-node HIGH rows are **not duplicated here**; their canonical rows live
+in the High/Medium table below, per rule 4.
 
 ### Recently closed
 
@@ -152,14 +175,17 @@ not satisfy the X1 closure criteria.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | HIGH | `UpdateLibrary`, `op=rename` and `ChangeStorageClass` have no permission gate: any authenticated org member can rename any library in the org, change its description, shorten its `version_ttl_days` retention, or move its storage-class preference. Only `GetLibrary` and `DeleteLibrary` check | Found auditing the storage-class characterization; runtime defect, negative tests still owed |
+| `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` | ✅ Closed 2026-08-22 | The three handlers now distinguish canonical ownership from organization owner/admin/superadmin overrides; owner API keys require `read-write`, role overrides require `admin`, and content shares/repo tokens remain insufficient. Negative tests cover all three handlers | [known issue](./KNOWN_ISSUES.md) |
+| `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` | HIGH | Six upload-link and file-share mutation handlers apply the user's underlying library authority or creator identity without applying the current credential's API-key scope; a `read` key can exceed its advertised authority | Verified preexisting 2026-08-22; direct API keys and derived sessions are affected. See [known issue](./KNOWN_ISSUES.md) and [technical debt](./TECHNICAL-DEBT.md#14-api-key-scope-hardening-follow-up-2026-04-04) |
 | `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01` | MEDIUM | `ReleaseStaleBlockClaim` decides "no claim to release" from a session-consistency read, and that zero makes the caller consume the candidate — so a claim taken by a GC worker in ANOTHER datacenter (RF 1 per DC: the quorums do not intersect) can be missed, stranding a live block behind `gc_state='deleting'`. No data loss; the cost is a permanent upload refusal. Found auditing X2; the clean fix depends on X1's serial-domain decision (EACH_QUORUM here would couple ordinary queue drain to every DC being up; SERIAL collides with R12) |
 | `ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01` | MEDIUM | A `gc_s3_orphans` row refused for still having references falls out of the working set once the day cursor passes it, then TTLs out at 90 days — storage leak, and the alerting counter goes quiet with it | Found auditing X2; needs a deferred/quarantine state, not a `phaseErr` |
 | `ISSUE-GC-LOGICAL-MAPPING-RETENTION-01` | LOW/MEDIUM | R11a intentionally preserves SHA-1 → SHA-256 mappings after physical GC; without a separate logical-death reaper, stale rows accumulate and may resolve to a 404 until rematerialization | R11a/B.3 accepted tradeoff · [known issue](./KNOWN_ISSUES.md) |
+| `ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` | ✅ Closed 2026-08-22 | The superadmin GC surfaces did not check `GC.Enabled`: manual triggers answered `{"started":true}` on nodes where nothing ran, and the DLQ requeue/delete path *claimed the GC lease* from a disabled replica. All are now explicitly lifecycle-gated; manual triggers additionally require current leadership | Found re-verifying the kill switch post-#181; defence in depth, never a live bypass |
+| `ISSUE-GC-DRYRUN-OVERRIDE-STICKY-01` | MEDIUM | The `dry_run` field of `POST /admin/gc/run` is not scoped to the run it accompanies: an accepted trigger replaces the node's runtime mode for the life of the process, so one superadmin call can lower a configured `GC_DRY_RUN=true` — the rung directly below `GC_ENABLED` — and it stays lowered, unaudited. Unreachable while GC is disabled fleet-wide; live from the moment destructive GC is activated | Verified preexisting 2026-08-23 (inherited from `main`, not the 2026-08-22 branch, which only stopped a *refused* trigger from committing the override). See [known issue](./KNOWN_ISSUES.md) |
 | `ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` | HIGH | `recv-fs` inflates each object unbounded; 128 MiB body → ~126 GiB at DEFLATE's measured 1029:1 | Found auditing X9; the body cap does not bound this |
 | `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01` | HIGH | `pack-fs` materializes the whole response: ~409k repeats of one valid id, `PermissionR` only. `check-fs` shares the fan-out | Found auditing X9; the fs-id equivalent of the closed X11 |
 | `ISSUE-RECVFS-FSID-UNVERIFIED-01` | ? | `recv-fs` never checks the client's fs_id hashes the content it stores — but the stored-vs-computed mapping may make that by design | Open **question**; settle the contract before "fixing" |
-| `ISSUE-ZIP-STREAM-LATEFAIL-01` | HIGH | ZIP download can truncate after `200 OK` | Readiness DL-2 |
+| `ISSUE-ZIP-STREAM-LATEFAIL-01` | MEDIUM | ZIP download can truncate after `200 OK` | Readiness DL-2. Severity corrected 2026-08-22 to match [KNOWN_ISSUES.md](./KNOWN_ISSUES.md), which has rated it Medium since the 2026-05-27 preflight narrowing — truncated/retryable download, not corruption |
 | `ISSUE-BLOCK-CROSS-LIBRARY-READ-01` | MEDIUM | Cross-library block read (BOLA), gated only by knowing the 256-bit hash | Readiness B2/SEC-1 |
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
 | `ISSUE-SYNC-METADATA-CONCURRENCY-01` | MEDIUM | Sync metadata routes bound one body, not N — 16 concurrent `recv-fs` ≈ 2 GiB | Successor to X9; X10's equivalent for the block routes is closed |
@@ -172,7 +198,7 @@ not satisfy the X1 closure criteria.
 | `ISSUE-SHARELINK-NO-ORG-SCOPE-01` | MEDIUM | No org-internal share-link scope (token-only, anonymous) | SH-2 — product / BY DESIGN option |
 | `ISSUE-SHARELINK-CREATOR-KEY-01` | MEDIUM | Encrypted share links decrypt with creator's key | SH-3 |
 | `ISSUE-TRAFFIC-RECORDER-DROPS-01` | MEDIUM | Saturated traffic recorder drops events silently | No counter / log |
-| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | `ChangeStorageClass` validates only that the class is known, so a `strict` org can move an existing library's preference outside its allowed region **and onto a cold tier** — neither half of the create-time contract is re-applied. **Decided:** under `strict` the endpoint must accept only an in-region hot class, and new materializations must not fail over across the region | Decided, not implemented. **Still open:** what `strict` promises about content placed before the policy took effect — the transition is ungated today. Compounded by `ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` |
+| `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01` | MEDIUM | **Preference validation improved 2026-08-22:** `ChangeStorageClass` rejects cold classes and rejects a class outside the currently read strict region. **Still open:** the endpoint read/write TOCTOU, policy-authoritative placement for stale preferences across v2/Sync/SeafHTTP, policy-gated failover, historical/reused content semantics and migration | Partial: endpoint validation is not a concurrency or placement fence |
 
 ## Low / latent / deferred hardening
 

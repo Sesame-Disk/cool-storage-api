@@ -18,14 +18,19 @@ import (
 )
 
 type fakeLeaderLease struct {
-	allowed  bool
-	err      error
-	delay    time.Duration
-	calls    int32
-	released atomic.Bool
-	leader   atomic.Bool
-	acquired chan struct{}
-	once     sync.Once
+	allowed         bool
+	err             error
+	delay           time.Duration
+	renewalInterval time.Duration
+	calls           int32
+	released        atomic.Bool
+	leader          atomic.Bool
+	acquired        chan struct{}
+	once            sync.Once
+}
+
+func (f *fakeLeaderLease) RenewalInterval() time.Duration {
+	return f.renewalInterval
 }
 
 func (f *fakeLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, error) {
@@ -222,7 +227,7 @@ func TestNewService_ConfigPropagation(t *testing.T) {
 	if svc.config.DryRun != true {
 		t.Error("config.DryRun should be true")
 	}
-	if svc.worker.dryRun != true {
+	if !svc.worker.dryRun.Load() {
 		t.Error("worker.dryRun should propagate from config")
 	}
 }
@@ -245,7 +250,7 @@ func TestService_SetDryRun(t *testing.T) {
 	if !svc.config.DryRun {
 		t.Error("config.DryRun should be true after SetDryRun(true)")
 	}
-	if !svc.worker.dryRun {
+	if !svc.worker.dryRun.Load() {
 		t.Error("worker.dryRun should be true after SetDryRun(true)")
 	}
 
@@ -510,6 +515,7 @@ func TestService_DeleteFailedItem_RequiresLeadership(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: false},
 	}
+	svc.acceptingWork.Store(true)
 
 	err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "blocked")
 	if !errors.Is(err, ErrNotLeader) {
@@ -932,6 +938,7 @@ func TestService_DLQOps_SerializeUnderConcurrency(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	var inFlight atomic.Int32
 	var maxInFlight atomic.Int32
@@ -1013,6 +1020,7 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	if err := svc.RequeueFailedItem(orgID, failedAt, ItemLibraryCascade, itemID); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)
@@ -1071,6 +1079,7 @@ func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.
 				config: config.GCConfig{Enabled: true},
 				lease:  &fakeLeaderLease{allowed: true},
 			}
+			svc.acceptingWork.Store(true)
 
 			err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID)
 			if err == nil {
@@ -1140,6 +1149,7 @@ func TestService_AdminFailedItemOps_RefreshSnapshotImmediately(t *testing.T) {
 		config: config.GCConfig{Enabled: true},
 		lease:  &fakeLeaderLease{allowed: true},
 	}
+	svc.acceptingWork.Store(true)
 
 	if err := svc.RequeueFailedItem(orgID, failedAtA, ItemBlock, "admin-requeue"); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)
@@ -1199,7 +1209,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		lease:  &fakeLeaderLease{allowed: true},
 	}
 
-	if retried := svc.retryAutoRecoverableFailedItems(); retried != 1 {
+	if retried := svc.retryAutoRecoverableFailedItems(context.Background()); retried != 1 {
 		t.Fatalf("retryAutoRecoverableFailedItems retried %d items, want 1", retried)
 	}
 

@@ -8,6 +8,284 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-23 - Merge-readiness pass: source-of-record repair and DLQ refusal contract
+
+Closing review follow-ups on the readiness branch. No change to the established
+library-authorization, GC-lifecycle or storage-placement invariants; this pass
+tightens operator-facing refusal semantics, observability and the source of record.
+
+**Source-of-record contradiction fixed.** `CURRENT_WORK.md` listed two open
+single-node HIGHs while `OPEN-WORK-INDEX.md` listed three — it was missing
+`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01`, the HIGH this same branch
+discovered and registered. That is exactly the class of drift the branch exists to
+correct, so the omission mattered more than its size. The
+`PROD-READINESS-VERIFICATION` verdict table no longer presents §B as the current
+blocker list either: §B is a dated, deliberately *selected* snapshot, and at least
+one open HIGH sits outside it. Readers are pointed at `KNOWN_ISSUES` /
+`OPEN-WORK-INDEX` for the live list.
+
+**DLQ mutations: a cancelled request is a refusal, not a server fault.** The two
+DLQ handlers mapped `ErrNotLeader` / `ErrGCDisabled` / `ErrGCNotRunning` to `503`
+but answered `500` for a cancelled context — which is what graceful shutdown
+produces, since GC stop cancels the in-flight DLQ operation while the HTTP server
+is still draining, and a client disconnect produces the same error. Both now answer
+`503` through one predicate, `isGCAdminMutationRefusal`. This is sound because of a
+one-directional property worth stating precisely: **if** the store returns a
+context error it did not reach its commit point, so nothing was written. The
+converse does not hold — a cancellation landing after that last check is
+deliberately ignored and the call returns the batch's own definite outcome — which
+is what guarantees `503` is never answered for a mutation that may have applied.
+The store now reports cancellation as a context error rather than a wrapped driver
+error, so that classification does not depend on gocql preserving the cause.
+
+**The DLQ commit point is now documented where reviewers keep stopping.** Three
+successive reviews proposed binding the DLQ `LoggedBatch` to the request context.
+That would be a regression, not hardening: Cassandra does not roll back a logged
+batch its coordinator has accepted, so cancelling there cannot undo the mutation —
+it can only abort the client's wait and turn a definite outcome into an ambiguous
+one, leaving the operator unable to tell whether `gc_failed_items` was cleared.
+Shutdown safety does not depend on it either: `finishStop` waits for the DLQ gate
+with an uncancellable context before releasing the lease, so a committing mutation
+can never overlap a new leader's destructive work. The rationale now lives on
+`DeleteFailedItemContext` instead of in review threads.
+
+**New finding registered, deliberately not fixed here.**
+`ISSUE-GC-DRYRUN-OVERRIDE-STICKY-01` (MEDIUM): the `dry_run` field of
+`POST /admin/gc/run` is not scoped to the run it accompanies — an accepted trigger
+replaces the node's runtime mode for the life of the process. One superadmin call
+can lower a configured `GC_DRY_RUN=true`, the rung directly below `GC_ENABLED`, and
+it stays lowered, unaudited. Inherited from `main`; this branch only stopped a
+*refused* trigger from committing the override. Unreachable while GC is disabled
+fleet-wide, live from the moment destructive GC is activated — so it is registered
+now rather than rediscovered at activation.
+
+**`Start()` now really does log a refused restart.** The first version of this
+change tested `started` before `stopping` — and a draining service holds *both*,
+since only `finishStop` clears them together, so the new log line was unreachable
+in exactly the case it was written for. Refusal was still correct; it was silent,
+which is what the change existed to fix. Order swapped, and
+`TestService_StopTimeoutBlocksRestartUntilRunDrains` now captures the log: the
+lifecycle assertions it already carried could not see this class of regression at
+all. Mutation-verified — the assertion fails against the original ordering.
+
+**Smaller corrections.** `handleGCRun` re-resolves the refusal reason for the
+scanner branch as it already did for the worker, so an operator sees a leadership
+handover rather than a generic message. `validateMutableStorageClass` is now built
+on `validateRequestedCreateStorageClass` so the two doors onto `storage_class`
+cannot drift on what counts as an admissible class. GC comments that read as if a
+datacenter were already running destructive GC now describe the post-activation
+posture.
+
+**Files**: `internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
+`internal/gc/gc.go`, `internal/gc/store_cassandra.go`,
+`internal/gc/manual_trigger_gate_test.go`, `internal/api/v2/storage_policy.go`,
+`CURRENT_WORK.md`, `docs/KNOWN_ISSUES.md`, `docs/OPEN-WORK-INDEX.md`,
+`docs/PROD-READINESS-VERIFICATION-20260822.md`, `docs/CHANGELOG.md`
+
+---
+
+## 2026-08-22 - Final readiness review corrections
+
+**`ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` — verified preexisting,
+open.** The April API-key hardening preserves `api_key_scope` for direct API-key
+authentication and derived sessions, but six existing mutation handlers do not
+consume that ceiling. Upload-link creation and file-share administration call
+bare `HasLibraryAccess`; upload-link update/delete use creator identity only. A
+`read` key belonging to an otherwise privileged user can therefore exceed its
+advertised scope. This branch does not change those routes; the issue registry
+records the finding, impact, fix direction and required scope matrix.
+
+**API-key creation defaults normalized to `read-write`; `admin` is never
+preselected.** "Narrowed" would not describe this accurately: for an admin-capable
+user the default drops (`admin` → `read-write`), but for an ordinary user it rises
+(`read` → `read-write`). Both self-service and sysadmin creation now land on the
+same value — the scope an ordinary client actually needs to sync and to administer
+its own libraries — while `admin` remains selectable only for an authorized target
+and is never the preselected option. Accounts still requires an explicitly selected
+admin-scoped key for its dedicated platform service account.
+
+**Settings compatibility restored.** The branch had made `GET history-limit` and
+`GET auto-delete` canonical-owner-only while adding mutation scope checks. Those
+two reads now retain `main`'s authenticated behavior; settings mutations, repo API
+token management and transfer continue to require the canonical owner and the
+appropriate credential scope.
+
+**Residency claim narrowed.** `ChangeStorageClass` still rejects cold classes and
+preferences outside the policy observed under `strict`, but that read-before-write
+check is not a concurrency fence. Policy-authoritative placement for stale
+preferences across v2, Sync and SeafHTTP, failover, historical/reused content and
+migration remain under `ISSUE-LIBRARY-CLASS-CHANGE-RESIDENCY-01`. No broad storage
+placement redesign is claimed in this bounded branch.
+
+**Documentation provenance corrected.** The readiness record now identifies
+`05197691c` as the last committed snapshot reviewed for its selected findings and
+describes the current `TriggerWorkerWithDryRun` / `TriggerScannerWithDryRun`
+mechanism. Subsequent corrections are explicitly outside that snapshot's
+provenance boundary. Runtime dry-run semantics remain the global behavior
+inherited from `main`.
+
+**Rejected scope wrapper removed; lateral fixes pinned.** The exported
+`APIKeyScopeAllowsLibraryPermission` wrapper belonged to an intermediate gate that
+collapsed canonical ownership and organization override into `PermissionOwner`.
+The final gate cannot use that model, and no production caller remained, so the
+wrapper is removed while the private ceiling used by `HasLibraryAccessCtx` stays
+tested. Focused regressions now prove that negative storage counters reconcile
+back to zero and that Cassandra `deleted_at = NULL` remains an active library for
+storage-counter reconstruction.
+
+**Files**: `internal/api/v2/library_settings.go`,
+`frontend/src/pages/sys-admin/users/user-api-keys.js`, `docs/API-REFERENCE.md`,
+`docs/ACCOUNTS-DASHBOARD-INTEGRATION.md`, `docs/KNOWN_ISSUES.md`,
+`docs/OPEN-WORK-INDEX.md`, `docs/TECHNICAL-DEBT.md`,
+`docs/PROD-READINESS-VERIFICATION-20260822.md`,
+`docs/STORAGE-CLASS-PLACEMENT-OPTIONS.md`,
+`docs/STORAGE-MULTIREGION-ANALYSIS.md`,
+`docs/SECURITY-ASSESSMENT-2026-04-v4.md`, `docs/DEPLOY.md`, `docs/CHANGELOG.md`,
+`internal/middleware/permissions.go`, `internal/middleware/permissions_test.go`,
+`internal/traffic/storage_sharding_test.go`, `internal/gc/store_cassandra.go`,
+`internal/gc/store_cassandra_storage_counter_test.go`,
+`internal/integration/library_projection_regression_test.go`
+
+---
+
+## 2026-08-22 - Bounded authorization, GC and readiness hardening
+
+Documentation/source-of-record pass following the independent re-verification of
+`main` at `a1570b186`, plus the two bounded runtime fixes that re-verification
+turned up. No X1 work: nothing here is progress against any of X1's four closure
+criteria, and P0/R12 remains the next X1 tranche.
+
+**Readiness posture corrected.** `OPEN-WORK-INDEX.md` claimed "no single-node
+go-live blockers remain" a few lines above its own table of open HIGH rows, and
+`CURRENT_WORK.md` called X1 "the sole blocker" without saying which gate. Both now
+separate three gates explicitly: activating destructive GC (X1 alone), single-node
+go-live (independent resource/late-failure findings), and multi-instance operation
+(the two node-local state issues). "X1 is the only blocker for enabling destructive
+GC" is still true; "X1 is the only blocker for production" was not.
+
+**`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` — fixed.** `UpdateLibrary`,
+`RenameLibrary` (via `LibraryOperation` `op=rename`) and `ChangeStorageClass` ran
+behind `authMiddleware` alone and never consulted the caller's library permission,
+so any authenticated org member could rename any library in the org, rewrite its
+description, shorten its `version_ttl_days` retention, or move its storage-class
+preference. All three now call one shared gate,
+`LibraryHandler.requireLibraryConfigAuthority`, which distinguishes the canonical
+owner from organization owner/admin/superadmin overrides. Content `rw` shares are deliberately insufficient: an
+`rw` share decides what is *in* a library, not what it is called or where its
+future blocks are placed. Repo API tokens are refused before the lookup, an empty
+`user_id` fails closed, and lookup errors return 500.
+
+One gate rather than three checks because the defect was precisely a per-handler
+check three handlers lacked: `RegisterLibraryRoutesWithToken` builds a
+`PermissionMiddleware` and applies it to no route in the group, and the handlers
+are reachable through five registrations under two prefixes. Ordered after the
+live-library check to match `DeleteLibrary`.
+
+The attempted follow-up `UPDATE ... IF deleted_at = null` was withdrawn after
+review. In Cassandra that predicate can apply to an absent row and create a
+partial canonical record; executing projections afterward also splits one logical
+mutation into two independently failing commits. This bounded fix therefore keeps
+canonical, policy and read-model updates in their prior logged batch and makes no
+new claim about fully serializing a concurrent library delete. A general
+canonical-to-projection repair protocol remains separate architecture work.
+
+Review caught that the first version enforced only half the question.
+`GetLibraryPermission` collapses canonical ownership and organization-role
+override onto `PermissionOwner`, but their credential ceilings differ. The final
+gate checks identity and role separately: canonical owners may use `read-write`,
+while organization-role overrides require `admin`. Repo API tokens remain denied.
+
+**`ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01` — found and fixed.** The `GC_ENABLED=false`
+kill switch was enforced on the config surface but not the runtime one:
+`gcService` is constructed unconditionally, `POST /api/v2.1/admin/gc/run` is
+registered unconditionally, and `TriggerWorker`/`TriggerScanner` checked neither
+`Enabled` nor `started`. Nothing ran only because `Service.Start` returns before
+launching its loops when disabled — so the switch rested on an emergent property
+of `Start`'s control flow rather than a check where the decision is made, and any
+refactor launching those loops unconditionally would have turned that endpoint
+into a live bypass with no test failing. It also answered `{"started":true}` for
+runs that never happened, on exactly the nodes that matter: in production only one
+datacenter runs GC and every other node serves this endpoint disabled.
+
+Now gated explicitly. The triggers return `bool`, so a refusal is a
+value the caller must handle; `handleGCRun` answers `503` **before** applying the
+optional `dry_run` override. Never a live bypass — hardened before it could become
+one.
+
+Review widened this twice, and both corrections are the same lesson. First, the
+initial predicate read `Enabled && started` under `s.mu` and reintroduced a
+**shutdown deadlock**: the original `Stop()` held `s.mu` across `s.wg.Wait()`, and
+`runScannerOnce` calls `TriggerWorker` from a goroutine `Wait` is waiting for. The
+predicate now reads an `atomic.Bool`; a guard on a shutdown path has to be
+lock-free.
+Second, `DeleteFailedItem` and `RequeueFailedItem` had the same gap with a worse
+consequence — they call `tryClaimLeadershipForAdmin`, which *claims the lease*, so
+an operator on a disabled or stopping replica could take GC leadership away from
+the one datacenter that drains the queue. Both now refuse with
+`ErrGCDisabled`/`ErrGCNotRunning` before claiming, and both HTTP handlers map those
+states to `503` rather than `500`. The real defect was never "manual triggers are
+ungated" but "the kill switch is honoured on some superadmin GC surfaces and not
+others".
+
+One kill switch, two predicates: triggers need `Enabled && started` plus current
+leadership because a follower's loop would consume the token and return without
+doing work; DLQ mutations need `Enabled && started` but may run on a follower
+because their store work is inline and the operation can claim leadership. The
+distinction is pinned by lifecycle and follower tests.
+
+`Start()` additionally drains the trigger channels before launching the loops, so
+a token that raced `Stop()` cannot fire an unrequested run at the next enable.
+
+The bounded shutdown path now has explicit `running -> stopping -> stopped`
+semantics. If `StopWithContext` times out, it returns the context error but leaves
+the service in `stopping`; `Start` cannot reuse the `WaitGroup` or reacquire the
+lease. Lease renewal continues while a background finalizer waits for DLQ and
+worker drain; only then does it stop renewal, release leadership, persist stats and
+publish `stopped`. HTTP and GC shutdown begin
+concurrently under the same deadline, and their errors are joined.
+Main's 30-second shutdown deadline can hard-exit before finalizer release, leaving
+takeover to the remaining lease TTL; early release is intentionally avoided while
+old work may remain.
+
+**New document.** `docs/PROD-READINESS-VERIFICATION-20260822.md` records the
+re-verification at `a1570b186`: ten defects (five HIGH), what #181 did and did not
+deliver, and the corrections to the draft it replaces — a nonexistent source
+document, a miscount, `internal/metrics` (not `internal/gc/metrics`), 409,200
+rather than "~400k" `pack-fs` ids, the full three-surface scope of
+`ISSUE-BLOCK-CROSS-LIBRARY-READ-01`, migration 016 in the binary/schema invariant,
+and fence observability being partial (a `gc_fence` retry label) rather than
+absent. It cites code by symbol name per the index's rule 3.
+
+Two further count/severity corrections came out of review: the ten defects are
+**five HIGH and five medium/low**, of which **one** (library mutation) closed here
+and **nine** remain open — the earlier "six HIGH / eight open" double-counted the
+GC hardening fix, which the same document declares is not one of the ten. And
+`ISSUE-ZIP-STREAM-LATEFAIL-01` is **Medium**: `KNOWN_ISSUES.md` has rated it Medium
+since the 2026-05-27 preflight narrowing, while `OPEN-WORK-INDEX.md` still carried
+HIGH. The index now matches the registry, per its own rule that the registry owns
+severity.
+
+**Runtime and tests**: `internal/api/server.go`, `internal/api/gc_run_gate_test.go`,
+`internal/api/v2/libraries.go`, `internal/api/v2/library_live_write_fence_test.go`,
+`internal/api/v2/library_mutation_authority_test.go`,
+`internal/api/v2/library_settings.go`, `internal/api/v2/library_settings_test.go`,
+`internal/api/v2/storage_policy.go`, `internal/api/v2/storage_policy_test.go`,
+`internal/gc/gc.go`, `internal/gc/gc_test.go`,
+`internal/gc/manual_trigger_gate_test.go`, `internal/gc/store.go`,
+`internal/gc/store_cassandra.go`, `internal/gc/store_mock.go`,
+`internal/gc/worker.go`, `internal/gc/worker_test.go`,
+`internal/integration/check_blocks_admission_test.go`,
+`internal/integration/gc_s3_deletion_test.go`,
+`internal/integration/integration_test.go`, `internal/middleware/permissions.go`,
+`internal/traffic/storage.go`.
+
+**Frontend and records**: `frontend/src/components/user-settings/api-keys.js`,
+`CURRENT_WORK.md`, `docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`,
+`docs/DEPLOY.md`, `docs/PROD-READINESS-VERIFICATION-20260822.md`,
+`docs/CHANGELOG.md`.
+
+---
+
 ## 2026-08-21 - P1 locator authority foundation
 
 Materialization funnels now resolve one org-scoped `storage_key`, use that exact

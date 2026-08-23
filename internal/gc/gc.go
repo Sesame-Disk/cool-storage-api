@@ -121,6 +121,15 @@ const (
 
 var ErrNotLeader = errors.New("gc leadership required")
 
+// ErrGCDisabled is returned when GC is disabled on this node. It is distinct
+// from ErrGCNotRunning and ErrNotLeader so callers can distinguish configuration
+// shutdown, lifecycle shutdown, and leadership routing.
+var ErrGCDisabled = errors.New("gc is disabled on this node")
+
+// ErrGCNotRunning is returned when GC is enabled in configuration but this
+// service is not currently inside its running lifecycle.
+var ErrGCNotRunning = errors.New("gc is not running on this node")
+
 // Service is the top-level GC orchestrator.
 // It starts and manages the worker and scanner goroutines.
 type Service struct {
@@ -138,10 +147,14 @@ type Service struct {
 	// not on the GC queue.
 	dbSession *gocql.Session
 
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	started bool
-	mu      sync.Mutex
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	leaseCancel context.CancelFunc
+	leaseWG     sync.WaitGroup
+	started     bool
+	stopping    bool
+	stopDone    chan struct{}
+	mu          sync.Mutex
 
 	// reconcileMu serializes snapshot reconciliation so global gc_stats totals
 	// are not corrupted by concurrent read-modify-write cycles.
@@ -149,8 +162,12 @@ type Service struct {
 
 	// dlqOpsMu serializes admin DLQ mutations (requeue/delete) so the
 	// non-atomic SELECT+INSERT+DELETE in RequeueFailedItem cannot duplicate
-	// queue rows under concurrent admin requests on the same leader.
-	dlqOpsMu sync.Mutex
+	// queue rows under concurrent admin requests on the same leader. A channel is
+	// used instead of sync.Mutex so shutdown can wait with its context.
+	dlqOpsMu    chan struct{}
+	dlqOpsOnce  sync.Once
+	dlqActiveMu sync.Mutex
+	dlqCancel   context.CancelFunc
 
 	// reconcilePasses counts serialized reconcile runs so we can do occasional
 	// full drift checks without paying that cost on every pass.
@@ -164,6 +181,18 @@ type Service struct {
 	// Channels for manual triggers
 	triggerWorker  chan struct{}
 	triggerScanner chan struct{}
+	// triggerMu serializes trigger admission with lifecycle transitions. It must
+	// never be held across wg.Wait(), because scanner shutdown can call a trigger.
+	triggerMu sync.Mutex
+
+	// acceptingWork mirrors the active running state for readers that must not take
+	// s.mu. The scanner can call TriggerWorker from a run-owned goroutine while
+	// shutdown waits for that run, so trigger admission stays lock-free.
+	acceptingWork atomic.Bool
+	// dryRun is the runtime value used by status and the worker. The config field
+	// remains the startup default; runtime changes must be atomic because the API
+	// can update them while a worker is processing a batch.
+	dryRun atomic.Bool
 }
 
 // NewService creates a new GC service using the provided store and storage provider.
@@ -179,7 +208,7 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 	scanner := NewScanner(store, queue, stats, cfg)
 	scanner.SetOrphanRecoverer(worker)
 
-	return &Service{
+	service := &Service{
 		store:          store,
 		storage:        storage,
 		config:         cfg,
@@ -192,6 +221,8 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 		triggerWorker:  make(chan struct{}, 1),
 		triggerScanner: make(chan struct{}, 1),
 	}
+	service.dryRun.Store(cfg.DryRun)
+	return service
 }
 
 // Start begins the worker and scanner goroutines.
@@ -199,6 +230,16 @@ func (s *Service) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// stopping is checked FIRST because it never appears alone: a draining service
+	// keeps started=true until finishStop clears both, so testing started first
+	// makes this branch unreachable exactly when it matters. A restart is refused,
+	// not queued, while the previous run drains — reusing the WaitGroup here would
+	// overlap two lifecycles — and it is logged, otherwise a mis-sequenced restart
+	// leaves no trace at all.
+	if s.stopping {
+		log.Println("[GC] Start ignored: previous run is still draining")
+		return
+	}
 	if s.started {
 		return
 	}
@@ -224,7 +265,16 @@ func (s *Service) Start() {
 		}
 	}
 
+	// Discard any trigger token that raced in against a Stop(). Serialize this
+	// drain with TriggerWorker/TriggerScanner so a trigger that passed the
+	// acceptingWork check cannot land in the channel after this drain and before
+	// the new lifecycle is enabled.
+	s.triggerMu.Lock()
+	drainTriggerChannel(s.triggerWorker)
+	drainTriggerChannel(s.triggerScanner)
 	s.started = true
+	s.acceptingWork.Store(true)
+	s.triggerMu.Unlock()
 
 	// Start worker goroutine
 	s.wg.Add(1)
@@ -244,10 +294,12 @@ func (s *Service) Start() {
 	// worker/scanner duration so long-running ProcessOnce or ScanOnce calls
 	// (which can exceed the TTL) don't cause the lease to lapse.
 	if s.lease != nil {
-		s.wg.Add(1)
+		leaseCtx, leaseCancel := context.WithCancel(context.Background())
+		s.leaseCancel = leaseCancel
+		s.leaseWG.Add(1)
 		go func() {
-			defer s.wg.Done()
-			s.runLeaseRenewalLoop(ctx)
+			defer s.leaseWG.Done()
+			s.runLeaseRenewalLoop(leaseCtx)
 		}()
 	}
 
@@ -262,50 +314,244 @@ func (s *Service) Start() {
 
 	log.Printf("[GC] Started (worker every %v, scanner every %v, grace %v, batch %d, dry_run=%v)",
 		s.config.WorkerInterval, s.config.ScanInterval, s.config.GracePeriod,
-		s.config.BatchSize, s.config.DryRun)
+		s.config.BatchSize, s.dryRun.Load())
 }
 
-// Stop gracefully stops the GC service.
-func (s *Service) Stop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Service) initDLQOpsGate() {
+	s.dlqOpsOnce.Do(func() {
+		s.dlqOpsMu = make(chan struct{}, 1)
+		s.dlqOpsMu <- struct{}{}
+	})
+}
 
-	if !s.started {
-		return
+func (s *Service) cancelActiveDLQOperation() {
+	s.dlqActiveMu.Lock()
+	cancel := s.dlqCancel
+	s.dlqActiveMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Service) waitForDLQDrain(ctx context.Context) bool {
+	s.initDLQOpsGate()
+	select {
+	case <-s.dlqOpsMu:
+		s.dlqOpsMu <- struct{}{}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Stop gracefully stops the GC service using an uncancelable context for
+// callers that need the historical blocking shutdown behavior.
+func (s *Service) Stop() {
+	s.StopWithContext(context.Background())
+}
+
+// StopWithContext starts shutdown and waits for the current run to drain. A
+// timed-out caller does not make the service restartable: the lifecycle remains
+// stopping until every worker and DLQ mutation has exited, then releases the
+// lease and transitions to stopped.
+func (s *Service) StopWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	if !s.started && !s.stopping {
+		s.mu.Unlock()
+		return nil
 	}
 
-	log.Println("[GC] Stopping...")
-	s.cancel()
+	if !s.stopping {
+		log.Println("[GC] Stopping...")
+		s.stopping = true
+		s.stopDone = make(chan struct{})
+		s.acceptingWork.Store(false)
+		s.cancelActiveDLQOperation()
+		s.triggerMu.Lock()
+		drainTriggerChannel(s.triggerWorker)
+		drainTriggerChannel(s.triggerScanner)
+		s.triggerMu.Unlock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		go s.finishStop(s.stopDone)
+	}
+	stopDone := s.stopDone
+	s.mu.Unlock()
+
+	select {
+	case <-stopDone:
+		return nil
+	case <-ctx.Done():
+		log.Printf("[GC] Shutdown context expired while waiting for drain: %v", ctx.Err())
+		return fmt.Errorf("stop gc service: %w", ctx.Err())
+	}
+}
+
+func (s *Service) finishStop(stopDone chan struct{}) {
+	// Once shutdown begins no new DLQ operation can pass its lifecycle check.
+	// Wait without the caller's deadline so a timeout cannot publish a false
+	// stopped state or permit WaitGroup reuse while this run is still draining.
+	s.waitForDLQDrain(context.Background())
 	s.wg.Wait()
 
-	// Release leadership so another replica can take over without waiting
-	// for TTL expiry. Best-effort — if it fails, TTL handles it.
+	if s.leaseCancel != nil {
+		s.leaseCancel()
+		s.leaseWG.Wait()
+	}
 	if s.lease != nil {
 		s.lease.Release(context.Background())
 	}
-
-	// Persist stats to database before shutdown
 	s.persistStats()
 
+	s.mu.Lock()
 	s.started = false
+	s.stopping = false
+	s.cancel = nil
+	s.leaseCancel = nil
+	close(stopDone)
+	s.mu.Unlock()
 	log.Println("[GC] Stopped")
 }
 
-// TriggerWorker triggers an immediate worker run.
-func (s *Service) TriggerWorker() {
+// AcceptsManualTriggers reports whether a manual worker/scanner trigger can
+// actually reach a consumer goroutine that will execute it right now.
+//
+// This is defence in depth for the GC kill switch, not decoration. A disabled
+// service is still CONSTRUCTED by the API server and its superadmin endpoint
+// (POST /api/v2.1/admin/gc/run) is still registered; Start() merely declines to
+// launch runWorkerLoop/runScannerLoop. So before this guard existed the kill
+// switch rested on "a disabled service has no consumer for the trigger channel",
+// which is an accident of Start()'s control flow rather than a stated invariant.
+// Any refactor that launched those loops unconditionally would have silently
+// promoted that endpoint into a live bypass of GC_ENABLED=false. The check
+// belongs where the decision is.
+//
+// Two smaller consequences it also removes: the endpoint answered
+// {"started":true} for a run that never happened, and the parked token in the
+// size-1 buffered channel would have fired one unrequested run the moment GC was
+// later enabled.
+//
+// Reads lifecycle state atomically and checks the cached lease state without
+// taking s.mu; a mutex here deadlocks Stop().
+func (s *Service) AcceptsManualTriggers() bool {
+	return s.acceptsManualTriggers()
+}
+
+// ManualTriggerError reports why a manual trigger cannot be accepted. A trigger
+// is only honest when the service is running and this node currently owns the
+// GC lease; a follower's loop will otherwise consume the token and immediately
+// return without doing work.
+func (s *Service) ManualTriggerError() error {
+	if s == nil {
+		return ErrGCNotRunning
+	}
+	if !s.acceptingWork.Load() {
+		if !s.config.Enabled {
+			return ErrGCDisabled
+		}
+		return ErrGCNotRunning
+	}
+	if s.lease != nil && !s.lease.IsLeader() {
+		return ErrNotLeader
+	}
+	return nil
+}
+
+func (s *Service) acceptsManualTriggers() bool {
+	return s.ManualTriggerError() == nil
+}
+
+// gcAdminMutationError gates the SYNCHRONOUS admin surface. DLQ mutations do
+// their store work inline and do not require leadership before entering this
+// check, but they must still be inside the service lifecycle: Stop() releases
+// the lease before HTTP shutdown completes, so accepting work on a merely
+// Enabled service could let a draining node reclaim leadership.
+func (s *Service) gcAdminMutationError() error {
+	if s == nil {
+		return ErrGCNotRunning
+	}
+	if !s.config.Enabled {
+		return ErrGCDisabled
+	}
+	if !s.acceptingWork.Load() {
+		return ErrGCNotRunning
+	}
+	return nil
+}
+
+// drainTriggerChannel empties a size-1 trigger channel without blocking.
+func drainTriggerChannel(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+	}
+}
+
+// TriggerWorker triggers an immediate worker run. It reports whether the trigger
+// was accepted; false means the service is disabled, not running, or not the
+// current leader, and nothing was queued.
+func (s *Service) TriggerWorker() bool {
+	return s.triggerWorkerWithDryRun(nil)
+}
+
+// TriggerWorkerWithDryRun atomically admits a worker trigger and applies an
+// optional runtime mode override. A rejected trigger never commits the override.
+func (s *Service) TriggerWorkerWithDryRun(dryRun *bool) bool {
+	return s.triggerWorkerWithDryRun(dryRun)
+}
+
+func (s *Service) triggerWorkerWithDryRun(dryRun *bool) bool {
+	s.triggerMu.Lock()
+	defer s.triggerMu.Unlock()
+
+	if err := s.ManualTriggerError(); err != nil {
+		return false
+	}
+	if dryRun != nil {
+		s.dryRun.Store(*dryRun)
+		s.worker.dryRun.Store(*dryRun)
+	}
 	select {
 	case s.triggerWorker <- struct{}{}:
 	default:
 		// Already triggered
 	}
+	return true
 }
 
-// TriggerScanner triggers an immediate scanner run.
-func (s *Service) TriggerScanner() {
+// TriggerScanner triggers an immediate scanner run. It reports whether the
+// trigger was accepted; false means the service is disabled, not running, or
+// not the current leader.
+func (s *Service) TriggerScanner() bool {
+	return s.triggerScannerWithDryRun(nil)
+}
+
+// TriggerScannerWithDryRun atomically admits a scanner trigger and applies an
+// optional runtime mode override. A rejected trigger never commits the override.
+func (s *Service) TriggerScannerWithDryRun(dryRun *bool) bool {
+	return s.triggerScannerWithDryRun(dryRun)
+}
+
+func (s *Service) triggerScannerWithDryRun(dryRun *bool) bool {
+	s.triggerMu.Lock()
+	defer s.triggerMu.Unlock()
+
+	if err := s.ManualTriggerError(); err != nil {
+		return false
+	}
+	if dryRun != nil {
+		s.dryRun.Store(*dryRun)
+		s.worker.dryRun.Store(*dryRun)
+	}
 	select {
 	case s.triggerScanner <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 // SetOnlyOfficeReconciler wires the OnlyOffice pending-blocks reconciler into
@@ -364,7 +610,7 @@ func (s *Service) Status() GCStatus {
 
 	return GCStatus{
 		Enabled:            s.config.Enabled,
-		DryRun:             s.config.DryRun,
+		DryRun:             s.dryRun.Load(),
 		LastWorkerRun:      formatTime(lastWorker),
 		LastScanRun:        formatTime(lastScanAttempt),
 		LastScanAttempt:    formatTime(lastScanAttempt),
@@ -713,7 +959,7 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 
 	start := time.Now()
 	err := s.scanner.ScanOnce(ctx)
-	retried := s.retryAutoRecoverableFailedItems()
+	retried := s.retryAutoRecoverableFailedItems(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("[GC Scanner] Error: %v", err)
 		s.stats.SetLastScanError(err.Error())
@@ -730,50 +976,55 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
 }
 
-func (s *Service) retryAutoRecoverableFailedItems() int {
-	orgs, err := s.store.ListOrgsWithFailedItems(gcAutoRetryFailedOrgLimit)
-	if err != nil {
-		log.Printf("[GC Scanner] Failed to list orgs with failed items for auto-retry: %v", err)
-		return 0
-	}
-
+func (s *Service) retryAutoRecoverableFailedItems(ctx context.Context) int {
 	retried := 0
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
-
-	for _, org := range orgs {
-		if retried >= gcAutoRetryFailedItemLimit {
-			break
-		}
-
-		items, err := s.store.ListFailedItems(org.OrgID, s.FailedItemsPageSize())
+	_ = s.withDLQOperation(ctx, func(ctx context.Context) error {
+		orgs, err := s.store.ListOrgsWithFailedItems(gcAutoRetryFailedOrgLimit)
 		if err != nil {
-			log.Printf("[GC Scanner] Failed to list failed items for org %s: %v", org.OrgID, err)
-			continue
+			log.Printf("[GC Scanner] Failed to list orgs with failed items for auto-retry: %v", err)
+			return nil
 		}
 
-		for _, item := range items {
+		for _, org := range orgs {
 			if retried >= gcAutoRetryFailedItemLimit {
 				break
 			}
 
-			eligible, err := s.isAutoRecoverableFailedItem(item)
+			items, err := s.store.ListFailedItems(org.OrgID, s.FailedItemsPageSize())
 			if err != nil {
-				log.Printf("[GC Scanner] Failed to classify DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
-				continue
-			}
-			if !eligible {
+				log.Printf("[GC Scanner] Failed to list failed items for org %s: %v", org.OrgID, err)
 				continue
 			}
 
-			if err := s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, time.Now().UTC()); err != nil {
-				log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
-				continue
+			for _, item := range items {
+				if retried >= gcAutoRetryFailedItemLimit {
+					break
+				}
+
+				eligible, err := s.isAutoRecoverableFailedItem(item)
+				if err != nil {
+					log.Printf("[GC Scanner] Failed to classify DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+					continue
+				}
+				if !eligible {
+					continue
+				}
+
+				queuedAt := time.Now().UTC()
+				if store, ok := s.store.(GCAdminContextStore); ok {
+					err = store.RequeueFailedItemContext(ctx, item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt)
+				} else {
+					err = s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt)
+				}
+				if err != nil {
+					log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+					continue
+				}
+				retried++
 			}
-			retried++
 		}
-	}
-
+		return nil
+	})
 	return retried
 }
 
@@ -1076,13 +1327,58 @@ func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_delete") {
+	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (s *Service) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	return s.withDLQOperation(ctx, func(ctx context.Context) error {
+		return s.deleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+	})
+}
+
+func (s *Service) withDLQOperation(ctx context.Context, fn func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.initDLQOpsGate()
+	select {
+	case <-s.dlqOpsMu:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	opCtx, cancel := context.WithCancel(ctx)
+	s.dlqActiveMu.Lock()
+	s.dlqCancel = cancel
+	s.dlqActiveMu.Unlock()
+	defer func() {
+		cancel()
+		s.dlqActiveMu.Lock()
+		s.dlqCancel = nil
+		s.dlqActiveMu.Unlock()
+		s.dlqOpsMu <- struct{}{}
+	}()
+	return fn(opCtx)
+}
+
+func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
+	// GC is disabled fleet-wide today; once it is activated, only the designated GC
+	// location is expected to run it. Without this check an operator on any disabled
+	// replica takes the lease away from the location that actually drains the queue,
+	// causing a GC outage from a node that cannot do the work.
+	if err := s.gcAdminMutationError(); err != nil {
+		return err
+	}
+	if !s.tryClaimLeadershipForAdmin(ctx, "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
-	err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID)
-	if err != nil {
+	if store, ok := s.store.(GCAdminContextStore); ok {
+		err := store.DeleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+		if err != nil {
+			return err
+		}
+	} else if err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
@@ -1092,7 +1388,26 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 }
 
 func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_requeue") {
+	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID)
+}
+
+func (s *Service) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	return s.withDLQOperation(ctx, func(ctx context.Context) error {
+		return s.requeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID)
+	})
+}
+
+func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+
+	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
+	// GC is disabled fleet-wide today; once it is activated, only the designated GC
+	// location is expected to run it. Without this check an operator on any disabled
+	// replica takes the lease away from the location that actually drains the queue,
+	// causing a GC outage from a node that cannot do the work.
+	if err := s.gcAdminMutationError(); err != nil {
+		return err
+	}
+	if !s.tryClaimLeadershipForAdmin(ctx, "admin_failed_item_requeue") {
 		return ErrNotLeader
 	}
 	// Serialize DLQ admin mutations: RequeueFailedItem performs a non-atomic
@@ -1101,10 +1416,12 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	// INSERT into gc_queue (with different queued_at), and the second DELETE
 	// would no-op — leaving a duplicated queue row that the worker would
 	// process twice.
-	s.dlqOpsMu.Lock()
-	defer s.dlqOpsMu.Unlock()
-	err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, time.Now().UTC())
-	if err != nil {
+	queuedAt := time.Now().UTC()
+	if store, ok := s.store.(GCAdminContextStore); ok {
+		if err := store.RequeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, queuedAt); err != nil {
+			return err
+		}
+	} else if err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, queuedAt); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
@@ -1164,6 +1481,11 @@ func (s *Service) leaseRenewalInterval() time.Duration {
 	if s.lease == nil {
 		return time.Minute
 	}
+	if provider, ok := s.lease.(interface{ RenewalInterval() time.Duration }); ok {
+		if interval := provider.RenewalInterval(); interval > 0 {
+			return interval
+		}
+	}
 	cl, ok := s.lease.(*cassandraLeaderLease)
 	if !ok {
 		return 10 * time.Second
@@ -1193,10 +1515,11 @@ func (s *Service) runLeaseRenewalLoop(ctx context.Context) {
 
 // SetDryRun changes the dry run mode at runtime (for admin API).
 func (s *Service) SetDryRun(dryRun bool) {
+	s.dryRun.Store(dryRun)
+	s.worker.dryRun.Store(dryRun)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.config.DryRun = dryRun
-	s.worker.dryRun = dryRun
 }
 
 // rolloverInterval is how often the rollover loop checks for expired billing

@@ -165,6 +165,22 @@ func validateRequestedCreateStorageClass(cfg *config.Config, requestedClass stri
 	return nil
 }
 
+// validateMutableStorageClass is the create-time class check plus the residency
+// constraint. It builds on validateRequestedCreateStorageClass on purpose: the two
+// doors onto this field must not drift on what counts as an admissible class.
+func validateMutableStorageClass(cfg *config.Config, policy orgStoragePolicy, requestedClass string) error {
+	if err := validateRequestedCreateStorageClass(cfg, requestedClass); err != nil {
+		return err
+	}
+	if policy.DataResidency != orgDataResidencyStrict {
+		return nil
+	}
+	if !strings.EqualFold(storageClassRegion(cfg, requestedClass), policy.DefaultRegion) {
+		return fmt.Errorf("storage class is not allowed by organization data residency policy")
+	}
+	return nil
+}
+
 func validateOrgStoragePolicy(cfg *config.Config, policy orgStoragePolicy) error {
 	if policy.DataResidency == orgDataResidencyStrict && policy.DefaultRegion == "" {
 		return fmt.Errorf("strict data residency requires a default_region")

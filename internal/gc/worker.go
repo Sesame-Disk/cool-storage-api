@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -472,7 +473,7 @@ type Worker struct {
 	queue       *Queue
 	batchSize   int
 	gracePeriod time.Duration
-	dryRun      bool
+	dryRun      atomic.Bool
 	stats       *Stats
 	clock       func() time.Time
 
@@ -581,13 +582,12 @@ const blockDeleteClaimStaleAfter = 15 * time.Minute
 
 // NewWorker creates a new GC worker.
 func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize int, gracePeriod time.Duration, dryRun bool, stats *Stats) *Worker {
-	return &Worker{
+	worker := &Worker{
 		store:       store,
 		storage:     storage,
 		queue:       queue,
 		batchSize:   batchSize,
 		gracePeriod: gracePeriod,
-		dryRun:      dryRun,
 		stats:       stats,
 		clock:       time.Now,
 		// Armed unconditionally: ValidateDestructiveGCTopology is part of GCStore, so
@@ -595,6 +595,8 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 		// ungated. Stores with no keyspace behind them (the mock) answer nil.
 		destructiveTopologyGate: store.ValidateDestructiveGCTopology,
 	}
+	worker.dryRun.Store(dryRun)
+	return worker
 }
 
 // SetDestructiveTopologyGate overrides the check that must pass before this worker
@@ -790,7 +792,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 			continue
 		}
 
-		if w.dryRun {
+		if w.dryRun.Load() {
 			continue
 		}
 
@@ -872,7 +874,7 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would conditionally delete block %s from DB and S3", item.ItemID)
 		return nil
 	}
@@ -1346,7 +1348,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	if w.storage == nil {
 		return 0, nil
 	}
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
 		return 0, nil
 	}
@@ -1762,7 +1764,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 		return nil
 	}
 
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would delete commit %s from library %s", item.ItemID, item.LibraryID)
 		return nil
 	}
@@ -1828,7 +1830,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would delete fs_object %s from library %s", item.ItemID, item.LibraryID)
 		return nil
 	}
@@ -1907,7 +1909,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would delete share link %s", item.ItemID)
 		return nil
 	}
@@ -1921,7 +1923,7 @@ func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processShare(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would delete share %s", item.ItemID)
 		return nil
 	}
@@ -1940,7 +1942,7 @@ func (w *Worker) processShare(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processRestoreJob(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would delete restore job %s", item.ItemID)
 		return nil
 	}
@@ -1966,7 +1968,7 @@ func (w *Worker) processRestoreJob(ctx context.Context, item QueueItem) error {
 // 5. Hard-delete user record + email lookup
 // 6. Audit log
 func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would cascade-delete user %s in org %s", item.ItemID, item.OrgID)
 		return nil
 	}
@@ -2147,7 +2149,7 @@ func (w *Worker) deleteUserShares(orgID, userID uuid.UUID) (int, error) {
 // 2. Hard-delete the library record
 // 3. Audit log
 func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would cascade-delete library %s in org %s", item.ItemID, item.OrgID)
 		return nil
 	}
@@ -2306,7 +2308,7 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 // 4. Hard-delete org record
 // 5. Audit log
 func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
-	if w.dryRun {
+	if w.dryRun.Load() {
 		log.Printf("[GC Worker] DRY RUN: Would cascade-delete org %s", item.ItemID)
 		return nil
 	}

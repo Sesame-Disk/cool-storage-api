@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -66,6 +68,52 @@ func TestLibrarySettings_RequireOwner_InvalidRepoID(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "invalid repo_id" {
 		t.Errorf("error = %v, want 'invalid repo_id'", resp["error"])
+	}
+}
+
+func TestLibrarySettings_RequireOwner_CredentialScopeMatrix(t *testing.T) {
+	tests := []struct {
+		name          string
+		scope         string
+		repoToken     bool
+		requiredScope string
+		wantOK        bool
+	}{
+		{name: "session mutation", requiredScope: apikeys.ScopeReadWrite, wantOK: true},
+		{name: "read-write mutation", scope: apikeys.ScopeReadWrite, requiredScope: apikeys.ScopeReadWrite, wantOK: true},
+		{name: "admin mutation", scope: apikeys.ScopeAdmin, requiredScope: apikeys.ScopeReadWrite, wantOK: true},
+		{name: "read mutation denied", scope: apikeys.ScopeRead, requiredScope: apikeys.ScopeReadWrite},
+		{name: "read settings", scope: apikeys.ScopeRead, requiredScope: apikeys.ScopeRead, wantOK: true},
+		{name: "repo token denied", repoToken: true, requiredScope: apikeys.ScopeRead},
+	}
+
+	original := isLibraryOwnerFn
+	isLibraryOwnerFn = func(_ *middleware.PermissionMiddleware, _, _, _ string) (bool, error) { return true, nil }
+	defer func() { isLibraryOwnerFn = original }()
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set("org_id", authTestOrgID)
+			c.Set("user_id", authTestUserID)
+			if tc.scope != "" {
+				c.Set("api_key_scope", tc.scope)
+			}
+			if tc.repoToken {
+				c.Set("repo_api_token", true)
+			}
+			c.Params = gin.Params{{Key: "repo_id", Value: authTestRepoID}}
+
+			h := &LibrarySettingsHandler{}
+			_, _, _, ok := h.requireOwner(c, tc.requiredScope)
+			if ok != tc.wantOK {
+				t.Fatalf("requireOwner ok = %v, want %v (status %d)", ok, tc.wantOK, w.Code)
+			}
+			if !tc.wantOK && w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+			}
+		})
 	}
 }
 

@@ -117,8 +117,8 @@ func verifyNoOrphanAdminLibraryProjections() error {
 
 func verifyNoOrphanAdminLibraryProjectionsInDB(database *dbpkg.DB) error {
 	type projectionIssue struct {
-		scope string
-		orgID string
+		scope  string
+		orgID  string
 		repoID string
 		reason string
 	}
@@ -296,6 +296,10 @@ func createTestLibrary(t *testing.T, c *testClient, name string) string {
 	return createLibraryForTest(t, c, name, map[string]string{"repo_name": name}, true)
 }
 
+func createTestLibraryWithCleanup(t *testing.T, c, cleanupClient *testClient, name string) string {
+	return createLibraryForTestWithCleanup(t, c, cleanupClient, name, map[string]string{"repo_name": name}, true)
+}
+
 func createDisposableTestLibrary(t *testing.T, c *testClient, name string) string {
 	return createLibraryForTest(t, c, name, map[string]string{"repo_name": name}, false)
 }
@@ -305,6 +309,10 @@ func createLibraryWithBody(t *testing.T, c *testClient, name string, body interf
 }
 
 func createLibraryForTest(t *testing.T, c *testClient, name string, body interface{}, cleanup bool) string {
+	return createLibraryForTestWithCleanup(t, c, c, name, body, cleanup)
+}
+
+func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient, name string, body interface{}, cleanup bool) string {
 	t.Helper()
 
 	const maxAttempts = 5
@@ -315,7 +323,7 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 			if cleanup {
 				t.Cleanup(func() {
 					liveRepoIDs.Delete(repoID)
-					resp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+					resp := cleanupClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
 					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
 						resp.Body.Close()
 						return
@@ -442,9 +450,9 @@ func cleanupOrphanAdminLibraryProjectionsWithoutTesting() (int, error) {
 
 func cleanupOrphanAdminLibraryProjectionsInDB(database *dbpkg.DB) (int, error) {
 	type cleanupTarget struct {
-		orgID string
+		orgID  string
 		repoID string
-		row   dbpkg.AdminLibraryProjectionRow
+		row    dbpkg.AdminLibraryProjectionRow
 	}
 
 	targets := map[string]cleanupTarget{}
