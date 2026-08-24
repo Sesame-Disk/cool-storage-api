@@ -91,18 +91,30 @@ row, recovery reload and physical DELETE. `blocks.storage_key` and the
 canonical `gc_s3_orphans.storage_key` are required; an empty key fails closed.
 The `_by_day` table remains an identity-only discovery projection. Both
 destructive paths additionally verify the persisted key against the key their
-own org-scoped store derives and refuse the delete on a mismatch, since the
-store applies whatever key it is handed. Successful destructive authorization is
-unchanged, but failure ordering is not: resolving the store during the
+own org-scoped store derives and refuse the delete on a mismatch. That caller-level
+logical binding remains necessary even though exact-key store operations now
+structurally reject keys outside their configured prefix and canonical org ID.
+Successful destructive authorization is unchanged, but failure ordering is not:
+resolving the store during the
 authorization phase means an unresolvable backend or an invalid locator is now
 refused before any destructive lifecycle state is written, where it previously
 could be discovered after the canonical row was already gone. The exact locator
 prevents a caller from silently deriving a different target, but it does not
 create a never-reused physical incarnation or solve the X1 publication-fence
-and per-attempt claim-ownership races. The equality check it relies on is also
-carrying tenant isolation, so P2 cannot simply delete it when keys stop being
-derived (see ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains
-disabled in production.
+and per-attempt claim-ownership races. The equality remains the deterministic
+layout check; exact-key tenant isolation no longer relies on it after the
+structural prerequisite below. P2 still cannot remove that equality until its
+minted-key format and install properties replace it (see
+ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains disabled in production.
+
+**Structural P2 prerequisite (2026-08-24).** Every exact-key `BlockStore`
+operation now validates the raw key against that store's configured prefix plus
+canonical org ID before any backend access. `ValidatePhysicalLocator` centralizes
+the stronger destructive check used by both normal GC deletion and orphan
+recovery: tenant ownership first, then the still-required deterministic
+`K == hashToKey(L)` equality. This removes caller convention as the exact-key
+tenant boundary, but does not mint keys or change P2's definition. P2, R9, R24
+and X1 remain open, and `GC_ENABLED=false` remains mandatory.
 
 **The historical risk remains real even though the current greenfield deployment
 contract now prohibits both halves.** An earlier version of this section justified the
@@ -185,6 +197,10 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   `hashToKey(L)`, exact-key delete and recovery are observationally equivalent to
   today's derived delete — same authorization, same object. The deployment is
   observable before identity moves.
+- **Structural prerequisite before P2 (implemented 2026-08-24).** Every exact-key
+  `BlockStore` operation enforces configured prefix + canonical org ID before
+  backend access, and destructive callers share `ValidatePhysicalLocator`. The
+  deterministic equality remains in force; this is not minted-key or install work.
 - **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.
