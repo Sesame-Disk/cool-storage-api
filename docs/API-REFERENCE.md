@@ -513,10 +513,17 @@ blockStore, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID.String())
 if err != nil {
     return err
 }
-blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
-// Legacy key: blocks/<org_id>/XX/XX/blockID
-// Fresh key:  blocks/<org_id>/XX/XX/blockID.<lowercase-uuid>
+legacyKey, err := blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
+// legacyKey: blocks/<org_id>/XX/XX/blockID
+
+mintedKey, err := blockStore.MintStorageKey(blockID)
+storedKey, err := blockStore.PutObjectAutoDirect(ctx, mintedKey, content)
+// storedKey: blocks/<org_id>/XX/XX/blockID.<lowercase-uuid>
 ```
+
+`PutBlockData` remains the deterministic legacy convenience API. Canonical
+writes that need a fresh physical incarnation use `MintStorageKey` and pass that
+exact key to `PutObjectAutoDirect`.
 
 There is no org-less `BlockStore` constructor. Manager-backed callers use
 `GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC requires the persisted
