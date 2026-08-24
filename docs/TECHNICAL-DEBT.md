@@ -2266,4 +2266,92 @@ fails if the granular flag result stops being honoured.
 
 ---
 
-*Last updated: 2026-07-23*
+## 34. Library-HEAD CAS Has No Serial-Domain Contract (2026-08-23)
+
+### Current State
+
+Two conditional statements advance the canonical library HEAD:
+
+- `internal/api/v2/fs_helpers.go` — `UpdateLibraryHead`, `UPDATE libraries ... IF head_commit_id = ?`
+- `internal/api/sync.go` — the sync-protocol publish, same conditional shape
+
+Neither pins a serial phase, so both inherit the session's `serial_consistency`.
+`confirmLibraryHeadCommitVisible` (`internal/api/v2/fs_helpers.go`), the
+confirmation read used to resolve an ambiguous CAS outcome, hardcodes
+`Consistency(gocql.Serial)`.
+
+Under the shipped configuration these agree: `serial_consistency: SERIAL` is the
+code default (`internal/config/config.go`) and the value in `config.prod.yaml`,
+`config.example.yaml`, `config.docker.yaml`, `config-usa.yaml` and
+`config-eu.yaml`. **There is no active defect in a shipped deployment.**
+
+They diverge wherever the session is `LOCAL_SERIAL` — the `config-usa.cluster.yaml`
+and `config-eu.cluster.yaml` multi-DC harnesses, or a `CASSANDRA_SERIAL_CONSISTENCY`
+override.
+
+### Why It Is Debt
+
+This is the same class of fragility that P0/R12 removed from the `blocks`
+partition: a correctness property that silently depends on a configurable
+session setting. R12 pinned `blocks`, `gc_s3_orphans` and `gc_block_candidates`;
+nobody ever established a contract for `libraries`.
+
+Two distinct consequences under `LOCAL_SERIAL`, and the second is the one that
+matters:
+
+1. **Confirmation read in a foreign domain.** A global serial quorum (5 of 9 at
+   3 DCs x RF3) can exclude the local DC entirely — 5 replicas fit inside
+   DC2+DC3 — so the read can miss a proposal already accepted locally and report
+   a false negative. `resolveLibraryHeadUpdateError` then returns an error for a
+   publish that subsequently commits.
+
+2. **Lost update on the HEAD CAS itself.** Two writers in different DCs can both
+   apply `IF head_commit_id = ?` because their local quorums do not intersect.
+   A published commit disappears and its tree is orphaned. This is R9/R12 on the
+   `libraries` partition.
+
+Neither is reachable today; both become reachable in exactly the harnesses used
+to validate multi-DC active-active behaviour, where a lost update would most
+likely be read as test flakiness rather than as the defect it is.
+
+### Blast Radius of the False Negative
+
+`shouldRollbackOnlyOfficeMaterializedBlock` (`internal/api/v2/onlyoffice.go`)
+rolls back on *any* publish error. Verified: the rollback path does **not**
+delete the block immediately — it leaves the materialized block for provisional
+TTL cleanup. A false negative therefore does not destroy HEAD-reachable content.
+The function name is more alarming than its effect.
+
+### Documentation Gap
+
+The consistency-level table in `docs/DATABASE-GUIDE.md` enumerates block
+metadata, identity repair, GC candidate and GC block/orphan lifecycle — and does
+not list the library-HEAD LWT at all. That partition has no documented serial
+contract in either direction.
+
+### Related Limit of the R12 Contract
+
+Separately, `internal/api/sync.go` issues a **non-conditional**
+`UPDATE blocks SET last_accessed = ?`. Mixing plain writes and LWTs on one
+partition weakens Paxos linearizability regardless of serial level. It touches a
+column no `IF` clause reads, so the practical effect is bounded, but the
+"one serial domain" property R12 claims for `blocks` is about conditional
+statements only. Worth stating explicitly rather than discovering later.
+
+### Follow-Up Plan
+
+1. Pin both library-HEAD CAS statements to `SerialConsistency(gocql.Serial)`.
+2. Add the library-HEAD row to the `docs/DATABASE-GUIDE.md` consistency table.
+3. Extend the R12 AST guard (`internal/integration/r12_serial_domain_guard_test.go`)
+   to cover `libraries`; the discovery pattern is already table-driven, so this
+   is one table in the regex plus two entries in the expected map.
+4. Decide whether `last_accessed` needs to move off the `blocks` partition or
+   whether the mixed-write limit is accepted and documented.
+
+This was found while auditing PR #183 and is deliberately **not** included in it:
+#183 is scoped to the block/orphan lifecycle, and widening it would have blurred
+the P0/R12 claim.
+
+---
+
+*Last updated: 2026-08-23*

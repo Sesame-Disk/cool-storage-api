@@ -215,6 +215,7 @@ not satisfy the X1 closure criteria.
 | `ISSUE-ENCRYPTED-VIEW-CONTENT-LENGTH-01` | LOW | v2 inline-view/share-raw omit `Content-Length` on encrypted downloads |
 | `ISSUE-DOWNLOAD-NO-REHASH-01` | MEDIUM (defense-in-depth) | Download does not re-hash blocks; trusts object store |
 | `ISSUE-OIDC-ROLE-RECONCILIATION-01` | MEDIUM (design) | OIDC claims ↔ manual role overrides: authoritative-source rule undefined |
+| `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` | LOW (latent) | Both library-HEAD CAS statements inherit the session serial level while their confirmation read hardcodes `SERIAL`; no defect under the shipped `SERIAL` config, lost-update reachable only under a `LOCAL_SERIAL` override. Same class R12 closed for `blocks`. See TECHNICAL-DEBT §34 |
 
 ## Performance — deferred pending measurement
 
