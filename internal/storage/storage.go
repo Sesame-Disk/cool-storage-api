@@ -527,13 +527,10 @@ func (m *Manager) GetColdBackends() []string {
 // fails closed on an empty/invalid org id. Stores are cached and reused per
 // canonical (org, class).
 //
-// Note what this does NOT provide: the locator-taking methods apply whatever key
-// they are handed, so the store is not itself a tenant boundary. Since P1, one
-// org's GC cannot touch another org's object because both destructive callers
-// compare the persisted key against StorageKeyForHash before the backend call —
-// a property of the callers, not of this constructor. See
-// ISSUE-BLOCK-STORAGE-KEY-READS-01 for why that has to become structural here
-// before P2 mints non-derived keys.
+// Locator-taking methods enforce the configured prefix plus canonical org ID
+// before backend access, making the store a structural tenant boundary. GC adds
+// the stronger logical block-to-key binding through ValidatePhysicalLocator;
+// see ISSUE-BLOCK-STORAGE-KEY-READS-01.
 func (m *Manager) GetBlockStoreForOrg(orgID, className string) (*BlockStore, error) {
 	normalizedOrgID, err := normalizeOrgID(orgID)
 	if err != nil {

@@ -34,15 +34,10 @@ func normalizeOrgID(orgID string) (string, error) {
 	return parsed.String(), nil
 }
 
-// NewOrgBlockStore creates a block store whose DERIVED physical S3 keys are
-// org-scoped: blocks/<org_id>/<h0:2>/<h2:4>/<hash>. That aligns physical ownership
-// with the per-org blocks/block_references tables and GC claims.
-//
-// It is not itself a tenant boundary. The locator-taking APIs apply whatever key
-// they are given, including one naming another org, so cross-org isolation
-// currently rests on the callers validating the key first (see
-// ISSUE-BLOCK-STORAGE-KEY-READS-01 for why that has to move in here before P2
-// mints non-derived keys).
+// NewOrgBlockStore creates a block store whose derived and explicit physical S3
+// keys are org-scoped under <prefix><org_id>/. Derived keys append the layout
+// <h0:2>/<h2:4>/<hash>. This aligns physical ownership with the per-org
+// blocks/block_references tables and GC claims.
 //
 // It fails closed: an empty or invalid org id is rejected rather than silently
 // falling back to a global key. The org id is normalized to its canonical UUID
@@ -164,8 +159,8 @@ func (bs *BlockStore) PutBlockAuto(ctx context.Context, hash string, data []byte
 // invariant they must not break is that nothing which registers canonical metadata
 // may use them.
 func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string, data []byte) (string, error) {
-	if strings.TrimSpace(storageKey) == "" {
-		return "", fmt.Errorf("block storage key is empty")
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return "", err
 	}
 	reader := &bytesReader{data: data}
 	_, err := bs.s3.PutAuto(ctx, storageKey, reader, int64(len(data)))
@@ -176,8 +171,11 @@ func (bs *BlockStore) PutObjectAutoDirect(ctx context.Context, storageKey string
 	return storageKey, nil
 }
 
-// ObjectExists checks whether an explicit storage key exists.
+// ObjectExists checks whether a tenant-scoped explicit storage key exists.
 func (bs *BlockStore) ObjectExists(ctx context.Context, storageKey string) (bool, error) {
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return false, err
+	}
 	return bs.s3.Exists(ctx, storageKey)
 }
 
@@ -186,12 +184,24 @@ func (bs *BlockStore) StorageKeyForHash(hash string) string {
 	return bs.hashToKey(hash)
 }
 
+// ValidatePhysicalLocator verifies that storageKey belongs to this store's
+// tenant and is the deterministic physical key derived from blockID.
+func (bs *BlockStore) ValidatePhysicalLocator(blockID, storageKey string) error {
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return err
+	}
+	if storageKey != bs.hashToKey(blockID) {
+		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	return nil
+}
+
 // GetBlock retrieves a block by its hash
 func (bs *BlockStore) GetBlock(ctx context.Context, hash string) ([]byte, error) {
 	return bs.GetBlockByStorageKey(ctx, bs.hashToKey(hash))
 }
 
-// GetBlockByStorageKey retrieves a block from an explicit storage key.
+// GetBlockByStorageKey retrieves a block from a tenant-scoped explicit storage key.
 func (bs *BlockStore) GetBlockByStorageKey(ctx context.Context, storageKey string) ([]byte, error) {
 	reader, err := bs.GetBlockReaderByStorageKey(ctx, storageKey)
 	if err != nil {
@@ -212,8 +222,11 @@ func (bs *BlockStore) GetBlockReader(ctx context.Context, hash string) (io.ReadC
 	return bs.GetBlockReaderByStorageKey(ctx, bs.hashToKey(hash))
 }
 
-// GetBlockReaderByStorageKey returns a reader for an explicit storage key.
+// GetBlockReaderByStorageKey returns a reader for a tenant-scoped explicit storage key.
 func (bs *BlockStore) GetBlockReaderByStorageKey(ctx context.Context, storageKey string) (io.ReadCloser, error) {
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return nil, err
+	}
 	return bs.s3.Get(ctx, storageKey)
 }
 
@@ -222,8 +235,11 @@ func (bs *BlockStore) GetBlockSize(ctx context.Context, hash string) (int64, err
 	return bs.GetBlockSizeByStorageKey(ctx, bs.hashToKey(hash))
 }
 
-// GetBlockSizeByStorageKey returns the size of an explicit storage key using S3 HEAD.
+// GetBlockSizeByStorageKey returns the size of a tenant-scoped explicit storage key using S3 HEAD.
 func (bs *BlockStore) GetBlockSizeByStorageKey(ctx context.Context, storageKey string) (int64, error) {
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return 0, err
+	}
 	return bs.s3.GetObjectSize(ctx, storageKey)
 }
 
@@ -289,7 +305,7 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 	return result, nil
 }
 
-// DeleteBlockByStorageKey removes an object from its explicit canonical key. It is
+// DeleteBlockByStorageKey removes an object from its tenant-scoped explicit key. It is
 // the only delete entry point on purpose: with no hash-derived variant, the storage
 // layer never picks the target, so a caller has to name it.
 //
@@ -297,11 +313,12 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 // DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(id)) compiles — the tests below
 // do exactly that for cleanup. Where the key came from is a property of the caller,
 // pinned by tests, not by the compiler: production GC loads it from persisted
-// metadata and refuses it unless it matches this store's derivation.
+// metadata and can use ValidatePhysicalLocator when deterministic derivation is
+// required. This method permits future non-derived locators owned by this tenant.
 // Note: Should only be called after verifying no references exist.
 func (bs *BlockStore) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
-	if strings.TrimSpace(storageKey) == "" {
-		return fmt.Errorf("block storage key is empty")
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return err
 	}
 	return bs.s3.Delete(ctx, storageKey)
 }
@@ -332,6 +349,19 @@ func (bs *BlockStore) hashToKey(hash string) string {
 	}
 	// Two-level sharding: first 2 chars, next 2 chars
 	return fmt.Sprintf("%s%s/%s/%s", prefix, hash[:2], hash[2:4], hash)
+}
+
+// validateExactStorageKey enforces tenant ownership without normalizing or
+// rewriting the caller-provided key.
+func (bs *BlockStore) validateExactStorageKey(storageKey string) error {
+	if strings.TrimSpace(storageKey) == "" {
+		return fmt.Errorf("block storage key is empty")
+	}
+	tenantPrefix := bs.prefix + bs.orgID + "/"
+	if !strings.HasPrefix(storageKey, tenantPrefix) {
+		return fmt.Errorf("block storage key %q is outside tenant prefix %q", storageKey, tenantPrefix)
+	}
+	return nil
 }
 
 // bytesReader wraps []byte to implement io.Reader
