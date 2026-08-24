@@ -13,8 +13,23 @@ Session-by-session development history for SesameFS.
 Pinned the 11 conditional `blocks` mutations and 4 canonical `gc_s3_orphans`
 mutations to `SerialConsistency(gocql.Serial)`, with the 2 `gc_block_candidates`
 mutations included as adjacent lifecycle hardening. Added an AST/source guard that
-checks operation identity, discovery and the explicit serial pin, including
-mutation-verified protection against `LOCAL_SERIAL` or a missing pin.
+checks operation identity, discovery and the explicit serial pin.
+
+The guard is **fail-closed on unresolvable CQL**. Discovery keys off a source
+literal, so a target LWT could otherwise leave the guard's view through an
+ordinary refactor into a `const`, a variable or `fmt.Sprintf` — review found that
+pattern already in use for the hard-delete lock helpers. Any conditional CAS
+whose CQL is not a literal now fails the gate unless it holds an explicit
+allowlist entry, and the only three allowlisted helpers are separately pinned to
+`gc_*_hard_delete_locks` table literals by
+`TestR12HardDeleteLockTablesAreOutOfScope`, so the allowance cannot become a way
+to reach an R12 partition.
+
+Mutation-verified end to end: a new unpinned `blocks` LWT carrying its CQL in a
+`const` passes the previous guard and fails the current one; removing or
+downgrading a pin on any of the 17 statements also fails it. Also fixed a
+discovery false positive where a string value containing `IF` was read as a
+conditional clause.
 
 This does not change regular commit consistency, settlement, physical incarnation
 identity or destructive-GC activation. P2 remains the next X1 tranche.

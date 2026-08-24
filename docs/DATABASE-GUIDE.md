@@ -1288,12 +1288,25 @@ Set appropriate consistency levels per operation:
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
 | Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
-| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (production default) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
-| Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (production default) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
-| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (production default) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
-| GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (production default) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
+| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (explicit statement pin) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
+| Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (explicit statement pin) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
+| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (explicit statement pin) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
+| GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (explicit statement pin) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
+
+The four rows marked **explicit statement pin** do not derive their level from
+`serial_consistency` at all. Since P0/R12 (2026-08-23) each of those statements
+calls `SerialConsistency(gocql.Serial)` itself, so the level holds even where a
+deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
+`blocks` statements, 4 canonical `gc_s3_orphans` and 2 `gc_block_candidates` —
+is pinned by the untagged source gate `TestR12SerialDomainGuard`
+(`internal/integration/`), which also fails closed if a target statement's CQL
+stops being a source literal.
+
+`serial_consistency` remains the level for every **other** LWT, including the
+conditional library-HEAD publish, which has no explicit contract
+(`ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01`).
 
 The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
 test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the

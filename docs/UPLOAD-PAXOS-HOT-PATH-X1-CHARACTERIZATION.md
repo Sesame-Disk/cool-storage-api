@@ -237,7 +237,7 @@ The implemented slice:
 
 - prevents a weaker session configuration from silently changing the R12
   serial-phase property;
-- make the relevant `blocks` LWT inventory auditable;
+- makes the relevant `blocks` LWT inventory auditable;
 - leaves unrelated LWTs and their test-profile session default unchanged;
 - adds no new `SERIAL` latency to deployments currently using the shipped
   `SERIAL` setting; it changes behavior for the target LWTs when a deployment
@@ -246,10 +246,10 @@ The implemented slice:
 This is only the serial-phase prerequisite. It does not add `EACH_QUORUM`,
 settlement reads, exact physical identity or an X1 closure claim.
 
-P0/R12 is not required as a performance fix and should not be started merely
-to address X4. Its sequencing as correctness hardening remains open while the
-install design is evaluated. If the final design removes the
-ordinary metadata LWT, the P0 inventory must be split between hot-path install
+P0/R12 was implemented as correctness hardening, not as an X4 performance
+change: it neither resolves nor attempts to optimize the per-block Paxos cost
+this document characterizes. If a future install design removes the ordinary
+metadata LWT, the P0 inventory must be split between hot-path install
 operations and background/destructive lifecycle operations. GC claims,
 conditional orphan transitions and ambiguous-outcome settlement cannot be
 made local merely because normal installation is redesigned.
