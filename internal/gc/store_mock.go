@@ -3845,13 +3845,8 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
-// Deliberately weaker than storage.BlockStore.ValidatePhysicalLocator: it checks
-// tenant scope and the logical binding but NOT that blockID is a 64-hex SHA-256,
-// because GC's unit fixtures use readable synthetic ids ("blk-redelete") that the
-// real validator would reject. Production ids are internal content addresses —
-// the canonical reader already refuses anything else on every read — so the gap
-// is a test-fixture affordance, not permitted behavior. A mock pass is therefore
-// not evidence about block-id format; internal/storage owns that coverage.
+// ValidatePhysicalLocator mirrors storage.BlockStore's deterministic locator
+// contract so GC unit tests do not bypass block-id format validation.
 func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) error {
 	d.provider.mu.Lock()
 	d.provider.PhysicalLocatorValidations = append(d.provider.PhysicalLocatorValidations, ScopedPhysicalLocatorValidation{
@@ -3861,6 +3856,9 @@ func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) e
 		StorageKey:   storageKey,
 	})
 	d.provider.mu.Unlock()
+	if !db.IsSHA256BlockID(blockID) {
+		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
+	}
 	if storageKey != MockCanonicalStorageKey(d.orgID, blockID) {
 		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
 	}

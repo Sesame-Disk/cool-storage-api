@@ -1,10 +1,19 @@
 package gc
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// testSHA256BlockID turns a readable scenario label into the content-address
+// shape used by production blocks without making the test lose its label.
+func testSHA256BlockID(label string) string {
+	digest := sha256.Sum256([]byte("sesamefs-gc-test:" + label))
+	return hex.EncodeToString(digest[:])
+}
 
 // SeedQueueItemForTest injects a raw gc_queue row for test setup, deliberately
 // bypassing the block-representation enqueue contract that EnqueueItem and

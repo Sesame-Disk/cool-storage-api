@@ -3,12 +3,31 @@ package gc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
+
+func TestMockBlockDeleterValidatePhysicalLocatorEnforcesBlockIDFormat(t *testing.T) {
+	provider := &MockStorageProvider{}
+	orgID := uuid.New()
+	deleter, err := provider.GetBlockStoreForOrg(orgID.String(), "hot")
+	if err != nil {
+		t.Fatalf("GetBlockStoreForOrg: %v", err)
+	}
+
+	if err := deleter.ValidatePhysicalLocator("block-1", MockCanonicalStorageKey(orgID.String(), "block-1")); err == nil {
+		t.Fatal("ValidatePhysicalLocator accepted a readable synthetic block ID")
+	}
+
+	blockID := strings.ToUpper(testSHA256BlockID("mock-format-contract"))
+	if err := deleter.ValidatePhysicalLocator(blockID, MockCanonicalStorageKey(orgID.String(), blockID)); err != nil {
+		t.Fatalf("ValidatePhysicalLocator rejected uppercase SHA-256 block ID: %v", err)
+	}
+}
 
 // The persisted storage_key says WHICH object to destroy. Exact-key BlockStore
 // operations structurally reject keys outside their configured org prefix, while
@@ -24,7 +43,7 @@ func TestWorker_ProcessBlock_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
-	const blockID = "blk-foreign-key"
+	blockID := testSHA256BlockID("worker-foreign-key")
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.SetBlockStorageKeyForTest(orgID, blockID, MockCanonicalStorageKey(victimOrgID.String(), blockID))
@@ -144,7 +163,7 @@ func TestWorker_RecoverS3Orphans_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
-	const blockID = "orph-foreign-key"
+	blockID := testSHA256BlockID("orphan-foreign-key")
 	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(victimOrgID.String(), blockID), "", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}

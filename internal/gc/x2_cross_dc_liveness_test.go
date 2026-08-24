@@ -41,8 +41,9 @@ func TestX2_DestructiveVerifyUsesGlobalRead(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	blockID := testSHA256BlockID("x2-global-read-delete")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
@@ -600,8 +601,9 @@ func TestX2_TopologyGateIsArmedWithoutExplicitWiring(t *testing.T) {
 	store.SetValidateDestructiveGCTopologyErrForTest(errors.New("live replication map no longer matches the declared topology"))
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	blockID := testSHA256BlockID("x2-topology-gate-implicit")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
@@ -610,7 +612,7 @@ func TestX2_TopologyGateIsArmedWithoutExplicitWiring(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Errorf("deleted bytes with the store's own topology gate rejecting: %+v", deletes)
 	}
-	if store.GetBlock(orgID, "block-1") == nil {
+	if store.GetBlock(orgID, blockID) == nil {
 		t.Error("canonical blocks row removed despite the store's topology gate rejecting")
 	}
 }
@@ -633,8 +635,9 @@ func TestX2_FailClosedDoesNotBurnTheRetryBudget(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	blockID := testSHA256BlockID("x2-fail-closed-retry-budget")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
@@ -679,8 +682,9 @@ func TestX2_UnsupportedTopologyBlocksDelete(t *testing.T) {
 	})
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	blockID := testSHA256BlockID("x2-unsupported-topology")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
@@ -689,7 +693,7 @@ func TestX2_UnsupportedTopologyBlocksDelete(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Errorf("deleted bytes under a topology that does not support the EACH_QUORUM argument: %+v", deletes)
 	}
-	if store.GetBlock(orgID, "block-1") == nil {
+	if store.GetBlock(orgID, blockID) == nil {
 		t.Error("canonical blocks row removed despite the topology gate rejecting the delete")
 	}
 	// The gate must run before the claim, so no liveness read should have been needed.

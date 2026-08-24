@@ -37,8 +37,9 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-retry", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-retry", uuid.Nil, "hot", 0)
+	blockID := testSHA256BlockID("s3-retry")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -54,7 +55,7 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 		t.Errorf("BlocksDeleted=%d, want 1", stats.BlocksDeleted())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-retry")}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), blockID)}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -75,9 +76,10 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-perma", "cold", 0)
-	store.AddBlockMapping(orgID, "sha1-xyz", "block-perma")
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-perma", uuid.Nil, "cold", 0)
+	blockID := testSHA256BlockID("s3-retry-exhausted")
+	store.AddBlock(orgID, blockID, "cold", 0)
+	store.AddBlockMapping(orgID, "sha1-xyz", blockID)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "cold", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -93,7 +95,7 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	if len(orphans) != 1 {
 		t.Fatalf("expected 1 orphan for org, got %d", len(orphans))
 	}
-	if orphans[0].BlockID != "block-perma" || orphans[0].StorageClass != "cold" {
+	if orphans[0].BlockID != blockID || orphans[0].StorageClass != "cold" {
 		t.Errorf("unexpected orphan info: %+v", orphans[0])
 	}
 	if orphans[0].LastError == "" {
@@ -107,7 +109,7 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	}
 
 	// DB cleanup must have happened even though S3 failed.
-	if store.GetBlock(orgID, "block-perma") != nil {
+	if store.GetBlock(orgID, blockID) != nil {
 		t.Error("block DB row should be gone after LWT delete")
 	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-xyz") {
@@ -128,10 +130,11 @@ func TestWorker_ProcessBlock_UsesExistingOrphanFirstSeenAtForCleanup(t *testing.
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	blockID := testSHA256BlockID("existing-orphan-cleanup")
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
-	store.AddBlock(orgID, "block-orphan-cleanup", "hot", 0)
-	seedS3Orphan(t, store, orgID, "block-orphan-cleanup", "hot", "", "previous failure", firstSeenAt)
-	if err := store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-orphan-cleanup", uuid.Nil, "hot", 0); err != nil {
+	store.AddBlock(orgID, blockID, "hot", 0)
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", firstSeenAt)
+	if err := store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
 
@@ -145,7 +148,7 @@ func TestWorker_ProcessBlock_UsesExistingOrphanFirstSeenAtForCleanup(t *testing.
 	if got := store.S3OrphanCount(); got != 0 {
 		t.Fatalf("expected canonical orphan cleanup, got %d rows", got)
 	}
-	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), "block-orphan-cleanup"), 10)
+	orphans, err := store.ListS3OrphansByDay(firstSeenAt, db.GCDiscoveryBucket(orgID.String(), blockID), 10)
 	if err != nil {
 		t.Fatalf("ListS3OrphansByDay failed: %v", err)
 	}
@@ -164,8 +167,9 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	blockID := testSHA256BlockID("orphan-recovery-success")
 	// Seed an orphan directly.
-	seedS3Orphan(t, store, orgID, "orph-1", "hot", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "earlier failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -178,7 +182,7 @@ func TestWorker_RecoverS3Orphans_Success(t *testing.T) {
 		t.Errorf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "orph-1")}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), blockID)}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 }
@@ -220,7 +224,8 @@ func TestWorker_RecoverS3Orphans_UsesCanonicalStorageClassForPhysicalDelete(t *t
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-canonical-class", "hot", "", "previous failure", time.Now())
+	blockID := testSHA256BlockID("orphan-canonical-class")
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -631,8 +636,9 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 
 	orgA := uuid.New()
 	orgB := uuid.New()
+	blockID := testSHA256BlockID("shared-hash")
 	for _, orgID := range []uuid.UUID{orgA, orgB} {
-		seedS3Orphan(t, store, orgID, "shared-hash", "hot", "", "earlier failure", time.Now())
+		seedS3Orphan(t, store, orgID, blockID, "hot", "", "earlier failure", time.Now())
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -644,7 +650,7 @@ func TestWorker_RecoverS3Orphans_SameHashInTwoOrgsDeletesBothScopes(t *testing.T
 	}
 	want := map[string]bool{orgA.String(): false, orgB.String(): false}
 	for _, deletion := range sp.ScopedBlockDeletes() {
-		if deletion.StorageClass != "hot" || deletion.StorageKey != MockCanonicalStorageKey(deletion.OrgID, "shared-hash") {
+		if deletion.StorageClass != "hot" || deletion.StorageKey != MockCanonicalStorageKey(deletion.OrgID, blockID) {
 			t.Fatalf("unexpected scoped deletion: %+v", deletion)
 		}
 		if _, ok := want[deletion.OrgID]; !ok {
@@ -667,8 +673,9 @@ func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlockMapping(orgID, "sha1-recover", "orph-map")
-	seedS3Orphan(t, store, orgID, "orph-map", "hot", "sha1-recover", "prev", time.Now())
+	blockID := testSHA256BlockID("orphan-map")
+	store.AddBlockMapping(orgID, "sha1-recover", blockID)
+	seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-recover", "prev", time.Now())
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -684,7 +691,7 @@ func TestWorker_RecoverS3Orphans_S3ThenOrphanFinalization(t *testing.T) {
 		t.Fatal("forward mapping should survive S3 recovery")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "orph-map") {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("expected one S3 delete for orph-map, got %v", deleted)
 	}
 }
@@ -729,20 +736,21 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "blk-redelete", "hot", 0)
-	store.AddBlockMapping(orgID, "sha1-new", "blk-redelete")
-	firstSeenAt := seedS3Orphan(t, store, orgID, "blk-redelete", "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
-	if err := store.MarkS3OrphanMappingCleanupPending(orgID, "blk-redelete", "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+	blockID := testSHA256BlockID("orphan-redelete")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockMapping(orgID, "sha1-new", blockID)
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("advance stale orphan phase: %v", err)
 	}
-	applied, err := store.ClaimBlockDelete(orgID, "blk-redelete", "claim-1")
+	applied, err := store.ClaimBlockDelete(orgID, blockID, "claim-1")
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-redelete", "hot", MockCanonicalStorageKey(orgID.String(), "blk-redelete"), "sha1-new", time.Now().UTC()); err != nil {
+	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
-	if err := store.FinalizeBlockDelete(orgID, "blk-redelete", "claim-1"); err != nil {
+	if err := store.FinalizeBlockDelete(orgID, blockID, "claim-1"); err != nil {
 		t.Fatalf("FinalizeBlockDelete: %v", err)
 	}
 
@@ -760,7 +768,7 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), "blk-redelete") {
+	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
 		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
 	}
 }
@@ -883,7 +891,7 @@ func TestWorker_RecoverS3Orphans_PostS3ClearRetryDoesNotRepeatS3(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	blockID := "orph-post-s3-clear-retry"
+	blockID := testSHA256BlockID("orphan-post-s3-clear-retry")
 	sha1 := "sha1-post-s3-clear-retry"
 	store.AddBlockMapping(orgID, sha1, blockID)
 	seedS3Orphan(t, store, orgID, blockID, "hot", sha1, "", time.Now())
@@ -926,7 +934,7 @@ func TestWorker_RecoverS3Orphans_PhysicalDeleteBeforePhaseAdvanceCanRepeatS3(t *
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	blockID := "orph-phase-advance-window"
+	blockID := testSHA256BlockID("orphan-phase-advance-window")
 	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-phase-window", "", time.Now())
 	store.SetMarkS3OrphanMappingCleanupPendingErrOnceForTest(errors.New("simulated phase advance failure"))
 
@@ -967,8 +975,10 @@ func TestWorker_RecoverS3Orphans_PartialFailure(t *testing.T) {
 
 	orgID := uuid.New()
 	now := time.Now()
-	seedS3Orphan(t, store, orgID, "orph-A", "hot", "", "prev", now)
-	seedS3Orphan(t, store, orgID, "orph-B", "hot", "", "prev", now)
+	blockA := testSHA256BlockID("orphan-A")
+	blockB := testSHA256BlockID("orphan-B")
+	seedS3Orphan(t, store, orgID, blockA, "hot", "", "prev", now)
+	seedS3Orphan(t, store, orgID, blockB, "hot", "", "prev", now)
 
 	// Fail one call during this recovery attempt. Since iteration order over a
 	// map is random, assert on totals rather than which block survives.
@@ -1071,7 +1081,8 @@ func TestWorker_RecoverS3Orphans_ColdStartSeesOldRows(t *testing.T) {
 
 	orgID := uuid.New()
 	firstSeenAt := now.AddDate(0, 0, -30)
-	seedS3Orphan(t, store, orgID, "orph-old", "hot", "", "old failure", firstSeenAt)
+	blockID := testSHA256BlockID("orphan-old")
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "old failure", firstSeenAt)
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err != nil {
@@ -1106,7 +1117,7 @@ func TestWorker_RecoverS3Orphans_PartitionLimitKeepsCursorUnchanged(t *testing.T
 	targetBucket := 0
 	seeded := 0
 	for i := 0; seeded < 101; i++ {
-		blockID := fmt.Sprintf("orph-bucket-%03d", i)
+		blockID := testSHA256BlockID(fmt.Sprintf("orphan-bucket-%03d", i))
 		if db.GCDiscoveryBucket(orgID.String(), blockID) != targetBucket {
 			continue
 		}
@@ -1213,7 +1224,8 @@ func TestScanner_S3OrphanRecoveryPhase_CallsRecoverer(t *testing.T) {
 	s.SetOrphanRecoverer(w)
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-phase", "hot", "", "prev", time.Now())
+	blockID := testSHA256BlockID("orphan-phase")
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "prev", time.Now())
 
 	n, err := s.scanS3OrphanRecovery(context.Background())
 	if err != nil {
