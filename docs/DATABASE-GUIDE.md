@@ -1324,6 +1324,16 @@ view:
   `TestR12UnresolvedAllowlistNamesNoR12Table`, and the three
   `gc_*_hard_delete_locks` helpers are additionally pinned to lock-table literals
   by `TestR12HardDeleteLockTablesAreOutOfScope`.
+- **A name resolved to the wrong binding.** Resolution is only sound if a name
+  resolves to the binding Go puts at that call site, and the gate does not model
+  lexical scope. It therefore records every name a scope binds — parameters,
+  receiver, named results, `range` variables, function-literal signatures and
+  locals — even when the value is unknown, so a binding it cannot resolve
+  *shadows* the outer one rather than unmasking it, and a name bound in both
+  scopes is resolved in neither. Fail-closed in both directions: a parameter named
+  like a package `const` cannot be read as that const, and an inner-block
+  `stmt := "SELECT ..."` cannot hide a package-level `stmt` that is an R12 LWT.
+  `TestR12ScanNodeFailsClosedOnShadowedBindings` covers both.
 - **Table spellings a name-literal regex misses** — `"blocks"`,
   `sesamefs.blocks`, `"sesamefs"."blocks"`, and `DELETE <columns> FROM <table>`.
   Quoted identifiers keep CQL case sensitivity, so `"BLOCKS"` is correctly a

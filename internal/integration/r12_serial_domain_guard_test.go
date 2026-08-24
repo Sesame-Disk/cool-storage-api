@@ -173,10 +173,12 @@ var r12AllowedHardDeleteLockTables = map[string]bool{
 // method and the exact serial argument, so a string-only search cannot be made
 // green by a comment or an unrelated query in the same function.
 //
-// Three escape routes are closed explicitly, because each one removes a
+// Four escape routes are closed explicitly, because each one removes a
 // statement from discovery instead of reporting it unpinned: CQL that is not a
 // source literal, a table reference spelled with quotes or a keyspace
-// qualifier, and a CAS executed through the Context or batch terminals.
+// qualifier, a CAS executed through the Context or batch terminals, and an
+// identifier the guard would resolve to a binding Go's scoping rules do not put
+// at that call site.
 func TestR12SerialDomainGuard(t *testing.T) {
 	root := filepath.Join("..", "..")
 	skipDirs := map[string]bool{
@@ -222,9 +224,10 @@ func TestR12SerialDomainGuard(t *testing.T) {
 		for _, declaration := range file.Decls {
 			switch typed := declaration.(type) {
 			case *ast.FuncDecl:
-				// A function's own locals shadow the package scope, so one
-				// function's `query` never resolves another function's name.
-				bindings := r12ScopedBindings(packageBindings, r12CollectStringBindings(typed.Body))
+				// A function's own bindings -- parameters and receiver
+				// included -- shadow the package scope, and a name bound in
+				// both scopes is resolved in neither.
+				bindings := r12FunctionBindings(packageBindings, typed)
 				r12ScanNode(fset, typed.Body, r12FunctionName(typed), bindings, discovered, unresolved, batchCAS)
 			case *ast.GenDecl:
 				for _, specification := range typed.Specs {
@@ -237,7 +240,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 						if index < len(valueSpec.Names) {
 							symbol = valueSpec.Names[index].Name
 						}
-						r12ScanNode(fset, value, symbol, packageBindings, discovered, unresolved, batchCAS)
+						r12ScanNode(fset, value, symbol, r12ValueBindings(packageBindings, value), discovered, unresolved, batchCAS)
 					}
 				}
 			}
@@ -688,17 +691,78 @@ func r12FindQueryCall(expression ast.Expr) *ast.CallExpr {
 // A name touched in any way the resolver cannot follow (a non-literal fragment,
 // a plain reassignment, a declaration without a value, an address taken) is
 // poisoned and reported as unresolvable.
-type r12StringBindings map[string]string
+// A name is recorded even when it cannot be resolved, and that is what makes the
+// resolver safe under Go's scoping rules. `values` says what a name is worth;
+// `names` records every name the scope binds at all -- parameters, receivers,
+// named results, range and := declarations, plain assignments, and poisoned
+// names alike. A name present in `names` but absent from `values` is the
+// load-bearing state: it means "bound here, value unknown", and it has to shadow
+// an outer binding of the same name instead of letting the outer value show
+// through. Without it, `func mutate(session S, stmt string)` sitting under a
+// package-level `const stmt = "SELECT ... FROM libraries"` would resolve
+// session.Query(stmt) to the package const, and the LWT the caller actually
+// passes would never be discovered -- the precise false green this guard exists
+// to prevent.
+type r12StringBindings struct {
+	values map[string]string
+	names  map[string]bool
+}
 
-// r12CollectStringBindings gathers the literal-only string identifiers visible in
-// the given nodes, concatenating appends in source order.
+func r12NewStringBindings() r12StringBindings {
+	return r12StringBindings{values: map[string]string{}, names: map[string]bool{}}
+}
+
+// resolve reports the CQL a name carries, for names this scope can resolve.
+func (bindings r12StringBindings) resolve(name string) (string, bool) {
+	value, ok := bindings.values[name]
+	return value, ok
+}
+
+// r12CollectStringBindings gathers the literal-only string identifiers bound in
+// the given nodes, concatenating appends in source order, and records every name
+// they bind at all. It descends into function literals, so a closure's
+// parameters shadow and its locals are seen.
 func r12CollectStringBindings(nodes ...ast.Node) r12StringBindings {
-	bindings := r12StringBindings{}
+	return r12CollectScopeBindings(true, nodes...)
+}
+
+// r12CollectScopeBindings collects one scope's bindings. descendIntoFuncLits
+// separates the two callers: a function is collected together with the literals
+// nested in it, while the package collection stops at every function literal,
+// because the names bound inside `var fn = func(query string) { ... }` belong to
+// that literal and not to the file.
+func r12CollectScopeBindings(descendIntoFuncLits bool, nodes ...ast.Node) r12StringBindings {
+	bindings := r12NewStringBindings()
 	poisoned := map[string]bool{}
 
+	// bind records that this scope binds the name at all. Every path below goes
+	// through it, so a name can never be resolved in an enclosing scope after
+	// this one has bound it.
+	bind := func(name string) bool {
+		if name == "" || name == "_" {
+			return false
+		}
+		bindings.names[name] = true
+		return true
+	}
+
 	poison := func(name string) {
+		if !bind(name) {
+			return
+		}
 		poisoned[name] = true
-		delete(bindings, name)
+		delete(bindings.values, name)
+	}
+
+	poisonFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				poison(name.Name)
+			}
+		}
 	}
 
 	literalValue := func(value ast.Expr) (string, bool) {
@@ -714,7 +778,7 @@ func r12CollectStringBindings(nodes ...ast.Node) r12StringBindings {
 	}
 
 	open := func(name string, value ast.Expr) {
-		if poisoned[name] {
+		if !bind(name) || poisoned[name] {
 			return
 		}
 		text, ok := literalValue(value)
@@ -722,17 +786,17 @@ func r12CollectStringBindings(nodes ...ast.Node) r12StringBindings {
 			poison(name)
 			return
 		}
-		if _, seen := bindings[name]; seen {
+		if _, seen := bindings.values[name]; seen {
 			// A second opening binding: which one reaches the call site is a
 			// flow question this guard does not answer.
 			poison(name)
 			return
 		}
-		bindings[name] = text
+		bindings.values[name] = text
 	}
 
 	appendFragment := func(name string, value ast.Expr) {
-		if poisoned[name] {
+		if !bind(name) || poisoned[name] {
 			return
 		}
 		text, ok := literalValue(value)
@@ -740,13 +804,13 @@ func r12CollectStringBindings(nodes ...ast.Node) r12StringBindings {
 			poison(name)
 			return
 		}
-		existing, seen := bindings[name]
+		existing, seen := bindings.values[name]
 		if !seen {
 			// Appending to something never opened here.
 			poison(name)
 			return
 		}
-		bindings[name] = existing + text
+		bindings.values[name] = existing + text
 	}
 
 	for _, node := range nodes {
@@ -755,6 +819,28 @@ func r12CollectStringBindings(nodes ...ast.Node) r12StringBindings {
 		}
 		ast.Inspect(node, func(current ast.Node) bool {
 			switch typed := current.(type) {
+			case *ast.FuncLit:
+				if !descendIntoFuncLits {
+					return false
+				}
+			case *ast.FuncDecl:
+				// The receiver and the signature bind before the body runs.
+				// ast.Inspect is pre-order, so it reaches this node and then the
+				// FuncType below before any statement in the body, and those
+				// names are poisoned before a body binding could open them.
+				poisonFields(typed.Recv)
+			case *ast.FuncType:
+				// Parameters and named results are bindings whose value the
+				// resolver cannot see: they come from the caller.
+				poisonFields(typed.Params)
+				poisonFields(typed.Results)
+			case *ast.RangeStmt:
+				// `for name := range ...` binds without an AssignStmt.
+				for _, target := range []ast.Expr{typed.Key, typed.Value} {
+					if identifier, ok := target.(*ast.Ident); ok {
+						poison(identifier.Name)
+					}
+				}
 			case *ast.ValueSpec:
 				for index, name := range typed.Names {
 					if index >= len(typed.Values) {
@@ -813,23 +899,67 @@ func r12PackageStringBindings(file *ast.File) r12StringBindings {
 			nodes = append(nodes, general)
 		}
 	}
-	return r12CollectStringBindings(nodes...)
+	return r12CollectScopeBindings(false, nodes...)
 }
 
-// r12ScopedBindings overlays a function's locals on the package-level bindings,
-// matching Go's shadowing.
+// r12ScopedBindings resolves a function's view of the package scope. It is
+// deliberately fail-closed rather than a faithful model of Go's lexical scoping,
+// because the two failure modes are not symmetric: a name this guard refuses to
+// resolve is reported as unresolvable CQL and fails the gate loudly, while a
+// name resolved to the wrong binding is a silent false green.
+//
+// Two rules, both in the same direction:
+//
+//   - A package name the function binds anywhere -- parameter, receiver, local,
+//     range variable, resolved or poisoned -- is dropped from the merged values.
+//     This is what stops a parameter, or a dynamically built local, from
+//     unmasking the package const it shadows.
+//   - A local name that collides with a package binding is dropped as well. The
+//     shadowing runs both ways: an inner-block `stmt := "SELECT ..."` must not
+//     make a package-level `stmt` holding an R12 LWT resolve to that inner
+//     SELECT at a call site the inner declaration never reaches.
+//
+// What stays resolvable is the case with no ambiguity at all: a name bound in
+// exactly one of the two scopes, once, entirely from string literals. Everything
+// else is answered with "unresolvable", which the caller turns into a fail-closed
+// report rather than a classification.
 func r12ScopedBindings(pkg r12StringBindings, local r12StringBindings) r12StringBindings {
-	if len(local) == 0 {
-		return pkg
+	merged := r12NewStringBindings()
+	for name := range pkg.names {
+		merged.names[name] = true
 	}
-	merged := make(r12StringBindings, len(pkg)+len(local))
-	for name, value := range pkg {
-		merged[name] = value
+	for name := range local.names {
+		merged.names[name] = true
 	}
-	for name, value := range local {
-		merged[name] = value
+	for name, value := range pkg.values {
+		if local.names[name] {
+			continue
+		}
+		merged.values[name] = value
+	}
+	for name, value := range local.values {
+		if pkg.names[name] {
+			continue
+		}
+		merged.values[name] = value
 	}
 	return merged
+}
+
+// r12FunctionBindings is the only supported way to build the bindings for a
+// declared function: it collects the receiver, the signature and the body as one
+// scope, so a parameter can never be missing from the function's name set.
+func r12FunctionBindings(pkg r12StringBindings, function *ast.FuncDecl) r12StringBindings {
+	return r12ScopedBindings(pkg, r12CollectStringBindings(function))
+}
+
+// r12ValueBindings scopes a package-level declaration's value. It matters for a
+// package-level `var mutateFn = func(session *gocql.Session, query string) {...}`:
+// a function literal's parameters and locals bind names exactly as a declared
+// function's do, so scanning such a body against the package scope alone would
+// resolve a shadowed name to the package value.
+func r12ValueBindings(pkg r12StringBindings, value ast.Expr) r12StringBindings {
+	return r12ScopedBindings(pkg, r12CollectStringBindings(value))
 }
 
 func r12QueryLiteral(call *ast.CallExpr, bindings r12StringBindings) (string, bool) {
@@ -850,7 +980,7 @@ func r12QueryLiteral(call *ast.CallExpr, bindings r12StringBindings) (string, bo
 		// A const or single-binding variable holding the CQL is as visible as an
 		// inline literal, so moving a statement into one neither hides it from
 		// discovery nor costs it an allowlist entry.
-		value, ok := bindings[argument.Name]
+		value, ok := bindings.resolve(argument.Name)
 		return value, ok
 	}
 	return "", false
@@ -1204,7 +1334,7 @@ func mutate(session S, table string) {
 				if !ok {
 					continue
 				}
-				bindings := r12ScopedBindings(packageBindings, r12CollectStringBindings(function.Body))
+				bindings := r12FunctionBindings(packageBindings, function)
 				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
 			}
 
@@ -1216,6 +1346,216 @@ func mutate(session S, table string) {
 			}
 			if got := len(batchCAS) > 0; got != test.wantBatchCAS {
 				t.Errorf("recorded conditional batch CAS = %v, want %v (batchCAS=%v)", got, test.wantBatchCAS, batchCAS)
+			}
+		})
+	}
+}
+
+// TestR12ScanNodeFailsClosedOnShadowedBindings is the regression for the fourth
+// way a target statement can leave the guard's view: not by hiding its CQL and
+// not by an unrecognised terminal, but by having the guard resolve its
+// identifier to the wrong binding. Go resolves a name by lexical scope; the
+// resolver here does not model scopes, so every name that is bound in more than
+// one of them has to be answered with "unresolvable" instead of a guess.
+//
+// The two dangerous directions are both covered below. A parameter or a
+// dynamically built local must not unmask the package const it shadows -- that
+// reads a harmless SELECT while the caller's real LWT runs. And a local
+// declared inside a block must not hide a package const that is itself an R12
+// LWT -- that removes a genuine target from the set. Either way the guard would
+// report nothing at all, which is the false green it exists to prevent.
+func TestR12ScanNodeFailsClosedOnShadowedBindings(t *testing.T) {
+	tests := []struct {
+		name                string
+		source              string
+		wantDiscovered      bool
+		wantUnresolved      bool
+		wantUnresolvedCount int
+	}{
+		{
+			// The caller decides what this parameter holds, so the package const
+			// of the same name says nothing about the statement that runs.
+			name: "parameter shadowing a package const is unresolvable",
+			source: `package p
+
+const stmt = "SELECT id FROM libraries"
+
+func mutate(session S, stmt string) {
+	session.Query(stmt).Exec()
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 1,
+		},
+		{
+			// The local is poisoned because it is built at run time. Poisoning
+			// has to shadow the package binding rather than remove the name and
+			// let the const show through again.
+			name: "dynamically built local shadowing a package const is unresolvable",
+			source: `package p
+
+const stmt = "SELECT id FROM libraries"
+
+func mutate(session S, table string) {
+	stmt := fmt.Sprintf("UPDATE %s SET gc_state = ? WHERE org_id = ? IF gc_state = ?", table)
+	session.Query(stmt).Exec()
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 1,
+		},
+		{
+			// The shadowing runs the other way here: the package const is a real
+			// R12 LWT and the inner SELECT only exists inside the if. Resolving
+			// the trailing call to the inner literal would drop a genuine target
+			// from the set, so both call sites are reported instead.
+			name: "inner-block local does not hide a package-level R12 LWT",
+			source: `package p
+
+const stmt = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+
+func mutate(session S, flag bool) {
+	if flag {
+		stmt := "SELECT id FROM libraries"
+		session.Query(stmt).Exec()
+	}
+
+	session.Query(stmt).Exec()
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 2,
+		},
+		{
+			name: "closure parameter shadowing an enclosing local is unresolvable",
+			source: `package p
+
+func mutate(session S, run func(func(string))) {
+	query := "SELECT id FROM libraries"
+	_ = query
+	run(func(query string) {
+		session.Query(query).Exec()
+	})
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 1,
+		},
+		{
+			name: "range variable shadowing a package const is unresolvable",
+			source: `package p
+
+const stmt = "SELECT id FROM libraries"
+
+func mutate(session S, statements []string) {
+	for _, stmt := range statements {
+		session.Query(stmt).Exec()
+	}
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 1,
+		},
+		{
+			// The package-level function literal is the shape the 17 protected
+			// statements are actually written in, so the scope rules have to
+			// hold there and not only inside declared functions.
+			name: "function-literal parameter shadowing a package const is unresolvable",
+			source: `package p
+
+const stmt = "SELECT id FROM libraries"
+
+var mutateFn = func(session S, stmt string) {
+	session.Query(stmt).Exec()
+}
+`,
+			wantUnresolved:      true,
+			wantUnresolvedCount: 1,
+		},
+		{
+			name: "function-literal local still resolves",
+			source: `package p
+
+var mutateFn = func(session S) {
+	stmt := "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+	session.Query(stmt).MapScanCAS(nil)
+}
+`,
+			wantDiscovered: true,
+		},
+		{
+			// The counterweight: shadowing is not an excuse to stop resolving.
+			// A package const nothing shadows still has to be read, or the
+			// fail-closed rules above would degrade into an allowlist of
+			// everything.
+			name: "unshadowed package const still resolves inside a function with parameters",
+			source: `package p
+
+const updateBlock = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+
+func mutate(session S, orgID string, stmt string) {
+	session.Query(updateBlock).MapScanCAS(nil)
+}
+`,
+			wantDiscovered: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+
+			discovered := map[string][]r12DiscoveredOperation{}
+			unresolved := map[string][]token.Position{}
+			batchCAS := map[string][]token.Position{}
+			packageBindings := r12PackageStringBindings(file)
+			for _, declaration := range file.Decls {
+				switch typed := declaration.(type) {
+				case *ast.FuncDecl:
+					bindings := r12FunctionBindings(packageBindings, typed)
+					r12ScanNode(fset, typed.Body, r12FunctionName(typed), bindings, discovered, unresolved, batchCAS)
+				case *ast.GenDecl:
+					// The 17 protected statements live in package-level
+					// `var ...Fn = func(...) { ... }` values, so the scope rules
+					// have to hold on that path too, not only for declared
+					// functions.
+					for _, specification := range typed.Specs {
+						valueSpec, ok := specification.(*ast.ValueSpec)
+						if !ok {
+							continue
+						}
+						for index, value := range valueSpec.Values {
+							symbol := "<package>"
+							if index < len(valueSpec.Names) {
+								symbol = valueSpec.Names[index].Name
+							}
+							r12ScanNode(fset, value, symbol, r12ValueBindings(packageBindings, value), discovered, unresolved, batchCAS)
+						}
+					}
+				}
+			}
+
+			if got := len(discovered) > 0; got != test.wantDiscovered {
+				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
+			}
+			if got := len(unresolved) > 0; got != test.wantUnresolved {
+				t.Errorf("recorded unresolvable CAS = %v, want %v (unresolved=%v)", got, test.wantUnresolved, unresolved)
+			}
+			if test.wantUnresolvedCount > 0 {
+				total := 0
+				for _, positions := range unresolved {
+					total += len(positions)
+				}
+				if total != test.wantUnresolvedCount {
+					t.Errorf("unresolvable CAS call sites = %d, want %d (unresolved=%v)", total, test.wantUnresolvedCount, unresolved)
+				}
+			}
+			if len(batchCAS) > 0 {
+				t.Errorf("recorded conditional batch CAS = %v, want none", batchCAS)
 			}
 		})
 	}
@@ -1373,7 +1713,7 @@ func redirect(target *url.URL) {
 				if !ok {
 					continue
 				}
-				bindings := r12ScopedBindings(packageBindings, r12CollectStringBindings(function.Body))
+				bindings := r12FunctionBindings(packageBindings, function)
 				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
 			}
 
@@ -1518,7 +1858,7 @@ func mutate(session S, flag bool) {
 				if !ok {
 					continue
 				}
-				bindings := r12ScopedBindings(packageBindings, r12CollectStringBindings(function.Body))
+				bindings := r12FunctionBindings(packageBindings, function)
 				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
 			}
 
@@ -1710,7 +2050,7 @@ func mutate(session S) {
 				if !ok {
 					continue
 				}
-				bindings := r12ScopedBindings(packageBindings, r12CollectStringBindings(function.Body))
+				bindings := r12FunctionBindings(packageBindings, function)
 				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
 			}
 

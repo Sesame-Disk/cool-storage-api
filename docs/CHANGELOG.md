@@ -18,7 +18,7 @@ checks operation identity, discovery and the explicit serial pin.
 The guard now keys discovery on **the CQL, not on the Go method that executes
 it**. That reversal is the substance of the change. A statement the gate cannot
 see is never reported as unpinned — no pin is demanded of it at all, and the gate
-stays green — and the original design let a statement disappear in four ways:
+stays green — and the original design let a statement disappear in five ways:
 
 - **The execution path.** This was the deepest one. Cassandra makes a statement a
   lightweight transaction because its CQL carries `IF`; the Go method consuming
@@ -40,6 +40,22 @@ stays green — and the original design let a statement disappear in four ways:
   resolver itself. What remains unresolvable fails the gate unless allowlisted,
   and every allowlisted symbol is now checked by
   `TestR12UnresolvedAllowlistNamesNoR12Table` instead of asserted.
+- **The binding a name resolved to.** Resolving `const` and single-binding
+  variables is only sound if a name resolves to the binding *Go* puts at that call
+  site, and the resolver does not model lexical scope. Two silent false greens
+  followed. A parameter named like a package const —
+  `func mutate(session S, stmt string)` under `const stmt = "SELECT ..."` — was
+  read as the const, so the LWT the caller actually passes was never discovered.
+  And a local the resolver poisoned for being built at run time was *deleted* from
+  the local map, which let the package const show through again instead of
+  shadowing it. Names are now recorded even when their value is unknown, so an
+  unresolvable binding shadows the outer one, and a name bound in both scopes is
+  resolved in neither. Parameters, receivers, named results, `range` variables and
+  function-literal signatures all count as bindings. The refusal is deliberate in
+  both directions: an inner-block `stmt := "SELECT ..."` no longer hides a
+  package-level `stmt` that is itself an R12 LWT. Over-refusal costs an allowlist
+  entry and fails loudly; under-refusal is the false green the gate exists to
+  prevent.
 - **Table spellings the matcher did not recognise.** `UPDATE "blocks"`,
   `UPDATE sesamefs.blocks`, `UPDATE "sesamefs"."blocks"` and
   `DELETE storage_key FROM blocks` were all read as out of scope. The matcher is
@@ -63,7 +79,12 @@ keyspace-qualified LWT on `MapScanCASContext`, a quoted-identifier LWT, a column
 `DELETE`, a conditional batch, a `const` LWT through `Exec`, a variable LWT
 through `ExecContext`, and both deprecated `Session` batch-CAS forms. Most are
 caught by two independent routes. Removing or downgrading a pin on any of the 17
-statements also fails the gate. Also fixed a discovery false positive where a
+statements also fails the gate. The scope pass adds five more: a parameter, a
+dynamically built local, a `range` variable and a closure parameter — each
+shadowing a name the gate could otherwise resolve — plus an inner-block local
+shadowing a package-level R12 LWT. Each is mutation-verified against the two
+resolver defects it covers: dropping the signature bindings, or restoring the
+flat package/local overlay, fails exactly those cases and nothing else. Also fixed a discovery false positive where a
 string value containing `IF` was read as a conditional clause, and another where
 `net/url`'s zero-argument `URL.Query()` was treated as a CQL call site.
 
