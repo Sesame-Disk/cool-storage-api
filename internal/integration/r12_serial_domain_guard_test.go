@@ -36,8 +36,59 @@ var r12ExpectedSerialOperations = map[string]string{
 	"(*CassandraStore).FinalizeBlockDelete|blocks|DELETE":                      "GC finalize",
 }
 
-var r12TargetStatementPattern = regexp.MustCompile(`(?is)\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(blocks|gc_block_candidates|gc_s3_orphans)\b`)
+// r12TargetTables is the R12 target set. Discovery resolves a statement's table
+// reference to one of these names; every other relation is out of scope.
+var r12TargetTables = map[string]bool{
+	"blocks":              true,
+	"gc_block_candidates": true,
+	"gc_s3_orphans":       true,
+}
+
+// r12IdentifierPattern matches one component of a CQL table reference: either a
+// quoted, case-sensitive identifier or a bare one.
+const r12IdentifierPattern = `(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_]*)`
+
+// r12StatementPattern recognises the mutating statement forms that can carry an
+// IF clause. It matches the table reference structurally rather than by literal
+// name, because CQL spells the same relation several ways -- blocks, "blocks",
+// sesamefs.blocks, "sesamefs"."blocks" -- and a name-literal regex would read the
+// qualified and quoted spellings as out of scope. That is a false green rather
+// than a missing pin: the statement leaves discovery entirely, so no pin is ever
+// demanded of it. The pattern also accepts DELETE <columns> FROM <table>, not
+// only row deletes.
+var r12StatementPattern = regexp.MustCompile(
+	`(?is)\b(INSERT\s+INTO|UPDATE|DELETE(?:\s+[\w"',\[\]\s.]+?)?\s+FROM)\s+(` +
+		r12IdentifierPattern + `)(?:\s*\.\s*(` + r12IdentifierPattern + `))?`)
+
 var r12ConditionalPattern = regexp.MustCompile(`(?i)\bIF\b`)
+
+// r12QueryCASTerminals are the gocql Query methods that execute a lightweight
+// transaction. All four matter: the driver in use
+// (github.com/apache/cassandra-gocql-driver/v2) exposes the Context variants as
+// equal-standing LWT execution, so a guard that knew only ScanCAS/MapScanCAS
+// would not merely miss a pin -- an identical statement written with
+// MapScanCASContext would leave discovery altogether and read as green.
+var r12QueryCASTerminals = map[string]bool{
+	"ScanCAS":           true,
+	"ScanCASContext":    true,
+	"MapScanCAS":        true,
+	"MapScanCASContext": true,
+}
+
+// r12BatchCASTerminals are the gocql Batch methods that execute a conditional
+// batch. R12 refuses them outright rather than inspecting them: a batch collects
+// its statements through separate Batch.Query calls, so the CQL cannot be
+// attributed to the CAS call site the way a Query chain can, and the serial pin
+// lives on the batch rather than on any one statement. Allowing one would reopen
+// the blind spot the fail-closed rule on non-literal CQL exists to close.
+// SesameFS uses no conditional batch today; introducing one against any relation
+// has to extend R12 deliberately, by teaching this guard how to classify it.
+var r12BatchCASTerminals = map[string]bool{
+	"ExecCAS":           true,
+	"ExecCASContext":    true,
+	"MapExecCAS":        true,
+	"MapExecCASContext": true,
+}
 
 type r12SerialPin struct {
 	present bool
@@ -96,6 +147,11 @@ var r12AllowedHardDeleteLockTables = map[string]bool{
 // different statement keeps the same total. It also checks the terminal CAS
 // method and the exact serial argument, so a string-only search cannot be made
 // green by a comment or an unrelated query in the same function.
+//
+// Three escape routes are closed explicitly, because each one removes a
+// statement from discovery instead of reporting it unpinned: CQL that is not a
+// source literal, a table reference spelled with quotes or a keyspace
+// qualifier, and a CAS executed through the Context or batch terminals.
 func TestR12SerialDomainGuard(t *testing.T) {
 	root := filepath.Join("..", "..")
 	skipDirs := map[string]bool{
@@ -108,6 +164,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 
 	discovered := map[string][]r12DiscoveredOperation{}
 	unresolved := map[string][]token.Position{}
+	batchCAS := map[string][]token.Position{}
 	scanned := 0
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
@@ -139,7 +196,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 		for _, declaration := range file.Decls {
 			switch typed := declaration.(type) {
 			case *ast.FuncDecl:
-				r12ScanNode(fset, typed.Body, r12FunctionName(typed), discovered, unresolved)
+				r12ScanNode(fset, typed.Body, r12FunctionName(typed), discovered, unresolved, batchCAS)
 			case *ast.GenDecl:
 				for _, specification := range typed.Specs {
 					valueSpec, ok := specification.(*ast.ValueSpec)
@@ -151,7 +208,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 						if index < len(valueSpec.Names) {
 							symbol = valueSpec.Names[index].Name
 						}
-						r12ScanNode(fset, value, symbol, discovered, unresolved)
+						r12ScanNode(fset, value, symbol, discovered, unresolved, batchCAS)
 					}
 				}
 			}
@@ -176,7 +233,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 		}
 		operation := operations[0]
 		if !operation.terminal {
-			t.Errorf("R12 operation %s (%s) does not terminate in ScanCAS or MapScanCAS", key, label)
+			t.Errorf("R12 operation %s (%s) does not terminate in a Query CAS method (ScanCAS/MapScanCAS, with or without Context)", key, label)
 		}
 		if !operation.pin.present || !operation.pin.serial {
 			t.Errorf("R12 operation %s (%s) must call SerialConsistency(gocql.Serial)", key, label)
@@ -228,6 +285,19 @@ func TestR12SerialDomainGuard(t *testing.T) {
 		if len(unresolved[symbol]) == 0 {
 			t.Errorf("allowlisted unresolvable CAS %s (%s) no longer exists; drop the stale allowlist entry", symbol, allowance.reason)
 		}
+	}
+
+	// Conditional batches are refused rather than classified. There is no
+	// allowlist here on purpose: unlike a Query chain, a batch does not carry its
+	// CQL or its serial pin at the CAS call site, so an allowance could not be
+	// justified the way the hard-delete lock helpers are. Wanting one means
+	// extending R12 to model batches, not adding a name to a map.
+	for symbol, positions := range batchCAS {
+		t.Errorf(
+			"conditional batch CAS in %s at %s: R12 forbids conditional batches, because a batch's statements and its serial pin cannot be attributed to this call site; extend R12 to classify batches before introducing one",
+			symbol,
+			r12FormatPositions(positions),
+		)
 	}
 }
 
@@ -287,6 +357,58 @@ func TestR12TargetStatementDiscovery(t *testing.T) {
 			wantTable:       "blocks",
 			wantStatement:   "UPDATE",
 			wantConditional: true,
+		},
+		{
+			name:            "quoted table identifier stays in scope",
+			query:           `UPDATE "blocks" SET gc_state = ? WHERE org_id = ? IF gc_state = ?`,
+			wantTable:       "blocks",
+			wantStatement:   "UPDATE",
+			wantConditional: true,
+		},
+		{
+			name:            "keyspace-qualified table stays in scope",
+			query:           "UPDATE sesamefs.blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?",
+			wantTable:       "blocks",
+			wantStatement:   "UPDATE",
+			wantConditional: true,
+		},
+		{
+			name:            "fully quoted qualified table stays in scope",
+			query:           `UPDATE "sesamefs"."blocks" SET gc_state = ? WHERE org_id = ? IF gc_state = ?`,
+			wantTable:       "blocks",
+			wantStatement:   "UPDATE",
+			wantConditional: true,
+		},
+		{
+			name:            "qualified insert stays in scope",
+			query:           "INSERT INTO sesamefs.gc_s3_orphans (org_id) VALUES (?) IF NOT EXISTS",
+			wantTable:       "gc_s3_orphans",
+			wantStatement:   "INSERT",
+			wantConditional: true,
+		},
+		{
+			name:            "column delete keeps the table in scope",
+			query:           "DELETE storage_key FROM blocks WHERE org_id = ? AND block_id = ? IF gc_state = ?",
+			wantTable:       "blocks",
+			wantStatement:   "DELETE",
+			wantConditional: true,
+		},
+		{
+			name:            "qualified column delete stays in scope",
+			query:           `DELETE storage_key FROM "sesamefs".gc_block_candidates WHERE org_id = ? IF gc_state = ?`,
+			wantTable:       "gc_block_candidates",
+			wantStatement:   "DELETE",
+			wantConditional: true,
+		},
+		{
+			name:            "qualified projection is still excluded",
+			query:           "INSERT INTO sesamefs.gc_s3_orphans_by_day (org_id) VALUES (?) IF NOT EXISTS",
+			wantConditional: false,
+		},
+		{
+			name:            "quoted identifiers keep CQL case sensitivity",
+			query:           `UPDATE "BLOCKS" SET gc_state = ? WHERE org_id = ? IF gc_state = ?`,
+			wantConditional: false,
 		},
 	}
 
@@ -357,7 +479,7 @@ func r12FunctionName(function *ast.FuncDecl) string {
 	return function.Name.Name
 }
 
-func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, discovered map[string][]r12DiscoveredOperation, unresolved map[string][]token.Position) {
+func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, discovered map[string][]r12DiscoveredOperation, unresolved map[string][]token.Position, batchCAS map[string][]token.Position) {
 	if node == nil {
 		return
 	}
@@ -367,7 +489,12 @@ func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, discovered m
 			return true
 		}
 
-		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && (selector.Sel.Name == "MapScanCAS" || selector.Sel.Name == "ScanCAS") {
+		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && r12BatchCASTerminals[selector.Sel.Name] {
+			batchCAS[symbol] = append(batchCAS[symbol], fset.Position(call.Pos()))
+			return true
+		}
+
+		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && r12QueryCASTerminals[selector.Sel.Name] {
 			queryCall := r12FindQueryCall(selector.X)
 			switch {
 			case queryCall == nil:
@@ -448,11 +575,35 @@ func r12TargetStatement(query string) (table, statement string, ok bool) {
 	if !r12ConditionalPattern.MatchString(query) {
 		return "", "", false
 	}
-	matches := r12TargetStatementPattern.FindStringSubmatch(query)
-	if len(matches) != 3 {
-		return "", "", false
+	// Every mutating statement in the query is examined, not just the first, so
+	// a target table cannot be hidden behind a leading out-of-scope one.
+	for _, matches := range r12StatementPattern.FindAllStringSubmatch(query, -1) {
+		name := r12NormalizeCQLIdentifier(matches[2])
+		if matches[3] != "" {
+			// The reference was keyspace-qualified; the table is the second
+			// component.
+			name = r12NormalizeCQLIdentifier(matches[3])
+		}
+		if !r12TargetTables[name] {
+			continue
+		}
+		return name, strings.ToUpper(strings.Fields(matches[1])[0]), true
 	}
-	return strings.ToLower(matches[2]), strings.ToUpper(strings.Fields(matches[1])[0]), true
+	return "", "", false
+}
+
+// r12NormalizeCQLIdentifier applies CQL identifier folding: a bare identifier is
+// case-insensitive and folds to lower case, while a quoted one keeps its case and
+// loses one level of quoting. The distinction is deliberate rather than
+// incidental strictness -- "BLOCKS" names a different relation than blocks, so
+// folding it into the target set would be a false positive on a table R12 does
+// not govern.
+func r12NormalizeCQLIdentifier(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && strings.HasPrefix(identifier, `"`) && strings.HasSuffix(identifier, `"`) {
+		return strings.ReplaceAll(identifier[1:len(identifier)-1], `""`, `"`)
+	}
+	return strings.ToLower(identifier)
 }
 
 func r12FindSerialPin(expression ast.Expr) r12SerialPin {
@@ -700,6 +851,7 @@ func TestR12ScanNodeFailsClosedOnNonLiteralCQL(t *testing.T) {
 		source         string
 		wantDiscovered bool
 		wantUnresolved bool
+		wantBatchCAS   bool
 	}{
 		{
 			name: "inline literal is discovered",
@@ -756,12 +908,13 @@ func mutate(session S, table string) {
 
 			discovered := map[string][]r12DiscoveredOperation{}
 			unresolved := map[string][]token.Position{}
+			batchCAS := map[string][]token.Position{}
 			for _, declaration := range file.Decls {
 				function, ok := declaration.(*ast.FuncDecl)
 				if !ok {
 					continue
 				}
-				r12ScanNode(fset, function.Body, r12FunctionName(function), discovered, unresolved)
+				r12ScanNode(fset, function.Body, r12FunctionName(function), discovered, unresolved, batchCAS)
 			}
 
 			if got := len(discovered) > 0; got != test.wantDiscovered {
@@ -769,6 +922,203 @@ func mutate(session S, table string) {
 			}
 			if got := len(unresolved) > 0; got != test.wantUnresolved {
 				t.Errorf("recorded unresolvable CAS = %v, want %v (unresolved=%v)", got, test.wantUnresolved, unresolved)
+			}
+			if got := len(batchCAS) > 0; got != test.wantBatchCAS {
+				t.Errorf("recorded conditional batch CAS = %v, want %v (batchCAS=%v)", got, test.wantBatchCAS, batchCAS)
+			}
+		})
+	}
+}
+
+// TestR12ScanNodeSeesEveryCASTerminal is the regression for the second way a
+// target statement can leave the guard's view without ever being reported: not by
+// hiding its CQL, but by executing through a CAS terminal the scanner does not
+// know. The gocql version in use exposes ScanCASContext/MapScanCASContext as
+// ordinary LWT execution and the ExecCAS family for conditional batches, so a
+// scanner that recognised only ScanCAS/MapScanCAS would return an empty discovery
+// set -- a green gate -- for an unpinned mutation on the blocks partition.
+func TestR12ScanNodeSeesEveryCASTerminal(t *testing.T) {
+	tests := []struct {
+		name           string
+		source         string
+		wantDiscovered bool
+		wantUnresolved bool
+		wantBatchCAS   bool
+	}{
+		{
+			name: "MapScanCASContext with an inline literal is discovered",
+			source: `package p
+
+func mutate(session S, ctx C) {
+	session.Query("UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?").MapScanCASContext(ctx, nil)
+}
+`,
+			wantDiscovered: true,
+		},
+		{
+			name: "ScanCASContext with an inline literal is discovered",
+			source: `package p
+
+func mutate(session S, ctx C) {
+	session.Query("UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?").ScanCASContext(ctx, nil)
+}
+`,
+			wantDiscovered: true,
+		},
+		{
+			name: "MapScanCASContext with const CQL fails closed",
+			source: `package p
+
+const updateBlock = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+
+func mutate(session S, ctx C) {
+	session.Query(updateBlock).MapScanCASContext(ctx, nil)
+}
+`,
+			wantUnresolved: true,
+		},
+		{
+			name: "ScanCASContext with constructed CQL fails closed",
+			source: `package p
+
+func mutate(session S, ctx C, table string) {
+	session.Query(fmt.Sprintf("UPDATE %s SET gc_state = ? WHERE org_id = ? IF gc_state = ?", table)).ScanCASContext(ctx, nil)
+}
+`,
+			wantUnresolved: true,
+		},
+		{
+			name: "batch ExecCAS is refused",
+			source: `package p
+
+func mutate(session S) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(updateBlock)
+	batch.ExecCAS()
+}
+`,
+			wantBatchCAS: true,
+		},
+		{
+			name: "batch MapExecCASContext is refused",
+			source: `package p
+
+func mutate(session S, ctx C) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(updateBlock)
+	batch.MapExecCASContext(ctx, nil)
+}
+`,
+			wantBatchCAS: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+
+			discovered := map[string][]r12DiscoveredOperation{}
+			unresolved := map[string][]token.Position{}
+			batchCAS := map[string][]token.Position{}
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok {
+					continue
+				}
+				r12ScanNode(fset, function.Body, r12FunctionName(function), discovered, unresolved, batchCAS)
+			}
+
+			if got := len(discovered) > 0; got != test.wantDiscovered {
+				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
+			}
+			if got := len(unresolved) > 0; got != test.wantUnresolved {
+				t.Errorf("recorded unresolvable CAS = %v, want %v (unresolved=%v)", got, test.wantUnresolved, unresolved)
+			}
+			if got := len(batchCAS) > 0; got != test.wantBatchCAS {
+				t.Errorf("recorded conditional batch CAS = %v, want %v (batchCAS=%v)", got, test.wantBatchCAS, batchCAS)
+			}
+		})
+	}
+}
+
+// TestR12ScanNodeDiscoversAlternateTableSpellings is the mutation test for the
+// table matcher. Each source below is a straggler the gate has to catch: an
+// unpinned or LOCAL_SERIAL conditional mutation on an R12 partition, written with
+// a table reference that a name-literal regex does not recognise. The assertion
+// is not only that the statement is discovered but that its pin is reported
+// wrong, since discovery without a pin verdict would still let the gate pass.
+func TestR12ScanNodeDiscoversAlternateTableSpellings(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   r12SerialPin
+	}{
+		{
+			name: "keyspace-qualified LOCAL_SERIAL mutation is caught",
+			source: `package p
+
+func mutate(session S) {
+	session.Query("UPDATE sesamefs.blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?").
+		SerialConsistency(gocql.LocalSerial).
+		MapScanCAS(nil)
+}
+`,
+			want: r12SerialPin{present: true, local: true},
+		},
+		{
+			name: "quoted unpinned mutation is caught",
+			source: `package p
+
+func mutate(session S) {
+	session.Query("UPDATE \"blocks\" SET gc_state = ? WHERE org_id = ? IF gc_state = ?").MapScanCAS(nil)
+}
+`,
+			want: r12SerialPin{},
+		},
+		{
+			name: "column delete without a pin is caught",
+			source: `package p
+
+func mutate(session S) {
+	session.Query("DELETE storage_key FROM blocks WHERE org_id = ? IF gc_state = ?").MapScanCAS(nil)
+}
+`,
+			want: r12SerialPin{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+
+			discovered := map[string][]r12DiscoveredOperation{}
+			unresolved := map[string][]token.Position{}
+			batchCAS := map[string][]token.Position{}
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok {
+					continue
+				}
+				r12ScanNode(fset, function.Body, r12FunctionName(function), discovered, unresolved, batchCAS)
+			}
+
+			operations := discovered["mutate|blocks|UPDATE"]
+			if len(operations) == 0 {
+				operations = discovered["mutate|blocks|DELETE"]
+			}
+			if len(operations) == 0 {
+				t.Fatalf("statement left the R12 target set entirely (discovered=%v, unresolved=%v)", discovered, unresolved)
+			}
+			if got := operations[0].pin; got != test.want {
+				t.Fatalf("serial pin = %+v, want %+v", got, test.want)
 			}
 		})
 	}

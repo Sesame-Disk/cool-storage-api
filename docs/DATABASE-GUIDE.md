@@ -1301,12 +1301,29 @@ calls `SerialConsistency(gocql.Serial)` itself, so the level holds even where a
 deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
 `blocks` statements, 4 canonical `gc_s3_orphans` and 2 `gc_block_candidates` —
 is pinned by the untagged source gate `TestR12SerialDomainGuard`
-(`internal/integration/`), which also fails closed if a target statement's CQL
-stops being a source literal.
+(`internal/integration/`).
+
+The gate is fail-closed on the three ways a statement can leave its view rather
+than be reported unpinned, which is the failure mode that matters: a statement it
+cannot see demands no pin at all.
+
+- **CQL that is not a source literal** — a `const`, a variable or `fmt.Sprintf`.
+  Only the three `gc_*_hard_delete_locks` helpers are allowed, and
+  `TestR12HardDeleteLockTablesAreOutOfScope` separately pins each of their call
+  sites to a lock-table literal.
+- **Table spellings a name-literal regex misses** — `"blocks"`,
+  `sesamefs.blocks`, `"sesamefs"."blocks"`, and `DELETE <columns> FROM <table>`.
+  Quoted identifiers keep CQL case sensitivity, so `"BLOCKS"` is correctly a
+  different relation.
+- **CAS terminals other than `ScanCAS`/`MapScanCAS`** — the `Context` variants are
+  recognised as equal-standing LWT execution, and the conditional-batch family
+  (`ExecCAS`, `MapExecCAS`, and their `Context` forms) is **refused outright**: a
+  batch carries neither its CQL nor its serial pin at the CAS call site, so R12
+  forbids conditional batches until the gate is extended to classify them.
 
 `serial_consistency` remains the level for every **other** LWT, including the
-conditional library-HEAD publish, which has no explicit contract
-(`ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01`).
+conditional library-HEAD publish, which has no explicit contract and is
+registered as `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` in `docs/KNOWN_ISSUES.md`.
 
 The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
 test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the
