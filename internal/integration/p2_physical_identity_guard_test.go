@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -179,23 +180,24 @@ func TestP2IndirectFreshAuthorityMutationsAreDetected(t *testing.T) {
 }
 
 func TestP2PositionalTargetConstructionViaAliasesIsDetected(t *testing.T) {
-	parse := func(path, source string) *ast.File {
+	parse := func(path, source string) (*token.FileSet, *ast.File) {
 		t.Helper()
-		file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, source, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
-		return file
+		return fset, file
 	}
 
-	bridge := parse("bridge.go", `package bridge
+	_, bridge := parse("bridge.go", `package bridge
 import v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 type Target = v2.BlockMaterializationTarget`)
-	consumer := parse("consumer.go", `package consumer
+	consumerFSet, consumer := parse("consumer.go", `package consumer
 import bridge "example.invalid/bridge"
 func f() {
 	type Local = bridge.Target
-	_ = Local{nil, "", "", true}
+	_ = []Local{{nil, "", "", true}}
 }`)
 	aliases := append(
 		p2TypeAliases("example.invalid/bridge", bridge),
@@ -203,9 +205,10 @@ func f() {
 	)
 	canonical := p2ResolveCanonicalTargetTypes(aliases)
 
+	info := p2ProductionTypeInfo(consumerFSet, "example.invalid/consumer", consumer, canonical)
 	var literal *ast.CompositeLit
 	ast.Inspect(consumer, func(node ast.Node) bool {
-		if candidate, ok := node.(*ast.CompositeLit); ok {
+		if candidate, ok := node.(*ast.CompositeLit); ok && candidate.Type == nil {
 			literal = candidate
 		}
 		return true
@@ -213,8 +216,8 @@ func f() {
 	if literal == nil {
 		t.Fatal("synthetic positional literal was not found")
 	}
-	if !p2CanonicalTargetType(literal.Type, "example.invalid/consumer", consumer, canonical) {
-		t.Fatal("positional construction through imported and local aliases was not resolved to BlockMaterializationTarget")
+	if !p2CanonicalTargetLiteral(literal, "example.invalid/consumer", consumer, canonical, info) {
+		t.Fatal("type-elided positional construction through imported and local aliases was not resolved to BlockMaterializationTarget")
 	}
 	if _, keyed := literal.Elts[0].(*ast.KeyValueExpr); keyed {
 		t.Fatal("synthetic mutation unexpectedly uses keyed construction")
@@ -356,6 +359,88 @@ func p2CanonicalTargetType(expression ast.Expr, packagePath string, file *ast.Fi
 	return false
 }
 
+type p2CanonicalImporter struct {
+	canonical map[p2NamedType]bool
+	target    types.Type
+	packages  map[string]*types.Package
+}
+
+func p2NewCanonicalImporter(canonical map[p2NamedType]bool) *p2CanonicalImporter {
+	targetPackage := types.NewPackage(p2TargetPackage, "v2")
+	fields := []*types.Var{
+		types.NewField(token.NoPos, targetPackage, "Store", types.Typ[types.UntypedNil], false),
+		types.NewField(token.NoPos, targetPackage, "StorageClass", types.Typ[types.String], false),
+		types.NewField(token.NoPos, targetPackage, "StorageKey", types.Typ[types.String], false),
+		types.NewField(token.NoPos, targetPackage, "FreshInstall", types.Typ[types.Bool], false),
+	}
+	targetName := types.NewTypeName(token.NoPos, targetPackage, "BlockMaterializationTarget", nil)
+	target := types.NewNamed(targetName, types.NewStruct(fields, nil), nil)
+	targetPackage.Scope().Insert(targetName)
+	targetPackage.MarkComplete()
+	return &p2CanonicalImporter{
+		canonical: canonical,
+		target:    target,
+		packages:  map[string]*types.Package{p2TargetPackage: targetPackage},
+	}
+}
+
+func (importer *p2CanonicalImporter) Import(path string) (*types.Package, error) {
+	if imported := importer.packages[path]; imported != nil {
+		return imported, nil
+	}
+	imported := types.NewPackage(path, filepath.Base(path))
+	for reference := range importer.canonical {
+		if reference.pkg != path {
+			continue
+		}
+		name := types.NewTypeName(token.NoPos, imported, reference.name, nil)
+		types.NewAlias(name, importer.target)
+		imported.Scope().Insert(name)
+	}
+	imported.MarkComplete()
+	importer.packages[path] = imported
+	return imported, nil
+}
+
+func p2ProductionTypeInfo(fset *token.FileSet, packagePath string, file *ast.File, canonical map[p2NamedType]bool) *types.Info {
+	canonicalImporter := p2NewCanonicalImporter(canonical)
+	checkedPackage := types.NewPackage(packagePath, file.Name.Name)
+	declared := map[string]bool{}
+	for _, declaration := range file.Decls {
+		if typeDeclaration, ok := declaration.(*ast.GenDecl); ok && typeDeclaration.Tok == token.TYPE {
+			for _, specification := range typeDeclaration.Specs {
+				declared[specification.(*ast.TypeSpec).Name.Name] = true
+			}
+		}
+	}
+	for reference := range canonical {
+		if reference.pkg != packagePath || declared[reference.name] {
+			continue
+		}
+		name := types.NewTypeName(token.NoPos, checkedPackage, reference.name, nil)
+		types.NewAlias(name, canonicalImporter.target)
+		checkedPackage.Scope().Insert(name)
+	}
+	info := &types.Info{Types: make(map[ast.Expr]types.TypeAndValue)}
+	config := types.Config{
+		Importer: canonicalImporter,
+		Error:    func(error) {},
+	}
+	_ = types.NewChecker(&config, fset, checkedPackage, info).Files([]*ast.File{file})
+	return info
+}
+
+func p2CanonicalTargetLiteral(literal *ast.CompositeLit, packagePath string, file *ast.File, canonical map[p2NamedType]bool, info *types.Info) bool {
+	if literal.Type != nil {
+		return p2CanonicalTargetType(literal.Type, packagePath, file, canonical)
+	}
+	typeName, ok := types.Unalias(info.TypeOf(literal)).(*types.Named)
+	if !ok || typeName.Obj().Pkg() == nil {
+		return false
+	}
+	return canonical[p2NamedType{pkg: typeName.Obj().Pkg().Path(), name: typeName.Obj().Name()}]
+}
+
 // TestP2PhysicalIdentityAuthorityGuard binds physical-locator authority to the
 // intended functions and BlockStore variables. Selector references are counted,
 // not only direct calls, so a method-value alias cannot evade the guard; a same-
@@ -397,6 +482,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 			t.Errorf("%s: resolve package path: %v", path, err)
 			return
 		}
+		typeInfo := p2ProductionTypeInfo(fset, packagePath, file, canonicalTargetTypes)
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			symbol := "package value"
@@ -452,7 +538,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 						}
 					}
 				case *ast.CompositeLit:
-					if len(typed.Elts) != 0 && p2CanonicalTargetType(typed.Type, packagePath, file, canonicalTargetTypes) {
+					if len(typed.Elts) != 0 && p2CanonicalTargetLiteral(typed, packagePath, file, canonicalTargetTypes, typeInfo) {
 						if _, keyed := typed.Elts[0].(*ast.KeyValueExpr); !keyed {
 							t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(typed.Pos()), symbol)
 						}
