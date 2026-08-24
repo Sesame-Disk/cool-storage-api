@@ -3845,8 +3845,8 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
-// ValidatePhysicalLocator mirrors storage.BlockStore's deterministic locator
-// contract so GC unit tests do not bypass block-id format validation.
+// ValidatePhysicalLocator mirrors storage.BlockStore's legacy-or-minted locator
+// contract so GC unit tests do not bypass block-id or incarnation validation.
 func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) error {
 	d.provider.mu.Lock()
 	d.provider.PhysicalLocatorValidations = append(d.provider.PhysicalLocatorValidations, ScopedPhysicalLocatorValidation{
@@ -3859,8 +3859,18 @@ func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) e
 	if !db.IsSHA256BlockID(blockID) {
 		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
 	}
-	if storageKey != MockCanonicalStorageKey(d.orgID, blockID) {
+	base := MockCanonicalStorageKey(d.orgID, blockID)
+	if storageKey == base {
+		return nil
+	}
+	incarnationPrefix := base + "."
+	if !strings.HasPrefix(storageKey, incarnationPrefix) {
 		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	incarnation := strings.TrimPrefix(storageKey, incarnationPrefix)
+	parsed, err := uuid.Parse(incarnation)
+	if err != nil || parsed.String() != incarnation {
+		return fmt.Errorf("block storage key %q has a malformed or non-canonical incarnation", storageKey)
 	}
 	return nil
 }

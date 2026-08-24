@@ -117,7 +117,7 @@ func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *
 // ResolveNeedsPutBlockStore chooses the physical destination for a NeedsPut
 // probe. A first writer has no storage metadata and keeps the preferred store.
 // Existing metadata is immutable placement state and must resolve without
-// health failover to the exact org-scoped class and derived key.
+// health failover to the exact org-scoped class and persisted key.
 func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass string, probe db.BlockReuseProbe, orgID, blockID string) (*storage.BlockStore, string, string, error) {
 	if probe.Decision != db.BlockReuseNeedsPut {
 		return nil, "", "", fmt.Errorf("block %s does not need a PUT", blockID)
@@ -150,13 +150,12 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 	if err != nil {
 		return nil, "", "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
 	}
-	storageKey := strings.TrimSpace(probe.StorageKey)
-	if storageKey == "" {
+	storageKey := probe.StorageKey
+	if strings.TrimSpace(storageKey) == "" {
 		return nil, "", "", fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
 	}
-	derivedKey := canonicalStore.StorageKeyForHash(blockID)
-	if storageKey != derivedKey {
-		return nil, "", "", fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storageKey, derivedKey)
+	if err := canonicalStore.ValidatePhysicalLocator(blockID, storageKey); err != nil {
+		return nil, "", "", fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, err)
 	}
 	return canonicalStore, canonicalClass, storageKey, nil
 }
@@ -174,13 +173,12 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 		if resolveErr != nil {
 			return "", canonicalClass, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
 		}
-		storageKey = strings.TrimSpace(probe.StorageKey)
-		if storageKey == "" {
+		storageKey = probe.StorageKey
+		if strings.TrimSpace(storageKey) == "" {
 			return "", canonicalClass, false, fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
 		}
-		derivedKey := canonicalStore.StorageKeyForHash(blockID)
-		if storageKey != derivedKey {
-			return "", canonicalClass, false, fmt.Errorf("canonical block %s storage key %q does not match derived org-scoped key %q", blockID, storageKey, derivedKey)
+		if validateErr := canonicalStore.ValidatePhysicalLocator(blockID, storageKey); validateErr != nil {
+			return "", canonicalClass, false, fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, validateErr)
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {

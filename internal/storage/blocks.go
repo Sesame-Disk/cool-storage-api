@@ -184,16 +184,25 @@ func (bs *BlockStore) StorageKeyForHash(hash string) string {
 	return bs.hashToKey(hash)
 }
 
+// MintStorageKey returns a fresh physical incarnation for a logical block.
+func (bs *BlockStore) MintStorageKey(blockID string) (string, error) {
+	if !isSHA256BlockID(blockID) {
+		return "", fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
+	}
+	return bs.hashToKey(blockID) + "." + uuid.NewString(), nil
+}
+
 // ValidatePhysicalLocator verifies that storageKey belongs to this store's
-// tenant and is the deterministic physical key derived from blockID.
+// tenant and is either the legacy deterministic key derived from blockID or a
+// minted incarnation of that key.
 //
 // blockID is validated FIRST, and that ordering is load-bearing rather than
 // stylistic. hashToKey degrades for a short id — it returns the bare tenant
 // prefix plus the id instead of the sharded layout — so a degenerate blockID
-// derives a degenerate key that the equality below then satisfies vacuously:
+// derives a degenerate key that the locator grammar below then accepts vacuously:
 // ValidatePhysicalLocator("", "<prefix><org>/") and ("ab", "<prefix><org>/ab")
 // both used to pass. Rejecting a malformed id up front is what makes the
-// equality mean "this key addresses this block".
+// grammar mean "this key addresses this block".
 func (bs *BlockStore) ValidatePhysicalLocator(blockID, storageKey string) error {
 	if !isSHA256BlockID(blockID) {
 		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
@@ -201,8 +210,18 @@ func (bs *BlockStore) ValidatePhysicalLocator(blockID, storageKey string) error 
 	if err := bs.validateExactStorageKey(storageKey); err != nil {
 		return err
 	}
-	if storageKey != bs.hashToKey(blockID) {
+	base := bs.hashToKey(blockID)
+	if storageKey == base {
+		return nil
+	}
+	incarnationPrefix := base + "."
+	if !strings.HasPrefix(storageKey, incarnationPrefix) {
 		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	incarnation := strings.TrimPrefix(storageKey, incarnationPrefix)
+	parsed, err := uuid.Parse(incarnation)
+	if err != nil || parsed.String() != incarnation {
+		return fmt.Errorf("block storage key %q has a malformed or non-canonical incarnation", storageKey)
 	}
 	return nil
 }
@@ -324,8 +343,8 @@ func (bs *BlockStore) CheckBlocksParallel(ctx context.Context, hashes []string, 
 // DeleteBlockByStorageKey(ctx, bs.StorageKeyForHash(id)) compiles — the tests below
 // do exactly that for cleanup. Where the key came from is a property of the caller,
 // pinned by tests, not by the compiler: production GC loads it from persisted
-// metadata and can use ValidatePhysicalLocator when deterministic derivation is
-// required. This method permits future non-derived locators owned by this tenant.
+// metadata and can use ValidatePhysicalLocator when logical-to-physical binding
+// is required. This method permits explicit locators owned by this tenant.
 // Note: Should only be called after verifying no references exist.
 func (bs *BlockStore) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {
 	if err := bs.validateExactStorageKey(storageKey); err != nil {

@@ -27,6 +27,13 @@ func TestMockBlockDeleterValidatePhysicalLocatorEnforcesBlockIDFormat(t *testing
 	if err := deleter.ValidatePhysicalLocator(blockID, MockCanonicalStorageKey(orgID.String(), blockID)); err != nil {
 		t.Fatalf("ValidatePhysicalLocator rejected uppercase SHA-256 block ID: %v", err)
 	}
+	minted := MockCanonicalStorageKey(orgID.String(), blockID) + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+	if err := deleter.ValidatePhysicalLocator(blockID, minted); err != nil {
+		t.Fatalf("ValidatePhysicalLocator rejected minted key: %v", err)
+	}
+	if err := deleter.ValidatePhysicalLocator(blockID, MockCanonicalStorageKey(orgID.String(), blockID)+".8F14E45F-EA4D-4F73-9F7C-63F4E7A5BC21"); err == nil {
+		t.Fatal("ValidatePhysicalLocator accepted non-canonical minted key")
+	}
 }
 
 // The persisted storage_key says WHICH object to destroy. Exact-key BlockStore

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // =============================================================================
@@ -531,27 +533,78 @@ func TestBlockStoreExplicitStorageKeyGuardCustomPrefix(t *testing.T) {
 	}
 }
 
+func TestBlockStoreMintStorageKey(t *testing.T) {
+	blockStore := mustNewTestOrgBlockStore(t, "custom/objects")
+	base := "custom/objects/" + testOrgA + "/e3/b0/" + testHash64
+	first, err := blockStore.MintStorageKey(testHash64)
+	if err != nil {
+		t.Fatalf("MintStorageKey(first) error = %v", err)
+	}
+	second, err := blockStore.MintStorageKey(testHash64)
+	if err != nil {
+		t.Fatalf("MintStorageKey(second) error = %v", err)
+	}
+	if first == second {
+		t.Fatalf("two mints returned the same key %q", first)
+	}
+	for _, key := range []string{first, second} {
+		if !strings.HasPrefix(key, base+".") {
+			t.Fatalf("minted key = %q, want layout %q.<uuid>", key, base)
+		}
+		suffix := strings.TrimPrefix(key, base+".")
+		parsed, parseErr := uuid.Parse(suffix)
+		if parseErr != nil || parsed.String() != suffix {
+			t.Fatalf("minted suffix %q is not a canonical UUID: %v", suffix, parseErr)
+		}
+	}
+	for _, blockID := range []string{"", strings.Repeat("z", 64)} {
+		if key, mintErr := blockStore.MintStorageKey(blockID); mintErr == nil || key != "" {
+			t.Fatalf("MintStorageKey(%q) = %q, %v, want empty key and error", blockID, key, mintErr)
+		}
+	}
+}
+
 func TestBlockStoreValidatePhysicalLocator(t *testing.T) {
 	blockStore, backend := newRecordingBlockStore(t, "blocks/")
-	ctx := context.Background()
-	exactKey := blockStore.StorageKeyForHash(testHash64)
+	base := blockStore.StorageKeyForHash(testHash64)
+	minted := base + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
 	otherHash := "a3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	otherKey := blockStore.StorageKeyForHash(otherHash)
-	futureKey := exactKey + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+	foreignBase := "blocks/" + testOrgB + "/e3/b0/" + testHash64
 
-	if err := blockStore.ValidatePhysicalLocator(testHash64, exactKey); err != nil {
-		t.Fatalf("ValidatePhysicalLocator(exact) error = %v", err)
-	}
-	for _, key := range []string{otherKey, futureKey} {
-		if _, err := blockStore.ObjectExists(ctx, key); err != nil {
-			t.Fatalf("ObjectExists(%q) structural validation error = %v", key, err)
+	for _, key := range []string{base, minted} {
+		if err := blockStore.ValidatePhysicalLocator(testHash64, key); err != nil {
+			t.Fatalf("ValidatePhysicalLocator(%q) error = %v", key, err)
 		}
+	}
+	rejected := []string{
+		blockStore.StorageKeyForHash(otherHash),
+		base + ".not-a-uuid",
+		base + ".8F14E45F-EA4D-4F73-9F7C-63F4E7A5BC21",
+		base + ".{8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21}",
+		base + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21.extra",
+		base + "/8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21",
+		minted + " ",
+		foreignBase + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21",
+	}
+	for _, key := range rejected {
 		if err := blockStore.ValidatePhysicalLocator(testHash64, key); err == nil {
-			t.Fatalf("ValidatePhysicalLocator(%q) error = nil, want physical mismatch", key)
+			t.Fatalf("ValidatePhysicalLocator(%q) error = nil, want refusal", key)
 		}
 	}
-	if got := backend.snapshot(); len(got) != 2 {
-		t.Fatalf("structurally valid requests = %v, want 2", got)
+	if got := backend.snapshot(); len(got) != 0 {
+		t.Fatalf("locator validation reached backend: %v", got)
+	}
+}
+
+func TestBlockStoreValidatePhysicalLocatorCustomPrefix(t *testing.T) {
+	blockStore := mustNewTestOrgBlockStore(t, "custom/objects")
+	base := blockStore.StorageKeyForHash(testHash64)
+	if err := blockStore.ValidatePhysicalLocator(testHash64, base+".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"); err != nil {
+		t.Fatalf("ValidatePhysicalLocator(custom minted key) error = %v", err)
+	}
+	defaultKey := "blocks/" + testOrgA + "/e3/b0/" + testHash64
+	if err := blockStore.ValidatePhysicalLocator(testHash64, defaultKey); err == nil {
+		t.Fatal("ValidatePhysicalLocator(default-prefix key) error = nil, want refusal")
 	}
 }
 
