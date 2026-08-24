@@ -214,15 +214,16 @@ at [`configs/config.prod.yaml`](../configs/config.prod.yaml), and
 `CASSANDRA_SERIAL_CONSISTENCY` overrides the YAML value before validation;
 `Validate()` accepts both `SERIAL` and `LOCAL_SERIAL`. `newCluster` places the
 effective value on the gocql session in [`internal/db/db.go`](../internal/db/db.go).
-The metadata query does not call `.SerialConsistency(...)`, so it inherits the
-session-level value.
+The metadata query now pins `.SerialConsistency(gocql.Serial)` explicitly. Other
+LWTs continue to inherit the session-level value unless they have their own
+contract.
 
 The current effective behavior is therefore:
 
 ```text
 metadata INSERT IF NOT EXISTS
-    -> inherited effective session serial consistency
-    -> SERIAL only when the runtime setting remains SERIAL
+    -> explicit SERIAL serial phase
+    -> independent of the session serial setting
 ```
 
 The USA/EU cluster profiles intentionally use `LOCAL_SERIAL` for their test
@@ -231,22 +232,24 @@ effective replication is multi-region. `SERIAL` is a global serial domain only
 relative to the configured replica set; a single-region deployment does not
 turn it into WAN latency.
 
-P0/R12 would change implicit/configurable behavior into explicit statement
-behavior. It would:
+P0/R12 changes implicit/configurable behavior into explicit statement behavior.
+The implemented slice:
 
-- prevent a weaker session configuration from silently changing a safety
-  property;
-- make the relevant `blocks` LWT inventory auditable;
-- align test profiles with the intended global serial contract if they are
-  meant to exercise that contract;
-- add no new `SERIAL` latency to deployments currently using the shipped
-  `SERIAL` setting; it can change behavior and latency for an override using
-  `LOCAL_SERIAL`.
+- prevents a weaker session configuration from silently changing the R12
+  serial-phase property;
+- makes the relevant `blocks` LWT inventory auditable;
+- leaves unrelated LWTs and their test-profile session default unchanged;
+- adds no new `SERIAL` latency to deployments currently using the shipped
+  `SERIAL` setting; it changes behavior for the target LWTs when a deployment
+  previously overrode the session to `LOCAL_SERIAL`.
 
-P0/R12 is not required as a performance fix and should not be started merely
-to address X4. Its sequencing as correctness hardening remains open while the
-install design is evaluated. If the final design removes the
-ordinary metadata LWT, the P0 inventory must be split between hot-path install
+This is only the serial-phase prerequisite. It does not add `EACH_QUORUM`,
+settlement reads, exact physical identity or an X1 closure claim.
+
+P0/R12 was implemented as correctness hardening, not as an X4 performance
+change: it neither resolves nor attempts to optimize the per-block Paxos cost
+this document characterizes. If a future install design removes the ordinary
+metadata LWT, the P0 inventory must be split between hot-path install
 operations and background/destructive lifecycle operations. GC claims,
 conditional orphan transitions and ambiguous-outcome settlement cannot be
 made local merely because normal installation is redesigned.

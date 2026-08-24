@@ -8,6 +8,126 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-23 - P0/R12 serial-phase prerequisite
+
+Pinned the 11 conditional `blocks` mutations and 4 canonical `gc_s3_orphans`
+mutations to `SerialConsistency(gocql.Serial)`, with the 2 `gc_block_candidates`
+mutations included as adjacent lifecycle hardening. Added an AST/source guard that
+checks operation identity, discovery and the explicit serial pin.
+
+The guard now keys discovery on **the CQL, not on the Go method that executes
+it**. That reversal is the substance of the change. A statement the gate cannot
+see is never reported as unpinned — no pin is demanded of it at all, and the gate
+stays green — and the original design let a statement disappear in five ways:
+
+- **The execution path.** This was the deepest one. Cassandra makes a statement a
+  lightweight transaction because its CQL carries `IF`; the Go method consuming
+  the result is not the authority. `Query.Exec` is literally `q.Iter().Close()`,
+  and the driver's own `NoSkipMetadata` documentation refers to *"CAS operations
+  which do not end in Cas"*. A gate organised around `ScanCAS`/`MapScanCAS`
+  therefore reported **nothing at all** for `Query(conditionalCQL).Exec()`. Every
+  `Query(...)` call site is now classified whatever consumes it, so a conditional
+  R12 statement reaching `Exec` is discovered and reported as having no CAS
+  terminal. `ScanCASContext`/`MapScanCASContext` are recognised as equal-standing
+  LWT execution.
+- **CQL the gate could not read.** A `const`, or a single-binding *local* built
+  entirely from literals, is now *resolved* — including literal `+=`
+  concatenation, which this codebase uses to build CQL — so moving a statement
+  into one neither hides it nor costs an allowance. A package-level `var` is
+  deliberately not resolved; see the next entry. Resolution is deliberately poisoned by anything it cannot follow (a
+  non-literal fragment, a plain reassignment, an address taken) rather than
+  resolving to a prefix, since reading `"SELECT ... FROM gc_pending_items"` and
+  ignoring the appended clauses would be a false green manufactured by the
+  resolver itself. What remains unresolvable fails the gate unless allowlisted,
+  and every allowlisted symbol is now checked by
+  `TestR12UnresolvedAllowlistNamesNoR12Table` instead of asserted.
+- **The binding a name resolved to.** Resolving `const` and single-binding
+  variables is only sound if a name resolves to the binding *Go* puts at that call
+  site, and the resolver does not model lexical scope. Two silent false greens
+  followed. A parameter named like a package const —
+  `func mutate(session S, stmt string)` under `const stmt = "SELECT ..."` — was
+  read as the const, so the LWT the caller actually passes was never discovered.
+  And a local the resolver poisoned for being built at run time was *deleted* from
+  the local map, which let the package const show through again instead of
+  shadowing it. Names are now recorded even when their value is unknown, so an
+  unresolvable binding shadows the outer one, and a name bound in both scopes is
+  resolved in neither. Parameters, receivers, named results, `range` variables and
+  function-literal signatures all count as bindings. The refusal is deliberate in
+  both directions: an inner-block `stmt := "SELECT ..."` no longer hides a
+  package-level `stmt` that is itself an R12 LWT. Over-refusal costs an allowlist
+  entry and fails loudly; under-refusal is the false green the gate exists to
+  prevent.
+
+  The same rule decides what a package-level name is worth. A `const` is
+  immutable, so its literal is what every call site sees. A `var` is not: any
+  function in any file of the package can reassign it, `&stmt` can be handed to
+  a helper, and the gate reads one file at a time. `var stmt = "SELECT id FROM
+  libraries"` is therefore no evidence about the statement a `Query(stmt)` call
+  executes — a reassignment elsewhere could have made it
+  `UPDATE blocks ... IF ...`. Package vars now contribute a *name*, which shadows
+  and blocks resolution, and never a value. Proving a package var is never
+  reassigned across files, inits, closures and build variants is not this gate's
+  job; refusing to resolve it costs an inline literal or an allowlist entry.
+- **Table spellings the matcher did not recognise.** `UPDATE "blocks"`,
+  `UPDATE sesamefs.blocks`, `UPDATE "sesamefs"."blocks"` and
+  `DELETE storage_key FROM blocks` were all read as out of scope. The matcher is
+  structural over CQL table references and applies CQL identifier folding, so
+  `"BLOCKS"` correctly remains a different relation.
+- **Conditional batches.** Covered are `ExecCAS`, `MapExecCAS`, their `Context`
+  forms, and the deprecated-but-functional `Session.ExecuteBatchCAS` /
+  `Session.MapExecuteBatchCAS`. A batch carries neither its CQL nor its serial pin
+  at its CAS call site, so each one must be allowlisted; `relocateLockRowCASFn`
+  (`locked_files` relocation) is the one in use. The allowance rests on the
+  general Query rule reading the batch's statements — an R12 target inside a
+  batch is discovered with no CAS terminal and fails the gate anyway — and that
+  in turn rests on *how* a statement enters the batch, which is why two more
+  entry points are now read. `Batch.Bind(stmt, binding)` appends its own
+  `BatchEntry` and is classified exactly like `Batch.Query`; a hand-built
+  `BatchEntry` (the driver's `Batch.Entries` slice and `BatchEntry.Stmt` are both
+  exported) is not classifiable at all and fails closed. Without those,
+  `batch.Bind("UPDATE blocks ... IF ...", binder)` inside the allowlisted helper
+  reached Cassandra with the gate green. Each allowlisted batch now also has its
+  shape pinned against the real source by
+  `TestR12AllowedBatchCASStatementsStayOutOfScope`: statement count, inline
+  literals, the relations it may touch, no `Bind`, no `BatchEntry` — and a new
+  batch allowance without a pinned shape fails the gate.
+
+  This corrects a claim in the previous revision of this entry, which said
+  SesameFS used no conditional batch. It does: the survey behind that sentence
+  grepped for `ExecCAS`/`MapExecCAS` and did not match `MapExecuteBatchCAS`.
+
+Mutation-verified against real production sources rather than synthetic fixtures
+alone: eight stragglers now fail the gate that the original guard accepted — a
+keyspace-qualified LWT on `MapScanCASContext`, a quoted-identifier LWT, a column
+`DELETE`, a conditional batch, a `const` LWT through `Exec`, a variable LWT
+through `ExecContext`, and both deprecated `Session` batch-CAS forms. Most are
+caught by two independent routes. Removing or downgrading a pin on any of the 17
+statements also fails the gate. The scope pass adds five more: a parameter, a
+dynamically built local, a `range` variable and a closure parameter — each
+shadowing a name the gate could otherwise resolve — plus an inner-block local
+shadowing a package-level R12 LWT. Each is mutation-verified against the two
+resolver defects it covers: dropping the signature bindings, or restoring the
+flat package/local overlay, fails exactly those cases and nothing else. The
+package-var and batch-entry passes add six more — a package var reassigned in
+another function, a package var with no visible reassignment, a `const`
+counterweight that must still resolve, `Batch.Bind` with a literal and with a
+non-literal statement, and a hand-built `BatchEntry` — plus two mutations of the
+real `relocateLockRowCASFn`: moving one `locked_files` statement to `Batch.Bind`
+fails the shape proof, and smuggling `UPDATE blocks ... IF ...` in through
+`Batch.Bind` fails the main gate with an unexpected R12 target and the shape
+proof twice over. A one-argument `Bind` (gin's `c.Bind(&payload)`) is
+deliberately not a CQL call site. Also fixed a discovery false positive where a
+string value containing `IF` was read as a conditional clause, and another where
+`net/url`'s zero-argument `URL.Query()` was treated as a CQL call site.
+
+The conditional library-HEAD publish stays out of scope and is now registered as
+`ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` rather than named only in passing: it is a
+separate invariant, pinning it would change the sync write path, and the decision
+belongs in the source of record.
+
+This does not change regular commit consistency, settlement, physical incarnation
+identity or destructive-GC activation. P2 remains the next X1 tranche.
+
 ## 2026-08-23 - Merge-readiness pass: source-of-record repair and DLQ refusal contract
 
 Closing review follow-ups on the readiness branch. No change to the established

@@ -170,7 +170,9 @@ var upsertBlockMetadataInsertWithRepresentationFn = func(database *DB, orgID, bl
 	return database.Session().Query(`
 		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now, now).MapScanCAS(map[string]interface{}{})
+	`, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now, now).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 }
 
 var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
@@ -213,7 +215,9 @@ var claimReleasedBlockStubForRepairFn = func(database *DB, orgID, blockID, repai
 		AND gc_state = null
 		AND gc_claim_id = null
 		AND gc_claimed_at = null
-	`, BlockGCStateRepairingStub, repairID, claimedAt, orgID, blockID).MapScanCAS(map[string]interface{}{})
+	`, BlockGCStateRepairingStub, repairID, claimedAt, orgID, blockID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 }
 
 var deleteRepairClaimedBlockStubFn = func(database *DB, orgID, blockID, repairID string) (bool, error) {
@@ -225,7 +229,9 @@ var deleteRepairClaimedBlockStubFn = func(database *DB, orgID, blockID, repairID
 		AND gc_state = ?
 		AND gc_claim_id = ?
 		AND gc_claimed_at != null
-	`, orgID, blockID, BlockGCStateRepairingStub, repairID).MapScanCAS(map[string]interface{}{})
+	`, orgID, blockID, BlockGCStateRepairingStub, repairID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 }
 
 var blockStubRepairIDFn = func(orgID, blockID string) string {
@@ -245,7 +251,9 @@ var deleteClaimedBlockStubFn = func(database *DB, orgID, blockID, claimID string
 		AND gc_state = ?
 		AND gc_claim_id = ?
 		AND gc_claimed_at != null
-	`, orgID, blockID, BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	`, orgID, blockID, BlockGCStateDeleting, claimID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 }
 
 // backfillBlockSHA1Fn fills in a missing sha1 with a compare-and-set against the
@@ -259,7 +267,9 @@ var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurre
 		SET sha1 = ?
 		WHERE org_id = ? AND block_id = ?
 		IF sha1 = ?
-	`, sha1, orgID, blockID, expectedCurrent).ScanCAS()
+	`, sha1, orgID, blockID, expectedCurrent).
+		SerialConsistency(gocql.Serial).
+		ScanCAS()
 }
 
 var backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
@@ -268,7 +278,9 @@ var backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, represe
 		SET representation_id = ?
 		WHERE org_id = ? AND block_id = ?
 		IF representation_id = ?
-	`, representationID, orgID, blockID, expectedCurrent).ScanCAS()
+	`, representationID, orgID, blockID, expectedCurrent).
+		SerialConsistency(gocql.Serial).
+		ScanCAS()
 }
 
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
@@ -1220,5 +1232,7 @@ func (db *DB) ReleaseBlockDeleteClaim(orgID, blockID, claimID string) (bool, err
 		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state = ? AND gc_claim_id = ?
-	`, orgID, blockID, BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	`, orgID, blockID, BlockGCStateDeleting, claimID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 }

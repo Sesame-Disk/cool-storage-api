@@ -163,7 +163,7 @@ func logCassandraRuntimeConfig(cfg config.DatabaseConfig, cluster *gocql.Cluster
 
 	if cluster.SerialConsistency == gocql.LocalSerial && isMultiRegionNetworkTopology(actualReplication) {
 		log.Printf(
-			"[db] WARNING: serial_consistency=LOCAL_SERIAL with multi-region %s replication (%s %s); LWT/CAS will only serialize within the local DC",
+			"[db] WARNING: serial_consistency=LOCAL_SERIAL with multi-region %s replication (%s %s); LWT/CAS without an explicit query override will only serialize within the local DC",
 			actualReplicationSource,
 			actualReplication.Class,
 			formatReplicationOptions(actualReplication.Options),

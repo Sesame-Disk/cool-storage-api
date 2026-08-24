@@ -69,6 +69,7 @@ is right about why.
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Library HEAD Publish Has No Serial-Domain Contract** | 🟡 Open — multi-DC only | The two conditional `UPDATE libraries ... IF head_commit_id = ?` publishes inherit the session's configurable `serial_consistency` instead of pinning their Paxos phase, so a deployment set to `LOCAL_SERIAL` serializes HEAD advancement only within one DC. Not reachable on the shipped `SERIAL` default or on a single-DC deployment. Registered when P0/R12 pinned the block/orphan LWTs and deliberately left this one out of scope. See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
@@ -1379,6 +1380,67 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 - `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md` — S-1
 - `docs/TECHNICAL-DEBT.md` §25
 - `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01` (the other node-local multi-instance blocker)
+
+---
+
+### ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01: Library HEAD Publish Has No Explicit Serial-Domain Contract
+
+**Status**: 🟡 Open — reachable only on a multi-DC deployment configured with `LOCAL_SERIAL`
+**Severity**: Medium (correctness under a supported configuration); no impact on the shipped `SERIAL` default or on single-DC
+**Affected**: `updateLibraryHeadWithStats` in `internal/api/sync.go`, `UpdateLibraryHead` in `internal/api/v2/fs_helpers.go`
+**Registered**: 2026-08-24, as the deliberate out-of-scope boundary of P0/R12
+
+#### Problem
+
+Both conditional library-HEAD publishes are lightweight transactions:
+
+```sql
+UPDATE libraries SET head_commit_id = ?, ...
+WHERE org_id = ? AND library_id = ?
+IF head_commit_id = ?
+```
+
+Neither calls `SerialConsistency(...)`, so both take the Paxos phase from
+`cluster.SerialConsistency`, which is operator-configurable
+(`database.serial_consistency`). The shipped production default is `SERIAL`, but
+`LOCAL_SERIAL` is a supported value and the cluster test profiles
+(`config-usa.cluster.yaml`, `config-eu.cluster.yaml`) use it.
+
+Under `LOCAL_SERIAL` with multi-region replication, the compare-and-set is
+serialized within one DC only. Two DCs can each read the same `head_commit_id`
+and each apply their own advancement, so the parent-chain validation that guards
+sync conflict recovery loses its atomicity across DCs — the same class of defect
+P0/R12 fixed for the block and orphan lifecycles. `newCluster` already emits a
+runtime warning for this combination (`internal/db/db.go`), which detects the
+configuration but does not constrain the statement.
+
+#### Why it is not in P0/R12
+
+R12 covers the conditional mutations in the canonical block/orphan lifecycle, and
+its source gate (`TestR12SerialDomainGuard`) enumerates exactly those three
+relations. Library HEAD is a separate invariant with its own conflict-recovery
+design (`ISSUE-SYNC-HEAD-RECOVERY-01`), and pinning it is a behavior change to the
+sync write path rather than a restatement of an existing contract. It was
+registered rather than silently pinned so the decision stays visible.
+
+#### Fix direction
+
+Decide the contract explicitly, then enforce it the way R12 is enforced:
+
+1. Either pin both statements to `SerialConsistency(gocql.Serial)`, or document
+   that HEAD publish is intentionally DC-local and state what that costs an
+   active-active deployment.
+2. If pinned, extend the source gate to cover `libraries` so the pin cannot be
+   removed silently — the gate's target set is a map, so this is an entry plus an
+   expected-operation key, not a redesign.
+3. Cover it with the same mutation verification: removing or downgrading the pin
+   must fail the gate.
+
+#### Related
+
+- `docs/DATABASE-GUIDE.md` — Phase 5 consistency table
+- `ISSUE-SYNC-HEAD-RECOVERY-01` — the conflict-recovery design this LWT backs
+- `docs/CHANGELOG.md` — 2026-08-23 P0/R12 entry
 
 ---
 

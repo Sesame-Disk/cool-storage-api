@@ -1288,12 +1288,82 @@ Set appropriate consistency levels per operation:
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
 | Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
-| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (production default) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
-| Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (production default) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
-| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (production default) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
-| GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (production default) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
+| Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (explicit statement pin) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
+| Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (explicit statement pin) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
+| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (explicit statement pin) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
+| GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (explicit statement pin) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
+
+The four rows marked **explicit statement pin** do not derive their level from
+`serial_consistency` at all. Since P0/R12 (2026-08-23) each of those statements
+calls `SerialConsistency(gocql.Serial)` itself, so the level holds even where a
+deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
+`blocks` statements, 4 canonical `gc_s3_orphans` and 2 `gc_block_candidates` —
+is pinned by the untagged source gate `TestR12SerialDomainGuard`
+(`internal/integration/`).
+
+The gate keys discovery on **the CQL, not on the Go method that executes it**.
+That direction matters: Cassandra makes a statement a lightweight transaction
+because its CQL carries `IF`, and `Query.Exec` is literally `q.Iter().Close()` —
+the driver's own `NoSkipMetadata` documentation refers to *"CAS operations which
+do not end in Cas"*. A gate organised around CAS terminals reports nothing at all
+for `Query(conditionalCQL).Exec()`, and a statement it cannot see is never asked
+for a pin.
+
+So every `Query(...)` call site in production code is classified, whatever
+consumes the result, and is fail-closed on each way a statement could leave that
+view:
+
+- **CQL the gate cannot read.** A `const` or a single-binding *local* is
+  *resolved*, including literal `+=` concatenation, so moving a statement into one
+  neither hides it nor costs an allowance. A package-level `var` is not resolved
+  at all: it is reassignable from any function in any file of the package, so its
+  declaration says nothing about what a call site executes. A name touched in any way the resolver
+  cannot follow — a non-literal fragment, a plain reassignment, an address taken —
+  is poisoned rather than resolved to a prefix, and the call site fails the gate
+  unless allowlisted. Seven symbols are allowlisted today; each is checked by
+  `TestR12UnresolvedAllowlistNamesNoR12Table`, and the three
+  `gc_*_hard_delete_locks` helpers are additionally pinned to lock-table literals
+  by `TestR12HardDeleteLockTablesAreOutOfScope`.
+- **A name resolved to the wrong binding.** Resolution is only sound if a name
+  resolves to the binding Go puts at that call site, and the gate does not model
+  lexical scope. It therefore records every name a scope binds — parameters,
+  receiver, named results, `range` variables, function-literal signatures and
+  locals — even when the value is unknown, so a binding it cannot resolve
+  *shadows* the outer one rather than unmasking it, and a name bound in both
+  scopes is resolved in neither. Fail-closed in both directions: a parameter named
+  like a package `const` cannot be read as that const, and an inner-block
+  `stmt := "SELECT ..."` cannot hide a package-level `stmt` that is an R12 LWT.
+  `TestR12ScanNodeFailsClosedOnShadowedBindings` covers both, and
+  `TestR12ScanNodeFailsClosedOnPackageVarCQL` covers the mutable package-level
+  `var`, which is the same failure with the package scope as the wrong answer.
+- **Table spellings a name-literal regex misses** — `"blocks"`,
+  `sesamefs.blocks`, `"sesamefs"."blocks"`, and `DELETE <columns> FROM <table>`.
+  Quoted identifiers keep CQL case sensitivity, so `"BLOCKS"` is correctly a
+  different relation.
+- **Execution paths other than `ScanCAS`/`MapScanCAS`.** The `Context` variants
+  are recognised as equal-standing LWT execution; a conditional statement reaching
+  `Exec`/`ExecContext` is discovered and reported as having no CAS terminal. The
+  conditional-batch family — `ExecCAS`, `MapExecCAS`, their `Context` forms, and
+  the deprecated-but-functional `Session.ExecuteBatchCAS` /
+  `Session.MapExecuteBatchCAS` — cannot be classified from its call site, since a
+  batch carries neither its CQL nor its serial pin there, so each conditional
+  batch must be allowlisted. `relocateLockRowCASFn` (`locked_files` relocation) is
+  the one in use. That allowance is sound because the general Query rule still
+  reads the batch's statements: an R12 target inside a batch is discovered with
+  no CAS terminal attributed to it and fails the gate regardless. That holds only
+  if every way of adding a statement is read, so `Batch.Bind(stmt, binding)` is
+  classified like `Batch.Query`, and a hand-built `BatchEntry` — the driver
+  exports both `Batch.Entries` and `BatchEntry.Stmt` — fails closed.
+  `TestR12AllowedBatchCASStatementsStayOutOfScope` additionally pins each
+  allowlisted batch against its real source: statement count, inline literals,
+  the relations it may touch, no `Bind` and no `BatchEntry`. A new batch
+  allowance without a pinned shape fails the gate.
+
+`serial_consistency` remains the level for every **other** LWT, including the
+conditional library-HEAD publish, which has no explicit contract and is
+registered as `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` in `docs/KNOWN_ISSUES.md`.
 
 The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
 test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the
