@@ -3,18 +3,38 @@ package gc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
-// The persisted storage_key says WHICH object to destroy, and a BlockStore is only
-// a bucket client: it deletes whatever key it is handed, prefix and all. So a row
-// carrying another org's key would aim this org's delete at that org's bytes —
-// the cross-org delete P10 closed in code, reopened through data. These tests pin
-// the refusal on both destructive paths, and they assert the *absence* of a
-// delete, because the only observable that matters here is that nothing happened.
+func TestMockBlockDeleterValidatePhysicalLocatorEnforcesBlockIDFormat(t *testing.T) {
+	provider := &MockStorageProvider{}
+	orgID := uuid.New()
+	deleter, err := provider.GetBlockStoreForOrg(orgID.String(), "hot")
+	if err != nil {
+		t.Fatalf("GetBlockStoreForOrg: %v", err)
+	}
+
+	if err := deleter.ValidatePhysicalLocator("block-1", MockCanonicalStorageKey(orgID.String(), "block-1")); err == nil {
+		t.Fatal("ValidatePhysicalLocator accepted a readable synthetic block ID")
+	}
+
+	blockID := strings.ToUpper(testSHA256BlockID("mock-format-contract"))
+	if err := deleter.ValidatePhysicalLocator(blockID, MockCanonicalStorageKey(orgID.String(), blockID)); err != nil {
+		t.Fatalf("ValidatePhysicalLocator rejected uppercase SHA-256 block ID: %v", err)
+	}
+}
+
+// The persisted storage_key says WHICH object to destroy. Exact-key BlockStore
+// operations structurally reject keys outside their configured org prefix, while
+// GC must still bind an accepted key to the intended logical block. These tests pin
+// that caller-level refusal on both destructive paths before lifecycle mutation,
+// and assert the *absence* of a delete because the only observable that matters
+// here is that nothing happened.
 
 func TestWorker_ProcessBlock_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 	store := NewMockStore()
@@ -23,7 +43,7 @@ func TestWorker_ProcessBlock_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
-	const blockID = "blk-foreign-key"
+	blockID := testSHA256BlockID("worker-foreign-key")
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.SetBlockStorageKeyForTest(orgID, blockID, MockCanonicalStorageKey(victimOrgID.String(), blockID))
@@ -39,6 +59,10 @@ func TestWorker_ProcessBlock_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 
 	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
 		t.Fatalf("S3 must not be touched for a foreign storage key, got %+v", got)
+	}
+	validations := sp.LocatorValidations()
+	if len(validations) != 1 || validations[0].BlockID != blockID || validations[0].StorageKey != MockCanonicalStorageKey(victimOrgID.String(), blockID) {
+		t.Fatalf("physical locator validations = %+v, want the persisted foreign locator validated exactly once", validations)
 	}
 	block := store.GetBlock(orgID, blockID)
 	if block == nil {
@@ -139,7 +163,7 @@ func TestWorker_RecoverS3Orphans_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
-	const blockID = "orph-foreign-key"
+	blockID := testSHA256BlockID("orphan-foreign-key")
 	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(victimOrgID.String(), blockID), "", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
@@ -154,8 +178,15 @@ func TestWorker_RecoverS3Orphans_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
 		t.Fatalf("S3 must not be touched for a foreign storage key, got %+v", got)
 	}
+	validations := sp.LocatorValidations()
+	if len(validations) != 1 || validations[0].BlockID != blockID || validations[0].StorageKey != MockCanonicalStorageKey(victimOrgID.String(), blockID) {
+		t.Fatalf("physical locator validations = %+v, want the reloaded foreign locator validated exactly once", validations)
+	}
 	if store.S3OrphanCount() != 1 {
 		t.Fatal("orphan row must remain for repair rather than be consumed by a refused delete")
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("cursor advanced past a refused physical locator, err=%v", err)
 	}
 }
 

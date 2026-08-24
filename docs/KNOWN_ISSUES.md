@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-23
+**Last Updated**: 2026-08-24
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -68,7 +68,7 @@ is right about why.
 | **Upload S3 PUT Serialized by Metadata Permit** | ✅ Fixed (2026-06-15) | `finalizeUploadBlockMetadataConcurrency = 1` was acquired around the full S3 block PUT, not just the Cassandra LWT. Fixed in `fix/upload-permit-unwrap-s3-put`. See ISSUE-UPLOAD-S3-PERMIT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
-| **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value; both destructive paths additionally verify it against the org-scoped key their own store derives, so a corrupt row cannot aim a delete outside its org. The deterministic layout remains enforced, so arbitrary relocation is unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
+| **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21); P2 prerequisite hardened 2026-08-24 (PR #184) | Canonical reads, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and fail closed on an empty or conflicting value. Every exact-key `BlockStore` operation now rejects a key outside its configured prefix plus canonical org ID — or equal to that bare prefix — before backend access, and both destructive paths use the centralized physical-locator validation, which also requires a well-formed SHA-256 block id. The deterministic `K == hashToKey(L)` check remains enforced at four sites, so arbitrary relocation and minted keys remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
 | **Library HEAD Publish Has No Serial-Domain Contract** | 🟡 Open — multi-DC only | The two conditional `UPDATE libraries ... IF head_commit_id = ?` publishes inherit the session's configurable `serial_consistency` instead of pinning their Paxos phase, so a deployment set to `LOCAL_SERIAL` serializes HEAD advancement only within one DC. Not reachable on the shipped `SERIAL` default or on a single-DC deployment. Registered when P0/R12 pinned the block/orphan LWTs and deliberately left this one out of scope. See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
@@ -1280,13 +1280,15 @@ to choose a physical target.
 persisted key and verifies the current deterministic invariant. An empty or
 conflicting `storage_key` fails closed before any S3 HEAD or repair PUT.
 
-The destructive side verifies the same equality rather than trusting the row. A
-`BlockStore` is only a bucket client — it deletes whatever key it is handed,
-including one naming another org's prefix — so `processBlock` resolves the store
-during the authorization phase (before `StartBlockDeleteOrphan` and
-`FinalizeBlockDelete`) and refuses a key the store would not derive, and
-`RecoverS3Orphans` repeats the check on the reloaded canonical row. Neither path
-records a recovery row for a refused delete. `storage.BlockStore` no longer
+The destructive side verifies the same equality rather than trusting the row.
+`ValidatePhysicalLocator` centralizes that destructive check in the org-scoped
+`BlockStore`: it first requires a well-formed SHA-256 block ID, then enforces the
+store's configured prefix plus canonical org ID, then requires the persisted key
+to equal the deterministic key for the block ID. `processBlock` calls it during
+the authorization phase (before
+`StartBlockDeleteOrphan` and `FinalizeBlockDelete`), and `RecoverS3Orphans` calls
+it on the reloaded canonical row. Neither path records or consumes recovery state
+for a refused delete. `storage.BlockStore` no longer
 exposes hash-derived `PutBlockAutoDirect`/`DeleteBlock` at all, so the storage
 layer never picks a delete target on a caller's behalf. That is the whole of what
 the signature guarantees: `StorageKeyForHash` is still public, so passing a
@@ -1322,22 +1324,40 @@ but canonical consumers now use the value already resolved from Cassandra. The
 the download hot path. `storage_key` must be non-empty and exactly match the
 current deterministic layout.
 
-The locator-taking APIs (`PutObjectAutoDirect`, `GetBlockByStorageKey`,
-`DeleteBlockByStorageKey`, …) do accept a caller-supplied key — that is the
-point of them — and the `BlockStore` validates only that it is non-empty, not
-that it belongs to this org. What makes that safe is the callers, not the
-store: writers take K from placement resolution, canonical consumers take it
-from persisted metadata, and both destructive callers require it to equal the
-deterministic org-scoped key before handing it to the backend.
+The locator-taking APIs (`PutObjectAutoDirect`, `ObjectExists`, the exact-key
+`Get`/reader/size methods, and `DeleteBlockByStorageKey`) accept a caller-supplied
+key, but they all pass through one `BlockStore` guard before backend access. The
+guard requires the raw key to begin with this store's configured prefix plus its
+canonical org ID and does not normalize or rewrite the key. This makes the tenant
+boundary structural for exact-key operations instead of relying on each caller.
 
-**Requirement for P2.** A minted key is by definition not `hashToKey(L)`, so P2
-must drop that equality — and dropping it without a replacement re-opens
-handing `DeleteBlockByStorageKey` a key belonging to another org. The equality
-check is doing tenant-isolation work today, not only layout work. Before it is
-removed, org isolation has to become structural in the `BlockStore` itself (an
-exact key must begin with `blocks/<canonical-org-id>/` before any GET/PUT/HEAD/
-DELETE), so the guarantee does not depend on every future destructive caller
-remembering to check.
+**Structural prerequisite for P2 (implemented 2026-08-24, PR #184).** Org isolation
+is now enforced inside `BlockStore` for every exact-key GET/PUT/HEAD/DELETE, using
+the configured prefix and canonical org ID, and a key equal to the bare tenant
+prefix is refused because it names no object. Destructive locator validation is
+centralized in `ValidatePhysicalLocator`, which checks a well-formed SHA-256 block
+id, then tenant ownership, then the equality — in that order, because `hashToKey`
+returns `<prefix><org>/` plus the id for an id shorter than four characters, so a
+degenerate id derives the very key the equality then compares it against. The
+deterministic `K == hashToKey(L)` check deliberately remains: removing that layout
+check and minting never-reused keys belong to P2 and its R9/R24 install properties,
+all of which remain open. This prerequisite does not implement minted keys, close
+P2 or X1, or authorize destructive GC; `GC_ENABLED=false` remains mandatory.
+
+**Inventory for P2: the equality lives at four sites, not one.** PR #184
+centralized it for the two destructive callers only, which is why P2 cannot treat
+`ValidatePhysicalLocator` as the single edit point:
+
+| Site | Path |
+|---|---|
+| `storage.ValidatePhysicalLocator` | covers `gc.processBlock` and `gc.RecoverS3Orphans` |
+| `ResolveNeedsPutBlockStore` | `internal/api/v2/upload_reuse.go` |
+| `Reusable` branch of `StoreUploadedBlockForProbe` | `internal/api/v2/upload_reuse.go` |
+| `newCanonicalBlockReader` | `internal/streaming/canonical_block_reader.go` |
+
+A site missed by P2 rejects every minted key rather than accepting a wrong one, so
+the failure mode is a hard outage on that path, not data loss. Recording it here
+because "fails closed" is only cheap when someone knows where to look.
 
 Closed by P1, with arbitrary relocation still out of scope.
 

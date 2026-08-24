@@ -57,11 +57,12 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.AddBlockMapping(orgID, "sha1-abc", "block-1")
+	blockID := testSHA256BlockID("worker-refcount-zero")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockMapping(orgID, "sha1-abc", blockID)
 
 	// Enqueue the block (in the past so grace period passes)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -73,13 +74,13 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 	}
 
 	// Block should be deleted from store
-	if store.GetBlock(orgID, "block-1") != nil {
+	if store.GetBlock(orgID, blockID) != nil {
 		t.Error("block should be deleted from DB")
 	}
 
 	// Block should be deleted from S3
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-1")}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "hot", StorageKey: MockCanonicalStorageKey(orgID.String(), blockID)}) {
 		t.Errorf("unexpected scoped S3 deletes: %+v", deletes)
 	}
 
@@ -107,11 +108,12 @@ func TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable(t *tes
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	blockID := testSHA256BlockID("worker-empty-block-sha1")
 	// Seed the forward mapping BEFORE the block exists, so the block row carries an
 	// empty blocks.sha1 (the legacy shape this fail-safe guards).
-	store.AddBlockMapping(orgID, "sha1-orphan", "block-nosha1")
-	store.AddBlock(orgID, "block-nosha1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-nosha1", uuid.Nil, "hot", 0)
+	store.AddBlockMapping(orgID, "sha1-orphan", blockID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -120,7 +122,7 @@ func TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable(t *tes
 	if n != 1 {
 		t.Fatalf("expected 1 processed, got %d", n)
 	}
-	if store.GetBlock(orgID, "block-nosha1") != nil {
+	if store.GetBlock(orgID, blockID) != nil {
 		t.Error("block should be deleted from DB even when blocks.sha1 is empty")
 	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-orphan") {
@@ -168,12 +170,13 @@ func TestWorker_ProcessBlock_RetryUsesIdentityAtForCandidateCleanup(t *testing.T
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	blockID := testSHA256BlockID("worker-retry-cleanup")
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	store.AddBlock(orgID, "block-retry-cleanup", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-retry-cleanup", "hot", candidateAt); err != nil {
+	store.AddBlock(orgID, blockID, "hot", 0)
+	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-retry-cleanup", uuid.Nil, "hot", 0); err != nil {
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
 
@@ -206,7 +209,7 @@ func TestWorker_ProcessBlock_RetryUsesIdentityAtForCandidateCleanup(t *testing.T
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected canonical block GC candidate cleanup, got %d rows", got)
 	}
-	candidates, err := store.ListBlockGCCandidatesByDay(candidateAt, db.GCDiscoveryBucket(orgID.String(), "block-retry-cleanup"))
+	candidates, err := store.ListBlockGCCandidatesByDay(candidateAt, db.GCDiscoveryBucket(orgID.String(), blockID))
 	if err != nil {
 		t.Fatalf("ListBlockGCCandidatesByDay failed: %v", err)
 	}
@@ -328,10 +331,11 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	blockID := testSHA256BlockID("worker-canonical-cold")
 	store.AddOrganization(orgID)
-	store.AddBlock(orgID, "block-canonical-cold", "cold-tier", 0)
+	store.AddBlock(orgID, blockID, "cold-tier", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-canonical-cold", uuid.Nil, "hot-tier", 0); err != nil {
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot-tier", 0); err != nil {
 		t.Fatalf("EnqueueItem() error = %v", err)
 	}
 
@@ -342,7 +346,7 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	if n != 1 {
 		t.Fatalf("ProcessOnce() processed = %d, want 1", n)
 	}
-	if store.GetBlock(orgID, "block-canonical-cold") != nil {
+	if store.GetBlock(orgID, blockID) != nil {
 		t.Fatal("expected block row to be finalized from DB")
 	}
 	orphans := store.AllS3Orphans()
@@ -350,7 +354,7 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 		t.Fatalf("AllS3Orphans() len = %d, want 0 after cleanup completes", len(orphans))
 	}
 	deletes := sp.ScopedBlockDeletes()
-	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier", StorageKey: MockCanonicalStorageKey(orgID.String(), "block-canonical-cold")}) {
+	if len(deletes) != 1 || deletes[0] != (ScopedBlockDelete{OrgID: orgID.String(), StorageClass: "cold-tier", StorageKey: MockCanonicalStorageKey(orgID.String(), blockID)}) {
 		t.Fatalf("delete used queued rather than canonical scope: %+v", deletes)
 	}
 }

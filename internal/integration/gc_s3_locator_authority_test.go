@@ -61,9 +61,10 @@ func gcFailedItemExistsForTest(t *testing.T, orgID uuid.UUID, itemType gcpkg.Ite
 //
 // A canonical row whose storage_key names ANOTHER organization object is what a
 // corrupt write, a bad backfill, or a future key-minting writer would leave
-// behind. The store applies whatever key it is handed, so without the guard this
-// row destroys the other tenant bytes for real. The unit test proves the
-// refusal; this one proves the object is still in the bucket afterwards.
+// behind. Exact-key stores now reject keys outside their configured org prefix,
+// while GC's locator guard additionally binds the persisted key to the logical
+// block before lifecycle mutation. The unit test proves the caller-level refusal;
+// this one proves the other tenant object is still in the bucket afterwards.
 func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	requireCassandra(t)
 

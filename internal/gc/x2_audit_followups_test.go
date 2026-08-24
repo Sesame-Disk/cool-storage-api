@@ -150,10 +150,11 @@ func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-unavailable-claim")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetClaimBlockDeleteErrForTest(gocql.ErrTimeoutNoResponse)
 
@@ -202,10 +203,11 @@ func TestX2_NonAvailabilityErrorStillReachesTheDLQ(t *testing.T) {
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-nonavailability-claim")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetClaimBlockDeleteErrForTest(errors.New("undefined column name gc_claim_id"))
 
@@ -250,10 +252,11 @@ func TestX2_NonAvailabilityErrorDuringGlobalVerifyStillReachesTheDLQ(t *testing.
 	w := NewWorker(store, sp, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-nonavailability-global-verify")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	// The FRAME, not a plain error carrying its text. A plain error can never be
 	// classified as environmental whatever the classifier does, so injecting one would
@@ -406,10 +409,11 @@ func TestX2_BlockedStateSurvivesAPassThatAttemptsNothing(t *testing.T) {
 	resetDestructivePairForTest(destructivePathBlock)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-blocked-state-idle-pass")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -477,10 +481,11 @@ func TestX2_DestructiveTimestampsTrackTheLastEvidence(t *testing.T) {
 	}
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-destructive-timestamps-last-evidence")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -579,10 +584,11 @@ func TestX2_CommitPointRefusalOutranksTheLivenessSuccessInTheSameWalk(t *testing
 	resetDestructivePairForTest(destructivePathBlock)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-commit-point-refusal-same-walk")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	// Passes at the top of the walk, rejects from the commit-point re-check onward: an
 	// ALTER landing after the authorizing read.
@@ -705,10 +711,11 @@ func TestX2_TopologyGateIsRecheckedAtTheCommitPoint(t *testing.T) {
 	w.clock = func() time.Time { return now }
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-topology-commit-point")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := now.Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	// The gate passes at the top of the walk and starts rejecting once the
 	// authorizing read is done — an ALTER landing mid-walk.
@@ -736,10 +743,10 @@ func TestX2_TopologyGateIsRecheckedAtTheCommitPoint(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Errorf("destroyed bytes after the topology stopped supporting the EACH_QUORUM argument: %+v", deletes)
 	}
-	if store.GetBlock(orgID, "block-1") == nil {
+	if store.GetBlock(orgID, blockID) == nil {
 		t.Error("canonical block row removed under a rejected topology")
 	}
-	if blk := store.GetBlock(orgID, "block-1"); blk != nil && blk.GCState == db.BlockGCStateDeleting {
+	if blk := store.GetBlock(orgID, blockID); blk != nil && blk.GCState == db.BlockGCStateDeleting {
 		t.Error("block left fenced after a late topology rejection; the fence protects nothing here and would persist for as long as the topology stays wrong")
 	}
 	if got := store.AllBlockGCCandidates(); len(got) != 1 {
@@ -768,7 +775,8 @@ func TestX2_DestructiveTimestampsArePerPath(t *testing.T) {
 
 	// Orphan recovery cannot authorize anything: its liveness read fails.
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-1", "hot", "", "", now.AddDate(0, 0, -1))
+	blockID := testSHA256BlockID("x2-orphan-path")
+	seedS3Orphan(t, store, orgID, blockID, "hot", "", "", now.AddDate(0, 0, -1))
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.RecoverS3Orphans(context.Background(), 100); err == nil {
 		t.Fatal("expected the sweep to fail closed")
@@ -819,10 +827,11 @@ func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
 	resetDestructivePairForTest(destructivePathBlock, destructivePathOrphan)
 
 	orgID := uuid.New()
-	store.AddBlock(orgID, "block-1", "hot", 0)
+	blockID := testSHA256BlockID("x2-orphan-refusal-worker")
+	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	// Orphan recovery refuses a delete from the middle of the worker's pass — the
 	// interleaving that actually happens when the scanner and the worker overlap.

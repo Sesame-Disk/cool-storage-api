@@ -374,19 +374,24 @@ func TestOrgBlockStoreHashToKey_IsOrgScoped(t *testing.T) {
 	}
 }
 
-func TestBlockStoreExplicitStorageKeyReads(t *testing.T) {
-	var mu sync.Mutex
-	var requests []string
+type recordingBlockBackend struct {
+	mu       sync.Mutex
+	requests []string
+}
+
+func newRecordingBlockStore(t *testing.T, prefix string) (*BlockStore, *recordingBlockBackend) {
+	t.Helper()
+	backend := &recordingBlockBackend{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requests = append(requests, r.Method+" "+r.URL.Path)
-		mu.Unlock()
+		backend.mu.Lock()
+		backend.requests = append(backend.requests, r.Method+" "+r.URL.Path)
+		backend.mu.Unlock()
 		w.Header().Set("Content-Length", "7")
 		if r.Method == http.MethodGet {
 			_, _ = io.WriteString(w, "payload")
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
 	s3Store, err := NewS3Store(context.Background(), S3Config{
 		Endpoint:        server.URL,
@@ -399,12 +404,27 @@ func TestBlockStoreExplicitStorageKeyReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewS3Store() error = %v", err)
 	}
-	blockStore, err := NewOrgBlockStore(s3Store, "blocks/", testOrgA)
+	blockStore, err := NewOrgBlockStore(s3Store, prefix, testOrgA)
 	if err != nil {
 		t.Fatalf("NewOrgBlockStore() error = %v", err)
 	}
+	return blockStore, backend
+}
+
+func (b *recordingBlockBackend) snapshot() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.requests...)
+}
+
+func TestBlockStoreExplicitStorageKeyOperations(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
 	ctx := context.Background()
-	const key = "explicit/canonical/key"
+	key := blockStore.StorageKeyForHash(testHash64)
+
+	if got, err := blockStore.PutObjectAutoDirect(ctx, key, []byte("payload")); err != nil || got != key {
+		t.Fatalf("PutObjectAutoDirect() = %q, %v, want %q, nil", got, err, key)
+	}
 
 	data, err := blockStore.GetBlockByStorageKey(ctx, key)
 	if err != nil || string(data) != "payload" {
@@ -427,11 +447,13 @@ func TestBlockStoreExplicitStorageKeyReads(t *testing.T) {
 	if err != nil || !exists {
 		t.Fatalf("ObjectExists() = %t, %v, want true, nil", exists, err)
 	}
+	if err := blockStore.DeleteBlockByStorageKey(ctx, key); err != nil {
+		t.Fatalf("DeleteBlockByStorageKey() error = %v", err)
+	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	wantPath := "/test-bucket/explicit/canonical/key"
-	want := []string{"GET " + wantPath, "GET " + wantPath, "HEAD " + wantPath, "HEAD " + wantPath}
+	wantPath := "/test-bucket/" + key
+	want := []string{"PUT " + wantPath, "GET " + wantPath, "GET " + wantPath, "HEAD " + wantPath, "HEAD " + wantPath, "DELETE " + wantPath}
+	requests := backend.snapshot()
 	if len(requests) != len(want) {
 		t.Fatalf("requests = %v, want %v", requests, want)
 	}
@@ -439,6 +461,137 @@ func TestBlockStoreExplicitStorageKeyReads(t *testing.T) {
 		if requests[i] != want[i] {
 			t.Fatalf("requests = %v, want %v", requests, want)
 		}
+	}
+}
+
+func TestBlockStoreExplicitStorageKeyGuard(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
+	ctx := context.Background()
+	foreignKey := "blocks/" + testOrgB + "/e3/b0/" + testHash64
+	suffixCollision := "blocks/" + testOrgA + "-other/e3/b0/" + testHash64
+
+	operations := []struct {
+		name string
+		call func(string) error
+	}{
+		{"PutObjectAutoDirect", func(key string) error {
+			_, err := blockStore.PutObjectAutoDirect(ctx, key, []byte("payload"))
+			return err
+		}},
+		{"ObjectExists", func(key string) error { _, err := blockStore.ObjectExists(ctx, key); return err }},
+		{"GetBlockByStorageKey", func(key string) error { _, err := blockStore.GetBlockByStorageKey(ctx, key); return err }},
+		{"GetBlockReaderByStorageKey", func(key string) error { _, err := blockStore.GetBlockReaderByStorageKey(ctx, key); return err }},
+		{"GetBlockSizeByStorageKey", func(key string) error { _, err := blockStore.GetBlockSizeByStorageKey(ctx, key); return err }},
+		{"DeleteBlockByStorageKey", func(key string) error { return blockStore.DeleteBlockByStorageKey(ctx, key) }},
+		{"ValidatePhysicalLocator", func(key string) error { return blockStore.ValidatePhysicalLocator(testHash64, key) }},
+	}
+	rejected := []struct {
+		name string
+		key  string
+	}{
+		{"empty", ""},
+		{"whitespace", " \t\r\n"},
+		{"foreign org", foreignKey},
+		{"org suffix collision", suffixCollision},
+		{"bare tenant prefix", "blocks/" + testOrgA + "/"},
+	}
+
+	for _, key := range rejected {
+		for _, operation := range operations {
+			t.Run(key.name+"/"+operation.name, func(t *testing.T) {
+				if err := operation.call(key.key); err == nil {
+					t.Fatalf("%s(%q) error = nil, want tenant guard rejection", operation.name, key.key)
+				}
+			})
+		}
+	}
+	if requests := backend.snapshot(); len(requests) != 0 {
+		t.Fatalf("rejected keys reached backend: %v", requests)
+	}
+}
+
+func TestBlockStoreExplicitStorageKeyGuardCustomPrefix(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "custom/objects")
+	customKey := blockStore.StorageKeyForHash(testHash64)
+	rawKeyWithTrailingSpace := customKey + " "
+	defaultKey := "blocks/" + testOrgA + "/e3/b0/" + testHash64
+
+	if _, err := blockStore.ObjectExists(context.Background(), customKey); err != nil {
+		t.Fatalf("ObjectExists(custom key) error = %v", err)
+	}
+	if _, err := blockStore.ObjectExists(context.Background(), rawKeyWithTrailingSpace); err != nil {
+		t.Fatalf("ObjectExists(raw key with trailing space) error = %v", err)
+	}
+	if _, err := blockStore.ObjectExists(context.Background(), defaultKey); err == nil {
+		t.Fatal("ObjectExists(default-prefix key) error = nil, want rejection")
+	}
+	want := []string{"HEAD /test-bucket/" + customKey, "HEAD /test-bucket/" + rawKeyWithTrailingSpace}
+	if got := backend.snapshot(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("requests = %v, want %v", got, want)
+	}
+}
+
+func TestBlockStoreValidatePhysicalLocator(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
+	ctx := context.Background()
+	exactKey := blockStore.StorageKeyForHash(testHash64)
+	otherHash := "a3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	otherKey := blockStore.StorageKeyForHash(otherHash)
+	futureKey := exactKey + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+
+	if err := blockStore.ValidatePhysicalLocator(testHash64, exactKey); err != nil {
+		t.Fatalf("ValidatePhysicalLocator(exact) error = %v", err)
+	}
+	for _, key := range []string{otherKey, futureKey} {
+		if _, err := blockStore.ObjectExists(ctx, key); err != nil {
+			t.Fatalf("ObjectExists(%q) structural validation error = %v", key, err)
+		}
+		if err := blockStore.ValidatePhysicalLocator(testHash64, key); err == nil {
+			t.Fatalf("ValidatePhysicalLocator(%q) error = nil, want physical mismatch", key)
+		}
+	}
+	if got := backend.snapshot(); len(got) != 2 {
+		t.Fatalf("structurally valid requests = %v, want 2", got)
+	}
+}
+
+// A short block id makes hashToKey skip the sharded layout and return the bare
+// tenant prefix plus the id, so the deterministic equality is satisfied by a key
+// that addresses nothing in particular. Both cases below passed before the block
+// id was validated first, which is the whole reason the ordering is fixed.
+func TestBlockStoreValidatePhysicalLocatorRejectsMalformedBlockID(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
+	tenantPrefix := "blocks/" + testOrgA + "/"
+
+	malformed := []struct {
+		name    string
+		blockID string
+		key     string
+	}{
+		{"empty id derives the bare prefix", "", tenantPrefix},
+		{"two-char id skips sharding", "ab", tenantPrefix + "ab"},
+		{"three-char id skips sharding", "abc", tenantPrefix + "abc"},
+		{"sha-1 external id", strings.Repeat("a", 40), blockStore.StorageKeyForHash(strings.Repeat("a", 40))},
+		{"64 chars but not hex", strings.Repeat("z", 64), blockStore.StorageKeyForHash(strings.Repeat("z", 64))},
+	}
+	for _, c := range malformed {
+		t.Run(c.name, func(t *testing.T) {
+			if err := blockStore.ValidatePhysicalLocator(c.blockID, c.key); err == nil {
+				t.Fatalf("ValidatePhysicalLocator(%q, %q) error = nil, want malformed block id rejection", c.blockID, c.key)
+			}
+		})
+	}
+
+	// Uppercase hex is a well-formed content address, and its derived key matches
+	// itself, so the validator must not reject it: db.IsSHA256BlockID accepts
+	// either case and the two predicates have to agree.
+	upper := strings.ToUpper(testHash64)
+	if err := blockStore.ValidatePhysicalLocator(upper, blockStore.StorageKeyForHash(upper)); err != nil {
+		t.Fatalf("ValidatePhysicalLocator(uppercase hex) error = %v, want nil", err)
+	}
+
+	if got := backend.snapshot(); len(got) != 0 {
+		t.Fatalf("validation must not touch the backend, got %v", got)
 	}
 }
 
@@ -464,23 +617,5 @@ func TestHashSharding(t *testing.T) {
 	// hash3 should have different first level (ef)
 	if strings.HasPrefix(key3, wantSharedPrefix) {
 		t.Errorf("Hashes starting with 'abcd' and 'efgh' should have different first level")
-	}
-}
-
-// The canonical direct PUT and the only physical DELETE both take an explicit
-// locator, so an empty key must be refused here rather than forwarded to S3. The
-// hash-derived PutBlock/PutBlockData/PutBlockAuto/PutBlocks still exist for
-// no-metadata paths and test seeding; they derive a key and cannot be empty. A nil S3Store makes the
-// test itself the proof: reaching the backend would panic instead of returning.
-func TestObjectAPIsRejectEmptyStorageKey(t *testing.T) {
-	bs := mustNewTestOrgBlockStore(t, "blocks/")
-
-	for _, storageKey := range []string{"", "   "} {
-		if _, err := bs.PutObjectAutoDirect(context.Background(), storageKey, []byte("data")); err == nil {
-			t.Fatalf("PutObjectAutoDirect(%q) error = nil, want empty storage key error", storageKey)
-		}
-		if err := bs.DeleteBlockByStorageKey(context.Background(), storageKey); err == nil {
-			t.Fatalf("DeleteBlockByStorageKey(%q) error = nil, want empty storage key error", storageKey)
-		}
 	}
 }

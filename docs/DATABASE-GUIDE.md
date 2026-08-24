@@ -1358,8 +1358,8 @@ view:
   exports both `Batch.Entries` and `BatchEntry.Stmt` — fails closed.
   `TestR12AllowedBatchCASStatementsStayOutOfScope` additionally pins each
   allowlisted batch against its real source: statement count, inline literals,
-  the relations it may touch, no `Bind` and no `BatchEntry`. A new batch
-  allowance without a pinned shape fails the gate.
+  the relations it may touch, no `Bind`, no `BatchEntry` and no direct `Entries`
+  access. A new batch allowance without a pinned shape fails the gate.
 
 `serial_consistency` remains the level for every **other** LWT, including the
 conditional library-HEAD publish, which has no explicit contract and is
