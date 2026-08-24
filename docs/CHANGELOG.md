@@ -30,10 +30,11 @@ stays green — and the original design let a statement disappear in five ways:
   R12 statement reaching `Exec` is discovered and reported as having no CAS
   terminal. `ScanCASContext`/`MapScanCASContext` are recognised as equal-standing
   LWT execution.
-- **CQL the gate could not read.** A `const` or single-binding variable is now
-  *resolved* — including literal `+=` concatenation, which this codebase uses to
-  build CQL — so moving a statement into one neither hides it nor costs an
-  allowance. Resolution is deliberately poisoned by anything it cannot follow (a
+- **CQL the gate could not read.** A `const`, or a single-binding *local* built
+  entirely from literals, is now *resolved* — including literal `+=`
+  concatenation, which this codebase uses to build CQL — so moving a statement
+  into one neither hides it nor costs an allowance. A package-level `var` is
+  deliberately not resolved; see the next entry. Resolution is deliberately poisoned by anything it cannot follow (a
   non-literal fragment, a plain reassignment, an address taken) rather than
   resolving to a prefix, since reading `"SELECT ... FROM gc_pending_items"` and
   ignoring the appended clauses would be a false green manufactured by the
@@ -56,6 +57,17 @@ stays green — and the original design let a statement disappear in five ways:
   package-level `stmt` that is itself an R12 LWT. Over-refusal costs an allowlist
   entry and fails loudly; under-refusal is the false green the gate exists to
   prevent.
+
+  The same rule decides what a package-level name is worth. A `const` is
+  immutable, so its literal is what every call site sees. A `var` is not: any
+  function in any file of the package can reassign it, `&stmt` can be handed to
+  a helper, and the gate reads one file at a time. `var stmt = "SELECT id FROM
+  libraries"` is therefore no evidence about the statement a `Query(stmt)` call
+  executes — a reassignment elsewhere could have made it
+  `UPDATE blocks ... IF ...`. Package vars now contribute a *name*, which shadows
+  and blocks resolution, and never a value. Proving a package var is never
+  reassigned across files, inits, closures and build variants is not this gate's
+  job; refusing to resolve it costs an inline literal or an allowlist entry.
 - **Table spellings the matcher did not recognise.** `UPDATE "blocks"`,
   `UPDATE sesamefs.blocks`, `UPDATE "sesamefs"."blocks"` and
   `DELETE storage_key FROM blocks` were all read as out of scope. The matcher is
@@ -65,9 +77,20 @@ stays green — and the original design let a statement disappear in five ways:
   forms, and the deprecated-but-functional `Session.ExecuteBatchCAS` /
   `Session.MapExecuteBatchCAS`. A batch carries neither its CQL nor its serial pin
   at its CAS call site, so each one must be allowlisted; `relocateLockRowCASFn`
-  (`locked_files` relocation) is the one in use. The allowance is sound because
-  the general Query rule still reads every `Batch.Query` statement — an R12 target
-  inside a batch is discovered with no CAS terminal and fails the gate anyway.
+  (`locked_files` relocation) is the one in use. The allowance rests on the
+  general Query rule reading the batch's statements — an R12 target inside a
+  batch is discovered with no CAS terminal and fails the gate anyway — and that
+  in turn rests on *how* a statement enters the batch, which is why two more
+  entry points are now read. `Batch.Bind(stmt, binding)` appends its own
+  `BatchEntry` and is classified exactly like `Batch.Query`; a hand-built
+  `BatchEntry` (the driver's `Batch.Entries` slice and `BatchEntry.Stmt` are both
+  exported) is not classifiable at all and fails closed. Without those,
+  `batch.Bind("UPDATE blocks ... IF ...", binder)` inside the allowlisted helper
+  reached Cassandra with the gate green. Each allowlisted batch now also has its
+  shape pinned against the real source by
+  `TestR12AllowedBatchCASStatementsStayOutOfScope`: statement count, inline
+  literals, the relations it may touch, no `Bind`, no `BatchEntry` — and a new
+  batch allowance without a pinned shape fails the gate.
 
   This corrects a claim in the previous revision of this entry, which said
   SesameFS used no conditional batch. It does: the survey behind that sentence
@@ -84,7 +107,16 @@ dynamically built local, a `range` variable and a closure parameter — each
 shadowing a name the gate could otherwise resolve — plus an inner-block local
 shadowing a package-level R12 LWT. Each is mutation-verified against the two
 resolver defects it covers: dropping the signature bindings, or restoring the
-flat package/local overlay, fails exactly those cases and nothing else. Also fixed a discovery false positive where a
+flat package/local overlay, fails exactly those cases and nothing else. The
+package-var and batch-entry passes add six more — a package var reassigned in
+another function, a package var with no visible reassignment, a `const`
+counterweight that must still resolve, `Batch.Bind` with a literal and with a
+non-literal statement, and a hand-built `BatchEntry` — plus two mutations of the
+real `relocateLockRowCASFn`: moving one `locked_files` statement to `Batch.Bind`
+fails the shape proof, and smuggling `UPDATE blocks ... IF ...` in through
+`Batch.Bind` fails the main gate with an unexpected R12 target and the shape
+proof twice over. A one-argument `Bind` (gin's `c.Bind(&payload)`) is
+deliberately not a CQL call site. Also fixed a discovery false positive where a
 string value containing `IF` was read as a conditional clause, and another where
 `net/url`'s zero-argument `URL.Query()` was treated as a CQL call site.
 

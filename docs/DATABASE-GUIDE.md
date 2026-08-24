@@ -1315,9 +1315,11 @@ So every `Query(...)` call site in production code is classified, whatever
 consumes the result, and is fail-closed on each way a statement could leave that
 view:
 
-- **CQL the gate cannot read.** A `const` or a single-binding variable is
+- **CQL the gate cannot read.** A `const` or a single-binding *local* is
   *resolved*, including literal `+=` concatenation, so moving a statement into one
-  neither hides it nor costs an allowance. A name touched in any way the resolver
+  neither hides it nor costs an allowance. A package-level `var` is not resolved
+  at all: it is reassignable from any function in any file of the package, so its
+  declaration says nothing about what a call site executes. A name touched in any way the resolver
   cannot follow — a non-literal fragment, a plain reassignment, an address taken —
   is poisoned rather than resolved to a prefix, and the call site fails the gate
   unless allowlisted. Seven symbols are allowlisted today; each is checked by
@@ -1333,7 +1335,9 @@ view:
   scopes is resolved in neither. Fail-closed in both directions: a parameter named
   like a package `const` cannot be read as that const, and an inner-block
   `stmt := "SELECT ..."` cannot hide a package-level `stmt` that is an R12 LWT.
-  `TestR12ScanNodeFailsClosedOnShadowedBindings` covers both.
+  `TestR12ScanNodeFailsClosedOnShadowedBindings` covers both, and
+  `TestR12ScanNodeFailsClosedOnPackageVarCQL` covers the mutable package-level
+  `var`, which is the same failure with the package scope as the wrong answer.
 - **Table spellings a name-literal regex misses** — `"blocks"`,
   `sesamefs.blocks`, `"sesamefs"."blocks"`, and `DELETE <columns> FROM <table>`.
   Quoted identifiers keep CQL case sensitivity, so `"BLOCKS"` is correctly a
@@ -1347,8 +1351,15 @@ view:
   batch carries neither its CQL nor its serial pin there, so each conditional
   batch must be allowlisted. `relocateLockRowCASFn` (`locked_files` relocation) is
   the one in use. That allowance is sound because the general Query rule still
-  reads every `Batch.Query` statement: an R12 target inside a batch is discovered
-  with no CAS terminal attributed to it and fails the gate regardless.
+  reads the batch's statements: an R12 target inside a batch is discovered with
+  no CAS terminal attributed to it and fails the gate regardless. That holds only
+  if every way of adding a statement is read, so `Batch.Bind(stmt, binding)` is
+  classified like `Batch.Query`, and a hand-built `BatchEntry` — the driver
+  exports both `Batch.Entries` and `BatchEntry.Stmt` — fails closed.
+  `TestR12AllowedBatchCASStatementsStayOutOfScope` additionally pins each
+  allowlisted batch against its real source: statement count, inline literals,
+  the relations it may touch, no `Bind` and no `BatchEntry`. A new batch
+  allowance without a pinned shape fails the gate.
 
 `serial_consistency` remains the level for every **other** LWT, including the
 conditional library-HEAD publish, which has no explicit contract and is

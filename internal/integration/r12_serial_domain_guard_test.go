@@ -104,6 +104,22 @@ var r12AllowedBatchCAS = map[string]r12UnresolvedAllowance{
 	"relocateLockRowCASFn": {count: 1, reason: "locked_files row relocation; both batch.Query statements are inline literals on locked_files, so the general Query rule classifies them and would discover an R12 target with no CAS terminal"},
 }
 
+// r12AllowedBatchCASShape pins what each allowlisted conditional batch is
+// allowed to contain. The allowance in r12AllowedBatchCAS rests on the claim
+// that the general Query rule reads the batch's statements, and that claim is
+// only as good as the way the statements were added: gocql exposes
+// Batch.Bind(stmt, binding) as a second entry point, and Batch.Entries is a
+// public []BatchEntry with a public Stmt field. A batch could therefore carry a
+// statement the scanner never classifies while its CAS terminal stays
+// allowlisted. TestR12AllowedBatchCASStatementsStayOutOfScope reads the real
+// source and proves the shape instead of assuming it.
+var r12AllowedBatchCASShape = map[string]struct {
+	statements int
+	tables     map[string]bool
+}{
+	"relocateLockRowCASFn": {statements: 2, tables: map[string]bool{"locked_files": true}},
+}
+
 type r12SerialPin struct {
 	present bool
 	serial  bool
@@ -173,86 +189,23 @@ var r12AllowedHardDeleteLockTables = map[string]bool{
 // method and the exact serial argument, so a string-only search cannot be made
 // green by a comment or an unrelated query in the same function.
 //
-// Four escape routes are closed explicitly, because each one removes a
-// statement from discovery instead of reporting it unpinned: CQL that is not a
-// source literal, a table reference spelled with quotes or a keyspace
-// qualifier, a CAS executed through the Context or batch terminals, and an
-// identifier the guard would resolve to a binding Go's scoping rules do not put
-// at that call site.
+// Five escape routes are closed explicitly, because each one removes a
+// statement from discovery instead of reporting it unpinned: an execution path
+// the scanner does not recognise (the Context CAS variants, batch CAS, or a
+// conditional statement consumed by Exec); CQL that is not a source literal; an
+// identifier resolved to a binding that is not the one reaching the call site
+// -- a shadowed name, or a package var that another function can reassign; a
+// table reference spelled with quotes or a keyspace qualifier; and a batch
+// statement added through Batch.Bind or a hand-built BatchEntry rather than
+// Batch.Query.
 func TestR12SerialDomainGuard(t *testing.T) {
-	root := filepath.Join("..", "..")
-	skipDirs := map[string]bool{
-		".git":            true,
-		"frontend":        true,
-		"mobile-frontend": true,
-		"node_modules":    true,
-		"vendor":          true,
-	}
-
 	discovered := map[string][]r12DiscoveredOperation{}
 	unresolved := map[string][]token.Position{}
 	batchCAS := map[string][]token.Position{}
-	scanned := 0
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if info.IsDir() {
-			if skipDirs[info.Name()] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		scanned++
-
-		source, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		fset := token.NewFileSet()
-		file, parseErr := parser.ParseFile(fset, path, source, 0)
-		if parseErr != nil {
-			t.Errorf("%s: parse: %v", path, parseErr)
-			return nil
-		}
-
-		packageBindings := r12PackageStringBindings(file)
-		for _, declaration := range file.Decls {
-			switch typed := declaration.(type) {
-			case *ast.FuncDecl:
-				// A function's own bindings -- parameters and receiver
-				// included -- shadow the package scope, and a name bound in
-				// both scopes is resolved in neither.
-				bindings := r12FunctionBindings(packageBindings, typed)
-				r12ScanNode(fset, typed.Body, r12FunctionName(typed), bindings, discovered, unresolved, batchCAS)
-			case *ast.GenDecl:
-				for _, specification := range typed.Specs {
-					valueSpec, ok := specification.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for index, value := range valueSpec.Values {
-						symbol := "<package>"
-						if index < len(valueSpec.Names) {
-							symbol = valueSpec.Names[index].Name
-						}
-						r12ScanNode(fset, value, symbol, r12ValueBindings(packageBindings, value), discovered, unresolved, batchCAS)
-					}
-				}
-			}
-		}
-		return nil
+	r12WalkProductionFiles(t, func(fset *token.FileSet, _ string, file *ast.File) {
+		r12ScanFile(fset, file, discovered, unresolved, batchCAS)
 	})
-	if err != nil {
-		t.Fatalf("scan production Go sources: %v", err)
-	}
-	if scanned == 0 {
-		t.Fatal("scanned no production Go sources; R12 guard would pass vacuously")
-	}
 
 	for key, label := range r12ExpectedSerialOperations {
 		operations := discovered[key]
@@ -351,6 +304,127 @@ func TestR12SerialDomainGuard(t *testing.T) {
 			t.Errorf("allowlisted conditional batch CAS %s (%s) no longer exists; drop the stale allowlist entry", symbol, allowance.reason)
 		}
 	}
+}
+
+// r12WalkProductionFiles parses every non-test Go file outside the excluded
+// trees and hands it to visit. The gate and the tests that prove an allowlist
+// entry share it, so all of them reason about exactly the same file set.
+func r12WalkProductionFiles(t *testing.T, visit func(fset *token.FileSet, path string, file *ast.File)) {
+	t.Helper()
+	root := filepath.Join("..", "..")
+	skipDirs := map[string]bool{
+		".git":            true,
+		"frontend":        true,
+		"mobile-frontend": true,
+		"node_modules":    true,
+		"vendor":          true,
+	}
+
+	scanned := 0
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			if skipDirs[info.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		scanned++
+
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			t.Errorf("%s: parse: %v", path, parseErr)
+			return nil
+		}
+		visit(fset, path, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan production Go sources: %v", err)
+	}
+	if scanned == 0 {
+		t.Fatal("scanned no production Go sources; R12 guard would pass vacuously")
+	}
+}
+
+// r12ScanFile classifies one parsed file, scoping each declaration the way Go
+// scopes it: a declared function is read with its own bindings, and a
+// package-level value -- the shape the protected statements are written in --
+// with the bindings of the function literal it holds.
+func r12ScanFile(fset *token.FileSet, file *ast.File, discovered map[string][]r12DiscoveredOperation, unresolved map[string][]token.Position, batchCAS map[string][]token.Position) {
+	packageBindings := r12PackageStringBindings(file)
+	for _, declaration := range file.Decls {
+		switch typed := declaration.(type) {
+		case *ast.FuncDecl:
+			// A function's own bindings -- parameters and receiver included --
+			// shadow the package scope, and a name bound in both scopes is
+			// resolved in neither.
+			r12ScanNode(fset, typed.Body, r12FunctionName(typed), r12FunctionBindings(packageBindings, typed), discovered, unresolved, batchCAS)
+		case *ast.GenDecl:
+			for _, specification := range typed.Specs {
+				valueSpec, ok := specification.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for index, value := range valueSpec.Values {
+					symbol := "<package>"
+					if index < len(valueSpec.Names) {
+						symbol = valueSpec.Names[index].Name
+					}
+					r12ScanNode(fset, value, symbol, r12ValueBindings(packageBindings, value), discovered, unresolved, batchCAS)
+				}
+			}
+		}
+	}
+}
+
+// r12DeclaredSymbols maps a top-level declaration to the symbols it defines and
+// the node each symbol's body or value lives in, under the same names the gate
+// reports.
+func r12DeclaredSymbols(declaration ast.Decl) map[string]ast.Node {
+	symbols := map[string]ast.Node{}
+	switch typed := declaration.(type) {
+	case *ast.FuncDecl:
+		if typed.Body != nil {
+			symbols[r12FunctionName(typed)] = typed.Body
+		}
+	case *ast.GenDecl:
+		for _, specification := range typed.Specs {
+			valueSpec, ok := specification.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, value := range valueSpec.Values {
+				if index < len(valueSpec.Names) {
+					symbols[valueSpec.Names[index].Name] = value
+				}
+			}
+		}
+	}
+	return symbols
+}
+
+// r12ScanSyntheticSource classifies a synthetic file exactly as the gate
+// classifies a production one, so a regression cannot pass through a scan path
+// the gate does not use.
+func r12ScanSyntheticSource(t *testing.T, source string) (map[string][]r12DiscoveredOperation, map[string][]token.Position, map[string][]token.Position) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "synthetic.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+	discovered := map[string][]r12DiscoveredOperation{}
+	unresolved := map[string][]token.Position{}
+	batchCAS := map[string][]token.Position{}
+	r12ScanFile(fset, file, discovered, unresolved, batchCAS)
+	return discovered, unresolved, batchCAS
 }
 
 func r12FormatPositions(positions []token.Position) string {
@@ -536,6 +610,19 @@ func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, bindings r12
 		return
 	}
 	ast.Inspect(node, func(current ast.Node) bool {
+		// A batch statement can also be added by building the driver's exported
+		// BatchEntry directly: Batch.Entries is a public []BatchEntry whose Stmt
+		// field is public too, so `b.Entries = append(b.Entries,
+		// gocql.BatchEntry{Stmt: cql})` reaches Cassandra without passing
+		// through Batch.Query or Batch.Bind. Discovery does not model that
+		// shape, so any reference to the type is fail-closed rather than read.
+		// Checking the identifier covers both `BatchEntry{...}` and
+		// `gocql.BatchEntry{...}`, and reaches each occurrence once.
+		if identifier, ok := current.(*ast.Ident); ok && identifier.Name == "BatchEntry" {
+			unresolved[symbol] = append(unresolved[symbol], fset.Position(identifier.Pos()))
+			return true
+		}
+
 		call, ok := current.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -561,13 +648,7 @@ func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, bindings r12
 		// NoSkipMetadata documentation speaks of "CAS operations which do not end
 		// in Cas" -- so keying discovery off CAS terminals would let an unpinned
 		// conditional mutation ending in Exec through untouched.
-		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "Query" {
-			if len(call.Args) == 0 {
-				// net/url's URL.Query() takes no arguments; gocql's always takes
-				// the statement. Without this the guard would demand an allowlist
-				// entry for ordinary URL handling.
-				return true
-			}
+		if selector, ok := call.Fun.(*ast.SelectorExpr); ok && r12IsCQLEntryPoint(selector.Sel.Name, len(call.Args)) {
 			query, resolvedCQL := r12QueryLiteral(call, bindings)
 			if !resolvedCQL {
 				// Fail closed: the CQL cannot be read, so discovery cannot rule
@@ -591,6 +672,29 @@ func r12ScanNode(fset *token.FileSet, node ast.Node, symbol string, bindings r12
 		}
 		return true
 	})
+}
+
+// r12IsCQLEntryPoint reports whether a call hands CQL text to the driver as its
+// first argument. Two methods do, and both have to be read: Session/Batch.Query
+// and Batch.Bind. Bind is not a variant spelling -- it appends its own
+// BatchEntry with the statement it was given, so a conditional statement added
+// with Bind inside an allowlisted batch would otherwise never be classified,
+// which is precisely the hole the batch allowance is supposed to be free of.
+//
+// The argument counts are the discriminator, because the guard has no type
+// information. net/url's URL.Query() takes none, while gocql's Query always
+// takes the statement. gin's c.Bind(&payload) takes exactly one, while gocql's
+// Batch.Bind takes the statement plus a binding callback. A two-argument Bind
+// that turns out to be something else fails closed and costs an allowlist
+// entry, which is the direction this gate errs in everywhere else.
+func r12IsCQLEntryPoint(method string, arguments int) bool {
+	switch method {
+	case "Query":
+		return arguments > 0
+	case "Bind":
+		return arguments >= 2
+	}
+	return false
 }
 
 // r12FindTerminalAndPin walks the scanned scope for the expression that consumes
@@ -890,16 +994,53 @@ func r12CollectScopeBindings(descendIntoFuncLits bool, nodes ...ast.Node) r12Str
 	return bindings
 }
 
-// r12PackageStringBindings gathers only the file's top-level const/var string
-// bindings, so one function's locals never resolve another function's names.
+// r12PackageStringBindings gathers the file's top-level string bindings, so one
+// function's locals never resolve another function's names -- and it separates
+// the two kinds of package-level name, because only one of them is a value.
+//
+// A package `const` is immutable: the literal in its declaration is what every
+// call site sees. A package `var` is not. Any function in the package can
+// reassign it, `&stmt` can be handed to a helper, and package vars are shared
+// across files while this gate reads one file at a time. A var declared as
+// `"SELECT id FROM libraries"` may therefore be carrying
+// `UPDATE blocks ... IF ...` by the time a Query call runs, and resolving it
+// from its declaration would be a false green manufactured by the guard itself.
+//
+// So a package var contributes its name -- which still shadows, and still
+// blocks a call site from resolving -- but never a value. Proving that a
+// package var is never reassigned anywhere in the package, in any file, init
+// function, closure or build variant, is not a thing this gate should attempt;
+// refusing to resolve it costs an inline literal or an allowlist entry.
 func r12PackageStringBindings(file *ast.File) r12StringBindings {
-	nodes := make([]ast.Node, 0, len(file.Decls))
+	bindings := r12NewStringBindings()
+	poisoned := map[string]bool{}
 	for _, declaration := range file.Decls {
-		if general, ok := declaration.(*ast.GenDecl); ok {
-			nodes = append(nodes, general)
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || (general.Tok != token.CONST && general.Tok != token.VAR) {
+			continue
+		}
+		collected := r12CollectScopeBindings(false, general)
+		for name := range collected.names {
+			if bindings.names[name] {
+				// Bound by more than one package-level declaration; resolve
+				// none of them.
+				poisoned[name] = true
+				delete(bindings.values, name)
+				continue
+			}
+			bindings.names[name] = true
+		}
+		if general.Tok != token.CONST {
+			continue
+		}
+		for name, value := range collected.values {
+			if poisoned[name] {
+				continue
+			}
+			bindings.values[name] = value
 		}
 	}
-	return r12CollectScopeBindings(false, nodes...)
+	return bindings
 }
 
 // r12ScopedBindings resolves a function's view of the package scope. It is
@@ -986,24 +1127,42 @@ func r12QueryLiteral(call *ast.CallExpr, bindings r12StringBindings) (string, bo
 	return "", false
 }
 
-func r12TargetStatement(query string) (table, statement string, ok bool) {
+type r12CQLStatement struct {
+	table string
+	verb  string
+}
+
+// r12CQLStatements lists the mutating statements a query contains, in source
+// order, with the relation each one addresses.
+func r12CQLStatements(query string) []r12CQLStatement {
 	query = r12StripCQLStringLiterals(r12StripCQLComments(query))
-	if !r12ConditionalPattern.MatchString(query) {
+	statements := []r12CQLStatement{}
+	for _, matches := range r12StatementPattern.FindAllStringSubmatch(query, -1) {
+		table := r12NormalizeCQLIdentifier(matches[2])
+		if matches[3] != "" {
+			// The reference was keyspace-qualified; the table is the second
+			// component.
+			table = r12NormalizeCQLIdentifier(matches[3])
+		}
+		statements = append(statements, r12CQLStatement{
+			table: table,
+			verb:  strings.ToUpper(strings.Fields(matches[1])[0]),
+		})
+	}
+	return statements
+}
+
+func r12TargetStatement(query string) (table, statement string, ok bool) {
+	if !r12ConditionalPattern.MatchString(r12StripCQLStringLiterals(r12StripCQLComments(query))) {
 		return "", "", false
 	}
 	// Every mutating statement in the query is examined, not just the first, so
 	// a target table cannot be hidden behind a leading out-of-scope one.
-	for _, matches := range r12StatementPattern.FindAllStringSubmatch(query, -1) {
-		name := r12NormalizeCQLIdentifier(matches[2])
-		if matches[3] != "" {
-			// The reference was keyspace-qualified; the table is the second
-			// component.
-			name = r12NormalizeCQLIdentifier(matches[3])
-		}
-		if !r12TargetTables[name] {
+	for _, candidate := range r12CQLStatements(query) {
+		if !r12TargetTables[candidate.table] {
 			continue
 		}
-		return name, strings.ToUpper(strings.Fields(matches[1])[0]), true
+		return candidate.table, candidate.verb, true
 	}
 	return "", "", false
 }
@@ -1261,6 +1420,93 @@ func TestR12HardDeleteLockTablesAreOutOfScope(t *testing.T) {
 // this rule a target LWT could leave the guard's view through an ordinary
 // refactor -- moving its CQL into a const, a variable or fmt.Sprintf -- and CI
 // would stay green with an unpinned statement on the blocks partition.
+// TestR12AllowedBatchCASStatementsStayOutOfScope reads the real source of every
+// allowlisted conditional batch and proves the property the allowance depends
+// on, rather than asserting it in a comment: each statement is added with an
+// inline literal through a CQL entry point the scanner reads, every relation
+// named is one the entry is allowed to touch, and the batch neither uses
+// Batch.Bind nor builds BatchEntry values by hand. Scanner coverage of Bind and
+// BatchEntry is the general defense; this is the specific one, so a change to
+// the allowlisted helper has to pass both.
+func TestR12AllowedBatchCASStatementsStayOutOfScope(t *testing.T) {
+	found := map[string]bool{}
+
+	r12WalkProductionFiles(t, func(fset *token.FileSet, path string, file *ast.File) {
+		for _, declaration := range file.Decls {
+			for symbol, node := range r12DeclaredSymbols(declaration) {
+				shape, tracked := r12AllowedBatchCASShape[symbol]
+				if !tracked {
+					continue
+				}
+				found[symbol] = true
+
+				statements := 0
+				ast.Inspect(node, func(current ast.Node) bool {
+					if identifier, ok := current.(*ast.Ident); ok && identifier.Name == "BatchEntry" {
+						t.Errorf("%s: allowlisted batch %s builds a BatchEntry at %s; its statements are no longer readable from the call site", path, symbol, fset.Position(identifier.Pos()))
+						return true
+					}
+					call, ok := current.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					selector, ok := call.Fun.(*ast.SelectorExpr)
+					if !ok || !r12IsCQLEntryPoint(selector.Sel.Name, len(call.Args)) {
+						return true
+					}
+					statements++
+					if selector.Sel.Name != "Query" {
+						t.Errorf("%s: allowlisted batch %s adds a statement with %s at %s; the allowance is justified by the Batch.Query rule alone", path, symbol, selector.Sel.Name, fset.Position(call.Pos()))
+						return true
+					}
+					literal, ok := call.Args[0].(*ast.BasicLit)
+					if !ok || literal.Kind != token.STRING {
+						t.Errorf("%s: allowlisted batch %s has a non-literal statement at %s; the allowance cannot prove it stays out of the R12 target set", path, symbol, fset.Position(call.Pos()))
+						return true
+					}
+					value, unquoteErr := strconv.Unquote(literal.Value)
+					if unquoteErr != nil {
+						t.Errorf("%s: allowlisted batch %s has an unparsable statement literal at %s", path, symbol, fset.Position(call.Pos()))
+						return true
+					}
+					relations := r12CQLStatements(value)
+					if len(relations) == 0 {
+						t.Errorf("%s: allowlisted batch %s has a statement at %s that names no relation the matcher recognises", path, symbol, fset.Position(call.Pos()))
+						return true
+					}
+					for _, relation := range relations {
+						if !shape.tables[relation.table] {
+							t.Errorf("%s: allowlisted batch %s touches %s at %s, which its allowance does not cover", path, symbol, relation.table, fset.Position(call.Pos()))
+						}
+						if r12TargetTables[relation.table] {
+							t.Errorf("%s: allowlisted batch %s touches R12 target table %s at %s", path, symbol, relation.table, fset.Position(call.Pos()))
+						}
+					}
+					return true
+				})
+
+				if statements != shape.statements {
+					t.Errorf("%s: allowlisted batch %s adds %d statements, want %d; re-check what the batch does before widening the shape", path, symbol, statements, shape.statements)
+				}
+			}
+		}
+	})
+
+	for symbol := range r12AllowedBatchCASShape {
+		if !found[symbol] {
+			t.Errorf("pinned batch shape %s no longer exists in production sources; drop the stale entry", symbol)
+		}
+	}
+
+	// A new batch allowance cannot be added without the proof that makes it
+	// sound.
+	for symbol, allowance := range r12AllowedBatchCAS {
+		if _, pinned := r12AllowedBatchCASShape[symbol]; !pinned {
+			t.Errorf("conditional batch %s is allowlisted (%s) but has no pinned statement shape; add one so the allowance proves what it claims", symbol, allowance.reason)
+		}
+	}
+}
+
 func TestR12ScanNodeFailsClosedOnNonLiteralCQL(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -1319,24 +1565,7 @@ func mutate(session S, table string) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
-
-			discovered := map[string][]r12DiscoveredOperation{}
-			unresolved := map[string][]token.Position{}
-			batchCAS := map[string][]token.Position{}
-			packageBindings := r12PackageStringBindings(file)
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				bindings := r12FunctionBindings(packageBindings, function)
-				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
-			}
+			discovered, unresolved, batchCAS := r12ScanSyntheticSource(t, test.source)
 
 			if got := len(discovered) > 0; got != test.wantDiscovered {
 				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
@@ -1503,41 +1732,7 @@ func mutate(session S, orgID string, stmt string) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
-
-			discovered := map[string][]r12DiscoveredOperation{}
-			unresolved := map[string][]token.Position{}
-			batchCAS := map[string][]token.Position{}
-			packageBindings := r12PackageStringBindings(file)
-			for _, declaration := range file.Decls {
-				switch typed := declaration.(type) {
-				case *ast.FuncDecl:
-					bindings := r12FunctionBindings(packageBindings, typed)
-					r12ScanNode(fset, typed.Body, r12FunctionName(typed), bindings, discovered, unresolved, batchCAS)
-				case *ast.GenDecl:
-					// The 17 protected statements live in package-level
-					// `var ...Fn = func(...) { ... }` values, so the scope rules
-					// have to hold on that path too, not only for declared
-					// functions.
-					for _, specification := range typed.Specs {
-						valueSpec, ok := specification.(*ast.ValueSpec)
-						if !ok {
-							continue
-						}
-						for index, value := range valueSpec.Values {
-							symbol := "<package>"
-							if index < len(valueSpec.Names) {
-								symbol = valueSpec.Names[index].Name
-							}
-							r12ScanNode(fset, value, symbol, r12ValueBindings(packageBindings, value), discovered, unresolved, batchCAS)
-						}
-					}
-				}
-			}
+			discovered, unresolved, batchCAS := r12ScanSyntheticSource(t, test.source)
 
 			if got := len(discovered) > 0; got != test.wantDiscovered {
 				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
@@ -1556,6 +1751,85 @@ func mutate(session S, orgID string, stmt string) {
 			}
 			if len(batchCAS) > 0 {
 				t.Errorf("recorded conditional batch CAS = %v, want none", batchCAS)
+			}
+		})
+	}
+}
+
+// TestR12ScanNodeFailsClosedOnPackageVarCQL is the regression for a binding that
+// looks resolvable and is not. A package `const` is immutable, so its literal is
+// what every call site sees; a package `var` can be reassigned by any function
+// in any file of the package, including one this gate is not looking at when it
+// classifies the call site. Reading a var's declaration would therefore let
+//
+//	var stmt = "SELECT id FROM libraries"
+//
+// stand in for whatever a reassignment put there -- an unpinned LWT on blocks,
+// for instance -- and the gate would report nothing at all.
+func TestR12ScanNodeFailsClosedOnPackageVarCQL(t *testing.T) {
+	tests := []struct {
+		name           string
+		source         string
+		wantDiscovered bool
+		wantUnresolved bool
+	}{
+		{
+			name: "package var reassigned elsewhere is unresolvable",
+			source: `package p
+
+var stmt = "SELECT id FROM libraries"
+
+func replace() {
+	stmt = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+}
+
+func mutate(session S) {
+	session.Query(stmt).Exec()
+}
+`,
+			wantUnresolved: true,
+		},
+		{
+			// No reassignment is visible here, and it still does not resolve:
+			// the reassignment may live in another file of the package, in an
+			// init function, or behind `someHelper(&stmt)`. Proving a package
+			// var never changes is not this gate's job.
+			name: "package var is unresolvable even with no visible reassignment",
+			source: `package p
+
+var stmt = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+
+func mutate(session S) {
+	session.Query(stmt).MapScanCAS(nil)
+}
+`,
+			wantUnresolved: true,
+		},
+		{
+			// The counterweight: a const is immutable, so it still resolves and
+			// is still held to the pin.
+			name: "package const still resolves",
+			source: `package p
+
+const stmt = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+
+func mutate(session S) {
+	session.Query(stmt).SerialConsistency(gocql.Serial).MapScanCAS(nil)
+}
+`,
+			wantDiscovered: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			discovered, unresolved, _ := r12ScanSyntheticSource(t, test.source)
+
+			if got := len(discovered) > 0; got != test.wantDiscovered {
+				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
+			}
+			if got := len(unresolved) > 0; got != test.wantUnresolved {
+				t.Errorf("recorded unresolvable CAS = %v, want %v (unresolved=%v)", got, test.wantUnresolved, unresolved)
 			}
 		})
 	}
@@ -1698,24 +1972,93 @@ func redirect(target *url.URL) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
+			discovered, unresolved, batchCAS := r12ScanSyntheticSource(t, test.source)
 
-			discovered := map[string][]r12DiscoveredOperation{}
-			unresolved := map[string][]token.Position{}
-			batchCAS := map[string][]token.Position{}
-			packageBindings := r12PackageStringBindings(file)
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				bindings := r12FunctionBindings(packageBindings, function)
-				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
+			if got := len(discovered) > 0; got != test.wantDiscovered {
+				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
 			}
+			if got := len(unresolved) > 0; got != test.wantUnresolved {
+				t.Errorf("recorded unresolvable CAS = %v, want %v (unresolved=%v)", got, test.wantUnresolved, unresolved)
+			}
+			if got := len(batchCAS) > 0; got != test.wantBatchCAS {
+				t.Errorf("recorded conditional batch CAS = %v, want %v (batchCAS=%v)", got, test.wantBatchCAS, batchCAS)
+			}
+		})
+	}
+}
+
+// TestR12ScanNodeSeesBatchStatementsAddedWithoutQuery covers the way into a
+// batch that is not Batch.Query. The conditional-batch allowance is explicitly
+// justified by "the general Query rule still reads every Batch.Query statement",
+// so an entry point that is not Batch.Query is exactly the shape that makes the
+// allowance unsound: the CAS terminal stays allowlisted while the statement is
+// never classified. gocql v2 has two such entry points -- Batch.Bind(stmt,
+// binding), which appends its own BatchEntry, and the exported Batch.Entries
+// slice of exported BatchEntry values.
+func TestR12ScanNodeSeesBatchStatementsAddedWithoutQuery(t *testing.T) {
+	tests := []struct {
+		name           string
+		source         string
+		wantDiscovered bool
+		wantUnresolved bool
+		wantBatchCAS   bool
+	}{
+		{
+			name: "Batch.Bind with an inline literal is discovered",
+			source: `package p
+
+func mutate(session S, binder B) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Bind("UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?", binder)
+	session.MapExecuteBatchCAS(batch, nil)
+}
+`,
+			wantDiscovered: true,
+			wantBatchCAS:   true,
+		},
+		{
+			name: "Batch.Bind with non-literal CQL fails closed",
+			source: `package p
+
+func mutate(session S, stmt string, binder B) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Bind(stmt, binder)
+	session.MapExecuteBatchCAS(batch, nil)
+}
+`,
+			wantUnresolved: true,
+			wantBatchCAS:   true,
+		},
+		{
+			// The discriminator has to leave ordinary one-argument Bind alone --
+			// gin's c.Bind(&payload) is not a CQL call site, and a gate that
+			// demanded an allowlist entry for it would be abandoned.
+			name: "single-argument Bind is not a CQL call site",
+			source: `package p
+
+func handler(c C, payload *P) {
+	_ = c.Bind(payload)
+}
+`,
+		},
+		{
+			name: "hand-built BatchEntry fails closed",
+			source: `package p
+
+func mutate(session S, cql string) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Entries = append(batch.Entries, gocql.BatchEntry{Stmt: cql})
+	session.MapExecuteBatchCAS(batch, nil)
+}
+`,
+			wantUnresolved: true,
+			wantBatchCAS:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			discovered, unresolved, batchCAS := r12ScanSyntheticSource(t, test.source)
 
 			if got := len(discovered) > 0; got != test.wantDiscovered {
 				t.Errorf("discovered target statement = %v, want %v (discovered=%v)", got, test.wantDiscovered, discovered)
@@ -1843,24 +2186,7 @@ func mutate(session S, flag bool) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
-
-			discovered := map[string][]r12DiscoveredOperation{}
-			unresolved := map[string][]token.Position{}
-			batchCAS := map[string][]token.Position{}
-			packageBindings := r12PackageStringBindings(file)
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				bindings := r12FunctionBindings(packageBindings, function)
-				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
-			}
+			discovered, unresolved, _ := r12ScanSyntheticSource(t, test.source)
 
 			if got := len(discovered) > 0; got != test.wantDiscovered {
 				t.Fatalf("discovered target statement = %v, want %v (discovered=%v, unresolved=%v)", got, test.wantDiscovered, discovered, unresolved)
@@ -2035,24 +2361,7 @@ func mutate(session S) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
-
-			discovered := map[string][]r12DiscoveredOperation{}
-			unresolved := map[string][]token.Position{}
-			batchCAS := map[string][]token.Position{}
-			packageBindings := r12PackageStringBindings(file)
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				bindings := r12FunctionBindings(packageBindings, function)
-				r12ScanNode(fset, function.Body, r12FunctionName(function), bindings, discovered, unresolved, batchCAS)
-			}
+			discovered, unresolved, _ := r12ScanSyntheticSource(t, test.source)
 
 			operations := discovered["mutate|blocks|UPDATE"]
 			if len(operations) == 0 {
