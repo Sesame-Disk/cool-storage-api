@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -17,14 +18,37 @@ type p2AuthoritySite struct {
 	pos      token.Position
 }
 
+const p2TargetPackage = "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+
+type p2NamedType struct {
+	pkg  string
+	name string
+}
+
+type p2TypeAlias struct {
+	name       p2NamedType
+	references []p2NamedType
+}
+
 func p2FreshInstallWriteTarget(expression ast.Expr) (ast.Node, bool) {
 	for {
 		switch typed := expression.(type) {
 		case *ast.Ident:
 			return typed, typed.Name == "FreshInstall"
 		case *ast.SelectorExpr:
-			return typed, typed.Sel.Name == "FreshInstall"
+			if typed.Sel.Name == "FreshInstall" {
+				return typed, true
+			}
+			expression = typed.X
 		case *ast.ParenExpr:
+			expression = typed.X
+		case *ast.StarExpr:
+			expression = typed.X
+		case *ast.UnaryExpr:
+			expression = typed.X
+		case *ast.IndexExpr:
+			expression = typed.X
+		case *ast.IndexListExpr:
 			expression = typed.X
 		default:
 			return nil, false
@@ -99,7 +123,105 @@ func TestP2LiteralTrueRequiresPredeclaredConstant(t *testing.T) {
 	}
 }
 
-func p2CanonicalTargetType(expression ast.Expr, path string, file *ast.File) bool {
+func TestP2IndirectFreshAuthorityMutationsAreDetected(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      string
+		wantWrite   bool
+		wantAddress bool
+	}{
+		{
+			name:        "dereferenced address assignment",
+			source:      `package synthetic; func f(target *struct{ FreshInstall bool }) { *(&target.FreshInstall) = true }`,
+			wantWrite:   true,
+			wantAddress: true,
+		},
+		{
+			name:        "address passed to setter",
+			source:      `package synthetic; func setter(*bool); func f(target *struct{ FreshInstall bool }) { setter(&target.FreshInstall) }`,
+			wantAddress: true,
+		},
+		{
+			name:   "legitimate read",
+			source: `package synthetic; func f(target *struct{ FreshInstall bool }) { if target.FreshInstall {} }`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+			var gotWrite, gotAddress bool
+			ast.Inspect(file, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.AssignStmt:
+					for _, lhs := range typed.Lhs {
+						if _, reserved := p2FreshInstallWriteTarget(lhs); reserved {
+							gotWrite = true
+						}
+					}
+				case *ast.UnaryExpr:
+					if typed.Op == token.AND {
+						if _, reserved := p2FreshInstallWriteTarget(typed.X); reserved {
+							gotAddress = true
+						}
+					}
+				}
+				return true
+			})
+			if gotWrite != test.wantWrite || gotAddress != test.wantAddress {
+				t.Errorf("detected write/address = %v/%v, want %v/%v", gotWrite, gotAddress, test.wantWrite, test.wantAddress)
+			}
+		})
+	}
+}
+
+func TestP2PositionalTargetConstructionViaAliasesIsDetected(t *testing.T) {
+	parse := func(path, source string) *ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		return file
+	}
+
+	bridge := parse("bridge.go", `package bridge
+import v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+type Target = v2.BlockMaterializationTarget`)
+	consumer := parse("consumer.go", `package consumer
+import bridge "example.invalid/bridge"
+func f() {
+	type Local = bridge.Target
+	_ = Local{nil, "", "", true}
+}`)
+	aliases := append(
+		p2TypeAliases("example.invalid/bridge", bridge),
+		p2TypeAliases("example.invalid/consumer", consumer)...,
+	)
+	canonical := p2ResolveCanonicalTargetTypes(aliases)
+
+	var literal *ast.CompositeLit
+	ast.Inspect(consumer, func(node ast.Node) bool {
+		if candidate, ok := node.(*ast.CompositeLit); ok {
+			literal = candidate
+		}
+		return true
+	})
+	if literal == nil {
+		t.Fatal("synthetic positional literal was not found")
+	}
+	if !p2CanonicalTargetType(literal.Type, "example.invalid/consumer", consumer, canonical) {
+		t.Fatal("positional construction through imported and local aliases was not resolved to BlockMaterializationTarget")
+	}
+	if _, keyed := literal.Elts[0].(*ast.KeyValueExpr); keyed {
+		t.Fatal("synthetic mutation unexpectedly uses keyed construction")
+	}
+}
+
+func p2NamedTypeReferences(expression ast.Expr, packagePath string, file *ast.File) []p2NamedType {
 	for {
 		switch typed := expression.(type) {
 		case *ast.ParenExpr:
@@ -114,37 +236,122 @@ func p2CanonicalTargetType(expression ast.Expr, path string, file *ast.File) boo
 	}
 
 resolved:
-	const targetImport = "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	if identifier, ok := expression.(*ast.Ident); ok {
-		if strings.HasSuffix(filepath.ToSlash(filepath.Dir(path)), "/internal/api/v2") && identifier.Name == "BlockMaterializationTarget" {
-			return true
-		}
+		references := []p2NamedType{{pkg: packagePath, name: identifier.Name}}
 		for _, imported := range file.Imports {
 			importPath, err := strconv.Unquote(imported.Path.Value)
-			if err == nil && importPath == targetImport && imported.Name != nil && imported.Name.Name == "." {
-				return identifier.Name == "BlockMaterializationTarget"
+			if err == nil && imported.Name != nil && imported.Name.Name == "." {
+				references = append(references, p2NamedType{pkg: importPath, name: identifier.Name})
 			}
 		}
-		return false
+		return references
 	}
 	selector, ok := expression.(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "BlockMaterializationTarget" {
-		return false
+	if !ok {
+		return nil
 	}
 	qualifier, ok := selector.X.(*ast.Ident)
 	if !ok {
-		return false
+		return nil
 	}
 	for _, imported := range file.Imports {
 		importPath, err := strconv.Unquote(imported.Path.Value)
-		if err != nil || importPath != targetImport {
+		if err != nil {
 			continue
 		}
-		name := "v2"
+		name := filepath.Base(importPath)
 		if imported.Name != nil {
 			name = imported.Name.Name
 		}
-		return qualifier.Name == name
+		if qualifier.Name == name {
+			return []p2NamedType{{pkg: importPath, name: selector.Sel.Name}}
+		}
+	}
+	return nil
+}
+
+func p2TypeAliases(packagePath string, file *ast.File) []p2TypeAlias {
+	var aliases []p2TypeAlias
+	ast.Inspect(file, func(node ast.Node) bool {
+		typeSpec, ok := node.(*ast.TypeSpec)
+		if !ok {
+			return true
+		}
+		references := p2NamedTypeReferences(typeSpec.Type, packagePath, file)
+		if len(references) != 0 {
+			aliases = append(aliases, p2TypeAlias{
+				name:       p2NamedType{pkg: packagePath, name: typeSpec.Name.Name},
+				references: references,
+			})
+		}
+		return true
+	})
+	return aliases
+}
+
+func p2ResolveCanonicalTargetTypes(aliases []p2TypeAlias) map[p2NamedType]bool {
+	canonical := map[p2NamedType]bool{
+		{pkg: p2TargetPackage, name: "BlockMaterializationTarget"}: true,
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, alias := range aliases {
+			if canonical[alias.name] {
+				continue
+			}
+			for _, reference := range alias.references {
+				if canonical[reference] {
+					canonical[alias.name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return canonical
+}
+
+func p2ProductionPackagePath(path string) (string, error) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		return "", err
+	}
+	directory, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(root, directory)
+	if err != nil {
+		return "", err
+	}
+	if relative == "." {
+		return "github.com/Sesame-Disk/sesamefs", nil
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("production source %s is outside repository root", path)
+	}
+	return "github.com/Sesame-Disk/sesamefs/" + filepath.ToSlash(relative), nil
+}
+
+func p2CanonicalTargetTypes(t *testing.T) map[p2NamedType]bool {
+	t.Helper()
+	var aliases []p2TypeAlias
+	r12WalkProductionFiles(t, func(_ *token.FileSet, path string, file *ast.File) {
+		packagePath, err := p2ProductionPackagePath(path)
+		if err != nil {
+			t.Errorf("%s: resolve package path: %v", path, err)
+			return
+		}
+		aliases = append(aliases, p2TypeAliases(packagePath, file)...)
+	})
+	return p2ResolveCanonicalTargetTypes(aliases)
+}
+
+func p2CanonicalTargetType(expression ast.Expr, packagePath string, file *ast.File, canonical map[p2NamedType]bool) bool {
+	for _, reference := range p2NamedTypeReferences(expression, packagePath, file) {
+		if canonical[reference] {
+			return true
+		}
 	}
 	return false
 }
@@ -182,8 +389,14 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 	mintInsideRowlessBranch := false
 	var freshInstallTrueWrites []ast.Node
 	var returnedFreshInstall *ast.KeyValueExpr
+	canonicalTargetTypes := p2CanonicalTargetTypes(t)
 
 	r12WalkProductionFiles(t, func(fset *token.FileSet, path string, file *ast.File) {
+		packagePath, err := p2ProductionPackagePath(path)
+		if err != nil {
+			t.Errorf("%s: resolve package path: %v", path, err)
+			return
+		}
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			symbol := "package value"
@@ -232,8 +445,14 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 							}
 						}
 					}
+				case *ast.UnaryExpr:
+					if typed.Op == token.AND {
+						if target, reserved := p2FreshInstallWriteTarget(typed.X); reserved {
+							t.Errorf("%s: %s takes the address of reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
+						}
+					}
 				case *ast.CompositeLit:
-					if len(typed.Elts) != 0 && p2CanonicalTargetType(typed.Type, path, file) {
+					if len(typed.Elts) != 0 && p2CanonicalTargetType(typed.Type, packagePath, file, canonicalTargetTypes) {
 						if _, keyed := typed.Elts[0].(*ast.KeyValueExpr); !keyed {
 							t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(typed.Pos()), symbol)
 						}
@@ -324,7 +543,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					}
 					literal, literalOK := returned.Results[0].(*ast.CompositeLit)
 					nilError, nilOK := returned.Results[1].(*ast.Ident)
-					if !literalOK || !p2CanonicalTargetType(literal.Type, path, file) || !nilOK || nilError.Name != "nil" {
+					if !literalOK || !p2CanonicalTargetType(literal.Type, packagePath, file, canonicalTargetTypes) || !nilOK || nilError.Name != "nil" {
 						continue
 					}
 					fields := map[string]string{}
