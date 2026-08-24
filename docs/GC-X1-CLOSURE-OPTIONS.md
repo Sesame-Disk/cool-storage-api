@@ -124,8 +124,9 @@ P2, R9, R24 and X1 remain open, and `GC_ENABLED=false` remains mandatory.
 **What PR #184 deliberately did not centralize.** The equality is centralized for
 the two *destructive* callers only. Three non-destructive sites still compare
 `storage_key` against `StorageKeyForHash` inline, and P2 has to change all four
-together: `internal/api/v2/upload_reuse.go` (`EnsureReusableBlockPresent` and
-`StoreUploadedBlockForProbe`) and `internal/streaming/canonical_block_reader.go`.
+together: `internal/api/v2/upload_reuse.go` (`ResolveNeedsPutBlockStore` and the
+`Reusable` branch of `StoreUploadedBlockForProbe`) and
+`internal/streaming/canonical_block_reader.go`.
 A missed site fails closed on every minted key rather than deleting anything, so
 this is a sequencing hazard for P2, not a safety gap in #184.
 

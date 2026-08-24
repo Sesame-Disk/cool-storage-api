@@ -1350,8 +1350,8 @@ centralized it for the two destructive callers only, which is why P2 cannot trea
 | Site | Path |
 |---|---|
 | `storage.ValidatePhysicalLocator` | covers `gc.processBlock` and `gc.RecoverS3Orphans` |
-| `EnsureReusableBlockPresent` | `internal/api/v2/upload_reuse.go` |
-| `StoreUploadedBlockForProbe` | `internal/api/v2/upload_reuse.go` |
+| `ResolveNeedsPutBlockStore` | `internal/api/v2/upload_reuse.go` |
+| `Reusable` branch of `StoreUploadedBlockForProbe` | `internal/api/v2/upload_reuse.go` |
 | `newCanonicalBlockReader` | `internal/streaming/canonical_block_reader.go` |
 
 A site missed by P2 rejects every minted key rather than accepting a wrong one, so
