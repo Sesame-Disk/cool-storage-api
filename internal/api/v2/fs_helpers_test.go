@@ -197,7 +197,7 @@ func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *tes
 		t.Fatalf("helper must not sleep on the fence; the outer wrapper owns backoff (slept %s)", delay)
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	err := helper.RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key-1"}, "sha1-1")
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
 	}
@@ -256,7 +256,7 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reset()
 			tc.setup()
-			err := (&FSHelper{}).RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 1, "hot", "key", "")
+			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 1, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key"}, "")
 			if !errors.Is(err, ErrBlockMaterializationTransient) {
 				t.Fatalf("error = %v, want ErrBlockMaterializationTransient", err)
 			}
@@ -286,7 +286,7 @@ func TestRegisterUploadedBlock_ReturnsPermanentMetadataFailureUntagged(t *testin
 		return fmt.Errorf("upsert: %w", db.ErrBlockMetadataPermanent)
 	}
 
-	err := (&FSHelper{}).RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 1, "hot", "key", "")
+	err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 1, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key"}, "")
 	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
 		t.Fatalf("error = %v, want db.ErrBlockMetadataPermanent", err)
 	}
@@ -314,7 +314,7 @@ func TestRegisterUploadedBlockReturnsPermanentProvisionalStorageClassFailureUnta
 		return false, nil
 	}
 
-	err := (&FSHelper{}).RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 1, "hot", "key", "")
+	err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 1, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key"}, "")
 	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
 		t.Fatalf("error = %v, want db.ErrBlockMetadataPermanent", err)
 	}
@@ -344,7 +344,7 @@ func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *
 		return fmt.Errorf("%w: block block-1 changed before stub repair", db.ErrBlockStubRepairContended)
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	err := helper.RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key-1"}, "sha1-1")
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
 	}
@@ -378,7 +378,7 @@ func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	}
 
 	before := time.Now().UTC()
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	err := helper.RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key-1"}, "sha1-1")
 	after := time.Now().UTC()
 	if err != nil {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
@@ -433,7 +433,7 @@ func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) 
 		return nil
 	}
 
-	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1", "sha1-1")
+	err := helper.RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key-1"}, "sha1-1")
 	if !errors.Is(err, batchErr) {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, batchErr)
 	}
@@ -497,14 +497,23 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}}
 		}
 		deleteCalls := 0
-		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+		deleteFreshInstallLoserFn = func(cleanupCtx context.Context, got BlockMaterializationTarget) error {
 			deleteCalls++
+			if err := cleanupCtx.Err(); err != nil {
+				t.Fatalf("detached cleanup inherited request cancellation: %v", err)
+			}
+			deadline, ok := cleanupCtx.Deadline()
+			if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > freshInstallLoserCleanupTimeout {
+				t.Fatalf("cleanup deadline = %v/%v, want active bounded deadline", deadline, ok)
+			}
 			if got.Store != store || got.StorageKey != key || got.StorageClass != "hot" {
 				t.Fatalf("cleanup target = %+v, want exact PUT target %+v", got, target)
 			}
 			return nil
 		}
-		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		requestCtx, cancelRequest := context.WithCancel(context.Background())
+		cancelRequest()
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(requestCtx, orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
 		if !errors.Is(err, ErrBlockMaterializationTransient) || deleteCalls != 1 {
 			t.Fatalf("error/deletes = %v/%d, want retryable/1", err, deleteCalls)
 		}

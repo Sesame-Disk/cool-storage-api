@@ -514,13 +514,25 @@ if err != nil {
     return err
 }
 blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
-// Stored at: blocks/<org_id>/XX/XX/blockID (org scope + two-level sharding)
+// Legacy key: blocks/<org_id>/XX/XX/blockID
+// Fresh key:  blocks/<org_id>/XX/XX/blockID.<lowercase-uuid>
 ```
 
 There is no org-less `BlockStore` constructor. Manager-backed callers use
-`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC normalizes incidental
-whitespace, selects the canonical storage class, and never health-fails over a
-delete to another backend.
+`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC requires the persisted
+class and key to already be canonical and never health-fails over a delete to
+another backend.
+
+Persisted `(storage_class, storage_key)` identity is byte-exact and is never
+trimmed. A key must match either the legacy deterministic grammar or the minted
+incarnation grammar above and must bind to the requested SHA-256 block. Fresh
+rowless uploads carry the complete minted target through PUT and the target-aware
+`InstallBlockMetadata` API. Existing canonical reuse/stub repair uses the stored
+tuple through `UpsertBlockMetadata`; it does not mint. If the one-shot INSTALL
+result is uncertain, SesameFS performs a bounded detached `SERIAL` settlement
+read. Only a different complete canonical tuple authorizes exact loser cleanup;
+an ambiguous result retains the object. This is the P2 contract, not a claim that
+the out-of-scope R17/P3 repair design is complete.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

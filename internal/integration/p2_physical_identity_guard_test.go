@@ -7,41 +7,55 @@ import (
 	"testing"
 )
 
-// TestP2PhysicalIdentityAuthorityGuard keeps logical-to-physical authority on
-// the validator. It reads executable syntax, so comments and string literals
-// cannot satisfy or bypass the gate.
+type p2AuthoritySite struct {
+	path     string
+	symbol   string
+	receiver string
+	pos      token.Position
+}
+
+// TestP2PhysicalIdentityAuthorityGuard binds physical-locator authority to the
+// intended functions and BlockStore variables. Selector references are counted,
+// not only direct calls, so a method-value alias cannot evade the guard; a same-
+// named method on an unrelated receiver cannot satisfy an expected flow.
 func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
-	type callSite struct {
-		path   string
-		symbol string
-		pos    token.Position
+	type expectedUse struct {
+		file     string
+		symbol   string
+		receiver string
 	}
-	var storageKeyCalls, mintCalls []callSite
-	validationCounts := map[string]int{}
+	wantValidations := map[expectedUse]int{
+		{file: "upload_reuse.go", symbol: "ResolveNeedsPutBlockStore", receiver: "canonicalStore"}:  1,
+		{file: "upload_reuse.go", symbol: "StoreUploadedBlockForProbe", receiver: "canonicalStore"}: 1,
+		{file: "canonical_block_reader.go", symbol: "newCanonicalBlockReader", receiver: "store"}:   1,
+		{file: "worker.go", symbol: "(*Worker).processBlock", receiver: "resolved"}:                 1,
+		{file: "worker.go", symbol: "(*Worker).RecoverS3Orphans", receiver: "blockStore"}:           1,
+	}
+	validationCounts := map[expectedUse]int{}
+	var storageKeyUses, unexpectedMints []p2AuthoritySite
+	forbiddenTupleWrappers := map[string]bool{
+		"RegisterUploadedBlock":              true,
+		"RegisterUploadedBlockAndMapping":    true,
+		"RegisterWebUploadedBlockAndMapping": true,
+	}
+	mintCount := 0
 	mintInsideRowlessBranch := false
 
 	r12WalkProductionFiles(t, func(fset *token.FileSet, path string, file *ast.File) {
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			if !ok {
-				// A package-level function literal is still executable production code.
-				// Count authority calls there so moving one out of a FuncDecl cannot
-				// make it disappear from this gate.
 				ast.Inspect(declaration, func(node ast.Node) bool {
-					call, callOK := node.(*ast.CallExpr)
-					if !callOK {
-						return true
-					}
-					selector, selectorOK := call.Fun.(*ast.SelectorExpr)
+					selector, selectorOK := node.(*ast.SelectorExpr)
 					if !selectorOK {
 						return true
 					}
-					site := callSite{path: path, symbol: "package value", pos: fset.Position(call.Pos())}
+					site := p2AuthoritySite{path: path, symbol: "package value", receiver: r24NodeText(t, selector.X), pos: fset.Position(selector.Pos())}
 					switch selector.Sel.Name {
 					case "StorageKeyForHash":
-						storageKeyCalls = append(storageKeyCalls, site)
+						storageKeyUses = append(storageKeyUses, site)
 					case "MintStorageKey":
-						mintCalls = append(mintCalls, site)
+						unexpectedMints = append(unexpectedMints, site)
 					}
 					return true
 				})
@@ -51,28 +65,35 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 				continue
 			}
 			symbol := r12FunctionName(function)
+			if forbiddenTupleWrappers[function.Name.Name] {
+				t.Errorf("%s: tuple-only production materialization wrapper %s bypasses target authority", fset.Position(function.Pos()), symbol)
+			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
+				selector, ok := node.(*ast.SelectorExpr)
 				if !ok {
 					return true
 				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				site := callSite{path: path, symbol: symbol, pos: fset.Position(call.Pos())}
+				receiver := r24NodeText(t, selector.X)
+				site := p2AuthoritySite{path: path, symbol: symbol, receiver: receiver, pos: fset.Position(selector.Pos())}
 				switch selector.Sel.Name {
 				case "StorageKeyForHash":
-					storageKeyCalls = append(storageKeyCalls, site)
+					storageKeyUses = append(storageKeyUses, site)
 				case "MintStorageKey":
-					mintCalls = append(mintCalls, site)
+					if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStore" && receiver == "preferredStore" {
+						mintCount++
+					} else {
+						unexpectedMints = append(unexpectedMints, site)
+					}
 				case "ValidatePhysicalLocator":
-					validationCounts[symbol]++
+					key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
+					if _, expected := wantValidations[key]; expected {
+						validationCounts[key]++
+					}
 				}
 				return true
 			})
 
-			if symbol == "ResolveNeedsPutBlockStore" {
+			if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStore" {
 				ast.Inspect(function.Body, func(node ast.Node) bool {
 					conditional, ok := node.(*ast.IfStmt)
 					if !ok || r24NodeText(t, conditional.Cond) != `canonicalClass == ""` {
@@ -80,12 +101,8 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					}
 					count := 0
 					ast.Inspect(conditional.Body, func(child ast.Node) bool {
-						call, ok := child.(*ast.CallExpr)
-						if !ok {
-							return true
-						}
-						selector, ok := call.Fun.(*ast.SelectorExpr)
-						if ok && selector.Sel.Name == "MintStorageKey" {
+						selector, ok := child.(*ast.SelectorExpr)
+						if ok && selector.Sel.Name == "MintStorageKey" && r24NodeText(t, selector.X) == "preferredStore" {
 							count++
 						}
 						return true
@@ -97,29 +114,18 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 		}
 	})
 
-	if len(storageKeyCalls) != 0 {
-		for _, site := range storageKeyCalls {
-			t.Errorf("%s: %s calls StorageKeyForHash; authority must use ValidatePhysicalLocator", site.pos, site.symbol)
-		}
+	for _, site := range storageKeyUses {
+		t.Errorf("%s: %s references %s.StorageKeyForHash; physical authority must use ValidatePhysicalLocator", site.pos, site.symbol, site.receiver)
 	}
-	if len(mintCalls) != 1 || mintCalls[0].symbol != "ResolveNeedsPutBlockStore" || filepath.Base(mintCalls[0].path) != "upload_reuse.go" {
-		t.Errorf("MintStorageKey production calls = %#v, want exactly the rowless ResolveNeedsPutBlockStore call", mintCalls)
+	for _, site := range unexpectedMints {
+		t.Errorf("%s: unexpected %s.MintStorageKey reference in %s", site.pos, site.receiver, site.symbol)
 	}
-	if !mintInsideRowlessBranch {
-		t.Error("MintStorageKey must remain inside the canonicalClass == empty rowless-install branch")
+	if mintCount != 1 || !mintInsideRowlessBranch {
+		t.Errorf("rowless ResolveNeedsPutBlockStore mint count/branch = %d/%v, want 1/true", mintCount, mintInsideRowlessBranch)
 	}
-
-	wantValidations := map[string]int{
-		"(*BlockStore).ValidatePhysicalLocator": 0,
-		"ResolveNeedsPutBlockStore":             1,
-		"StoreUploadedBlockForProbe":            1,
-		"newCanonicalBlockReader":               1,
-		"(*Worker).processBlock":                1,
-		"(*Worker).RecoverS3Orphans":            1,
-	}
-	for symbol, want := range wantValidations {
-		if got := validationCounts[symbol]; got != want {
-			t.Errorf("%s ValidatePhysicalLocator calls = %d, want %d", symbol, got, want)
+	for use, want := range wantValidations {
+		if got := validationCounts[use]; got != want {
+			t.Errorf("%s %s.%s ValidatePhysicalLocator references = %d, want %d", use.file, use.symbol, use.receiver, got, want)
 		}
 	}
 }

@@ -440,8 +440,9 @@ func TestProvisionalRollbackPreservesTTLRows(t *testing.T) {
 		`, orgID, dbpkg.PlainBlockRepresentationID, externalID).Exec()
 	})
 
-	err := apiv2.RegisterWebUploadedBlockAndMapping(
-		database, orgID, repoID, blockID, operationID, len(content), "hot", "blocks/"+blockID, externalID,
+	err := apiv2.RegisterWebUploadedBlockTargetAndMapping(
+		context.Background(), database, orgID, repoID, blockID, operationID, len(content),
+		apiv2.BlockMaterializationTarget{StorageClass: "hot", StorageKey: "blocks/" + blockID}, externalID,
 	)
 	if !errors.Is(err, dbpkg.ErrBlockIDMappingConflict) {
 		t.Fatalf("materialization error = %v, want mapping conflict", err)

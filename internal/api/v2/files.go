@@ -1269,6 +1269,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var templateMaterializedStorageClass string
 	var templateStorageKey string
 	var templateBlockStored bool
+	var templateTarget BlockMaterializationTarget
 
 	if len(templateContent) > 0 {
 		fileSize = int64(len(templateContent))
@@ -1328,7 +1329,6 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 
 		if templateBlockData != nil {
-			var templateTarget BlockMaterializationTarget
 			if templateBlockStore == nil {
 				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {

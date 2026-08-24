@@ -24,10 +24,15 @@ docker compose --profile test run --rm --build go-integration-test
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
-# P2 real Cassandra/MinIO canonical-install race
+# P2 real Cassandra/MinIO canonical-install race. The shell assertions make a
+# skipped or non-executed test fail instead of producing vacuous green evidence.
 docker compose --profile test run --rm --build go-integration-test \
-  go test -tags integration -run '^TestP2ConcurrentCanonicalInstall$' \
-  -v -count=1 -timeout 5m ./internal/integration
+  sh -ec 'out="$(go test -tags integration \
+    -run "^TestP2ConcurrentCanonicalInstall$" -v -count=1 -timeout 5m \
+    ./internal/integration 2>&1)"; printf "%s\n" "$out"; \
+    printf "%s\n" "$out" | grep -q -- "--- PASS: TestP2ConcurrentCanonicalInstall"; \
+    printf "%s\n" "$out" | grep -q -- "P2_CONTENTION_EVIDENCE candidates=2"; \
+    ! printf "%s\n" "$out" | grep -q -- "--- SKIP: TestP2ConcurrentCanonicalInstall"'
 
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test

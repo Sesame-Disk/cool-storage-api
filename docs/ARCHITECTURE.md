@@ -167,6 +167,29 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 - Reference counting for garbage collection
 - Per-tenant isolation (optional cross-tenant dedup)
 
+#### Physical Block Locator Grammar
+
+The persisted physical identity is the byte-exact tuple
+`(storage_class, storage_key)`. Neither component is trimmed or normalized when
+it is compared, installed, settled, read, repaired, or deleted. Incidental
+leading/trailing whitespace is invalid rather than an alternate spelling.
+
+An org-scoped `BlockStore` accepts exactly two key forms for a SHA-256 block ID:
+
+- legacy: `blocks/<org_id>/<hh>/<hh>/<sha256>`
+- minted incarnation: `blocks/<org_id>/<hh>/<hh>/<sha256>.<lowercase-uuid>`
+
+Fresh, rowless materialization mints a new incarnation, PUTs that exact key, and
+uses the target-aware metadata API to `InstallBlockMetadata` once. Existing-row
+reuse and explicitly repairable stubs use the persisted tuple and the repair
+`UpsertBlockMetadata` path; they do not mint or silently relocate the block. An
+uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
+detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
+different complete tuple proves it lost, and incomplete/unavailable settlement
+remains ambiguous and authorizes no cleanup. A proven loser is deleted only by
+its exact minted key with a separate bounded cleanup context. This closes the P2
+materialization contract; it does not claim the broader R17/P3 repair work.
+
 #### Storage Config Formats
 
 The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. `docker-compose.yaml` is only the local development/integration profile; it intentionally carries both formats, with modern classes on regional MinIO buckets and legacy `hot` on a separate compatibility bucket. Local Compose defaults the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1` and lets `.env` override them; pointing `S3_BUCKET` back at the default class's bucket is refused by `Config.Validate` at startup rather than silently aliased. Note which bucket each variable names: the generic `S3_*` set configures the LEGACY backend only, while the `default_class` the server actually writes through takes `S3_CLASS_HOT_MINIO_LOCAL_*` overrides over the values `config.docker.yaml` declares. Anything verifying local block objects directly must follow the latter. Production behavior is defined by `docker-compose.prod.yml` and `configs/config.prod.yaml`, with environment overrides applied last.
@@ -409,10 +432,10 @@ policies:
 3. Server selects storage backend by class name and constructs an org-scoped
    BlockStore for `org_id`.
 
-4. Server uses the persisted `storage_key` to retrieve the object and returns it.
-   The current key remains deterministic (`blocks/<org_id>/ab/c1/abc123`); a
-   missing or conflicting persisted key fails closed rather than selecting a
-   replacement locator.
+4. Server validates and uses the persisted `storage_key` byte-for-byte to
+   retrieve the object and returns it. Both the legacy deterministic grammar and
+   the minted-incarnation grammar are valid; a missing, trimmed, malformed, or
+   block-mismatched key fails closed rather than selecting a replacement locator.
 ```
 
 ---
@@ -629,7 +652,7 @@ A reference row is `((org_id, block_id), referrer)` where:
 
 **Operations** (`block_references` steady-state INSERT/DELETE is idempotent and
 non-LWT; canonical metadata creation and lifecycle state transitions are separate):
-- **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
+- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or repair-capable `UpsertBlockMetadata` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`). Tuple-only registration wrappers are not production entrypoints.
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
 - **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and the persisted `storage_key` is checked against the key that store derives (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.

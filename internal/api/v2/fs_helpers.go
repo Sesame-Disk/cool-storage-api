@@ -111,6 +111,8 @@ var deleteFreshInstallLoserFn = func(ctx context.Context, target BlockMaterializ
 	return target.Store.DeleteBlockByStorageKey(ctx, target.StorageKey)
 }
 
+const freshInstallLoserCleanupTimeout = 5 * time.Second
+
 // registerUploadedBlockSleepFn is the overridable backoff sleep used by the
 // non-cancellable store->materialize retry path (see upload_reuse.go). Tests
 // swap it to avoid real sleeps.
@@ -996,14 +998,13 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // so the wrapper retries it inside its bounded budget instead of failing on the
 // first timeout. A permanent metadata failure (db.ErrBlockMetadataPermanent) is
 // returned untagged so it is not retried.
-func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
-	return h.RegisterUploadedBlockTarget(context.Background(), orgID, libraryID, blockID, operationID, sizeBytes, BlockMaterializationTarget{StorageClass: storageClass, StorageKey: storageKey}, sha1ID)
-}
-
 // RegisterUploadedBlockTarget materializes one exact store observation. A fresh
 // target is single-use: an uncertain INSTALL is never retried here, while a
 // proven loser may clean only the exact object this attempt PUT.
 func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libraryID, blockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
@@ -1037,7 +1038,10 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 			if result.Canonical.StorageClass == target.StorageClass && result.Canonical.StorageKey == target.StorageKey {
 				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
 			}
-			if cleanupErr := deleteFreshInstallLoserFn(ctx, target); cleanupErr != nil {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), freshInstallLoserCleanupTimeout)
+			cleanupErr := deleteFreshInstallLoserFn(cleanupCtx, target)
+			cancelCleanup()
+			if cleanupErr != nil {
 				log.Printf("[RegisterUploadedBlock] WARNING: exact loser cleanup leaked block %s at %s/%s: %v", blockID, target.StorageClass, target.StorageKey, cleanupErr)
 			}
 			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)

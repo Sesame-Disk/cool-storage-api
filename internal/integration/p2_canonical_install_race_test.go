@@ -61,11 +61,13 @@ func TestP2ConcurrentCanonicalInstall(t *testing.T) {
 		proposed db.BlockPhysicalLocation
 		result   db.InstallBlockMetadataResult
 	}
+	ready := make(chan db.BlockPhysicalLocation, 2)
 	start := make(chan struct{})
 	results := make(chan attempt, 2)
 	for _, key := range []string{key1, key2} {
 		proposed := db.BlockPhysicalLocation{StorageClass: storageClass, StorageKey: key}
 		go func() {
+			ready <- proposed
 			<-start
 			results <- attempt{
 				proposed: proposed,
@@ -75,6 +77,11 @@ func TestP2ConcurrentCanonicalInstall(t *testing.T) {
 			}
 		}()
 	}
+	contenders := []db.BlockPhysicalLocation{<-ready, <-ready}
+	if contenders[0] == contenders[1] || contenders[0].StorageKey == contenders[1].StorageKey {
+		t.Fatalf("contention gate received non-distinct candidates: %+v", contenders)
+	}
+	t.Logf("P2_CONTENTION_EVIDENCE candidates=%d keys=%q,%q", len(contenders), contenders[0].StorageKey, contenders[1].StorageKey)
 	close(start)
 	attempts := []attempt{<-results, <-results}
 
