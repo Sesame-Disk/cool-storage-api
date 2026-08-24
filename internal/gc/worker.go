@@ -1179,11 +1179,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// Resolve the destination store HERE, in the authorization phase, rather than
 	// after the row is gone. Two reasons, and the second is the one that matters:
 	//
-	//   - the persisted locator can only be checked against something, and the
-	//     org-scoped store is the only thing that knows what this org's key looks
-	//     like. A mismatch must abort BEFORE StartBlockDeleteOrphan and
-	//     FinalizeBlockDelete, or a suspicious row is already half-destroyed by the
-	//     time anyone refuses to touch its bytes.
+	//   - the persisted locator can only be validated by the org-scoped store that
+	//     owns its physical naming rules. A mismatch must abort BEFORE
+	//     StartBlockDeleteOrphan and FinalizeBlockDelete, or a suspicious row is
+	//     already half-destroyed by the time anyone refuses to touch its bytes.
 	//   - a store that will not resolve now hands the claim back instead of stranding
 	//     a deleted row whose object nothing is left to remove.
 	var blockStore BlockStoreDeleter
@@ -1195,12 +1194,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			}
 			return fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, resolveErr)
 		}
-		if derivedKey := resolved.StorageKeyForHash(item.ItemID); storageKey != derivedKey {
+		if validateErr := resolved.ValidatePhysicalLocator(item.ItemID, storageKey); validateErr != nil {
 			metrics.GCErrorsTotal.WithLabelValues("block_storage_key_mismatch").Inc()
 			if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 				return relErr
 			}
-			return fmt.Errorf("block %s persisted storage key %q does not match derived org-scoped key %q", item.ItemID, storageKey, derivedKey)
+			return fmt.Errorf("block %s persisted physical locator %q failed org-scoped validation: %w", item.ItemID, storageKey, validateErr)
 		}
 		blockStore = resolved
 	}
@@ -1634,13 +1633,13 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					continue
 				}
 				// Same refusal as the normal delete path: the reloaded row names the
-				// object, but only this org's store can say whether that name is one of
-				// its own. Refuse rather than hand an unverified key to S3.
-				if derivedKey := blockStore.StorageKeyForHash(canonicalCommit.BlockID); canonicalCommit.StorageKey != derivedKey {
+				// object, but only this org's store can validate that physical locator.
+				// Refuse rather than hand an unverified key to S3.
+				if validateErr := blockStore.ValidatePhysicalLocator(canonicalCommit.BlockID, canonicalCommit.StorageKey); validateErr != nil {
 					metrics.GCErrorsTotal.WithLabelValues("s3_orphan_storage_key_mismatch").Inc()
-					log.Printf("[GC Worker] S3 orphan recovery: persisted storage key %q for org=%s block=%s does not match derived org-scoped key %q; retaining cursor", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, derivedKey)
+					log.Printf("[GC Worker] S3 orphan recovery: persisted physical locator %q for org=%s block=%s failed org-scoped validation: %v; retaining cursor", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("canonical S3 orphan storage key %q for org=%s block=%s does not match derived org-scoped key %q", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, derivedKey)
+						phaseErr = fmt.Errorf("canonical S3 orphan physical locator %q for org=%s block=%s failed org-scoped validation: %w", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
 					}
 					continue
 				}

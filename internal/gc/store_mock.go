@@ -3701,10 +3701,11 @@ func (m *MockStore) LoadGCStats(key string) (string, error) {
 
 // MockStorageProvider implements StorageProvider for testing.
 type MockStorageProvider struct {
-	mu             sync.Mutex
-	DeletedKeys    []string
-	ScopedDeletes  []ScopedBlockDelete
-	ResolvedStores []ScopedBlockStoreRequest
+	mu                         sync.Mutex
+	DeletedKeys                []string
+	ScopedDeletes              []ScopedBlockDelete
+	ResolvedStores             []ScopedBlockStoreRequest
+	PhysicalLocatorValidations []ScopedPhysicalLocatorValidation
 
 	// failTimes is the number of upcoming DeleteBlock calls that should
 	// return an error before the next call succeeds. Decremented per call.
@@ -3754,6 +3755,15 @@ type ScopedBlockStoreRequest struct {
 	StorageClass string
 }
 
+// ScopedPhysicalLocatorValidation records the exact persisted locator presented
+// to an org-scoped store before a physical delete.
+type ScopedPhysicalLocatorValidation struct {
+	OrgID        string
+	StorageClass string
+	BlockID      string
+	StorageKey   string
+}
+
 func (p *MockStorageProvider) GetBlockStoreForOrg(orgID, storageClass string) (BlockStoreDeleter, error) {
 	trimmedOrgID := strings.TrimSpace(orgID)
 	if trimmedOrgID == "" {
@@ -3795,6 +3805,12 @@ func (p *MockStorageProvider) BlockStoreRequests() []ScopedBlockStoreRequest {
 	return append([]ScopedBlockStoreRequest{}, p.ResolvedStores...)
 }
 
+func (p *MockStorageProvider) LocatorValidations() []ScopedPhysicalLocatorValidation {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]ScopedPhysicalLocatorValidation{}, p.PhysicalLocatorValidations...)
+}
+
 // FailNextN causes the next n DeleteBlock calls to return err. After that,
 // calls succeed as normal. Used to simulate transient S3 failures.
 func (p *MockStorageProvider) FailNextN(n int, err error) {
@@ -3829,8 +3845,19 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
-func (d *mockBlockDeleter) StorageKeyForHash(hash string) string {
-	return MockCanonicalStorageKey(d.orgID, hash)
+func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) error {
+	d.provider.mu.Lock()
+	d.provider.PhysicalLocatorValidations = append(d.provider.PhysicalLocatorValidations, ScopedPhysicalLocatorValidation{
+		OrgID:        d.orgID,
+		StorageClass: d.storageClass,
+		BlockID:      blockID,
+		StorageKey:   storageKey,
+	})
+	d.provider.mu.Unlock()
+	if storageKey != MockCanonicalStorageKey(d.orgID, blockID) {
+		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	return nil
 }
 
 func (d *mockBlockDeleter) DeleteBlockByStorageKey(ctx context.Context, storageKey string) error {

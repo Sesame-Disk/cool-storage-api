@@ -708,21 +708,19 @@ const (
 	BlockClaimTooFresh
 )
 
-// BlockStoreDeleter is a minimal interface for S3 block deletion.
+// BlockStoreDeleter validates and deletes physical block locators.
 // Allows mocking the storage layer in tests.
 type BlockStoreDeleter interface {
-	// StorageKeyForHash returns the canonical org-scoped locator this store would
-	// mint for a block id. Destructive callers compare the PERSISTED key against it
-	// and refuse the delete on a mismatch.
+	// ValidatePhysicalLocator verifies that the persisted key belongs to this
+	// exact org-scoped store and identifies blockID. Destructive callers must call
+	// it before handing the persisted locator to the backing store.
 	//
-	// The persisted key is authoritative for WHICH object to destroy, but the store
-	// is only a bucket client: it applies whatever key it is handed. So a row whose
-	// storage_key names another org's prefix — corruption, a bad backfill, a future
-	// writer that mints keys — would otherwise aim an org's delete at another org's
-	// bytes, which is exactly the cross-org delete P10 closed at the code level. The
-	// writers already refuse a non-derived key; this is the same refusal on the side
-	// that destroys.
-	StorageKeyForHash(hash string) string
+	// The persisted key is authoritative for WHICH object to destroy. Exact-key store
+	// operations structurally reject keys outside their configured org prefix, but
+	// they cannot prove that an in-prefix key belongs to blockID. This caller-level
+	// logical binding prevents corruption, a bad backfill, or a future key-minting
+	// writer from redirecting a delete to different bytes within the same org.
+	ValidatePhysicalLocator(blockID, storageKey string) error
 	DeleteBlockByStorageKey(ctx context.Context, storageKey string) error
 }
 

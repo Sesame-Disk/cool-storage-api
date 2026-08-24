@@ -22,12 +22,13 @@ type fastClearTestBlockStore struct {
 	objectPresent *atomic.Bool
 }
 
-// The worker checks the persisted locator against what this store would derive
-// before it deletes, so the stub has to derive the same org-scoped key the mock
-// store seeded — otherwise the delete is refused and the race under test never
-// happens.
-func (s fastClearTestBlockStore) StorageKeyForHash(hash string) string {
-	return gc.MockCanonicalStorageKey(s.orgID, hash)
+// The worker asks the resolved store to validate the persisted physical locator
+// before deletion, so this stub mirrors the mock store's org-scoped validation.
+func (s fastClearTestBlockStore) ValidatePhysicalLocator(blockID, storageKey string) error {
+	if storageKey != gc.MockCanonicalStorageKey(s.orgID, blockID) {
+		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	return nil
 }
 
 func (s fastClearTestBlockStore) DeleteBlockByStorageKey(context.Context, string) error {
