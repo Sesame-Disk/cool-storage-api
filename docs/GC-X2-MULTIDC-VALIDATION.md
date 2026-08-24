@@ -498,9 +498,10 @@ count out of `configs/`.
   `clearSeafHTTPS3OrphanFence`, returns `(false, nil)` on every path. Writers cannot
   shorten a fence wait; they re-probe each retry and proceed on the first attempt
   after GC clears the orphan.
-- **Eleven conditional statements touch the `blocks` partition**, and all of them
-  inherit the session serial level, which the cluster profiles set to `LOCAL_SERIAL`.
-  Mixing `LOCAL_SERIAL` and `SERIAL` on one partition breaks linearizability: they are
+- **Eleven conditional statements touch the `blocks` partition**. Before P0 they
+  inherited the session serial level, which the cluster profiles set to
+  `LOCAL_SERIAL`; P0 now pins all eleven to `SERIAL` explicitly. Mixing
+  `LOCAL_SERIAL` and `SERIAL` on one partition breaks linearizability: they are
   different quorum domains, and one straggler invalidates every other statement's
   guarantee. This is the **one-serial-domain rule**. X2 does not depend on it, but
   any X1 design does. Tracked as R12 in

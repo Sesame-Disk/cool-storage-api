@@ -92,7 +92,7 @@ ordinary CI unit pass and a future refactor cannot silently reintroduce
 #181 changed which value is authoritative, not whether the value is recomputable —
 the guard compares persisted against derived precisely because they should agree.
 It therefore cannot discriminate two different physical lives at the same address.
-That discrimination is P2/R12's job and is not merged. **P1 does not by itself
+That discrimination is P2's mint/install work and is not merged. **P1 does not by itself
 satisfy any of X1's four closure criteria.**
 
 Schema: migration `016_gc_s3_orphans_storage_key.cql`.

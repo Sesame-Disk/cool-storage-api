@@ -4,6 +4,13 @@
 not an ADR.** P1's locator-authority foundation is implemented separately; it
 does not close X1 or authorize destructive GC.
 
+**P0/R12 serial-phase prerequisite (2026-08-23):** The 11 conditional statements
+on `blocks` and the four conditional statements on canonical `gc_s3_orphans` now
+pin `SerialConsistency(gocql.Serial)` explicitly. The two conditional
+`gc_block_candidates` mutations are pinned in the same hardening slice. This
+changes only the Paxos serial phase: regular commit consistency, serial
+settlement, exact physical identity and X1 closure remain open.
+
 Even a future verified X1 implementation would not enable destructive GC by itself;
 removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
 the closure evidence and operational rollout checks pass.
@@ -164,8 +171,11 @@ needs no minted key to do so.
 
 A workable split, one property per PR as the R11/R22/R23 slices were:
 
-- **P0 — SERIAL domain (R12).** Every relevant `blocks` LWT on one consistency level. No
-  minted keys, no new identity.
+- **P0 — SERIAL domain (R12, serial-phase prerequisite implemented 2026-08-23).**
+  Every relevant `blocks` and canonical `gc_s3_orphans` LWT pins the `SERIAL`
+  phase explicitly. The two `gc_block_candidates` LWTs are included as adjacent
+  lifecycle hardening. No minted keys, no new identity, no change to regular
+  commit consistency.
 - **P1 — locator authority.** The persisted `storage_key` becomes the exact locator for
   reads, existence checks, repair and physical delete, still holding the currently
   derived value. It carries the delete chain that must exist before a key can differ:
@@ -1546,10 +1556,10 @@ migration, preflight, binding bootstrap, or claim marker is required.
 | R6 | A non-local `QUORUM` GC read (2 of 3), writer LQ in the DC not contacted | **Forbidden.** Empirically red on the three-DC harness. |
 | R7 | One DC down during the authorizing read | Fail closed; no DELETE. Already the shipped behaviour. |
 | R8 | Who installs the next life, and with what CAS | `blocks` is one row per logical block and the install is `INSERT … IF NOT EXISTS`. **A+:** the writer waits until both the row and orphan are gone, then a plain insert creates `P2`. **B:** the writer waits only until GC drops the row, then may install `P2` while orphan `P1` remains. If the row still exists and is healthy, `NeedsPut` repairs the current `P` instead; it must not mint a losing second object. Neither needs a `P1→P2` successor CAS or a second generation table. |
-| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. `UpsertBlockMetadata` sets no serial level, so it inherits the session's — `LOCAL_SERIAL` in the shipped cluster profiles (`configs/config-eu.cluster.yaml:27`, `configs/config-usa.cluster.yaml:27`) — and two local Paxos transactions can both apply. Harmless while keys are derived (both write the same key); **not** harmless once each DC mints its own. The installing statement needs a `SERIAL` serial phase. `SERIAL` picks a canonical winner; it does **not** prevent the loser's PUT. The losing writer still knows its exact key and should best-effort delete it, or persist that exact key for cleanup. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
+| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. Before P0, `UpsertBlockMetadata` inherited the session's serial level, including `LOCAL_SERIAL` in the cluster profiles; P0 now pins its serial phase to `SERIAL`. That prerequisite is necessary for P2 but is not sufficient: `SERIAL` picks a canonical winner, does **not** prevent the loser's PUT, and does not settle ambiguous outcomes. The losing writer still needs exact-key cleanup or durable cleanup intent. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
 | R10 | Writer stalls after `Probe=Reusable(K1)`; GC fences, sees 0, authorizes `DELETE K1`; the writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT a condemned key. Confirmed live: the `Reusable` branch of `StoreUploadedBlockForProbe` (`upload_reuse.go:152-174`) does `ObjectExists` → repair-PUT with **no** fence re-check, and `EnsureReusableBlockPresent` passes `beforePut = nil` (`:205`). The one caller that supplies `beforePut` (`v2/blocks.go:996`) uses it for the staging cap, not for the fence. Under minted keys the clean rule is **repair an active current incarnation with its current key; never repair a condemned incarnation — wait and mint a new key after the row is free**. |
 | R11 | `K1`'s delete completes, `K2` is created and live, then stale `K1` cleanup runs | **CLOSED by R11a/B.3.** Physical GC no longer deletes `block_id_mappings`, so the mapping survives independently of the physical lifecycle. The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate pins that absence of physical-GC mapping-delete authority. `BlockExists` remains only in `pending_s3`, where it protects against repeating a physical S3 delete while a canonical block row exists; it is no longer consulted by `pending_mapping_cleanup`. This closes the mapping-loss race, but not the exact physical `P` identity problem tracked by R26 and the remaining X1 work. |
-| R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. See the inventory below — it is **eleven** statements, not six. |
+| R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. P0 pins the 11 `blocks` statements and the 4 canonical orphan statements explicitly; the adjacent candidate lifecycle is pinned in the same slice. |
 | R13 | `INSERT orphan(L,P1)` succeeds, `DELETE blocks` row fails persistently, and a later candidate pass may release the claim once it is at least 15 minutes old | **New, and it is a data-loss path under B.** The row is now live, unclaimed, and pointing at a physical tuple already authorized for retirement. Today `ProbeBlockReuse` refuses it because `hasOrphan` outranks everything (`block_references.go:927`); B must replace that logical fence with a tuple-aware one. The corrected outcome is not to mint `P2` while `blocks(L) -> P1` still exists: both repair and install paths must block because the canonical tuple is condemned. Once the row is removed, `P2` may be minted. This makes step 6 of the naive protocol ("`P1` is irrevocably retired once the orphan is written") false: retirement completes when the canonical row stops naming `P1`. |
 | R14 | A candidate enqueued for `P1=(B1,K1)` is processed after `P1` died and `P2` was installed | The claim CAS must bind the physical tuple (`IF … AND backend_identity = B1 AND storage_key = K1`), or GC claims a life it never verified. The candidate/discovery work item must carry `P1` far enough for claim, finalize and candidate cleanup to reject stale work instead of touching `P2`. `processBlock` re-reads `GetBlockInfo` after the claim, which limits the damage, but the CAS should still name the life. |
 | R15 | `StartBlockDeleteOrphan` returns a conflict or ambiguous error after the orphan insert may have applied | Same-identity conflict is an idempotent resume and must retain the claim; a different identity is a confirmed competing lifecycle and may release/postpone by CAS; a timeout or error must not release the claim until the outcome has been **settled in the serial domain** (R20) — never by a non-serial consistency read. Treating every non-applied result as a conflict reopens the claim/orphan gap. |
@@ -1664,14 +1674,14 @@ The orphan partition carries four remaining conditional statements in the
 `StartBlockDeleteOrphan`, mapping-phase and attempt-update lifecycle plus the two
 unconditional `DELETE` statements in the active `DeleteS3Orphan` method
 (`internal/gc/store_cassandra.go`), which B.1 requires to become conditional.
-The former `DeleteBlockS3Orphan` helper was removed by R21. Every relevant LWT in both partitions uses
-serial phase `SERIAL`, with `EACH_QUORUM` as the default regular commit for global
-claim/orphan visibility (`ALL` is stricter but not required for intersection with an
-explicit `LOCAL_QUORUM` writer read). The regular consistency for `INSTALL` remains an
-explicit open decision: `LOCAL_QUORUM` provides local read-your-write behaviour, while
-`EACH_QUORUM` provides ordinary visibility in every DC before acknowledgement. Do not
-summarize this property as `QUORUM or higher`. This is a consistency discipline, not
-cross-table atomicity.
+The former `DeleteBlockS3Orphan` helper was removed by R21. Every relevant LWT in both partitions
+uses serial phase `SERIAL` after P0. The regular consistency target for global
+claim/orphan visibility remains `EACH_QUORUM` in the design, but P0 does not add
+that override to these mutations. The regular consistency for `INSTALL` remains
+an explicit open decision: `LOCAL_QUORUM` provides local read-your-write
+behaviour, while `EACH_QUORUM` provides ordinary visibility in every DC before
+acknowledgement. Do not summarize this property as `QUORUM or higher`. This is a
+consistency discipline, not cross-table atomicity.
 
 There is a related defect already filed against the same decision:
 `ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01`, documented at length in
@@ -1736,9 +1746,9 @@ recorded above and does not change the open X1 requirements.
 | `S3Store.Put(ctx, blockID, …)` | Second derivation layer: `s.key(blockID)` on what callers already pass as a key | Make the key parameter mean a key |
 | `canonical_block_reader.go:238` | Rejects persisted ≠ derived | Use the persisted key; validate org/hash/format instead |
 | `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Immediately before repair PUT, re-read the canonical row and require the same `storage_key`, no destructive/repair claim and no orphan. Repair/reuse that active key; mint only when a new incarnation is allowed; never repair a condemned incarnation (R10) |
-| `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` inheriting the session serial level | Store the exact key; raise the serial phase to `SERIAL` so one incarnation wins globally (R9) |
+| `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` with an explicit `SERIAL` serial phase after P0 | Store the exact key; P2 must use that phase for canonical install and add the remaining incarnation/settlement rules (R9) |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND backend_identity = B1 AND storage_key = K1`, with fresh per-attempt claim identity (R14/R16) |
-| `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, inheriting the session serial level | Serial phase `SERIAL` — the one-serial-domain rule admits no exceptions on this partition (R12) |
+| `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, explicitly pinned to serial phase `SERIAL` by P0 | The one-serial-domain rule admits no exceptions on this partition (R12); stale-read settlement and exact-`P` identity remain open |
 | `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007); R11b-1 removes the redundant `representation_id`, while R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
 | `StartBlockDeleteOrphan` | `INSERT … IF NOT EXISTS`, then **resets** an existing row to `pending_s3` | Return/classify applied, same-key idempotent, different-key conflict and ambiguous error; never overwrite/reset, never release on an ambiguous result, and postpone only a confirmed different lifecycle (B.1) |
 | `gcS3OrphanInitialScanLookbackDays = 90` | Cold-start horizon, matched to the TTL | Redefine together with the TTL removal |
@@ -1874,9 +1884,9 @@ decisions come first.
    can still expire and take its recovery record with it; removing it needs the
    cold-start horizon and cursor semantics redefined at the same time, which is
    R27's unsolved partitioning problem, not a one-line schema change.
-11. **R12 — one serial domain**, across eleven `blocks` statements and the
-   `gc_s3_orphans` partition; use `SERIAL` for the serial phase and `EACH_QUORUM` as the
-   default regular visibility level for the global fence.
+11. **R12 — one serial domain prerequisite**, across eleven `blocks` statements and the
+    `gc_s3_orphans` partition; P0 pins `SERIAL` for the serial phase. `EACH_QUORUM`
+    regular visibility, settlement and exact lifecycle identity remain later work.
 12. **B-specific R13/B.1.** If B is pursued, settle the tuple-aware probe/install rules and
    rewrite the recovery argument so `P1` authorization is not confused with `L` liveness.
 13. **R9 — the losing PUT.** `SERIAL` picks a canonical winner, but the loser's minted key

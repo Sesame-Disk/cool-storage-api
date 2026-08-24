@@ -1427,7 +1427,9 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 		applied, err := s.db.Session().Query(`
 			INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
 			VALUES (?, ?, ?, ?) IF NOT EXISTS
-		`, orgID.String(), blockID, storageClass, effectiveCandidateAt).MapScanCAS(existing)
+		`, orgID.String(), blockID, storageClass, effectiveCandidateAt).
+			SerialConsistency(gocql.Serial).
+			MapScanCAS(existing)
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -1464,7 +1466,9 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 			UPDATE gc_block_candidates SET candidate_at = ?
 			WHERE org_id = ? AND block_id = ?
 			IF candidate_at = ?
-		`, effectiveCandidateAt, orgID.String(), blockID, existingCandidateAt).MapScanCAS(updateState)
+		`, effectiveCandidateAt, orgID.String(), blockID, existingCandidateAt).
+			SerialConsistency(gocql.Serial).
+			MapScanCAS(updateState)
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -1671,7 +1675,9 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, storage_key, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").MapScanCAS(existing)
+	`, orgID.String(), blockID, storageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
 	}
@@ -1691,7 +1697,9 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 			SET storage_class = ?, storage_key = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
-		`, effectiveStorageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).MapScanCAS(updateState)
+		`, effectiveStorageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).
+			SerialConsistency(gocql.Serial).
+			MapScanCAS(updateState)
 		if err != nil {
 			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
 		}
@@ -1717,7 +1725,9 @@ func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, bloc
 		SET external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF EXISTS
-	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).MapScanCAS(map[string]interface{}{})
+	`, externalSHA1, S3OrphanPhasePendingMappingCleanup, now, "", orgID.String(), blockID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("mark S3 orphan mapping cleanup pending org=%s block=%s: %w", orgID, blockID, err)
 	}
@@ -1841,7 +1851,9 @@ func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, 
 		SET last_attempt_at = ?, retry_count = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 		IF first_seen_at = ?
-	`, ttl, now, prev+1, errMsg, orgID.String(), blockID, expectedFirstSeenAt).MapScanCAS(map[string]interface{}{})
+	`, ttl, now, prev+1, errMsg, orgID.String(), blockID, expectedFirstSeenAt).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("failed to record S3 orphan attempt: %w", err)
 	}
@@ -2054,7 +2066,9 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string,
 		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state = ? AND gc_claim_id = ? AND gc_claimed_at = ?
-	`, orgID.String(), blockID, db.BlockGCStateDeleting, gcClaimID, gcClaimedAt).MapScanCAS(map[string]interface{}{})
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, gcClaimID, gcClaimedAt).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return BlockClaimAbsent, err
 	}
@@ -2305,7 +2319,9 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID stri
 		UPDATE blocks SET gc_state = ?, gc_claim_id = ?, gc_claimed_at = ?
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state != ?
-	`, db.BlockGCStateDeleting, claimID, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).MapScanCAS(existing)
+	`, db.BlockGCStateDeleting, claimID, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(existing)
 	if err != nil {
 		return false, err
 	}
@@ -2329,7 +2345,9 @@ func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID str
 		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state = ? AND gc_claim_id = ?
-	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return err
 	}
@@ -2348,7 +2366,9 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID s
 	applied, err := s.db.Session().Query(`
 		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
 		IF gc_state = ? AND gc_claim_id = ?
-	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		log.Printf("[GC Store] Warning: claim succeeded but conditional DELETE failed for block %s: %v", blockID, err)
 		return err

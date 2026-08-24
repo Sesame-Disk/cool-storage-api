@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-23 - P0/R12 serial-phase prerequisite
+
+Pinned the 11 conditional `blocks` mutations and 4 canonical `gc_s3_orphans`
+mutations to `SerialConsistency(gocql.Serial)`, with the 2 `gc_block_candidates`
+mutations included as adjacent lifecycle hardening. Added an AST/source guard that
+checks operation identity, discovery and the explicit serial pin, including
+mutation-verified protection against `LOCAL_SERIAL` or a missing pin.
+
+This does not change regular commit consistency, settlement, physical incarnation
+identity or destructive-GC activation. P2 remains the next X1 tranche.
+
 ## 2026-08-23 - Merge-readiness pass: source-of-record repair and DLQ refusal contract
 
 Closing review follow-ups on the readiness branch. No change to the established

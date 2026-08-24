@@ -199,7 +199,7 @@ func TestLogCassandraRuntimeConfigWarnsOnLocalSerialInMultiregion(t *testing.T) 
 	if !strings.Contains(output, "multi-region keyspace replication") {
 		t.Fatalf("logCassandraRuntimeConfig() output = %q, want warning context about keyspace replication", output)
 	}
-	if !strings.Contains(output, "LWT/CAS will only serialize within the local DC") {
+	if !strings.Contains(output, "LWT/CAS without an explicit query override will only serialize within the local DC") {
 		t.Fatalf("logCassandraRuntimeConfig() output = %q, want warning impact statement", output)
 	}
 }

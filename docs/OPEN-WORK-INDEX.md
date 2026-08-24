@@ -162,9 +162,9 @@ new incarnation is created. Closure criteria are in Registry X1.
 
 **Closure options are compared in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md)** (2026-08-14), which replaces the
-abandoned generational-fence ADR. Nothing there is accepted and no X1
-implementation has started; the separate P1 locator-authority foundation does
-not satisfy the X1 closure criteria.
+abandoned generational-fence ADR. No X1 option is accepted. P1 locator authority
+and the P0/R12 serial-phase prerequisite are implemented foundations, not an X1
+closure; P2 mint/install remains pending.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
