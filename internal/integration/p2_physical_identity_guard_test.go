@@ -2,6 +2,7 @@ package integration
 
 import (
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"path/filepath"
 	"strconv"
@@ -31,9 +32,71 @@ func p2FreshInstallWriteTarget(expression ast.Expr) (ast.Node, bool) {
 	}
 }
 
-func p2LiteralTrue(expression ast.Expr) bool {
+func p2LiteralTrue(expression ast.Expr, file *ast.File) bool {
 	identifier, ok := expression.(*ast.Ident)
-	return ok && identifier.Name == "true"
+	if !ok || identifier.Name != "true" || identifier.Obj != nil {
+		return false
+	}
+	for _, imported := range file.Imports {
+		if imported.Name != nil && imported.Name.Name == "true" {
+			return false
+		}
+	}
+	return true
+}
+
+func TestP2LiteralTrueRequiresPredeclaredConstant(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   bool
+	}{
+		{
+			name:   "predeclared",
+			source: `package synthetic; var _ = struct{ FreshInstall bool }{FreshInstall: true}`,
+			want:   true,
+		},
+		{
+			name:   "parameter",
+			source: `package synthetic; func f(true bool) { _ = struct{ FreshInstall bool }{FreshInstall: true} }`,
+		},
+		{
+			name:   "local",
+			source: `package synthetic; func f() { true := false; _ = struct{ FreshInstall bool }{FreshInstall: true} }`,
+		},
+		{
+			name:   "package declaration",
+			source: `package synthetic; var true bool; var _ = struct{ FreshInstall bool }{FreshInstall: true}`,
+		},
+		{
+			name:   "import",
+			source: `package synthetic; import true "example.invalid/true"; var _ = struct{ FreshInstall any }{FreshInstall: true}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+
+			var values []ast.Expr
+			ast.Inspect(file, func(node ast.Node) bool {
+				field, ok := node.(*ast.KeyValueExpr)
+				if ok && field.Key.(*ast.Ident).Name == "FreshInstall" {
+					values = append(values, field.Value)
+				}
+				return true
+			})
+			if len(values) != 1 {
+				t.Fatalf("FreshInstall values = %d, want 1", len(values))
+			}
+			if got := p2LiteralTrue(values[0], file); got != test.want {
+				t.Errorf("p2LiteralTrue() = %v, want %v", got, test.want)
+			}
+		})
+	}
 }
 
 func p2CanonicalTargetType(expression ast.Expr, path string, file *ast.File) bool {
@@ -131,6 +194,12 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 				t.Errorf("%s: tuple-only production materialization wrapper %s bypasses target authority", fset.Position(function.Pos()), symbol)
 			}
 			ast.Inspect(declaration, func(node ast.Node) bool {
+				if identifier, identifierOK := node.(*ast.Ident); identifierOK && identifier.Name == "true" && identifier.Obj != nil && identifier.Obj.Pos() == identifier.Pos() {
+					t.Errorf("%s: %s declares reserved predeclared true identifier", fset.Position(identifier.Pos()), symbol)
+				}
+				if imported, importedOK := node.(*ast.ImportSpec); importedOK && imported.Name != nil && imported.Name.Name == "true" {
+					t.Errorf("%s: %s imports a package as reserved predeclared true identifier", fset.Position(imported.Name.Pos()), symbol)
+				}
 				switch typed := node.(type) {
 				case *ast.ValueSpec:
 					for index, name := range typed.Names {
@@ -138,7 +207,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 							continue
 						}
 						t.Errorf("%s: %s declares reserved FreshInstall authority", fset.Position(name.Pos()), symbol)
-						if len(typed.Names) == len(typed.Values) && p2LiteralTrue(typed.Values[index]) {
+						if len(typed.Names) == len(typed.Values) && p2LiteralTrue(typed.Values[index], file) {
 							freshInstallTrueWrites = append(freshInstallTrueWrites, typed)
 						}
 					}
@@ -146,7 +215,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					for index, lhs := range typed.Lhs {
 						if target, reserved := p2FreshInstallWriteTarget(lhs); reserved {
 							t.Errorf("%s: %s assigns reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
-							if len(typed.Lhs) == len(typed.Rhs) && p2LiteralTrue(typed.Rhs[index]) {
+							if len(typed.Lhs) == len(typed.Rhs) && p2LiteralTrue(typed.Rhs[index], file) {
 								freshInstallTrueWrites = append(freshInstallTrueWrites, typed)
 							}
 						}
@@ -174,7 +243,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 						if !keyed || r24NodeText(t, field.Key) != "FreshInstall" {
 							continue
 						}
-						if !p2LiteralTrue(field.Value) {
+						if !p2LiteralTrue(field.Value, file) {
 							t.Errorf("%s: %s writes reserved FreshInstall authority with a value other than literal true", fset.Position(field.Pos()), symbol)
 							continue
 						}
@@ -269,7 +338,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 							t.Errorf("%s: returned fresh target duplicates %s", fset.Position(field.Pos()), name)
 						}
 						fields[name] = r24NodeText(t, field.Value)
-						if name == "FreshInstall" && p2LiteralTrue(field.Value) {
+						if name == "FreshInstall" && p2LiteralTrue(field.Value, file) {
 							returnedFreshInstall = field
 							freshReturn = returned
 						}
