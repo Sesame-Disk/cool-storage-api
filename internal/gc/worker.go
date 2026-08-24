@@ -1169,8 +1169,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
 	}
-	storageKey := strings.TrimSpace(blockInfo.StorageKey)
-	if storageKey == "" {
+	storageKey := blockInfo.StorageKey
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 			return relErr
 		}

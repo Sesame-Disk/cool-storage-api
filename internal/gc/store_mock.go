@@ -3924,8 +3924,7 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 }
 
 func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
-	storageKey = strings.TrimSpace(storageKey)
-	if storageKey == "" {
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
 	}
 	m.mu.Lock()
@@ -3939,7 +3938,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 		existing.StorageClass = storageClass
-		existing.StorageKey = strings.TrimSpace(storageKey)
+		existing.StorageKey = storageKey
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3952,7 +3951,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
-		StorageKey:    strings.TrimSpace(storageKey),
+		StorageKey:    storageKey,
 		ExternalSHA1:  strings.TrimSpace(externalSHA1),
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),

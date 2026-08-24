@@ -120,6 +120,39 @@ func TestWorker_ProcessBlock_RefusesEmptyStorageKey(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessBlock_RefusesPaddedStorageKeyWithoutRetargeting(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("worker-padded-key")
+	persistedKey := MockCanonicalStorageKey(orgID.String(), blockID) + " "
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.SetBlockStorageKeyForTest(orgID, blockID, persistedKey)
+
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem() error = %v", err)
+	}
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce() error = %v", err)
+	}
+	if got := sp.ScopedBlockDeletes(); len(got) != 0 {
+		t.Fatalf("S3 must not be touched for a padded persisted locator, got %+v", got)
+	}
+	if got := sp.LocatorValidations(); len(got) != 0 {
+		t.Fatalf("padded locator must fail before it can be normalized into validation, got %+v", got)
+	}
+	if block := store.GetBlock(orgID, blockID); block == nil || block.GCState != "" || block.StorageKey != persistedKey {
+		t.Fatalf("canonical row was deleted, claimed, or rewritten: %+v", block)
+	}
+	if got := store.AllS3Orphans(); len(got) != 0 {
+		t.Fatalf("no orphan may be recorded for a padded locator, got %+v", got)
+	}
+}
+
 // The store is resolved during authorization precisely so this case can fail
 // before the lifecycle writes. A class that will not resolve is the reachable
 // degenerate config (a manager with no backend registered for it), and the old
@@ -232,8 +265,10 @@ func TestStartBlockDeleteOrphanRequiresStorageKey(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
 
-	if _, err := store.StartBlockDeleteOrphan(orgID, "blk-no-key", "hot", "   ", "", time.Now().UTC()); err == nil {
-		t.Fatal("StartBlockDeleteOrphan() error = nil, want missing storage key error")
+	for _, storageKey := range []string{"", "   ", "canonical-key ", " canonical-key"} {
+		if _, err := store.StartBlockDeleteOrphan(orgID, "blk-no-key", "hot", storageKey, "", time.Now().UTC()); err == nil {
+			t.Fatalf("StartBlockDeleteOrphan(%q) error = nil, want invalid storage key error", storageKey)
+		}
 	}
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("no orphan row may be created without a storage key, got %d", store.S3OrphanCount())

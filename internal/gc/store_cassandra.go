@@ -1666,8 +1666,7 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 // delete lifecycle. It always resets the phase to pending_s3, even when a
 // stale row from an older delete already exists for the same block_id.
 func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
-	storageKey = strings.TrimSpace(storageKey)
-	if storageKey == "" {
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
 	}
 	externalSHA1 = strings.TrimSpace(externalSHA1)
@@ -2103,7 +2102,6 @@ func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInf
 		return BlockInfo{}, err
 	}
 	info.CreatedAt = createdAt
-	info.StorageKey = strings.TrimSpace(info.StorageKey)
 	info.Sha1 = strings.TrimSpace(sha1)
 	return info, nil
 }

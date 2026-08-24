@@ -210,24 +210,27 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 	}
 
 	session := shareProjectionDBForTest(t).Session()
-	var classA, classB string
-	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, orgA.orgID, blockID).Scan(&classA); err != nil {
+	var classA, classB, keyA, keyB string
+	if err := session.Query(`SELECT storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?`, orgA.orgID, blockID).Scan(&classA, &keyA); err != nil {
 		t.Fatalf("read orgA block class: %v", err)
 	}
-	if err := session.Query(`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`, orgB.orgID, blockID).Scan(&classB); err != nil {
+	if err := session.Query(`SELECT storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?`, orgB.orgID, blockID).Scan(&classB, &keyB); err != nil {
 		t.Fatalf("read orgB block class: %v", err)
 	}
 	if classA == "" || classA != classB {
 		t.Fatalf("test requires one shared storage class, orgA=%q orgB=%q", classA, classB)
 	}
-	if storeA.StorageKeyForHash(blockID) == storeB.StorageKeyForHash(blockID) {
+	if keyA == keyB {
 		t.Fatal("precondition failed: org-scoped physical keys are equal")
 	}
-	for label, blockStore := range map[string]*storage.BlockStore{
-		"orgA": storeA,
-		"orgB": storeB,
+	for label, target := range map[string]struct {
+		store *storage.BlockStore
+		key   string
+	}{
+		"orgA": {store: storeA, key: keyA},
+		"orgB": {store: storeB, key: keyB},
 	} {
-		if exists, err := blockStore.BlockExists(ctx, blockID); err != nil || !exists {
+		if exists, err := target.store.ObjectExists(ctx, target.key); err != nil || !exists {
 			t.Fatalf("%s physical object missing before GC: exists=%v err=%v", label, exists, err)
 		}
 	}
@@ -321,7 +324,7 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("orgA BlockExists: %v", err)
 		}
-		physicalExists, err := storeA.BlockExists(ctx, blockID)
+		physicalExists, err := storeA.ObjectExists(ctx, keyA)
 		if err != nil {
 			t.Fatalf("orgA S3 BlockExists: %v", err)
 		}
@@ -335,7 +338,7 @@ func TestGC_CrossOrgIdenticalBlockDeleteIsolation(t *testing.T) {
 	if exists, err := store.BlockExists(orgBUUID, blockID); err != nil || !exists {
 		t.Fatalf("orgB canonical block lost: exists=%v err=%v", exists, err)
 	}
-	if exists, err := storeB.BlockExists(ctx, blockID); err != nil || !exists {
+	if exists, err := storeB.ObjectExists(ctx, keyB); err != nil || !exists {
 		t.Fatalf("orgB physical block lost: exists=%v err=%v", exists, err)
 	}
 	orgBRef := db.BlockReferrerForFSObject(repoB, fileFSID)
@@ -361,12 +364,12 @@ func discoverStorageClass(t *testing.T) string {
 	bs := newVerificationBlockStore(t, orgID)
 	_, realBlockID := uploadUniqueFile(t, adminClient, repoID, "discover.txt", "/")
 
-	var storageClass string
+	var storageClass, storageKey string
 	session := shareProjectionDBForTest(t).Session()
 	if err := session.Query(
-		`SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?`,
+		`SELECT storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?`,
 		orgID, realBlockID,
-	).Scan(&storageClass); err != nil {
+	).Scan(&storageClass, &storageKey); err != nil {
 		t.Fatalf("read storage_class for real block: %v", err)
 	}
 	if storageClass == "" {
@@ -376,7 +379,7 @@ func discoverStorageClass(t *testing.T) string {
 	// Self-check: the real block the server just wrote must be visible through our
 	// verification BlockStore. If not, our env points at a different bucket than
 	// the server and any S3 assertion below would be meaningless — skip instead.
-	exists, err := bs.BlockExists(ctx, realBlockID)
+	exists, err := bs.ObjectExists(ctx, storageKey)
 	if err != nil {
 		t.Fatalf("verification BlockStore lookup of real block: %v", err)
 	}

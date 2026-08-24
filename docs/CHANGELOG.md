@@ -8,6 +8,37 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-24 - P2/R9/R24 minted canonical install closure
+
+Closed the P2 canonical-install tranche. Rowless materialization attempts now
+mint distinct physical keys, PUT and persist the same exact tuple, and compete
+through one non-idempotent global-SERIAL `INSERT ... IF NOT EXISTS`. Unknown LWT
+responses receive one SERIAL settlement read and are never resubmitted. Direct
+and settled known losers can remove only their own exact object; ambiguous
+outcomes retain bytes.
+
+True lost-response injection remains unit-test fault injection: Cassandra cannot
+portably be forced to apply an LWT while dropping only its client response. The
+matrix covers settled own tuple, other tuple, no row and unavailable settlement
+through the install seams; the real service test covers the concurrent Paxos
+winner and physical cleanup boundary.
+
+Added a real Cassandra/MinIO two-writer race proving distinct candidates, one
+canonical row, complete tuple agreement, exact loser cleanup and unchanged winner
+bytes. AST guards now pin the install/settlement driver configuration, prohibit
+authority sites from deriving `StorageKeyForHash`, and permit minting only in the
+rowless branch. Compatibility tests cover legacy and minted read/HEAD,
+reuse/repair and GC validation.
+
+The combined audit found and fixed one additional exact-identity defect: DB and
+GC paths trimmed persisted `storage_key` values, which could retarget a malformed
+row to different bytes. They now preserve exact values and fail closed on padding.
+
+Scope is deliberately narrow: P2, R9 and R24 are closed. P3
+(R10/R13/R17), P4 (R14/R19/R20/R26), X1, arbitrary locator migration and
+destructive-GC activation remain open. `GC_ENABLED=false` remains mandatory on
+every replica in every DC.
+
 ## 2026-08-23 - P0/R12 serial-phase prerequisite
 
 Pinned the 11 conditional `blocks` mutations and 4 canonical `gc_s3_orphans`

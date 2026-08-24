@@ -679,8 +679,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	if storageClass == "" {
 		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
 	}
-	storageKey = strings.TrimSpace(storageKey)
-	if storageKey == "" {
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		return fmt.Errorf("%w: missing canonical storage key for block %s", ErrBlockMetadataPermanent, blockID)
 	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
@@ -868,8 +867,8 @@ func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1, sto
 	if !config.IsCanonicalStorageClassName(row.StorageClass) {
 		return fmt.Errorf("%w: block %s has non-canonical storage class %q", ErrBlockMetadataPermanent, blockID, row.StorageClass)
 	}
-	currentStorageKey := strings.TrimSpace(row.StorageKey)
-	if currentStorageKey == "" {
+	currentStorageKey := row.StorageKey
+	if currentStorageKey == "" || strings.TrimSpace(currentStorageKey) != currentStorageKey {
 		return fmt.Errorf("%w: block %s has empty canonical storage key", ErrBlockMetadataPermanent, blockID)
 	}
 	if storageKey != "" && currentStorageKey != storageKey {
@@ -1128,12 +1127,12 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 		Sha1:         strings.TrimSpace(metadata.Sha1),
 		SizeBytes:    metadata.SizeBytes,
 		StorageClass: metadata.StorageClass,
-		StorageKey:   strings.TrimSpace(metadata.StorageKey),
+		StorageKey:   metadata.StorageKey,
 	}
 	if !metadata.StorageClassPresent || probe.StorageClass == "" {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
 	}
-	if probe.StorageKey == "" {
+	if probe.StorageKey == "" || strings.TrimSpace(probe.StorageKey) != probe.StorageKey {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage key", blockID)
 	}
 	// A stored class that is not canonical cannot name a physical namespace, and the

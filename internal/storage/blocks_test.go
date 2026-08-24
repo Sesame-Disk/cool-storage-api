@@ -422,39 +422,40 @@ func (b *recordingBlockBackend) snapshot() []string {
 func TestBlockStoreExplicitStorageKeyOperations(t *testing.T) {
 	blockStore, backend := newRecordingBlockStore(t, "blocks/")
 	ctx := context.Background()
-	key := blockStore.StorageKeyForHash(testHash64)
-
-	if got, err := blockStore.PutObjectAutoDirect(ctx, key, []byte("payload")); err != nil || got != key {
-		t.Fatalf("PutObjectAutoDirect() = %q, %v, want %q, nil", got, err, key)
+	legacyKey := blockStore.StorageKeyForHash(testHash64)
+	mintedKey := legacyKey + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+	var want []string
+	for _, key := range []string{legacyKey, mintedKey} {
+		if got, err := blockStore.PutObjectAutoDirect(ctx, key, []byte("payload")); err != nil || got != key {
+			t.Fatalf("PutObjectAutoDirect(%q) = %q, %v", key, got, err)
+		}
+		data, err := blockStore.GetBlockByStorageKey(ctx, key)
+		if err != nil || string(data) != "payload" {
+			t.Fatalf("GetBlockByStorageKey(%q) = %q, %v", key, data, err)
+		}
+		reader, err := blockStore.GetBlockReaderByStorageKey(ctx, key)
+		if err != nil {
+			t.Fatalf("GetBlockReaderByStorageKey(%q) error = %v", key, err)
+		}
+		readerData, readErr := io.ReadAll(reader)
+		_ = reader.Close()
+		if readErr != nil || string(readerData) != "payload" {
+			t.Fatalf("explicit reader for %q = %q, %v", key, readerData, readErr)
+		}
+		size, err := blockStore.GetBlockSizeByStorageKey(ctx, key)
+		if err != nil || size != 7 {
+			t.Fatalf("GetBlockSizeByStorageKey(%q) = %d, %v", key, size, err)
+		}
+		exists, err := blockStore.ObjectExists(ctx, key)
+		if err != nil || !exists {
+			t.Fatalf("ObjectExists(%q) = %t, %v", key, exists, err)
+		}
+		if err := blockStore.DeleteBlockByStorageKey(ctx, key); err != nil {
+			t.Fatalf("DeleteBlockByStorageKey(%q) error = %v", key, err)
+		}
+		wantPath := "/test-bucket/" + key
+		want = append(want, "PUT "+wantPath, "GET "+wantPath, "GET "+wantPath, "HEAD "+wantPath, "HEAD "+wantPath, "DELETE "+wantPath)
 	}
-
-	data, err := blockStore.GetBlockByStorageKey(ctx, key)
-	if err != nil || string(data) != "payload" {
-		t.Fatalf("GetBlockByStorageKey() = %q, %v", data, err)
-	}
-	reader, err := blockStore.GetBlockReaderByStorageKey(ctx, key)
-	if err != nil {
-		t.Fatalf("GetBlockReaderByStorageKey() error = %v", err)
-	}
-	readerData, readErr := io.ReadAll(reader)
-	_ = reader.Close()
-	if readErr != nil || string(readerData) != "payload" {
-		t.Fatalf("explicit reader = %q, %v", readerData, readErr)
-	}
-	size, err := blockStore.GetBlockSizeByStorageKey(ctx, key)
-	if err != nil || size != 7 {
-		t.Fatalf("GetBlockSizeByStorageKey() = %d, %v, want 7, nil", size, err)
-	}
-	exists, err := blockStore.ObjectExists(ctx, key)
-	if err != nil || !exists {
-		t.Fatalf("ObjectExists() = %t, %v, want true, nil", exists, err)
-	}
-	if err := blockStore.DeleteBlockByStorageKey(ctx, key); err != nil {
-		t.Fatalf("DeleteBlockByStorageKey() error = %v", err)
-	}
-
-	wantPath := "/test-bucket/" + key
-	want := []string{"PUT " + wantPath, "GET " + wantPath, "GET " + wantPath, "HEAD " + wantPath, "HEAD " + wantPath, "DELETE " + wantPath}
 	requests := backend.snapshot()
 	if len(requests) != len(want) {
 		t.Fatalf("requests = %v, want %v", requests, want)

@@ -24,6 +24,11 @@ docker compose --profile test run --rm --build go-integration-test
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
+# P2 real Cassandra/MinIO canonical-install race
+docker compose --profile test run --rm --build go-integration-test \
+  go test -tags integration -run '^TestP2ConcurrentCanonicalInstall$' \
+  -v -count=1 -timeout 5m ./internal/integration
+
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 

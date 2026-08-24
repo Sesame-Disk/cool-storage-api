@@ -83,6 +83,11 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 
 	t.Cleanup(func() {
 		database := shareProjectionDBForTest(t)
+		var storageKey string
+		if err := database.Session().Query(
+			`SELECT storage_key FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&storageKey); err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			t.Errorf("cleanup blocks row %s/%s: read storage key: %v", orgID, blockID, err)
+		}
 
 		for _, referrer := range referrers {
 			if err := database.Session().Query(
@@ -110,8 +115,8 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 			t.Errorf("cleanup blocks row %s/%s: %v", orgID, blockID, err)
 		}
 
-		if blockStore != nil {
-			if err := blockStore.DeleteBlockByStorageKey(context.Background(), blockStore.StorageKeyForHash(blockID)); err != nil {
+		if blockStore != nil && storageKey != "" {
+			if err := blockStore.DeleteBlockByStorageKey(context.Background(), storageKey); err != nil {
 				t.Errorf("cleanup S3 object for block %s: %v", blockID, err)
 			}
 		}
@@ -513,9 +518,9 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 	// fixture's evidence that it materialized this org-scoped object, and it carries the
 	// storage_class that says which bucket the object lives in. Without it we would be
 	// deleting a hash we cannot prove this fixture created, from a bucket we are guessing.
-	var externalSHA1 string
+	var externalSHA1, storageKey string
 	switch err := database.Session().Query(
-		`SELECT sha1 FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1); {
+		`SELECT sha1, storage_key FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&externalSHA1, &storageKey); {
 	case errors.Is(err, gocql.ErrNotFound):
 		return // already reclaimed by GC, or never materialized here
 	case err != nil:
@@ -535,7 +540,7 @@ func releaseStagedBlockForTest(t *testing.T, database *dbpkg.DB, orgID, blockID,
 		t.Errorf("cleanup staged block %s/%s: delete blocks row: %v", orgID, blockID, err)
 	}
 	if blockStore != nil {
-		if err := blockStore.DeleteBlockByStorageKey(context.Background(), blockStore.StorageKeyForHash(blockID)); err != nil {
+		if err := blockStore.DeleteBlockByStorageKey(context.Background(), storageKey); err != nil {
 			t.Errorf("cleanup staged block %s/%s: delete S3 object: %v", orgID, blockID, err)
 		}
 	}
@@ -894,10 +899,11 @@ func TestWebBlockUploadDeduplicatesAcrossLibrariesInSameOrg(t *testing.T) {
 		}
 	}
 
-	if exists, err := blockStore.BlockExists(context.Background(), blockID); err != nil {
+	storageKey := canonicalStorageKeyForTest(t, defaultOrgID, blockID)
+	if exists, err := blockStore.ObjectExists(context.Background(), storageKey); err != nil {
 		t.Fatalf("check same-org physical block: %v", err)
 	} else if !exists {
-		t.Fatalf("same-org deduplicated block %s does not exist at %s", blockID, blockStore.StorageKeyForHash(blockID))
+		t.Fatalf("same-org deduplicated block %s does not exist at %s", blockID, storageKey)
 	}
 }
 
@@ -939,21 +945,38 @@ func TestWebBlockUploadIdenticalBytesUseDistinctOrgKeys(t *testing.T) {
 		}
 	}
 
-	defaultKey := defaultStore.StorageKeyForHash(blockID)
-	platformKey := platformStore.StorageKeyForHash(blockID)
+	defaultKey := canonicalStorageKeyForTest(t, defaultOrgID, blockID)
+	platformKey := canonicalStorageKeyForTest(t, platformOrgID, blockID)
 	if defaultKey == platformKey {
 		t.Fatalf("identical bytes in distinct orgs resolved to the same key %q", defaultKey)
 	}
-	for orgID, blockStore := range map[string]*storage.BlockStore{
-		defaultOrgID:  defaultStore,
-		platformOrgID: platformStore,
+	for orgID, target := range map[string]struct {
+		store *storage.BlockStore
+		key   string
+	}{
+		defaultOrgID:  {store: defaultStore, key: defaultKey},
+		platformOrgID: {store: platformStore, key: platformKey},
 	} {
-		if exists, err := blockStore.BlockExists(context.Background(), blockID); err != nil {
+		if exists, err := target.store.ObjectExists(context.Background(), target.key); err != nil {
 			t.Fatalf("check physical block for org %s: %v", orgID, err)
 		} else if !exists {
-			t.Fatalf("physical block for org %s does not exist at %s", orgID, blockStore.StorageKeyForHash(blockID))
+			t.Fatalf("physical block for org %s does not exist at %s", orgID, target.key)
 		}
 	}
+}
+
+func canonicalStorageKeyForTest(t *testing.T, orgID, blockID string) string {
+	t.Helper()
+	var storageKey string
+	if err := shareProjectionDBForTest(t).Session().Query(
+		`SELECT storage_key FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID,
+	).Scan(&storageKey); err != nil {
+		t.Fatalf("read canonical storage key for %s/%s: %v", orgID, blockID, err)
+	}
+	if storageKey == "" {
+		t.Fatalf("canonical storage key for %s/%s is empty", orgID, blockID)
+	}
+	return storageKey
 }
 
 // TestWebBlockUploadCommittedSessionIsTerminal guards that a committed session can

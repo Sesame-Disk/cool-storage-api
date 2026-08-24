@@ -513,7 +513,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyBeforeInsert(t *testing.T) {
 		return false, nil
 	}
 
-	for _, storageKey := range []string{"", "   "} {
+	for _, storageKey := range []string{"", "   ", " key", "key "} {
 		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", storageKey)
 		if err == nil || !strings.Contains(err.Error(), "missing canonical storage key") {
 			t.Fatalf("UpsertBlockMetadata(%q) error = %v, want missing storage key error", storageKey, err)
@@ -545,7 +545,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyOnTheExistingRow(t *testing.T)
 	}
 	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
 		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
-		row.StorageKey = "  "
+		row.StorageKey = " key "
 		return row, true, nil
 	}
 
@@ -1511,7 +1511,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageKey(t *testing.T) {
 		return false, nil
 	}
 
-	for _, storageKey := range []string{"", "   "} {
+	for _, storageKey := range []string{"", "   ", "canonical-key ", " canonical-key"} {
 		probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
 			row := completeProbeMetadataRow("hot")
 			row.SizeBytes = 123
