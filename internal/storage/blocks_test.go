@@ -493,6 +493,7 @@ func TestBlockStoreExplicitStorageKeyGuard(t *testing.T) {
 		{"whitespace", " \t\r\n"},
 		{"foreign org", foreignKey},
 		{"org suffix collision", suffixCollision},
+		{"bare tenant prefix", "blocks/" + testOrgA + "/"},
 	}
 
 	for _, key := range rejected {
@@ -551,6 +552,46 @@ func TestBlockStoreValidatePhysicalLocator(t *testing.T) {
 	}
 	if got := backend.snapshot(); len(got) != 2 {
 		t.Fatalf("structurally valid requests = %v, want 2", got)
+	}
+}
+
+// A short block id makes hashToKey skip the sharded layout and return the bare
+// tenant prefix plus the id, so the deterministic equality is satisfied by a key
+// that addresses nothing in particular. Both cases below passed before the block
+// id was validated first, which is the whole reason the ordering is fixed.
+func TestBlockStoreValidatePhysicalLocatorRejectsMalformedBlockID(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
+	tenantPrefix := "blocks/" + testOrgA + "/"
+
+	malformed := []struct {
+		name    string
+		blockID string
+		key     string
+	}{
+		{"empty id derives the bare prefix", "", tenantPrefix},
+		{"two-char id skips sharding", "ab", tenantPrefix + "ab"},
+		{"three-char id skips sharding", "abc", tenantPrefix + "abc"},
+		{"sha-1 external id", strings.Repeat("a", 40), blockStore.StorageKeyForHash(strings.Repeat("a", 40))},
+		{"64 chars but not hex", strings.Repeat("z", 64), blockStore.StorageKeyForHash(strings.Repeat("z", 64))},
+	}
+	for _, c := range malformed {
+		t.Run(c.name, func(t *testing.T) {
+			if err := blockStore.ValidatePhysicalLocator(c.blockID, c.key); err == nil {
+				t.Fatalf("ValidatePhysicalLocator(%q, %q) error = nil, want malformed block id rejection", c.blockID, c.key)
+			}
+		})
+	}
+
+	// Uppercase hex is a well-formed content address, and its derived key matches
+	// itself, so the validator must not reject it: db.IsSHA256BlockID accepts
+	// either case and the two predicates have to agree.
+	upper := strings.ToUpper(testHash64)
+	if err := blockStore.ValidatePhysicalLocator(upper, blockStore.StorageKeyForHash(upper)); err != nil {
+		t.Fatalf("ValidatePhysicalLocator(uppercase hex) error = %v, want nil", err)
+	}
+
+	if got := backend.snapshot(); len(got) != 0 {
+		t.Fatalf("validation must not touch the backend, got %v", got)
 	}
 }
 

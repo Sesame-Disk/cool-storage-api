@@ -107,14 +107,27 @@ structural prerequisite below. P2 still cannot remove that equality until its
 minted-key format and install properties replace it (see
 ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains disabled in production.
 
-**Structural P2 prerequisite (2026-08-24).** Every exact-key `BlockStore`
+**Structural P2 prerequisite (2026-08-24, PR #184).** Every exact-key `BlockStore`
 operation now validates the raw key against that store's configured prefix plus
-canonical org ID before any backend access. `ValidatePhysicalLocator` centralizes
-the stronger destructive check used by both normal GC deletion and orphan
-recovery: tenant ownership first, then the still-required deterministic
-`K == hashToKey(L)` equality. This removes caller convention as the exact-key
-tenant boundary, but does not mint keys or change P2's definition. P2, R9, R24
-and X1 remain open, and `GC_ENABLED=false` remains mandatory.
+canonical org ID before any backend access, and a key that is exactly the tenant
+prefix — naming no object — is refused with it. `ValidatePhysicalLocator`
+centralizes the stronger destructive check used by both normal GC deletion and
+orphan recovery: a well-formed SHA-256 block id first, then tenant ownership,
+then the still-required deterministic `K == hashToKey(L)` equality. **The block-id
+check is ordered first because the equality is otherwise satisfiable vacuously:**
+`hashToKey` returns the bare tenant prefix plus the id for an id shorter than
+four characters, so `("", "<prefix><org>/")` and `("ab", "<prefix><org>/ab")` both
+derived the key they were then compared against. This removes caller convention as
+the exact-key tenant boundary, but does not mint keys or change P2's definition.
+P2, R9, R24 and X1 remain open, and `GC_ENABLED=false` remains mandatory.
+
+**What PR #184 deliberately did not centralize.** The equality is centralized for
+the two *destructive* callers only. Three non-destructive sites still compare
+`storage_key` against `StorageKeyForHash` inline, and P2 has to change all four
+together: `internal/api/v2/upload_reuse.go` (`EnsureReusableBlockPresent` and
+`StoreUploadedBlockForProbe`) and `internal/streaming/canonical_block_reader.go`.
+A missed site fails closed on every minted key rather than deleting anything, so
+this is a sequencing hazard for P2, not a safety gap in #184.
 
 **The historical risk remains real even though the current greenfield deployment
 contract now prohibits both halves.** An earlier version of this section justified the
@@ -197,10 +210,12 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   `hashToKey(L)`, exact-key delete and recovery are observationally equivalent to
   today's derived delete — same authorization, same object. The deployment is
   observable before identity moves.
-- **Structural prerequisite before P2 (implemented 2026-08-24).** Every exact-key
-  `BlockStore` operation enforces configured prefix + canonical org ID before
-  backend access, and destructive callers share `ValidatePhysicalLocator`. The
-  deterministic equality remains in force; this is not minted-key or install work.
+- **Structural prerequisite before P2 (implemented 2026-08-24, PR #184).** Every
+  exact-key `BlockStore` operation enforces configured prefix + canonical org ID
+  before backend access, and destructive callers share `ValidatePhysicalLocator`,
+  which also requires a well-formed SHA-256 block id. The deterministic equality
+  remains in force at four sites — see the note above for the three P2 must find
+  outside `ValidatePhysicalLocator`. This is not minted-key or install work.
 - **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.

@@ -186,7 +186,18 @@ func (bs *BlockStore) StorageKeyForHash(hash string) string {
 
 // ValidatePhysicalLocator verifies that storageKey belongs to this store's
 // tenant and is the deterministic physical key derived from blockID.
+//
+// blockID is validated FIRST, and that ordering is load-bearing rather than
+// stylistic. hashToKey degrades for a short id — it returns the bare tenant
+// prefix plus the id instead of the sharded layout — so a degenerate blockID
+// derives a degenerate key that the equality below then satisfies vacuously:
+// ValidatePhysicalLocator("", "<prefix><org>/") and ("ab", "<prefix><org>/ab")
+// both used to pass. Rejecting a malformed id up front is what makes the
+// equality mean "this key addresses this block".
 func (bs *BlockStore) ValidatePhysicalLocator(blockID, storageKey string) error {
+	if !isSHA256BlockID(blockID) {
+		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
+	}
 	if err := bs.validateExactStorageKey(storageKey); err != nil {
 		return err
 	}
@@ -361,7 +372,28 @@ func (bs *BlockStore) validateExactStorageKey(storageKey string) error {
 	if !strings.HasPrefix(storageKey, tenantPrefix) {
 		return fmt.Errorf("block storage key %q is outside tenant prefix %q", storageKey, tenantPrefix)
 	}
+	if len(storageKey) == len(tenantPrefix) {
+		return fmt.Errorf("block storage key %q names no object under tenant prefix %q", storageKey, tenantPrefix)
+	}
 	return nil
+}
+
+// isSHA256BlockID mirrors db.IsSHA256BlockID: 64 hex characters, case
+// insensitive, validating content rather than length alone. It is duplicated
+// here on purpose. internal/storage depends only on config and chunker, and
+// importing internal/db — the Cassandra layer that sits ABOVE this one — to
+// test a hex string would invert the layering for three lines. Keep the two
+// predicates in step if either changes.
+func isSHA256BlockID(blockID string) bool {
+	if len(blockID) != 64 {
+		return false
+	}
+	for _, r := range blockID {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // bytesReader wraps []byte to implement io.Reader

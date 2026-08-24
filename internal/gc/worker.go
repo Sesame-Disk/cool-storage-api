@@ -1199,7 +1199,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
 				return relErr
 			}
-			return fmt.Errorf("block %s persisted physical locator %q failed org-scoped validation: %w", item.ItemID, storageKey, validateErr)
+			return fmt.Errorf("block %s persisted physical locator %q failed validation: %w", item.ItemID, storageKey, validateErr)
 		}
 		blockStore = resolved
 	}
@@ -1637,9 +1637,9 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				// Refuse rather than hand an unverified key to S3.
 				if validateErr := blockStore.ValidatePhysicalLocator(canonicalCommit.BlockID, canonicalCommit.StorageKey); validateErr != nil {
 					metrics.GCErrorsTotal.WithLabelValues("s3_orphan_storage_key_mismatch").Inc()
-					log.Printf("[GC Worker] S3 orphan recovery: persisted physical locator %q for org=%s block=%s failed org-scoped validation: %v; retaining cursor", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
+					log.Printf("[GC Worker] S3 orphan recovery: persisted physical locator %q for org=%s block=%s failed validation: %v; retaining cursor", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("canonical S3 orphan physical locator %q for org=%s block=%s failed org-scoped validation: %w", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
+						phaseErr = fmt.Errorf("canonical S3 orphan physical locator %q for org=%s block=%s failed validation: %w", canonicalCommit.StorageKey, canonicalCommit.OrgID, canonicalCommit.BlockID, validateErr)
 					}
 					continue
 				}
