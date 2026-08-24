@@ -89,8 +89,9 @@ stays green — and the original design let a statement disappear in five ways:
   reached Cassandra with the gate green. Each allowlisted batch now also has its
   shape pinned against the real source by
   `TestR12AllowedBatchCASStatementsStayOutOfScope`: statement count, inline
-  literals, the relations it may touch, no `Bind`, no `BatchEntry` — and a new
-  batch allowance without a pinned shape fails the gate.
+  literals, the relations it may touch, no `Bind`, no `BatchEntry` and no direct
+  `Entries` access — and a new batch allowance without a pinned shape fails the
+  gate.
 
   This corrects a claim in the previous revision of this entry, which said
   SesameFS used no conditional batch. It does: the survey behind that sentence

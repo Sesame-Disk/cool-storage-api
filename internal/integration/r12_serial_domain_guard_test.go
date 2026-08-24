@@ -196,8 +196,8 @@ var r12AllowedHardDeleteLockTables = map[string]bool{
 // identifier resolved to a binding that is not the one reaching the call site
 // -- a shadowed name, or a package var that another function can reassign; a
 // table reference spelled with quotes or a keyspace qualifier; and a batch
-// statement added through Batch.Bind or a hand-built BatchEntry rather than
-// Batch.Query.
+// statement added through Batch.Bind, a hand-built BatchEntry, or direct access
+// to Batch.Entries rather than Batch.Query.
 func TestR12SerialDomainGuard(t *testing.T) {
 	discovered := map[string][]r12DiscoveredOperation{}
 	unresolved := map[string][]token.Position{}
@@ -408,6 +408,22 @@ func r12DeclaredSymbols(declaration ast.Decl) map[string]ast.Node {
 		}
 	}
 	return symbols
+}
+
+// r12DirectBatchEntriesSelector finds the exported batch slice access that the
+// general scanner cannot classify. The shape gate has no type information, so
+// any selector named Entries inside an allowlisted batch is rejected.
+func r12DirectBatchEntriesSelector(node ast.Node) *ast.SelectorExpr {
+	var found *ast.SelectorExpr
+	ast.Inspect(node, func(current ast.Node) bool {
+		selector, ok := current.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "Entries" {
+			found = selector
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // r12ScanSyntheticSource classifies a synthetic file exactly as the gate
@@ -1425,9 +1441,10 @@ func TestR12HardDeleteLockTablesAreOutOfScope(t *testing.T) {
 // on, rather than asserting it in a comment: each statement is added with an
 // inline literal through a CQL entry point the scanner reads, every relation
 // named is one the entry is allowed to touch, and the batch neither uses
-// Batch.Bind nor builds BatchEntry values by hand. Scanner coverage of Bind and
-// BatchEntry is the general defense; this is the specific one, so a change to
-// the allowlisted helper has to pass both.
+// Batch.Bind, builds BatchEntry values by hand, or accesses Batch.Entries
+// directly. Scanner coverage of Bind and BatchEntry is the general defense;
+// this is the specific one, so a change to the allowlisted helper has to pass
+// both.
 func TestR12AllowedBatchCASStatementsStayOutOfScope(t *testing.T) {
 	found := map[string]bool{}
 
@@ -1441,6 +1458,14 @@ func TestR12AllowedBatchCASStatementsStayOutOfScope(t *testing.T) {
 				found[symbol] = true
 
 				statements := 0
+				if selector := r12DirectBatchEntriesSelector(node); selector != nil {
+					t.Errorf(
+						"%s: allowlisted batch %s accesses .Entries directly at %s; the pinned shape only permits inline Batch.Query statements",
+						path,
+						symbol,
+						fset.Position(selector.Pos()),
+					)
+				}
 				ast.Inspect(node, func(current ast.Node) bool {
 					if identifier, ok := current.(*ast.Ident); ok && identifier.Name == "BatchEntry" {
 						t.Errorf("%s: allowlisted batch %s builds a BatchEntry at %s; its statements are no longer readable from the call site", path, symbol, fset.Position(identifier.Pos()))
@@ -1504,6 +1529,44 @@ func TestR12AllowedBatchCASStatementsStayOutOfScope(t *testing.T) {
 		if _, pinned := r12AllowedBatchCASShape[symbol]; !pinned {
 			t.Errorf("conditional batch %s is allowlisted (%s) but has no pinned statement shape; add one so the allowance proves what it claims", symbol, allowance.reason)
 		}
+	}
+}
+
+// TestR12AllowedBatchCASShapeRejectsDirectEntries is the synthetic mutation for
+// the allowlisted batch proof. The general scanner deliberately does not model
+// a statement assigned through the driver's exported Entries slice, so this
+// mutation must be rejected by the shape gate instead.
+func TestR12AllowedBatchCASShapeRejectsDirectEntries(t *testing.T) {
+	source := `package p
+
+var relocateLockRowCASFn = func(session S) {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query("INSERT INTO locked_files (repo_id, path) VALUES (?, ?) IF NOT EXISTS")
+	batch.Query("DELETE FROM locked_files WHERE repo_id = ? AND path = ? IF locked_by = ?")
+	batch.Entries[0].Stmt = "UPDATE blocks SET gc_state = ? WHERE org_id = ? IF gc_state = ?"
+	session.MapExecuteBatchCAS(batch, nil)
+}
+`
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "synthetic.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+	var node ast.Node
+	for _, declaration := range file.Decls {
+		if candidate := r12DeclaredSymbols(declaration)["relocateLockRowCASFn"]; candidate != nil {
+			node = candidate
+			break
+		}
+	}
+	if node == nil {
+		t.Fatal("synthetic relocateLockRowCASFn was not found")
+	}
+	if selector := r12DirectBatchEntriesSelector(node); selector == nil {
+		t.Fatal("direct .Entries mutation was not rejected by the batch shape predicate")
+	} else if got := fset.Position(selector.Pos()).Line; got == 0 {
+		t.Fatal("direct .Entries mutation has no source position")
 	}
 }
 
