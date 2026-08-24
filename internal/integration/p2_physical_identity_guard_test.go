@@ -1,13 +1,13 @@
 package integration
 
 import (
-	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -20,16 +20,6 @@ type p2AuthoritySite struct {
 }
 
 const p2TargetPackage = "github.com/Sesame-Disk/sesamefs/internal/api/v2"
-
-type p2NamedType struct {
-	pkg  string
-	name string
-}
-
-type p2TypeAlias struct {
-	name       p2NamedType
-	references []p2NamedType
-}
 
 func p2FreshInstallWriteTarget(expression ast.Expr) (ast.Node, bool) {
 	for {
@@ -57,17 +47,9 @@ func p2FreshInstallWriteTarget(expression ast.Expr) (ast.Node, bool) {
 	}
 }
 
-func p2LiteralTrue(expression ast.Expr, file *ast.File) bool {
+func p2LiteralTrue(expression ast.Expr, info *types.Info) bool {
 	identifier, ok := expression.(*ast.Ident)
-	if !ok || identifier.Name != "true" || identifier.Obj != nil {
-		return false
-	}
-	for _, imported := range file.Imports {
-		if imported.Name != nil && imported.Name.Name == "true" {
-			return false
-		}
-	}
-	return true
+	return ok && info.Uses[identifier] == types.Universe.Lookup("true")
 }
 
 func TestP2LiteralTrueRequiresPredeclaredConstant(t *testing.T) {
@@ -101,10 +83,12 @@ func TestP2LiteralTrueRequiresPredeclaredConstant(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			file, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", test.source, 0)
-			if err != nil {
-				t.Fatalf("parse synthetic source: %v", err)
-			}
+			program := p2ParsePackageProgram(t, map[string]map[string]string{
+				"example.invalid/synthetic": {"synthetic.go": test.source},
+			})
+			pkg := program.packages["example.invalid/synthetic"]
+			program.check(pkg)
+			file := pkg.files[0]
 
 			var values []ast.Expr
 			ast.Inspect(file, func(node ast.Node) bool {
@@ -117,7 +101,7 @@ func TestP2LiteralTrueRequiresPredeclaredConstant(t *testing.T) {
 			if len(values) != 1 {
 				t.Fatalf("FreshInstall values = %d, want 1", len(values))
 			}
-			if got := p2LiteralTrue(values[0], file); got != test.want {
+			if got := p2LiteralTrue(values[0], pkg.info); got != test.want {
 				t.Errorf("p2LiteralTrue() = %v, want %v", got, test.want)
 			}
 		})
@@ -180,32 +164,30 @@ func TestP2IndirectFreshAuthorityMutationsAreDetected(t *testing.T) {
 }
 
 func TestP2PositionalTargetConstructionViaAliasesIsDetected(t *testing.T) {
-	parse := func(path, source string) (*token.FileSet, *ast.File) {
-		t.Helper()
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, source, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		return fset, file
-	}
-
-	_, bridge := parse("bridge.go", `package bridge
+	program := p2ParsePackageProgram(t, map[string]map[string]string{
+		p2TargetPackage: {
+			"target.go": `package v2
+type BlockMaterializationTarget struct { Store any; StorageClass, StorageKey string; FreshInstall bool }`,
+		},
+		"example.invalid/bridge": {
+			"bridge.go": `package bridge
 import v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
-type Target = v2.BlockMaterializationTarget`)
-	consumerFSet, consumer := parse("consumer.go", `package consumer
+type Target = v2.BlockMaterializationTarget`,
+		},
+		"example.invalid/consumer": {
+			"aliases.go": `package consumer
 import bridge "example.invalid/bridge"
+type Targets = []bridge.Target`,
+			"consumer.go": `package consumer
 func f() {
-	type Local = bridge.Target
-	_ = []Local{{nil, "", "", true}}
-}`)
-	aliases := append(
-		p2TypeAliases("example.invalid/bridge", bridge),
-		p2TypeAliases("example.invalid/consumer", consumer)...,
-	)
-	canonical := p2ResolveCanonicalTargetTypes(aliases)
-
-	info := p2ProductionTypeInfo(consumerFSet, "example.invalid/consumer", consumer, canonical)
+	_ = Targets{{nil, "", "", true}}
+}`,
+		},
+	})
+	consumerPackage := program.packages["example.invalid/consumer"]
+	program.check(consumerPackage)
+	target := program.targetType(t)
+	consumer := consumerPackage.filesByName["consumer.go"]
 	var literal *ast.CompositeLit
 	ast.Inspect(consumer, func(node ast.Node) bool {
 		if candidate, ok := node.(*ast.CompositeLit); ok && candidate.Type == nil {
@@ -216,229 +198,154 @@ func f() {
 	if literal == nil {
 		t.Fatal("synthetic positional literal was not found")
 	}
-	if !p2CanonicalTargetLiteral(literal, "example.invalid/consumer", consumer, canonical, info) {
-		t.Fatal("type-elided positional construction through imported and local aliases was not resolved to BlockMaterializationTarget")
+	if !p2CanonicalTargetLiteral(literal, target, consumerPackage.info) {
+		t.Fatal("type-elided positional construction through a cross-file aggregate alias was not resolved to BlockMaterializationTarget")
 	}
 	if _, keyed := literal.Elts[0].(*ast.KeyValueExpr); keyed {
 		t.Fatal("synthetic mutation unexpectedly uses keyed construction")
 	}
 }
 
-func p2NamedTypeReferences(expression ast.Expr, packagePath string, file *ast.File) []p2NamedType {
-	for {
-		switch typed := expression.(type) {
-		case *ast.ParenExpr:
-			expression = typed.X
-		case *ast.IndexExpr:
-			expression = typed.X
-		case *ast.IndexListExpr:
-			expression = typed.X
-		default:
-			goto resolved
-		}
-	}
-
-resolved:
-	if identifier, ok := expression.(*ast.Ident); ok {
-		references := []p2NamedType{{pkg: packagePath, name: identifier.Name}}
-		for _, imported := range file.Imports {
-			importPath, err := strconv.Unquote(imported.Path.Value)
-			if err == nil && imported.Name != nil && imported.Name.Name == "." {
-				references = append(references, p2NamedType{pkg: importPath, name: identifier.Name})
-			}
-		}
-		return references
-	}
-	selector, ok := expression.(*ast.SelectorExpr)
-	if !ok {
-		return nil
-	}
-	qualifier, ok := selector.X.(*ast.Ident)
-	if !ok {
-		return nil
-	}
-	for _, imported := range file.Imports {
-		importPath, err := strconv.Unquote(imported.Path.Value)
-		if err != nil {
-			continue
-		}
-		name := filepath.Base(importPath)
-		if imported.Name != nil {
-			name = imported.Name.Name
-		}
-		if qualifier.Name == name {
-			return []p2NamedType{{pkg: importPath, name: selector.Sel.Name}}
-		}
-	}
-	return nil
+type p2PackageSource struct {
+	path        string
+	name        string
+	fset        *token.FileSet
+	files       []*ast.File
+	filesByName map[string]*ast.File
+	paths       map[*ast.File]string
+	info        *types.Info
+	types       *types.Package
 }
 
-func p2TypeAliases(packagePath string, file *ast.File) []p2TypeAlias {
-	var aliases []p2TypeAlias
-	ast.Inspect(file, func(node ast.Node) bool {
-		typeSpec, ok := node.(*ast.TypeSpec)
-		if !ok {
-			return true
-		}
-		references := p2NamedTypeReferences(typeSpec.Type, packagePath, file)
-		if len(references) != 0 {
-			aliases = append(aliases, p2TypeAlias{
-				name:       p2NamedType{pkg: packagePath, name: typeSpec.Name.Name},
-				references: references,
-			})
-		}
-		return true
-	})
-	return aliases
+type p2PackageProgram struct {
+	packages map[string]*p2PackageSource
+	fallback types.Importer
 }
 
-func p2ResolveCanonicalTargetTypes(aliases []p2TypeAlias) map[p2NamedType]bool {
-	canonical := map[p2NamedType]bool{
-		{pkg: p2TargetPackage, name: "BlockMaterializationTarget"}: true,
-	}
-	for changed := true; changed; {
-		changed = false
-		for _, alias := range aliases {
-			if canonical[alias.name] {
-				continue
+func p2ParsePackageProgram(t *testing.T, sources map[string]map[string]string) *p2PackageProgram {
+	t.Helper()
+	program := &p2PackageProgram{packages: make(map[string]*p2PackageSource), fallback: importer.Default()}
+	for packagePath, files := range sources {
+		pkg := &p2PackageSource{path: packagePath, fset: token.NewFileSet(), filesByName: make(map[string]*ast.File), paths: make(map[*ast.File]string)}
+		for name, source := range files {
+			file, err := parser.ParseFile(pkg.fset, name, source, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", name, err)
 			}
-			for _, reference := range alias.references {
-				if canonical[reference] {
-					canonical[alias.name] = true
-					changed = true
-					break
-				}
-			}
+			pkg.name = file.Name.Name
+			pkg.files = append(pkg.files, file)
+			pkg.filesByName[name] = file
+			pkg.paths[file] = name
 		}
+		program.packages[packagePath] = pkg
 	}
-	return canonical
+	return program
 }
 
-func p2ProductionPackagePath(path string) (string, error) {
+func p2LoadProductionProgram(t *testing.T) *p2PackageProgram {
+	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
-		return "", err
+		t.Fatal(err)
 	}
-	directory, err := filepath.Abs(filepath.Dir(path))
-	if err != nil {
-		return "", err
-	}
-	relative, err := filepath.Rel(root, directory)
-	if err != nil {
-		return "", err
-	}
-	if relative == "." {
-		return "github.com/Sesame-Disk/sesamefs", nil
-	}
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("production source %s is outside repository root", path)
-	}
-	return "github.com/Sesame-Disk/sesamefs/" + filepath.ToSlash(relative), nil
-}
-
-func p2CanonicalTargetTypes(t *testing.T) map[p2NamedType]bool {
-	t.Helper()
-	var aliases []p2TypeAlias
-	r12WalkProductionFiles(t, func(_ *token.FileSet, path string, file *ast.File) {
-		packagePath, err := p2ProductionPackagePath(path)
-		if err != nil {
-			t.Errorf("%s: resolve package path: %v", path, err)
-			return
+	program := &p2PackageProgram{packages: make(map[string]*p2PackageSource), fallback: importer.Default()}
+	skipDirs := map[string]bool{".git": true, "frontend": true, "mobile-frontend": true, "node_modules": true, "vendor": true}
+	scanned := 0
+	err = filepath.Walk(root, func(path string, entry os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		aliases = append(aliases, p2TypeAliases(packagePath, file)...)
+		if entry.IsDir() {
+			if skipDirs[entry.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relative, relErr := filepath.Rel(root, filepath.Dir(path))
+		if relErr != nil {
+			return relErr
+		}
+		packagePath := "github.com/Sesame-Disk/sesamefs"
+		if relative != "." {
+			packagePath += "/" + filepath.ToSlash(relative)
+		}
+		pkg := program.packages[packagePath]
+		if pkg == nil {
+			pkg = &p2PackageSource{path: packagePath, fset: token.NewFileSet(), filesByName: make(map[string]*ast.File), paths: make(map[*ast.File]string)}
+			program.packages[packagePath] = pkg
+		}
+		file, parseErr := parser.ParseFile(pkg.fset, path, nil, 0)
+		if parseErr != nil {
+			t.Errorf("%s: parse: %v", path, parseErr)
+			return nil
+		}
+		if pkg.name != "" && pkg.name != file.Name.Name {
+			t.Errorf("%s: package %s shares production directory with package %s", path, file.Name.Name, pkg.name)
+		}
+		pkg.name = file.Name.Name
+		pkg.files = append(pkg.files, file)
+		pkg.filesByName[filepath.Base(path)] = file
+		pkg.paths[file] = path
+		scanned++
+		return nil
 	})
-	return p2ResolveCanonicalTargetTypes(aliases)
-}
-
-func p2CanonicalTargetType(expression ast.Expr, packagePath string, file *ast.File, canonical map[p2NamedType]bool) bool {
-	for _, reference := range p2NamedTypeReferences(expression, packagePath, file) {
-		if canonical[reference] {
-			return true
-		}
+	if err != nil {
+		t.Fatalf("scan production Go sources: %v", err)
 	}
-	return false
-}
-
-type p2CanonicalImporter struct {
-	canonical map[p2NamedType]bool
-	target    types.Type
-	packages  map[string]*types.Package
-}
-
-func p2NewCanonicalImporter(canonical map[p2NamedType]bool) *p2CanonicalImporter {
-	targetPackage := types.NewPackage(p2TargetPackage, "v2")
-	fields := []*types.Var{
-		types.NewField(token.NoPos, targetPackage, "Store", types.Typ[types.UntypedNil], false),
-		types.NewField(token.NoPos, targetPackage, "StorageClass", types.Typ[types.String], false),
-		types.NewField(token.NoPos, targetPackage, "StorageKey", types.Typ[types.String], false),
-		types.NewField(token.NoPos, targetPackage, "FreshInstall", types.Typ[types.Bool], false),
+	if scanned == 0 {
+		t.Fatal("scanned no production Go sources; P2 guard would pass vacuously")
 	}
-	targetName := types.NewTypeName(token.NoPos, targetPackage, "BlockMaterializationTarget", nil)
-	target := types.NewNamed(targetName, types.NewStruct(fields, nil), nil)
-	targetPackage.Scope().Insert(targetName)
-	targetPackage.MarkComplete()
-	return &p2CanonicalImporter{
-		canonical: canonical,
-		target:    target,
-		packages:  map[string]*types.Package{p2TargetPackage: targetPackage},
-	}
+	return program
 }
 
-func (importer *p2CanonicalImporter) Import(path string) (*types.Package, error) {
-	if imported := importer.packages[path]; imported != nil {
+func (program *p2PackageProgram) Import(path string) (*types.Package, error) {
+	if source := program.packages[path]; source != nil {
+		return program.check(source), nil
+	}
+	if imported, err := program.fallback.Import(path); err == nil {
 		return imported, nil
 	}
-	imported := types.NewPackage(path, filepath.Base(path))
-	for reference := range importer.canonical {
-		if reference.pkg != path {
-			continue
-		}
-		name := types.NewTypeName(token.NoPos, imported, reference.name, nil)
-		types.NewAlias(name, importer.target)
-		imported.Scope().Insert(name)
-	}
-	imported.MarkComplete()
-	importer.packages[path] = imported
-	return imported, nil
+	// Unresolved third-party declarations are irrelevant to target identity.
+	stub := types.NewPackage(path, filepath.Base(path))
+	stub.MarkComplete()
+	return stub, nil
 }
 
-func p2ProductionTypeInfo(fset *token.FileSet, packagePath string, file *ast.File, canonical map[p2NamedType]bool) *types.Info {
-	canonicalImporter := p2NewCanonicalImporter(canonical)
-	checkedPackage := types.NewPackage(packagePath, file.Name.Name)
-	declared := map[string]bool{}
-	for _, declaration := range file.Decls {
-		if typeDeclaration, ok := declaration.(*ast.GenDecl); ok && typeDeclaration.Tok == token.TYPE {
-			for _, specification := range typeDeclaration.Specs {
-				declared[specification.(*ast.TypeSpec).Name.Name] = true
-			}
-		}
+func (program *p2PackageProgram) check(source *p2PackageSource) *types.Package {
+	if source.types != nil {
+		return source.types
 	}
-	for reference := range canonical {
-		if reference.pkg != packagePath || declared[reference.name] {
-			continue
-		}
-		name := types.NewTypeName(token.NoPos, checkedPackage, reference.name, nil)
-		types.NewAlias(name, canonicalImporter.target)
-		checkedPackage.Scope().Insert(name)
+	source.types = types.NewPackage(source.path, source.name)
+	source.info = &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
 	}
-	info := &types.Info{Types: make(map[ast.Expr]types.TypeAndValue)}
-	config := types.Config{
-		Importer: canonicalImporter,
-		Error:    func(error) {},
-	}
-	_ = types.NewChecker(&config, fset, checkedPackage, info).Files([]*ast.File{file})
-	return info
+	config := types.Config{Importer: program, Error: func(error) {}}
+	_ = types.NewChecker(&config, source.fset, source.types, source.info).Files(source.files)
+	return source.types
 }
 
-func p2CanonicalTargetLiteral(literal *ast.CompositeLit, packagePath string, file *ast.File, canonical map[p2NamedType]bool, info *types.Info) bool {
-	if literal.Type != nil {
-		return p2CanonicalTargetType(literal.Type, packagePath, file, canonical)
+func (program *p2PackageProgram) targetType(t *testing.T) types.Type {
+	t.Helper()
+	targetPackage := program.packages[p2TargetPackage]
+	if targetPackage == nil {
+		t.Fatal("P2 target package was not parsed")
 	}
-	typeName, ok := types.Unalias(info.TypeOf(literal)).(*types.Named)
-	if !ok || typeName.Obj().Pkg() == nil {
-		return false
+	checked := program.check(targetPackage)
+	target := checked.Scope().Lookup("BlockMaterializationTarget")
+	if target == nil || target.Type() == nil {
+		t.Fatal("BlockMaterializationTarget was not type-checked")
 	}
-	return canonical[p2NamedType{pkg: typeName.Obj().Pkg().Path(), name: typeName.Obj().Name()}]
+	return types.Unalias(target.Type())
+}
+
+func p2CanonicalTargetLiteral(literal *ast.CompositeLit, target types.Type, info *types.Info) bool {
+	literalType := info.TypeOf(literal)
+	return literalType != nil && types.Identical(types.Unalias(literalType), target)
 }
 
 // TestP2PhysicalIdentityAuthorityGuard binds physical-locator authority to the
@@ -474,214 +381,215 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 	mintInsideRowlessBranch := false
 	var freshInstallTrueWrites []ast.Node
 	var returnedFreshInstall *ast.KeyValueExpr
-	canonicalTargetTypes := p2CanonicalTargetTypes(t)
+	program := p2LoadProductionProgram(t)
+	canonicalTargetType := program.targetType(t)
 
-	r12WalkProductionFiles(t, func(fset *token.FileSet, path string, file *ast.File) {
-		packagePath, err := p2ProductionPackagePath(path)
-		if err != nil {
-			t.Errorf("%s: resolve package path: %v", path, err)
-			return
-		}
-		typeInfo := p2ProductionTypeInfo(fset, packagePath, file, canonicalTargetTypes)
-		for _, declaration := range file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			symbol := "package value"
-			if ok {
-				symbol = r12FunctionName(function)
-			}
-			if ok && forbiddenTupleWrappers[function.Name.Name] {
-				t.Errorf("%s: tuple-only production materialization wrapper %s bypasses target authority", fset.Position(function.Pos()), symbol)
-			}
-			ast.Inspect(declaration, func(node ast.Node) bool {
-				if identifier, identifierOK := node.(*ast.Ident); identifierOK && identifier.Name == "true" && identifier.Obj != nil && identifier.Obj.Pos() == identifier.Pos() {
-					t.Errorf("%s: %s declares reserved predeclared true identifier", fset.Position(identifier.Pos()), symbol)
+	for _, productionPackage := range program.packages {
+		program.check(productionPackage)
+		fset := productionPackage.fset
+		typeInfo := productionPackage.info
+		for _, file := range productionPackage.files {
+			path := productionPackage.paths[file]
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				symbol := "package value"
+				if ok {
+					symbol = r12FunctionName(function)
 				}
-				if imported, importedOK := node.(*ast.ImportSpec); importedOK && imported.Name != nil && imported.Name.Name == "true" {
-					t.Errorf("%s: %s imports a package as reserved predeclared true identifier", fset.Position(imported.Name.Pos()), symbol)
+				if ok && forbiddenTupleWrappers[function.Name.Name] {
+					t.Errorf("%s: tuple-only production materialization wrapper %s bypasses target authority", fset.Position(function.Pos()), symbol)
 				}
-				switch typed := node.(type) {
-				case *ast.ValueSpec:
-					for index, name := range typed.Names {
-						if name.Name != "FreshInstall" {
-							continue
-						}
-						t.Errorf("%s: %s declares reserved FreshInstall authority", fset.Position(name.Pos()), symbol)
-						if len(typed.Names) == len(typed.Values) && p2LiteralTrue(typed.Values[index], file) {
-							freshInstallTrueWrites = append(freshInstallTrueWrites, typed)
-						}
+				ast.Inspect(declaration, func(node ast.Node) bool {
+					if identifier, identifierOK := node.(*ast.Ident); identifierOK && identifier.Name == "true" && identifier.Obj != nil && identifier.Obj.Pos() == identifier.Pos() {
+						t.Errorf("%s: %s declares reserved predeclared true identifier", fset.Position(identifier.Pos()), symbol)
 					}
-				case *ast.AssignStmt:
-					for index, lhs := range typed.Lhs {
-						if target, reserved := p2FreshInstallWriteTarget(lhs); reserved {
-							t.Errorf("%s: %s assigns reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
-							if len(typed.Lhs) == len(typed.Rhs) && p2LiteralTrue(typed.Rhs[index], file) {
+					if imported, importedOK := node.(*ast.ImportSpec); importedOK && imported.Name != nil && imported.Name.Name == "true" {
+						t.Errorf("%s: %s imports a package as reserved predeclared true identifier", fset.Position(imported.Name.Pos()), symbol)
+					}
+					switch typed := node.(type) {
+					case *ast.ValueSpec:
+						for index, name := range typed.Names {
+							if name.Name != "FreshInstall" {
+								continue
+							}
+							t.Errorf("%s: %s declares reserved FreshInstall authority", fset.Position(name.Pos()), symbol)
+							if len(typed.Names) == len(typed.Values) && p2LiteralTrue(typed.Values[index], typeInfo) {
 								freshInstallTrueWrites = append(freshInstallTrueWrites, typed)
 							}
 						}
-					}
-				case *ast.IncDecStmt:
-					if target, reserved := p2FreshInstallWriteTarget(typed.X); reserved {
-						t.Errorf("%s: %s mutates reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
-					}
-				case *ast.RangeStmt:
-					for _, targetExpression := range []ast.Expr{typed.Key, typed.Value} {
-						if targetExpression != nil {
-							if target, reserved := p2FreshInstallWriteTarget(targetExpression); reserved {
-								t.Errorf("%s: %s assigns reserved FreshInstall authority in range", fset.Position(target.Pos()), symbol)
+					case *ast.AssignStmt:
+						for index, lhs := range typed.Lhs {
+							if target, reserved := p2FreshInstallWriteTarget(lhs); reserved {
+								t.Errorf("%s: %s assigns reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
+								if len(typed.Lhs) == len(typed.Rhs) && p2LiteralTrue(typed.Rhs[index], typeInfo) {
+									freshInstallTrueWrites = append(freshInstallTrueWrites, typed)
+								}
 							}
 						}
-					}
-				case *ast.UnaryExpr:
-					if typed.Op == token.AND {
+					case *ast.IncDecStmt:
 						if target, reserved := p2FreshInstallWriteTarget(typed.X); reserved {
-							t.Errorf("%s: %s takes the address of reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
+							t.Errorf("%s: %s mutates reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
 						}
-					}
-				case *ast.CompositeLit:
-					if len(typed.Elts) != 0 && p2CanonicalTargetLiteral(typed, packagePath, file, canonicalTargetTypes, typeInfo) {
-						if _, keyed := typed.Elts[0].(*ast.KeyValueExpr); !keyed {
-							t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(typed.Pos()), symbol)
-						}
-					}
-					for _, element := range typed.Elts {
-						field, keyed := element.(*ast.KeyValueExpr)
-						if !keyed || r24NodeText(t, field.Key) != "FreshInstall" {
-							continue
-						}
-						if !p2LiteralTrue(field.Value, file) {
-							t.Errorf("%s: %s writes reserved FreshInstall authority with a value other than literal true", fset.Position(field.Pos()), symbol)
-							continue
-						}
-						freshInstallTrueWrites = append(freshInstallTrueWrites, field)
-					}
-				}
-				selector, ok := node.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				receiver := r24NodeText(t, selector.X)
-				site := p2AuthoritySite{path: path, symbol: symbol, receiver: receiver, pos: fset.Position(selector.Pos())}
-				switch selector.Sel.Name {
-				case "StorageKeyForHash":
-					storageKeyUses = append(storageKeyUses, site)
-				case "MintStorageKey":
-					if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStore" && receiver == "preferredStore" {
-						mintCount++
-					} else {
-						unexpectedMints = append(unexpectedMints, site)
-					}
-				case "ValidatePhysicalLocator":
-					key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
-					if _, expected := wantValidations[key]; expected {
-						validationCounts[key]++
-					}
-				case "ValidateMintedPhysicalLocator":
-					key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
-					if _, expected := wantMintedValidations[key]; expected {
-						mintedValidationCounts[key]++
-					}
-				}
-				return true
-			})
-
-			if !ok || function.Body == nil || filepath.Base(path) != "upload_reuse.go" || symbol != "ResolveNeedsPutBlockStore" {
-				continue
-			}
-			for _, statement := range function.Body.List {
-				conditional, branchOK := statement.(*ast.IfStmt)
-				if !branchOK || r24NodeText(t, conditional.Cond) != `canonicalClass == ""` {
-					continue
-				}
-				rowlessBranchCount++
-				branchMintCount := 0
-				mintedKey := ""
-				var mintAssignment *ast.AssignStmt
-				var freshReturn *ast.ReturnStmt
-				for _, branchStatement := range conditional.Body.List {
-					assignment, assignmentOK := branchStatement.(*ast.AssignStmt)
-					if assignmentOK && len(assignment.Rhs) == 1 {
-						call, callOK := assignment.Rhs[0].(*ast.CallExpr)
-						var selector *ast.SelectorExpr
-						if callOK {
-							selector, _ = call.Fun.(*ast.SelectorExpr)
-						}
-						if selector != nil && selector.Sel.Name == "MintStorageKey" && r24NodeText(t, selector.X) == "preferredStore" {
-							branchMintCount++
-							if len(call.Args) != 1 || r24NodeText(t, call.Args[0]) != "blockID" {
-								t.Errorf("%s: rowless mint must derive its key from blockID", fset.Position(call.Pos()))
-							}
-							if assignment.Tok != token.DEFINE || len(assignment.Lhs) != 2 {
-								t.Errorf("%s: rowless mint must define local key and error variables", fset.Position(assignment.Pos()))
-							} else if key, keyOK := assignment.Lhs[0].(*ast.Ident); !keyOK || key.Name == "_" {
-								t.Errorf("%s: rowless mint result must bind a specific local key variable", fset.Position(assignment.Pos()))
-							} else {
-								mintedKey = key.Name
-								mintAssignment = assignment
+					case *ast.RangeStmt:
+						for _, targetExpression := range []ast.Expr{typed.Key, typed.Value} {
+							if targetExpression != nil {
+								if target, reserved := p2FreshInstallWriteTarget(targetExpression); reserved {
+									t.Errorf("%s: %s assigns reserved FreshInstall authority in range", fset.Position(target.Pos()), symbol)
+								}
 							}
 						}
-					}
-					returned, returnOK := branchStatement.(*ast.ReturnStmt)
-					if !returnOK {
-						continue
-					}
-					if len(returned.Results) != 2 {
-						continue
-					}
-					literal, literalOK := returned.Results[0].(*ast.CompositeLit)
-					nilError, nilOK := returned.Results[1].(*ast.Ident)
-					if !literalOK || !p2CanonicalTargetType(literal.Type, packagePath, file, canonicalTargetTypes) || !nilOK || nilError.Name != "nil" {
-						continue
-					}
-					fields := map[string]string{}
-					for _, element := range literal.Elts {
-						field, keyed := element.(*ast.KeyValueExpr)
-						if !keyed {
-							continue
-						}
-						name := r24NodeText(t, field.Key)
-						if _, duplicate := fields[name]; duplicate {
-							t.Errorf("%s: returned fresh target duplicates %s", fset.Position(field.Pos()), name)
-						}
-						fields[name] = r24NodeText(t, field.Value)
-						if name == "FreshInstall" && p2LiteralTrue(field.Value, file) {
-							returnedFreshInstall = field
-							freshReturn = returned
-						}
-					}
-					if len(fields) != 4 || fields["Store"] != "preferredStore" || fields["StorageClass"] != "preferredClass" || fields["StorageKey"] != mintedKey || fields["FreshInstall"] != "true" {
-						t.Errorf("%s: returned fresh target = Store:%s StorageClass:%s StorageKey:%s FreshInstall:%s, want preferredStore/preferredClass/%s/true only", fset.Position(literal.Pos()), fields["Store"], fields["StorageClass"], fields["StorageKey"], fields["FreshInstall"], mintedKey)
-					}
-					if mintAssignment == nil || mintAssignment.Pos() >= returned.Pos() {
-						t.Errorf("%s: returned fresh target is not dataflow-bound to a preceding rowless mint", fset.Position(literal.Pos()))
-					}
-				}
-				mintedKeyWrites := 0
-				mintedKeyUses := 0
-				ast.Inspect(conditional.Body, func(child ast.Node) bool {
-					if assignment, assignmentOK := child.(*ast.AssignStmt); assignmentOK {
-						for _, lhs := range assignment.Lhs {
-							identifier, identifierOK := lhs.(*ast.Ident)
-							if identifierOK && identifier.Name == mintedKey {
-								mintedKeyWrites++
+					case *ast.UnaryExpr:
+						if typed.Op == token.AND {
+							if target, reserved := p2FreshInstallWriteTarget(typed.X); reserved {
+								t.Errorf("%s: %s takes the address of reserved FreshInstall authority", fset.Position(target.Pos()), symbol)
 							}
 						}
+					case *ast.CompositeLit:
+						if len(typed.Elts) != 0 && p2CanonicalTargetLiteral(typed, canonicalTargetType, typeInfo) {
+							if _, keyed := typed.Elts[0].(*ast.KeyValueExpr); !keyed {
+								t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(typed.Pos()), symbol)
+							}
+						}
+						for _, element := range typed.Elts {
+							field, keyed := element.(*ast.KeyValueExpr)
+							if !keyed || r24NodeText(t, field.Key) != "FreshInstall" {
+								continue
+							}
+							if !p2LiteralTrue(field.Value, typeInfo) {
+								t.Errorf("%s: %s writes reserved FreshInstall authority with a value other than literal true", fset.Position(field.Pos()), symbol)
+								continue
+							}
+							freshInstallTrueWrites = append(freshInstallTrueWrites, field)
+						}
 					}
-					identifier, ok := child.(*ast.Ident)
-					if ok && identifier.Name == mintedKey {
-						mintedKeyUses++
+					selector, ok := node.(*ast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					receiver := r24NodeText(t, selector.X)
+					site := p2AuthoritySite{path: path, symbol: symbol, receiver: receiver, pos: fset.Position(selector.Pos())}
+					switch selector.Sel.Name {
+					case "StorageKeyForHash":
+						storageKeyUses = append(storageKeyUses, site)
+					case "MintStorageKey":
+						if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStore" && receiver == "preferredStore" {
+							mintCount++
+						} else {
+							unexpectedMints = append(unexpectedMints, site)
+						}
+					case "ValidatePhysicalLocator":
+						key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
+						if _, expected := wantValidations[key]; expected {
+							validationCounts[key]++
+						}
+					case "ValidateMintedPhysicalLocator":
+						key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
+						if _, expected := wantMintedValidations[key]; expected {
+							mintedValidationCounts[key]++
+						}
 					}
 					return true
 				})
-				if mintedKey != "" && mintedKeyWrites != 1 {
-					t.Errorf("%s: minted key variable %s has %d assignments, want only the preferredStore.MintStorageKey assignment", fset.Position(conditional.Pos()), mintedKey, mintedKeyWrites)
+
+				if !ok || function.Body == nil || filepath.Base(path) != "upload_reuse.go" || symbol != "ResolveNeedsPutBlockStore" {
+					continue
 				}
-				if mintedKey != "" && mintedKeyUses != 2 {
-					t.Errorf("%s: minted key variable %s has %d AST uses, want definition plus returned StorageKey only", fset.Position(conditional.Pos()), mintedKey, mintedKeyUses)
+				for _, statement := range function.Body.List {
+					conditional, branchOK := statement.(*ast.IfStmt)
+					if !branchOK || r24NodeText(t, conditional.Cond) != `canonicalClass == ""` {
+						continue
+					}
+					rowlessBranchCount++
+					branchMintCount := 0
+					mintedKey := ""
+					var mintAssignment *ast.AssignStmt
+					var freshReturn *ast.ReturnStmt
+					for _, branchStatement := range conditional.Body.List {
+						assignment, assignmentOK := branchStatement.(*ast.AssignStmt)
+						if assignmentOK && len(assignment.Rhs) == 1 {
+							call, callOK := assignment.Rhs[0].(*ast.CallExpr)
+							var selector *ast.SelectorExpr
+							if callOK {
+								selector, _ = call.Fun.(*ast.SelectorExpr)
+							}
+							if selector != nil && selector.Sel.Name == "MintStorageKey" && r24NodeText(t, selector.X) == "preferredStore" {
+								branchMintCount++
+								if len(call.Args) != 1 || r24NodeText(t, call.Args[0]) != "blockID" {
+									t.Errorf("%s: rowless mint must derive its key from blockID", fset.Position(call.Pos()))
+								}
+								if assignment.Tok != token.DEFINE || len(assignment.Lhs) != 2 {
+									t.Errorf("%s: rowless mint must define local key and error variables", fset.Position(assignment.Pos()))
+								} else if key, keyOK := assignment.Lhs[0].(*ast.Ident); !keyOK || key.Name == "_" {
+									t.Errorf("%s: rowless mint result must bind a specific local key variable", fset.Position(assignment.Pos()))
+								} else {
+									mintedKey = key.Name
+									mintAssignment = assignment
+								}
+							}
+						}
+						returned, returnOK := branchStatement.(*ast.ReturnStmt)
+						if !returnOK {
+							continue
+						}
+						if len(returned.Results) != 2 {
+							continue
+						}
+						literal, literalOK := returned.Results[0].(*ast.CompositeLit)
+						nilError, nilOK := returned.Results[1].(*ast.Ident)
+						if !literalOK || !p2CanonicalTargetLiteral(literal, canonicalTargetType, typeInfo) || !nilOK || nilError.Name != "nil" {
+							continue
+						}
+						fields := map[string]string{}
+						for _, element := range literal.Elts {
+							field, keyed := element.(*ast.KeyValueExpr)
+							if !keyed {
+								continue
+							}
+							name := r24NodeText(t, field.Key)
+							if _, duplicate := fields[name]; duplicate {
+								t.Errorf("%s: returned fresh target duplicates %s", fset.Position(field.Pos()), name)
+							}
+							fields[name] = r24NodeText(t, field.Value)
+							if name == "FreshInstall" && p2LiteralTrue(field.Value, typeInfo) {
+								returnedFreshInstall = field
+								freshReturn = returned
+							}
+						}
+						if len(fields) != 4 || fields["Store"] != "preferredStore" || fields["StorageClass"] != "preferredClass" || fields["StorageKey"] != mintedKey || fields["FreshInstall"] != "true" {
+							t.Errorf("%s: returned fresh target = Store:%s StorageClass:%s StorageKey:%s FreshInstall:%s, want preferredStore/preferredClass/%s/true only", fset.Position(literal.Pos()), fields["Store"], fields["StorageClass"], fields["StorageKey"], fields["FreshInstall"], mintedKey)
+						}
+						if mintAssignment == nil || mintAssignment.Pos() >= returned.Pos() {
+							t.Errorf("%s: returned fresh target is not dataflow-bound to a preceding rowless mint", fset.Position(literal.Pos()))
+						}
+					}
+					mintedKeyWrites := 0
+					mintedKeyUses := 0
+					ast.Inspect(conditional.Body, func(child ast.Node) bool {
+						if assignment, assignmentOK := child.(*ast.AssignStmt); assignmentOK {
+							for _, lhs := range assignment.Lhs {
+								identifier, identifierOK := lhs.(*ast.Ident)
+								if identifierOK && identifier.Name == mintedKey {
+									mintedKeyWrites++
+								}
+							}
+						}
+						identifier, ok := child.(*ast.Ident)
+						if ok && identifier.Name == mintedKey {
+							mintedKeyUses++
+						}
+						return true
+					})
+					if mintedKey != "" && mintedKeyWrites != 1 {
+						t.Errorf("%s: minted key variable %s has %d assignments, want only the preferredStore.MintStorageKey assignment", fset.Position(conditional.Pos()), mintedKey, mintedKeyWrites)
+					}
+					if mintedKey != "" && mintedKeyUses != 2 {
+						t.Errorf("%s: minted key variable %s has %d AST uses, want definition plus returned StorageKey only", fset.Position(conditional.Pos()), mintedKey, mintedKeyUses)
+					}
+					mintInsideRowlessBranch = branchMintCount == 1 && mintedKey != "" && mintAssignment != nil && freshReturn != nil
 				}
-				mintInsideRowlessBranch = branchMintCount == 1 && mintedKey != "" && mintAssignment != nil && freshReturn != nil
 			}
 		}
-	})
+	}
 
 	for _, site := range storageKeyUses {
 		t.Errorf("%s: %s references %s.StorageKeyForHash; physical authority must use ValidatePhysicalLocator", site.pos, site.symbol, site.receiver)
