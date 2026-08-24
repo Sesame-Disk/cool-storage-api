@@ -19,7 +19,11 @@ type p2AuthoritySite struct {
 	pos      token.Position
 }
 
-const p2TargetPackage = "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+const (
+	p2TargetPackage  = "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	p2StoragePackage = "github.com/Sesame-Disk/sesamefs/internal/storage"
+	p2GCPackage      = "github.com/Sesame-Disk/sesamefs/internal/gc"
+)
 
 func p2FreshInstallWriteTarget(expression ast.Expr) (ast.Node, bool) {
 	for {
@@ -198,11 +202,89 @@ func f() {
 	if literal == nil {
 		t.Fatal("synthetic positional literal was not found")
 	}
-	if !p2CanonicalTargetLiteral(literal, target, consumerPackage.info) {
+	if !p2TargetLikeLiteral(literal, target, consumerPackage.info) {
 		t.Fatal("type-elided positional construction through a cross-file aggregate alias was not resolved to BlockMaterializationTarget")
 	}
 	if _, keyed := literal.Elts[0].(*ast.KeyValueExpr); keyed {
 		t.Fatal("synthetic mutation unexpectedly uses keyed construction")
+	}
+}
+
+func TestP2DistinctTargetConversionIsDetected(t *testing.T) {
+	program := p2ParsePackageProgram(t, map[string]map[string]string{
+		p2TargetPackage: {
+			"target.go": `package v2
+type BlockMaterializationTarget struct { Store any; StorageClass, StorageKey string; FreshInstall bool }`,
+		},
+		"example.invalid/consumer": {
+			"consumer.go": `package consumer
+import v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+type distinctTarget v2.BlockMaterializationTarget
+func f() v2.BlockMaterializationTarget {
+	return v2.BlockMaterializationTarget(distinctTarget{nil, "", "", true})
+}`,
+		},
+	})
+	consumerPackage := program.packages["example.invalid/consumer"]
+	program.check(consumerPackage)
+	target := program.targetType(t)
+	consumer := consumerPackage.filesByName["consumer.go"]
+	var literal *ast.CompositeLit
+	var conversion *ast.CallExpr
+	ast.Inspect(consumer, func(node ast.Node) bool {
+		switch candidate := node.(type) {
+		case *ast.CompositeLit:
+			literal = candidate
+		case *ast.CallExpr:
+			conversion = candidate
+		}
+		return true
+	})
+	if literal == nil || !p2TargetLikeLiteral(literal, target, consumerPackage.info) {
+		t.Fatal("distinct defined target construction was not treated as target-like")
+	}
+	if conversion == nil || !p2TargetLikeConversion(conversion, target, consumerPackage.info) {
+		t.Fatal("conversion from a distinct defined target was not treated as a target authority conversion")
+	}
+}
+
+func TestP2ValidatorSelectionRejectsUnrelatedReceiver(t *testing.T) {
+	program := p2ParsePackageProgram(t, map[string]map[string]string{
+		p2StoragePackage: {
+			"blocks.go": `package storage
+type BlockStore struct{}
+func (*BlockStore) ValidatePhysicalLocator(string, string) error { return nil }`,
+		},
+		"example.invalid/consumer": {
+			"consumer.go": `package consumer
+import "github.com/Sesame-Disk/sesamefs/internal/storage"
+type unrelated struct{}
+func (*unrelated) ValidatePhysicalLocator(string, string) error { return nil }
+func f(store *storage.BlockStore, other *unrelated) {
+	_ = store.ValidatePhysicalLocator("", "")
+	_ = other.ValidatePhysicalLocator("", "")
+}`,
+		},
+	})
+	consumerPackage := program.packages["example.invalid/consumer"]
+	program.check(consumerPackage)
+	blockStore := program.namedType(t, p2StoragePackage, "BlockStore")
+	var selectors []*ast.SelectorExpr
+	ast.Inspect(consumerPackage.filesByName["consumer.go"], func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "ValidatePhysicalLocator" {
+			selectors = append(selectors, selector)
+		}
+		return true
+	})
+	if len(selectors) != 2 {
+		t.Fatalf("validator selectors = %d, want 2", len(selectors))
+	}
+	if !p2MethodSelectionOn(selectors[0], "ValidatePhysicalLocator", types.NewPointer(blockStore), consumerPackage.info) {
+		t.Fatal("storage.BlockStore validator selection was not recognized")
+	}
+	if p2MethodSelectionOn(selectors[1], "ValidatePhysicalLocator", types.NewPointer(blockStore), consumerPackage.info) {
+		t.Fatal("same-named validator on an unrelated receiver was accepted")
 	}
 }
 
@@ -320,9 +402,10 @@ func (program *p2PackageProgram) check(source *p2PackageSource) *types.Package {
 	}
 	source.types = types.NewPackage(source.path, source.name)
 	source.info = &types.Info{
-		Types: make(map[ast.Expr]types.TypeAndValue),
-		Defs:  make(map[*ast.Ident]types.Object),
-		Uses:  make(map[*ast.Ident]types.Object),
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
 	config := types.Config{Importer: program, Error: func(error) {}}
 	_ = types.NewChecker(&config, source.fset, source.types, source.info).Files(source.files)
@@ -331,21 +414,50 @@ func (program *p2PackageProgram) check(source *p2PackageSource) *types.Package {
 
 func (program *p2PackageProgram) targetType(t *testing.T) types.Type {
 	t.Helper()
-	targetPackage := program.packages[p2TargetPackage]
-	if targetPackage == nil {
-		t.Fatal("P2 target package was not parsed")
+	return program.namedType(t, p2TargetPackage, "BlockMaterializationTarget")
+}
+
+func (program *p2PackageProgram) namedType(t *testing.T, packagePath, name string) *types.Named {
+	t.Helper()
+	source := program.packages[packagePath]
+	if source == nil {
+		t.Fatalf("P2 package %s was not parsed", packagePath)
 	}
-	checked := program.check(targetPackage)
-	target := checked.Scope().Lookup("BlockMaterializationTarget")
-	if target == nil || target.Type() == nil {
-		t.Fatal("BlockMaterializationTarget was not type-checked")
+	object := program.check(source).Scope().Lookup(name)
+	if object == nil || object.Type() == nil {
+		t.Fatalf("%s.%s was not type-checked", packagePath, name)
 	}
-	return types.Unalias(target.Type())
+	named, ok := types.Unalias(object.Type()).(*types.Named)
+	if !ok {
+		t.Fatalf("%s.%s has type %T, want named type", packagePath, name, object.Type())
+	}
+	return named
+}
+
+func p2TargetLikeType(candidate, target types.Type) bool {
+	return candidate != nil && target != nil && types.Identical(types.Unalias(candidate).Underlying(), types.Unalias(target).Underlying())
+}
+
+func p2TargetLikeLiteral(literal *ast.CompositeLit, target types.Type, info *types.Info) bool {
+	return p2TargetLikeType(info.TypeOf(literal), target)
 }
 
 func p2CanonicalTargetLiteral(literal *ast.CompositeLit, target types.Type, info *types.Info) bool {
 	literalType := info.TypeOf(literal)
-	return literalType != nil && types.Identical(types.Unalias(literalType), target)
+	return literalType != nil && types.Identical(types.Unalias(literalType), types.Unalias(target))
+}
+
+func p2TargetLikeConversion(call *ast.CallExpr, target types.Type, info *types.Info) bool {
+	return len(call.Args) == 1 && p2TargetLikeType(info.TypeOf(call.Fun), target)
+}
+
+func p2MethodSelectionOn(selector *ast.SelectorExpr, method string, receiver types.Type, info *types.Info) bool {
+	selection := info.Selections[selector]
+	if selection == nil || selection.Kind() != types.MethodVal || !types.Identical(types.Unalias(selection.Recv()), types.Unalias(receiver)) {
+		return false
+	}
+	expected := types.NewMethodSet(receiver).Lookup(nil, method)
+	return expected != nil && selection.Obj() == expected.Obj() && info.Uses[selector.Sel] == expected.Obj()
 }
 
 // TestP2PhysicalIdentityAuthorityGuard binds physical-locator authority to the
@@ -383,6 +495,13 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 	var returnedFreshInstall *ast.KeyValueExpr
 	program := p2LoadProductionProgram(t)
 	canonicalTargetType := program.targetType(t)
+	blockStoreType := program.namedType(t, p2StoragePackage, "BlockStore")
+	blockStorePointer := types.NewPointer(blockStoreType)
+	gcBlockStoreDeleter := program.namedType(t, p2GCPackage, "BlockStoreDeleter")
+	gcBlockStoreContract, ok := gcBlockStoreDeleter.Underlying().(*types.Interface)
+	if !ok || !types.Implements(blockStorePointer, gcBlockStoreContract) {
+		t.Fatal("*storage.BlockStore does not implement the typed gc.BlockStoreDeleter authority contract")
+	}
 
 	for _, productionPackage := range program.packages {
 		program.check(productionPackage)
@@ -445,9 +564,9 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 							}
 						}
 					case *ast.CompositeLit:
-						if len(typed.Elts) != 0 && p2CanonicalTargetLiteral(typed, canonicalTargetType, typeInfo) {
+						if len(typed.Elts) != 0 && p2TargetLikeLiteral(typed, canonicalTargetType, typeInfo) {
 							if _, keyed := typed.Elts[0].(*ast.KeyValueExpr); !keyed {
-								t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(typed.Pos()), symbol)
+								t.Errorf("%s: %s uses positional target-like construction", fset.Position(typed.Pos()), symbol)
 							}
 						}
 						for _, element := range typed.Elts {
@@ -460,6 +579,10 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 								continue
 							}
 							freshInstallTrueWrites = append(freshInstallTrueWrites, field)
+						}
+					case *ast.CallExpr:
+						if p2TargetLikeConversion(typed, canonicalTargetType, typeInfo) {
+							t.Errorf("%s: %s converts a target-like value into fresh authority", fset.Position(typed.Pos()), symbol)
 						}
 					}
 					selector, ok := node.(*ast.SelectorExpr)
@@ -479,12 +602,18 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 						}
 					case "ValidatePhysicalLocator":
 						key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
-						if _, expected := wantValidations[key]; expected {
+						semanticMethod := p2MethodSelectionOn(selector, selector.Sel.Name, blockStorePointer, typeInfo) ||
+							p2MethodSelectionOn(selector, selector.Sel.Name, gcBlockStoreDeleter, typeInfo)
+						if !semanticMethod {
+							t.Errorf("%s: %s.%s does not resolve to the typed BlockStore physical-locator authority", site.pos, receiver, selector.Sel.Name)
+						} else if _, expected := wantValidations[key]; expected {
 							validationCounts[key]++
 						}
 					case "ValidateMintedPhysicalLocator":
 						key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
-						if _, expected := wantMintedValidations[key]; expected {
+						if !p2MethodSelectionOn(selector, selector.Sel.Name, blockStorePointer, typeInfo) {
+							t.Errorf("%s: %s.%s does not resolve to storage.BlockStore authority", site.pos, receiver, selector.Sel.Name)
+						} else if _, expected := wantMintedValidations[key]; expected {
 							mintedValidationCounts[key]++
 						}
 					}
