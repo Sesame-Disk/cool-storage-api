@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -96,6 +97,18 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 		return err
 	}
 	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
+}
+
+var registerUploadedBlockInstallMetadataFn = func(ctx context.Context, h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) db.InstallBlockMetadataResult {
+	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
+	if err != nil {
+		return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataAmbiguous, Cause: err}
+	}
+	return h.db.InstallBlockMetadata(ctx, orgID, representationID, blockID, sha1ID, sizeBytes, db.BlockPhysicalLocation{StorageClass: target.StorageClass, StorageKey: target.StorageKey})
+}
+
+var deleteFreshInstallLoserFn = func(ctx context.Context, target BlockMaterializationTarget) error {
+	return target.Store.DeleteBlockByStorageKey(ctx, target.StorageKey)
 }
 
 // registerUploadedBlockSleepFn is the overridable backoff sleep used by the
@@ -984,10 +997,17 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // first timeout. A permanent metadata failure (db.ErrBlockMetadataPermanent) is
 // returned untagged so it is not retried.
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
+	return h.RegisterUploadedBlockTarget(context.Background(), orgID, libraryID, blockID, operationID, sizeBytes, BlockMaterializationTarget{StorageClass: storageClass, StorageKey: storageKey}, sha1ID)
+}
+
+// RegisterUploadedBlockTarget materializes one exact store observation. A fresh
+// target is single-use: an uncertain INSTALL is never retried here, while a
+// proven loser may clean only the exact object this attempt PUT.
+func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libraryID, blockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
-	if err := registerUploadedBlockAddProvisionalRefFn(h, orgID, blockID, referrer, libraryID, storageClass, expiresAt); err != nil {
+	if err := registerUploadedBlockAddProvisionalRefFn(h, orgID, blockID, referrer, libraryID, target.StorageClass, expiresAt); err != nil {
 		// One logged batch: the reference and its GC tracking either both landed or
 		// neither did, so there is no half-written state to compensate for and a
 		// plain transient retry is safe.
@@ -1005,7 +1025,36 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 
-	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+	if target.FreshInstall {
+		if target.Store == nil {
+			return fmt.Errorf("fresh block %s has no exact PUT store", blockID)
+		}
+		result := registerUploadedBlockInstallMetadataFn(ctx, h, orgID, libraryID, blockID, sha1ID, sizeBytes, target)
+		switch result.Outcome {
+		case db.InstallBlockMetadataApplied:
+			return nil
+		case db.InstallBlockMetadataKnownLost:
+			if result.Canonical.StorageClass == target.StorageClass && result.Canonical.StorageKey == target.StorageKey {
+				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
+			}
+			if cleanupErr := deleteFreshInstallLoserFn(ctx, target); cleanupErr != nil {
+				log.Printf("[RegisterUploadedBlock] WARNING: exact loser cleanup leaked block %s at %s/%s: %v", blockID, target.StorageClass, target.StorageKey, cleanupErr)
+			}
+			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)
+			if result.Cause != nil {
+				return errors.Join(lostErr, result.Cause)
+			}
+			return lostErr
+		default:
+			ambiguousErr := fmt.Errorf("canonical install outcome is ambiguous for block %s; proposed object retained", blockID)
+			if result.Cause != nil {
+				return errors.Join(ambiguousErr, result.Cause)
+			}
+			return ambiguousErr
+		}
+	}
+
+	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, target.StorageClass, target.StorageKey); err != nil {
 		switch {
 		case errors.Is(err, db.ErrBlockStubRepairContended):
 			// A contended stub repair is a transient race (concurrent completion or a

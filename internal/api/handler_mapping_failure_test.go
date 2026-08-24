@@ -17,13 +17,13 @@ import (
 func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	oldPutDirect := putUploadedBlockAutoDirectForUploadFn
 	oldProbe := probeUploadedBlockReuseForUploadFn
-	oldRegister := registerUploadedBlockAndMappingForUploadFn
+	oldRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
 	t.Cleanup(func() {
 		putUploadedBlockAutoDirectForUploadFn = oldPutDirect
 		probeUploadedBlockReuseForUploadFn = oldProbe
-		registerUploadedBlockAndMappingForUploadFn = oldRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = oldRegister
 		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
 	})
@@ -44,7 +44,7 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
 		return false, nil
 	}
-	registerUploadedBlockAndMappingForUploadFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(_ context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target v2.BlockMaterializationTarget, externalBlockID string) error {
 		return fmt.Errorf("mapping failed: %w", v2.ErrBlockMappingWriteFailed)
 	}
 
@@ -114,7 +114,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
 	oldEnsureReusable := syncEnsureReusableBlockPresentFn
-	oldRegister := registerUploadedBlockAndMappingForSyncFn
+	oldRegister := registerUploadedBlockTargetAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
 		syncBlockExistsFn = oldExists
@@ -122,7 +122,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
 		syncEnsureReusableBlockPresentFn = oldEnsureReusable
-		registerUploadedBlockAndMappingForSyncFn = oldRegister
+		registerUploadedBlockTargetAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
 
@@ -138,7 +138,7 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 	syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 		return hash, nil
 	}
-	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
+	registerUploadedBlockTargetAndMappingForSyncFn = func(_ context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target v2.BlockMaterializationTarget, externalBlockID string) error {
 		return fmt.Errorf("mapping failed: %w", v2.ErrBlockMappingWriteFailed)
 	}
 	lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) (string, error) {
@@ -167,14 +167,14 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	oldPut := syncPutBlockDataFn
 	oldPutDirect := syncPutBlockAutoDirectFn
 	oldProbe := syncProbeUploadedBlockReuseFn
-	oldRegister := registerUploadedBlockAndMappingForSyncFn
+	oldRegister := registerUploadedBlockTargetAndMappingForSyncFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
 		syncBlockExistsFn = oldExists
 		syncPutBlockDataFn = oldPut
 		syncPutBlockAutoDirectFn = oldPutDirect
 		syncProbeUploadedBlockReuseFn = oldProbe
-		registerUploadedBlockAndMappingForSyncFn = oldRegister
+		registerUploadedBlockTargetAndMappingForSyncFn = oldRegister
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
 
@@ -213,7 +213,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 		return "", nil
 	}
 	registerCalls := 0
-	registerUploadedBlockAndMappingForSyncFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
+	registerUploadedBlockTargetAndMappingForSyncFn = func(_ context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target v2.BlockMaterializationTarget, externalBlockID string) error {
 		registerCalls++
 		return nil
 	}
@@ -242,11 +242,11 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 }
 
 func TestSeafHTTPHandleUploadFailsClosedWithoutS3BlockBackend(t *testing.T) {
-	oldRegister := registerUploadedBlockAndMappingForUploadFn
+	oldRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
 	oldEncrypted := lookupLibraryEncryptedForUploadFn
 	t.Cleanup(func() {
-		registerUploadedBlockAndMappingForUploadFn = oldRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = oldRegister
 		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
 		lookupLibraryEncryptedForUploadFn = oldEncrypted
 	})
@@ -258,7 +258,7 @@ func TestSeafHTTPHandleUploadFailsClosedWithoutS3BlockBackend(t *testing.T) {
 		return false, nil
 	}
 	registerCalled := false
-	registerUploadedBlockAndMappingForUploadFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(_ context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target v2.BlockMaterializationTarget, externalBlockID string) error {
 		registerCalled = true
 		return nil
 	}

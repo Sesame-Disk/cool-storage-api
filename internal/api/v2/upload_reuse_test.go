@@ -821,12 +821,77 @@ func TestResolveNeedsPutBlockStoreUsesPreferredPlacementForFirstWriter(t *testin
 		t.Fatal(err)
 	}
 
-	gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, "abcd1234")
+	target, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, uploadReuseTestBlockID)
 	if err != nil {
 		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
 	}
-	if gotStore != preferred || gotClass != "preferred" || gotKey != preferred.StorageKeyForHash("abcd1234") {
-		t.Fatalf("placement = %p/%q/%q, want preferred/%q/%q", gotStore, gotClass, gotKey, "preferred", preferred.StorageKeyForHash("abcd1234"))
+	if target.Store != preferred || target.StorageClass != "preferred" || !target.FreshInstall || target.StorageKey == preferred.StorageKeyForHash(uploadReuseTestBlockID) {
+		t.Fatalf("target = %+v, want fresh preferred minted placement", target)
+	}
+	if err := preferred.ValidatePhysicalLocator(uploadReuseTestBlockID, target.StorageKey); err != nil {
+		t.Fatalf("minted key = %q: %v", target.StorageKey, err)
+	}
+}
+
+func TestResolveNeedsPutBlockStoreMintsPerRowlessAttempt(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.StorageKey == second.StorageKey || !first.FreshInstall || !second.FreshInstall {
+		t.Fatalf("rowless targets = %+v / %+v, want distinct fresh keys", first, second)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationMintsAfterRowlessKnownLoss(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var target BlockMaterializationTarget
+	var installedKey string
+	var rowlessKeys []string
+	storeCalls := 0
+	err = RetryUploadedBlockMaterialization("KnownLoss", uploadReuseTestBlockID, func() error {
+		storeCalls++
+		if installedKey != "" {
+			target = BlockMaterializationTarget{Store: preferred, StorageClass: "preferred", StorageKey: installedKey}
+			return nil
+		}
+		var resolveErr error
+		target, resolveErr = ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, uploadReuseTestBlockID)
+		if resolveErr == nil {
+			rowlessKeys = append(rowlessKeys, target.StorageKey)
+		}
+		return resolveErr
+	}, func() error {
+		if len(rowlessKeys) == 1 {
+			return ErrBlockMaterializationTransient // proven known loss forces a full reprobe
+		}
+		installedKey = target.StorageKey
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rowlessKeys) != 2 || rowlessKeys[0] == rowlessKeys[1] {
+		t.Fatalf("rowless retry keys = %v, want two distinct minted identities", rowlessKeys)
+	}
+	if storeCalls != 3 || target.FreshInstall || target.StorageKey != installedKey {
+		t.Fatalf("confirmation target/calls = %+v/%d, want adopted non-fresh canonical %q/3", target, storeCalls, installedKey)
 	}
 }
 
@@ -843,13 +908,13 @@ func TestResolveNeedsPutBlockStoreRefusesNonCanonicalFirstWriterClass(t *testing
 	}
 
 	for _, preferredClass := range []string{" hot-v1", "hot-v1 ", " hot-v1 ", "Hot-V1", "hot_v1", "hot--v1", "   "} {
-		gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, preferredClass,
-			db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, "abcd1234")
+		target, err := ResolveNeedsPutBlockStore(nil, preferred, preferredClass,
+			db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, orgID, uploadReuseTestBlockID)
 		if err == nil {
-			t.Fatalf("preferred class %q: placement = %p/%q/%q, want refusal", preferredClass, gotStore, gotClass, gotKey)
+			t.Fatalf("preferred class %q: target = %+v, want refusal", preferredClass, target)
 		}
-		if gotStore != nil || gotClass != "" || gotKey != "" {
-			t.Fatalf("preferred class %q: refusal must return no placement, got %p/%q/%q", preferredClass, gotStore, gotClass, gotKey)
+		if target != (BlockMaterializationTarget{}) {
+			t.Fatalf("preferred class %q: refusal must return no target, got %+v", preferredClass, target)
 		}
 	}
 }
@@ -871,14 +936,14 @@ func TestResolveNeedsPutBlockStoreRefusesExistingRowWithoutPersistedKey(t *testi
 	}
 
 	for _, storageKey := range []string{"", "   "} {
-		gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, canonical, "preferred", db.BlockReuseProbe{
+		target, err := ResolveNeedsPutBlockStore(nil, canonical, "preferred", db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: storageKey,
 		}, orgID, "abcd1234")
 		if err == nil || !strings.Contains(err.Error(), "empty persisted storage key") {
 			t.Fatalf("storage key %q: error = %v, want empty persisted key refusal", storageKey, err)
 		}
-		if gotStore != nil || gotClass != "" || gotKey != "" {
-			t.Fatalf("storage key %q: refusal must return no placement, got %p/%q/%q", storageKey, gotStore, gotClass, gotKey)
+		if target != (BlockMaterializationTarget{}) {
+			t.Fatalf("storage key %q: refusal must return no target, got %+v", storageKey, target)
 		}
 	}
 }
@@ -904,14 +969,14 @@ func TestResolveNeedsPutBlockStoreUsesExistingCanonicalPlacement(t *testing.T) {
 		return canonical, nil
 	}
 
-	gotStore, gotClass, gotKey, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{
+	target, err := ResolveNeedsPutBlockStore(nil, preferred, "preferred", db.BlockReuseProbe{
 		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
 	}, orgID, uploadReuseTestBlockID)
 	if err != nil {
 		t.Fatalf("ResolveNeedsPutBlockStore() error = %v", err)
 	}
-	if gotStore != canonical || gotClass != "archive" || gotKey != wantKey {
-		t.Fatalf("placement = %p/%q/%q, want canonical/archive/%q", gotStore, gotClass, gotKey, wantKey)
+	if target.Store != canonical || target.StorageClass != "archive" || target.StorageKey != wantKey || target.FreshInstall {
+		t.Fatalf("target = %+v, want non-fresh canonical/archive/%q", target, wantKey)
 	}
 }
 
@@ -930,7 +995,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 	}
 
 	t.Run("first writer empty preferred class", func(t *testing.T) {
-		_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+		_, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut,
 		}, []byte("data"), nil, &storage.BlockStore{}, "  ", "org-1", nil)
 		if err == nil || putCalls != 0 {
@@ -942,7 +1007,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
 			return nil, errors.New("class unavailable")
 		}
-		_, _, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+		_, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut, StorageClass: "archive",
 		}, []byte("data"), nil, &storage.BlockStore{}, "preferred", "org-1", nil)
 		if err == nil || putCalls != 0 {
@@ -960,7 +1025,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 			return canonical, nil
 		}
 		for _, decision := range []db.BlockReuseDecision{db.BlockReuseNeedsPut, db.BlockReuseReusable} {
-			_, _, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+			_, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
 				Decision: decision, StorageClass: "archive", StorageKey: "   ",
 			}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 			if err == nil || !strings.Contains(err.Error(), "empty persisted storage key") {
@@ -981,7 +1046,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
 			return canonical, nil
 		}
-		_, _, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+		_, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: "blocks/00000000-0000-0000-0000-000000000001/ab/cd/abcd1234",
 		}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 		if err == nil || putCalls != 0 {
@@ -1017,17 +1082,17 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 		return gotKey, nil
 	}
 
-	gotKey, gotClass, didPut, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	target, didPut, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
 	}, []byte("data"), nil, canonical, "preferred", orgID, func() error {
 		admissionCalls++
 		return nil
 	})
-	if err != nil || gotKey != wantKey || gotClass != "archive" || !didPut || putCalls != 1 || admissionCalls != 1 {
-		t.Fatalf("result = %q/%q/%v/%v puts=%d admission=%d", gotKey, gotClass, didPut, err, putCalls, admissionCalls)
+	if err != nil || target.StorageKey != wantKey || target.StorageClass != "archive" || target.FreshInstall || !didPut || putCalls != 1 || admissionCalls != 1 {
+		t.Fatalf("result = %+v/%v/%v puts=%d admission=%d", target, didPut, err, putCalls, admissionCalls)
 	}
 
-	_, _, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
+	_, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 	if !errors.Is(err, ErrBlockDeleteInProgress) || putCalls != 1 || admissionCalls != 1 {
 		t.Fatalf("fence error/put/admission = %v/%d/%d, want ErrBlockDeleteInProgress/1/1", err, putCalls, admissionCalls)
 	}
@@ -1049,7 +1114,7 @@ func TestStoreUploadedBlockForProbePreservesTransientStorageCause(t *testing.T) 
 		return false, context.Canceled
 	}
 
-	_, _, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	_, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseReusable, StorageClass: "archive", StorageKey: canonical.StorageKeyForHash(uploadReuseTestBlockID),
 	}, []byte("data"), nil, canonical, "preferred", "org-1", nil)
 	if !errors.Is(err, ErrBlockMaterializationTransient) || !errors.Is(err, context.Canceled) {
@@ -1086,9 +1151,9 @@ func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T
 			probe.StorageClass = "archive"
 		}
 		probe.StorageKey = canonical.StorageKeyForHash(uploadReuseTestBlockID)
-		_, resolvedClass, _, resolveErr := ResolveNeedsPutBlockStore(nil, preferred, "preferred", probe, orgID, uploadReuseTestBlockID)
+		target, resolveErr := ResolveNeedsPutBlockStore(nil, preferred, "preferred", probe, orgID, uploadReuseTestBlockID)
 		if resolveErr == nil {
-			placementClass = resolvedClass
+			placementClass = target.StorageClass
 		}
 		return resolveErr
 	}, func() error {

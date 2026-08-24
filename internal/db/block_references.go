@@ -740,7 +740,8 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 // mutation result is unknown, it performs one bounded SERIAL read; it never
 // repeats the proposed install.
 //
-// Production upload paths intentionally continue to use UpsertBlockMetadata.
+// Production upload paths use this only for a freshly minted-and-PUT target;
+// canonical reuse and repair continue through UpsertBlockMetadata.
 func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID, blockID, sha1 string, sizeBytes int, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
 	result := InstallBlockMetadataResult{Outcome: InstallBlockMetadataAmbiguous}
 	if err := ValidateBlockRepresentationID(representationID); err != nil {

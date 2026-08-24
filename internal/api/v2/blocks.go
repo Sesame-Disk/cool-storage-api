@@ -747,8 +747,8 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 // only ever READS this mapping; it never mints one from the manifest, which is why
 // a forged manifest SHA-1 cannot poison resolution. The shared legacy/seafhttp
 // mapping path now uses the same fail-closed conflict contract.
-func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass, storageKey string) error {
-	return RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, storageKey, sha1ID)
+func (h *BlockHandler) materializeUploadedBlock(ctx context.Context, session db.BlockUploadSession, sha256ID, sha1ID string, size int, target BlockMaterializationTarget) error {
+	return RegisterWebUploadedBlockTargetAndMapping(ctx, h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, target, sha1ID)
 }
 
 // respondBlockMaterializeError maps a materializeUploadedBlock failure to the web
@@ -1000,7 +1000,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return admissionErr
 	}
 
-	var storageKey, storageClass string
+	var target BlockMaterializationTarget
 	var didPutAny bool
 	storeErr := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadBlock", hash, func() error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
@@ -1010,15 +1010,15 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		if probeErr != nil {
 			return probeErr
 		}
-		resolvedKey, resolvedClass, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
+		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
 		if putErr != nil {
 			return putErr
 		}
-		storageKey, storageClass = resolvedKey, resolvedClass
+		target = resolvedTarget
 		didPutAny = didPutAny || didPut
 		return nil
 	}, func() error {
-		return h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, storageKey)
+		return h.materializeUploadedBlock(c.Request.Context(), session, hash, sha1Hash, len(data), target)
 	}, nil, nil)
 	if errors.Is(storeErr, errSessionStagingCapReached) {
 		metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()

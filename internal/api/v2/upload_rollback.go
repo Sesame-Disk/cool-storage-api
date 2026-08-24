@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,9 @@ import (
 
 var registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
 	return NewFSHelper(database).RegisterUploadedBlock(orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, sha1ID)
+}
+var registerUploadedBlockTargetForMaterializationFn = func(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
+	return NewFSHelper(database).RegisterUploadedBlockTarget(ctx, orgID, repoID, internalBlockID, operationID, sizeBytes, target, sha1ID)
 }
 var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 	if database == nil {
@@ -64,6 +68,22 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 	return nil
 }
 
+func RegisterUploadedBlockTargetAndMapping(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, externalBlockID string) error {
+	if err := registerUploadedBlockTargetForMaterializationFn(ctx, database, orgID, repoID, internalBlockID, operationID, sizeBytes, target, externalBlockID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(externalBlockID) == "" {
+		return nil
+	}
+	if err := writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
+		if errors.Is(err, db.ErrBlockIDMappingConflict) {
+			return fmt.Errorf("%w: %w", ErrBlockMappingWriteFailed, err)
+		}
+		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
+	}
+	return nil
+}
+
 // RegisterWebUploadedBlockAndMapping is the WEB block-upload (session) variant of
 // RegisterUploadedBlockAndMapping. It is identical EXCEPT it writes the forward
 // SHA-1 -> SHA-256 mapping through WriteVerifiedWebBlockMapping, which fails
@@ -77,6 +97,22 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 // it into a 409); any other mapping failure is wrapped as ErrBlockMappingWriteFailed.
 func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
 	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(externalBlockID) == "" {
+		return nil
+	}
+	if err := writeVerifiedWebBlockMappingFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
+		if errors.Is(err, db.ErrBlockIDMappingConflict) {
+			return err
+		}
+		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
+	}
+	return nil
+}
+
+func RegisterWebUploadedBlockTargetAndMapping(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, externalBlockID string) error {
+	if err := registerUploadedBlockTargetForMaterializationFn(ctx, database, orgID, repoID, internalBlockID, operationID, sizeBytes, target, externalBlockID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(externalBlockID) == "" {

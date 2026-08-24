@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -442,6 +444,145 @@ func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) 
 	}
 	if addCalls != 1 {
 		t.Fatalf("provisional write calls = %d, want exactly 1 (reference and expiry are one write)", addCalls)
+	}
+}
+
+func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	oldDelete := deleteFreshInstallLoserFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockInstallMetadataFn = oldInstall
+		deleteFreshInstallLoserFn = oldDelete
+	})
+
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
+		t.Fatal("fresh target must not use repair-capable metadata upsert")
+		return nil
+	}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.MintStorageKey(uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := BlockMaterializationTarget{Store: store, StorageClass: "hot", StorageKey: key, FreshInstall: true}
+
+	t.Run("applied retains canonical object", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+		}
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+			t.Fatal("applied canonical object must never be deleted")
+			return nil
+		}
+		if err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, ""); err != nil {
+			t.Fatalf("RegisterUploadedBlockTarget() error = %v", err)
+		}
+	})
+
+	t.Run("known loser deletes exact put tuple", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}}
+		}
+		deleteCalls := 0
+		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if got.Store != store || got.StorageKey != key || got.StorageClass != "hot" {
+				t.Fatalf("cleanup target = %+v, want exact PUT target %+v", got, target)
+			}
+			return nil
+		}
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if !errors.Is(err, ErrBlockMaterializationTransient) || deleteCalls != 1 {
+			t.Fatalf("error/deletes = %v/%d, want retryable/1", err, deleteCalls)
+		}
+	})
+
+	t.Run("contradictory known loser never deletes winner", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: target.StorageClass, StorageKey: target.StorageKey}}
+		}
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+			t.Fatal("canonical tuple must never be deleted")
+			return nil
+		}
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if err == nil || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want conservative non-retryable contradiction", err)
+		}
+	})
+
+	t.Run("cleanup failure leaks and still reprobes", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost}
+		}
+		cleanupErr := errors.New("delete unavailable")
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if !errors.Is(err, ErrBlockMaterializationTransient) || errors.Is(err, cleanupErr) {
+			t.Fatalf("error = %v, want retryable reprobe without making cleanup failure authoritative", err)
+		}
+	})
+
+	for _, cause := range []error{nil, errors.New("own settlement unavailable"), errors.New("other settlement unavailable"), errors.New("row absent settlement unavailable")} {
+		name := "nil_cause"
+		if cause != nil {
+			name = strings.ReplaceAll(cause.Error(), " ", "_")
+		}
+		t.Run("ambiguous_"+name, func(t *testing.T) {
+			registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+				return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataAmbiguous, Cause: cause}
+			}
+			deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+				t.Fatal("ambiguous install must never authorize cleanup")
+				return nil
+			}
+			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+			if err == nil || IsRetryableBlockMaterializationError(err) {
+				t.Fatalf("error = %v, want conservative non-retryable ambiguity", err)
+			}
+		})
+	}
+}
+
+func TestRegisterUploadedBlockTargetCanonicalPathNeverInstallsOrMints(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockInstallMetadataFn = oldInstall
+	})
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+		t.Fatal("existing canonical target must never INSTALL")
+		return db.InstallBlockMetadataResult{}
+	}
+	want := BlockMaterializationTarget{StorageClass: "archive", StorageKey: "persisted-exact-key"}
+	registerUploadedBlockUpsertMetadataFn = func(_ *FSHelper, _, _, _, _ string, _ int, class, key string) error {
+		if class != want.StorageClass || key != want.StorageKey {
+			t.Fatalf("upsert tuple = %q/%q, want exact %q/%q", class, key, want.StorageClass, want.StorageKey)
+		}
+		return nil
+	}
+	if err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), "org", "lib", "block", "op", 1, want, ""); err != nil {
+		t.Fatal(err)
 	}
 }
 

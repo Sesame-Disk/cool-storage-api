@@ -3172,7 +3172,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
@@ -3181,7 +3181,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
-		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 	})
 
@@ -3201,7 +3201,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		storeCalls.Add(1)
 		return "", nil
 	}
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		storeCalls.Add(1)
 		return nil
 	}
@@ -3252,14 +3252,14 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 		}
 	}()
 
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	t.Cleanup(func() {
-		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
@@ -3289,7 +3289,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	}
 
 	registerCalled := make(chan struct{}, 1)
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		registerCalled <- struct{}{}
 		return nil
 	}
@@ -3402,7 +3402,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 	originalPrepare := prepareUploadedBlockProbeForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
 	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	originalQuota := checkUploadStorageQuotaForCurrentHeadFn
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
@@ -3411,7 +3411,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		prepareUploadedBlockProbeForUploadFn = originalPrepare
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
 		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
-		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
@@ -3459,7 +3459,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		reusableChecks.Add(1)
 		return "", nil
 	}
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		registerCalls.Add(1)
 		return nil
 	}
@@ -3578,14 +3578,14 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalEncrypted := lookupLibraryEncryptedForUploadFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalPut := putUploadedBlockAutoDirectForUploadFn
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
 		lookupLibraryEncryptedForUploadFn = originalEncrypted
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalPut
-		registerUploadedBlockAndMappingForUploadFn = originalRegister
+		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 	})
 
@@ -3608,7 +3608,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		putCalls.Add(1)
 		return hash, nil
 	}
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		registerCalls.Add(1)
 		return nil
 	}
@@ -3821,11 +3821,11 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 	}
 	t.Cleanup(func() { putUploadedBlockAutoDirectForUploadFn = originalPut })
 
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		return nil
 	}
-	t.Cleanup(func() { registerUploadedBlockAndMappingForUploadFn = originalRegister })
+	t.Cleanup(func() { registerUploadedBlockTargetAndMappingForUploadFn = originalRegister })
 
 	done := make(chan error, 1)
 	go func() {
@@ -3840,7 +3840,7 @@ func TestFinalizeUploadBlockMetadataPermitDoesNotBlockS3Put(t *testing.T) {
 					return permitErr
 				}
 				defer rel()
-				return registerUploadedBlockAndMappingForUploadFn(nil, "", "", "", "", 0, "", "", "")
+				return registerUploadedBlockTargetAndMappingForUploadFn(context.Background(), nil, "", "", "", "", 0, v2.BlockMaterializationTarget{}, "")
 			},
 			nil,
 		)
@@ -3882,11 +3882,11 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 	}
 	t.Cleanup(func() { putUploadedBlockAutoDirectForUploadFn = originalPut })
 
-	originalRegister := registerUploadedBlockAndMappingForUploadFn
-	registerUploadedBlockAndMappingForUploadFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
+	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		return nil
 	}
-	t.Cleanup(func() { registerUploadedBlockAndMappingForUploadFn = originalRegister })
+	t.Cleanup(func() { registerUploadedBlockTargetAndMappingForUploadFn = originalRegister })
 
 	// Pre-hold the single permit: the goroutine's materialize callback must block
 	// until we release it, proving the store callback does not need the permit.
@@ -3915,7 +3915,7 @@ func TestFinalizeUploadS3PutPrecedesPermitRelease(t *testing.T) {
 					permitReleaseSeq = seq.Add(1)
 					rel()
 				}()
-				return registerUploadedBlockAndMappingForUploadFn(nil, "", "", "", "", 0, "", "", "")
+				return registerUploadedBlockTargetAndMappingForUploadFn(context.Background(), nil, "", "", "", "", 0, v2.BlockMaterializationTarget{}, "")
 			},
 			nil,
 		)

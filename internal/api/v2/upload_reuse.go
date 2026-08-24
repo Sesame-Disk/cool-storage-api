@@ -59,6 +59,16 @@ var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage
 	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
 }
 
+// BlockMaterializationTarget is the exact physical tuple selected for one store
+// observation. FreshInstall is authority carried from mint through PUT; the key
+// shape alone never authorizes install or cleanup.
+type BlockMaterializationTarget struct {
+	Store        *storage.BlockStore
+	StorageClass string
+	StorageKey   string
+	FreshInstall bool
+}
+
 // ProbeUploadedBlockReuse wraps the DB probe. Upload callers fail closed when
 // Cassandra cannot establish whether GC owns the physical object.
 func ProbeUploadedBlockReuse(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
@@ -118,15 +128,15 @@ func ResolveCanonicalBlockStore(storageManager *storage.Manager, fallbackStore *
 // probe. A first writer has no storage metadata and keeps the preferred store.
 // Existing metadata is immutable placement state and must resolve without
 // health failover to the exact org-scoped class and persisted key.
-func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass string, probe db.BlockReuseProbe, orgID, blockID string) (*storage.BlockStore, string, string, error) {
+func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass string, probe db.BlockReuseProbe, orgID, blockID string) (BlockMaterializationTarget, error) {
 	if probe.Decision != db.BlockReuseNeedsPut {
-		return nil, "", "", fmt.Errorf("block %s does not need a PUT", blockID)
+		return BlockMaterializationTarget{}, fmt.Errorf("block %s does not need a PUT", blockID)
 	}
 
 	canonicalClass := probe.StorageClass
 	if canonicalClass == "" {
 		if preferredStore == nil {
-			return nil, "", "", fmt.Errorf("preferred block store is unavailable for %s", blockID)
+			return BlockMaterializationTarget{}, fmt.Errorf("preferred block store is unavailable for %s", blockID)
 		}
 		// The first writer MINTS this block's physical identity: the class returned
 		// here is the one persisted, so it is certified, never normalized. Trimming
@@ -138,32 +148,36 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 		// from landing: the object is written before materialization, so a class
 		// rejected downstream would leave bytes in S3 that no row points at.
 		if preferredClass == "" {
-			return nil, "", "", fmt.Errorf("preferred storage class is empty for %s", blockID)
+			return BlockMaterializationTarget{}, fmt.Errorf("preferred storage class is empty for %s", blockID)
 		}
 		if !config.IsCanonicalStorageClassName(preferredClass) {
-			return nil, "", "", fmt.Errorf("preferred storage class %q for block %s is not canonical", preferredClass, blockID)
+			return BlockMaterializationTarget{}, fmt.Errorf("preferred storage class %q for block %s is not canonical", preferredClass, blockID)
 		}
-		return preferredStore, preferredClass, preferredStore.StorageKeyForHash(blockID), nil
+		storageKey, err := preferredStore.MintStorageKey(blockID)
+		if err != nil {
+			return BlockMaterializationTarget{}, fmt.Errorf("mint storage key for %s: %w", blockID, err)
+		}
+		return BlockMaterializationTarget{Store: preferredStore, StorageClass: preferredClass, StorageKey: storageKey, FreshInstall: true}, nil
 	}
 
 	canonicalStore, err := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, canonicalClass, orgID)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
+		return BlockMaterializationTarget{}, fmt.Errorf("resolve canonical block store for %s: %w", blockID, err)
 	}
 	storageKey := probe.StorageKey
 	if strings.TrimSpace(storageKey) == "" {
-		return nil, "", "", fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
+		return BlockMaterializationTarget{}, fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
 	}
 	if err := canonicalStore.ValidatePhysicalLocator(blockID, storageKey); err != nil {
-		return nil, "", "", fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, err)
+		return BlockMaterializationTarget{}, fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, err)
 	}
-	return canonicalStore, canonicalClass, storageKey, nil
+	return BlockMaterializationTarget{Store: canonicalStore, StorageClass: canonicalClass, StorageKey: storageKey}, nil
 }
 
 // StoreUploadedBlockForProbe executes the physical action selected by a
 // prepared Cassandra probe and returns the placement to materialize. beforePut
 // runs only when a physical write is about to occur.
-func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (storageKey, storageClass string, didPut bool, err error) {
+func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (target BlockMaterializationTarget, didPut bool, err error) {
 	switch probe.Decision {
 	case db.BlockReuseReusable:
 		// The class this returns is re-persisted by the caller, so it must be the
@@ -171,49 +185,51 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 		canonicalClass := probe.StorageClass
 		canonicalStore, resolveErr := resolveCanonicalBlockStoreFn(storageManager, preferredStore, preferredClass, canonicalClass, orgID)
 		if resolveErr != nil {
-			return "", canonicalClass, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
+			return target, false, fmt.Errorf("resolve canonical block store for %s: %w", blockID, resolveErr)
 		}
-		storageKey = probe.StorageKey
+		target = BlockMaterializationTarget{Store: canonicalStore, StorageClass: canonicalClass, StorageKey: probe.StorageKey}
+		storageKey := target.StorageKey
 		if strings.TrimSpace(storageKey) == "" {
-			return "", canonicalClass, false, fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
+			return target, false, fmt.Errorf("canonical block %s has empty persisted storage key", blockID)
 		}
 		if validateErr := canonicalStore.ValidatePhysicalLocator(blockID, storageKey); validateErr != nil {
-			return "", canonicalClass, false, fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, validateErr)
+			return target, false, fmt.Errorf("canonical block %s has invalid persisted storage key %q: %w", blockID, storageKey, validateErr)
 		}
 		exists, existsErr := reusableCanonicalObjectExistsFn(ctx, canonicalStore, storageKey)
 		if existsErr != nil {
-			return storageKey, canonicalClass, false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, existsErr)
+			return target, false, fmt.Errorf("%w: verify canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, existsErr)
 		}
 		if exists {
-			return storageKey, canonicalClass, false, nil
+			return target, false, nil
 		}
 		if beforePut != nil {
 			if beforeErr := beforePut(); beforeErr != nil {
-				return storageKey, canonicalClass, false, beforeErr
+				return target, false, beforeErr
 			}
 		}
 		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
-			return storageKey, canonicalClass, false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, putErr)
+			return target, false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, putErr)
 		}
-		return storageKey, canonicalClass, true, nil
+		return target, true, nil
 	case db.BlockReuseNeedsPut:
-		putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(storageManager, preferredStore, preferredClass, probe, orgID, blockID)
+		var resolveErr error
+		target, resolveErr = ResolveNeedsPutBlockStore(storageManager, preferredStore, preferredClass, probe, orgID, blockID)
 		if resolveErr != nil {
-			return "", "", false, resolveErr
+			return BlockMaterializationTarget{}, false, resolveErr
 		}
 		if beforePut != nil {
 			if beforeErr := beforePut(); beforeErr != nil {
-				return resolvedKey, resolvedClass, false, beforeErr
+				return target, false, beforeErr
 			}
 		}
-		if _, putErr := repairCanonicalBlockDirectFn(ctx, putStore, resolvedKey, data); putErr != nil {
-			return resolvedKey, resolvedClass, false, fmt.Errorf("%w: store block %s in %s: %w", ErrBlockMaterializationTransient, blockID, resolvedClass, putErr)
+		if _, putErr := repairCanonicalBlockDirectFn(ctx, target.Store, target.StorageKey, data); putErr != nil {
+			return target, false, fmt.Errorf("%w: store block %s in %s: %w", ErrBlockMaterializationTransient, blockID, target.StorageClass, putErr)
 		}
-		return resolvedKey, resolvedClass, true, nil
+		return target, true, nil
 	case db.BlockReuseBlockedByGC:
-		return "", "", false, ErrBlockDeleteInProgress
+		return target, false, ErrBlockDeleteInProgress
 	default:
-		return "", "", false, fmt.Errorf("unsupported block reuse decision %d for %s", probe.Decision, blockID)
+		return target, false, fmt.Errorf("unsupported block reuse decision %d for %s", probe.Decision, blockID)
 	}
 }
 
@@ -224,8 +240,8 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 	if probe.Decision != db.BlockReuseReusable {
 		return "", fmt.Errorf("block %s is not reusable", blockID)
 	}
-	storageKey, _, _, err := StoreUploadedBlockForProbe(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil)
-	return storageKey, err
+	target, _, err := StoreUploadedBlockForProbe(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil)
+	return target.StorageKey, err
 }
 
 // RetryUploadedBlockMaterialization retries the full store->materialize->confirm

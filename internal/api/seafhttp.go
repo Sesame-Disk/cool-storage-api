@@ -1848,7 +1848,7 @@ var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var prepareUploadedBlockProbeForUploadFn = v2.PrepareUploadedBlockProbe
 var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
 var resolveNeedsPutBlockStoreForUploadFn = v2.ResolveNeedsPutBlockStore
-var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
+var registerUploadedBlockTargetAndMappingForUploadFn = v2.RegisterUploadedBlockTargetAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
 	return fsHelper.ResolveStoredBlockIDs(orgID, repoID, blockIDs)
 }
@@ -2503,11 +2503,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
-	materializedStorageClass := actualStorageClass
-	materializedStorageKey := ""
+	var materializationTarget v2.BlockMaterializationTarget
 	storeUploadedBlock := func() error {
-		materializedStorageClass = actualStorageClass
-		materializedStorageKey = ""
+		materializationTarget = v2.BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -2518,22 +2516,20 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = probe.StorageClass
-			var ensureErr error
-			materializedStorageKey, ensureErr = ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+			storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+			materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			if ensureErr != nil {
 				return ensureErr
 			}
 			log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
 			return nil
 		case db.BlockReuseNeedsPut:
-			putStore, resolvedClass, resolvedKey, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+			target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
 			if resolveErr != nil {
 				return resolveErr
 			}
-			materializedStorageClass = resolvedClass
-			var putErr error
-			materializedStorageKey, putErr = putUploadedBlockAutoDirectForUploadFn(ctx, putStore, resolvedKey, storedContent)
+			materializationTarget = target
+			_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, target.Store, target.StorageKey, storedContent)
 			if putErr == nil {
 				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
 			}
@@ -2553,7 +2549,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		return nil
 	}, func() error {
-		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedContent), materializedStorageClass, materializedStorageKey, fileID)
+		return registerUploadedBlockTargetAndMappingForUploadFn(ctx, h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedContent), materializationTarget, fileID)
 	}, func() (bool, error) {
 		return clearSeafHTTPS3OrphanFenceFn(c.Request.Context(), h.db, h.storageManager, "HandleUpload", token.OrgID, sha256ID)
 	}); err != nil {
@@ -3018,11 +3014,9 @@ readLoop:
 
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				materializedStorageClass := actualStorageClass
-				materializedStorageKey := ""
+				var materializationTarget v2.BlockMaterializationTarget
 				return retrySeafHTTPBlockMaterializationContext(egCtx, "finalizeUploadStreaming", sha256ID, func() error {
-					materializedStorageClass = actualStorageClass
-					materializedStorageKey = ""
+					materializationTarget = v2.BlockMaterializationTarget{}
 					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 					if probeErr != nil {
 						return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -3033,18 +3027,16 @@ readLoop:
 					}
 					switch probe.Decision {
 					case db.BlockReuseReusable:
-						materializedStorageClass = probe.StorageClass
-						var ensureErr error
-						materializedStorageKey, ensureErr = ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+						storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+						materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 						return ensureErr
 					case db.BlockReuseNeedsPut:
-						putStore, resolvedClass, resolvedKey, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+						target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
 						if resolveErr != nil {
 							return resolveErr
 						}
-						materializedStorageClass = resolvedClass
-						var putErr error
-						materializedStorageKey, putErr = putUploadedBlockAutoDirectForUploadFn(egCtx, putStore, resolvedKey, storedBlock)
+						materializationTarget = target
+						_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, target.Store, target.StorageKey, storedBlock)
 						if putErr != nil {
 							return fmt.Errorf("failed to store block: %w", putErr)
 						}
@@ -3062,7 +3054,7 @@ readLoop:
 						return permitErr
 					}
 					defer releaseMetadataPermit()
-					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), materializedStorageClass, materializedStorageKey, blockSHA1IDLocal)
+					return registerUploadedBlockTargetAndMappingForUploadFn(egCtx, h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), materializationTarget, blockSHA1IDLocal)
 				}, func() (bool, error) {
 					return clearSeafHTTPS3OrphanFenceFn(egCtx, h.db, h.storageManager, "finalizeUploadStreaming", token.OrgID, sha256ID)
 				})

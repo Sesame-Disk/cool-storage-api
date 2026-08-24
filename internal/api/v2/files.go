@@ -1328,6 +1328,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 
 		if templateBlockData != nil {
+			var templateTarget BlockMaterializationTarget
 			if templateBlockStore == nil {
 				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {
@@ -1362,16 +1363,18 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					if ensureErr != nil {
 						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
+					templateTarget = BlockMaterializationTarget{StorageClass: templateMaterializedStorageClass, StorageKey: templateStorageKey}
 					templateBlockStored = true
 					return nil
 				case db.BlockReuseNeedsPut:
-					putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash)
+					target, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash)
 					if resolveErr != nil {
 						return resolveErr
 					}
-					templateMaterializedStorageClass = resolvedClass
+					templateTarget = target
+					templateMaterializedStorageClass = target.StorageClass
 					var err error
-					templateStorageKey, err = putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, templateBlockData.Data)
+					templateStorageKey, err = putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, templateBlockData.Data)
 					if err != nil {
 						return fmt.Errorf("failed to store file content: %w", err)
 					}
@@ -1390,12 +1393,13 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				// written from the real bytes — required for desktop downloads (which
 				// fetch by SHA-1) and for staging to resolve the fs_object's SHA-1
 				// block id back to its storage identity.
-				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateMaterializedStorageClass, templateStorageKey, externalBlockID); err != nil {
+				if err := RegisterUploadedBlockTargetAndMapping(c.Request.Context(), h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateTarget, externalBlockID); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
 				return nil
 			}, func() {
 				templateBlockStored = false
+				templateTarget = BlockMaterializationTarget{}
 			}); err != nil {
 				return err
 			}
@@ -3441,11 +3445,9 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
-	materializedStorageClass := storageClass
-	materializedStorageKey := ""
+	var materializationTarget BlockMaterializationTarget
 	if err := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadFile", sha256ID, func() error {
-		materializedStorageClass = storageClass
-		materializedStorageKey = ""
+		materializationTarget = BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, sha256ID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -3456,18 +3458,17 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = probe.StorageClass
 			var ensureErr error
-			materializedStorageKey, ensureErr = EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
+			storageKey, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
+			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
-			putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID)
+			target, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID)
 			if resolveErr != nil {
 				return resolveErr
 			}
-			materializedStorageClass = resolvedClass
-			var putErr error
-			materializedStorageKey, putErr = putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, storedContent)
+			materializationTarget = target
+			_, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, storedContent)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
@@ -3480,7 +3481,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		// Register block metadata + a provisional reference (kept alive by TTL until
 		// the fs_object commit below creates the permanent reference), then write the
 		// external SHA-1 mapping only after the block is durable in Cassandra.
-		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializedStorageClass, materializedStorageKey, fileID)
+		return RegisterUploadedBlockTargetAndMapping(c.Request.Context(), h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializationTarget, fileID)
 	}, nil, nil); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, ErrBlockDeleteInProgress) {

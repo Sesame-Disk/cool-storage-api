@@ -441,7 +441,7 @@ var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStore
 var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
-var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
+var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping
 var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderWithFanout
@@ -1989,8 +1989,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		if classifiedID.isLegacySHA1 {
 			externalMappingID = classifiedID.normalized
 		}
-		materializedStorageClass := storageClass
-		materializedStorageKey := ""
+		var materializationTarget v2.BlockMaterializationTarget
 		// IMPORTANT: this store callback can be re-invoked by
 		// RetryUploadedBlockMaterialization (the retry path fires when store or
 		// materialize returns a retryable sentinel: ErrBlockDeleteInProgress or
@@ -2006,8 +2005,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
-			materializedStorageClass = storageClass
-			materializedStorageKey = ""
+			materializationTarget = v2.BlockMaterializationTarget{}
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
 			if probeErr != nil {
 				return fmt.Errorf("probe block reuse for %s: %w", internalID, probeErr)
@@ -2024,9 +2022,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				materializedStorageClass = probe.StorageClass
-				var ensureErr error
-				materializedStorageKey, ensureErr = syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 				return ensureErr
 			case db.BlockReuseNeedsPut:
 				if checker := getAPIQuotaChecker(); checker != nil {
@@ -2035,13 +2032,12 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 						return errSyncStorageQuotaExceeded
 					}
 				}
-				putStore, resolvedClass, resolvedKey, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID)
+				target, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID)
 				if resolveErr != nil {
 					return resolveErr
 				}
-				materializedStorageClass = resolvedClass
-				var putErr error
-				materializedStorageKey, putErr = syncPutBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, data)
+				materializationTarget = target
+				_, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, data)
 				if putErr != nil {
 					return fmt.Errorf("%w: %w", errSyncStoreBackend, putErr)
 				}
@@ -2065,7 +2061,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
-			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, materializedStorageKey, externalMappingID)
+			return registerUploadedBlockTargetAndMappingForSyncFn(c.Request.Context(), h.db, orgID, repoID, internalID, operationID, len(data), materializationTarget, externalMappingID)
 		}, nil, nil); err != nil {
 			if rejectAdmittedTimeout(c, lifetime, "storage", err) {
 				return
