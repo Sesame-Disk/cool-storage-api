@@ -15,39 +15,57 @@ mutations to `SerialConsistency(gocql.Serial)`, with the 2 `gc_block_candidates`
 mutations included as adjacent lifecycle hardening. Added an AST/source guard that
 checks operation identity, discovery and the explicit serial pin.
 
-The guard is **fail-closed on the ways a statement leaves its view**, which is
-the failure mode that matters. A statement the gate cannot see is not reported as
-unpinned — no pin is demanded of it at all, and the gate stays green. Review found
-three such routes and all three are now closed:
+The guard now keys discovery on **the CQL, not on the Go method that executes
+it**. That reversal is the substance of the change. A statement the gate cannot
+see is never reported as unpinned — no pin is demanded of it at all, and the gate
+stays green — and the original design let a statement disappear in four ways:
 
-- **CQL that is not a source literal.** Discovery keys off a literal, so a target
-  LWT could leave the guard's view through an ordinary refactor into a `const`, a
-  variable or `fmt.Sprintf` — a pattern already in use for the hard-delete lock
-  helpers. Any conditional CAS whose CQL is not a literal now fails the gate
-  unless it holds an explicit allowlist entry, and the only three allowlisted
-  helpers are separately pinned to `gc_*_hard_delete_locks` table literals by
-  `TestR12HardDeleteLockTablesAreOutOfScope`.
-- **Table spellings the matcher did not recognise.** The target set was matched by
-  literal name, so `UPDATE "blocks"`, `UPDATE sesamefs.blocks`,
-  `UPDATE "sesamefs"."blocks"` and `DELETE storage_key FROM blocks` were all read
-  as out of scope. The matcher is now structural over CQL table references and
-  applies CQL identifier folding, so `"BLOCKS"` correctly remains a different
-  relation rather than being folded into the target set.
-- **CAS terminals other than `ScanCAS`/`MapScanCAS`.** The driver in use
-  (`cassandra-gocql-driver/v2`) also executes LWTs through `ScanCASContext` and
-  `MapScanCASContext`, which the scanner did not know, and conditional batches
-  through the `ExecCAS`/`MapExecCAS` family. The `Context` variants are now
-  recognised as equal-standing LWT execution. Conditional batches are **refused
-  outright**: a batch carries neither its CQL nor its serial pin at the CAS call
-  site, so no allowlist could justify one the way the lock helpers are justified.
-  SesameFS uses none today; introducing one has to extend R12 deliberately.
+- **The execution path.** This was the deepest one. Cassandra makes a statement a
+  lightweight transaction because its CQL carries `IF`; the Go method consuming
+  the result is not the authority. `Query.Exec` is literally `q.Iter().Close()`,
+  and the driver's own `NoSkipMetadata` documentation refers to *"CAS operations
+  which do not end in Cas"*. A gate organised around `ScanCAS`/`MapScanCAS`
+  therefore reported **nothing at all** for `Query(conditionalCQL).Exec()`. Every
+  `Query(...)` call site is now classified whatever consumes it, so a conditional
+  R12 statement reaching `Exec` is discovered and reported as having no CAS
+  terminal. `ScanCASContext`/`MapScanCASContext` are recognised as equal-standing
+  LWT execution.
+- **CQL the gate could not read.** A `const` or single-binding variable is now
+  *resolved* — including literal `+=` concatenation, which this codebase uses to
+  build CQL — so moving a statement into one neither hides it nor costs an
+  allowance. Resolution is deliberately poisoned by anything it cannot follow (a
+  non-literal fragment, a plain reassignment, an address taken) rather than
+  resolving to a prefix, since reading `"SELECT ... FROM gc_pending_items"` and
+  ignoring the appended clauses would be a false green manufactured by the
+  resolver itself. What remains unresolvable fails the gate unless allowlisted,
+  and every allowlisted symbol is now checked by
+  `TestR12UnresolvedAllowlistNamesNoR12Table` instead of asserted.
+- **Table spellings the matcher did not recognise.** `UPDATE "blocks"`,
+  `UPDATE sesamefs.blocks`, `UPDATE "sesamefs"."blocks"` and
+  `DELETE storage_key FROM blocks` were all read as out of scope. The matcher is
+  structural over CQL table references and applies CQL identifier folding, so
+  `"BLOCKS"` correctly remains a different relation.
+- **Conditional batches.** Covered are `ExecCAS`, `MapExecCAS`, their `Context`
+  forms, and the deprecated-but-functional `Session.ExecuteBatchCAS` /
+  `Session.MapExecuteBatchCAS`. A batch carries neither its CQL nor its serial pin
+  at its CAS call site, so each one must be allowlisted; `relocateLockRowCASFn`
+  (`locked_files` relocation) is the one in use. The allowance is sound because
+  the general Query rule still reads every `Batch.Query` statement — an R12 target
+  inside a batch is discovered with no CAS terminal and fails the gate anyway.
 
-Mutation-verified end to end against real production sources, not only synthetic
-fixtures: four stragglers — a keyspace-qualified LWT on `MapScanCASContext`, a
-quoted-identifier LWT, a column `DELETE`, and a conditional batch — pass the
-previous guard and each fail the current one. Removing or downgrading a pin on any
-of the 17 statements also fails it. Also fixed a discovery false positive where a
-string value containing `IF` was read as a conditional clause.
+  This corrects a claim in the previous revision of this entry, which said
+  SesameFS used no conditional batch. It does: the survey behind that sentence
+  grepped for `ExecCAS`/`MapExecCAS` and did not match `MapExecuteBatchCAS`.
+
+Mutation-verified against real production sources rather than synthetic fixtures
+alone: eight stragglers now fail the gate that the original guard accepted — a
+keyspace-qualified LWT on `MapScanCASContext`, a quoted-identifier LWT, a column
+`DELETE`, a conditional batch, a `const` LWT through `Exec`, a variable LWT
+through `ExecContext`, and both deprecated `Session` batch-CAS forms. Most are
+caught by two independent routes. Removing or downgrading a pin on any of the 17
+statements also fails the gate. Also fixed a discovery false positive where a
+string value containing `IF` was read as a conditional clause, and another where
+`net/url`'s zero-argument `URL.Query()` was treated as a CQL call site.
 
 The conditional library-HEAD publish stays out of scope and is now registered as
 `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` rather than named only in passing: it is a

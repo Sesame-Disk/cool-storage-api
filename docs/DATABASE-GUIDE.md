@@ -1303,23 +1303,42 @@ deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
 is pinned by the untagged source gate `TestR12SerialDomainGuard`
 (`internal/integration/`).
 
-The gate is fail-closed on the three ways a statement can leave its view rather
-than be reported unpinned, which is the failure mode that matters: a statement it
-cannot see demands no pin at all.
+The gate keys discovery on **the CQL, not on the Go method that executes it**.
+That direction matters: Cassandra makes a statement a lightweight transaction
+because its CQL carries `IF`, and `Query.Exec` is literally `q.Iter().Close()` —
+the driver's own `NoSkipMetadata` documentation refers to *"CAS operations which
+do not end in Cas"*. A gate organised around CAS terminals reports nothing at all
+for `Query(conditionalCQL).Exec()`, and a statement it cannot see is never asked
+for a pin.
 
-- **CQL that is not a source literal** — a `const`, a variable or `fmt.Sprintf`.
-  Only the three `gc_*_hard_delete_locks` helpers are allowed, and
-  `TestR12HardDeleteLockTablesAreOutOfScope` separately pins each of their call
-  sites to a lock-table literal.
+So every `Query(...)` call site in production code is classified, whatever
+consumes the result, and is fail-closed on each way a statement could leave that
+view:
+
+- **CQL the gate cannot read.** A `const` or a single-binding variable is
+  *resolved*, including literal `+=` concatenation, so moving a statement into one
+  neither hides it nor costs an allowance. A name touched in any way the resolver
+  cannot follow — a non-literal fragment, a plain reassignment, an address taken —
+  is poisoned rather than resolved to a prefix, and the call site fails the gate
+  unless allowlisted. Seven symbols are allowlisted today; each is checked by
+  `TestR12UnresolvedAllowlistNamesNoR12Table`, and the three
+  `gc_*_hard_delete_locks` helpers are additionally pinned to lock-table literals
+  by `TestR12HardDeleteLockTablesAreOutOfScope`.
 - **Table spellings a name-literal regex misses** — `"blocks"`,
   `sesamefs.blocks`, `"sesamefs"."blocks"`, and `DELETE <columns> FROM <table>`.
   Quoted identifiers keep CQL case sensitivity, so `"BLOCKS"` is correctly a
   different relation.
-- **CAS terminals other than `ScanCAS`/`MapScanCAS`** — the `Context` variants are
-  recognised as equal-standing LWT execution, and the conditional-batch family
-  (`ExecCAS`, `MapExecCAS`, and their `Context` forms) is **refused outright**: a
-  batch carries neither its CQL nor its serial pin at the CAS call site, so R12
-  forbids conditional batches until the gate is extended to classify them.
+- **Execution paths other than `ScanCAS`/`MapScanCAS`.** The `Context` variants
+  are recognised as equal-standing LWT execution; a conditional statement reaching
+  `Exec`/`ExecContext` is discovered and reported as having no CAS terminal. The
+  conditional-batch family — `ExecCAS`, `MapExecCAS`, their `Context` forms, and
+  the deprecated-but-functional `Session.ExecuteBatchCAS` /
+  `Session.MapExecuteBatchCAS` — cannot be classified from its call site, since a
+  batch carries neither its CQL nor its serial pin there, so each conditional
+  batch must be allowlisted. `relocateLockRowCASFn` (`locked_files` relocation) is
+  the one in use. That allowance is sound because the general Query rule still
+  reads every `Batch.Query` statement: an R12 target inside a batch is discovered
+  with no CAS terminal attributed to it and fails the gate regardless.
 
 `serial_consistency` remains the level for every **other** LWT, including the
 conditional library-HEAD publish, which has no explicit contract and is
