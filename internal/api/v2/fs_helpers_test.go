@@ -519,9 +519,9 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		}
 	})
 
-	t.Run("contradictory known loser never deletes winner", func(t *testing.T) {
+	t.Run("direct same-tuple contradiction never succeeds cleans or retries", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: target.StorageClass, StorageKey: target.StorageKey}}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataIdentityContradiction, Cause: db.ErrInstallBlockMetadataIdentityContradiction}
 		}
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
 			t.Fatal("canonical tuple must never be deleted")
@@ -530,6 +530,9 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
 		if err == nil || IsRetryableBlockMaterializationError(err) {
 			t.Fatalf("error = %v, want conservative non-retryable contradiction", err)
+		}
+		if !errors.Is(err, db.ErrInstallBlockMetadataIdentityContradiction) {
+			t.Fatalf("error = %v, want identity contradiction cause", err)
 		}
 	})
 
@@ -561,6 +564,61 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
 			if err == nil || IsRetryableBlockMaterializationError(err) {
 				t.Fatalf("error = %v, want conservative non-retryable ambiguity", err)
+			}
+		})
+	}
+}
+
+func TestRegisterUploadedBlockTargetRejectsForgedFreshLocatorBeforeAuthority(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	oldDelete := deleteFreshInstallLoserFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockInstallMetadataFn = oldInstall
+		deleteFreshInstallLoserFn = oldDelete
+	})
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+		t.Fatal("forged fresh target must fail before provisional reference")
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		t.Fatal("forged fresh target must fail before fence or DB mutation")
+		return false, nil
+	}
+	registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+		t.Fatal("forged fresh target must fail before INSTALL")
+		return db.InstallBlockMetadataResult{}
+	}
+	deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+		t.Fatal("forged fresh target must grant no cleanup authority")
+		return nil
+	}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := store.StorageKeyForHash(uploadReuseTestBlockID)
+	otherBlockID := strings.Repeat("b", 64)
+	tests := []struct {
+		name  string
+		store *storage.BlockStore
+		key   string
+	}{
+		{name: "legacy", store: store, key: base},
+		{name: "malformed incarnation", store: store, key: base + ".not-a-uuid"},
+		{name: "wrong block", store: store, key: store.StorageKeyForHash(otherBlockID) + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := BlockMaterializationTarget{Store: test.store, StorageClass: "hot", StorageKey: test.key, FreshInstall: true}
+			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+			if !errors.Is(err, db.ErrBlockMetadataPermanent) || IsRetryableBlockMaterializationError(err) {
+				t.Fatalf("error = %v, want permanent non-retryable refusal", err)
 			}
 		})
 	}

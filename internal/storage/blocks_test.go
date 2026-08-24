@@ -487,6 +487,7 @@ func TestBlockStoreExplicitStorageKeyGuard(t *testing.T) {
 		{"GetBlockSizeByStorageKey", func(key string) error { _, err := blockStore.GetBlockSizeByStorageKey(ctx, key); return err }},
 		{"DeleteBlockByStorageKey", func(key string) error { return blockStore.DeleteBlockByStorageKey(ctx, key) }},
 		{"ValidatePhysicalLocator", func(key string) error { return blockStore.ValidatePhysicalLocator(testHash64, key) }},
+		{"ValidateMintedPhysicalLocator", func(key string) error { return blockStore.ValidateMintedPhysicalLocator(testHash64, key) }},
 	}
 	rejected := []struct {
 		name string
@@ -594,6 +595,35 @@ func TestBlockStoreValidatePhysicalLocator(t *testing.T) {
 	}
 	if got := backend.snapshot(); len(got) != 0 {
 		t.Fatalf("locator validation reached backend: %v", got)
+	}
+}
+
+func TestBlockStoreValidateMintedPhysicalLocator(t *testing.T) {
+	blockStore, backend := newRecordingBlockStore(t, "blocks/")
+	base := blockStore.StorageKeyForHash(testHash64)
+	minted := base + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+	otherHash := "a3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	otherBase := blockStore.StorageKeyForHash(otherHash)
+	foreignBase := "blocks/" + testOrgB + "/e3/b0/" + testHash64
+
+	if err := blockStore.ValidateMintedPhysicalLocator(testHash64, minted); err != nil {
+		t.Fatalf("ValidateMintedPhysicalLocator(%q) error = %v", minted, err)
+	}
+	for _, key := range []string{
+		base,
+		base + ".not-a-uuid",
+		base + ".8F14E45F-EA4D-4F73-9F7C-63F4E7A5BC21",
+		base + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21.extra",
+		minted + " ",
+		otherBase + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21",
+		foreignBase + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21",
+	} {
+		if err := blockStore.ValidateMintedPhysicalLocator(testHash64, key); err == nil {
+			t.Fatalf("ValidateMintedPhysicalLocator(%q) error = nil, want refusal", key)
+		}
+	}
+	if got := backend.snapshot(); len(got) != 0 {
+		t.Fatalf("minted locator validation reached backend: %v", got)
 	}
 }
 

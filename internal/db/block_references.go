@@ -71,6 +71,12 @@ var ErrBlockStubRepairContended = errors.New("block stub repair contended")
 // mislabeled transient only wastes a bounded budget before failing.
 var ErrBlockMetadataPermanent = errors.New("block metadata write is permanently failed")
 
+// ErrInstallBlockMetadataIdentityContradiction means a definite non-applied
+// create-only CAS returned the exact proposed tuple. That tuple may have come
+// from an earlier use of the minted identity, so it grants neither success nor
+// cleanup authority and must never be retried.
+var ErrInstallBlockMetadataIdentityContradiction = errors.New("single-use block install identity was already present")
+
 type BlockReuseDecision int
 
 const (
@@ -102,6 +108,10 @@ const (
 	// InstallBlockMetadataKnownLost means Canonical names a different complete
 	// tuple, or is empty when settlement proved that no canonical row exists.
 	InstallBlockMetadataKnownLost
+	// InstallBlockMetadataIdentityContradiction is a definite direct CAS result
+	// that found the exact proposed tuple already present. It authorizes neither
+	// use nor cleanup of the single-use proposal.
+	InstallBlockMetadataIdentityContradiction
 )
 
 type BlockPhysicalLocation struct {
@@ -791,7 +801,7 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 	if !found {
 		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Cause: installErr}
 	}
-	settled := classifyInstalledBlockMetadataRow(row, proposed)
+	settled := classifySettledBlockMetadataRow(row, proposed)
 	settled.Cause = errors.Join(installErr, settled.Cause)
 	return settled
 }
@@ -814,17 +824,34 @@ func classifyInstalledBlockMetadataCAS(current map[string]interface{}, proposed 
 		row.Location.StorageKey = storageKey
 		row.StorageKeyPresent = true
 	}
-	return classifyInstalledBlockMetadataRow(row, proposed)
+	if malformed := validateInstalledBlockMetadataRow(row); malformed != nil {
+		return *malformed
+	}
+	if row.Location == proposed {
+		return InstallBlockMetadataResult{
+			Outcome: InstallBlockMetadataIdentityContradiction,
+			Cause:   fmt.Errorf("%w: direct CAS for %s/%s returned the proposed tuple", ErrInstallBlockMetadataIdentityContradiction, proposed.StorageClass, proposed.StorageKey),
+		}
+	}
+	return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Canonical: row.Location}
 }
 
-func classifyInstalledBlockMetadataRow(row installedBlockMetadataRow, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
-	if !row.StorageClassPresent || !row.StorageKeyPresent || !config.IsCanonicalStorageClassName(row.Location.StorageClass) || row.Location.StorageKey == "" || strings.TrimSpace(row.Location.StorageKey) != row.Location.StorageKey {
-		return malformedInstalledBlockMetadataResult("canonical physical tuple is incomplete or malformed")
+func classifySettledBlockMetadataRow(row installedBlockMetadataRow, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
+	if malformed := validateInstalledBlockMetadataRow(row); malformed != nil {
+		return *malformed
 	}
 	if row.Location == proposed {
 		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataApplied, Canonical: row.Location}
 	}
 	return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Canonical: row.Location}
+}
+
+func validateInstalledBlockMetadataRow(row installedBlockMetadataRow) *InstallBlockMetadataResult {
+	if !row.StorageClassPresent || !row.StorageKeyPresent || !config.IsCanonicalStorageClassName(row.Location.StorageClass) || row.Location.StorageKey == "" || strings.TrimSpace(row.Location.StorageKey) != row.Location.StorageKey {
+		result := malformedInstalledBlockMetadataResult("canonical physical tuple is incomplete or malformed")
+		return &result
+	}
+	return nil
 }
 
 func malformedInstalledBlockMetadataResult(reason string) InstallBlockMetadataResult {

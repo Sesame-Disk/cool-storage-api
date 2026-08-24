@@ -214,9 +214,23 @@ func (bs *BlockStore) ValidatePhysicalLocator(blockID, storageKey string) error 
 	if storageKey == base {
 		return nil
 	}
+	return bs.ValidateMintedPhysicalLocator(blockID, storageKey)
+}
+
+// ValidateMintedPhysicalLocator verifies that storageKey is exactly one fresh
+// incarnation of blockID in this store. Unlike ValidatePhysicalLocator it never
+// accepts the legacy deterministic base key.
+func (bs *BlockStore) ValidateMintedPhysicalLocator(blockID, storageKey string) error {
+	if !isSHA256BlockID(blockID) {
+		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
+	}
+	if err := bs.validateExactStorageKey(storageKey); err != nil {
+		return err
+	}
+	base := bs.hashToKey(blockID)
 	incarnationPrefix := base + "."
 	if !strings.HasPrefix(storageKey, incarnationPrefix) {
-		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+		return fmt.Errorf("block storage key %q is not a minted locator for block id %q", storageKey, blockID)
 	}
 	incarnation := strings.TrimPrefix(storageKey, incarnationPrefix)
 	parsed, err := uuid.Parse(incarnation)

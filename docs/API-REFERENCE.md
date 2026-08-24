@@ -537,9 +537,14 @@ rowless uploads carry the complete minted target through PUT and the target-awar
 `InstallBlockMetadata` API. Existing canonical reuse/stub repair uses the stored
 tuple through `UpsertBlockMetadata`; it does not mint. If the one-shot INSTALL
 result is uncertain, SesameFS performs a bounded detached `SERIAL` settlement
-read. Only a different complete canonical tuple authorizes exact loser cleanup;
-an ambiguous result retains the object. This is the P2 contract, not a claim that
-the out-of-scope R17/P3 repair design is complete.
+read. An exact tuple proves Applied; a different complete tuple or no row proves
+KnownLost and authorizes cleanup of only the attempted key; unavailable or
+malformed settlement remains ambiguous and retains the object. A definite direct
+CAS result that returns the proposed tuple is instead a single-use identity
+contradiction: it grants no success or cleanup and is not retryable. Fresh targets
+must pass strict minted-only locator validation before any provisional reference
+or metadata mutation. This is the P2 contract, not a claim that the out-of-scope
+R17/P3 repair design or durable reconciliation is complete.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

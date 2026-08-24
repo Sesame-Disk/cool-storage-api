@@ -31,7 +31,11 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 		{file: "worker.go", symbol: "(*Worker).processBlock", receiver: "resolved"}:                 1,
 		{file: "worker.go", symbol: "(*Worker).RecoverS3Orphans", receiver: "blockStore"}:           1,
 	}
+	wantMintedValidations := map[expectedUse]int{
+		{file: "fs_helpers.go", symbol: "(*FSHelper).RegisterUploadedBlockTarget", receiver: "target.Store"}: 1,
+	}
 	validationCounts := map[expectedUse]int{}
+	mintedValidationCounts := map[expectedUse]int{}
 	var storageKeyUses, unexpectedMints []p2AuthoritySite
 	forbiddenTupleWrappers := map[string]bool{
 		"RegisterUploadedBlock":              true,
@@ -40,6 +44,8 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 	}
 	mintCount := 0
 	mintInsideRowlessBranch := false
+	freshInstallTrueCount := 0
+	freshInstallInsideRowlessBranch := false
 
 	r12WalkProductionFiles(t, func(fset *token.FileSet, path string, file *ast.File) {
 		for _, declaration := range file.Decls {
@@ -69,6 +75,32 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 				t.Errorf("%s: tuple-only production materialization wrapper %s bypasses target authority", fset.Position(function.Pos()), symbol)
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.AssignStmt:
+					for _, lhs := range typed.Lhs {
+						selector, selectorOK := lhs.(*ast.SelectorExpr)
+						if selectorOK && selector.Sel.Name == "FreshInstall" {
+							t.Errorf("%s: %s mutates FreshInstall; authority must be constructed only with the rowless minted target", fset.Position(selector.Pos()), symbol)
+						}
+					}
+				case *ast.CompositeLit:
+					if typed.Type != nil && r24NodeText(t, typed.Type) == "BlockMaterializationTarget" {
+						for _, element := range typed.Elts {
+							field, keyed := element.(*ast.KeyValueExpr)
+							if !keyed {
+								t.Errorf("%s: %s uses positional BlockMaterializationTarget construction", fset.Position(element.Pos()), symbol)
+								continue
+							}
+							if r24NodeText(t, field.Key) == "FreshInstall" {
+								if r24NodeText(t, field.Value) != "true" {
+									t.Errorf("%s: %s constructs FreshInstall with non-literal-true authority", fset.Position(field.Pos()), symbol)
+								} else {
+									freshInstallTrueCount++
+								}
+							}
+						}
+					}
+				}
 				selector, ok := node.(*ast.SelectorExpr)
 				if !ok {
 					return true
@@ -89,6 +121,11 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					if _, expected := wantValidations[key]; expected {
 						validationCounts[key]++
 					}
+				case "ValidateMintedPhysicalLocator":
+					key := expectedUse{file: filepath.Base(path), symbol: symbol, receiver: receiver}
+					if _, expected := wantMintedValidations[key]; expected {
+						mintedValidationCounts[key]++
+					}
 				}
 				return true
 			})
@@ -99,15 +136,21 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					if !ok || r24NodeText(t, conditional.Cond) != `canonicalClass == ""` {
 						return true
 					}
-					count := 0
+					mintCount := 0
+					freshCount := 0
 					ast.Inspect(conditional.Body, func(child ast.Node) bool {
 						selector, ok := child.(*ast.SelectorExpr)
 						if ok && selector.Sel.Name == "MintStorageKey" && r24NodeText(t, selector.X) == "preferredStore" {
-							count++
+							mintCount++
+						}
+						field, ok := child.(*ast.KeyValueExpr)
+						if ok && r24NodeText(t, field.Key) == "FreshInstall" && r24NodeText(t, field.Value) == "true" {
+							freshCount++
 						}
 						return true
 					})
-					mintInsideRowlessBranch = count == 1
+					mintInsideRowlessBranch = mintCount == 1
+					freshInstallInsideRowlessBranch = freshCount == 1
 					return true
 				})
 			}
@@ -123,9 +166,17 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 	if mintCount != 1 || !mintInsideRowlessBranch {
 		t.Errorf("rowless ResolveNeedsPutBlockStore mint count/branch = %d/%v, want 1/true", mintCount, mintInsideRowlessBranch)
 	}
+	if freshInstallTrueCount != 1 || !freshInstallInsideRowlessBranch {
+		t.Errorf("production FreshInstall:true count/rowless branch = %d/%v, want 1/true", freshInstallTrueCount, freshInstallInsideRowlessBranch)
+	}
 	for use, want := range wantValidations {
 		if got := validationCounts[use]; got != want {
 			t.Errorf("%s %s.%s ValidatePhysicalLocator references = %d, want %d", use.file, use.symbol, use.receiver, got, want)
+		}
+	}
+	for use, want := range wantMintedValidations {
+		if got := mintedValidationCounts[use]; got != want {
+			t.Errorf("%s %s.%s ValidateMintedPhysicalLocator references = %d, want %d", use.file, use.symbol, use.receiver, got, want)
 		}
 	}
 }

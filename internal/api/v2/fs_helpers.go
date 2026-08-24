@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -1005,6 +1006,17 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if target.FreshInstall {
+		if target.Store == nil {
+			return fmt.Errorf("%w: fresh block %s has no exact PUT store", db.ErrBlockMetadataPermanent, blockID)
+		}
+		if !config.IsCanonicalStorageClassName(target.StorageClass) {
+			return fmt.Errorf("%w: fresh block %s has non-canonical storage class %q", db.ErrBlockMetadataPermanent, blockID, target.StorageClass)
+		}
+		if err := target.Store.ValidateMintedPhysicalLocator(blockID, target.StorageKey); err != nil {
+			return fmt.Errorf("%w: fresh block %s has invalid minted locator %q: %v", db.ErrBlockMetadataPermanent, blockID, target.StorageKey, err)
+		}
+	}
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
@@ -1027,9 +1039,6 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 	}
 
 	if target.FreshInstall {
-		if target.Store == nil {
-			return fmt.Errorf("fresh block %s has no exact PUT store", blockID)
-		}
 		result := registerUploadedBlockInstallMetadataFn(ctx, h, orgID, libraryID, blockID, sha1ID, sizeBytes, target)
 		switch result.Outcome {
 		case db.InstallBlockMetadataApplied:
@@ -1049,6 +1058,12 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 				return errors.Join(lostErr, result.Cause)
 			}
 			return lostErr
+		case db.InstallBlockMetadataIdentityContradiction:
+			contradictionErr := fmt.Errorf("single-use canonical install identity contradiction for block %s; proposed object retained", blockID)
+			if result.Cause != nil {
+				return errors.Join(contradictionErr, result.Cause)
+			}
+			return contradictionErr
 		default:
 			ambiguousErr := fmt.Errorf("canonical install outcome is ambiguous for block %s; proposed object retained", blockID)
 			if result.Cause != nil {

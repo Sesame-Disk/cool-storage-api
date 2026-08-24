@@ -185,9 +185,15 @@ reuse and explicitly repairable stubs use the persisted tuple and the repair
 `UpsertBlockMetadata` path; they do not mint or silently relocate the block. An
 uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
 detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
-different complete tuple proves it lost, and incomplete/unavailable settlement
-remains ambiguous and authorizes no cleanup. A proven loser is deleted only by
-its exact minted key with a separate bounded cleanup context. This closes the P2
+different complete tuple or no row proves it lost, and incomplete/unavailable
+settlement remains ambiguous and authorizes no cleanup. A definite direct
+non-applied CAS returning the proposed tuple is not settlement evidence: it is a
+fail-closed single-use identity contradiction with no success, cleanup, or retry
+authority. The fresh authority boundary validates the target as this store's exact
+minted locator before writing a provisional reference. A proven loser is deleted
+only by its exact minted key with a separate bounded cleanup context. Unresolved
+install-uncertain state is request-local in P2; there is no durable reconciliation
+worker, so retained bytes are a possible X3 leak. This closes the P2
 materialization contract; it does not claim the broader R17/P3 repair work.
 
 #### Storage Config Formats

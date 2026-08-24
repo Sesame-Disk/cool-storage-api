@@ -32,7 +32,7 @@ func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
 		want        BlockPhysicalLocation
 	}{
 		{name: "insert applied", applied: true, wantOutcome: InstallBlockMetadataApplied, want: proposed},
-		{name: "CAS returns exact tuple", current: map[string]interface{}{"storage_class": proposed.StorageClass, "storage_key": proposed.StorageKey}, wantOutcome: InstallBlockMetadataApplied, want: proposed},
+		{name: "CAS returns exact tuple contradiction", current: map[string]interface{}{"storage_class": proposed.StorageClass, "storage_key": proposed.StorageKey}, wantOutcome: InstallBlockMetadataIdentityContradiction},
 		{name: "different key loses", current: map[string]interface{}{"storage_class": proposed.StorageClass, "storage_key": "blocks/org-1/winner"}, wantOutcome: InstallBlockMetadataKnownLost, want: BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/winner"}},
 		{name: "same key in different class loses", current: map[string]interface{}{"storage_class": "cold", "storage_key": proposed.StorageKey}, wantOutcome: InstallBlockMetadataKnownLost, want: BlockPhysicalLocation{StorageClass: "cold", StorageKey: proposed.StorageKey}},
 	}
@@ -55,6 +55,9 @@ func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
 			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", strings.Repeat("a", 40), 123, proposed)
 			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
 				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
+			}
+			if test.wantOutcome == InstallBlockMetadataIdentityContradiction && !errors.Is(got.Cause, ErrInstallBlockMetadataIdentityContradiction) {
+				t.Fatalf("InstallBlockMetadata() cause = %v, want identity contradiction", got.Cause)
 			}
 			if installCalls != 1 {
 				t.Fatalf("install calls = %d, want exactly 1", installCalls)
