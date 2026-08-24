@@ -12,11 +12,93 @@ import (
 	"testing"
 )
 
+// TestR24CanonicalInstallQueryShape pins the distinction that makes settlement
+// safe: the mutation is one non-idempotent globally-serial LWT with no retry or
+// speculation, while settlement is a separate SELECT whose query consistency is
+// SERIAL (not its serial-consistency option).
+func TestR24CanonicalInstallQueryShape(t *testing.T) {
+	path := filepath.Join("..", "db", "block_references.go")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical install source: %v", err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, source, 0)
+	if err != nil {
+		t.Fatalf("parse canonical install source: %v", err)
+	}
+
+	install := r24PackageValueSource(t, fset, file, source, "installBlockMetadataLWTFn")
+	settlement := r24PackageValueSource(t, fset, file, source, "settleInstalledBlockMetadataFn")
+
+	installRequired := []string{
+		"INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)",
+		"IF NOT EXISTS",
+		"SerialConsistency(gocql.Serial)",
+		"Idempotent(false)",
+		"RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0})",
+		"SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{})",
+		"MapScanCAS(current)",
+	}
+	for _, required := range installRequired {
+		if !strings.Contains(install, required) {
+			t.Errorf("install query is missing %q", required)
+		}
+	}
+	if strings.Count(install, "INSERT INTO blocks") != 1 || strings.Count(install, "MapScanCAS(") != 1 {
+		t.Errorf("install must contain exactly one blocks INSERT and one CAS terminal")
+	}
+
+	settlementRequired := []string{
+		"SELECT storage_class, storage_key",
+		"Consistency(gocql.Serial)",
+		"Scan(&storageClass, &storageKey)",
+	}
+	for _, required := range settlementRequired {
+		if !strings.Contains(settlement, required) {
+			t.Errorf("settlement query is missing %q", required)
+		}
+	}
+	if strings.Contains(settlement, "SerialConsistency(") || strings.Contains(settlement, "INSERT INTO blocks") {
+		t.Error("settlement must use query Consistency(SERIAL) and must never repeat INSTALL")
+	}
+}
+
+func r24PackageValueSource(t *testing.T, fset *token.FileSet, file *ast.File, source []byte, name string) string {
+	t.Helper()
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, specification := range general.Specs {
+			valueSpec, ok := specification.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, identifier := range valueSpec.Names {
+				if identifier.Name != name || index >= len(valueSpec.Values) {
+					continue
+				}
+				value := valueSpec.Values[index]
+				fileInfo := fset.File(value.Pos())
+				if fileInfo == nil {
+					t.Fatalf("%s has no token file", name)
+				}
+				return string(source[fileInfo.Offset(value.Pos()):fileInfo.Offset(value.End())])
+			}
+		}
+	}
+	t.Fatalf("package value %s not found", name)
+	return ""
+}
+
 // R12 covers the conditional mutations that can participate in the canonical
 // block/orphan lifecycle. The candidate lifecycle is pinned in the same PR as
 // adjacent hardening, but is kept distinct in the labels below so the design
 // documents do not accidentally claim that candidate ordering closes X1.
 var r12ExpectedSerialOperations = map[string]string{
+	"installBlockMetadataLWTFn|blocks|INSERT":                                  "single-use metadata install",
 	"upsertBlockMetadataInsertWithRepresentationFn|blocks|INSERT":              "metadata first-writer",
 	"claimReleasedBlockStubForRepairFn|blocks|UPDATE":                          "released-stub repair claim",
 	"deleteRepairClaimedBlockStubFn|blocks|DELETE":                             "released-stub repair cleanup",
