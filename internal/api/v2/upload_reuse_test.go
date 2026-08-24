@@ -2,6 +2,8 @@ package v2
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -23,12 +25,21 @@ type fastClearTestBlockStore struct {
 }
 
 // The worker asks the resolved store to validate the persisted physical locator
-// before deletion, so this stub mirrors the mock store's org-scoped validation.
+// before deletion, so this stub mirrors the mock store's org-scoped validation,
+// including the resolved SHA-256 block-ID format.
 func (s fastClearTestBlockStore) ValidatePhysicalLocator(blockID, storageKey string) error {
+	if !db.IsSHA256BlockID(blockID) {
+		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
+	}
 	if storageKey != gc.MockCanonicalStorageKey(s.orgID, blockID) {
 		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
 	}
 	return nil
+}
+
+func fastClearTestBlockID(label string) string {
+	digest := sha256.Sum256([]byte("sesamefs-v2-fast-clear:" + label))
+	return hex.EncodeToString(digest[:])
 }
 
 func (s fastClearTestBlockStore) DeleteBlockByStorageKey(context.Context, string) error {
@@ -390,7 +401,7 @@ func TestRetryUploadedBlockMaterializationWithWorkerFastClear(t *testing.T) {
 	store := gc.NewMockStore()
 	orgID := uuid.New()
 	libraryID := uuid.New()
-	const blockID = "fast-clear-block"
+	blockID := fastClearTestBlockID("fast-clear-block")
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", candidateAt)

@@ -1282,9 +1282,10 @@ conflicting `storage_key` fails closed before any S3 HEAD or repair PUT.
 
 The destructive side verifies the same equality rather than trusting the row.
 `ValidatePhysicalLocator` centralizes that destructive check in the org-scoped
-`BlockStore`: it first enforces the store's configured prefix plus canonical org
-ID, then requires the persisted key to equal the deterministic key for the block
-ID. `processBlock` calls it during the authorization phase (before
+`BlockStore`: it first requires a well-formed SHA-256 block ID, then enforces the
+store's configured prefix plus canonical org ID, then requires the persisted key
+to equal the deterministic key for the block ID. `processBlock` calls it during
+the authorization phase (before
 `StartBlockDeleteOrphan` and `FinalizeBlockDelete`), and `RecoverS3Orphans` calls
 it on the reloaded canonical row. Neither path records or consumes recovery state
 for a refused delete. `storage.BlockStore` no longer
