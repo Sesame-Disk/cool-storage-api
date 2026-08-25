@@ -10,6 +10,11 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
+// installTestBlockID is a real SHA-256 block id. InstallBlockMetadata validates
+// its own block id now, so these tests must use an identity production could
+// actually produce rather than a readable placeholder.
+var installTestBlockID = strings.Repeat("b", 64)
+
 func withInstallBlockMetadataSeams(t *testing.T) {
 	t.Helper()
 	oldInstall := installBlockMetadataLWTFn
@@ -42,7 +47,7 @@ func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
 			installCalls := 0
 			installBlockMetadataLWTFn = func(ctx context.Context, database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, location BlockPhysicalLocation, now time.Time) (bool, map[string]interface{}, error) {
 				installCalls++
-				if ctx == nil || database == nil || orgID != "org-1" || blockID != "block-1" || representationID != PlainBlockRepresentationID || sha1 != strings.Repeat("a", 40) || sizeBytes != 123 || location != proposed || now.IsZero() {
+				if ctx == nil || database == nil || orgID != "org-1" || blockID != installTestBlockID || representationID != PlainBlockRepresentationID || sha1 != strings.Repeat("a", 40) || sizeBytes != 123 || location != proposed || now.IsZero() {
 					t.Fatalf("install args were not preserved: db=%p org=%q block=%q representation=%q sha1=%q size=%d location=%+v now=%v", database, orgID, blockID, representationID, sha1, sizeBytes, location, now)
 				}
 				return test.applied, test.current, nil
@@ -52,7 +57,7 @@ func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
 				return installedBlockMetadataRow{}, false, nil
 			}
 
-			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", strings.Repeat("a", 40), 123, proposed)
+			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, strings.Repeat("a", 40), 123, proposed)
 			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
 				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
 			}
@@ -83,7 +88,7 @@ func TestInstallBlockMetadataMalformedCASRowsFailClosed(t *testing.T) {
 		installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
 			return false, current, nil
 		}
-		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
 		if got.Outcome != InstallBlockMetadataAmbiguous || got.Canonical != (BlockPhysicalLocation{}) || got.Cause == nil {
 			t.Fatalf("InstallBlockMetadata() = %+v, want non-authorizing malformed result", got)
 		}
@@ -123,7 +128,7 @@ func TestInstallBlockMetadataSettlesMutationErrorsWithoutRepeatingInstall(t *tes
 				return test.row, test.found, test.settleErr
 			}
 
-			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
 			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
 				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
 			}
@@ -156,7 +161,7 @@ func TestInstallBlockMetadataSettlementSurvivesRequestCancellationAndIsBounded(t
 		return completeInstalledBlockMetadataRow(proposed), true, nil
 	}
 
-	got := (&DB{config: config.DatabaseConfig{Timeout: time.Second}}).InstallBlockMetadata(requestCtx, "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+	got := (&DB{config: config.DatabaseConfig{Timeout: time.Second}}).InstallBlockMetadata(requestCtx, "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
 	if got.Outcome != InstallBlockMetadataApplied || got.Canonical != proposed {
 		t.Fatalf("InstallBlockMetadata() = %+v, want settled Applied", got)
 	}
@@ -177,12 +182,81 @@ func TestInstallBlockMetadataRejectsInvalidInputBeforeInstall(t *testing.T) {
 	}
 
 	for _, proposed := range []BlockPhysicalLocation{{StorageClass: "Hot", StorageKey: "key"}, {StorageClass: "hot", StorageKey: " key "}, {StorageClass: "hot"}} {
-		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
 		if got.Outcome != InstallBlockMetadataAmbiguous || !errors.Is(got.Cause, ErrBlockMetadataPermanent) {
 			t.Fatalf("InstallBlockMetadata(%+v) = %+v, want non-authorizing permanent rejection", proposed, got)
 		}
 		if got.Submitted {
 			t.Fatalf("InstallBlockMetadata(%+v) Submitted = true before LWT", proposed)
+		}
+	}
+}
+
+// TestInstallBlockMetadataRejectsNonSHA256BlockID keeps this seam self-sufficient.
+// InstallBlockMetadata is the single-use canonical install boundary, so it validates
+// its own block id instead of trusting the caller. Production only reaches it behind
+// ValidateMintedPhysicalLocator, which already checks the SHA-256 -- but that is the
+// caller guarantee, not this boundary guarantee, and a future internal caller must
+// not be able to install a canonical row under a block id that is not a SHA-256.
+//
+// The rejection must happen before the LWT seam so it is conclusively unsubmitted:
+// Submitted stays false, which is what tells the cleanup path the object is safe to
+// remove and that no install identity was consumed.
+// TestInstallBlockMetadataAcceptsCanonicalBlockID is the companion to the rejection
+// table: the gate must accept the exact lower-case digest production actually mints,
+// or it would be rejecting everything and the table above would prove nothing.
+func TestInstallBlockMetadataAcceptsCanonicalBlockID(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	installed := ""
+	installBlockMetadataLWTFn = func(_ context.Context, _ *DB, _, blockID, _, _ string, _ int, _ BlockPhysicalLocation, _ time.Time) (bool, map[string]interface{}, error) {
+		installed = blockID
+		return true, nil, nil
+	}
+
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
+	if got.Outcome != InstallBlockMetadataApplied {
+		t.Fatalf("InstallBlockMetadata() = %+v, want Applied", got)
+	}
+	if installed != installTestBlockID {
+		t.Fatalf("installed block id = %q, want the exact validated id %q", installed, installTestBlockID)
+	}
+}
+
+func TestInstallBlockMetadataRejectsNonSHA256BlockID(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
+		t.Fatal("a non-SHA-256 block id must not issue INSTALL")
+		return false, nil, nil
+	}
+	settleInstalledBlockMetadataFn = func(context.Context, *DB, string, string) (installedBlockMetadataRow, bool, error) {
+		t.Fatal("a non-SHA-256 block id must not settle an INSTALL that was never issued")
+		return installedBlockMetadataRow{}, false, nil
+	}
+
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	for _, blockID := range []string{
+		"block-1",
+		"",
+		strings.Repeat("b", 63),
+		strings.Repeat("b", 65),
+		strings.Repeat("z", 64),
+		strings.Repeat("b", 40),
+		// Non-canonical SPELLINGS of an otherwise valid digest. These are the cases
+		// a normalize-then-validate gate would wave through while the LWT and the
+		// settlement SELECT still used the original string as the partition key --
+		// validating one identity and installing the canonical row under another.
+		strings.ToUpper(installTestBlockID),
+		" " + installTestBlockID,
+		installTestBlockID + " ",
+		" " + installTestBlockID + " ",
+	} {
+		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, blockID, "", 1, proposed)
+		if got.Outcome != InstallBlockMetadataAmbiguous || !errors.Is(got.Cause, ErrBlockMetadataPermanent) {
+			t.Fatalf("InstallBlockMetadata(blockID=%q) = %+v, want permanent rejection", blockID, got)
+		}
+		if got.Submitted {
+			t.Fatalf("InstallBlockMetadata(blockID=%q) Submitted = true; a pre-seam rejection must stay conclusively unsubmitted", blockID)
 		}
 	}
 }
@@ -227,7 +301,7 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 	var calls []string
 	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
 		calls = append(calls, "insert")
-		if orgID != "org-1" || blockID != "block-1" || sha1 != strings.Repeat("a", 40) {
+		if orgID != "org-1" || blockID != installTestBlockID || sha1 != strings.Repeat("a", 40) {
 			t.Fatalf("insert args = %s/%s/%s", orgID, blockID, sha1)
 		}
 		return false, nil // row already existed -> proceed to read + backfill
@@ -247,7 +321,7 @@ func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
 		return true, nil
 	}
 
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
 	}
 	want := []string{"insert", "read", "backfill"}
@@ -286,7 +360,7 @@ func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.
 		return false, nil
 	}
 
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
 	}
 }
@@ -318,7 +392,7 @@ func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testin
 		return false, nil
 	}
 
-	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "changed before sha1 repair") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want changed-before-sha1-repair", err)
 	}
@@ -346,7 +420,7 @@ func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
 		return false, nil
 	}
 
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("b", 40), 123, "hot", "key"); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("b", 40), 123, "hot", "key"); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
 	}
 }
@@ -373,7 +447,7 @@ func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T
 		return false, nil
 	}
 
-	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("d", 40), 123, "hot", "key")
+	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("d", 40), 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting sha1", err)
 	}
@@ -397,7 +471,7 @@ func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
 		return blockIdentityRepairRow{}, false, nil
 	}
 
-	err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 123, "hot", "key")
+	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, "not-a-sha1", 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "invalid block sha1") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want invalid block sha1", err)
 	}
@@ -419,7 +493,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageClassBeforeInsert(t *testing.T) {
 		return false, nil
 	}
 
-	if err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "   ", "key"); err == nil {
+	if err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "   ", "key"); err == nil {
 		t.Fatal("UpsertBlockMetadata() error = nil, want empty storage class error")
 	}
 }
@@ -434,7 +508,7 @@ func TestUpsertBlockMetadataRejectsEmptyRepresentationBeforeInsert(t *testing.T)
 		return false, nil
 	}
 
-	err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", "", "block-1", "", 1, "hot", "key")
+	err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", "", installTestBlockID, "", 1, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "missing block representation id") {
 		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v, want missing representation error", err)
 	}
@@ -455,7 +529,7 @@ func TestUpsertBlockMetadataRejectsNonCanonicalStorageClass(t *testing.T) {
 	}
 
 	for _, storageClass := range []string{" hot", "hot ", "Hot", "hot_tier", "hot--tier", "   "} {
-		err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", PlainBlockRepresentationID, "block-1", "", 1, storageClass, "key")
+		err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, storageClass, "key")
 		if err == nil || !strings.Contains(err.Error(), "non-canonical storage class") {
 			t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1(%q) error = %v, want non-canonical rejection", storageClass, err)
 		}
@@ -495,7 +569,7 @@ func TestUpsertBlockMetadataRejectsNonCanonicalStorageClassOnTheExistingRow(t *t
 		}
 
 		// The ARGUMENT is canonical here; only the stored row is not.
-		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
 		if err == nil {
 			t.Fatalf("stored class %q: error = nil, want rejection", storedClass)
 		}
@@ -529,7 +603,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyBeforeInsert(t *testing.T) {
 	}
 
 	for _, storageKey := range []string{"", "   ", " key", "key "} {
-		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", storageKey)
+		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", storageKey)
 		if err == nil || !strings.Contains(err.Error(), "missing canonical storage key") {
 			t.Fatalf("UpsertBlockMetadata(%q) error = %v, want missing storage key error", storageKey, err)
 		}
@@ -564,7 +638,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyOnTheExistingRow(t *testing.T)
 		return row, true, nil
 	}
 
-	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "key")
+	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
 	if err == nil || !strings.Contains(err.Error(), "empty canonical storage key") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want empty storage key rejection", err)
 	}
@@ -599,7 +673,7 @@ func TestUpsertBlockMetadataRejectsConflictingStorageKeyOnTheExistingRow(t *test
 		return row, true, nil
 	}
 
-	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 123, "hot", "blocks/org-2/ab/cd/abcd1234")
+	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "blocks/org-2/ab/cd/abcd1234")
 	if err == nil || !strings.Contains(err.Error(), "conflicting storage key") {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting storage key rejection", err)
 	}
@@ -633,7 +707,7 @@ func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
 		return true, nil
 	}
 
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", "block-1", strings.Repeat("a", 40), 1, "hot", "key"); err != nil {
+	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 1, "hot", "key"); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
 	}
 	if insertCalls != 2 || repairCalls != 1 {
@@ -666,7 +740,7 @@ func TestUpsertRepresentationMetadataRepairsReleasedStubAndRetriesInsert(t *test
 		return true, nil
 	}
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", representationID, "block-1", "", 1, "hot", "key"); err != nil {
+	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", representationID, installTestBlockID, "", 1, "hot", "key"); err != nil {
 		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v", err)
 	}
 	if insertCalls != 2 || repairCalls != 1 {
@@ -695,7 +769,7 @@ func TestUpsertBlockMetadataStopsWhenReleasedStubDeleteLosesRace(t *testing.T) {
 	}
 	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) { return false, nil }
 
-	err := database.UpsertBlockMetadata("org-1", "block-1", 1, "hot", "key")
+	err := database.UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", "key")
 	if !errors.Is(err, ErrBlockStubRepairContended) {
 		t.Fatalf("UpsertBlockMetadata() error = %v, want ErrBlockStubRepairContended (retryable)", err)
 	}
@@ -717,7 +791,7 @@ func TestRepairReleasedBlockStubClaimsRechecksOrphanAndDeletes(t *testing.T) {
 	})
 	blockStubRepairIDFn = func(string, string) string { return "repair-1" }
 	claimReleasedBlockStubForRepairFn = func(_ *DB, orgID, blockID, repairID string, claimedAt time.Time) (bool, error) {
-		if orgID != "org-1" || blockID != "block-1" || repairID != "repair-1" || claimedAt.IsZero() {
+		if orgID != "org-1" || blockID != installTestBlockID || repairID != "repair-1" || claimedAt.IsZero() {
 			t.Fatalf("claim args = %s/%s/%s/%v", orgID, blockID, repairID, claimedAt)
 		}
 		return true, nil
@@ -730,7 +804,7 @@ func TestRepairReleasedBlockStubClaimsRechecksOrphanAndDeletes(t *testing.T) {
 		return true, nil
 	}
 
-	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", installTestBlockID)
 	if err != nil || !repaired {
 		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want true/nil", repaired, err)
 	}
@@ -753,7 +827,7 @@ func TestRepairReleasedBlockStubStopsWhenOrphanFenceAppears(t *testing.T) {
 		return true, nil
 	}
 
-	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", installTestBlockID)
 	if err != nil || repaired {
 		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/nil", repaired, err)
 	}
@@ -774,7 +848,7 @@ func TestRepairReleasedBlockStubResumesAmbiguousClaim(t *testing.T) {
 		readBlockIdentityForRepairFn = oldRead
 	})
 	claimedAt := time.Now().UTC()
-	repairID := blockStubRepairIDFn("org-1", "block-1")
+	repairID := blockStubRepairIDFn("org-1", installTestBlockID)
 	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) {
 		return false, errors.New("ambiguous timeout")
 	}
@@ -784,7 +858,7 @@ func TestRepairReleasedBlockStubResumesAmbiguousClaim(t *testing.T) {
 	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
 	deleteRepairClaimedBlockStubFn = func(*DB, string, string, string) (bool, error) { return true, nil }
 
-	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", installTestBlockID)
 	if err != nil || !repaired {
 		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want true/nil", repaired, err)
 	}
@@ -802,7 +876,7 @@ func TestRepairReleasedBlockStubRetriesAmbiguousDelete(t *testing.T) {
 		readBlockIdentityForRepairFn = oldRead
 	})
 	claimedAt := time.Now().UTC()
-	repairID := blockStubRepairIDFn("org-1", "block-1")
+	repairID := blockStubRepairIDFn("org-1", installTestBlockID)
 	claimReleasedBlockStubForRepairFn = func(*DB, string, string, string, time.Time) (bool, error) { return true, nil }
 	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
 		return blockIdentityRepairRow{GCState: BlockGCStateRepairingStub, GCClaimID: repairID, GCClaimedAt: &claimedAt}, true, nil
@@ -817,7 +891,7 @@ func TestRepairReleasedBlockStubRetriesAmbiguousDelete(t *testing.T) {
 		return true, nil
 	}
 
-	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", installTestBlockID)
 	if err != nil || !repaired || deleteCalls != 2 {
 		t.Fatalf("RepairReleasedBlockStub() = %v, %v with %d deletes, want true/nil with 2", repaired, err, deleteCalls)
 	}
@@ -844,7 +918,7 @@ func TestRepairReleasedBlockStubDoesNotSucceedWhenClaimedRowChanges(t *testing.T
 	// The row was completed by another actor before our conditional delete. That is
 	// a benign lost race, so the repair reports (false, nil) — retryable, not a hard
 	// error — and the caller re-probes to converge on Reusable/BlockedByGC.
-	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", "block-1")
+	repaired, err := (&DB{}).RepairReleasedBlockStub("org-1", installTestBlockID)
 	if err != nil || repaired {
 		t.Fatalf("RepairReleasedBlockStub() = %v, %v, want false/nil (retryable lost race)", repaired, err)
 	}
@@ -987,7 +1061,7 @@ func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testin
 		return false, nil
 	}
 
-	if err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40)); err != nil {
+	if err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40)); err != nil {
 		t.Fatalf("ensureBlockIdentity() error = %v, want nil", err)
 	}
 }
@@ -1015,7 +1089,7 @@ func TestEnsureBlockIdentity_PlaintextRejectsStoredRepresentationConflict(t *tes
 		return false, nil
 	}
 
-	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40))
+	err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40))
 	if err == nil || !strings.Contains(err.Error(), "conflicting representation id") {
 		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting representation id", err)
 	}
@@ -1044,7 +1118,7 @@ func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *t
 		return false, nil
 	}
 
-	err := database.ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("e", 40))
+	err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("e", 40))
 	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
 		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting sha1", err)
 	}
@@ -1055,13 +1129,13 @@ func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
 	// deterministically irrecoverable and must carry ErrBlockMetadataPermanent so
 	// the upload materialization wrapper refuses to retry them.
 	t.Run("empty storage class is permanent", func(t *testing.T) {
-		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "   ", "key")
+		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "   ", "key")
 		if !errors.Is(err, ErrBlockMetadataPermanent) {
 			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
 		}
 	})
 	t.Run("invalid sha1 is permanent", func(t *testing.T) {
-		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", "block-1", "not-a-sha1", 1, "hot", "key")
+		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, "not-a-sha1", 1, "hot", "key")
 		if !errors.Is(err, ErrBlockMetadataPermanent) {
 			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
 		}
@@ -1074,7 +1148,7 @@ func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
 		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
 			return completeIdentityRepairRow(EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40)), true, nil
 		}
-		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("a", 40))
+		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40))
 		if !errors.Is(err, ErrBlockMetadataPermanent) {
 			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
 		}
@@ -1083,7 +1157,7 @@ func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
 		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
 			return completeIdentityRepairRow("", strings.Repeat("d", 40)), true, nil
 		}
-		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, strings.Repeat("e", 40))
+		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("e", 40))
 		if !errors.Is(err, ErrBlockMetadataPermanent) {
 			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
 		}
@@ -1100,7 +1174,7 @@ func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
 				GCClaimID:           "claim-1",
 			}, true, nil
 		}
-		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, "")
+		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, "")
 		if !errors.Is(err, ErrBlockMetadataPermanent) {
 			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
 		}
@@ -1120,7 +1194,7 @@ func TestUpsertBlockMetadataLeavesTransientFailuresUnmarked(t *testing.T) {
 		upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
 			return false, wantErr
 		}
-		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", "key")
+		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", "key")
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("error = %v, want wrapped %v", err, wantErr)
 		}
@@ -1140,7 +1214,7 @@ func TestUpsertBlockMetadataLeavesTransientFailuresUnmarked(t *testing.T) {
 				GCClaimedAt: &claimedAt,
 			}, true, nil
 		}
-		err := (&DB{}).ensureBlockIdentity("org-1", "block-1", PlainBlockRepresentationID, "")
+		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, "")
 		if err == nil {
 			t.Fatal("ensureBlockIdentity() error = nil, want incomplete metadata error")
 		}
@@ -1180,15 +1254,15 @@ func TestPromotePublishAttemptReferences_RetriesRegisterFailure(t *testing.T) {
 		if orgID != "org-1" || attemptID != "attempt-1" {
 			t.Fatalf("remove args = %s/%s, want org-1/attempt-1", orgID, attemptID)
 		}
-		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
-			t.Fatalf("remove blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+		if len(blockIDs) != 1 || blockIDs[0] != installTestBlockID {
+			t.Fatalf("remove blockIDs = %#v, want []string{%q}", blockIDs, installTestBlockID)
 		}
 		return nil
 	}
 
 	registerCalls := 0
 	wantErr := errors.New("register boom")
-	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{"block-1"}, func() error {
+	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{installTestBlockID}, func() error {
 		registerCalls++
 		if registerCalls == 1 {
 			return wantErr
@@ -1244,7 +1318,7 @@ func TestPromotePublishAttemptReferences_RetriesRemoveFailure(t *testing.T) {
 		return nil
 	}
 
-	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{"block-1"}, func() error {
+	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{installTestBlockID}, func() error {
 		registerCalls++
 		return nil
 	})
@@ -1289,7 +1363,7 @@ func TestPromotePublishAttemptReferences_ReturnsLastErrorAfterExhaustingRetries(
 
 	registerCalls := 0
 	wantErr := errors.New("register boom")
-	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{"block-1"}, func() error {
+	err := PromotePublishAttemptReferences(nil, "org-1", "attempt-1", []string{installTestBlockID}, func() error {
 		registerCalls++
 		return wantErr
 	})
@@ -1333,18 +1407,18 @@ func TestStagePublishAttemptReferences_RollsBackPartialStage(t *testing.T) {
 		return nil
 	}
 
-	resolved, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{"block-1", "block-2"}, nil)
+	resolved, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{installTestBlockID, "block-2"}, nil)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("StagePublishAttemptReferences() error = %v, want %v", err, wantErr)
 	}
 	if resolved != nil {
 		t.Fatalf("resolved = %#v, want nil on stage failure", resolved)
 	}
-	if len(added) != 1 || added[0] != "block-1" {
-		t.Fatalf("added = %#v, want []string{\"block-1\"}", added)
+	if len(added) != 1 || added[0] != installTestBlockID {
+		t.Fatalf("added = %#v, want []string{%q}", added, installTestBlockID)
 	}
-	if len(removed) != 1 || removed[0] != "block-1" {
-		t.Fatalf("removed = %#v, want []string{\"block-1\"}", removed)
+	if len(removed) != 1 || removed[0] != installTestBlockID {
+		t.Fatalf("removed = %#v, want []string{%q}", removed, installTestBlockID)
 	}
 }
 
@@ -1368,7 +1442,7 @@ func TestStagePublishAttemptReferences_JoinsRollbackFailure(t *testing.T) {
 		return wantRollbackErr
 	}
 
-	_, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{"block-1", "block-2"}, nil)
+	_, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{installTestBlockID, "block-2"}, nil)
 	if !errors.Is(err, wantStageErr) {
 		t.Fatalf("error = %v, want stage error %v", err, wantStageErr)
 	}
@@ -1400,7 +1474,7 @@ func TestProbeBlockReuseReusable(t *testing.T) {
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1430,7 +1504,7 @@ func TestProbeBlockReuseNeedsPutWithoutMetadata(t *testing.T) {
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1454,7 +1528,7 @@ func TestProbeBlockReuseBlockedByGC(t *testing.T) {
 		return true, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1473,7 +1547,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageClass(t *testing.T) {
 		return row, true, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err == nil {
 		t.Fatal("ProbeBlockReuse() error = nil, want error")
 	}
@@ -1495,7 +1569,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForNonCanonicalStorageClass(t *testin
 			return row, true, nil
 		}
 
-		probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+		probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 		if err == nil {
 			t.Fatalf("ProbeBlockReuse(%q) error = nil, want error", storageClass)
 		}
@@ -1534,7 +1608,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageKey(t *testing.T) {
 			return row, true, nil
 		}
 
-		probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+		probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 		if err == nil || !strings.Contains(err.Error(), "empty canonical storage key") {
 			t.Fatalf("ProbeBlockReuse(%q) error = %v, want empty storage key error", storageKey, err)
 		}
@@ -1556,7 +1630,7 @@ func TestProbeBlockReuseReturnsRepairableStubForReleasedClaimRow(t *testing.T) {
 	}
 	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1577,7 +1651,7 @@ func TestProbeBlockReuseBlocksReleasedStubWithS3Orphan(t *testing.T) {
 	}
 	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return true, nil }
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1602,7 +1676,7 @@ func TestProbeBlockReuseBlocksActivelyClaimedStub(t *testing.T) {
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1622,13 +1696,13 @@ func TestProbeBlockReuseResumesOwnedRepairingStub(t *testing.T) {
 	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
 		return blockReuseMetadataRow{
 			GCState:     BlockGCStateRepairingStub,
-			GCClaimID:   blockStubRepairIDFn("org-1", "block-1"),
+			GCClaimID:   blockStubRepairIDFn("org-1", installTestBlockID),
 			GCClaimedAt: &claimedAt,
 		}, true, nil
 	}
 	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil || probe.Decision != BlockReuseRepairableStub {
 		t.Fatalf("ProbeBlockReuse() = %v, %v, want repairable/nil", probe.Decision, err)
 	}
@@ -1650,7 +1724,7 @@ func TestProbeBlockReuseBlocksForeignRepairingStub(t *testing.T) {
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil || probe.Decision != BlockReuseBlockedByGC {
 		t.Fatalf("ProbeBlockReuse() = %v, %v, want blocked/nil", probe.Decision, err)
 	}
@@ -1663,7 +1737,7 @@ func TestProbeBlockReuseRejectsIncompleteClaimOwnership(t *testing.T) {
 		return blockReuseMetadataRow{GCState: BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err == nil {
 		t.Fatal("ProbeBlockReuse() error = nil, want malformed ownership error")
 	}
@@ -1702,7 +1776,7 @@ func TestProbeBlockReuseNeedsPutWhenMetadataPresentButNoReferences(t *testing.T)
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1752,7 +1826,7 @@ func TestProbeBlockReuseBlockedByGCWhenGCStateDeleting(t *testing.T) {
 		return false, nil
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if err != nil {
 		t.Fatalf("ProbeBlockReuse() error = %v, want nil", err)
 	}
@@ -1777,7 +1851,7 @@ func TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails(t *testing.T) {
 		return blockReuseMetadataRow{}, false, wantErr
 	}
 
-	probe, err := (&DB{}).ProbeBlockReuse("org-1", "block-1")
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("ProbeBlockReuse() error = %v, want wrapped %v", err, wantErr)
 	}

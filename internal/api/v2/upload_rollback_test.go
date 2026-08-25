@@ -48,6 +48,10 @@ func TestRegisterUploadedBlockTargetAndMapping_WritesMappingAfterMetadata(t *tes
 // A mapping failure is reported without invoking any eager provisional-reference
 // cleanup. The up: reference written by the register step remains TTL-bound.
 func TestRegisterUploadedBlockTargetAndMapping_ReportsMappingFailure(t *testing.T) {
+	// The mapping now retries in place, so without the shortened backoff this test
+	// would burn the full budget in real time.
+	fastBlockMaterializationRetries(t)
+
 	oldRegister := registerUploadedBlockTargetForMaterializationFn
 	oldWriteMapping := writeBlockMappingForMaterializationFn
 	t.Cleanup(func() {
@@ -72,7 +76,20 @@ func TestRegisterUploadedBlockTargetAndMapping_ReportsMappingFailure(t *testing.
 	}
 }
 
-func TestRegisterUploadedBlockTargetAndMapping_TransientMappingFailureIsRetryable(t *testing.T) {
+// TestRegisterUploadedBlockTargetAndMapping_ExhaustedMappingFailureIsNotRetryable
+// pins the inverted contract. This used to assert the opposite -- that a transient
+// mapping failure is retryable by the materialization driver -- which was the bug:
+// the mapping runs AFTER the canonical install applied, and the driver answers a
+// retryable materialize error by restarting the cycle at the mint-capable initial
+// phase. A sidecar mapping timeout could therefore authorize a second physical
+// incarnation for a block that was already canonical.
+//
+// Transient mapping failures now retry in place (see the mapping isolation tests);
+// only an exhausted budget surfaces, and it must be permanent so the store phase
+// is never re-entered. The cause is still preserved for diagnosis.
+func TestRegisterUploadedBlockTargetAndMapping_ExhaustedMappingFailureIsNotRetryable(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
 	oldRegister := registerUploadedBlockTargetForMaterializationFn
 	oldWriteMapping := writeBlockMappingForMaterializationFn
 	t.Cleanup(func() {
@@ -87,8 +104,8 @@ func TestRegisterUploadedBlockTargetAndMapping_TransientMappingFailureIsRetryabl
 	writeBlockMappingForMaterializationFn = func(*db.DB, string, string, string, string) error { return wantCause }
 
 	err := RegisterUploadedBlockTargetAndMapping(context.Background(), nil, "org-1", "repo-1", "int-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot"}, "ext-1")
-	if !IsRetryableBlockMaterializationError(err) {
-		t.Fatalf("error = %v, want retryable (ErrBlockMaterializationTransient)", err)
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("error = %v is retryable; an exhausted post-install mapping budget must not restart the mint-capable store phase", err)
 	}
 	if !errors.Is(err, ErrBlockMappingWriteFailed) {
 		t.Fatalf("error = %v, want ErrBlockMappingWriteFailed preserved", err)

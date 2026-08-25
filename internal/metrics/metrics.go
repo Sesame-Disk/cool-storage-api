@@ -538,6 +538,13 @@ var (
 	// + provisional reference) under a web block-upload session at
 	// /blocks/upload, by whether the underlying S3 PUT was a new write or a
 	// dedup no-op (R9 — a session governs a block either way).
+	//
+	// "new" here is PHYSICAL: an initial-phase PUT that wrote bytes, including a
+	// repair of an existing canonical block whose object was missing. It is
+	// deliberately NOT the same question as the response's New/201 flag, which
+	// asks whether the request CREATED the block and is false for that repair.
+	// The two were once one boolean; keep them apart, or one of the contracts
+	// silently starts lying.
 	BlockUploadStagedBlocksTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "block_upload_staged_blocks_total",
@@ -597,6 +604,19 @@ var (
 			Help: "Total bounded block upload store->materialize retries by surface and reason.",
 		},
 		[]string{"surface", "reason"},
+	)
+
+	// BlockUploadMappingRetriesTotal counts in-place retries of the external SHA-1
+	// mapping write that runs AFTER the canonical install applied. These retries
+	// deliberately do not go through the materialization retry driver: restarting
+	// that cycle would re-enter the mint-capable initial phase for a block that is
+	// already canonical. A rising counter means Cassandra mapping writes are
+	// struggling, not that block identity is churning.
+	BlockUploadMappingRetriesTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "block_upload_mapping_retries_total",
+			Help: "In-place retries of the post-install external block id mapping write.",
+		},
 	)
 
 	// BlockUploadFreshPhysicalCleanupTotal records one final outcome for each
@@ -1155,6 +1175,7 @@ func Register() {
 		BlockUploadSessionAdmissionRejectionsTotal,
 		BlockUploadMaterializationRetriesTotal,
 		BlockUploadFreshPhysicalCleanupTotal,
+		BlockUploadMappingRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		SyncPutBlockInflightCurrent,

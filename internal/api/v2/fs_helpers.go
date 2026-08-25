@@ -993,7 +993,16 @@ func isTransientFreshInstallPreparationError(err error) bool {
 	if errors.As(err, &requestErr) {
 		switch requestErr.Code() {
 		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded, gocql.ErrCodeBootstrapping,
-			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
+			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout,
+			// Read_failure is a non-timeout replica-side failure during a READ, not a
+			// semantic rejection like a syntax or invalid-query error. This step only
+			// READS the library representation, and it runs before any INSTALL is
+			// submitted while the same already-PUT target is still held -- so retrying
+			// is safe and strictly better than deleting that target and failing the
+			// whole upload for a recoverable Cassandra perturbation. WriteFailure is
+			// deliberately NOT included: this step issues no write, so seeing one means
+			// something other than the resolution read failed.
+			gocql.ErrCodeReadFailure:
 			return true
 		}
 	}
@@ -1174,7 +1183,32 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 			if result.Canonical.StorageClass == target.StorageClass && result.Canonical.StorageKey == target.StorageKey {
 				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
 			}
-			_ = cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
+			cleanupErr := cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
+			// Same rule as the conclusively-unsubmitted pre-INSTALL branch: a failed
+			// exact cleanup does not authorize an outer remint while that target
+			// survives. The retryable sentinel sends the driver back to the initial
+			// phase, which is the only phase that mints, so granting it on top of a
+			// known-dead object that is still in the store is how one failure becomes
+			// two orphans.
+			//
+			// This holds even when KnownLost names a DIFFERENT canonical tuple. That
+			// proves a winner existed at classification time, but the next probe is an
+			// ordinary read of `blocks`, not the SERIAL settlement that observed it --
+			// and this codebase already refuses to assume those agree. That assumption
+			// is exactly what ErrBlockCanonicalStateNotVisible exists to reject: the
+			// confirmation phase treats a rowless read of a row it knows was installed
+			// as convergence, never as permission to mint. Relying here on the
+			// visibility the confirmation phase declines to rely on would be
+			// inconsistent, so the rule is uniform: object survived -> no retry
+			// authority.
+			//
+			// The cost is failing a rare request whose block may already be durable --
+			// but only when the physical cleanup ALSO failed, and the client's own
+			// retry starts from a fresh probe. That is cheaper than answering a failed
+			// delete by immediately authorizing another incarnation.
+			if cleanupErr != nil {
+				return errors.Join(result.Cause, fmt.Errorf("exact known-lost cleanup for block %s failed; its object survives, so no outer remint is authorized: %w", blockID, cleanupErr))
+			}
 			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)
 			if result.Cause != nil {
 				return errors.Join(lostErr, result.Cause)

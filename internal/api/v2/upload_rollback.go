@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 )
 
 var registerUploadedBlockTargetForMaterializationFn = func(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
@@ -47,13 +48,11 @@ func RegisterUploadedBlockTargetAndMapping(ctx context.Context, database *db.DB,
 	if strings.TrimSpace(externalBlockID) == "" {
 		return nil
 	}
-	if err := writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
-		if errors.Is(err, db.ErrBlockIDMappingConflict) {
-			return fmt.Errorf("%w: %w", ErrBlockMappingWriteFailed, err)
-		}
-		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
-	}
-	return nil
+	return writeBlockMappingAfterInstall(ctx, func() error {
+		return writeBlockMappingForMaterializationFn(database, orgID, repoID, externalBlockID, internalBlockID)
+	}, internalBlockID, func(err error) error {
+		return fmt.Errorf("%w: %w", ErrBlockMappingWriteFailed, err)
+	})
 }
 
 // RegisterWebUploadedBlockTargetAndMapping is the WEB block-upload (session)
@@ -72,11 +71,72 @@ func RegisterWebUploadedBlockTargetAndMapping(ctx context.Context, database *db.
 	if strings.TrimSpace(externalBlockID) == "" {
 		return nil
 	}
-	if err := writeVerifiedWebBlockMappingFn(database, orgID, repoID, externalBlockID, internalBlockID); err != nil {
-		if errors.Is(err, db.ErrBlockIDMappingConflict) {
-			return err
-		}
-		return fmt.Errorf("%w: %w: %w", ErrBlockMaterializationTransient, ErrBlockMappingWriteFailed, err)
+	return writeBlockMappingAfterInstall(ctx, func() error {
+		return writeVerifiedWebBlockMappingFn(database, orgID, repoID, externalBlockID, internalBlockID)
+	}, internalBlockID, func(err error) error { return err })
+}
+
+// writeBlockMappingAfterInstall writes the external SHA-1 mapping for a block
+// whose canonical metadata is ALREADY installed, retrying transient failures in
+// place instead of letting them escape as ErrBlockMaterializationTransient.
+//
+// That distinction is the whole point. The materialization retry driver answers a
+// transient materialize error by restarting the cycle at
+// BlockMaterializationInitial -- the one phase with mint authority. Before the
+// INSTALL that is correct: nothing is canonical yet, so re-probing and minting is
+// the recovery. After the INSTALL applied it is not: the block is already
+// canonical under this exact target, and a probe that momentarily reads rowless
+// would hand a sidecar mapping timeout the authority to mint and PUT a second
+// physical incarnation. The mapping is a sidecar write; failing it must never
+// reopen physical identity.
+//
+// So transient mapping failures retry here, on the same bounded budget the driver
+// uses, and an exhausted budget returns a NON-retryable error. The block stays
+// installed and durable; the request fails with a mapping error and the client's
+// own retry finds the block reusable. A mapping conflict (external -> different
+// internal) is permanent and never retried -- conflictErr maps it to each
+// funnel's established sentinel.
+func writeBlockMappingAfterInstall(ctx context.Context, write func() error, blockID string, conflictErr func(error) error) error {
+	attempts := RetryAttempts()
+	if attempts < 1 {
+		attempts = 1
 	}
-	return nil
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("%w: mapping write for block %s aborted: %w", ErrBlockMappingWriteFailed, blockID, err)
+			}
+		}
+		err := write()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, db.ErrBlockIDMappingConflict) {
+			return conflictErr(err)
+		}
+		if errors.Is(err, db.ErrBlockMetadataPermanent) {
+			return fmt.Errorf("%w: mapping write for block %s failed permanently: %w", ErrBlockMappingWriteFailed, blockID, err)
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		metrics.BlockUploadMappingRetriesTotal.Inc()
+		if err := waitBeforeBlockMaterializationRetry(ctx, RetryBackoff(attempt)); err != nil {
+			return fmt.Errorf("%w: mapping write for block %s aborted: %w", ErrBlockMappingWriteFailed, blockID, err)
+		}
+	}
+	// Deliberately NOT tagged ErrBlockMaterializationTransient: the canonical
+	// install already applied, so the retry driver must not restart the store
+	// phase and reopen mint authority for this block.
+	failure := fmt.Errorf("%w: mapping write for block %s failed after %d attempts: %w", ErrBlockMappingWriteFailed, blockID, attempts, lastErr)
+	if !IsRetryableBlockMaterializationError(failure) {
+		return failure
+	}
+	// The cause carried a retryable sentinel of its own. Chaining it with %w would
+	// re-arm the retry driver through this error and undo the entire isolation, so
+	// the cause is degraded to text. Non-retryability is a property of this seam,
+	// not something to inherit from whatever the mapping writer happened to return.
+	return fmt.Errorf("%w: mapping write for block %s failed after %d attempts: %v", ErrBlockMappingWriteFailed, blockID, attempts, lastErr)
 }

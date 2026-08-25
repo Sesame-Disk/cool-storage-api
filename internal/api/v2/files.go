@@ -200,6 +200,16 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 }
 
 func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMaterializationPhase) error, register func() error, resetStored func()) error {
+	// Checked up front, before any side effect. resetStored is what re-probes after
+	// registration and rebuilds the caller's target without the fresh-install
+	// authority the initial phase minted; without it the confirmation store
+	// short-circuits on the cached state and a later HEAD-conflict retry would
+	// resubmit a single-use install identity. A nil callback is a caller bug, so it
+	// should not first mint, PUT and register a block and only then be reported.
+	if resetStored == nil {
+		return fmt.Errorf("template block materialization requires a reset callback to re-probe after registration")
+	}
+
 	attempts := createFileTemplateBlockRetryAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -240,10 +250,10 @@ func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMateriali
 			continue
 		}
 		// Re-probe after the provisional reference is durable. Clearing the cached
-		// store state makes this a real canonical HEAD/repair, not a no-op.
-		if resetStored != nil {
-			resetStored()
-		}
+		// store state makes this a real canonical HEAD/repair, not a no-op -- and it
+		// is what rebuilds the caller's target from the now-canonical row, dropping
+		// the fresh-install authority the initial phase minted.
+		resetStored()
 		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
 			if err := store(BlockMaterializationConfirmation); err == nil {
 				return nil
@@ -1535,22 +1545,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, errLibraryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
-		case errors.Is(err, errFileExists):
-			c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
-		case errors.Is(err, errBlockStorageUnavailable):
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		case errors.Is(err, ErrBlockDeleteInProgress):
-			c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
-		case errors.Is(err, ErrLibraryHeadConflict):
-			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file"})
-		}
+		writeCreateFileError(c, err)
 		return
 	}
 
@@ -3504,7 +3499,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return RegisterUploadedBlockTargetAndMapping(c.Request.Context(), h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializationTarget, fileID)
 	}, nil, nil); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
-		if errors.Is(err, ErrBlockDeleteInProgress) {
+		if errors.Is(err, ErrBlockDeleteInProgress) || errors.Is(err, ErrBlockCanonicalStateNotVisible) {
 			writeUploadFileError(c, err)
 		} else if errors.Is(err, ErrBlockMappingWriteFailed) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
@@ -3536,6 +3531,34 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
 }
 
+// writeCreateFileError maps CreateFile failures to their HTTP contract. It is a
+// named function rather than an inline switch so the mapping is reachable from a
+// test: the block-materialization sentinels it shares with writeUploadFileError
+// are exactly the ones that regress silently, since removing a case only changes a
+// status code and never breaks a build.
+func writeCreateFileError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errLibraryNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+	case errors.Is(err, errParentDirectoryNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
+	case errors.Is(err, errFileExists):
+		c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
+	case errors.Is(err, errBlockStorageUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+	case errors.Is(err, ErrBlockDeleteInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
+	// Same transient class as the fence above; see writeUploadFileError.
+	case errors.Is(err, ErrBlockCanonicalStateNotVisible):
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the create"})
+	case errors.Is(err, ErrLibraryHeadConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file"})
+	}
+}
+
 func writeUploadFileError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, ErrLibraryHeadConflict):
@@ -3547,6 +3570,14 @@ func writeUploadFileError(c *gin.Context, err error) {
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
 	case errors.Is(err, ErrBlockDeleteInProgress):
 		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+	// Same transient class as the fence above: the block is installed and durable,
+	// only its canonical row stayed invisible for this request's confirmation
+	// budget. The block funnels (web /blocks/upload, seafhttp, sync PutBlock)
+	// already answer 409 here; a 500 on this surface would report a healthy block
+	// as a server fault and split one state across two status codes.
+	case errors.Is(err, ErrBlockCanonicalStateNotVisible):
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the upload"})
 	case errors.Is(err, errUploadStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:

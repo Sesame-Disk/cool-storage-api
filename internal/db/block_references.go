@@ -539,11 +539,15 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 }
 
 func (db *DB) writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+	// Tagged permanent because they are deterministic input rejections: the same
+	// ids will fail identically on every attempt. The post-install mapping retry
+	// loop reads this tag to stop immediately instead of spending its whole budget
+	// on a write that cannot succeed.
 	if !isHexN(externalID, 40) {
-		return fmt.Errorf("invalid external block id for mapping %s", externalID)
+		return fmt.Errorf("%w: invalid external block id for mapping %s", ErrBlockMetadataPermanent, externalID)
 	}
 	if !isHexN(internalID, 64) {
-		return fmt.Errorf("invalid internal block id for mapping %s", internalID)
+		return fmt.Errorf("%w: invalid internal block id for mapping %s", ErrBlockMetadataPermanent, internalID)
 	}
 	existing, found, err := getBlockIDMappingForWriteCheckFn(db, orgID, representationID, externalID)
 	if err != nil {
@@ -758,6 +762,26 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 	result := InstallBlockMetadataResult{Outcome: InstallBlockMetadataAmbiguous}
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
 		result.Cause = fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
+		return result
+	}
+	// This function is the single-use canonical install boundary, so it validates
+	// its own inputs rather than trusting the caller to have done it. Production
+	// reaches it only behind ValidateMintedPhysicalLocator, which already checks
+	// the SHA-256, but that is the caller's guarantee, not this seam's -- and a
+	// future internal caller must not be able to install a canonical row under a
+	// block id that is not a SHA-256. Returns before Submitted is set, so a
+	// rejection here is conclusively unsubmitted.
+	//
+	// The check is deliberately fail-closed on the EXACT spelling rather than on a
+	// normalized copy. blockID is the partition key the LWT and the settlement
+	// SELECT both use verbatim, so validating NormalizeBlockID(blockID) and then
+	// persisting blockID would accept "  ABCD..  " and install the canonical row
+	// under a padded, upper-case identity that is not the block's content address
+	// -- validating one string and persisting another. At an identity boundary the
+	// caller must arrive already canonical; silent normalization here would just
+	// move the inconsistency downstream.
+	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
+		result.Cause = fmt.Errorf("%w: block id %q is not a canonical lower-case SHA-256 for canonical install", ErrBlockMetadataPermanent, blockID)
 		return result
 	}
 	if !config.IsCanonicalStorageClassName(proposed.StorageClass) {

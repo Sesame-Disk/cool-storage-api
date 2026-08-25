@@ -780,6 +780,15 @@ func respondBlockMaterializeError(c *gin.Context, err error) bool {
 	// and resolved by repeating the request. Mapping it to the default 500 would
 	// report a healthy block as a server fault and be indistinguishable from a
 	// real one in monitoring (finding F2).
+	//
+	// CLIENT_CONTRACT: the machine code is the authoritative signal. The web
+	// uploader keeps an allowlist of retryable 409 codes in
+	// RETRYABLE_BLOCK_UPLOAD_CONFLICT_CODES
+	// (frontend/src/components/file-uploader/block-upload-orchestrator.js) and
+	// treats every OTHER 4xx as permanent. A retryable 409 that is missing from
+	// that set aborts the upload on the first try -- worse than the 500 this
+	// replaced, which the hard-retry path did retry. Add new retryable codes to
+	// both places.
 	if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
 		c.Header("Retry-After", "1")
 		c.JSON(http.StatusConflict, gin.H{
@@ -1015,7 +1024,14 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	}
 
 	var target BlockMaterializationTarget
-	var didPutAny bool
+	// Two different questions, deliberately two variables. createdByRequest answers
+	// "did THIS request create the block" and drives New/201. didInitialPhysicalPut
+	// answers "did the underlying S3 PUT write bytes or dedup" and drives the staged
+	// metric. They used to be one flag, which was fine only while they agreed; an
+	// initial-phase repair of an existing canonical block writes bytes without
+	// creating anything, so collapsing them makes one of the two contracts lie.
+	var createdByRequest bool
+	var didInitialPhysicalPut bool
 	storeErr := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadBlock", hash, func(phase BlockMaterializationPhase) error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
 		if probeErr == nil {
@@ -1029,15 +1045,30 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 			return putErr
 		}
 		target = resolvedTarget
-		// RESPONSE_CONTRACT: only the initial phase can make this block "new".
-		// A confirmation-phase write is a repair of an object that went missing
-		// between INSTALL and reconfirmation, not this request creating the block,
-		// so it must not turn a reused block's 200/New:false into 201/New:true.
-		// The consequence is deliberate: the same repair now answers 200 or 201
-		// depending on the phase it happened in, and New again means exactly
-		// "this request created the block".
+		// RESPONSE_CONTRACT: New means "this request created the block", so it
+		// follows the fresh-install AUTHORITY, not the fact that bytes were written.
+		//
+		// Two writes are physical but not creation. A confirmation-phase write
+		// repairs an object that went missing between INSTALL and reconfirmation.
+		// And the shared store helper also reports didPut for a Reusable probe whose
+		// canonical object is missing -- a repair that can happen in the INITIAL
+		// phase too. Both act on a block that was already canonical before this
+		// request started, so counting either as creation would answer 201/New:true
+		// for a block this request did not create.
+		//
+		// createdByRequest is deliberately assigned, not accumulated with OR. Across
+		// outer retries an attempt may mint a fresh incarnation, lose the canonical
+		// race, and the next attempt then find the block reusable; the winner is
+		// someone else's, so the last initial observation is the honest answer rather
+		// than a sticky true.
+		//
+		// METRIC_CONTRACT: didInitialPhysicalPut keeps its own, older meaning --
+		// whether an initial-phase S3 PUT wrote bytes or deduped. A repair writes
+		// bytes, so it counts here even though it creates nothing. This one DOES
+		// accumulate: if any attempt wrote, the staging involved a write.
 		if phase == BlockMaterializationInitial {
-			didPutAny = didPutAny || didPut
+			createdByRequest = resolvedTarget.FreshInstall && didPut
+			didInitialPhysicalPut = didInitialPhysicalPut || didPut
 		}
 		return nil
 	}, func() error {
@@ -1061,10 +1092,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 	recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didPutAny)).Inc()
+	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didInitialPhysicalPut)).Inc()
 	status := http.StatusOK
-	if didPutAny {
+	if createdByRequest {
 		status = http.StatusCreated
 	}
-	c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPutAny})
+	c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: createdByRequest})
 }

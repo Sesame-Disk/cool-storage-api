@@ -389,12 +389,32 @@ function isTerminal429Error(error) {
   return String(data.code || '').toLowerCase() === 'staging_cap_reached';
 }
 
-function isBlockDeleteInProgressError(error) {
+// CLIENT_CONTRACT: 409 codes the server sends to ask for a retry, not to reject
+// the request. Both mean the block will become usable on its own and resending the
+// same bytes is the intended recovery, so they must stay OUT of the permanent-4xx
+// branch below.
+//
+//   block_delete_in_progress          GC holds a delete fence on this block.
+//   block_canonical_state_not_visible The block IS installed and durable; only the
+//                                     server could not observe its canonical row
+//                                     within one request's confirmation budget.
+//
+// The second one used to be a 500, which the hard-retry path retried. Answering it
+// with a retryable status that this client treats as fatal would be strictly worse
+// than the 500 it replaced, so this list has to move with
+// respondBlockMaterializeError in internal/api/v2/blocks.go. Any new retryable 409
+// code added there belongs here too.
+const RETRYABLE_BLOCK_UPLOAD_CONFLICT_CODES = new Set([
+  'block_delete_in_progress',
+  'block_canonical_state_not_visible',
+]);
+
+function isRetryableBlockConflictError(error) {
   const response = error && error.response;
   const data = (response && response.data) || {};
   return Boolean(response
     && response.status === 409
-    && String(data.code || '').toLowerCase() === 'block_delete_in_progress');
+    && RETRYABLE_BLOCK_UPLOAD_CONFLICT_CODES.has(String(data.code || '').toLowerCase()));
 }
 
 // retryAfterMs reads the server's Retry-After hint (seconds) from a soft-retry response,
@@ -438,7 +458,7 @@ async function withRetry(fn, attempts, { signal } = {}) {
       if (isAbortError(err) || (signal && signal.aborted)) {
         throw err;
       }
-      const softRetry = (is429Error(err) && !isTerminal429Error(err)) || isBlockDeleteInProgressError(err);
+      const softRetry = (is429Error(err) && !isTerminal429Error(err)) || isRetryableBlockConflictError(err);
       if (softRetry && softWaits < MAX_BACKPRESSURE_WAITS) {
         softWaits += 1;
         const jitter = Math.floor(Math.random() * 250);

@@ -35,7 +35,13 @@ func TestIsTransientFreshInstallPreparationErrorRequestCodes(t *testing.T) {
 		{name: "bootstrapping", code: gocql.ErrCodeBootstrapping, want: true},
 		{name: "read timeout", code: gocql.ErrCodeReadTimeout, want: true},
 		{name: "write timeout", code: gocql.ErrCodeWriteTimeout, want: true},
-		{name: "read failure", code: gocql.ErrCodeReadFailure, want: false},
+		// Read_failure is a replica-side failure during a READ, not a semantic
+		// rejection. This step only reads the representation, runs before any
+		// INSTALL is submitted, and still holds the same already-PUT target, so
+		// retrying beats deleting that target and failing the upload.
+		{name: "read failure", code: gocql.ErrCodeReadFailure, want: true},
+		// WriteFailure stays permanent: this step issues no write, so seeing one
+		// means something other than the resolution read failed.
 		{name: "write failure", code: gocql.ErrCodeWriteFailure, want: false},
 		{name: "invalid query", code: gocql.ErrCodeInvalid, want: false},
 		{name: "syntax error", code: gocql.ErrCodeSyntax, want: false},
@@ -594,17 +600,52 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		}
 	})
 
-	t.Run("cleanup failure leaks and still reprobes", func(t *testing.T) {
-		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true}
-		}
-		cleanupErr := errors.New("delete unavailable")
-		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
-		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
-		if !errors.Is(err, ErrBlockMaterializationTransient) || errors.Is(err, cleanupErr) {
-			t.Fatalf("error = %v, want retryable reprobe without making cleanup failure authoritative", err)
-		}
-	})
+	// KnownLost authority follows the surviving OBJECT, not whether a winner is
+	// known. A failed exact cleanup never authorizes an outer remint, because the
+	// retryable sentinel sends the driver back to the only phase that mints and the
+	// known-dead object is still in the store.
+	//
+	// This is uniform across both KnownLost sources on purpose. A different
+	// canonical tuple proves a winner existed at classification time, but the next
+	// probe is an ordinary read of `blocks`, not that SERIAL settlement -- and
+	// ErrBlockCanonicalStateNotVisible exists precisely because this codebase
+	// refuses to assume a known-installed row is immediately visible to a later
+	// read. Relying on that visibility here while the confirmation phase declines to
+	// would be inconsistent.
+	for _, source := range []struct {
+		name      string
+		canonical db.BlockPhysicalLocation
+	}{
+		{name: "with a known winner", canonical: db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org/winner"}},
+		{name: "with no canonical row", canonical: db.BlockPhysicalLocation{}},
+	} {
+		t.Run("known lost "+source.name+" withholds retry when cleanup fails", func(t *testing.T) {
+			registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+				return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true, Canonical: source.canonical}
+			}
+			cleanupErr := errors.New("delete unavailable")
+			deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
+			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+			if IsRetryableBlockMaterializationError(err) {
+				t.Fatalf("error = %v is retryable; an outer remint on top of a surviving known-dead object multiplies orphans for the same reason the pre-install branch refuses it", err)
+			}
+			if !errors.Is(err, cleanupErr) {
+				t.Fatalf("error = %v, want the cleanup failure surfaced as the reason authority was withheld", err)
+			}
+		})
+
+		// The dead object is gone, so a retry can mint at most one live incarnation.
+		t.Run("known lost "+source.name+" stays retryable when cleanup succeeds", func(t *testing.T) {
+			registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+				return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true, Canonical: source.canonical}
+			}
+			deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return nil }
+			err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+			if !errors.Is(err, ErrBlockMaterializationTransient) {
+				t.Fatalf("error = %v, want retryable after a successful exact cleanup", err)
+			}
+		})
+	}
 
 	for _, cause := range []error{nil, errors.New("own settlement unavailable"), errors.New("other settlement unavailable"), errors.New("row absent settlement unavailable")} {
 		name := "nil_cause"
