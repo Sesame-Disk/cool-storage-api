@@ -1,5 +1,9 @@
 # X2 — multi-DC validation runbook and closure findings
 
+> **This fixture also carries the P3 writer-fence legs.** `--p3` proves the mirror
+> property on the write side: GC cannot publish a fence a writer in another
+> datacenter would be unable to see. See "P3 writer-fence legs" at the end.
+
 **Scope:** `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`. Status of record lives in
 `KNOWN_ISSUES.md`; this document holds the reproduction, the runbook, and the
 findings turned up while implementing the fix.
@@ -650,3 +654,96 @@ RF 3 is not on this list: it needs a 9-node stack and is hardening, not closure.
 Closing X2 does **not** enable destructive GC. `GC_ENABLED=false` remains mandatory
 on every replica in every DC, resting on `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`
 (X1) alone.
+
+---
+
+## P3 writer-fence legs
+
+Same three datacenters, mirror question. X2 asks whether a destructive **read**
+intersects every DC that could have acknowledged a reference. P3 asks whether a
+fence **write** is visible to a writer in another DC before GC acts on it.
+
+### Why the proof has a different shape
+
+X2 builds a deliberately divergent cluster and reads it two ways. P3 cannot: with a
+datacenter down, an `EACH_QUORUM` publication does not complete at all. That is the
+property rather than an obstacle —
+
+> the publication either obtains a quorum in **every** datacenter, or it fails and
+> nothing is condemned.
+
+So the green leg asserts the failure, and the mutations show the weaker levels
+succeed and leave the third DC blind.
+
+### The legs
+
+```
+--p3                 leg 1  dc-na stopped: ClaimBlockDelete and StartBlockDeleteOrphan
+                            must BOTH refuse to publish
+                     leg 2  all DCs up: a fence published from dc-eu blocks the
+                            rowless-mint gate AND the pre-PUT repair authority when
+                            read from dc-na
+
+--p3-mutate          publishers -> LOCAL_QUORUM: publication succeeds with dc-na
+                            down, dc-na is blind, leg 1 goes RED
+--p3-mutate-quorum   publishers -> QUORUM: 2 of 3 satisfied by dc-eu + dc-asia,
+                            same outcome, leg 1 goes RED
+```
+
+Observed on the fixture, with dc-na stopped:
+
+```
+Cannot achieve consistency level EACH_QUORUM in DC dc-na
+```
+
+for both the claim and the orphan — and under either mutation, `applied=true`
+instead.
+
+### Why three datacenters, again
+
+`--p3-mutate-quorum` is the reason. At two DCs with RF 1, `QUORUM` is 2 of 2: it
+fails with a datacenter down exactly like `EACH_QUORUM`, so leg 1 would stay green
+and plain `QUORUM` would look like a valid fix. At three it is 2 of 3, satisfied by
+the two DCs that are up, and the leg goes red. Same argument X2 makes for the read
+side, on the write side.
+
+### What these legs do NOT show
+
+The pinned **read** level. `BlockFenceReadConsistency` is `LOCAL_QUORUM` because
+`database.consistency` accepts `ONE` and a `ONE` read can miss a committed fence.
+With RF 1 per datacenter, `LOCAL_QUORUM` and `ONE` both resolve to the single local
+replica, so they are indistinguishable here. That pin defends a deployment with
+RF > 1 inside a datacenter; it stays covered by
+`TestP3FenceReadConsistencyIsLocalQuorum` and by the AST guard that requires every
+`gc_s3_orphans` read to declare its level.
+
+### Running it where Go binaries cannot execute on the host
+
+The script drives `go run` and `go test` from the host. Where a host policy blocks
+executing freshly built binaries, run the same legs from a container attached to
+both the fixture network and the app network:
+
+```bash
+docker compose -f docker-compose.cassandra-3dc.yaml up -d
+docker build -f Dockerfile.gotest -t sesamefs-p3-3dc .
+docker run -d --name p3run --network sesamefs-cassandra-3dc_default sesamefs-p3-3dc sleep 7200
+docker network connect sesamefs_default p3run
+
+# schema
+docker run --rm --network sesamefs-cassandra-3dc_default \
+  -e CASSANDRA_HOSTS=cassandra-na:9042 -e CASSANDRA_LOCAL_DC=dc-na \
+  -e CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
+  -e CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
+  sesamefs-p3-3dc go run ./cmd/sesamefs migrate
+
+# leg 1 (dc-na stopped), then leg 2 (all up)
+docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-na
+docker exec -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
+  -e SESAMEFS_URL=http://sesamefs:8080 -e CASSANDRA_HOSTS=cassandra-eu:9042 \
+  -e CASSANDRA_LOCAL_DC=dc-eu -e P3_EXPECT_DC_DOWN=1 \
+  p3run go test -tags integration -count=1 ./internal/integration/ \
+  -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v
+```
+
+`P3_EXPECT_DC_DOWN=1` is required for leg 1 and is what keeps it from passing
+vacuously against a healthy cluster.

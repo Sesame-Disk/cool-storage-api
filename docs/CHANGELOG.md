@@ -8,6 +8,35 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-25 - P3 cross-DC fence evidence on the three-datacenter fixture
+
+The P3 consistency row moves from "implementation complete, cross-DC evidence
+pending" to GREEN, measured rather than argued. Two legs join X2's on the existing
+`{dc-na:1, dc-eu:1, dc-asia:1}` fixture, reachable as
+`scripts/x2-multidc-validation.sh --p3`.
+
+The proof has a different shape from X2's. X2 builds a divergent cluster and reads
+it two ways; P3 cannot, because with a datacenter down an EACH_QUORUM publication
+does not complete at all. That is the property: the publication either obtains a
+quorum in every DC, or it fails and nothing is condemned. So leg 1 stops dc-na and
+requires both ClaimBlockDelete and StartBlockDeleteOrphan to refuse -- Cassandra
+answers "Cannot achieve consistency level EACH_QUORUM in DC dc-na" -- and leg 2
+shows a fence published from dc-eu blocking both the rowless-mint gate and the
+pre-PUT authority read from dc-na.
+
+Both mutations turn leg 1 red: at LOCAL_QUORUM and at plain QUORUM the publication
+succeeds while dc-na is blind. The QUORUM one is why the fixture has three
+datacenters -- at two, QUORUM is 2 of 2 and fails with a DC down exactly like
+EACH_QUORUM, hiding the wrong fix. Writing it also turned up that X2's mutation
+pattern does not transfer verbatim: block_references.go writes
+`.Consistency(gocql.EachQuorum)` inline while the GC store puts the call on its own
+line, so a pattern anchored on the leading dot matches nothing there. The script's
+own cmp check is what caught it.
+
+Not evidenced by these legs, and said so in the row: the pinned READ level. With
+RF 1 per datacenter, LOCAL_QUORUM and ONE both resolve to the single local replica,
+so the pin defends an RF > 1 deployment this fixture does not have.
+
 ## 2026-08-25 - P3/R10/R13/R17 writer-fence implementation
 
 Implemented the existing-incarnation writer boundary on the X1/P3 branch.
