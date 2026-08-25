@@ -200,6 +200,16 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 }
 
 func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMaterializationPhase) error, register func() error, resetStored func()) error {
+	// Checked up front, before any side effect. resetStored is what re-probes after
+	// registration and rebuilds the caller's target without the fresh-install
+	// authority the initial phase minted; without it the confirmation store
+	// short-circuits on the cached state and a later HEAD-conflict retry would
+	// resubmit a single-use install identity. A nil callback is a caller bug, so it
+	// should not first mint, PUT and register a block and only then be reported.
+	if resetStored == nil {
+		return fmt.Errorf("template block materialization requires a reset callback to re-probe after registration")
+	}
+
 	attempts := createFileTemplateBlockRetryAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -242,13 +252,7 @@ func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMateriali
 		// Re-probe after the provisional reference is durable. Clearing the cached
 		// store state makes this a real canonical HEAD/repair, not a no-op -- and it
 		// is what rebuilds the caller's target from the now-canonical row, dropping
-		// the fresh-install authority the initial phase minted. Without it the
-		// confirmation store short-circuits on the cache and a later HEAD-conflict
-		// retry would resubmit a single-use install identity, so a nil reset is a
-		// caller bug rather than an optional callback.
-		if resetStored == nil {
-			return fmt.Errorf("template block materialization requires a reset callback to re-probe after registration")
-		}
+		// the fresh-install authority the initial phase minted.
 		resetStored()
 		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
 			if err := store(BlockMaterializationConfirmation); err == nil {

@@ -1024,7 +1024,14 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	}
 
 	var target BlockMaterializationTarget
-	var didPutAny bool
+	// Two different questions, deliberately two variables. createdByRequest answers
+	// "did THIS request create the block" and drives New/201. didInitialPhysicalPut
+	// answers "did the underlying S3 PUT write bytes or dedup" and drives the staged
+	// metric. They used to be one flag, which was fine only while they agreed; an
+	// initial-phase repair of an existing canonical block writes bytes without
+	// creating anything, so collapsing them makes one of the two contracts lie.
+	var createdByRequest bool
+	var didInitialPhysicalPut bool
 	storeErr := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadBlock", hash, func(phase BlockMaterializationPhase) error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
 		if probeErr == nil {
@@ -1049,12 +1056,19 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		// request started, so counting either as creation would answer 201/New:true
 		// for a block this request did not create.
 		//
-		// The assignment is deliberately not an accumulating OR. Across outer retries
-		// an attempt may mint a fresh incarnation, lose the canonical race, and the
-		// next attempt then find the block reusable; the winner is someone else's, so
-		// the last initial observation is the honest answer rather than a sticky true.
+		// createdByRequest is deliberately assigned, not accumulated with OR. Across
+		// outer retries an attempt may mint a fresh incarnation, lose the canonical
+		// race, and the next attempt then find the block reusable; the winner is
+		// someone else's, so the last initial observation is the honest answer rather
+		// than a sticky true.
+		//
+		// METRIC_CONTRACT: didInitialPhysicalPut keeps its own, older meaning --
+		// whether an initial-phase S3 PUT wrote bytes or deduped. A repair writes
+		// bytes, so it counts here even though it creates nothing. This one DOES
+		// accumulate: if any attempt wrote, the staging involved a write.
 		if phase == BlockMaterializationInitial {
-			didPutAny = resolvedTarget.FreshInstall && didPut
+			createdByRequest = resolvedTarget.FreshInstall && didPut
+			didInitialPhysicalPut = didInitialPhysicalPut || didPut
 		}
 		return nil
 	}, func() error {
@@ -1078,10 +1092,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 	recordBlockUploadTrafficFn(traffic.Get(), uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
-	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didPutAny)).Inc()
+	metrics.BlockUploadStagedBlocksTotal.WithLabelValues(strconv.FormatBool(didInitialPhysicalPut)).Inc()
 	status := http.StatusOK
-	if didPutAny {
+	if createdByRequest {
 		status = http.StatusCreated
 	}
-	c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: didPutAny})
+	c.JSON(status, UploadBlockResponse{Hash: hash, Size: int64(len(data)), New: createdByRequest})
 }

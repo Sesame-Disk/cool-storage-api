@@ -179,8 +179,8 @@ func TestCreateFileTemplateMaterializationRequiresResetCallback(t *testing.T) {
 	if err == nil {
 		t.Fatal("error = nil, want a caller-bug rejection for a nil reset callback")
 	}
-	if storeCalls != 1 || registerCalls != 1 {
-		t.Errorf("store/register calls = %d/%d, want 1/1 before the rejection", storeCalls, registerCalls)
+	if storeCalls != 0 || registerCalls != 0 {
+		t.Errorf("store/register calls = %d/%d, want 0/0; a caller bug must be rejected before it mints, PUTs and registers a block", storeCalls, registerCalls)
 	}
 	if IsRetryableBlockMaterializationError(err) {
 		t.Errorf("error = %v is retryable; a caller bug must not be retried", err)

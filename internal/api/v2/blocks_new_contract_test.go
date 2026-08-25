@@ -11,10 +11,21 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// stagedBlocksMetric reads the staged-block counter for one "new" label. That label
+// is PHYSICAL -- did the initial-phase S3 PUT write bytes -- and is deliberately a
+// different question from the response's New flag. The two were once one boolean, so
+// every case below asserts both to keep them from quietly re-merging.
+func stagedBlocksMetric(t *testing.T, label string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(metrics.BlockUploadStagedBlocksTotal.WithLabelValues(label))
+}
 
 // UploadBlock reports whether THIS request created the block: 201 with New=true, or
 // 200 with New=false. Phase-scoping didPutAny to the initial phase changed what a
@@ -145,6 +156,7 @@ func decodeUploadBlockResponse(t *testing.T, w *httptest.ResponseRecorder) Uploa
 
 // TestUploadBlockFreshPutAnswers201New reports a block this request actually created.
 func TestUploadBlockFreshPutAnswers201New(t *testing.T) {
+	beforeWrote := stagedBlocksMetric(t, "true")
 	w, counts := uploadBlockNewContractHarness(t,
 		func(call int, orgID, blockID string) db.BlockReuseProbe {
 			if call == 1 {
@@ -166,6 +178,9 @@ func TestUploadBlockFreshPutAnswers201New(t *testing.T) {
 	if counts.puts != 1 {
 		t.Errorf("physical writes = %d, want 1 (the initial mint+PUT only)", counts.puts)
 	}
+	if got := stagedBlocksMetric(t, "true"); got != beforeWrote+1 {
+		t.Errorf("staged metric new=true = %v, want %v; a fresh mint+PUT is a physical write", got, beforeWrote+1)
+	}
 }
 
 // TestUploadBlockConfirmationRepairKeeps200NotNew is the regression this contract
@@ -173,6 +188,7 @@ func TestUploadBlockFreshPutAnswers201New(t *testing.T) {
 // confirmation phase then finds the object missing and repairs it. That repair is a
 // physical write, but it must NOT promote the answer to 201/New=true.
 func TestUploadBlockConfirmationRepairKeeps200NotNew(t *testing.T) {
+	beforeDedup := stagedBlocksMetric(t, "false")
 	w, counts := uploadBlockNewContractHarness(t,
 		// Reusable in BOTH phases: the block already existed before this request.
 		func(_ int, orgID, blockID string) db.BlockReuseProbe { return reusableProbeFor(orgID, blockID) },
@@ -189,6 +205,11 @@ func TestUploadBlockConfirmationRepairKeeps200NotNew(t *testing.T) {
 	if counts.puts != 1 {
 		t.Errorf("physical writes = %d, want exactly 1 (the confirmation repair); without it this test would not exercise the contract at all", counts.puts)
 	}
+	// The write happened in the CONFIRMATION phase, and the staged label reports the
+	// initial-phase PUT, which deduped here.
+	if got := stagedBlocksMetric(t, "false"); got != beforeDedup+1 {
+		t.Errorf("staged metric new=false = %v, want %v; the initial phase deduped", got, beforeDedup+1)
+	}
 }
 
 // TestUploadBlockInitialRepairOfExistingCanonicalKeeps200NotNew is the other half of
@@ -201,6 +222,7 @@ func TestUploadBlockConfirmationRepairKeeps200NotNew(t *testing.T) {
 //
 // New must follow the fresh-install AUTHORITY, not the fact that bytes were written.
 func TestUploadBlockInitialRepairOfExistingCanonicalKeeps200NotNew(t *testing.T) {
+	beforeWrote := stagedBlocksMetric(t, "true")
 	w, counts := uploadBlockNewContractHarness(t,
 		// Already canonical in both phases: this request did not create it.
 		func(_ int, orgID, blockID string) db.BlockReuseProbe { return reusableProbeFor(orgID, blockID) },
@@ -216,5 +238,12 @@ func TestUploadBlockInitialRepairOfExistingCanonicalKeeps200NotNew(t *testing.T)
 	}
 	if body := decodeUploadBlockResponse(t, w); body.New {
 		t.Errorf("New = %v, want false; the block was canonical before this request", body.New)
+	}
+	// The case where the two contracts diverge, and the reason they are separate
+	// variables: no creation, but a real initial-phase S3 write. Reporting new=false
+	// here would silently redefine an existing metric from "was there a write" to
+	// "was the block created".
+	if got := stagedBlocksMetric(t, "true"); got != beforeWrote+1 {
+		t.Errorf("staged metric new=true = %v, want %v; the initial phase wrote bytes even though it created nothing", got, beforeWrote+1)
 	}
 }

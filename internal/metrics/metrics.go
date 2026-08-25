@@ -538,6 +538,13 @@ var (
 	// + provisional reference) under a web block-upload session at
 	// /blocks/upload, by whether the underlying S3 PUT was a new write or a
 	// dedup no-op (R9 — a session governs a block either way).
+	//
+	// "new" here is PHYSICAL: an initial-phase PUT that wrote bytes, including a
+	// repair of an existing canonical block whose object was missing. It is
+	// deliberately NOT the same question as the response's New/201 flag, which
+	// asks whether the request CREATED the block and is false for that repair.
+	// The two were once one boolean; keep them apart, or one of the contracts
+	// silently starts lying.
 	BlockUploadStagedBlocksTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "block_upload_staged_blocks_total",

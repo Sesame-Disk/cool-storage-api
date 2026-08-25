@@ -1255,7 +1255,7 @@ func TestPromotePublishAttemptReferences_RetriesRegisterFailure(t *testing.T) {
 			t.Fatalf("remove args = %s/%s, want org-1/attempt-1", orgID, attemptID)
 		}
 		if len(blockIDs) != 1 || blockIDs[0] != installTestBlockID {
-			t.Fatalf("remove blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+			t.Fatalf("remove blockIDs = %#v, want []string{%q}", blockIDs, installTestBlockID)
 		}
 		return nil
 	}
@@ -1415,10 +1415,10 @@ func TestStagePublishAttemptReferences_RollsBackPartialStage(t *testing.T) {
 		t.Fatalf("resolved = %#v, want nil on stage failure", resolved)
 	}
 	if len(added) != 1 || added[0] != installTestBlockID {
-		t.Fatalf("added = %#v, want []string{\"block-1\"}", added)
+		t.Fatalf("added = %#v, want []string{%q}", added, installTestBlockID)
 	}
 	if len(removed) != 1 || removed[0] != installTestBlockID {
-		t.Fatalf("removed = %#v, want []string{\"block-1\"}", removed)
+		t.Fatalf("removed = %#v, want []string{%q}", removed, installTestBlockID)
 	}
 }
 
