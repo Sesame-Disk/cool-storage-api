@@ -30,9 +30,7 @@ func TestSeafHTTPHandleUploadMappingFailureReturns500(t *testing.T) {
 
 	probeUploadedBlockReuseForUploadFn = func(_ *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 		return db.BlockReuseProbe{
-			Decision:     db.BlockReuseNeedsPut,
-			StorageClass: "hot",
-			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
+			Decision: db.BlockReuseNeedsPut,
 		}, nil
 	}
 	putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
@@ -195,11 +193,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 	syncProbeUploadedBlockReuseFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
 		probeCalls++
 		if probeCalls == 1 {
-			return db.BlockReuseProbe{
-				Decision:     db.BlockReuseNeedsPut,
-				StorageClass: "hot",
-				StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
-			}, nil
+			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
 		}
 		return db.BlockReuseProbe{
 			Decision:     db.BlockReuseReusable,
@@ -208,7 +202,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 		}, nil
 	}
 	ensureCalls := 0
-	syncEnsureReusableBlockPresentFn = func(context.Context, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string, v2.BlockMaterializationPhase) (string, error) {
+	syncEnsureReusableBlockPresentFn = func(context.Context, *db.DB, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string, v2.BlockMaterializationPhase) (string, error) {
 		ensureCalls++
 		return "", nil
 	}

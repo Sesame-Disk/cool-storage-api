@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // installTestBlockID is a real SHA-256 block id. InstallBlockMetadata validates
@@ -287,494 +288,187 @@ func completeProbeMetadataRow(storageClass string) blockReuseMetadataRow {
 	}
 }
 
-func TestUpsertBlockMetadataWithSHA1_BackfillsEmptyExistingSHA1(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
+func withBlockRepairSeams(t *testing.T) {
+	t.Helper()
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	oldRepresentation := backfillCurrentBlockRepresentationIDFn
+	oldSHA1 := backfillCurrentBlockSHA1Fn
 	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+		backfillCurrentBlockRepresentationIDFn = oldRepresentation
+		backfillCurrentBlockSHA1Fn = oldSHA1
 	})
+}
 
-	var calls []string
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		calls = append(calls, "insert")
-		if orgID != "org-1" || blockID != installTestBlockID || sha1 != strings.Repeat("a", 40) {
-			t.Fatalf("insert args = %s/%s/%s", orgID, blockID, sha1)
-		}
-		return false, nil // row already existed -> proceed to read + backfill
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		calls = append(calls, "read")
-		return completeIdentityRepairRow(PlainBlockRepresentationID, ""), true, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		calls = append(calls, "backfill")
-		if sha1 != strings.Repeat("a", 40) {
-			t.Fatalf("backfill sha1 = %q, want %q", sha1, strings.Repeat("a", 40))
-		}
-		if expectedCurrent != "" {
-			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
-		}
-		return true, nil
-	}
-
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
-	}
-	want := []string{"insert", "read", "backfill"}
-	if len(calls) != len(want) {
-		t.Fatalf("calls = %#v, want %#v", calls, want)
-	}
-	for i := range want {
-		if calls[i] != want[i] {
-			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
-		}
+func completeBlockRepairAuthorityRow(location BlockPhysicalLocation) blockRepairAuthorityRow {
+	createdAt := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	return blockRepairAuthorityRow{
+		blockIdentityRepairRow: blockIdentityRepairRow{
+			RepresentationID:    PlainBlockRepresentationID,
+			Sha1:                strings.Repeat("a", 40),
+			SizeBytes:           123,
+			StorageClass:        location.StorageClass,
+			StorageClassPresent: true,
+			StorageKey:          location.StorageKey,
+			CreatedAt:           &createdAt,
+		},
+		StorageKeyPresent: true,
 	}
 }
 
-func TestUpsertBlockMetadataWithSHA1_FirstWriterSkipsReadAndBackfill(t *testing.T) {
-	// Hot path: when the INSERT IF NOT EXISTS applies (a brand-new block), the row
-	// already holds our sha1, so there must be NO extra read and NO backfill LWT.
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
+func TestValidateBlockRepairAuthorityClassifiesExactIncarnation(t *testing.T) {
+	withBlockRepairSeams(t)
+	expected := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/bb/bb/" + installTestBlockID + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"}
+	claimedAt := time.Date(2026, time.August, 25, 12, 1, 0, 0, time.UTC)
 
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		return true, nil // first writer created the row with this sha1
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		t.Fatal("read should not run when the INSERT applied")
-		return blockIdentityRepairRow{}, false, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("backfill should not run when the INSERT applied")
-		return false, nil
+	tests := []struct {
+		name        string
+		row         blockRepairAuthorityRow
+		found       bool
+		hasOrphan   bool
+		wantOutcome BlockRepairAuthorityOutcome
+		wantErr     error
+	}{
+		{name: "absent row", wantOutcome: BlockRepairAuthorityChanged, wantErr: ErrBlockRepairAuthorityChanged},
+		{name: "tuple changed", row: completeBlockRepairAuthorityRow(BlockPhysicalLocation{StorageClass: "hot", StorageKey: expected.StorageKey + ".other"}), found: true, wantOutcome: BlockRepairAuthorityChanged, wantErr: ErrBlockRepairAuthorityChanged},
+		{name: "deleting claim", row: func() blockRepairAuthorityRow {
+			row := completeBlockRepairAuthorityRow(expected)
+			row.GCState, row.GCClaimID, row.GCClaimedAt = BlockGCStateDeleting, "delete-1", &claimedAt
+			return row
+		}(), found: true, wantOutcome: BlockRepairAuthorityBlocked, wantErr: ErrBlockRepairBlocked},
+		{name: "repair claim", row: func() blockRepairAuthorityRow {
+			row := completeBlockRepairAuthorityRow(expected)
+			row.GCState, row.GCClaimID, row.GCClaimedAt = BlockGCStateRepairingStub, "repair-1", &claimedAt
+			return row
+		}(), found: true, wantOutcome: BlockRepairAuthorityBlocked, wantErr: ErrBlockRepairBlocked},
+		{name: "orphan fence", row: completeBlockRepairAuthorityRow(expected), found: true, hasOrphan: true, wantOutcome: BlockRepairAuthorityBlocked, wantErr: ErrBlockRepairBlocked},
+		{name: "complete exact row", row: completeBlockRepairAuthorityRow(expected), found: true, wantOutcome: BlockRepairAuthorityAuthorized},
 	}
 
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key"); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+				return test.row, test.found, nil
+			}
+			blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) {
+				return test.hasOrphan, nil
+			}
+			outcome, err := (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, expected)
+			if outcome != test.wantOutcome || !errors.Is(err, test.wantErr) {
+				t.Fatalf("ValidateBlockRepairAuthority() = %v, %v, want %v, %v", outcome, err, test.wantOutcome, test.wantErr)
+			}
+		})
 	}
 }
 
-func TestUpsertBlockMetadataWithSHA1_FailsWhenRowChangesBeforeBackfill(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
-
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		return false, nil // row already existed -> proceed to read/ensure
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow(PlainBlockRepresentationID, ""), true, nil
-	}
-	// The conditional backfill does not apply: another writer (or GC) changed the
-	// row between read and write. The CAS reports applied=false and the caller must
-	// fail closed instead of overwriting or creating a phantom row.
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		if expectedCurrent != "" {
-			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
-		}
-		return false, nil
+func TestRepairBlockMetadataIfCurrentAbsentRowNeverInserts(t *testing.T) {
+	withBlockRepairSeams(t)
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		return blockRepairAuthorityRow{}, false, nil
 	}
 
-	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "changed before sha1 repair") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want changed-before-sha1-repair", err)
+	err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, strings.Repeat("a", 40), 123, BlockPhysicalLocation{StorageClass: "hot", StorageKey: "legacy-key"})
+	if !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+		t.Fatalf("RepairBlockMetadataIfCurrent() error = %v, want authority changed", err)
 	}
 }
 
-func TestUpsertBlockMetadataWithSHA1_LeavesMatchingSHA1Untouched(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
+func TestRepairBlockMetadataIfCurrentBackfillsWithTupleBoundCAS(t *testing.T) {
+	expected := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "canonical-key"}
 
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		return false, nil // row already existed -> proceed to read/ensure
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("b", 40)), true, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("backfill should not run when the stored sha1 already matches")
-		return false, nil
-	}
-
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("b", 40), 123, "hot", "key"); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
-	}
-}
-
-func TestUpsertBlockMetadataWithSHA1_RejectsConflictingExistingSHA1(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
-
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		return false, nil // row already existed -> proceed to read/ensure
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow(PlainBlockRepresentationID, strings.Repeat("c", 40)), true, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("backfill should not run when the stored sha1 conflicts")
-		return false, nil
-	}
-
-	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("d", 40), 123, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting sha1", err)
-	}
-}
-
-func TestUpsertBlockMetadataWithSHA1_RejectsMalformedInputSHA1(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-	})
-
-	upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-		t.Fatal("insert should not run for malformed sha1 input")
-		return false, nil
-	}
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		t.Fatal("read should not run for malformed sha1 input")
-		return blockIdentityRepairRow{}, false, nil
-	}
-
-	err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, "not-a-sha1", 123, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "invalid block sha1") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want invalid block sha1", err)
-	}
-}
-
-func TestUpsertBlockMetadataRejectsEmptyStorageClassBeforeInsert(t *testing.T) {
-	oldPlainInsert := upsertBlockMetadataInsertFn
-	oldRepresentationInsert := upsertBlockMetadataInsertWithRepresentationFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldPlainInsert
-		upsertBlockMetadataInsertWithRepresentationFn = oldRepresentationInsert
-	})
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("plain insert must not run with an empty storage class")
-		return false, nil
-	}
-	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("representation insert must not run with an empty storage class")
-		return false, nil
-	}
-
-	if err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "   ", "key"); err == nil {
-		t.Fatal("UpsertBlockMetadata() error = nil, want empty storage class error")
-	}
-}
-
-func TestUpsertBlockMetadataRejectsEmptyRepresentationBeforeInsert(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
-	})
-	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("representation insert must not run with an empty representation id")
-		return false, nil
-	}
-
-	err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", "", installTestBlockID, "", 1, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "missing block representation id") {
-		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v, want missing representation error", err)
-	}
-}
-
-// R23a: the persisted storage_class is the physical namespace identity, so the
-// write funnel is where a non-canonical value has to be stopped. Normalizing it
-// would store an identity the writer never named; every reader resolves the raw
-// stored value and would fail on it later, far from the cause.
-func TestUpsertBlockMetadataRejectsNonCanonicalStorageClass(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
-	})
-	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("insert must not run with a non-canonical storage class")
-		return false, nil
-	}
-
-	for _, storageClass := range []string{" hot", "hot ", "Hot", "hot_tier", "hot--tier", "   "} {
-		err := (&DB{}).UpsertBlockMetadataWithRepresentationAndSHA1("org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, storageClass, "key")
-		if err == nil || !strings.Contains(err.Error(), "non-canonical storage class") {
-			t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1(%q) error = %v, want non-canonical rejection", storageClass, err)
-		}
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1(%q) error is not permanent: %v", storageClass, err)
-		}
-	}
-}
-
-// Validating only the incoming argument leaves the case that actually matters
-// uncovered: when the INSERT loses, the caller inherits whatever identity the
-// existing row already carries. Reporting success there would finish an upload
-// whose metadata ProbeBlockReuse and GC both refuse to resolve.
-func TestUpsertBlockMetadataRejectsNonCanonicalStorageClassOnTheExistingRow(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
-
-	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
-		t.Fatal("must not repair identity on a row whose storage class cannot name a namespace")
-		return false, nil
-	}
-
-	for _, storedClass := range []string{" hot", "hot ", "Hot", "hot_tier", "   "} {
-		upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-			return false, nil // the row already exists; converge on it
-		}
-		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-			row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
-			row.StorageClass = storedClass
+	t.Run("representation contention", func(t *testing.T) {
+		withBlockRepairSeams(t)
+		row := completeBlockRepairAuthorityRow(expected)
+		row.RepresentationID = ""
+		readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 			return row, true, nil
 		}
+		blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
+		backfillCurrentBlockRepresentationIDFn = func(_ *DB, orgID, blockID, representationID, current string, location BlockPhysicalLocation, createdAt time.Time, size int) (bool, error) {
+			if orgID != "org-1" || blockID != installTestBlockID || representationID != PlainBlockRepresentationID || current != "" || location != expected || !createdAt.Equal(*row.CreatedAt) || size != 123 {
+				t.Fatalf("representation CAS was not bound to the observed row: %s/%s/%s/%q/%+v/%v/%d", orgID, blockID, representationID, current, location, createdAt, size)
+			}
+			return false, nil
+		}
+		err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, row.Sha1, 123, expected)
+		if !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+			t.Fatalf("RepairBlockMetadataIfCurrent() error = %v, want authority changed", err)
+		}
+	})
 
-		// The ARGUMENT is canonical here; only the stored row is not.
-		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
-		if err == nil {
-			t.Fatalf("stored class %q: error = nil, want rejection", storedClass)
+	t.Run("sha1 contention", func(t *testing.T) {
+		withBlockRepairSeams(t)
+		row := completeBlockRepairAuthorityRow(expected)
+		row.Sha1 = ""
+		readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+			return row, true, nil
 		}
-		if !strings.Contains(err.Error(), "non-canonical storage class") {
-			t.Fatalf("stored class %q: error = %v, want non-canonical rejection", storedClass, err)
+		blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
+		backfillCurrentBlockSHA1Fn = func(_ *DB, orgID, blockID, sha1, current, representationID string, location BlockPhysicalLocation, createdAt time.Time, size int) (bool, error) {
+			if orgID != "org-1" || blockID != installTestBlockID || sha1 != strings.Repeat("b", 40) || current != "" || representationID != PlainBlockRepresentationID || location != expected || !createdAt.Equal(*row.CreatedAt) || size != 123 {
+				t.Fatalf("sha1 CAS was not bound to the observed row: %s/%s/%s/%q/%s/%+v/%v/%d", orgID, blockID, sha1, current, representationID, location, createdAt, size)
+			}
+			return false, nil
 		}
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("stored class %q: error is not permanent (a corrupt label never converges): %v", storedClass, err)
+		err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, strings.Repeat("b", 40), 123, expected)
+		if !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+			t.Fatalf("RepairBlockMetadataIfCurrent() error = %v, want authority changed", err)
 		}
-	}
+	})
 }
 
-// The persisted storage_key is what GC hands to S3 and what reads resolve, so a
-// row must never be created without one. Empty is refused BEFORE the insert, not
-// normalized: a row minted here with no locator would have to be repaired by
-// deriving a key later, which is exactly the derivation authority P1 removed.
-func TestUpsertBlockMetadataRejectsEmptyStorageKeyBeforeInsert(t *testing.T) {
-	oldPlainInsert := upsertBlockMetadataInsertFn
-	oldRepresentationInsert := upsertBlockMetadataInsertWithRepresentationFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldPlainInsert
-		upsertBlockMetadataInsertWithRepresentationFn = oldRepresentationInsert
-	})
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("plain insert must not run without a canonical storage key")
-		return false, nil
-	}
-	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
-		t.Fatal("representation insert must not run without a canonical storage key")
-		return false, nil
-	}
-
-	for _, storageKey := range []string{"", "   ", " key", "key "} {
-		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", storageKey)
-		if err == nil || !strings.Contains(err.Error(), "missing canonical storage key") {
-			t.Fatalf("UpsertBlockMetadata(%q) error = %v, want missing storage key error", storageKey, err)
-		}
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("UpsertBlockMetadata(%q) error is not permanent: %v", storageKey, err)
-		}
-	}
-}
-
-// Losing the INSERT means inheriting the existing row's locator. A row with no
-// locator cannot be inherited into a successful upload: reads and GC would both
-// refuse it later, far from the cause.
-func TestUpsertBlockMetadataRejectsEmptyStorageKeyOnTheExistingRow(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
-	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
-		t.Fatal("must not repair identity on a row with no canonical locator")
-		return false, nil
-	}
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		return false, nil // the row already exists; converge on it
-	}
-	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
-		row.StorageKey = " key "
+func TestRepairBlockMetadataIfCurrentAcceptsCompleteAndLegacyRows(t *testing.T) {
+	withBlockRepairSeams(t)
+	legacy := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/bb/bb/" + installTestBlockID}
+	row := completeBlockRepairAuthorityRow(legacy)
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 		return row, true, nil
 	}
-
-	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "key")
-	if err == nil || !strings.Contains(err.Error(), "empty canonical storage key") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want empty storage key rejection", err)
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
+	backfillCurrentBlockRepresentationIDFn = func(*DB, string, string, string, string, BlockPhysicalLocation, time.Time, int) (bool, error) {
+		t.Fatal("complete row must not backfill representation")
+		return false, nil
 	}
-	if !errors.Is(err, ErrBlockMetadataPermanent) {
-		t.Fatalf("error is not permanent: %v", err)
+	backfillCurrentBlockSHA1Fn = func(*DB, string, string, string, string, string, BlockPhysicalLocation, time.Time, int) (bool, error) {
+		t.Fatal("complete row must not backfill sha1")
+		return false, nil
+	}
+	if err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, row.Sha1, row.SizeBytes, legacy); err != nil {
+		t.Fatalf("RepairBlockMetadataIfCurrent(legacy deterministic key) error = %v", err)
 	}
 }
 
-// Two writers proposing different locators for the same content is a placement
-// conflict, not a race that converges: one of them PUT bytes somewhere the
-// canonical row does not name. Fail permanently rather than report success for a
-// locator the row never adopted.
-func TestUpsertBlockMetadataRejectsConflictingStorageKeyOnTheExistingRow(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfill := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockSHA1Fn = oldBackfill
-	})
-	backfillBlockSHA1Fn = func(*DB, string, string, string, string) (bool, error) {
-		t.Fatal("must not repair identity on a row whose locator disagrees with the writer")
-		return false, nil
-	}
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		return false, nil
-	}
-	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
-		row.StorageKey = "blocks/org-1/ab/cd/abcd1234"
+func TestBlockRepairAuthorityRejectsMalformedStatePermanently(t *testing.T) {
+	withBlockRepairSeams(t)
+	expected := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "canonical-key"}
+	row := completeBlockRepairAuthorityRow(expected)
+	row.GCClaimID = "claim-without-state"
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 		return row, true, nil
 	}
-
-	err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 123, "hot", "blocks/org-2/ab/cd/abcd1234")
-	if err == nil || !strings.Contains(err.Error(), "conflicting storage key") {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want conflicting storage key rejection", err)
-	}
-	if !errors.Is(err, ErrBlockMetadataPermanent) {
-		t.Fatalf("error is not permanent: %v", err)
-	}
-}
-
-func TestUpsertBlockMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldRepair := repairReleasedBlockStubForUpsertFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		repairReleasedBlockStubForUpsertFn = oldRepair
-	})
-
-	insertCalls := 0
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		insertCalls++
-		return insertCalls == 2, nil
-	}
-	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-		return blockIdentityRepairRow{RepresentationID: PlainBlockRepresentationID, Sha1: strings.Repeat("a", 40)}, true, nil
-	}
-	repairCalls := 0
-	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) {
-		repairCalls++
-		return true, nil
-	}
-
-	if err := database.UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, strings.Repeat("a", 40), 1, "hot", "key"); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithSHA1() error = %v, want nil", err)
-	}
-	if insertCalls != 2 || repairCalls != 1 {
-		t.Fatalf("insert/repair calls = %d/%d, want 2/1", insertCalls, repairCalls)
-	}
-}
-
-func TestUpsertRepresentationMetadataRepairsReleasedStubAndRetriesInsert(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertWithRepresentationFn
-	oldRead := readBlockIdentityForRepairFn
-	oldRepair := repairReleasedBlockStubForUpsertFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertWithRepresentationFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		repairReleasedBlockStubForUpsertFn = oldRepair
-	})
-	representationID := EncryptedLibraryBlockRepresentationID("library-1")
-	insertCalls := 0
-	upsertBlockMetadataInsertWithRepresentationFn = func(*DB, string, string, string, string, int, string, string, time.Time) (bool, error) {
-		insertCalls++
-		return insertCalls == 2, nil
-	}
-	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-		return blockIdentityRepairRow{RepresentationID: representationID}, true, nil
-	}
-	repairCalls := 0
-	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) {
-		repairCalls++
-		return true, nil
-	}
-
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1("org-1", representationID, installTestBlockID, "", 1, "hot", "key"); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithRepresentationAndSHA1() error = %v", err)
-	}
-	if insertCalls != 2 || repairCalls != 1 {
-		t.Fatalf("insert/repair calls = %d/%d, want 2/1", insertCalls, repairCalls)
-	}
-}
-
-func TestUpsertBlockMetadataStopsWhenReleasedStubDeleteLosesRace(t *testing.T) {
-	database := &DB{}
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	oldRepair := repairReleasedBlockStubForUpsertFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-		repairReleasedBlockStubForUpsertFn = oldRepair
-	})
-
-	insertCalls := 0
-	upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-		insertCalls++
+	orphanRead := false
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) {
+		orphanRead = true
 		return false, nil
 	}
-	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-		return blockIdentityRepairRow{}, true, nil
+	outcome, err := (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, expected)
+	if outcome != BlockRepairAuthorityPermanent || !errors.Is(err, ErrBlockRepairAuthorityPermanent) || !errors.Is(err, ErrBlockMetadataPermanent) {
+		t.Fatalf("ValidateBlockRepairAuthority() = %v, %v, want permanent malformed-state rejection", outcome, err)
 	}
-	repairReleasedBlockStubForUpsertFn = func(*DB, string, string) (bool, error) { return false, nil }
+	if !orphanRead {
+		t.Fatal("authority validation must read the orphan fence before validating the canonical row")
+	}
 
-	err := database.UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", "key")
-	if !errors.Is(err, ErrBlockStubRepairContended) {
-		t.Fatalf("UpsertBlockMetadata() error = %v, want ErrBlockStubRepairContended (retryable)", err)
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		t.Fatal("malformed locator input must fail before reading")
+		return blockRepairAuthorityRow{}, false, nil
 	}
-	if insertCalls != 1 {
-		t.Fatalf("insertCalls = %d, want 1", insertCalls)
+	outcome, err = (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, BlockPhysicalLocation{StorageClass: "Hot", StorageKey: " key "})
+	if outcome != BlockRepairAuthorityPermanent || !errors.Is(err, ErrBlockRepairAuthorityPermanent) {
+		t.Fatalf("ValidateBlockRepairAuthority(malformed locator) = %v, %v, want permanent", outcome, err)
 	}
 }
 
@@ -1031,197 +725,6 @@ func TestWriteBlockIDMapping_CanonicalizesHashesToLowercase(t *testing.T) {
 	if !getCalled || !insertCalled {
 		t.Fatalf("expected canonicalized lookup+insert path, got lookup=%v insert=%v", getCalled, insertCalled)
 	}
-}
-
-func TestEnsureBlockIdentity_PlaintextBackfillsMissingRepresentationID(t *testing.T) {
-	database := &DB{}
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfillRepresentation := backfillBlockRepresentationIDFn
-	oldBackfillSHA1 := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockRepresentationIDFn = oldBackfillRepresentation
-		backfillBlockSHA1Fn = oldBackfillSHA1
-	})
-
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow("", strings.Repeat("a", 40)), true, nil
-	}
-	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
-		if representationID != PlainBlockRepresentationID {
-			t.Fatalf("representationID = %q, want %q", representationID, PlainBlockRepresentationID)
-		}
-		if expectedCurrent != "" {
-			t.Fatalf("expectedCurrent = %q, want empty", expectedCurrent)
-		}
-		return true, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("sha1 backfill should not run when the stored sha1 already matches")
-		return false, nil
-	}
-
-	if err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40)); err != nil {
-		t.Fatalf("ensureBlockIdentity() error = %v, want nil", err)
-	}
-}
-
-func TestEnsureBlockIdentity_PlaintextRejectsStoredRepresentationConflict(t *testing.T) {
-	database := &DB{}
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfillRepresentation := backfillBlockRepresentationIDFn
-	oldBackfillSHA1 := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockRepresentationIDFn = oldBackfillRepresentation
-		backfillBlockSHA1Fn = oldBackfillSHA1
-	})
-
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow(EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40)), true, nil
-	}
-	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
-		t.Fatal("representation backfill should not run on a stored conflict")
-		return false, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("sha1 backfill should not run on a stored conflict")
-		return false, nil
-	}
-
-	err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40))
-	if err == nil || !strings.Contains(err.Error(), "conflicting representation id") {
-		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting representation id", err)
-	}
-}
-
-func TestEnsureBlockIdentity_DoesNotBackfillRepresentationWhenSHA1Conflicts(t *testing.T) {
-	database := &DB{}
-	oldRead := readBlockIdentityForRepairFn
-	oldBackfillRepresentation := backfillBlockRepresentationIDFn
-	oldBackfillSHA1 := backfillBlockSHA1Fn
-	t.Cleanup(func() {
-		readBlockIdentityForRepairFn = oldRead
-		backfillBlockRepresentationIDFn = oldBackfillRepresentation
-		backfillBlockSHA1Fn = oldBackfillSHA1
-	})
-
-	readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
-		return completeIdentityRepairRow("", strings.Repeat("d", 40)), true, nil
-	}
-	backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
-		t.Fatal("representation backfill should not run when the stored sha1 already conflicts")
-		return false, nil
-	}
-	backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-		t.Fatal("sha1 backfill should not run when the stored sha1 already conflicts")
-		return false, nil
-	}
-
-	err := database.ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("e", 40))
-	if err == nil || !strings.Contains(err.Error(), "conflicting sha1") {
-		t.Fatalf("ensureBlockIdentity() error = %v, want conflicting sha1", err)
-	}
-}
-
-func TestUpsertBlockMetadataClassifiesPermanentFailures(t *testing.T) {
-	// Entry-level invariant violations never reach the driver: they are
-	// deterministically irrecoverable and must carry ErrBlockMetadataPermanent so
-	// the upload materialization wrapper refuses to retry them.
-	t.Run("empty storage class is permanent", func(t *testing.T) {
-		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "   ", "key")
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
-		}
-	})
-	t.Run("invalid sha1 is permanent", func(t *testing.T) {
-		err := (&DB{}).UpsertBlockMetadataWithSHA1("org-1", installTestBlockID, "not-a-sha1", 1, "hot", "key")
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
-		}
-	})
-
-	oldRead := readBlockIdentityForRepairFn
-	t.Cleanup(func() { readBlockIdentityForRepairFn = oldRead })
-
-	t.Run("conflicting representation id is permanent", func(t *testing.T) {
-		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-			return completeIdentityRepairRow(EncryptedLibraryBlockRepresentationID("library-1"), strings.Repeat("a", 40)), true, nil
-		}
-		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("a", 40))
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
-		}
-	})
-	t.Run("conflicting sha1 is permanent", func(t *testing.T) {
-		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-			return completeIdentityRepairRow("", strings.Repeat("d", 40)), true, nil
-		}
-		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, strings.Repeat("e", 40))
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
-		}
-	})
-	t.Run("malformed GC ownership is permanent", func(t *testing.T) {
-		createdAt := time.Now().UTC()
-		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-			// Claim identity present without a lifecycle state == row corruption.
-			return blockIdentityRepairRow{
-				RepresentationID:    PlainBlockRepresentationID,
-				StorageClass:        "hot",
-				StorageClassPresent: true,
-				CreatedAt:           &createdAt,
-				GCClaimID:           "claim-1",
-			}, true, nil
-		}
-		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, "")
-		if !errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("error = %v, want ErrBlockMetadataPermanent", err)
-		}
-	})
-}
-
-func TestUpsertBlockMetadataLeavesTransientFailuresUnmarked(t *testing.T) {
-	oldInsert := upsertBlockMetadataInsertFn
-	oldRead := readBlockIdentityForRepairFn
-	t.Cleanup(func() {
-		upsertBlockMetadataInsertFn = oldInsert
-		readBlockIdentityForRepairFn = oldRead
-	})
-
-	t.Run("raw driver insert error is transient", func(t *testing.T) {
-		wantErr := errors.New("cassandra timeout")
-		upsertBlockMetadataInsertFn = func(*DB, string, string, string, int, string, string, time.Time) (bool, error) {
-			return false, wantErr
-		}
-		err := (&DB{}).UpsertBlockMetadata("org-1", installTestBlockID, 1, "hot", "key")
-		if !errors.Is(err, wantErr) {
-			t.Fatalf("error = %v, want wrapped %v", err, wantErr)
-		}
-		if errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("driver I/O error must not be classified permanent: %v", err)
-		}
-	})
-
-	t.Run("incomplete metadata from an active claim is transient", func(t *testing.T) {
-		claimedAt := time.Now().UTC()
-		readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
-			// An active GC delete claim (deleting) can converge on a re-probe, so
-			// the caller must retry rather than fail closed.
-			return blockIdentityRepairRow{
-				GCState:     BlockGCStateDeleting,
-				GCClaimID:   "claim-1",
-				GCClaimedAt: &claimedAt,
-			}, true, nil
-		}
-		err := (&DB{}).ensureBlockIdentity("org-1", installTestBlockID, PlainBlockRepresentationID, "")
-		if err == nil {
-			t.Fatal("ensureBlockIdentity() error = nil, want incomplete metadata error")
-		}
-		if errors.Is(err, ErrBlockMetadataPermanent) {
-			t.Fatalf("incomplete-metadata (active claim) must not be permanent: %v", err)
-		}
-	})
 }
 
 func TestPromotePublishAttemptReferences_RetriesRegisterFailure(t *testing.T) {
@@ -1534,6 +1037,30 @@ func TestProbeBlockReuseBlockedByGC(t *testing.T) {
 	}
 	if probe.Decision != BlockReuseBlockedByGC {
 		t.Fatalf("decision = %v, want BlockReuseBlockedByGC", probe.Decision)
+	}
+}
+
+func TestP3ProbeBlockReuseOrphanOutranksReferences(t *testing.T) {
+	oldMetadata := probeBlockReuseMetadataFn
+	oldReferences := probeBlockReuseHasReferencesFn
+	oldOrphan := probeBlockReuseHasS3OrphanFn
+	t.Cleanup(func() {
+		probeBlockReuseMetadataFn = oldMetadata
+		probeBlockReuseHasReferencesFn = oldReferences
+		probeBlockReuseHasS3OrphanFn = oldOrphan
+	})
+
+	probeBlockReuseMetadataFn = func(*DB, string, string) (blockReuseMetadataRow, bool, error) {
+		row := completeProbeMetadataRow("hot")
+		row.StorageKey = "legacy-deterministic-key"
+		return row, true, nil
+	}
+	probeBlockReuseHasReferencesFn = func(*DB, string, string) (bool, error) { return true, nil }
+	probeBlockReuseHasS3OrphanFn = func(*DB, string, string) (bool, error) { return true, nil }
+
+	probe, err := (&DB{}).ProbeBlockReuse("org-1", installTestBlockID)
+	if err != nil || probe.Decision != BlockReuseBlockedByGC {
+		t.Fatalf("ProbeBlockReuse() = %v, %v, want BlockReuseBlockedByGC", probe.Decision, err)
 	}
 }
 
@@ -1857,5 +1384,187 @@ func TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails(t *testing.T) {
 	}
 	if probe.Decision != BlockReuseUnknownError {
 		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
+
+// TestP3BlockDeleteFenceSurvivesOrphanHandoff pins the read order that closes the
+// A+ handoff race (R13). GC writes the orphan and only then removes the canonical
+// row, so a writer that reads the orphan FIRST can observe "no orphan", have GC
+// complete both steps underneath it, then read an absent row and conclude there is
+// no fence at all -- leaving orphan(P1) live while it installs P2.
+//
+// The seam below reproduces exactly that interleaving: the canonical read is the
+// moment GC finishes. With the canonical row read first the orphan read that
+// follows must observe the fence; swap the two reads back and this test fails.
+func TestP3BlockDeleteFenceSurvivesOrphanHandoff(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	orphanPublished := false
+	canonicalReads := 0
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		canonicalReads++
+		// GC's StartBlockDeleteOrphan then FinalizeBlockDelete land here.
+		orphanPublished = true
+		return "", false, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		return orphanPublished, nil
+	}
+
+	fenced, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID)
+	if err != nil {
+		t.Fatalf("BlockDeleteFenceActive() error = %v, want nil", err)
+	}
+	if !fenced {
+		t.Fatal("BlockDeleteFenceActive() = false; a rowless read must not be reported as unfenced while the lifecycle's orphan is live")
+	}
+	if canonicalReads != 1 {
+		t.Fatalf("canonical reads = %d, want 1", canonicalReads)
+	}
+}
+
+// TestP3BlockDeleteFenceReadsCanonicalRowBeforeOrphan states the ordering as a
+// property rather than as a consequence, so a refactor cannot satisfy the handoff
+// test by accident.
+func TestP3BlockDeleteFenceReadsCanonicalRowBeforeOrphan(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	var order []string
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		order = append(order, "blocks")
+		return "", true, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		order = append(order, "orphan")
+		return false, nil
+	}
+
+	if _, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID); err != nil {
+		t.Fatalf("BlockDeleteFenceActive() error = %v, want nil", err)
+	}
+	if len(order) != 2 || order[0] != "blocks" || order[1] != "orphan" {
+		t.Fatalf("fence read order = %v, want [blocks orphan]: the orphan must be the last fence read", order)
+	}
+}
+
+// TestP3BlockDeleteFenceStillCatchesAnActiveClaim keeps the short-circuit honest:
+// an in-row claim fences without needing the orphan read at all.
+func TestP3BlockDeleteFenceStillCatchesAnActiveClaim(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	orphanReads := 0
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		return BlockGCStateDeleting, true, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		orphanReads++
+		return false, nil
+	}
+
+	fenced, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID)
+	if err != nil || !fenced {
+		t.Fatalf("BlockDeleteFenceActive() = %v, %v; want true, nil", fenced, err)
+	}
+	if orphanReads != 0 {
+		t.Fatalf("orphan reads = %d, want 0 for an already-claimed row", orphanReads)
+	}
+}
+
+// TestP3RepairAuthorityReadsCanonicalRowBeforeOrphan applies the same ordering
+// proof to the pre-PUT authority boundary.
+func TestP3RepairAuthorityReadsCanonicalRowBeforeOrphan(t *testing.T) {
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	t.Cleanup(func() {
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+	})
+
+	var order []string
+	var observedMode BlockAuthorityRead
+	readBlockRepairAuthorityFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		order = append(order, "blocks")
+		observedMode = mode
+		return blockRepairAuthorityRow{}, false, nil
+	}
+	blockRepairHasS3OrphanFn = func(_ *DB, _, _ string, _ BlockAuthorityRead) (bool, error) {
+		order = append(order, "orphan")
+		return true, nil
+	}
+
+	outcome, err := (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, BlockPhysicalLocation{
+		StorageClass: "hot",
+		StorageKey:   "blocks/org-1/minted",
+	})
+	if outcome != BlockRepairAuthorityBlocked || !errors.Is(err, ErrBlockRepairBlocked) {
+		t.Fatalf("ValidateBlockRepairAuthority() = %v, %v; want Blocked with a fence error", outcome, err)
+	}
+	if len(order) != 2 || order[0] != "blocks" || order[1] != "orphan" {
+		t.Fatalf("authority read order = %v, want [blocks orphan]", order)
+	}
+	if observedMode != BlockAuthorityStrong {
+		t.Fatalf("pre-PUT authority read mode = %v, want BlockAuthorityStrong", observedMode)
+	}
+}
+
+// TestP3MetadataRepairUsesAdvisoryReads keeps the hot dedup path off global Paxos.
+// Its safety comes from the non-creating tuple-bound CAS, not from read freshness.
+func TestP3MetadataRepairUsesAdvisoryReads(t *testing.T) {
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	t.Cleanup(func() {
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+	})
+
+	modes := map[BlockAuthorityRead]int{}
+	readBlockRepairAuthorityFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		modes[mode]++
+		return blockRepairAuthorityRow{}, false, nil
+	}
+	blockRepairHasS3OrphanFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (bool, error) {
+		modes[mode]++
+		return false, nil
+	}
+
+	err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, "", 7, BlockPhysicalLocation{
+		StorageClass: "hot",
+		StorageKey:   "blocks/org-1/minted",
+	})
+	if !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+		t.Fatalf("RepairBlockMetadataIfCurrent() = %v, want authority changed for an absent row", err)
+	}
+	if modes[BlockAuthorityStrong] != 0 {
+		t.Fatalf("metadata repair issued %d SERIAL reads, want 0 on the deduplicated upload path", modes[BlockAuthorityStrong])
+	}
+	if modes[BlockAuthorityAdvisory] != 2 {
+		t.Fatalf("metadata repair advisory reads = %d, want 2", modes[BlockAuthorityAdvisory])
+	}
+}
+
+// TestP3FenceReadConsistencyIsLocalQuorum pins the value, not just the fact that
+// fence reads declare one. The whole advisory-read argument is an intersection --
+// an EACH_QUORUM fence commit meets the reader's quorum in every DC -- and it
+// holds for LOCAL_QUORUM and stronger. Lowering this constant to ONE would leave
+// every fence read syntactically "pinned" while silently removing the guarantee,
+// which the AST guard alone cannot see.
+func TestP3FenceReadConsistencyIsLocalQuorum(t *testing.T) {
+	if BlockFenceReadConsistency != gocql.LocalQuorum {
+		t.Fatalf("BlockFenceReadConsistency = %v, want gocql.LocalQuorum; a weaker level does not intersect an EACH_QUORUM fence publication", BlockFenceReadConsistency)
 	}
 }

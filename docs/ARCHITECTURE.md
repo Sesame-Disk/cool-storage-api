@@ -181,8 +181,11 @@ An org-scoped `BlockStore` accepts exactly two key forms for a SHA-256 block ID:
 
 Fresh, rowless materialization mints a new incarnation, PUTs that exact key, and
 uses the target-aware metadata API to `InstallBlockMetadata` once. Existing-row
-reuse and explicitly repairable stubs use the persisted tuple and the repair
-`UpsertBlockMetadata` path; they do not mint or silently relocate the block. Fresh
+reuse uses the persisted tuple and the non-creating `RepairBlockMetadataIfCurrent`
+path; it does not mint or silently relocate the block. A repairable stub takes a
+different route: `RepairReleasedBlockStub` claims and removes the incomplete row,
+after which the block is rowless and materializes through the fresh-INSTALL
+contract -- it never reaches the repair primitive. Fresh
 INSTALL preparation first resolves the library's representation with the request
 context. Transient Cassandra resolution failures retry locally with bounded
 backoff while retaining the same already-PUT target; permanent identity/library
@@ -284,7 +287,11 @@ minted locator before writing a provisional reference. A proven loser is deleted
 only by its exact minted key with a separate bounded cleanup context. Unresolved
 install-uncertain state is request-local in P2; there is no durable reconciliation
 worker, so retained bytes are a possible X3 leak. This closes the P2
-materialization contract; it does not claim the broader R17/P3 repair work.
+materialization contract. Existing-incarnation PUTs separately revalidate exact
+tuple authority immediately before writing, and metadata repair uses
+`RepairBlockMetadataIfCurrent`, which cannot create an absent row. R18/R27 remain
+open because rejected `up:` references are retained and deferred-orphan
+rescheduling is not implemented; `GC_ENABLED=false` remains mandatory.
 
 #### Storage Config Formats
 
@@ -748,7 +755,7 @@ A reference row is `((org_id, block_id), referrer)` where:
 
 **Operations** (`block_references` steady-state INSERT/DELETE is idempotent and
 non-LWT; canonical metadata creation and lifecycle state transitions are separate):
-- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or repair-capable `UpsertBlockMetadata` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`). Tuple-only registration wrappers are not production entrypoints.
+- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or non-creating `RepairBlockMetadataIfCurrent` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`) or an orphan fence exists. Tuple-only registration wrappers are not production entrypoints. A rejected existing-incarnation repair intentionally retains `up:`; its recovery/liveness cost is R18/R27 and remains open.
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
 - **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and `ValidatePhysicalLocator` verifies the exact persisted `storage_key` as a valid legacy-or-minted locator for that block (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through the backend selected by the persisted org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
@@ -765,8 +772,8 @@ Upload race:   writer sees gc_state='deleting' → backs off → re-creates afte
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
 cross-DC Paxos), so concurrent uploads/deletes no longer collide on a shared
-mutable counter. Block-path `SERIAL` operations include the first-writer
-`UpsertBlockMetadata` LWT, conditional identity backfills, GC candidate
+ mutable counter. Block-path `SERIAL` operations include the single-use
+`InstallBlockMetadata` LWT, non-creating tuple-bound identity backfills, GC candidate
 create/replacement, GC claim/release/finalize and orphan lifecycle transitions. GC
 must be enabled in only one DC (see `configs/config.prod.yaml` comments and
 KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period is a mitigation

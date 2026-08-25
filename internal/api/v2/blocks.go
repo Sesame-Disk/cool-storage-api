@@ -1040,7 +1040,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		if probeErr != nil {
 			return probeErr
 		}
-		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbeForPhase(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut, phase)
+		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbeForPhase(c.Request.Context(), h.db, hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut, phase)
 		if putErr != nil {
 			return putErr
 		}

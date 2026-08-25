@@ -144,16 +144,24 @@ Add to `.github/workflows/test.yml`:
 ## 20. Block Metadata Hot-Path LWT (DEFERRED)
 
 ### Current State
-The row-per-reference migration removed Paxos from `block_references`, but block materialization still uses `INSERT ... IF NOT EXISTS` in `UpsertBlockMetadata` for the canonical `blocks` row.
+The row-per-reference migration removed Paxos from `block_references`. Canonical
+block materialization now uses `InstallBlockMetadata` for first-writer
+`INSERT ... IF NOT EXISTS`, while existing-incarnation repair uses conditional
+updates through `RepairBlockMetadataIfCurrent` and never creates a row.
 
 ### Why It Was Deferred
-This branch keeps the LWT because it still pins one canonical `(storage_class, storage_key)` for a content-addressed block. A blind last-writer-wins rewrite could repoint reads and GC to a backend that does not actually hold the canonical copy.
+The first-writer LWT remains because it pins one canonical
+`(storage_class, storage_key)` for a content-addressed block. A blind
+last-writer-wins rewrite could repoint reads and GC to a backend that does not
+actually hold the canonical copy. The repair split is complete; performance
+measurement of the remaining install/repair CAS cost is still deferred.
 
 ### Follow-Up Plan
-1. Split block materialization into a hot re-upload path and a cold-create path.
-2. Use a cheap read/confirmation path for already-known blocks.
-3. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
-4. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
+1. Measure the remaining first-writer install and tuple-bound repair CAS cost.
+   P3 deliberately kept writer fence reads at ordinary consistency so this cost
+   did not grow; only the pre-PUT repair authority read is linearizable.
+2. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
+3. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
 
 ### Regression Tests To Keep
 - `TestConcurrentV2UploadsNoLostCommits`
@@ -2267,3 +2275,38 @@ fails if the granular flag result stops being honoured.
 ---
 
 *Last updated: 2026-07-23*
+
+## 21. Session staging reservation is not released on a fenced repair (LOW)
+
+### Current State
+`beforePut` in `internal/api/v2/blocks.go` writes a `block_upload_session_staged_blocks`
+row before the bytes are written. P3 moved it to run only after repair authority is
+granted, so a fenced repair no longer charges it. What is still missing is an inverse:
+if the PUT itself fails after admission, the reservation stands.
+
+### Why It Was Deferred
+`ReserveSessionStagedBlock` writes `USING TTL`, so the leak is bounded by the upload
+session and only consumes bucket-cap headroom -- never correctness, never storage.
+There is no release primitive today, and adding one to the staging ledger is a wider
+change than the P3 writer boundary.
+
+### Follow-Up Plan
+1. Add a scoped release for the reserving request's own hash.
+2. Call it when the PUT fails after admission.
+
+### Regression Tests To Keep
+- `TestP3StagingAdmissionRunsOnlyAfterAuthority`
+
+## 22. `ReleaseStaleBlockClaim` reads at session consistency (LOW, pre-existing)
+
+### Current State
+`internal/gc/store_cassandra.go` releases a stale claim after an ordinary read, so a
+claim owned by a worker in another DC may not be observed and the fence can stay stuck.
+
+### Why It Was Deferred
+Fail-closed: the consequence is an un-released fence, never deleted live data. It is GC
+worker liveness and predates P3; the P3 boundary does not depend on it. It belongs with
+the P4 work that binds claim identity to the exact physical tuple (R14).
+
+### Follow-Up Plan
+1. Fold into P4's claim-identity work rather than patching the read in isolation.

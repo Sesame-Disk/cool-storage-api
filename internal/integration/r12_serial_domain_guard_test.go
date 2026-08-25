@@ -161,12 +161,11 @@ func r24NodeText(t *testing.T, node ast.Node) string {
 // documents do not accidentally claim that candidate ordering closes X1.
 var r12ExpectedSerialOperations = map[string]string{
 	"installBlockMetadataLWTFn|blocks|INSERT":                                  "single-use metadata install",
-	"upsertBlockMetadataInsertWithRepresentationFn|blocks|INSERT":              "metadata first-writer",
 	"claimReleasedBlockStubForRepairFn|blocks|UPDATE":                          "released-stub repair claim",
 	"deleteRepairClaimedBlockStubFn|blocks|DELETE":                             "released-stub repair cleanup",
 	"deleteClaimedBlockStubFn|blocks|DELETE":                                   "GC stub cleanup",
-	"backfillBlockSHA1Fn|blocks|UPDATE":                                        "SHA-1 identity backfill",
-	"backfillBlockRepresentationIDFn|blocks|UPDATE":                            "representation identity backfill",
+	"backfillCurrentBlockRepresentationIDFn|blocks|UPDATE":                     "tuple-bound representation identity repair",
+	"backfillCurrentBlockSHA1Fn|blocks|UPDATE":                                 "tuple-bound SHA-1 identity repair",
 	"(*DB).ReleaseBlockDeleteClaim|blocks|UPDATE":                              "database claim release",
 	"(*CassandraStore).ReleaseStaleBlockClaim|blocks|UPDATE":                   "stale claim release",
 	"(*CassandraStore).EnsureBlockGCCandidate|gc_block_candidates|INSERT":      "candidate creation",

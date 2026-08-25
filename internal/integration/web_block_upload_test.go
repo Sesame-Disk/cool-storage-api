@@ -424,6 +424,13 @@ func TestProvisionalRollbackPreservesTTLRows(t *testing.T) {
 	}
 	operationID := "rollback-" + fmt.Sprint(time.Now().UnixNano())
 	referrer := dbpkg.BlockReferrerForUpload(operationID)
+	installed := database.InstallBlockMetadata(
+		context.Background(), orgID, dbpkg.PlainBlockRepresentationID, blockID, "", len(content),
+		dbpkg.BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/" + blockID},
+	)
+	if installed.Outcome != dbpkg.InstallBlockMetadataApplied {
+		t.Fatalf("seed canonical metadata: outcome=%v cause=%v", installed.Outcome, installed.Cause)
+	}
 
 	if err := session.Query(`
 		INSERT INTO block_id_mappings (org_id, representation_id, external_id, internal_id, created_at)

@@ -571,7 +571,7 @@ func TestRetryUploadedBlockMaterializationDoesNotRetryPermanentFailure(t *testin
 		return nil
 	}, func() error {
 		materializeCalls++
-		return fmt.Errorf("upsert block metadata: %w", db.ErrBlockMetadataPermanent)
+		return fmt.Errorf("repair block metadata: %w", db.ErrBlockMetadataPermanent)
 	}, nil, nil)
 	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
 		t.Fatalf("error = %v, want db.ErrBlockMetadataPermanent", err)
@@ -710,7 +710,7 @@ func TestEnsureReusableBlockPresentSkipsPutWhenCanonicalObjectExists(t *testing.
 		return "", nil
 	}
 
-	key, err := EnsureReusableBlockPresent(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	key, err := EnsureReusableBlockPresent(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision:     db.BlockReuseReusable,
 		StorageClass: "hot-s3",
 		StorageKey:   wantKey,
@@ -730,11 +730,16 @@ func TestEnsureReusableBlockPresentRepairsMissingCanonicalObject(t *testing.T) {
 	oldResolve := resolveCanonicalBlockStoreFn
 	oldExists := reusableCanonicalObjectExistsFn
 	oldRepair := repairCanonicalBlockDirectFn
+	oldAuthority := validateBlockRepairAuthorityFn
 	t.Cleanup(func() {
 		resolveCanonicalBlockStoreFn = oldResolve
 		reusableCanonicalObjectExistsFn = oldExists
 		repairCanonicalBlockDirectFn = oldRepair
+		validateBlockRepairAuthorityFn = oldAuthority
 	})
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
 
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 	canonicalStore, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
@@ -766,7 +771,7 @@ func TestEnsureReusableBlockPresentRepairsMissingCanonicalObject(t *testing.T) {
 		return storageKey, nil
 	}
 
-	key, err := EnsureReusableBlockPresent(context.Background(), blockID, db.BlockReuseProbe{
+	key, err := EnsureReusableBlockPresent(context.Background(), &db.DB{}, blockID, db.BlockReuseProbe{
 		Decision:     db.BlockReuseReusable,
 		StorageClass: "hot-s3",
 		StorageKey:   wantKey,
@@ -782,6 +787,99 @@ func TestEnsureReusableBlockPresentRepairsMissingCanonicalObject(t *testing.T) {
 	}
 	if putCalls != 1 {
 		t.Fatalf("putCalls = %d, want 1", putCalls)
+	}
+}
+
+func TestP3ReusableRepairRevalidatesAuthorityBeforePut(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldAuthority := validateBlockRepairAuthorityFn
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		validateBlockRepairAuthorityFn = oldAuthority
+		repairCanonicalBlockDirectFn = oldPut
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.StorageKeyForHash(uploadReuseTestBlockID)
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return store, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("repair PUT must not run after the incarnation is condemned")
+		return "", nil
+	}
+
+	tests := []struct {
+		name    string
+		outcome db.BlockRepairAuthorityOutcome
+		cause   error
+		want    error
+	}{
+		{name: "delete claim", outcome: db.BlockRepairAuthorityBlocked, cause: db.ErrBlockRepairBlocked, want: ErrBlockDeleteInProgress},
+		{name: "orphan fence", outcome: db.BlockRepairAuthorityBlocked, cause: db.ErrBlockRepairBlocked, want: ErrBlockDeleteInProgress},
+		{name: "canonical missing", outcome: db.BlockRepairAuthorityChanged, cause: db.ErrBlockRepairAuthorityChanged, want: ErrBlockMaterializationTransient},
+		{name: "canonical changed", outcome: db.BlockRepairAuthorityChanged, cause: db.ErrBlockRepairAuthorityChanged, want: ErrBlockMaterializationTransient},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			validateBlockRepairAuthorityFn = func(_ *db.DB, gotOrgID, gotBlockID string, expected db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+				if gotOrgID != orgID || gotBlockID != uploadReuseTestBlockID || expected != (db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: key}) {
+					t.Fatalf("authority args = %s/%s/%+v", gotOrgID, gotBlockID, expected)
+				}
+				return test.outcome, test.cause
+			}
+			_, err := EnsureReusableBlockPresent(context.Background(), &db.DB{}, uploadReuseTestBlockID, db.BlockReuseProbe{
+				Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: key,
+			}, []byte("data"), nil, store, "hot", orgID)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestP3NeedsPutExistingIncarnationRevalidatesAuthorityBeforePut(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldAuthority := validateBlockRepairAuthorityFn
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		validateBlockRepairAuthorityFn = oldAuthority
+		repairCanonicalBlockDirectFn = oldPut
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.StorageKeyForHash(uploadReuseTestBlockID)
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return store, nil
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityBlocked, db.ErrBlockRepairBlocked
+	}
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("NeedsPut on an existing condemned incarnation must not PUT")
+		return "", nil
+	}
+
+	_, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut, StorageClass: "hot", StorageKey: key,
+	}, []byte("data"), nil, store, "hot", orgID, nil, BlockMaterializationInitial)
+	if !errors.Is(err, ErrBlockDeleteInProgress) || didPut {
+		t.Fatalf("error/didPut = %v/%v, want fence/false", err, didPut)
 	}
 }
 
@@ -815,7 +913,7 @@ func TestEnsureReusableBlockPresentRejectsMismatchedStorageKey(t *testing.T) {
 		return "", nil
 	}
 
-	_, err = EnsureReusableBlockPresent(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	_, err = EnsureReusableBlockPresent(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision:     db.BlockReuseReusable,
 		StorageClass: "hot-s3",
 		StorageKey:   "blocks/ab/cd/" + uploadReuseTestBlockID,
@@ -971,7 +1069,7 @@ func TestStoreUploadedBlockForProbeForPhaseRejectsUnknownAndRowlessConfirmation(
 	}
 
 	for _, phase := range []BlockMaterializationPhase{-1, BlockMaterializationPhase(2)} {
-		target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+		target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut,
 		}, []byte("data"), nil, preferred, "preferred", orgID, beforePut, phase)
 		if !errors.Is(err, ErrBlockMaterializationPhaseInvalid) || IsRetryableBlockMaterializationError(err) {
@@ -982,7 +1080,7 @@ func TestStoreUploadedBlockForProbeForPhaseRejectsUnknownAndRowlessConfirmation(
 		}
 	}
 
-	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseNeedsPut,
 	}, []byte("data"), nil, preferred, "preferred", orgID, beforePut, BlockMaterializationConfirmation)
 	if !errors.Is(err, ErrBlockCanonicalStateNotVisible) {
@@ -1201,7 +1299,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 	}
 
 	t.Run("first writer empty preferred class", func(t *testing.T) {
-		_, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+		_, _, err := StoreUploadedBlockForProbe(context.Background(), nil, "block-1", db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut,
 		}, []byte("data"), nil, &storage.BlockStore{}, "  ", "org-1", nil)
 		if err == nil || putCalls != 0 {
@@ -1213,7 +1311,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
 			return nil, errors.New("class unavailable")
 		}
-		_, _, err := StoreUploadedBlockForProbe(context.Background(), "block-1", db.BlockReuseProbe{
+		_, _, err := StoreUploadedBlockForProbe(context.Background(), nil, "block-1", db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut, StorageClass: "archive",
 		}, []byte("data"), nil, &storage.BlockStore{}, "preferred", "org-1", nil)
 		if err == nil || putCalls != 0 {
@@ -1231,7 +1329,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 			return canonical, nil
 		}
 		for _, decision := range []db.BlockReuseDecision{db.BlockReuseNeedsPut, db.BlockReuseReusable} {
-			_, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+			_, _, err := StoreUploadedBlockForProbe(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 				Decision: decision, StorageClass: "archive", StorageKey: "   ",
 			}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 			if err == nil || !strings.Contains(err.Error(), "empty persisted storage key") {
@@ -1252,7 +1350,7 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 		resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
 			return canonical, nil
 		}
-		_, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+		_, _, err = StoreUploadedBlockForProbe(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 			Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: "blocks/00000000-0000-0000-0000-000000000001/ab/cd/abcd1234",
 		}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 		if err == nil || putCalls != 0 {
@@ -1264,10 +1362,15 @@ func TestStoreUploadedBlockForProbeCanonicalFailuresDoNotPut(t *testing.T) {
 func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.T) {
 	oldResolve := resolveCanonicalBlockStoreFn
 	oldPut := repairCanonicalBlockDirectFn
+	oldAuthority := validateBlockRepairAuthorityFn
 	t.Cleanup(func() {
 		resolveCanonicalBlockStoreFn = oldResolve
 		repairCanonicalBlockDirectFn = oldPut
+		validateBlockRepairAuthorityFn = oldAuthority
 	})
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
 
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
@@ -1288,7 +1391,7 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 		return gotKey, nil
 	}
 
-	target, didPut, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	target, didPut, err := StoreUploadedBlockForProbe(context.Background(), &db.DB{}, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
 	}, []byte("data"), nil, canonical, "preferred", orgID, func() error {
 		admissionCalls++
@@ -1298,7 +1401,7 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 		t.Fatalf("result = %+v/%v/%v puts=%d admission=%d", target, didPut, err, putCalls, admissionCalls)
 	}
 
-	_, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
+	_, _, err = StoreUploadedBlockForProbe(context.Background(), &db.DB{}, uploadReuseTestBlockID, db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 	if !errors.Is(err, ErrBlockDeleteInProgress) || putCalls != 1 || admissionCalls != 1 {
 		t.Fatalf("fence error/put/admission = %v/%d/%d, want ErrBlockDeleteInProgress/1/1", err, putCalls, admissionCalls)
 	}
@@ -1307,10 +1410,15 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 func TestStoreUploadedBlockForProbeConfirmationRepairsExactPersistedTarget(t *testing.T) {
 	oldResolve := resolveCanonicalBlockStoreFn
 	oldPut := repairCanonicalBlockDirectFn
+	oldAuthority := validateBlockRepairAuthorityFn
 	t.Cleanup(func() {
 		resolveCanonicalBlockStoreFn = oldResolve
 		repairCanonicalBlockDirectFn = oldPut
+		validateBlockRepairAuthorityFn = oldAuthority
 	})
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
 
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
@@ -1330,7 +1438,7 @@ func TestStoreUploadedBlockForProbeConfirmationRepairsExactPersistedTarget(t *te
 		return gotKey, nil
 	}
 
-	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
 	}, []byte("data"), nil, canonical, "preferred", orgID, nil, BlockMaterializationConfirmation)
 	if err != nil || target.Store != canonical || target.StorageKey != wantKey || target.FreshInstall || !didPut || putCalls != 1 {
@@ -1354,7 +1462,7 @@ func TestStoreUploadedBlockForProbePreservesTransientStorageCause(t *testing.T) 
 		return false, context.Canceled
 	}
 
-	_, _, err := StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+	_, _, err := StoreUploadedBlockForProbe(context.Background(), nil, uploadReuseTestBlockID, db.BlockReuseProbe{
 		Decision: db.BlockReuseReusable, StorageClass: "archive", StorageKey: canonical.StorageKeyForHash(uploadReuseTestBlockID),
 	}, []byte("data"), nil, canonical, "preferred", "org-1", nil)
 	if !errors.Is(err, ErrBlockMaterializationTransient) || !errors.Is(err, context.Canceled) {
@@ -1414,5 +1522,306 @@ func TestRetryUploadedBlockMaterializationResetsPlacementPerAttempt(t *testing.T
 	}
 	if attempt != 3 || materializeCalls != 2 {
 		t.Fatalf("store/materialize calls = %d/%d, want 3/2", attempt, materializeCalls)
+	}
+}
+
+// TestP3PermanentRepairAuthorityIsNotRetryable pins the error class across the
+// store funnel. A permanently invalid persisted locator must not be re-tagged as
+// transient: in the initial phase the retry re-enters the only phase that may
+// mint, so a deterministic rejection would become a fresh incarnation.
+func TestP3PermanentRepairAuthorityIsNotRetryable(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	permanentErr := fmt.Errorf("%w: block %s has a malformed canonical locator", db.ErrBlockMetadataPermanent, uploadReuseTestBlockID)
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityPermanent, permanentErr
+	}
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	_, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, nil, BlockMaterializationInitial)
+
+	if didPut || putCalls != 0 {
+		t.Fatalf("didPut=%v putCalls=%d; a permanently invalid locator must not be written", didPut, putCalls)
+	}
+	if !errors.Is(err, db.ErrBlockMetadataPermanent) {
+		t.Fatalf("error = %v; want it to preserve db.ErrBlockMetadataPermanent", err)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("IsRetryableBlockMaterializationError(%v) = true; a permanent authority failure must never be retried", err)
+	}
+}
+
+// TestP3FencedRepairKeepsItsFenceSentinel guards the other half of the same
+// classification: a GC fence must stay a fence, not become a generic transient.
+func TestP3FencedRepairKeepsItsFenceSentinel(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityBlocked, fmt.Errorf("%w: fenced", db.ErrBlockRepairBlocked)
+	}
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	_, _, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, nil, BlockMaterializationInitial)
+
+	if putCalls != 0 {
+		t.Fatalf("putCalls = %d, want 0 under an active fence", putCalls)
+	}
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("error = %v; want ErrBlockDeleteInProgress preserved", err)
+	}
+	if !IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("a fenced repair must stay retryable, got %v", err)
+	}
+}
+
+// TestP3StagingAdmissionRunsOnlyAfterAuthority keeps the session staging ledger
+// from being charged for a PUT the fence then refuses. The reservation is written
+// with a TTL and has no inverse, so a rejected repair would otherwise burn bucket
+// cap for the rest of the session.
+func TestP3StagingAdmissionRunsOnlyAfterAuthority(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		return "", nil
+	}
+	probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+
+	for _, tc := range []struct {
+		name       string
+		outcome    db.BlockRepairAuthorityOutcome
+		authErr    error
+		wantAdmits int
+	}{
+		{name: "fenced repair never charges admission", outcome: db.BlockRepairAuthorityBlocked, authErr: fmt.Errorf("%w: fenced", db.ErrBlockRepairBlocked), wantAdmits: 0},
+		{name: "authorized repair charges admission once", outcome: db.BlockRepairAuthorityAuthorized, wantAdmits: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+				return tc.outcome, tc.authErr
+			}
+			admits := 0
+			admit := func() error { admits++; return nil }
+			_, _, _ = StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, admit, BlockMaterializationInitial)
+			if admits != tc.wantAdmits {
+				t.Fatalf("admission calls = %d, want %d", admits, tc.wantAdmits)
+			}
+		})
+	}
+}
+
+// TestP3AdmissionRejectionKeepsItsOwnClassification is the regression gate for
+// the staging cap contract. Admission speaks the caller's vocabulary, so its
+// error must reach UploadBlock with errSessionStagingCapReached intact and
+// WITHOUT the transient tag: the tag would retry a decision that cannot change
+// within the request, and the lost sentinel would turn a precise 429 into a
+// generic 500.
+func TestP3AdmissionRejectionKeepsItsOwnClassification(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	for _, sentinel := range []error{errSessionStagingCapReached, errSessionStagingCheck, errSessionStagingReserve} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			putCalls = 0
+			admit := func() error { return sentinel }
+			probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+			_, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, admit, BlockMaterializationInitial)
+
+			if didPut || putCalls != 0 {
+				t.Fatalf("didPut=%v putCalls=%d; a rejected admission must not write bytes", didPut, putCalls)
+			}
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("error = %v; want %v preserved so the handler can classify it", err, sentinel)
+			}
+			if errors.Is(err, ErrBlockMaterializationTransient) {
+				t.Fatalf("error = %v; an admission decision must not be tagged transient", err)
+			}
+			if IsRetryableBlockMaterializationError(err) {
+				t.Fatalf("IsRetryableBlockMaterializationError(%v) = true; admission is memoized per request and cannot change on retry", err)
+			}
+		})
+	}
+}
+
+// TestP3PutFailureKeepsItsCause pins the other half of the wrapper contract: the
+// transient tag is added to the store's error, never substituted for it, so
+// cancellation and backend sentinels stay matchable.
+func TestP3PutFailureKeepsItsCause(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		return "", context.Canceled
+	}
+
+	probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	_, _, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, nil, BlockMaterializationInitial)
+
+	if !errors.Is(err, ErrBlockMaterializationTransient) {
+		t.Fatalf("error = %v; want the transient tag", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v; want context.Canceled to survive the wrapper", err)
+	}
+}
+
+// TestP3AuthorityRejectionKeepsTheDBCause pins that the funnel's outer
+// classification is added to the authority error, never substituted for it, so a
+// caller can still tell which fence rejected the tuple.
+func TestP3AuthorityRejectionKeepsTheDBCause(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldValidate })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	target := BlockMaterializationTarget{Store: canonicalStore, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	put := func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("PUT must not run when authority is refused")
+		return "", nil
+	}
+
+	for _, tc := range []struct {
+		name    string
+		outcome db.BlockRepairAuthorityOutcome
+		cause   error
+		outer   error
+	}{
+		{name: "fenced", outcome: db.BlockRepairAuthorityBlocked, cause: db.ErrBlockRepairBlocked, outer: ErrBlockDeleteInProgress},
+		{name: "changed", outcome: db.BlockRepairAuthorityChanged, cause: db.ErrBlockRepairAuthorityChanged, outer: ErrBlockMaterializationTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+				return tc.outcome, fmt.Errorf("%w: detail", tc.cause)
+			}
+			_, err := PutBlockMaterializationTarget(context.Background(), &db.DB{}, orgID, uploadReuseTestBlockID, target, []byte("data"), put, nil)
+			if !errors.Is(err, tc.outer) {
+				t.Fatalf("error = %v; want outer %v", err, tc.outer)
+			}
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("error = %v; want the db cause %v to survive", err, tc.cause)
+			}
+		})
 	}
 }

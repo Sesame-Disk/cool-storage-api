@@ -68,10 +68,28 @@ IF NOT EXISTS
 
 The query is in
 [`internal/db/block_references.go`](../internal/db/block_references.go), in
-`upsertBlockMetadataInsertWithRepresentationFn`.
-`UpsertBlockMetadataWithRepresentationAndSHA1` calls it for every materialized
-block and retries only for the specific released-stub repair path in the same
-file.
+`installBlockMetadataLWTFn`.
+`InstallBlockMetadata` is used for every fresh materialization; existing
+incarnations use `RepairBlockMetadataIfCurrent`, whose tuple-bound conditional
+updates are also part of the writer authority boundary.
+
+P3 added a second coordination axis that this document must state explicitly:
+writer-side fence reads. The P3-added reads are deliberately NOT global-SERIAL on
+the deduplicated path (P2's post-install settlement read remains `SERIAL`, and is
+the one pre-existing exception). `ProbeBlockReuse`, `BlockDeleteFenceActive` and
+`RepairBlockMetadataIfCurrent` all read at ordinary consistency, because the
+fence publishers (`ClaimBlockDelete`, `StartBlockDeleteOrphan`) commit at
+`EACH_QUORUM` and the authority that admits a write is structural rather than
+read-derived. Exactly one read is linearizable: `ValidateBlockRepairAuthority`,
+immediately before a repair PUT, which runs only when an existing physical object
+turned out to be missing. `TestP3SerialReadsStayOffTheDedupPath` fails the build
+if another `gocql.Serial` read appears in `internal/db`.
+
+The ordinary reads pin `LOCAL_QUORUM` explicitly rather than inheriting
+`database.consistency`, which accepts `ONE`. The correctness argument is an
+intersection -- an `EACH_QUORUM` commit meets a `LOCAL_QUORUM` read in every DC --
+and a `ONE` read does not participate in it, so a fence read declares the level
+its own correctness needs instead of trusting deployment configuration.
 
 For a new block, the normal materialization cost is one metadata LWT attempt.
 The surrounding operations are not all LWTs:
@@ -261,7 +279,7 @@ The current metadata comments explicitly state that `storage_class` and
 one physical location because writers can arrive with different classes:
 
 [`internal/db/block_references.go`](../internal/db/block_references.go), in the
-`UpsertBlockMetadata` placement contract comments.
+  `InstallBlockMetadata` and `RepairBlockMetadataIfCurrent` placement contract comments.
 
 The resolver has three materially different cases:
 

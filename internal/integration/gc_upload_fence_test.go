@@ -118,8 +118,9 @@ func TestNeedsPutUsesCanonicalMinIOBucket(t *testing.T) {
 		t.Fatalf("remove stale canonical object: %v", err)
 	}
 
-	if err := database.UpsertBlockMetadata(orgID, blockID, len(data), "hot-s3-usa", canonicalKey); err != nil {
-		t.Fatalf("seed canonical block metadata: %v", err)
+	installed := database.InstallBlockMetadata(ctx, orgID, db.PlainBlockRepresentationID, blockID, externalBlockID, len(data), db.BlockPhysicalLocation{StorageClass: "hot-s3-usa", StorageKey: canonicalKey})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed canonical block metadata: outcome=%v cause=%v", installed.Outcome, installed.Cause)
 	}
 	if hasReferences, err := database.BlockHasReferences(orgID, blockID); err != nil || hasReferences {
 		t.Fatalf("seeded block references = %v, %v; want false, nil", hasReferences, err)

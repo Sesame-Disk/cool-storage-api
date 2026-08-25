@@ -1389,7 +1389,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				case db.BlockReuseReusable:
 					templateMaterializedStorageClass = probe.StorageClass
 					var ensureErr error
-					templateStorageKey, ensureErr = EnsureReusableBlockPresentForPhase(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID, phase)
+					templateStorageKey, ensureErr = EnsureReusableBlockPresentForPhase(c.Request.Context(), h.db, templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID, phase)
 					if ensureErr != nil {
 						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
@@ -1404,7 +1404,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					templateTarget = target
 					templateMaterializedStorageClass = target.StorageClass
 					var err error
-					templateStorageKey, err = putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, templateBlockData.Data)
+					templateStorageKey, err = PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, templateBlockData.Hash, target, templateBlockData.Data, putUploadedBlockAutoDirectFn, nil)
 					if err != nil {
 						return fmt.Errorf("failed to store file content: %w", err)
 					}
@@ -3474,7 +3474,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		switch probe.Decision {
 		case db.BlockReuseReusable:
 			var ensureErr error
-			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID, phase)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(c.Request.Context(), h.db, sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID, phase)
 			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
@@ -3483,7 +3483,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, storedContent)
+			_, putErr := PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectFn, nil)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}

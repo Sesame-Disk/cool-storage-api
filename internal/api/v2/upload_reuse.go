@@ -78,6 +78,98 @@ var reusableCanonicalObjectExistsFn = func(ctx context.Context, blockStore *stor
 var repairCanonicalBlockDirectFn = func(ctx context.Context, blockStore *storage.BlockStore, storageKey string, data []byte) (string, error) {
 	return blockStore.PutObjectAutoDirect(ctx, storageKey, data)
 }
+var validateBlockRepairAuthorityFn = func(database *db.DB, orgID, blockID string, expected db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+	return database.ValidateBlockRepairAuthority(orgID, blockID, expected)
+}
+
+type blockMaterializationPutFn func(context.Context, *storage.BlockStore, string, []byte) (string, error)
+
+// PutBlockMaterializationTarget is the only authority boundary for a physical
+// PUT selected by the upload materialization protocol. Fresh targets retain the
+// P2 single-use INSTALL contract. Existing targets must still be the exact,
+// unfenced canonical incarnation immediately before bytes are written.
+//
+// admit runs after authority is granted and before the bytes are written. Order
+// matters in both directions: running it earlier would charge a session staging
+// reservation for a PUT the fence then refuses (the ledger write has a TTL and no
+// inverse), and running it later would put a write between the authority decision
+// and the PUT it authorizes. Between the two, the staging ledger round trip is
+// the smaller cost, and the residual authority->PUT race is covered by R17's
+// non-creating repair rather than by shortening this window. Note the ledger
+// operations inherit the session consistency (block_upload_staging.go) rather
+// than pinning one, so this window is "not a WAN authority read", not a
+// LOCAL_QUORUM guarantee.
+func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, blockID string, target BlockMaterializationTarget, data []byte, put blockMaterializationPutFn, admit func() error) (string, error) {
+	if target.Store == nil || put == nil {
+		return "", fmt.Errorf("block store PUT is unavailable for %s", blockID)
+	}
+	if !target.FreshInstall {
+		if database == nil {
+			return "", fmt.Errorf("%w: block repair authority is unavailable for %s", ErrBlockMaterializationTransient, blockID)
+		}
+		outcome, authorityErr := validateBlockRepairAuthorityFn(database, orgID, blockID, db.BlockPhysicalLocation{
+			StorageClass: target.StorageClass,
+			StorageKey:   target.StorageKey,
+		})
+		switch outcome {
+		case db.BlockRepairAuthorityAuthorized:
+			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues("allowed").Inc()
+			// The PUT below is deliberately adjacent to the authority decision.
+		case db.BlockRepairAuthorityBlocked:
+			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues("blocked_gc").Inc()
+			// Both sentinels stay matchable: the outer one is what the upload funnel
+			// classifies on, the inner one says which fence rejected the tuple.
+			return "", fmt.Errorf("%w: %w", ErrBlockDeleteInProgress, authorityErr)
+		case db.BlockRepairAuthorityPermanent:
+			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues("invalid").Inc()
+			return "", authorityErr
+		default:
+			result := "error"
+			if outcome == db.BlockRepairAuthorityChanged {
+				result = "changed"
+			}
+			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues(result).Inc()
+			return "", fmt.Errorf("%w: revalidate repair authority for block %s: %w", ErrBlockMaterializationTransient, blockID, authorityErr)
+		}
+	}
+	if admit != nil {
+		if admitErr := admit(); admitErr != nil {
+			return "", fmt.Errorf("%w: %w", errBlockAdmissionRejected, admitErr)
+		}
+	}
+	return put(ctx, target.Store, target.StorageKey, data)
+}
+
+// errBlockAdmissionRejected marks an error produced by the caller's admission
+// callback rather than by the store. Admission speaks the caller's own vocabulary
+// -- the session staging ledger answers with errSessionStagingCapReached, which
+// UploadBlock turns into 429 plus a Retry-After -- so it must reach the caller
+// with that sentinel intact and WITHOUT acquiring the transient tag. Tagging it
+// transient would both retry a decision that cannot change within the request
+// (admission is memoized per request) and strip the sentinel the handler matches
+// on, collapsing a precise 429 into a generic 500.
+var errBlockAdmissionRejected = errors.New("block admission rejected")
+
+// wrapBlockMaterializationPutError preserves the class the authority boundary
+// already decided. Blanket-tagging every PUT failure as transient would make a
+// permanently invalid locator retryable, and in the initial phase the retry
+// re-enters the only phase that may mint -- turning a deterministic rejection
+// into a fresh incarnation. Fence and permanent errors therefore pass through
+// with their own sentinel intact.
+func wrapBlockMaterializationPutError(putErr error, format string, args ...interface{}) error {
+	switch {
+	case errors.Is(putErr, errBlockAdmissionRejected):
+		// Not a store failure. Hand it back untouched so the caller's own
+		// classification -- and its HTTP status -- survives.
+		return putErr
+	case errors.Is(putErr, ErrBlockDeleteInProgress):
+		return fmt.Errorf("%w: %s: %w", ErrBlockDeleteInProgress, fmt.Sprintf(format, args...), putErr)
+	case errors.Is(putErr, db.ErrBlockMetadataPermanent):
+		return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), putErr)
+	default:
+		return fmt.Errorf("%w: %s: %w", ErrBlockMaterializationTransient, fmt.Sprintf(format, args...), putErr)
+	}
+}
 
 // BlockMaterializationTarget is the exact physical tuple selected for one store
 // observation. FreshInstall is authority carried from mint through PUT; the key
@@ -210,16 +302,17 @@ func ResolveNeedsPutBlockStoreForPhase(storageManager *storage.Manager, preferre
 
 // StoreUploadedBlockForProbe executes the physical action selected by a
 // prepared Cassandra probe and returns the placement to materialize. beforePut
-// runs only when a physical write is about to occur.
-func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (target BlockMaterializationTarget, didPut bool, err error) {
-	return StoreUploadedBlockForProbeForPhase(ctx, blockID, probe, data, storageManager, preferredStore, preferredClass, orgID, beforePut, BlockMaterializationInitial)
+// is session-staging admission; it runs only once repair authority has been
+// granted and a physical write is genuinely about to occur.
+func StoreUploadedBlockForProbe(ctx context.Context, database *db.DB, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error) (target BlockMaterializationTarget, didPut bool, err error) {
+	return StoreUploadedBlockForProbeForPhase(ctx, database, blockID, probe, data, storageManager, preferredStore, preferredClass, orgID, beforePut, BlockMaterializationInitial)
 }
 
 // StoreUploadedBlockForProbeForPhase executes the physical action selected by a
 // probe in an explicit phase. Confirmation may repair an existing persisted
 // target, but a rowless NeedsPut is retryable state convergence, not permission
 // to mint or PUT another target.
-func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error, phase BlockMaterializationPhase) (target BlockMaterializationTarget, didPut bool, err error) {
+func StoreUploadedBlockForProbeForPhase(ctx context.Context, database *db.DB, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error, phase BlockMaterializationPhase) (target BlockMaterializationTarget, didPut bool, err error) {
 	switch phase {
 	case BlockMaterializationInitial, BlockMaterializationConfirmation:
 	default:
@@ -249,13 +342,8 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, pro
 		if exists {
 			return target, false, nil
 		}
-		if beforePut != nil {
-			if beforeErr := beforePut(); beforeErr != nil {
-				return target, false, beforeErr
-			}
-		}
-		if _, putErr := repairCanonicalBlockDirectFn(ctx, canonicalStore, storageKey, data); putErr != nil {
-			return target, false, fmt.Errorf("%w: repair canonical block %s in %s: %w", ErrBlockMaterializationTransient, blockID, canonicalClass, putErr)
+		if _, putErr := PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, repairCanonicalBlockDirectFn, beforePut); putErr != nil {
+			return target, false, wrapBlockMaterializationPutError(putErr, "repair canonical block %s in %s", blockID, canonicalClass)
 		}
 		return target, true, nil
 	case db.BlockReuseNeedsPut:
@@ -264,13 +352,8 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, pro
 		if resolveErr != nil {
 			return BlockMaterializationTarget{}, false, resolveErr
 		}
-		if beforePut != nil {
-			if beforeErr := beforePut(); beforeErr != nil {
-				return target, false, beforeErr
-			}
-		}
-		if _, putErr := repairCanonicalBlockDirectFn(ctx, target.Store, target.StorageKey, data); putErr != nil {
-			return target, false, fmt.Errorf("%w: store block %s in %s: %w", ErrBlockMaterializationTransient, blockID, target.StorageClass, putErr)
+		if _, putErr := PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, repairCanonicalBlockDirectFn, beforePut); putErr != nil {
+			return target, false, wrapBlockMaterializationPutError(putErr, "store block %s in %s", blockID, target.StorageClass)
 		}
 		return target, true, nil
 	case db.BlockReuseBlockedByGC:
@@ -283,8 +366,8 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, pro
 // EnsureReusableBlockPresent verifies that the canonical physical copy exists for
 // a Cassandra-reusable block and repairs it in place when it is missing. orgID
 // org-scopes the canonical locator (see ResolveCanonicalBlockStore).
-func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (string, error) {
-	return EnsureReusableBlockPresentForPhase(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, BlockMaterializationInitial)
+func EnsureReusableBlockPresent(ctx context.Context, database *db.DB, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (string, error) {
+	return EnsureReusableBlockPresentForPhase(ctx, database, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, BlockMaterializationInitial)
 }
 
 // EnsureReusableBlockPresentForPhase is the phase-carrying form. The Reusable
@@ -292,11 +375,11 @@ func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.Bl
 // phase anyway keeps every confirmation-phase funnel out of an initial-phase
 // helper, so no future change to the Reusable branch can silently regain mint
 // authority through this door (finding F4).
-func EnsureReusableBlockPresentForPhase(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string, phase BlockMaterializationPhase) (string, error) {
+func EnsureReusableBlockPresentForPhase(ctx context.Context, database *db.DB, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string, phase BlockMaterializationPhase) (string, error) {
 	if probe.Decision != db.BlockReuseReusable {
 		return "", fmt.Errorf("block %s is not reusable", blockID)
 	}
-	target, _, err := StoreUploadedBlockForProbeForPhase(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil, phase)
+	target, _, err := StoreUploadedBlockForProbeForPhase(ctx, database, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil, phase)
 	return target.StorageKey, err
 }
 

@@ -8,6 +8,76 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-25 - P3/R10/R13/R17 writer-fence implementation
+
+Implemented the existing-incarnation writer boundary on the X1/P3 branch.
+Physical repair PUTs now pass through one authority funnel that revalidates the
+exact persisted `(storage_class, storage_key)` tuple immediately before writing.
+Metadata repair uses `RepairBlockMetadataIfCurrent`, a tuple-bound conditional
+UPDATE path that never creates a `blocks` row; the former generic metadata-upsert
+APIs were removed and test fixtures now use explicit INSTALL or released-stub
+repair primitives.
+
+GC fence-publication LWTs pin `EachQuorum` plus `Serial`, while the final repair
+authority and negative fence reads use explicit `Consistency(Serial)` where the
+authority decision requires it. The observed-fence race and the residual race that must not recreate a condemned
+row are covered by tagged Cassandra/MinIO integration tests
+(`internal/integration/p3_condemned_repair_test.go`, `//go:build integration`);
+the untagged files are the AST guards. The test services now pin
+`SESAMEFS_REQUIRE_P{2,3}_EVIDENCE=1`, so a stack that never came up fails the run
+instead of skipping the evidence and reporting green.
+
+The writer fence reads the canonical row before the orphan on every path. GC
+writes gc_state, then the orphan, then removes the row, so reading the orphan
+first let a writer see no orphan, have GC complete both steps underneath it, read
+an absent row, and conclude there was no fence at all -- installing `P2` while
+`orphan(P1)` was still live, the overlapped state conservative A+ forbids.
+
+Global SERIAL reads are confined to the pre-PUT authority boundary. Existing
+metadata repair, the reuse probe and the delete-fence check read normally: their
+safety is structural (single-use INSTALL, or a non-creating tuple-bound CAS), and
+the fence publishers commit at EACH_QUORUM so an ordinary read already observes
+every committed fence. A physical PUT failure now keeps the class the authority
+boundary decided, so a permanently invalid locator is no longer re-tagged
+retryable -- which in the initial phase would have re-entered the minting phase.
+Session staging admission runs after authority is granted, so a fenced repair no
+longer burns bucket cap it cannot release.
+
+R13's status is split into the boundary P3 controls and the invariant it does
+not. The writer boundary is closed: a condemned incarnation cannot be reused,
+repaired or minted over by a writer that observes the fence, and the
+claim->orphan->row-delete handoff cannot be read as "rowless, no fence". Strict
+A+ non-overlap is a separate, OPEN row: `InstallBlockMetadata` never consults
+`gc_s3_orphans`, and although a well-formed lifecycle cannot produce an overlap
+(the orphan precedes the row delete), a stale worker still can, because
+`StartBlockDeleteOrphan` never proves it owns the claim while `FinalizeBlockDelete`
+does. `worker.go` already named that window and assigned it to per-attempt claim
+identity -- R14, in P4. If it occurs the result is a stuck fence plus a P1 leak,
+not deletion of live bytes, because recovery revalidates the canonical row.
+
+Fence reads pin `LOCAL_QUORUM` instead of inheriting `database.consistency`,
+which accepts `ONE`. The advisory-read argument is an intersection between an
+`EACH_QUORUM` fence commit and the reader's quorum; a `ONE` read does not
+participate in it and could report no fence at all, letting a writer mint while
+the previous lifecycle's orphan was still live.
+
+Admission errors no longer pass through the physical-PUT error wrapper. Moving
+session staging admission inside the authority funnel had let
+`errSessionStagingCapReached` acquire the transient tag and lose its sentinel,
+which retried a decision that cannot change within a request and collapsed the
+web uploader's 429 plus `Retry-After` into a generic 500. The wrapper also now
+ends on the store's own error, so cancellation and backend sentinels stay
+matchable through it.
+
+A `size_bytes` disagreement on an existing canonical row is now a permanent
+failure. The removed generic upsert never compared size; the block id is a
+SHA-256 of the content, so a mismatch is an identity contradiction and fails
+closed.
+
+R18 and R27 remain OPEN by design: a repair rejected by an orphan fence retains
+the provisional `up:` reference, and the deferred-orphan projection has no
+durable future retry schedule. `GC_ENABLED=false` remains mandatory.
+
 ## 2026-08-24 - P2/R9/R24 minted canonical install closure
 
 Closed the P2 canonical-install tranche. Rowless materialization attempts now

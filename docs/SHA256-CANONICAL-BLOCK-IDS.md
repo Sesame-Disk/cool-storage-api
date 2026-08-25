@@ -333,7 +333,7 @@ Each PR must leave `go test` / Jest + lint + build green, keep the web block-upl
   Server is pre-deploy/empty → no backfill needed.
 
 ### PR2 — Populate `blocks.sha1` on write (the server already computes SHA-1)
-- `UploadBlock` → `RegisterWebUploadedBlockAndMapping` / `UpsertBlockMetadata`
+- `UploadBlock` → `RegisterWebUploadedBlockAndMapping` / `InstallBlockMetadata`
   ([block_references.go:407](../internal/db/block_references.go#L407)) and the seafhttp finalize
   write `sha1`.
 - `ProbeBlockReuse` ([block_references.go:451](../internal/db/block_references.go#L451)) now
@@ -436,7 +436,7 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
    populated by stale/orphan ("reverse-only") rows for defensive cleanup, never by honest content —
    and those vanish with the table.
 3. **`blocks.sha1` is complete.** Every block-materialization path co-writes `blocks.sha1` with the
-   forward mapping via `UpsertBlockMetadataWithSHA1`: web block flow, seafhttp upload/finalize,
+   forward mapping via `InstallBlockMetadata`: web block flow, seafhttp upload/finalize,
    desktop `PutBlock`, `CreateFile`, OnlyOffice, copy. On the pre-deploy/empty DB there are no
    pre-PR2 rows with an empty `sha1`; PR5 self-heals any such row on re-upload.
 4. **Physical GC has no mapping-delete authority.** When `blocks.sha1` is empty, when the

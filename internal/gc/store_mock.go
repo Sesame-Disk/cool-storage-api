@@ -831,8 +831,7 @@ func (m *MockStore) AddBlockMappingForRepresentation(orgID uuid.UUID, representa
 // block that already carries a sha1 still gets its representation modeled. Caller
 // must hold m.mu.
 func (m *MockStore) addBlockMappingLocked(orgID uuid.UUID, representationID, externalID, internalID string) {
-	// Canonicalize exactly like the Cassandra writer (writeCheckedBlockIDMapping +
-	// UpsertBlockMetadataWithRepresentationAndSHA1) so a test that passes an
+	// Canonicalize exactly like the Cassandra writer so a test that passes an
 	// uppercase/padded id behaves identically in the mock and against Cassandra.
 	externalID = db.NormalizeBlockID(externalID)
 	internalID = db.NormalizeBlockID(internalID)

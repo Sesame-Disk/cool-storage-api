@@ -630,6 +630,27 @@ var (
 		[]string{"result", "reason"},
 	)
 
+	// BlockUploadRepairAuthorityTotal records exact-incarnation revalidation
+	// immediately before an existing physical target is PUT. Labels deliberately
+	// omit tenant and storage-key identity.
+	BlockUploadRepairAuthorityTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_repair_authority_total",
+			Help: "Existing-incarnation block PUT authority decisions by result.",
+		},
+		[]string{"result"},
+	)
+
+	// BlockUploadRepairMetadataTotal records non-creating metadata repair
+	// outcomes after a block was selected from an existing canonical row.
+	BlockUploadRepairMetadataTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_repair_metadata_total",
+			Help: "Existing-incarnation non-creating metadata repair outcomes by result.",
+		},
+		[]string{"result"},
+	)
+
 	// SyncPutBlockBodyBytes measures request bodies on the desktop-sync block
 	// route that passed the size gate. The cap on that route was originally
 	// derived from the web uploader's chunk ceiling rather than from observed
@@ -1176,6 +1197,8 @@ func Register() {
 		BlockUploadMaterializationRetriesTotal,
 		BlockUploadFreshPhysicalCleanupTotal,
 		BlockUploadMappingRetriesTotal,
+		BlockUploadRepairAuthorityTotal,
+		BlockUploadRepairMetadataTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		SyncPutBlockInflightCurrent,

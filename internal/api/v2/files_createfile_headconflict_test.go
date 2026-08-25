@@ -102,7 +102,7 @@ func TestCreateFileTemplateTargetSurvivesHeadConflictWithoutRemintOrPut(t *testi
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				storageKey, ensureErr := EnsureReusableBlockPresentForPhase(context.Background(), uploadReuseTestBlockID, probe, nil, nil, blockStore, "hot", orgID, phase)
+				storageKey, ensureErr := EnsureReusableBlockPresentForPhase(context.Background(), nil, uploadReuseTestBlockID, probe, nil, nil, blockStore, "hot", orgID, phase)
 				if ensureErr != nil {
 					return ensureErr
 				}

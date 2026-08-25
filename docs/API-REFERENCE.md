@@ -534,8 +534,10 @@ Persisted `(storage_class, storage_key)` identity is byte-exact and is never
 trimmed. A key must match either the legacy deterministic grammar or the minted
 incarnation grammar above and must bind to the requested SHA-256 block. Fresh
 rowless uploads carry the complete minted target through PUT and the target-aware
-`InstallBlockMetadata` API. Existing canonical reuse/stub repair uses the stored
-tuple through `UpsertBlockMetadata`; it does not mint. If the one-shot INSTALL
+`InstallBlockMetadata` API. Existing canonical reuse uses the stored tuple through the
+non-creating `RepairBlockMetadataIfCurrent` API; it does not mint or recreate an
+absent row. A released stub is instead removed by `RepairReleasedBlockStub` and
+then materializes as a fresh INSTALL. If the one-shot INSTALL
 result is uncertain, SesameFS performs a bounded detached `SERIAL` settlement
 read. An exact tuple proves Applied; a different complete tuple or no row proves
 KnownLost and authorizes cleanup of only the attempted key; unavailable or
@@ -543,8 +545,10 @@ malformed settlement remains ambiguous and retains the object. A definite direct
 CAS result that returns the proposed tuple is instead a single-use identity
 contradiction: it grants no success or cleanup and is not retryable. Fresh targets
 must pass strict minted-only locator validation before any provisional reference
-or metadata mutation. This is the P2 contract, not a claim that the out-of-scope
-R17/P3 repair design or durable reconciliation is complete.
+or metadata mutation. Existing-incarnation PUTs also revalidate the exact tuple
+immediately before writing. R18/R27 remain open: rejected `up:` references are
+retained and the deferred-orphan retry lifecycle is not implemented.
+`GC_ENABLED=false` remains mandatory.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

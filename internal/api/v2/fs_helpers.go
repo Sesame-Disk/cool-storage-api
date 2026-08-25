@@ -93,12 +93,12 @@ var registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string
 	return h.db.BlockDeleteFenceActive(orgID, blockID)
 }
 
-var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+var registerUploadedBlockRepairMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) error {
 	representationID, err := db.ResolveBlockRepresentationID(h.db.Session(), orgID, libraryID)
 	if err != nil {
 		return err
 	}
-	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
+	return h.db.RepairBlockMetadataIfCurrent(orgID, representationID, blockID, sha1ID, sizeBytes, db.BlockPhysicalLocation{StorageClass: target.StorageClass, StorageKey: target.StorageKey})
 }
 
 var resolveFreshInstallRepresentationFn = func(ctx context.Context, h *FSHelper, orgID, libraryID string) (string, error) {
@@ -1229,21 +1229,25 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 		}
 	}
 
-	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, target.StorageClass, target.StorageKey); err != nil {
+	if err := registerUploadedBlockRepairMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, target); err != nil {
 		switch {
-		case errors.Is(err, db.ErrBlockStubRepairContended):
-			// A contended stub repair is a transient race (concurrent completion or a
-			// reappeared GC orphan fence): surface the retryable GC-fence signal so the
-			// materialization wrapper re-probes.
-			return fmt.Errorf("%w: block %s stub repair lost a race", ErrBlockDeleteInProgress, blockID)
+		case errors.Is(err, db.ErrBlockRepairBlocked):
+			metrics.BlockUploadRepairMetadataTotal.WithLabelValues("blocked").Inc()
+			return fmt.Errorf("%w: block %s repair is fenced by GC", ErrBlockDeleteInProgress, blockID)
+		case errors.Is(err, db.ErrBlockRepairAuthorityChanged):
+			metrics.BlockUploadRepairMetadataTotal.WithLabelValues("stale").Inc()
+			return fmt.Errorf("%w: block %s repair authority changed: %w", ErrBlockMaterializationTransient, blockID, err)
 		case errors.Is(err, db.ErrBlockMetadataPermanent):
+			metrics.BlockUploadRepairMetadataTotal.WithLabelValues("invalid").Inc()
 			// Deterministically irrecoverable (invariant/identity violation): return
 			// as-is so the wrapper does NOT retry it.
-			return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+			return fmt.Errorf("repair block metadata for %s: %w", blockID, err)
 		default:
-			return fmt.Errorf("%w: upsert block metadata for %s: %w", ErrBlockMaterializationTransient, blockID, err)
+			metrics.BlockUploadRepairMetadataTotal.WithLabelValues("error").Inc()
+			return fmt.Errorf("%w: repair block metadata for %s: %w", ErrBlockMaterializationTransient, blockID, err)
 		}
 	}
+	metrics.BlockUploadRepairMetadataTotal.WithLabelValues("applied").Inc()
 	return nil
 }
 

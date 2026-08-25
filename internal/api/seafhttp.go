@@ -2516,7 +2516,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
+			storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, h.db, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
 			materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			if ensureErr != nil {
 				return ensureErr
@@ -2529,7 +2529,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := putUploadedBlockAutoDirectForUploadFn(ctx, target.Store, target.StorageKey, storedContent)
+			_, putErr := v2.PutBlockMaterializationTarget(ctx, h.db, token.OrgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectForUploadFn, nil)
 			if putErr == nil {
 				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
 			}
@@ -3053,7 +3053,7 @@ readLoop:
 					}
 					switch probe.Decision {
 					case db.BlockReuseReusable:
-						storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
+						storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, h.db, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
 						materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 						return ensureErr
 					case db.BlockReuseNeedsPut:
@@ -3062,7 +3062,7 @@ readLoop:
 							return resolveErr
 						}
 						materializationTarget = target
-						_, putErr := putUploadedBlockAutoDirectForUploadFn(egCtx, target.Store, target.StorageKey, storedBlock)
+						_, putErr := v2.PutBlockMaterializationTarget(egCtx, h.db, token.OrgID, sha256ID, target, storedBlock, putUploadedBlockAutoDirectForUploadFn, nil)
 						if putErr != nil {
 							return fmt.Errorf("failed to store block: %w", putErr)
 						}

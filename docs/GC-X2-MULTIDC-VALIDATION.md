@@ -527,12 +527,12 @@ count out of `configs/`.
   | 2 | `ReleaseBlockClaim` (`IF gc_state = ? AND gc_claim_id = ?`) | `gc/store_cassandra.go` | |
   | 3 | `FinalizeBlockDelete` (conditional `DELETE`) | `gc/store_cassandra.go` | |
   | 4 | `ReleaseStaleBlockClaim` (`IF gc_state/claim_id/claimed_at`) | `gc/store_cassandra.go` | ✅ |
-  | 5 | `UpsertBlockMetadata` (`INSERT ... IF NOT EXISTS`) | `db/block_references.go` | |
+  | 5 | `InstallBlockMetadata` (`INSERT ... IF NOT EXISTS`) | `db/block_references.go` | |
   | 6 | stub repair claim (`IF created_at = null AND ...`) | `db/block_references.go` | |
   | 7 | repair-claimed stub delete | `db/block_references.go` | |
   | 8 | GC-claimed stub delete | `db/block_references.go` | |
-  | 9 | `backfillBlockSHA1` (`IF sha1 = ?`) | `db/block_references.go` | |
-  | 10 | `backfillBlockRepresentationID` (`IF representation_id = ?`) | `db/block_references.go` | |
+  | 9 | `backfillCurrentBlockSHA1` (`IF sha1 = ?`) | `db/block_references.go` | |
+  | 10 | `backfillCurrentBlockRepresentationID` (`IF representation_id = ?`) | `db/block_references.go` | |
   | 11 | `DB.ReleaseBlockDeleteClaim` (`IF gc_state = ? AND gc_claim_id = ?`) | `db/block_references.go` | |
 
   Rows 9–11 are the ones the old list silently omitted; rows 6–8 were collapsed into

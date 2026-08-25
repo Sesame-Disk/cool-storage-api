@@ -210,10 +210,11 @@ because it was found while auditing that branch and would otherwise be lost.
 ### The LWT/Paxos transaction
 
 Every upload path that registers canonical block metadata — web session, seafhttp,
-sync `PutBlock`, OnlyOffice — ends in `UpsertBlockMetadata`, which is an
+sync `PutBlock`, OnlyOffice — ends in `InstallBlockMetadata` for a fresh
+incarnation or `RepairBlockMetadataIfCurrent` for an existing one. The install is an
 `INSERT INTO blocks ... IF NOT EXISTS`
 ([`internal/db/block_references.go`](../internal/db/block_references.go),
-`upsertBlockMetadataInsertWithRepresentationFn`): **one lightweight transaction
+`installBlockMetadataLWTFn`): **one lightweight transaction
 per block**. The defective no-session legacy path tracked
 as F8 used to be the production exception: it wrote only the S3 object and never
 reached metadata registration. PR-7 removed that path, so every remaining
@@ -240,7 +241,7 @@ process-local metadata permit.
 revision of this section said "the legacy resumable path pays none of them". That is
 false. `finalizeUploadStreaming` splits a resumable upload into `uploadBlockSize`
 (8 MB) blocks and calls `registerUploadedBlockAndMappingForUploadFn` →
-`RegisterUploadedBlock` → `UpsertBlockMetadata` for each one, so a 1 GB resumable
+`RegisterUploadedBlock` → `InstallBlockMetadata` or tuple-bound repair for each one, so a 1 GB resumable
 upload pays the same ~128 LWTs. Both governed upload modes carry the identical cost.
 The F8 no-session branch used to skip registration entirely; PR-7 removed it, so
 there is no longer a supported public upload path that stores block bytes without
@@ -312,7 +313,7 @@ liveness design.
    ...PUT...
    AddBlockReference      write    — publish our flag
    BlockDeleteFenceActive read #2  — AFTER the reference, decides whether to publish
-   UpsertBlockMetadata    write
+   InstallBlockMetadata / RepairBlockMetadataIfCurrent    write
    ProbeBlockReuse        read #3  — confirmation after materialization
    ```
 

@@ -32,6 +32,7 @@ func TestPutBlockForwardsPhaseAndGatesQuotaToInitial(t *testing.T) {
 	oldProbe := syncProbeUploadedBlockReuseFn
 	oldPrepare := syncPrepareUploadedBlockProbeFn
 	oldResolve := syncResolveNeedsPutBlockStoreFn
+	oldMaterialize := syncPutBlockMaterializationTargetFn
 	oldPut := syncPutBlockAutoDirectFn
 	oldRegister := registerUploadedBlockTargetAndMappingForSyncFn
 	oldRetry := syncRetryUploadedBlockMaterializationFn
@@ -40,6 +41,7 @@ func TestPutBlockForwardsPhaseAndGatesQuotaToInitial(t *testing.T) {
 		syncProbeUploadedBlockReuseFn = oldProbe
 		syncPrepareUploadedBlockProbeFn = oldPrepare
 		syncResolveNeedsPutBlockStoreFn = oldResolve
+		syncPutBlockMaterializationTargetFn = oldMaterialize
 		syncPutBlockAutoDirectFn = oldPut
 		registerUploadedBlockTargetAndMappingForSyncFn = oldRegister
 		syncRetryUploadedBlockMaterializationFn = oldRetry
@@ -58,6 +60,9 @@ func TestPutBlockForwardsPhaseAndGatesQuotaToInitial(t *testing.T) {
 	syncResolveNeedsPutBlockStoreFn = func(_ *storage.Manager, preferred *storage.BlockStore, class string, _ db.BlockReuseProbe, _, _ string, phase v2.BlockMaterializationPhase) (v2.BlockMaterializationTarget, error) {
 		resolvedPhases = append(resolvedPhases, phase)
 		return v2.BlockMaterializationTarget{Store: preferred, StorageClass: class, StorageKey: "key", FreshInstall: phase == v2.BlockMaterializationInitial}, nil
+	}
+	syncPutBlockMaterializationTargetFn = func(ctx context.Context, _ *db.DB, _ string, _ string, target v2.BlockMaterializationTarget, data []byte, put func(context.Context, *storage.BlockStore, string, []byte) (string, error)) (string, error) {
+		return put(ctx, target.Store, target.StorageKey, data)
 	}
 	syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
 		return "key", nil

@@ -207,17 +207,17 @@ func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *t
 // core: on an active GC delete fence the helper returns the retryable signal
 // immediately — it reads the fence once (no loop, no sleep) and leaves the
 // provisional reference in place so GC observes it and the outer wrapper repeats
-// store->materialize (re-PUT). It must NOT upsert metadata over a fenced block.
+// store->materialize (re-PUT). It must NOT repair metadata over a fenced block.
 func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *testing.T) {
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	oldSleep := registerUploadedBlockSleepFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 		registerUploadedBlockSleepFn = oldSleep
 	})
 
@@ -232,8 +232,8 @@ func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *tes
 		calls = append(calls, "fence")
 		return true, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-		t.Fatal("metadata upsert must not run over an active GC delete fence")
+	registerUploadedBlockRepairMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) error {
+		t.Fatal("metadata repair must not run over an active GC delete fence")
 		return nil
 	}
 	registerUploadedBlockSleepFn = func(delay time.Duration) {
@@ -266,11 +266,11 @@ func TestRegisterUploadedBlock_PropagatesFenceWithoutWaitingOrDroppingRef(t *tes
 func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 	})
 
 	boom := errors.New("cassandra timeout")
@@ -278,7 +278,7 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 	reset := func() {
 		registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 		registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
-		registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error { return nil }
+		registerUploadedBlockRepairMetadataFn = func(*FSHelper, string, string, string, string, int, BlockMaterializationTarget) error { return nil }
 	}
 
 	cases := []struct {
@@ -291,8 +291,8 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 		{"fence read", func() {
 			registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, boom }
 		}},
-		{"metadata upsert I/O", func() {
-			registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error { return boom }
+		{"metadata repair I/O", func() {
+			registerUploadedBlockRepairMetadataFn = func(*FSHelper, string, string, string, string, int, BlockMaterializationTarget) error { return boom }
 		}},
 	}
 	for _, tc := range cases {
@@ -316,17 +316,17 @@ func TestRegisterUploadedBlock_TagsTransientCassandraIO(t *testing.T) {
 func TestRegisterUploadedBlock_ReturnsPermanentMetadataFailureUntagged(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 	})
 
 	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
-	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
-		return fmt.Errorf("upsert: %w", db.ErrBlockMetadataPermanent)
+	registerUploadedBlockRepairMetadataFn = func(*FSHelper, string, string, string, string, int, BlockMaterializationTarget) error {
+		return fmt.Errorf("repair: %w", db.ErrBlockMetadataPermanent)
 	}
 
 	err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 1, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key"}, "")
@@ -366,48 +366,21 @@ func TestRegisterUploadedBlockReturnsPermanentProvisionalStorageClassFailureUnta
 	}
 }
 
-// TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence proves
-// that a benign lost stub-repair race inside the metadata upsert (the backstop for
-// the unprobed web-session funnel) surfaces as the retryable ErrBlockDeleteInProgress
-// signal rather than a hard error, so the materialization wrapper re-probes.
-func TestRegisterUploadedBlock_TranslatesContendedStubRepairToRetryableFence(t *testing.T) {
-	helper := &FSHelper{}
-	oldAdd := registerUploadedBlockAddProvisionalRefFn
-	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
-	t.Cleanup(func() {
-		registerUploadedBlockAddProvisionalRefFn = oldAdd
-		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
-	})
-
-	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
-	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
-	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
-		return fmt.Errorf("%w: block block-1 changed before stub repair", db.ErrBlockStubRepairContended)
-	}
-
-	err := helper.RegisterUploadedBlockTarget(context.Background(), "org-1", "lib-1", "block-1", "op-1", 123, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "key-1"}, "sha1-1")
-	if !errors.Is(err, ErrBlockDeleteInProgress) {
-		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
-	}
-}
-
 func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 	})
 
 	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
+	registerUploadedBlockRepairMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) error {
 		return nil
 	}
 
@@ -451,11 +424,11 @@ func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) 
 	helper := &FSHelper{}
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 	})
 
 	batchErr := errors.New("batch write failed")
@@ -471,8 +444,8 @@ func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) 
 		t.Fatal("fence check must not run once the provisional write failed")
 		return false, nil
 	}
-	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, storageClass, storageKey string) error {
-		t.Fatal("metadata upsert must not run once the provisional write failed")
+	registerUploadedBlockRepairMetadataFn = func(h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) error {
+		t.Fatal("metadata repair must not run once the provisional write failed")
 		return nil
 	}
 
@@ -493,14 +466,14 @@ func TestRegisterUploadedBlock_WritesReferenceAndExpiryAtomically(t *testing.T) 
 func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	oldResolve := resolveFreshInstallRepresentationFn
 	oldInstall := registerUploadedBlockInstallMetadataFn
 	oldDelete := deleteFreshInstallLoserFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 		resolveFreshInstallRepresentationFn = oldResolve
 		registerUploadedBlockInstallMetadataFn = oldInstall
 		deleteFreshInstallLoserFn = oldDelete
@@ -508,8 +481,8 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 
 	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
 	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
-	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
-		t.Fatal("fresh target must not use repair-capable metadata upsert")
+	registerUploadedBlockRepairMetadataFn = func(*FSHelper, string, string, string, string, int, BlockMaterializationTarget) error {
+		t.Fatal("fresh target must not use existing-row metadata repair")
 		return nil
 	}
 	resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
@@ -1125,12 +1098,12 @@ func TestRegisterUploadedBlockTargetRejectsForgedFreshLocatorBeforeAuthority(t *
 func TestRegisterUploadedBlockTargetCanonicalPathNeverInstallsOrMints(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
-	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRepairMetadata := registerUploadedBlockRepairMetadataFn
 	oldInstall := registerUploadedBlockInstallMetadataFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
-		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockRepairMetadataFn = oldRepairMetadata
 		registerUploadedBlockInstallMetadataFn = oldInstall
 	})
 	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
@@ -1140,9 +1113,9 @@ func TestRegisterUploadedBlockTargetCanonicalPathNeverInstallsOrMints(t *testing
 		return db.InstallBlockMetadataResult{}
 	}
 	want := BlockMaterializationTarget{StorageClass: "archive", StorageKey: "persisted-exact-key"}
-	registerUploadedBlockUpsertMetadataFn = func(_ *FSHelper, _, _, _, _ string, _ int, class, key string) error {
-		if class != want.StorageClass || key != want.StorageKey {
-			t.Fatalf("upsert tuple = %q/%q, want exact %q/%q", class, key, want.StorageClass, want.StorageKey)
+	registerUploadedBlockRepairMetadataFn = func(_ *FSHelper, _, _, _, _ string, _ int, target BlockMaterializationTarget) error {
+		if target.StorageClass != want.StorageClass || target.StorageKey != want.StorageKey {
+			t.Fatalf("repair tuple = %q/%q, want exact %q/%q", target.StorageClass, target.StorageKey, want.StorageClass, want.StorageKey)
 		}
 		return nil
 	}

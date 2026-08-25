@@ -7715,7 +7715,8 @@ Decide SoT (IdP wins / admin wins / last-write-wins with audit) in
 
 **Status**: 🟡 Open — deferred PR-11 pending measurement
 **Severity**: High (perf), not a correctness blocker
-**Affected**: metadata-registering upload paths (`UpsertBlockMetadata` / LWT)
+**Affected**: metadata-registering upload paths (`InstallBlockMetadata` and
+tuple-bound repair CAS/LWTs)
 **Source of record**: registry **X4**; readiness UP-2; P-4; [X1/X4 hot-path characterization](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
 
 #### Problem
