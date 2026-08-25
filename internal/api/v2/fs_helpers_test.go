@@ -872,6 +872,126 @@ func TestRegisterUploadedBlockTargetFreshCleanupRetriesAndMetrics(t *testing.T) 
 	})
 }
 
+func TestRetryUploadedBlockMaterializationRemintsAfterPreInstallResolutionFailure(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldResolve := resolveFreshInstallRepresentationFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	oldDelete := deleteFreshInstallLoserFn
+	oldFreshBackoff := freshInstallRetryBackoffFn
+	oldRetryDelay := libraryHeadMutationRetryDelay
+	oldRetryMaxDelay := libraryHeadMutationRetryMaxDelay
+	oldRetryJitter := libraryHeadMutationRetryJitter
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		resolveFreshInstallRepresentationFn = oldResolve
+		registerUploadedBlockInstallMetadataFn = oldInstall
+		deleteFreshInstallLoserFn = oldDelete
+		freshInstallRetryBackoffFn = oldFreshBackoff
+		libraryHeadMutationRetryDelay = oldRetryDelay
+		libraryHeadMutationRetryMaxDelay = oldRetryMaxDelay
+		libraryHeadMutationRetryJitter = oldRetryJitter
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
+		return false, nil
+	}
+	freshInstallRetryBackoffFn = func(int) time.Duration { return 0 }
+	libraryHeadMutationRetryDelay = 0
+	libraryHeadMutationRetryMaxDelay = 0
+	libraryHeadMutationRetryJitter = 0
+	registerUploadedBlockSleepFn = func(time.Duration) {}
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key1, err := store.MintStorageKey(uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key2, err := store.MintStorageKey(uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target1 := BlockMaterializationTarget{Store: store, StorageClass: "hot", StorageKey: key1, FreshInstall: true}
+	target2 := BlockMaterializationTarget{Store: store, StorageClass: "hot", StorageKey: key2, FreshInstall: true}
+
+	storeCalls := 0
+	var target BlockMaterializationTarget
+	storeFn := func() error {
+		storeCalls++
+		switch storeCalls {
+		case 1:
+			target = target1
+		case 2:
+			target = target2
+		case 3:
+			if target != target2 {
+				t.Fatalf("confirmation target = %+v, want second minted target %+v", target, target2)
+			}
+		default:
+			t.Fatalf("store called %d times, want initial PUT, remint, and confirmation only", storeCalls)
+		}
+		return nil
+	}
+
+	resolveCalls := 0
+	resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+		resolveCalls++
+		if resolveCalls <= freshInstallPreparationAttempts {
+			return "", gocql.ErrNoConnections
+		}
+		return db.PlainBlockRepresentationID, nil
+	}
+
+	installCalls := 0
+	var installedTarget BlockMaterializationTarget
+	registerUploadedBlockInstallMetadataFn = func(_ context.Context, _ *FSHelper, _ string, _ string, _ string, _ string, _ int, got BlockMaterializationTarget) db.InstallBlockMetadataResult {
+		installCalls++
+		installedTarget = got
+		return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+	}
+
+	cleanupCalls := 0
+	var cleanedTarget BlockMaterializationTarget
+	deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+		cleanupCalls++
+		cleanedTarget = got
+		return nil
+	}
+
+	helper := &FSHelper{}
+	err = RetryUploadedBlockMaterialization("FreshPreInstall", uploadReuseTestBlockID, storeFn, func() error {
+		return helper.RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterialization() error = %v, want nil", err)
+	}
+	if key1 == key2 {
+		t.Fatalf("minted keys are identical: %q", key1)
+	}
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3 (K1, K2, confirmation)", storeCalls)
+	}
+	if resolveCalls != freshInstallPreparationAttempts+1 {
+		t.Fatalf("resolveCalls = %d, want %d", resolveCalls, freshInstallPreparationAttempts+1)
+	}
+	if installCalls != 1 || installedTarget != target2 {
+		t.Fatalf("INSTALL calls/target = %d/%+v, want 1/%+v", installCalls, installedTarget, target2)
+	}
+	if cleanupCalls != 1 || cleanedTarget != target1 {
+		t.Fatalf("cleanup calls/target = %d/%+v, want 1/%+v", cleanupCalls, cleanedTarget, target1)
+	}
+}
+
 func TestRegisterUploadedBlockTargetRejectsForgedFreshLocatorBeforeAuthority(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
