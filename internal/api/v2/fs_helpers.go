@@ -1184,23 +1184,30 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
 			}
 			cleanupErr := cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
-			// KnownLost proves this target is NOT canonical. It does not prove that
-			// some other target is: settlement that finds no row at SERIAL also
-			// reports KnownLost, with an empty Canonical.
+			// Same rule as the conclusively-unsubmitted pre-INSTALL branch: a failed
+			// exact cleanup does not authorize an outer remint while that target
+			// survives. The retryable sentinel sends the driver back to the initial
+			// phase, which is the only phase that mints, so granting it on top of a
+			// known-dead object that is still in the store is how one failure becomes
+			// two orphans.
 			//
-			// That no-row variant has exactly the shape the conclusively-unsubmitted
-			// pre-INSTALL branch refuses to retry -- nothing is canonical, so an
-			// outer retry probes rowless and mints ANOTHER incarnation while this
-			// known-dead one is still in the store. Treating it like the winner case
-			// would multiply orphans for the same reason that branch exists, so a
-			// failed cleanup withholds the retry sentinel here too.
+			// This holds even when KnownLost names a DIFFERENT canonical tuple. That
+			// proves a winner existed at classification time, but the next probe is an
+			// ordinary read of `blocks`, not the SERIAL settlement that observed it --
+			// and this codebase already refuses to assume those agree. That assumption
+			// is exactly what ErrBlockCanonicalStateNotVisible exists to reject: the
+			// confirmation phase treats a rowless read of a row it knows was installed
+			// as convergence, never as permission to mint. Relying here on the
+			// visibility the confirmation phase declines to rely on would be
+			// inconsistent, so the rule is uniform: object survived -> no retry
+			// authority.
 			//
-			// A KnownLost that names a DIFFERENT canonical tuple is not that shape: a
-			// winner demonstrably exists, so the retry converges on it rather than
-			// minting, and failing the upload would reject a block that is already
-			// durable. That case keeps its best-effort cleanup and stays retryable.
-			if cleanupErr != nil && result.Canonical.StorageClass == "" && result.Canonical.StorageKey == "" {
-				return errors.Join(result.Cause, fmt.Errorf("exact known-lost cleanup for block %s failed while no canonical row is installed: %w", blockID, cleanupErr))
+			// The cost is failing a rare request whose block may already be durable --
+			// but only when the physical cleanup ALSO failed, and the client's own
+			// retry starts from a fresh probe. That is cheaper than answering a failed
+			// delete by immediately authorizing another incarnation.
+			if cleanupErr != nil {
+				return errors.Join(result.Cause, fmt.Errorf("exact known-lost cleanup for block %s failed; its object survives, so no outer remint is authorized: %w", blockID, cleanupErr))
 			}
 			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)
 			if result.Cause != nil {

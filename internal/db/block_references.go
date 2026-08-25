@@ -539,11 +539,15 @@ func (db *DB) WriteVerifiedWebBlockMapping(orgID, representationID, externalID, 
 }
 
 func (db *DB) writeCheckedBlockIDMapping(orgID, representationID, externalID, internalID string, createdAt time.Time) error {
+	// Tagged permanent because they are deterministic input rejections: the same
+	// ids will fail identically on every attempt. The post-install mapping retry
+	// loop reads this tag to stop immediately instead of spending its whole budget
+	// on a write that cannot succeed.
 	if !isHexN(externalID, 40) {
-		return fmt.Errorf("invalid external block id for mapping %s", externalID)
+		return fmt.Errorf("%w: invalid external block id for mapping %s", ErrBlockMetadataPermanent, externalID)
 	}
 	if !isHexN(internalID, 64) {
-		return fmt.Errorf("invalid internal block id for mapping %s", internalID)
+		return fmt.Errorf("%w: invalid internal block id for mapping %s", ErrBlockMetadataPermanent, internalID)
 	}
 	existing, found, err := getBlockIDMappingForWriteCheckFn(db, orgID, representationID, externalID)
 	if err != nil {

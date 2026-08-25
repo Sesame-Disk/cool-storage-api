@@ -1029,15 +1029,23 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 			return putErr
 		}
 		target = resolvedTarget
-		// RESPONSE_CONTRACT: only the initial phase can make this block "new".
-		// A confirmation-phase write is a repair of an object that went missing
-		// between INSTALL and reconfirmation, not this request creating the block,
-		// so it must not turn a reused block's 200/New:false into 201/New:true.
-		// The consequence is deliberate: the same repair now answers 200 or 201
-		// depending on the phase it happened in, and New again means exactly
-		// "this request created the block".
+		// RESPONSE_CONTRACT: New means "this request created the block", so it
+		// follows the fresh-install AUTHORITY, not the fact that bytes were written.
+		//
+		// Two writes are physical but not creation. A confirmation-phase write
+		// repairs an object that went missing between INSTALL and reconfirmation.
+		// And the shared store helper also reports didPut for a Reusable probe whose
+		// canonical object is missing -- a repair that can happen in the INITIAL
+		// phase too. Both act on a block that was already canonical before this
+		// request started, so counting either as creation would answer 201/New:true
+		// for a block this request did not create.
+		//
+		// The assignment is deliberately not an accumulating OR. Across outer retries
+		// an attempt may mint a fresh incarnation, lose the canonical race, and the
+		// next attempt then find the block reusable; the winner is someone else's, so
+		// the last initial observation is the honest answer rather than a sticky true.
 		if phase == BlockMaterializationInitial {
-			didPutAny = didPutAny || didPut
+			didPutAny = resolvedTarget.FreshInstall && didPut
 		}
 		return nil
 	}, func() error {

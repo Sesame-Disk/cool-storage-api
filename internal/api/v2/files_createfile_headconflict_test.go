@@ -157,3 +157,32 @@ func TestCreateFileTemplateTargetSurvivesHeadConflictWithoutRemintOrPut(t *testi
 		t.Fatalf("registration keys = %q then %q, want the same canonical key", registeredTargets[0].StorageKey, registeredTargets[1].StorageKey)
 	}
 }
+
+// TestCreateFileTemplateMaterializationRequiresResetCallback pins that the reset is
+// mandatory rather than an optional optimization. It is what re-probes after
+// registration and rebuilds the target without fresh-install authority; with a nil
+// callback the confirmation store short-circuits on the cached state, the cached
+// target keeps FreshInstall=true, and a later HEAD conflict resubmits a single-use
+// install identity. Without this check that regression would be a silent nil.
+func TestCreateFileTemplateMaterializationRequiresResetCallback(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	storeCalls, registerCalls := 0, 0
+	err := retryCreateFileTemplateBlockMaterializationPhased(func(BlockMaterializationPhase) error {
+		storeCalls++
+		return nil
+	}, func() error {
+		registerCalls++
+		return nil
+	}, nil)
+
+	if err == nil {
+		t.Fatal("error = nil, want a caller-bug rejection for a nil reset callback")
+	}
+	if storeCalls != 1 || registerCalls != 1 {
+		t.Errorf("store/register calls = %d/%d, want 1/1 before the rejection", storeCalls, registerCalls)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Errorf("error = %v is retryable; a caller bug must not be retried", err)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
@@ -244,5 +245,34 @@ func TestMappingPermanentFailureIsNotRetried(t *testing.T) {
 	}
 	if mappingCalls != 1 {
 		t.Errorf("mapping calls = %d, want 1; a permanent rejection must not be retried", mappingCalls)
+	}
+}
+
+// TestMappingInvalidIdsAreNotRetried uses the REAL mapping writer path rather than a
+// hand-tagged sentinel. Deterministic id rejections are permanent, so the post-install
+// loop must stop on the first attempt instead of spending the whole budget.
+func TestMappingInvalidIdsAreNotRetried(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	installs := 0
+	stubMaterializationRegister(t, &installs)
+
+	mappingCalls := 0
+	oldMapping := writeBlockMappingForMaterializationFn
+	t.Cleanup(func() { writeBlockMappingForMaterializationFn = oldMapping })
+	writeBlockMappingForMaterializationFn = func(_ *db.DB, orgID, repoID, externalID, internalID string) error {
+		mappingCalls++
+		return (&db.DB{}).WriteBlockIDMapping(orgID, db.PlainBlockRepresentationID, externalID, internalID, time.Time{})
+	}
+
+	err := RegisterUploadedBlockTargetAndMapping(context.Background(), nil, "org", "repo", uploadReuseTestBlockID, "op", 1, mappingIsolationTarget(), "not-a-sha1")
+	if !errors.Is(err, ErrBlockMappingWriteFailed) {
+		t.Fatalf("error = %v, want ErrBlockMappingWriteFailed", err)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("error = %v is retryable, want permanent", err)
+	}
+	if mappingCalls != 1 {
+		t.Errorf("mapping calls = %d, want 1; a deterministic rejection must not burn the retry budget", mappingCalls)
 	}
 }

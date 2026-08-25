@@ -195,25 +195,38 @@ canonical row a retry may probe rowless and mint a second incarnation while the
 first is still in the store.
 
 A KnownLost target is deleted the same way -- bounded application-level retries
-against only its exact store and key. KnownLost proves that the *attempted*
-target is not canonical and that its physical identity is burned: it can never
-later become canonical, and because every incarnation is a distinct minted key, a
-late cleanup of it can never name a future one. What KnownLost does NOT prove is
-that some other target IS canonical. It has two sources:
+against only its exact store and key -- and follows the same authority rule: a
+failed exact cleanup does not authorize an outer remint while that target
+survives. The retryable sentinel returns the driver to the initial phase, the
+only phase that mints, so granting it on top of a known-dead object that is still
+in the store is how one failure becomes two orphans.
+
+KnownLost proves that the *attempted* target is not canonical and that its
+physical identity is burned: it can never later become canonical, and because
+every incarnation is a distinct minted key, a late cleanup of it can never name a
+future one. What KnownLost does NOT prove is that some other target IS canonical.
+It has two sources:
 
 - the direct CAS or SERIAL settlement observed a **different** canonical tuple --
-  a winner demonstrably exists, so a retry converges on it rather than minting;
+  a winner existed at classification time;
 - settlement found **no row** at `SERIAL` -- the install conclusively did not
   apply and nothing is canonical, with `Canonical` left empty.
 
-The second source has the same leak shape as the conclusively-unsubmitted
-pre-INSTALL branch, so it follows the same rule: if the exact cleanup fails while
-no canonical row is installed, the retryable sentinel is withheld rather than
-authorizing an outer remint on top of a surviving known-dead object. The
-winner-exists source keeps its best-effort cleanup and stays retryable, since
-blocking it would reject an upload whose block is already durable and would not
-recover the leaked object either way. A loser key that survives a failed cleanup
-in the retryable case is X3 space, not an identity hazard. `block_upload_fresh_physical_cleanup_total{result,reason}` records
+The cleanup rule is uniform across both, deliberately. The second source plainly
+has the pre-INSTALL leak shape. The first might look safe to retry, but the next
+probe is an ordinary read of `blocks`, not the `SERIAL` settlement that observed
+the winner, and this design already refuses to assume those agree: a rowless read
+of a row known to be installed is exactly what `ErrBlockCanonicalStateNotVisible`
+exists to classify as convergence rather than permission to mint. Relying on that
+visibility here while the confirmation phase declines to rely on it would be
+inconsistent, so a surviving loser withholds retry authority in both cases.
+
+The cost is failing a rare request whose block may already be durable, but only
+when the physical cleanup ALSO failed. Note what this does and does not promise:
+it removes the *automatic* remint inside this materialization cycle. The client's
+own retry is a new request that probes afresh and may legitimately mint a new
+incarnation. A loser key that survives is X3 space, not an identity hazard --
+`K1 != K2` always, so a late cleanup can never delete a live incarnation. `block_upload_fresh_physical_cleanup_total{result,reason}` records
 one final cleanup outcome, not each application or SDK attempt. It is emitted only
 where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
 KnownLost. The branches that retain their object instead of deleting it (ambiguous
@@ -237,6 +250,15 @@ failures therefore retry in place on the same bounded budget
 non-retryable `ErrBlockMappingWriteFailed` so the store phase is never re-entered.
 A verified external-to-different-internal conflict stays permanent and is never
 retried.
+
+The web block-upload response reports `New` (and 201 vs 200) from the fresh-install
+AUTHORITY of the last initial-phase observation, not from whether bytes were
+written. A physical write is not creation: the shared store helper also PUTs when
+a `Reusable` probe finds its canonical object missing and repairs it, in either
+phase, and that block was canonical before the request began. Nor is the flag
+sticky across retries -- an attempt may mint, lose the canonical race, and the
+next attempt find the block reusable, in which case the winner is another
+writer's and the answer is 200.
 
 The upload retry state machine is phase-aware. Only the initial store phase may
 mint and PUT a rowless `NeedsPut` target. The post-materialization confirmation

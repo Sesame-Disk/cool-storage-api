@@ -190,3 +190,31 @@ func TestUploadBlockConfirmationRepairKeeps200NotNew(t *testing.T) {
 		t.Errorf("physical writes = %d, want exactly 1 (the confirmation repair); without it this test would not exercise the contract at all", counts.puts)
 	}
 }
+
+// TestUploadBlockInitialRepairOfExistingCanonicalKeeps200NotNew is the other half of
+// the same contract, and the half the confirmation-phase test cannot reach. The
+// shared store helper returns didPut=true for a Reusable probe whose canonical
+// OBJECT is missing and gets repaired -- and that repair can happen in the INITIAL
+// phase. Counting any initial-phase physical write as "created" therefore reports
+// 201/New=true for a block that was already canonical before this request started,
+// which contradicts both UploadBlockResponse.New and the handler comment.
+//
+// New must follow the fresh-install AUTHORITY, not the fact that bytes were written.
+func TestUploadBlockInitialRepairOfExistingCanonicalKeeps200NotNew(t *testing.T) {
+	w, counts := uploadBlockNewContractHarness(t,
+		// Already canonical in both phases: this request did not create it.
+		func(_ int, orgID, blockID string) db.BlockReuseProbe { return reusableProbeFor(orgID, blockID) },
+		// Missing on the INITIAL verification -> repaired there, present afterwards.
+		func(call int) bool { return call != 1 },
+	)
+
+	if counts.puts != 1 {
+		t.Fatalf("physical writes = %d, want 1 (the initial-phase repair); without it this test would not exercise the contract", counts.puts)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; repairing an already-canonical block is not creating it, body=%s", w.Code, w.Body.String())
+	}
+	if body := decodeUploadBlockResponse(t, w); body.New {
+		t.Errorf("New = %v, want false; the block was canonical before this request", body.New)
+	}
+}

@@ -179,8 +179,14 @@ func TestNeedsPutUsesCanonicalMinIOBucket(t *testing.T) {
 	if len(existing) != 0 || len(missing) != 1 || missing[0] != strings.ToUpper(blockID) {
 		t.Fatalf("session check existing/missing = %v/%v, want []/[%s]", existing, missing, strings.ToUpper(blockID))
 	}
+	// 200, not 201: this block was ALREADY canonical (its metadata stayed pinned
+	// to USA above) and only its object was missing, so the session repairs the
+	// canonical copy rather than creating the block. New reports fresh-install
+	// authority, not the fact that bytes were written, so an initial-phase repair
+	// of an existing canonical block stays 200/new:false. This assertion read 201
+	// while the handler counted any initial-phase PUT as creation.
 	uploadResp := webUploadBlock(t, adminClient, sessionID, data)
-	if uploadResp.StatusCode != http.StatusCreated {
+	if uploadResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(uploadResp.Body)
 		uploadResp.Body.Close()
 		t.Fatalf("session upload status %d: %s", uploadResp.StatusCode, body)

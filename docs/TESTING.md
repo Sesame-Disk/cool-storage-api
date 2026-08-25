@@ -45,7 +45,7 @@ docker compose --profile test run --rm --build \
 # UploadBlock New/201-vs-200 response contract, canonical-convergence 409 mapping on
 # the file surfaces, and the canonical install SHA-256 input gate.
 docker compose --profile test run --rm --build gotest \
-  go test -count=1 -run 'Mapping|TestCreateFileTemplateTargetSurvivesHeadConflict|TestUploadBlock(FreshPutAnswers201New|ConfirmationRepairKeeps200NotNew)|TestWrite(UploadFile|CreateFile)Error|TestInstallBlockMetadata(RejectsNonSHA256BlockID|AcceptsCanonicalBlockID)|TestIsTransientFreshInstallPreparationErrorRequestCodes|TestRegisterUploadedBlockTargetFreshInstallAuthority' \
+  go test -count=1 -run 'Mapping|TestCreateFileTemplateTargetSurvivesHeadConflict|TestUploadBlock(FreshPutAnswers201New|ConfirmationRepairKeeps200NotNew|InitialRepairOfExistingCanonicalKeeps200NotNew)|TestCreateFileTemplateMaterializationRequiresResetCallback|TestWrite(UploadFile|CreateFile)Error|TestInstallBlockMetadata(RejectsNonSHA256BlockID|AcceptsCanonicalBlockID)|TestIsTransientFreshInstallPreparationErrorRequestCodes|TestRegisterUploadedBlockTargetFreshInstallAuthority' \
   ./internal/api/v2 ./internal/db
 
 # P2 phase forwarding. Proves every upload funnel forwards the retry driver's
