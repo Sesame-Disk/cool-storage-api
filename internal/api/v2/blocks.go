@@ -780,6 +780,15 @@ func respondBlockMaterializeError(c *gin.Context, err error) bool {
 	// and resolved by repeating the request. Mapping it to the default 500 would
 	// report a healthy block as a server fault and be indistinguishable from a
 	// real one in monitoring (finding F2).
+	//
+	// CLIENT_CONTRACT: the machine code is the authoritative signal. The web
+	// uploader keeps an allowlist of retryable 409 codes in
+	// RETRYABLE_BLOCK_UPLOAD_CONFLICT_CODES
+	// (frontend/src/components/file-uploader/block-upload-orchestrator.js) and
+	// treats every OTHER 4xx as permanent. A retryable 409 that is missing from
+	// that set aborts the upload on the first try -- worse than the 500 this
+	// replaced, which the hard-retry path did retry. Add new retryable codes to
+	// both places.
 	if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
 		c.Header("Retry-After", "1")
 		c.JSON(http.StatusConflict, gin.H{

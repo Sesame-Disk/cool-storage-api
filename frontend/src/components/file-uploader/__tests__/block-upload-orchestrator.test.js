@@ -740,6 +740,47 @@ describe('global concurrency limiter (shared across files)', () => {
     expect(limiter.noteFailure).not.toHaveBeenCalled();
   });
 
+  // block_canonical_state_not_visible means the block IS installed and durable and
+  // only the server could not observe its canonical row within one request's
+  // confirmation budget. The backend answers 409 + Retry-After precisely to ask for
+  // a retry, so aborting here would turn a transient convergence into a failed
+  // upload -- and this used to be a 500, which the hard-retry path DID retry. A
+  // retryable status the client treats as fatal is worse than the 500 it replaced.
+  test('block_canonical_state_not_visible is a soft retry that honors Retry-After', async () => {
+    let attempt = 0;
+    const api = {
+      createBlockUploadSession: jest.fn().mockResolvedValue({ data: { session_id: 's' } }),
+      checkBlocks: jest.fn((batch) => Promise.resolve({ data: { missing: batch.slice() } })),
+      uploadBlock: jest.fn(() => {
+        attempt += 1;
+        if (attempt <= 2) {
+          const err = new Error('block state is still converging');
+          err.response = {
+            status: 409,
+            headers: { 'retry-after': '0.01' },
+            data: { code: 'block_canonical_state_not_visible' },
+          };
+          return Promise.reject(err);
+        }
+        return Promise.resolve({ data: {} });
+      }),
+      createFileFromBlocks: jest.fn().mockResolvedValue({ data: [{ name: 'f', id: 'i', size: '1' }] }),
+    };
+    const limiter = {
+      acquire: jest.fn().mockResolvedValue(() => { }),
+      noteRetry: jest.fn(),
+      noteFailure: jest.fn(),
+      getMaxConcurrency: () => 1,
+    };
+
+    // retries:1 proves the waits are SOFT: they must not consume the hard budget.
+    await uploadFileViaBlocks(makeFile(1), { repoID: 'r', api, hashFn: hashOf('A', 1), blockSize: 1, limiter, retries: 1 });
+
+    expect(attempt).toBe(3);
+    expect(limiter.noteRetry).toHaveBeenCalledTimes(2);
+    expect(limiter.noteFailure).not.toHaveBeenCalled();
+  });
+
   test('an unrelated 409 is not treated as a soft retry', async () => {
     let attempt = 0;
     const api = {
