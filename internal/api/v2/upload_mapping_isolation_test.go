@@ -179,3 +179,70 @@ func TestWebMappingTransientRetriesInPlaceAfterInstallApplied(t *testing.T) {
 		t.Errorf("installs/mapping calls = %d/%d, want 1/2", installs, mappingCalls)
 	}
 }
+
+// TestMappingExhaustionStripsRetryableCause closes a latent hole in the isolation
+// itself. The exhausted error chains its cause with %w for diagnosis, so if a
+// mapping writer ever returned an error already tagged ErrBlockMaterializationTransient,
+// errors.Is would find that sentinel THROUGH the wrapper and the retry driver would
+// restart the mint-capable store phase again -- the exact behavior this seam exists
+// to prevent, reintroduced by a caller far away from it. Non-retryability has to be
+// a property of this boundary, not something inherited from the writer.
+func TestMappingExhaustionStripsRetryableCause(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	installs := 0
+	stubMaterializationRegister(t, &installs)
+
+	oldMapping := writeBlockMappingForMaterializationFn
+	t.Cleanup(func() { writeBlockMappingForMaterializationFn = oldMapping })
+	writeBlockMappingForMaterializationFn = func(*db.DB, string, string, string, string) error {
+		return fmt.Errorf("mapping: %w", ErrBlockMaterializationTransient)
+	}
+
+	storeCalls := 0
+	err := RetryUploadedBlockMaterializationPhasedContext(context.Background(), "UploadFile", uploadReuseTestBlockID,
+		func(BlockMaterializationPhase) error {
+			storeCalls++
+			return nil
+		},
+		func() error {
+			return RegisterUploadedBlockTargetAndMapping(context.Background(), nil, "org", "repo", uploadReuseTestBlockID, "op", 1, mappingIsolationTarget(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		}, nil, nil)
+
+	if !errors.Is(err, ErrBlockMappingWriteFailed) {
+		t.Fatalf("error = %v, want ErrBlockMappingWriteFailed", err)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("error = %v is retryable; a retryable cause must not leak through the exhausted mapping error", err)
+	}
+	if storeCalls != 1 {
+		t.Errorf("store calls = %d, want 1; the store phase must not be re-entered", storeCalls)
+	}
+}
+
+// TestMappingPermanentFailureIsNotRetried keeps a deterministic mapping rejection
+// from burning the whole budget on a write that cannot succeed.
+func TestMappingPermanentFailureIsNotRetried(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	installs, mappingCalls := 0, 0
+	stubMaterializationRegister(t, &installs)
+
+	oldMapping := writeBlockMappingForMaterializationFn
+	t.Cleanup(func() { writeBlockMappingForMaterializationFn = oldMapping })
+	writeBlockMappingForMaterializationFn = func(*db.DB, string, string, string, string) error {
+		mappingCalls++
+		return fmt.Errorf("bad id: %w", db.ErrBlockMetadataPermanent)
+	}
+
+	err := RegisterUploadedBlockTargetAndMapping(context.Background(), nil, "org", "repo", uploadReuseTestBlockID, "op", 1, mappingIsolationTarget(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if !errors.Is(err, ErrBlockMappingWriteFailed) || !errors.Is(err, db.ErrBlockMetadataPermanent) {
+		t.Fatalf("error = %v, want a permanent mapping failure", err)
+	}
+	if IsRetryableBlockMaterializationError(err) {
+		t.Fatalf("error = %v is retryable, want permanent", err)
+	}
+	if mappingCalls != 1 {
+		t.Errorf("mapping calls = %d, want 1; a permanent rejection must not be retried", mappingCalls)
+	}
+}

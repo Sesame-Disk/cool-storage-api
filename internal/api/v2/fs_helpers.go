@@ -1183,7 +1183,25 @@ func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libra
 			if result.Canonical.StorageClass == target.StorageClass && result.Canonical.StorageKey == target.StorageKey {
 				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
 			}
-			_ = cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
+			cleanupErr := cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
+			// KnownLost proves this target is NOT canonical. It does not prove that
+			// some other target is: settlement that finds no row at SERIAL also
+			// reports KnownLost, with an empty Canonical.
+			//
+			// That no-row variant has exactly the shape the conclusively-unsubmitted
+			// pre-INSTALL branch refuses to retry -- nothing is canonical, so an
+			// outer retry probes rowless and mints ANOTHER incarnation while this
+			// known-dead one is still in the store. Treating it like the winner case
+			// would multiply orphans for the same reason that branch exists, so a
+			// failed cleanup withholds the retry sentinel here too.
+			//
+			// A KnownLost that names a DIFFERENT canonical tuple is not that shape: a
+			// winner demonstrably exists, so the retry converges on it rather than
+			// minting, and failing the upload would reject a block that is already
+			// durable. That case keeps its best-effort cleanup and stays retryable.
+			if cleanupErr != nil && result.Canonical.StorageClass == "" && result.Canonical.StorageKey == "" {
+				return errors.Join(result.Cause, fmt.Errorf("exact known-lost cleanup for block %s failed while no canonical row is installed: %w", blockID, cleanupErr))
+			}
 			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)
 			if result.Cause != nil {
 				return errors.Join(lostErr, result.Cause)

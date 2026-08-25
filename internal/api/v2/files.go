@@ -240,10 +240,16 @@ func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMateriali
 			continue
 		}
 		// Re-probe after the provisional reference is durable. Clearing the cached
-		// store state makes this a real canonical HEAD/repair, not a no-op.
-		if resetStored != nil {
-			resetStored()
+		// store state makes this a real canonical HEAD/repair, not a no-op -- and it
+		// is what rebuilds the caller's target from the now-canonical row, dropping
+		// the fresh-install authority the initial phase minted. Without it the
+		// confirmation store short-circuits on the cache and a later HEAD-conflict
+		// retry would resubmit a single-use install identity, so a nil reset is a
+		// caller bug rather than an optional callback.
+		if resetStored == nil {
+			return fmt.Errorf("template block materialization requires a reset callback to re-probe after registration")
 		}
+		resetStored()
 		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
 			if err := store(BlockMaterializationConfirmation); err == nil {
 				return nil
@@ -1535,26 +1541,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, errLibraryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
-		case errors.Is(err, errFileExists):
-			c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
-		case errors.Is(err, errBlockStorageUnavailable):
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		case errors.Is(err, ErrBlockDeleteInProgress):
-			c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
-		// Same transient class as the fence above; see writeUploadFileError.
-		case errors.Is(err, ErrBlockCanonicalStateNotVisible):
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the create"})
-		case errors.Is(err, ErrLibraryHeadConflict):
-			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file"})
-		}
+		writeCreateFileError(c, err)
 		return
 	}
 
@@ -3538,6 +3525,34 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
+}
+
+// writeCreateFileError maps CreateFile failures to their HTTP contract. It is a
+// named function rather than an inline switch so the mapping is reachable from a
+// test: the block-materialization sentinels it shares with writeUploadFileError
+// are exactly the ones that regress silently, since removing a case only changes a
+// status code and never breaks a build.
+func writeCreateFileError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, errLibraryNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+	case errors.Is(err, errParentDirectoryNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
+	case errors.Is(err, errFileExists):
+		c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
+	case errors.Is(err, errBlockStorageUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+	case errors.Is(err, ErrBlockDeleteInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
+	// Same transient class as the fence above; see writeUploadFileError.
+	case errors.Is(err, ErrBlockCanonicalStateNotVisible):
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the create"})
+	case errors.Is(err, ErrLibraryHeadConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file"})
+	}
 }
 
 func writeUploadFileError(c *gin.Context, err error) {

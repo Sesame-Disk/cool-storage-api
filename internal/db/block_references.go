@@ -767,8 +767,17 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 	// future internal caller must not be able to install a canonical row under a
 	// block id that is not a SHA-256. Returns before Submitted is set, so a
 	// rejection here is conclusively unsubmitted.
-	if !IsSHA256BlockID(NormalizeBlockID(blockID)) {
-		result.Cause = fmt.Errorf("%w: invalid SHA-256 block id %q for canonical install", ErrBlockMetadataPermanent, blockID)
+	//
+	// The check is deliberately fail-closed on the EXACT spelling rather than on a
+	// normalized copy. blockID is the partition key the LWT and the settlement
+	// SELECT both use verbatim, so validating NormalizeBlockID(blockID) and then
+	// persisting blockID would accept "  ABCD..  " and install the canonical row
+	// under a padded, upper-case identity that is not the block's content address
+	// -- validating one string and persisting another. At an identity boundary the
+	// caller must arrive already canonical; silent normalization here would just
+	// move the inconsistency downstream.
+	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
+		result.Cause = fmt.Errorf("%w: block id %q is not a canonical lower-case SHA-256 for canonical install", ErrBlockMetadataPermanent, blockID)
 		return result
 	}
 	if !config.IsCanonicalStorageClassName(proposed.StorageClass) {

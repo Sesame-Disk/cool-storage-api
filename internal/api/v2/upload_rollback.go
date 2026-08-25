@@ -115,6 +115,9 @@ func writeBlockMappingAfterInstall(ctx context.Context, write func() error, bloc
 		if errors.Is(err, db.ErrBlockIDMappingConflict) {
 			return conflictErr(err)
 		}
+		if errors.Is(err, db.ErrBlockMetadataPermanent) {
+			return fmt.Errorf("%w: mapping write for block %s failed permanently: %w", ErrBlockMappingWriteFailed, blockID, err)
+		}
 		lastErr = err
 		if attempt == attempts {
 			break
@@ -127,5 +130,13 @@ func writeBlockMappingAfterInstall(ctx context.Context, write func() error, bloc
 	// Deliberately NOT tagged ErrBlockMaterializationTransient: the canonical
 	// install already applied, so the retry driver must not restart the store
 	// phase and reopen mint authority for this block.
-	return fmt.Errorf("%w: mapping write for block %s failed after %d attempts: %w", ErrBlockMappingWriteFailed, blockID, attempts, lastErr)
+	failure := fmt.Errorf("%w: mapping write for block %s failed after %d attempts: %w", ErrBlockMappingWriteFailed, blockID, attempts, lastErr)
+	if !IsRetryableBlockMaterializationError(failure) {
+		return failure
+	}
+	// The cause carried a retryable sentinel of its own. Chaining it with %w would
+	// re-arm the retry driver through this error and undo the entire isolation, so
+	// the cause is degraded to text. Non-retryability is a property of this seam,
+	// not something to inherit from whatever the mapping writer happened to return.
+	return fmt.Errorf("%w: mapping write for block %s failed after %d attempts: %v", ErrBlockMappingWriteFailed, blockID, attempts, lastErr)
 }

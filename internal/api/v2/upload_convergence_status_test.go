@@ -60,3 +60,46 @@ func TestWriteUploadFileErrorKeeps500ForUnknownFailures(t *testing.T) {
 		t.Fatalf("status = %d, want 500", w.Code)
 	}
 }
+
+// CreateFile carries the same sentinel through its own mapping, so it needs its own
+// coverage: a test of writeUploadFileError says nothing about whether the create
+// surface still answers 409. Deleting the case there only changes a status code, so
+// nothing else in the build or the suite would notice.
+func TestWriteCreateFileErrorMapsCanonicalConvergenceTo409(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	writeCreateFileError(c, fmt.Errorf("materialize: %w", ErrBlockCanonicalStateNotVisible))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; the block is installed, this is convergence, not a server fault", w.Code)
+	}
+	if retryAfter := w.Header().Get("Retry-After"); retryAfter == "" {
+		t.Errorf("Retry-After = %q, want a retry hint like the fence response", retryAfter)
+	}
+}
+
+func TestWriteCreateFileErrorStillMapsDeleteFenceTo409(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	writeCreateFileError(c, fmt.Errorf("materialize: %w", ErrBlockDeleteInProgress))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+}
+
+func TestWriteCreateFileErrorKeeps500ForUnknownFailures(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	writeCreateFileError(c, fmt.Errorf("something genuinely broken"))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+}

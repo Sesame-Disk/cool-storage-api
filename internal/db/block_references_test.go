@@ -202,6 +202,27 @@ func TestInstallBlockMetadataRejectsInvalidInputBeforeInstall(t *testing.T) {
 // The rejection must happen before the LWT seam so it is conclusively unsubmitted:
 // Submitted stays false, which is what tells the cleanup path the object is safe to
 // remove and that no install identity was consumed.
+// TestInstallBlockMetadataAcceptsCanonicalBlockID is the companion to the rejection
+// table: the gate must accept the exact lower-case digest production actually mints,
+// or it would be rejecting everything and the table above would prove nothing.
+func TestInstallBlockMetadataAcceptsCanonicalBlockID(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	installed := ""
+	installBlockMetadataLWTFn = func(_ context.Context, _ *DB, _, blockID, _, _ string, _ int, _ BlockPhysicalLocation, _ time.Time) (bool, map[string]interface{}, error) {
+		installed = blockID
+		return true, nil, nil
+	}
+
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, installTestBlockID, "", 1, proposed)
+	if got.Outcome != InstallBlockMetadataApplied {
+		t.Fatalf("InstallBlockMetadata() = %+v, want Applied", got)
+	}
+	if installed != installTestBlockID {
+		t.Fatalf("installed block id = %q, want the exact validated id %q", installed, installTestBlockID)
+	}
+}
+
 func TestInstallBlockMetadataRejectsNonSHA256BlockID(t *testing.T) {
 	withInstallBlockMetadataSeams(t)
 	installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
@@ -221,6 +242,14 @@ func TestInstallBlockMetadataRejectsNonSHA256BlockID(t *testing.T) {
 		strings.Repeat("b", 65),
 		strings.Repeat("z", 64),
 		strings.Repeat("b", 40),
+		// Non-canonical SPELLINGS of an otherwise valid digest. These are the cases
+		// a normalize-then-validate gate would wave through while the LWT and the
+		// settlement SELECT still used the original string as the partition key --
+		// validating one identity and installing the canonical row under another.
+		strings.ToUpper(installTestBlockID),
+		" " + installTestBlockID,
+		installTestBlockID + " ",
+		" " + installTestBlockID + " ",
 	} {
 		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, blockID, "", 1, proposed)
 		if got.Outcome != InstallBlockMetadataAmbiguous || !errors.Is(got.Cause, ErrBlockMetadataPermanent) {

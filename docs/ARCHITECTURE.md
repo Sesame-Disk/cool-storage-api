@@ -190,18 +190,30 @@ failures, cancellation, and exhaustion submit no INSTALL. A conclusively
 unsubmitted target receives bounded detached cleanup of that exact key. The
 provisional logical reference may remain until its TTL, but no metadata row ever
 installs the deleted target; a failed cleanup is an observable X3 leak and does
-not authorize an outer remint while that target survives. A KnownLost target is
-deleted the same way -- bounded application-level retries against only its exact
-store and key -- but it deliberately does NOT share that remint restriction, and
-the asymmetry is intentional rather than an oversight. The pre-INSTALL case has no
-canonical row, so a retry is *guaranteed* to probe rowless and mint a second
-incarnation; withholding the retryable sentinel is the only thing preventing that.
-A KnownLost target lost a completed race, which means a canonical row for this
-block demonstrably exists, so the retry re-probes, sees it, and reuses it instead
-of minting. Blocking the retry there would fail an upload whose block is already
-canonical and durable, and would not save the leaked object either way. The loser
-key is burned and can never be confused with the winner, so what remains is X3
-space, not an identity hazard. `block_upload_fresh_physical_cleanup_total{result,reason}` records
+not authorize an outer remint while that target survives, because with no
+canonical row a retry may probe rowless and mint a second incarnation while the
+first is still in the store.
+
+A KnownLost target is deleted the same way -- bounded application-level retries
+against only its exact store and key. KnownLost proves that the *attempted*
+target is not canonical and that its physical identity is burned: it can never
+later become canonical, and because every incarnation is a distinct minted key, a
+late cleanup of it can never name a future one. What KnownLost does NOT prove is
+that some other target IS canonical. It has two sources:
+
+- the direct CAS or SERIAL settlement observed a **different** canonical tuple --
+  a winner demonstrably exists, so a retry converges on it rather than minting;
+- settlement found **no row** at `SERIAL` -- the install conclusively did not
+  apply and nothing is canonical, with `Canonical` left empty.
+
+The second source has the same leak shape as the conclusively-unsubmitted
+pre-INSTALL branch, so it follows the same rule: if the exact cleanup fails while
+no canonical row is installed, the retryable sentinel is withheld rather than
+authorizing an outer remint on top of a surviving known-dead object. The
+winner-exists source keeps its best-effort cleanup and stays retryable, since
+blocking it would reject an upload whose block is already durable and would not
+recover the leaked object either way. A loser key that survives a failed cleanup
+in the retryable case is X3 space, not an identity hazard. `block_upload_fresh_physical_cleanup_total{result,reason}` records
 one final cleanup outcome, not each application or SDK attempt. It is emitted only
 where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
 KnownLost. The branches that retain their object instead of deleting it (ambiguous

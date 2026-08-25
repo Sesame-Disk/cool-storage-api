@@ -600,15 +600,59 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		}
 	})
 
-	t.Run("cleanup failure leaks and still reprobes", func(t *testing.T) {
+	// KnownLost has two sources and they carry different retry authority.
+	//
+	// When settlement observed a DIFFERENT canonical tuple, a winner demonstrably
+	// exists, so an outer retry converges on it instead of minting. A failed
+	// cleanup there leaks the loser key as X3 space but must not fail an upload
+	// whose block is already durable.
+	t.Run("known lost with a winner stays retryable even if cleanup fails", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true}
+			return db.InstallBlockMetadataResult{
+				Outcome:   db.InstallBlockMetadataKnownLost,
+				Submitted: true,
+				Canonical: db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org/winner"},
+			}
 		}
 		cleanupErr := errors.New("delete unavailable")
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
 		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
 		if !errors.Is(err, ErrBlockMaterializationTransient) || errors.Is(err, cleanupErr) {
 			t.Fatalf("error = %v, want retryable reprobe without making cleanup failure authoritative", err)
+		}
+	})
+
+	// When settlement found NO row at SERIAL, KnownLost proves only that THIS
+	// target is dead -- nothing is canonical, and Canonical is left empty. That is
+	// the same leak shape as the conclusively-unsubmitted pre-INSTALL branch: an
+	// outer retry would probe rowless and mint ANOTHER incarnation while this
+	// known-dead object is still in the store. So a failed cleanup withholds the
+	// retry sentinel here, exactly as that branch does.
+	t.Run("known lost with no canonical row withholds retry when cleanup fails", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true}
+		}
+		cleanupErr := errors.New("delete unavailable")
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v is retryable; an outer remint on top of a surviving known-dead object multiplies orphans for the same reason the pre-install branch refuses it", err)
+		}
+		if !errors.Is(err, cleanupErr) {
+			t.Fatalf("error = %v, want the cleanup failure surfaced as the reason authority was withheld", err)
+		}
+	})
+
+	// The same no-row KnownLost stays retryable when the cleanup SUCCEEDS: the dead
+	// object is gone, so a retry mints at most one live incarnation.
+	t.Run("known lost with no canonical row stays retryable when cleanup succeeds", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true}
+		}
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return nil }
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if !errors.Is(err, ErrBlockMaterializationTransient) {
+			t.Fatalf("error = %v, want retryable after a successful exact cleanup", err)
 		}
 	})
 
