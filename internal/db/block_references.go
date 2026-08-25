@@ -760,6 +760,17 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 		result.Cause = fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
 		return result
 	}
+	// This function is the single-use canonical install boundary, so it validates
+	// its own inputs rather than trusting the caller to have done it. Production
+	// reaches it only behind ValidateMintedPhysicalLocator, which already checks
+	// the SHA-256, but that is the caller's guarantee, not this seam's -- and a
+	// future internal caller must not be able to install a canonical row under a
+	// block id that is not a SHA-256. Returns before Submitted is set, so a
+	// rejection here is conclusively unsubmitted.
+	if !IsSHA256BlockID(NormalizeBlockID(blockID)) {
+		result.Cause = fmt.Errorf("%w: invalid SHA-256 block id %q for canonical install", ErrBlockMetadataPermanent, blockID)
+		return result
+	}
 	if !config.IsCanonicalStorageClassName(proposed.StorageClass) {
 		result.Cause = fmt.Errorf("%w: non-canonical storage class %q for block %s", ErrBlockMetadataPermanent, proposed.StorageClass, blockID)
 		return result

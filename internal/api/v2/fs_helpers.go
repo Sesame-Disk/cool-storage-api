@@ -993,7 +993,16 @@ func isTransientFreshInstallPreparationError(err error) bool {
 	if errors.As(err, &requestErr) {
 		switch requestErr.Code() {
 		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded, gocql.ErrCodeBootstrapping,
-			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
+			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout,
+			// Read_failure is a non-timeout replica-side failure during a READ, not a
+			// semantic rejection like a syntax or invalid-query error. This step only
+			// READS the library representation, and it runs before any INSTALL is
+			// submitted while the same already-PUT target is still held -- so retrying
+			// is safe and strictly better than deleting that target and failing the
+			// whole upload for a recoverable Cassandra perturbation. WriteFailure is
+			// deliberately NOT included: this step issues no write, so seeing one means
+			// something other than the resolution read failed.
+			gocql.ErrCodeReadFailure:
 			return true
 		}
 	}

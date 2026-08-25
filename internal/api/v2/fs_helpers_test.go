@@ -35,7 +35,13 @@ func TestIsTransientFreshInstallPreparationErrorRequestCodes(t *testing.T) {
 		{name: "bootstrapping", code: gocql.ErrCodeBootstrapping, want: true},
 		{name: "read timeout", code: gocql.ErrCodeReadTimeout, want: true},
 		{name: "write timeout", code: gocql.ErrCodeWriteTimeout, want: true},
-		{name: "read failure", code: gocql.ErrCodeReadFailure, want: false},
+		// Read_failure is a replica-side failure during a READ, not a semantic
+		// rejection. This step only reads the representation, runs before any
+		// INSTALL is submitted, and still holds the same already-PUT target, so
+		// retrying beats deleting that target and failing the upload.
+		{name: "read failure", code: gocql.ErrCodeReadFailure, want: true},
+		// WriteFailure stays permanent: this step issues no write, so seeing one
+		// means something other than the resolution read failed.
 		{name: "write failure", code: gocql.ErrCodeWriteFailure, want: false},
 		{name: "invalid query", code: gocql.ErrCodeInvalid, want: false},
 		{name: "syntax error", code: gocql.ErrCodeSyntax, want: false},

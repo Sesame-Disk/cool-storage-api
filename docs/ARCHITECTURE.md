@@ -191,8 +191,17 @@ unsubmitted target receives bounded detached cleanup of that exact key. The
 provisional logical reference may remain until its TTL, but no metadata row ever
 installs the deleted target; a failed cleanup is an observable X3 leak and does
 not authorize an outer remint while that target survives. A KnownLost target is
-similarly deleted with bounded application-level retries against only its exact
-store and key. `block_upload_fresh_physical_cleanup_total{result,reason}` records
+deleted the same way -- bounded application-level retries against only its exact
+store and key -- but it deliberately does NOT share that remint restriction, and
+the asymmetry is intentional rather than an oversight. The pre-INSTALL case has no
+canonical row, so a retry is *guaranteed* to probe rowless and mint a second
+incarnation; withholding the retryable sentinel is the only thing preventing that.
+A KnownLost target lost a completed race, which means a canonical row for this
+block demonstrably exists, so the retry re-probes, sees it, and reuses it instead
+of minting. Blocking the retry there would fail an upload whose block is already
+canonical and durable, and would not save the leaked object either way. The loser
+key is burned and can never be confused with the winner, so what remains is X3
+space, not an identity hazard. `block_upload_fresh_physical_cleanup_total{result,reason}` records
 one final cleanup outcome, not each application or SDK attempt. It is emitted only
 where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
 KnownLost. The branches that retain their object instead of deleting it (ambiguous
@@ -203,6 +212,19 @@ emit nothing: the counter measures cleanup outcomes, not the retained-object
 population. The qualifier matters -- the conclusively-unsubmitted branch itself
 both emits `reason="preinstall_failed"` and returns the retryable sentinel, so
 "returns the sentinel" alone does not imply "emits nothing". See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
+
+The external SHA-1 mapping is a sidecar write that runs AFTER the canonical
+install applied, and its failures are isolated from the materialization retry
+driver. That driver answers a retryable materialize error by restarting the cycle
+at the initial phase, which is the only phase with mint authority. Before the
+INSTALL that is the correct recovery; after it applied it is not, because the
+block is already canonical and a probe that momentarily reads rowless would let a
+mapping timeout authorize a second physical incarnation. Transient mapping
+failures therefore retry in place on the same bounded budget
+(`block_upload_mapping_retries_total`), and an exhausted budget returns a
+non-retryable `ErrBlockMappingWriteFailed` so the store phase is never re-entered.
+A verified external-to-different-internal conflict stays permanent and is never
+retried.
 
 The upload retry state machine is phase-aware. Only the initial store phase may
 mint and PUT a rowless `NeedsPut` target. The post-materialization confirmation

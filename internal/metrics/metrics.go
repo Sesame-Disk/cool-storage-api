@@ -599,6 +599,19 @@ var (
 		[]string{"surface", "reason"},
 	)
 
+	// BlockUploadMappingRetriesTotal counts in-place retries of the external SHA-1
+	// mapping write that runs AFTER the canonical install applied. These retries
+	// deliberately do not go through the materialization retry driver: restarting
+	// that cycle would re-enter the mint-capable initial phase for a block that is
+	// already canonical. A rising counter means Cassandra mapping writes are
+	// struggling, not that block identity is churning.
+	BlockUploadMappingRetriesTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "block_upload_mapping_retries_total",
+			Help: "In-place retries of the post-install external block id mapping write.",
+		},
+	)
+
 	// BlockUploadFreshPhysicalCleanupTotal records one final outcome for each
 	// bounded exact-key cleanup. It intentionally does not count SDK or
 	// application retry attempts and carries no object or tenant identity.
@@ -1155,6 +1168,7 @@ func Register() {
 		BlockUploadSessionAdmissionRejectionsTotal,
 		BlockUploadMaterializationRetriesTotal,
 		BlockUploadFreshPhysicalCleanupTotal,
+		BlockUploadMappingRetriesTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		SyncPutBlockInflightCurrent,

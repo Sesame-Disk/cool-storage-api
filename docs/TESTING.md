@@ -39,6 +39,15 @@ docker compose --profile test run --rm --build \
   go test -tags integration -run '^TestP2ConcurrentCanonicalInstall$' \
   -v -count=1 -timeout 5m ./internal/integration
 
+# P2 follow-up regressions: post-install mapping isolation (a mapping timeout must
+# never re-enter the mint-capable initial phase), the CreateFile HEAD-conflict retry
+# (no resubmit of a single-use install identity, no remint, no re-PUT), the
+# UploadBlock New/201-vs-200 response contract, canonical-convergence 409 mapping on
+# the file surfaces, and the canonical install SHA-256 input gate.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'Mapping|TestCreateFileTemplateTargetSurvivesHeadConflict|TestUploadBlock(FreshPutAnswers201New|ConfirmationRepairKeeps200NotNew)|TestWriteUploadFileError|TestInstallBlockMetadataRejectsNonSHA256BlockID|TestIsTransientFreshInstallPreparationErrorRequestCodes' \
+  ./internal/api/v2 ./internal/db
+
 # P2 phase forwarding. Proves every upload funnel forwards the retry driver's
 # materialization phase instead of a constant, that no production caller reaches
 # a phase-erasing wrapper, and that the desktop-sync funnel gates the storage
