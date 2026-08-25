@@ -1,11 +1,195 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
+
+func withInstallBlockMetadataSeams(t *testing.T) {
+	t.Helper()
+	oldInstall := installBlockMetadataLWTFn
+	oldSettle := settleInstalledBlockMetadataFn
+	t.Cleanup(func() {
+		installBlockMetadataLWTFn = oldInstall
+		settleInstalledBlockMetadataFn = oldSettle
+	})
+}
+
+func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+
+	tests := []struct {
+		name        string
+		applied     bool
+		current     map[string]interface{}
+		wantOutcome InstallBlockMetadataOutcome
+		want        BlockPhysicalLocation
+	}{
+		{name: "insert applied", applied: true, wantOutcome: InstallBlockMetadataApplied, want: proposed},
+		{name: "CAS returns exact tuple contradiction", current: map[string]interface{}{"storage_class": proposed.StorageClass, "storage_key": proposed.StorageKey}, wantOutcome: InstallBlockMetadataIdentityContradiction},
+		{name: "different key loses", current: map[string]interface{}{"storage_class": proposed.StorageClass, "storage_key": "blocks/org-1/winner"}, wantOutcome: InstallBlockMetadataKnownLost, want: BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/winner"}},
+		{name: "same key in different class loses", current: map[string]interface{}{"storage_class": "cold", "storage_key": proposed.StorageKey}, wantOutcome: InstallBlockMetadataKnownLost, want: BlockPhysicalLocation{StorageClass: "cold", StorageKey: proposed.StorageKey}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installCalls := 0
+			installBlockMetadataLWTFn = func(ctx context.Context, database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, location BlockPhysicalLocation, now time.Time) (bool, map[string]interface{}, error) {
+				installCalls++
+				if ctx == nil || database == nil || orgID != "org-1" || blockID != "block-1" || representationID != PlainBlockRepresentationID || sha1 != strings.Repeat("a", 40) || sizeBytes != 123 || location != proposed || now.IsZero() {
+					t.Fatalf("install args were not preserved: db=%p org=%q block=%q representation=%q sha1=%q size=%d location=%+v now=%v", database, orgID, blockID, representationID, sha1, sizeBytes, location, now)
+				}
+				return test.applied, test.current, nil
+			}
+			settleInstalledBlockMetadataFn = func(context.Context, *DB, string, string) (installedBlockMetadataRow, bool, error) {
+				t.Fatal("settlement must not run after a definite CAS result")
+				return installedBlockMetadataRow{}, false, nil
+			}
+
+			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", strings.Repeat("a", 40), 123, proposed)
+			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
+				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
+			}
+			if !got.Submitted {
+				t.Fatal("InstallBlockMetadata() Submitted = false, want true after LWT seam entry")
+			}
+			if test.wantOutcome == InstallBlockMetadataIdentityContradiction && !errors.Is(got.Cause, ErrInstallBlockMetadataIdentityContradiction) {
+				t.Fatalf("InstallBlockMetadata() cause = %v, want identity contradiction", got.Cause)
+			}
+			if installCalls != 1 {
+				t.Fatalf("install calls = %d, want exactly 1", installCalls)
+			}
+		})
+	}
+}
+
+func TestInstallBlockMetadataMalformedCASRowsFailClosed(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	tests := []map[string]interface{}{
+		{"storage_key": proposed.StorageKey},
+		{"storage_class": proposed.StorageClass},
+		{"storage_class": "Hot", "storage_key": proposed.StorageKey},
+		{"storage_class": proposed.StorageClass, "storage_key": " "},
+		{"storage_class": 42, "storage_key": proposed.StorageKey},
+	}
+	for _, current := range tests {
+		installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
+			return false, current, nil
+		}
+		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+		if got.Outcome != InstallBlockMetadataAmbiguous || got.Canonical != (BlockPhysicalLocation{}) || got.Cause == nil {
+			t.Fatalf("InstallBlockMetadata() = %+v, want non-authorizing malformed result", got)
+		}
+	}
+}
+
+func TestInstallBlockMetadataSettlesMutationErrorsWithoutRepeatingInstall(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	installErr := errors.New("LWT timeout")
+
+	tests := []struct {
+		name        string
+		row         installedBlockMetadataRow
+		found       bool
+		settleErr   error
+		wantOutcome InstallBlockMetadataOutcome
+		want        BlockPhysicalLocation
+	}{
+		{name: "exact tuple applied", row: completeInstalledBlockMetadataRow(proposed), found: true, wantOutcome: InstallBlockMetadataApplied, want: proposed},
+		{name: "other tuple lost", row: completeInstalledBlockMetadataRow(BlockPhysicalLocation{StorageClass: "cold", StorageKey: proposed.StorageKey}), found: true, wantOutcome: InstallBlockMetadataKnownLost, want: BlockPhysicalLocation{StorageClass: "cold", StorageKey: proposed.StorageKey}},
+		{name: "no row lost", wantOutcome: InstallBlockMetadataKnownLost},
+		{name: "read failure ambiguous", settleErr: errors.New("SERIAL unavailable"), wantOutcome: InstallBlockMetadataAmbiguous},
+		{name: "malformed row ambiguous", row: installedBlockMetadataRow{Location: proposed, StorageKeyPresent: true}, found: true, wantOutcome: InstallBlockMetadataAmbiguous},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installCalls := 0
+			installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
+				installCalls++
+				return false, nil, installErr
+			}
+			settleCalls := 0
+			settleInstalledBlockMetadataFn = func(context.Context, *DB, string, string) (installedBlockMetadataRow, bool, error) {
+				settleCalls++
+				return test.row, test.found, test.settleErr
+			}
+
+			got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
+				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
+			}
+			if !got.Submitted {
+				t.Fatal("settled InstallBlockMetadata() Submitted = false, want true")
+			}
+			if installCalls != 1 || settleCalls != 1 {
+				t.Fatalf("install/settle calls = %d/%d, want 1/1", installCalls, settleCalls)
+			}
+		})
+	}
+}
+
+func TestInstallBlockMetadataSettlementSurvivesRequestCancellationAndIsBounded(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	proposed := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/minted"}
+	installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
+		cancelRequest()
+		return false, nil, errors.New("request canceled after submission")
+	}
+	settleInstalledBlockMetadataFn = func(ctx context.Context, _ *DB, _, _ string) (installedBlockMetadataRow, bool, error) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("settlement context inherited request cancellation: %v", err)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > time.Second {
+			t.Fatalf("settlement deadline = %v, want active bound no greater than 1s", deadline)
+		}
+		return completeInstalledBlockMetadataRow(proposed), true, nil
+	}
+
+	got := (&DB{config: config.DatabaseConfig{Timeout: time.Second}}).InstallBlockMetadata(requestCtx, "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+	if got.Outcome != InstallBlockMetadataApplied || got.Canonical != proposed {
+		t.Fatalf("InstallBlockMetadata() = %+v, want settled Applied", got)
+	}
+	if !got.Submitted {
+		t.Fatal("settled InstallBlockMetadata() Submitted = false, want true")
+	}
+}
+
+func TestInstallBlockMetadataRejectsInvalidInputBeforeInstall(t *testing.T) {
+	withInstallBlockMetadataSeams(t)
+	installBlockMetadataLWTFn = func(context.Context, *DB, string, string, string, string, int, BlockPhysicalLocation, time.Time) (bool, map[string]interface{}, error) {
+		t.Fatal("invalid input must not issue INSTALL")
+		return false, nil, nil
+	}
+	settleInstalledBlockMetadataFn = func(context.Context, *DB, string, string) (installedBlockMetadataRow, bool, error) {
+		t.Fatal("invalid input must not settle an INSTALL that was never issued")
+		return installedBlockMetadataRow{}, false, nil
+	}
+
+	for _, proposed := range []BlockPhysicalLocation{{StorageClass: "Hot", StorageKey: "key"}, {StorageClass: "hot", StorageKey: " key "}, {StorageClass: "hot"}} {
+		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
+		if got.Outcome != InstallBlockMetadataAmbiguous || !errors.Is(got.Cause, ErrBlockMetadataPermanent) {
+			t.Fatalf("InstallBlockMetadata(%+v) = %+v, want non-authorizing permanent rejection", proposed, got)
+		}
+		if got.Submitted {
+			t.Fatalf("InstallBlockMetadata(%+v) Submitted = true before LWT", proposed)
+		}
+	}
+}
+
+func completeInstalledBlockMetadataRow(location BlockPhysicalLocation) installedBlockMetadataRow {
+	return installedBlockMetadataRow{Location: location, StorageClassPresent: true, StorageKeyPresent: true}
+}
 
 func completeIdentityRepairRow(representationID, sha1 string) blockIdentityRepairRow {
 	createdAt := time.Now().UTC()
@@ -344,7 +528,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyBeforeInsert(t *testing.T) {
 		return false, nil
 	}
 
-	for _, storageKey := range []string{"", "   "} {
+	for _, storageKey := range []string{"", "   ", " key", "key "} {
 		err := (&DB{}).UpsertBlockMetadata("org-1", "block-1", 1, "hot", storageKey)
 		if err == nil || !strings.Contains(err.Error(), "missing canonical storage key") {
 			t.Fatalf("UpsertBlockMetadata(%q) error = %v, want missing storage key error", storageKey, err)
@@ -376,7 +560,7 @@ func TestUpsertBlockMetadataRejectsEmptyStorageKeyOnTheExistingRow(t *testing.T)
 	}
 	readBlockIdentityForRepairFn = func(*DB, string, string) (blockIdentityRepairRow, bool, error) {
 		row := completeIdentityRepairRow(PlainBlockRepresentationID, "")
-		row.StorageKey = "  "
+		row.StorageKey = " key "
 		return row, true, nil
 	}
 
@@ -1342,7 +1526,7 @@ func TestProbeBlockReuseReturnsUnknownErrorForEmptyStorageKey(t *testing.T) {
 		return false, nil
 	}
 
-	for _, storageKey := range []string{"", "   "} {
+	for _, storageKey := range []string{"", "   ", "canonical-key ", " canonical-key"} {
 		probeBlockReuseMetadataFn = func(database *DB, orgID, blockID string) (blockReuseMetadataRow, bool, error) {
 			row := completeProbeMetadataRow("hot")
 			row.SizeBytes = 123

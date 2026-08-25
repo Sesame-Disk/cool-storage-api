@@ -599,6 +599,17 @@ var (
 		[]string{"surface", "reason"},
 	)
 
+	// BlockUploadFreshPhysicalCleanupTotal records one final outcome for each
+	// bounded exact-key cleanup. It intentionally does not count SDK or
+	// application retry attempts and carries no object or tenant identity.
+	BlockUploadFreshPhysicalCleanupTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "block_upload_fresh_physical_cleanup_total",
+			Help: "Final outcomes of bounded exact cleanup for fresh block objects.",
+		},
+		[]string{"result", "reason"},
+	)
+
 	// SyncPutBlockBodyBytes measures request bodies on the desktop-sync block
 	// route that passed the size gate. The cap on that route was originally
 	// derived from the web uploader's chunk ceiling rather than from observed
@@ -1143,6 +1154,7 @@ func Register() {
 		BlockUploadConcurrencyRejectionsTotal,
 		BlockUploadSessionAdmissionRejectionsTotal,
 		BlockUploadMaterializationRetriesTotal,
+		BlockUploadFreshPhysicalCleanupTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		SyncPutBlockInflightCurrent,

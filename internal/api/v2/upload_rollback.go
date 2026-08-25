@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,8 +10,8 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
-var registerUploadedBlockForMaterializationFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
-	return NewFSHelper(database).RegisterUploadedBlock(orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, sha1ID)
+var registerUploadedBlockTargetForMaterializationFn = func(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
+	return NewFSHelper(database).RegisterUploadedBlockTarget(ctx, orgID, repoID, internalBlockID, operationID, sizeBytes, target, sha1ID)
 }
 var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, repoID, externalBlockID, internalBlockID string) error {
 	if database == nil {
@@ -37,19 +38,10 @@ var writeVerifiedWebBlockMappingFn = func(database *db.DB, orgID, repoID, extern
 	return database.WriteVerifiedWebBlockMapping(orgID, representationID, externalBlockID, internalBlockID, time.Time{})
 }
 
-// RegisterUploadedBlockAndMapping materializes an uploaded block in Cassandra by
-// creating the provisional upload reference + metadata first and only then
-// writing the optional external SHA-1 mapping. If the mapping write fails, the
-// provisional reference remains discoverable and TTL-bound; retries renew that
-// same upload identity instead of deleting from block_references.
-//
-// A transient mapping-write failure (Cassandra I/O) is tagged
-// ErrBlockMaterializationTransient — with the cause preserved via %w — so the
-// store->materialize wrapper retries the whole cycle (re-register + re-map are
-// idempotent) instead of failing the upload on the first timeout (F6). A
-// permanent id-mapping conflict is not tagged and not retried.
-func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
-	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
+// RegisterUploadedBlockTargetAndMapping materializes the exact target selected
+// by the store/probe flow, then writes its optional external SHA-1 mapping.
+func RegisterUploadedBlockTargetAndMapping(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, externalBlockID string) error {
+	if err := registerUploadedBlockTargetForMaterializationFn(ctx, database, orgID, repoID, internalBlockID, operationID, sizeBytes, target, externalBlockID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(externalBlockID) == "" {
@@ -64,19 +56,17 @@ func RegisterUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlo
 	return nil
 }
 
-// RegisterWebUploadedBlockAndMapping is the WEB block-upload (session) variant of
-// RegisterUploadedBlockAndMapping. It is identical EXCEPT it writes the forward
+// RegisterWebUploadedBlockTargetAndMapping is the WEB block-upload (session)
+// variant. It writes the forward
 // SHA-1 -> SHA-256 mapping through WriteVerifiedWebBlockMapping, which fails
 // closed on an external→different-internal conflict (a forged/colliding SHA-1).
 // Both hashes are server-computed from the block's real bytes, so the mapping is
-// verified, not client-asserted. Legacy upload paths keep using
-// RegisterUploadedBlockAndMapping + the plain WriteBlockIDMapping, so they pay no
-// extra read and see no behavior change.
+// verified, not client-asserted.
 //
 // A db.ErrBlockIDMappingConflict is returned unwrapped (so callers can errors.Is
 // it into a 409); any other mapping failure is wrapped as ErrBlockMappingWriteFailed.
-func RegisterWebUploadedBlockAndMapping(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
-	if err := registerUploadedBlockForMaterializationFn(database, orgID, repoID, internalBlockID, operationID, sizeBytes, storageClass, storageKey, externalBlockID); err != nil {
+func RegisterWebUploadedBlockTargetAndMapping(ctx context.Context, database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, target BlockMaterializationTarget, externalBlockID string) error {
+	if err := registerUploadedBlockTargetForMaterializationFn(ctx, database, orgID, repoID, internalBlockID, operationID, sizeBytes, target, externalBlockID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(externalBlockID) == "" {

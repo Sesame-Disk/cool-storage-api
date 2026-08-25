@@ -439,10 +439,10 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 }
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
-var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStore
-var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
-var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
-var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationContext
+var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStoreForPhase
+var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresentForPhase
+var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping
+var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationPhasedContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderWithFanout
 
@@ -1989,8 +1989,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		if classifiedID.isLegacySHA1 {
 			externalMappingID = classifiedID.normalized
 		}
-		materializedStorageClass := storageClass
-		materializedStorageKey := ""
+		var materializationTarget v2.BlockMaterializationTarget
 		// IMPORTANT: this store callback can be re-invoked by
 		// RetryUploadedBlockMaterialization (the retry path fires when store or
 		// materialize returns a retryable sentinel: ErrBlockDeleteInProgress or
@@ -2002,12 +2001,11 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// The retryable returns write no response. If you add a new response-writing
 		// branch, it MUST return a non-retryable error or the response will be
 		// written twice on retry.
-		if err := syncRetryUploadedBlockMaterializationFn(c.Request.Context(), "PutBlock", internalID, func() error {
+		if err := syncRetryUploadedBlockMaterializationFn(c.Request.Context(), "PutBlock", internalID, func(phase v2.BlockMaterializationPhase) error {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
-			materializedStorageClass = storageClass
-			materializedStorageKey = ""
+			materializationTarget = v2.BlockMaterializationTarget{}
 			probe, probeErr := syncProbeUploadedBlockReuseFn(h.db, orgID, internalID)
 			if probeErr != nil {
 				return fmt.Errorf("probe block reuse for %s: %w", internalID, probeErr)
@@ -2024,24 +2022,24 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				materializedStorageClass = probe.StorageClass
-				var ensureErr error
-				materializedStorageKey, ensureErr = syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID, phase)
+				materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 				return ensureErr
 			case db.BlockReuseNeedsPut:
-				if checker := getAPIQuotaChecker(); checker != nil {
-					if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
-						c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-						return errSyncStorageQuotaExceeded
+				if phase == v2.BlockMaterializationInitial {
+					if checker := getAPIQuotaChecker(); checker != nil {
+						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+							c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+							return errSyncStorageQuotaExceeded
+						}
 					}
 				}
-				putStore, resolvedClass, resolvedKey, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID)
+				target, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID, phase)
 				if resolveErr != nil {
 					return resolveErr
 				}
-				materializedStorageClass = resolvedClass
-				var putErr error
-				materializedStorageKey, putErr = syncPutBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, data)
+				materializationTarget = target
+				_, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, data)
 				if putErr != nil {
 					return fmt.Errorf("%w: %w", errSyncStoreBackend, putErr)
 				}
@@ -2065,7 +2063,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
-			return registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), materializedStorageClass, materializedStorageKey, externalMappingID)
+			return registerUploadedBlockTargetAndMappingForSyncFn(c.Request.Context(), h.db, orgID, repoID, internalID, operationID, len(data), materializationTarget, externalMappingID)
 		}, nil, nil); err != nil {
 			if rejectAdmittedTimeout(c, lifetime, "storage", err) {
 				return
@@ -2078,6 +2076,14 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
 				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+			} else if errors.Is(err, v2.ErrBlockCanonicalStateNotVisible) {
+				// Same retryable class as the fence above: the block is installed and
+				// durable, only its canonical row stayed invisible for this request's
+				// whole confirmation budget. A 500 would tell the desktop client this
+				// was a server fault and make a healthy block indistinguishable from a
+				// real failure in monitoring (finding F2).
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the upload"})
 			} else if errors.Is(err, errSyncStorageQuotaExceeded) {
 				return
 			} else if errors.Is(err, errSyncBlockExistenceCheck) {

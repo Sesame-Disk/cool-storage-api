@@ -194,6 +194,12 @@ var createFileTemplateBlockRetryBackoffFn = RetryBackoff
 var createFileTemplateBlockSleepFn = time.Sleep
 
 func retryCreateFileTemplateBlockMaterialization(store func() error, register func() error, resetStored func()) error {
+	return retryCreateFileTemplateBlockMaterializationPhased(func(BlockMaterializationPhase) error {
+		return store()
+	}, register, resetStored)
+}
+
+func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMaterializationPhase) error, register func() error, resetStored func()) error {
 	attempts := createFileTemplateBlockRetryAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -219,7 +225,7 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if err := store(); err != nil {
+		if err := store(BlockMaterializationInitial); err != nil {
 			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
@@ -238,14 +244,28 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 		if resetStored != nil {
 			resetStored()
 		}
-		if err := store(); err != nil {
-			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
-				return err
+		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
+			if err := store(BlockMaterializationConfirmation); err == nil {
+				return nil
+			} else {
+				if !IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
+					return err
+				}
+				retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
+				// Only a GC delete fence restarts the full cycle: the fence invalidates
+				// the canonical state this request just installed, so probe->prepare has
+				// to re-run from the initial phase. Every other retryable confirmation
+				// failure -- a transient canonical HEAD/repair error, or a canonical row
+				// that is not visible yet -- is convergence of state this request already
+				// installed, so it retries the confirmation probe instead. Staying here is
+				// what keeps a transient HEAD failure from handing the initial phase
+				// another chance to mint a second incarnation (finding F5).
+				if !errors.Is(err, ErrBlockDeleteInProgress) {
+					continue
+				}
 			}
-			retryBlocked(attempt, blockMaterializationReasonProbe, err)
-			continue
+			break
 		}
-		return nil
 	}
 
 	return fmt.Errorf("unreachable template block materialization state")
@@ -1269,6 +1289,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var templateMaterializedStorageClass string
 	var templateStorageKey string
 	var templateBlockStored bool
+	var templateTarget BlockMaterializationTarget
 
 	if len(templateContent) > 0 {
 		fileSize = int64(len(templateContent))
@@ -1340,7 +1361,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				templateStorageClass = storageClass
 				templateMaterializedStorageClass = storageClass
 			}
-			if err := retryCreateFileTemplateBlockMaterialization(func() error {
+			if err := retryCreateFileTemplateBlockMaterializationPhased(func(phase BlockMaterializationPhase) error {
 				if templateBlockStored {
 					return nil
 				}
@@ -1358,20 +1379,22 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				case db.BlockReuseReusable:
 					templateMaterializedStorageClass = probe.StorageClass
 					var ensureErr error
-					templateStorageKey, ensureErr = EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID)
+					templateStorageKey, ensureErr = EnsureReusableBlockPresentForPhase(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID, phase)
 					if ensureErr != nil {
 						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
+					templateTarget = BlockMaterializationTarget{StorageClass: templateMaterializedStorageClass, StorageKey: templateStorageKey}
 					templateBlockStored = true
 					return nil
 				case db.BlockReuseNeedsPut:
-					putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash)
+					target, resolveErr := ResolveNeedsPutBlockStoreForPhase(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash, phase)
 					if resolveErr != nil {
 						return resolveErr
 					}
-					templateMaterializedStorageClass = resolvedClass
+					templateTarget = target
+					templateMaterializedStorageClass = target.StorageClass
 					var err error
-					templateStorageKey, err = putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, templateBlockData.Data)
+					templateStorageKey, err = putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, templateBlockData.Data)
 					if err != nil {
 						return fmt.Errorf("failed to store file content: %w", err)
 					}
@@ -1390,12 +1413,13 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				// written from the real bytes — required for desktop downloads (which
 				// fetch by SHA-1) and for staging to resolve the fs_object's SHA-1
 				// block id back to its storage identity.
-				if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateMaterializedStorageClass, templateStorageKey, externalBlockID); err != nil {
+				if err := RegisterUploadedBlockTargetAndMapping(c.Request.Context(), h.db, orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateTarget, externalBlockID); err != nil {
 					return fmt.Errorf("failed to register template block metadata: %w", err)
 				}
 				return nil
 			}, func() {
 				templateBlockStored = false
+				templateTarget = BlockMaterializationTarget{}
 			}); err != nil {
 				return err
 			}
@@ -3441,11 +3465,9 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
 	}
-	materializedStorageClass := storageClass
-	materializedStorageKey := ""
-	if err := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadFile", sha256ID, func() error {
-		materializedStorageClass = storageClass
-		materializedStorageKey = ""
+	var materializationTarget BlockMaterializationTarget
+	if err := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadFile", sha256ID, func(phase BlockMaterializationPhase) error {
+		materializationTarget = BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, sha256ID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", sha256ID, probeErr)
@@ -3456,18 +3478,17 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = probe.StorageClass
 			var ensureErr error
-			materializedStorageKey, ensureErr = EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID, phase)
+			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
-			putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID)
+			target, resolveErr := ResolveNeedsPutBlockStoreForPhase(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID, phase)
 			if resolveErr != nil {
 				return resolveErr
 			}
-			materializedStorageClass = resolvedClass
-			var putErr error
-			materializedStorageKey, putErr = putUploadedBlockAutoDirectFn(c.Request.Context(), putStore, resolvedKey, storedContent)
+			materializationTarget = target
+			_, putErr := putUploadedBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, storedContent)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
@@ -3480,7 +3501,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		// Register block metadata + a provisional reference (kept alive by TTL until
 		// the fs_object commit below creates the permanent reference), then write the
 		// external SHA-1 mapping only after the block is durable in Cassandra.
-		return RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializedStorageClass, materializedStorageKey, fileID)
+		return RegisterUploadedBlockTargetAndMapping(c.Request.Context(), h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), materializationTarget, fileID)
 	}, nil, nil); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, ErrBlockDeleteInProgress) {

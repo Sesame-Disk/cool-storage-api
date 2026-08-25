@@ -3845,8 +3845,8 @@ type mockBlockDeleter struct {
 	storageClass string
 }
 
-// ValidatePhysicalLocator mirrors storage.BlockStore's deterministic locator
-// contract so GC unit tests do not bypass block-id format validation.
+// ValidatePhysicalLocator mirrors storage.BlockStore's legacy-or-minted locator
+// contract so GC unit tests do not bypass block-id or incarnation validation.
 func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) error {
 	d.provider.mu.Lock()
 	d.provider.PhysicalLocatorValidations = append(d.provider.PhysicalLocatorValidations, ScopedPhysicalLocatorValidation{
@@ -3859,8 +3859,18 @@ func (d *mockBlockDeleter) ValidatePhysicalLocator(blockID, storageKey string) e
 	if !db.IsSHA256BlockID(blockID) {
 		return fmt.Errorf("block id %q is not a resolved SHA-256 block id", blockID)
 	}
-	if storageKey != MockCanonicalStorageKey(d.orgID, blockID) {
+	base := MockCanonicalStorageKey(d.orgID, blockID)
+	if storageKey == base {
+		return nil
+	}
+	incarnationPrefix := base + "."
+	if !strings.HasPrefix(storageKey, incarnationPrefix) {
 		return fmt.Errorf("block storage key %q does not match block id %q", storageKey, blockID)
+	}
+	incarnation := strings.TrimPrefix(storageKey, incarnationPrefix)
+	parsed, err := uuid.Parse(incarnation)
+	if err != nil || parsed.String() != incarnation {
+		return fmt.Errorf("block storage key %q has a malformed or non-canonical incarnation", storageKey)
 	}
 	return nil
 }
@@ -3914,8 +3924,7 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 }
 
 func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
-	storageKey = strings.TrimSpace(storageKey)
-	if storageKey == "" {
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
 	}
 	m.mu.Lock()
@@ -3929,7 +3938,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
 		}
 		existing.StorageClass = storageClass
-		existing.StorageKey = strings.TrimSpace(storageKey)
+		existing.StorageKey = storageKey
 		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
 		existing.RecoveryPhase = S3OrphanPhasePendingS3
 		existing.LastAttemptAt = now
@@ -3942,7 +3951,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
-		StorageKey:    strings.TrimSpace(storageKey),
+		StorageKey:    storageKey,
 		ExternalSHA1:  strings.TrimSpace(externalSHA1),
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now.UTC(),

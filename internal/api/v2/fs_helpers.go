@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -96,6 +99,31 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, libraryID, 
 		return err
 	}
 	return h.db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1ID, sizeBytes, storageClass, storageKey)
+}
+
+var resolveFreshInstallRepresentationFn = func(ctx context.Context, h *FSHelper, orgID, libraryID string) (string, error) {
+	return db.ResolveBlockRepresentationIDContext(ctx, h.db.Session(), orgID, libraryID)
+}
+
+var registerUploadedBlockInstallMetadataFn = func(ctx context.Context, h *FSHelper, orgID, representationID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) db.InstallBlockMetadataResult {
+	return h.db.InstallBlockMetadata(ctx, orgID, representationID, blockID, sha1ID, sizeBytes, db.BlockPhysicalLocation{StorageClass: target.StorageClass, StorageKey: target.StorageKey})
+}
+
+var deleteFreshInstallLoserFn = func(ctx context.Context, target BlockMaterializationTarget) error {
+	return target.Store.DeleteBlockByStorageKey(ctx, target.StorageKey)
+}
+
+const (
+	freshInstallPreparationAttempts = 3
+	freshInstallCleanupAttempts     = 3
+	freshInstallLoserCleanupTimeout = 5 * time.Second
+)
+
+var freshInstallRetryBackoffFn = func(attempt int) time.Duration {
+	if attempt < 1 {
+		return 0
+	}
+	return time.Duration(1<<(attempt-1)) * 25 * time.Millisecond
 }
 
 // registerUploadedBlockSleepFn is the overridable backoff sleep used by the
@@ -950,6 +978,108 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 	return resolveStoredBlockIDsFn(h, orgID, libraryID, blockIDs)
 }
 
+type freshInstallPreparation struct {
+	result    db.InstallBlockMetadataResult
+	submitted bool
+	err       error
+	transient bool
+}
+
+func isTransientFreshInstallPreparationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var requestErr gocql.RequestError
+	if errors.As(err, &requestErr) {
+		switch requestErr.Code() {
+		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded, gocql.ErrCodeBootstrapping,
+			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
+			return true
+		}
+	}
+	for _, transient := range []error{
+		gocql.ErrTimeoutNoResponse,
+		gocql.ErrConnectionClosed,
+		gocql.ErrNoConnections,
+		gocql.ErrNoStreams,
+		gocql.ErrNoHosts,
+		gocql.ErrCannotFindHost,
+		context.DeadlineExceeded,
+	} {
+		if errors.Is(err, transient) {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareFreshBlockInstall resolves the mapping domain before the single-use
+// INSTALL. Resolver retries retain the already-PUT target; INSTALL is submitted
+// exactly once, only after preparation succeeds.
+func prepareFreshBlockInstall(ctx context.Context, h *FSHelper, orgID, libraryID, blockID, sha1ID string, sizeBytes int, target BlockMaterializationTarget) freshInstallPreparation {
+	var lastErr error
+	for attempt := 1; attempt <= freshInstallPreparationAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return freshInstallPreparation{err: err}
+		}
+		representationID, err := resolveFreshInstallRepresentationFn(ctx, h, orgID, libraryID)
+		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return freshInstallPreparation{err: ctxErr}
+			}
+			result := registerUploadedBlockInstallMetadataFn(ctx, h, orgID, representationID, blockID, sha1ID, sizeBytes, target)
+			if !result.Submitted && result.Cause == nil {
+				result.Cause = fmt.Errorf("%w: fresh install callback returned without submitting INSTALL for %s", db.ErrBlockMetadataPermanent, blockID)
+			}
+			return freshInstallPreparation{result: result, submitted: result.Submitted, err: result.Cause}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return freshInstallPreparation{err: ctxErr}
+		}
+		if errors.Is(err, gocql.ErrNotFound) || errors.Is(err, db.ErrLibraryDeleted) || !isTransientFreshInstallPreparationError(err) {
+			return freshInstallPreparation{err: fmt.Errorf("%w: resolve block representation before fresh install for %s: %v", db.ErrBlockMetadataPermanent, blockID, err)}
+		}
+		lastErr = err
+		if attempt < freshInstallPreparationAttempts {
+			if waitErr := waitBeforeBlockMaterializationRetry(ctx, freshInstallRetryBackoffFn(attempt)); waitErr != nil {
+				return freshInstallPreparation{err: waitErr}
+			}
+		}
+	}
+	return freshInstallPreparation{
+		err:       fmt.Errorf("resolve block representation before fresh install for %s after %d attempts: %w", blockID, freshInstallPreparationAttempts, lastErr),
+		transient: true,
+	}
+}
+
+func cleanupFreshInstallTarget(ctx context.Context, blockID, reason string, target BlockMaterializationTarget) error {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), freshInstallLoserCleanupTimeout)
+	defer cancelCleanup()
+
+	var cleanupErr error
+	for attempt := 1; attempt <= freshInstallCleanupAttempts; attempt++ {
+		if err := cleanupCtx.Err(); err != nil {
+			cleanupErr = err
+			break
+		}
+		cleanupErr = deleteFreshInstallLoserFn(cleanupCtx, target)
+		if cleanupErr == nil {
+			metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("success", reason).Inc()
+			return nil
+		}
+		if attempt < freshInstallCleanupAttempts {
+			if err := waitBeforeBlockMaterializationRetry(cleanupCtx, freshInstallRetryBackoffFn(attempt)); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+				break
+			}
+		}
+	}
+
+	metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("failure", reason).Inc()
+	log.Printf("[RegisterUploadedBlock] WARNING: exact fresh cleanup leaked block %s at %s/%s reason=%s: %v", blockID, target.StorageClass, target.StorageKey, reason, cleanupErr)
+	return cleanupErr
+}
+
 // RegisterUploadedBlock records freshly-uploaded block metadata plus a
 // provisional reference that keeps the block alive through fs_object commit.
 // The provisional reference remains until its TTL even after a permanent fs:
@@ -983,11 +1113,28 @@ func (h *FSHelper) ResolveStoredBlockIDs(orgID, libraryID string, blockIDs []str
 // so the wrapper retries it inside its bounded budget instead of failing on the
 // first timeout. A permanent metadata failure (db.ErrBlockMetadataPermanent) is
 // returned untagged so it is not retried.
-func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey, sha1ID string) error {
+// RegisterUploadedBlockTarget materializes one exact store observation. A fresh
+// target is single-use: an uncertain INSTALL is never retried here, while a
+// proven loser may clean only the exact object this attempt PUT.
+func (h *FSHelper) RegisterUploadedBlockTarget(ctx context.Context, orgID, libraryID, blockID, operationID string, sizeBytes int, target BlockMaterializationTarget, sha1ID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if target.FreshInstall {
+		if target.Store == nil {
+			return fmt.Errorf("%w: fresh block %s has no exact PUT store", db.ErrBlockMetadataPermanent, blockID)
+		}
+		if !config.IsCanonicalStorageClassName(target.StorageClass) {
+			return fmt.Errorf("%w: fresh block %s has non-canonical storage class %q", db.ErrBlockMetadataPermanent, blockID, target.StorageClass)
+		}
+		if err := target.Store.ValidateMintedPhysicalLocator(blockID, target.StorageKey); err != nil {
+			return fmt.Errorf("%w: fresh block %s has invalid minted locator %q: %v", db.ErrBlockMetadataPermanent, blockID, target.StorageKey, err)
+		}
+	}
 	referrer := db.BlockReferrerForUpload(operationID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
-	if err := registerUploadedBlockAddProvisionalRefFn(h, orgID, blockID, referrer, libraryID, storageClass, expiresAt); err != nil {
+	if err := registerUploadedBlockAddProvisionalRefFn(h, orgID, blockID, referrer, libraryID, target.StorageClass, expiresAt); err != nil {
 		// One logged batch: the reference and its GC tracking either both landed or
 		// neither did, so there is no half-written state to compensate for and a
 		// plain transient retry is safe.
@@ -1005,7 +1152,50 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 
-	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, storageClass, storageKey); err != nil {
+	if target.FreshInstall {
+		preparation := prepareFreshBlockInstall(ctx, h, orgID, libraryID, blockID, sha1ID, sizeBytes, target)
+		if !preparation.submitted {
+			cleanupErr := cleanupFreshInstallTarget(ctx, blockID, "preinstall_failed", target)
+			if cleanupErr != nil {
+				// Do not expose the outer retry sentinel while this exact unsubmitted
+				// object still survives; a retry could mint another incarnation.
+				return errors.Join(preparation.err, fmt.Errorf("exact pre-install cleanup for block %s failed: %w", blockID, cleanupErr))
+			}
+			if preparation.transient {
+				return fmt.Errorf("%w: %w", ErrBlockMaterializationTransient, preparation.err)
+			}
+			return preparation.err
+		}
+		result := preparation.result
+		switch result.Outcome {
+		case db.InstallBlockMetadataApplied:
+			return nil
+		case db.InstallBlockMetadataKnownLost:
+			if result.Canonical.StorageClass == target.StorageClass && result.Canonical.StorageKey == target.StorageKey {
+				return fmt.Errorf("canonical install returned contradictory known-lost outcome for block %s; proposed object retained", blockID)
+			}
+			_ = cleanupFreshInstallTarget(ctx, blockID, "known_lost", target)
+			lostErr := fmt.Errorf("%w: fresh install for block %s lost canonical race", ErrBlockMaterializationTransient, blockID)
+			if result.Cause != nil {
+				return errors.Join(lostErr, result.Cause)
+			}
+			return lostErr
+		case db.InstallBlockMetadataIdentityContradiction:
+			contradictionErr := fmt.Errorf("single-use canonical install identity contradiction for block %s; proposed object retained", blockID)
+			if result.Cause != nil {
+				return errors.Join(contradictionErr, result.Cause)
+			}
+			return contradictionErr
+		default:
+			ambiguousErr := fmt.Errorf("canonical install outcome is ambiguous for block %s; proposed object retained", blockID)
+			if result.Cause != nil {
+				return errors.Join(ambiguousErr, result.Cause)
+			}
+			return ambiguousErr
+		}
+	}
+
+	if err := registerUploadedBlockUpsertMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, target.StorageClass, target.StorageKey); err != nil {
 		switch {
 		case errors.Is(err, db.ErrBlockStubRepairContended):
 			// A contended stub repair is a transient race (concurrent completion or a

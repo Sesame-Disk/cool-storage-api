@@ -406,6 +406,68 @@ func TestRetryCreateFileTemplateBlockMaterializationStopsOnNonRetryableError(t *
 	}
 }
 
+func TestCreateFileTemplateTargetSurvivesHeadConflictWithoutRemintOrPut(t *testing.T) {
+	oldHeadDelay := libraryHeadMutationRetryDelay
+	oldHeadJitter := libraryHeadMutationRetryJitter
+	t.Cleanup(func() {
+		libraryHeadMutationRetryDelay = oldHeadDelay
+		libraryHeadMutationRetryJitter = oldHeadJitter
+	})
+	libraryHeadMutationRetryDelay = 0
+	libraryHeadMutationRetryJitter = 0
+
+	want := BlockMaterializationTarget{StorageClass: "hot", StorageKey: "blocks/org/ab/cd/hash.minted", FreshInstall: true}
+	target := BlockMaterializationTarget{}
+	stored := false
+	canonicalInstalled := false
+	putCalls := 0
+	registerCalls := 0
+	outerAttempts := 0
+
+	err := retryLibraryHeadMutation("CreateFile", func() error {
+		outerAttempts++
+		if err := retryCreateFileTemplateBlockMaterialization(func() error {
+			if stored {
+				return nil
+			}
+			if canonicalInstalled {
+				target = want
+				target.FreshInstall = false
+			} else {
+				target = want
+				putCalls++
+			}
+			stored = true
+			return nil
+		}, func() error {
+			registerCalls++
+			if target.StorageClass != want.StorageClass || target.StorageKey != want.StorageKey {
+				t.Fatalf("registration target = %+v, want exact %+v", target, want)
+			}
+			canonicalInstalled = true
+			return nil
+		}, func() {
+			stored = false
+			target = BlockMaterializationTarget{}
+		}); err != nil {
+			return err
+		}
+		if outerAttempts == 1 {
+			return ErrLibraryHeadConflict
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("forced-conflict CreateFile materialization: %v", err)
+	}
+	if outerAttempts != 2 || registerCalls != 2 || putCalls != 1 {
+		t.Fatalf("attempts/registers/PUTs = %d/%d/%d, want 2/2/1", outerAttempts, registerCalls, putCalls)
+	}
+	if !stored || target.StorageClass != want.StorageClass || target.StorageKey != want.StorageKey || target.FreshInstall {
+		t.Fatalf("surviving state = stored:%v target:%+v, want exact canonical target", stored, target)
+	}
+}
+
 // Test CreateDirectory root path
 func TestCreateDirectory_RootPath(t *testing.T) {
 	r := gin.New()

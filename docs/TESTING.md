@@ -24,6 +24,45 @@ docker compose --profile test run --rm --build go-integration-test
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
+# P2 real Cassandra/MinIO canonical-install race -- the closure evidence for
+# P2/R9/R24. SESAMEFS_REQUIRE_P2_EVIDENCE=1 makes the gate non-vacuous: without
+# it this test can t.Skip its way to exit 0 (unreachable MinIO, bucket mismatch,
+# empty storage_class) and print "PASS / ok" while proving nothing. With it, any
+# skip becomes a FAIL, and the run also fails unless it logs
+# P2_CONTENTION_EVIDENCE candidates=2. The enforcement lives in the test, not in
+# shell, so it is portable across Windows and Linux hosts.
+#
+# A green run of this command therefore means: the test really executed, two
+# distinct physical incarnations really contended, and it passed.
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_REQUIRE_P2_EVIDENCE=1 go-integration-test \
+  go test -tags integration -run '^TestP2ConcurrentCanonicalInstall$' \
+  -v -count=1 -timeout 5m ./internal/integration
+
+# P2 phase forwarding. Proves every upload funnel forwards the retry driver's
+# materialization phase instead of a constant, that no production caller reaches
+# a phase-erasing wrapper, and that the desktop-sync funnel gates the storage
+# quota precheck to the initial phase only.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'TestP2MaterializationPhaseIsForwardedByFunnels' ./internal/integration
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'TestPutBlockForwardsPhaseAndGatesQuotaToInitial' ./internal/api
+
+# P2 fresh pre-INSTALL preparation and exact-cleanup regressions. These prove
+# transient resolver retries retain one target, canceled/permanent/exhausted
+# preparation submits no INSTALL, post-submit ambiguity grants no cleanup, and
+# KnownLost/pre-INSTALL cleanup retries and final metrics stay exact-key scoped.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'FreshInstall(Authority|PreparationAndCleanup)|FreshCleanupRetriesAndMetrics' \
+  ./internal/api/v2
+
+# P2 confirmation phase and submitted-state regressions. These prove a rowless
+# confirmation never mints/PUTs a second target, confirmation retries do not
+# restart the initial phase, and pre-LWT versus entered-LWT provenance is kept.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'Confirmation(RejectsRowlessWithoutMint|DoesNotRestartInitialPhase)|InstallBlockMetadata' \
+  ./internal/api/v2 ./internal/db
+
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 

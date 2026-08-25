@@ -71,6 +71,12 @@ var ErrBlockStubRepairContended = errors.New("block stub repair contended")
 // mislabeled transient only wastes a bounded budget before failing.
 var ErrBlockMetadataPermanent = errors.New("block metadata write is permanently failed")
 
+// ErrInstallBlockMetadataIdentityContradiction means a definite non-applied
+// create-only CAS returned the exact proposed tuple. That tuple may have come
+// from an earlier use of the minted identity, so it grants neither success nor
+// cleanup authority and must never be retried.
+var ErrInstallBlockMetadataIdentityContradiction = errors.New("single-use block install identity was already present")
+
 type BlockReuseDecision int
 
 const (
@@ -87,6 +93,47 @@ type BlockReuseProbe struct {
 	SizeBytes    int
 	StorageClass string
 	StorageKey   string
+}
+
+// InstallBlockMetadataOutcome is the authority returned by the single-use
+// canonical metadata install. Callers must branch on this value, not Cause.
+type InstallBlockMetadataOutcome int
+
+const (
+	// InstallBlockMetadataAmbiguous authorizes neither use nor cleanup of the
+	// proposed physical object.
+	InstallBlockMetadataAmbiguous InstallBlockMetadataOutcome = iota
+	// InstallBlockMetadataApplied means Canonical is the proposed physical tuple.
+	InstallBlockMetadataApplied
+	// InstallBlockMetadataKnownLost means Canonical names a different complete
+	// tuple, or is empty when settlement proved that no canonical row exists.
+	InstallBlockMetadataKnownLost
+	// InstallBlockMetadataIdentityContradiction is a definite direct CAS result
+	// that found the exact proposed tuple already present. It authorizes neither
+	// use nor cleanup of the single-use proposal.
+	InstallBlockMetadataIdentityContradiction
+)
+
+type BlockPhysicalLocation struct {
+	StorageClass string
+	StorageKey   string
+}
+
+type InstallBlockMetadataResult struct {
+	Outcome   InstallBlockMetadataOutcome
+	Canonical BlockPhysicalLocation
+	// Submitted is true once the single-use INSTALL LWT has been entered. It is
+	// provenance, not an authority signal; callers still branch on Outcome.
+	Submitted bool
+	// Cause is diagnostic only. It never grants authority to use or clean up a
+	// physical object; Outcome is the complete authority contract.
+	Cause error
+}
+
+type installedBlockMetadataRow struct {
+	Location            BlockPhysicalLocation
+	StorageClassPresent bool
+	StorageKeyPresent   bool
 }
 
 type blockReuseMetadataRow struct {
@@ -173,6 +220,53 @@ var upsertBlockMetadataInsertWithRepresentationFn = func(database *DB, orgID, bl
 	`, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now, now).
 		SerialConsistency(gocql.Serial).
 		MapScanCAS(map[string]interface{}{})
+}
+
+// installBlockMetadataLWTFn is deliberately separate from the repair-capable
+// upsert path. A proposed physical incarnation is single-use, so this statement
+// gets exactly one driver attempt and is never repeated by settlement.
+var installBlockMetadataLWTFn = func(ctx context.Context, database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, proposed BlockPhysicalLocation, now time.Time) (bool, map[string]interface{}, error) {
+	current := map[string]interface{}{}
+	applied, err := database.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID, blockID, representationID, sha1, sizeBytes, proposed.StorageClass, proposed.StorageKey, now, now).
+		WithContext(ctx).
+		SerialConsistency(gocql.Serial).
+		Idempotent(false).
+		RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0}).
+		SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{}).
+		MapScanCAS(current)
+	return applied, current, err
+}
+
+var settleInstalledBlockMetadataFn = func(ctx context.Context, database *DB, orgID, blockID string) (installedBlockMetadataRow, bool, error) {
+	var row installedBlockMetadataRow
+	var storageClass *string
+	var storageKey *string
+	err := database.Session().Query(`
+		SELECT storage_class, storage_key
+		FROM blocks
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).
+		WithContext(ctx).
+		Consistency(gocql.Serial).
+		Scan(&storageClass, &storageKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return installedBlockMetadataRow{}, false, nil
+		}
+		return installedBlockMetadataRow{}, false, err
+	}
+	if storageClass != nil {
+		row.Location.StorageClass = *storageClass
+		row.StorageClassPresent = true
+	}
+	if storageKey != nil {
+		row.Location.StorageKey = *storageKey
+		row.StorageKeyPresent = true
+	}
+	return row, true, nil
 }
 
 var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (blockIdentityRepairRow, bool, error) {
@@ -598,8 +692,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	if storageClass == "" {
 		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
 	}
-	storageKey = strings.TrimSpace(storageKey)
-	if storageKey == "" {
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		return fmt.Errorf("%w: missing canonical storage key for block %s", ErrBlockMetadataPermanent, blockID)
 	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
@@ -654,6 +747,130 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 	return fmt.Errorf("exhausted metadata stub repair for block %s", blockID)
 }
 
+// InstallBlockMetadata performs a create-only canonical install for one freshly
+// minted physical incarnation. It submits exactly one non-idempotent LWT. If the
+// mutation result is unknown, it performs one bounded SERIAL read; it never
+// repeats the proposed install.
+//
+// Production upload paths use this only for a freshly minted-and-PUT target;
+// canonical reuse and repair continue through UpsertBlockMetadata.
+func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID, blockID, sha1 string, sizeBytes int, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
+	result := InstallBlockMetadataResult{Outcome: InstallBlockMetadataAmbiguous}
+	if err := ValidateBlockRepresentationID(representationID); err != nil {
+		result.Cause = fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
+		return result
+	}
+	if !config.IsCanonicalStorageClassName(proposed.StorageClass) {
+		result.Cause = fmt.Errorf("%w: non-canonical storage class %q for block %s", ErrBlockMetadataPermanent, proposed.StorageClass, blockID)
+		return result
+	}
+	if proposed.StorageKey == "" || strings.TrimSpace(proposed.StorageKey) != proposed.StorageKey {
+		result.Cause = fmt.Errorf("%w: invalid canonical storage key for block %s", ErrBlockMetadataPermanent, blockID)
+		return result
+	}
+	sha1 = NormalizeBlockID(sha1)
+	if sha1 != "" && !isHexN(sha1, 40) {
+		result.Cause = fmt.Errorf("%w: invalid block sha1 for %s", ErrBlockMetadataPermanent, blockID)
+		return result
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		result.Cause = err
+		return result
+	}
+
+	now := time.Now().UTC()
+	// The seam is the DB execution boundary. Once it is entered, even a
+	// preflight/transport error from the driver is post-submit for cleanup
+	// purposes; the LWT itself is single-use and must not be repeated.
+	result.Submitted = true
+	applied, current, installErr := installBlockMetadataLWTFn(ctx, db, orgID, blockID, representationID, sha1, sizeBytes, proposed, now)
+	if installErr == nil {
+		if applied {
+			return InstallBlockMetadataResult{Outcome: InstallBlockMetadataApplied, Canonical: proposed, Submitted: true}
+		}
+		classified := classifyInstalledBlockMetadataCAS(current, proposed)
+		classified.Submitted = true
+		return classified
+	}
+
+	settlementTimeout := db.config.Timeout
+	if settlementTimeout <= 0 {
+		settlementTimeout = defaultCassandraTimeout
+	}
+	settlementCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settlementTimeout)
+	defer cancel()
+	row, found, settlementErr := settleInstalledBlockMetadataFn(settlementCtx, db, orgID, blockID)
+	if settlementErr != nil {
+		result.Cause = errors.Join(installErr, fmt.Errorf("settle canonical install: %w", settlementErr))
+		return result
+	}
+	if !found {
+		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Submitted: true, Cause: installErr}
+	}
+	settled := classifySettledBlockMetadataRow(row, proposed)
+	settled.Submitted = true
+	settled.Cause = errors.Join(installErr, settled.Cause)
+	return settled
+}
+
+func classifyInstalledBlockMetadataCAS(current map[string]interface{}, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
+	row := installedBlockMetadataRow{}
+	if value, ok := current["storage_class"]; ok && value != nil {
+		storageClass, stringOK := value.(string)
+		if !stringOK {
+			return malformedInstalledBlockMetadataResult("storage_class is not text")
+		}
+		row.Location.StorageClass = storageClass
+		row.StorageClassPresent = true
+	}
+	if value, ok := current["storage_key"]; ok && value != nil {
+		storageKey, stringOK := value.(string)
+		if !stringOK {
+			return malformedInstalledBlockMetadataResult("storage_key is not text")
+		}
+		row.Location.StorageKey = storageKey
+		row.StorageKeyPresent = true
+	}
+	if malformed := validateInstalledBlockMetadataRow(row); malformed != nil {
+		return *malformed
+	}
+	if row.Location == proposed {
+		return InstallBlockMetadataResult{
+			Outcome: InstallBlockMetadataIdentityContradiction,
+			Cause:   fmt.Errorf("%w: direct CAS for %s/%s returned the proposed tuple", ErrInstallBlockMetadataIdentityContradiction, proposed.StorageClass, proposed.StorageKey),
+		}
+	}
+	return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Canonical: row.Location}
+}
+
+func classifySettledBlockMetadataRow(row installedBlockMetadataRow, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
+	if malformed := validateInstalledBlockMetadataRow(row); malformed != nil {
+		return *malformed
+	}
+	if row.Location == proposed {
+		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataApplied, Canonical: row.Location}
+	}
+	return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Canonical: row.Location}
+}
+
+func validateInstalledBlockMetadataRow(row installedBlockMetadataRow) *InstallBlockMetadataResult {
+	if !row.StorageClassPresent || !row.StorageKeyPresent || !config.IsCanonicalStorageClassName(row.Location.StorageClass) || row.Location.StorageKey == "" || strings.TrimSpace(row.Location.StorageKey) != row.Location.StorageKey {
+		result := malformedInstalledBlockMetadataResult("canonical physical tuple is incomplete or malformed")
+		return &result
+	}
+	return nil
+}
+
+func malformedInstalledBlockMetadataResult(reason string) InstallBlockMetadataResult {
+	return InstallBlockMetadataResult{
+		Outcome: InstallBlockMetadataAmbiguous,
+		Cause:   fmt.Errorf("malformed canonical block metadata: %s", reason),
+	}
+}
+
 func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string) error {
 	row, found, err := readBlockIdentityForRepairFn(db, orgID, blockID)
 	if err != nil {
@@ -687,8 +904,8 @@ func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1, sto
 	if !config.IsCanonicalStorageClassName(row.StorageClass) {
 		return fmt.Errorf("%w: block %s has non-canonical storage class %q", ErrBlockMetadataPermanent, blockID, row.StorageClass)
 	}
-	currentStorageKey := strings.TrimSpace(row.StorageKey)
-	if currentStorageKey == "" {
+	currentStorageKey := row.StorageKey
+	if currentStorageKey == "" || strings.TrimSpace(currentStorageKey) != currentStorageKey {
 		return fmt.Errorf("%w: block %s has empty canonical storage key", ErrBlockMetadataPermanent, blockID)
 	}
 	if storageKey != "" && currentStorageKey != storageKey {
@@ -947,12 +1164,12 @@ func (db *DB) ProbeBlockReuse(orgID, blockID string) (BlockReuseProbe, error) {
 		Sha1:         strings.TrimSpace(metadata.Sha1),
 		SizeBytes:    metadata.SizeBytes,
 		StorageClass: metadata.StorageClass,
-		StorageKey:   strings.TrimSpace(metadata.StorageKey),
+		StorageKey:   metadata.StorageKey,
 	}
 	if !metadata.StorageClassPresent || probe.StorageClass == "" {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage class", blockID)
 	}
-	if probe.StorageKey == "" {
+	if probe.StorageKey == "" || strings.TrimSpace(probe.StorageKey) != probe.StorageKey {
 		return BlockReuseProbe{Decision: BlockReuseUnknownError}, fmt.Errorf("block %s has empty canonical storage key", blockID)
 	}
 	// A stored class that is not canonical cannot name a physical namespace, and the

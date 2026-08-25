@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -503,7 +504,7 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 	oldPrepare := syncPrepareUploadedBlockProbeFn
 	oldResolve := syncResolveNeedsPutBlockStoreFn
 	oldPut := syncPutBlockAutoDirectFn
-	oldRegister := registerUploadedBlockAndMappingForSyncFn
+	oldRegister := registerUploadedBlockTargetAndMappingForSyncFn
 	oldRetry := syncRetryUploadedBlockMaterializationFn
 	oldLookupClass := lookupLibraryStorageClassForSyncFn
 	t.Cleanup(func() {
@@ -511,7 +512,7 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 		syncPrepareUploadedBlockProbeFn = oldPrepare
 		syncResolveNeedsPutBlockStoreFn = oldResolve
 		syncPutBlockAutoDirectFn = oldPut
-		registerUploadedBlockAndMappingForSyncFn = oldRegister
+		registerUploadedBlockTargetAndMappingForSyncFn = oldRegister
 		syncRetryUploadedBlockMaterializationFn = oldRetry
 		lookupLibraryStorageClassForSyncFn = oldLookupClass
 	})
@@ -523,28 +524,28 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 	syncPrepareUploadedBlockProbeFn = func(_ *db.DB, _, _ string, probe db.BlockReuseProbe) (db.BlockReuseProbe, error) {
 		return probe, nil
 	}
-	syncResolveNeedsPutBlockStoreFn = func(_ *storage.Manager, preferred *storage.BlockStore, class string, _ db.BlockReuseProbe, _, _ string) (*storage.BlockStore, string, string, error) {
-		return preferred, class, "key", nil
+	syncResolveNeedsPutBlockStoreFn = func(_ *storage.Manager, preferred *storage.BlockStore, class string, _ db.BlockReuseProbe, _, _ string, _ v2.BlockMaterializationPhase) (v2.BlockMaterializationTarget, error) {
+		return v2.BlockMaterializationTarget{Store: preferred, StorageClass: class, StorageKey: "key", FreshInstall: true}, nil
 	}
 	syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
 		return "key", nil
 	}
 	registerCalled := false
-	registerUploadedBlockAndMappingForSyncFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+	registerUploadedBlockTargetAndMappingForSyncFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		registerCalled = true
 		time.Sleep(120 * time.Millisecond)
 		return nil
 	}
 	secondStoreCalled := false
-	syncRetryUploadedBlockMaterializationFn = func(_ context.Context, _, _ string, store, materialize func() error, _ func(), _ func() (bool, error)) error {
-		if err := store(); err != nil {
+	syncRetryUploadedBlockMaterializationFn = func(_ context.Context, _, _ string, store func(v2.BlockMaterializationPhase) error, materialize func() error, _ func(), _ func() (bool, error)) error {
+		if err := store(v2.BlockMaterializationInitial); err != nil {
 			return err
 		}
 		if err := materialize(); err != nil {
 			return err
 		}
 		secondStoreCalled = true
-		return store()
+		return store(v2.BlockMaterializationConfirmation)
 	}
 
 	cfg := syncInflightConfig(1, 1, 5*time.Second)

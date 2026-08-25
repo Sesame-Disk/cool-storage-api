@@ -167,6 +167,69 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 - Reference counting for garbage collection
 - Per-tenant isolation (optional cross-tenant dedup)
 
+#### Physical Block Locator Grammar
+
+The persisted physical identity is the byte-exact tuple
+`(storage_class, storage_key)`. Neither component is trimmed or normalized when
+it is compared, installed, settled, read, repaired, or deleted. Incidental
+leading/trailing whitespace is invalid rather than an alternate spelling.
+
+An org-scoped `BlockStore` accepts exactly two key forms for a SHA-256 block ID:
+
+- legacy: `blocks/<org_id>/<hh>/<hh>/<sha256>`
+- minted incarnation: `blocks/<org_id>/<hh>/<hh>/<sha256>.<lowercase-uuid>`
+
+Fresh, rowless materialization mints a new incarnation, PUTs that exact key, and
+uses the target-aware metadata API to `InstallBlockMetadata` once. Existing-row
+reuse and explicitly repairable stubs use the persisted tuple and the repair
+`UpsertBlockMetadata` path; they do not mint or silently relocate the block. Fresh
+INSTALL preparation first resolves the library's representation with the request
+context. Transient Cassandra resolution failures retry locally with bounded
+backoff while retaining the same already-PUT target; permanent identity/library
+failures, cancellation, and exhaustion submit no INSTALL. A conclusively
+unsubmitted target receives bounded detached cleanup of that exact key. The
+provisional logical reference may remain until its TTL, but no metadata row ever
+installs the deleted target; a failed cleanup is an observable X3 leak and does
+not authorize an outer remint while that target survives. A KnownLost target is
+similarly deleted with bounded application-level retries against only its exact
+store and key. `block_upload_fresh_physical_cleanup_total{result,reason}` records
+one final cleanup outcome, not each application or SDK attempt. It is emitted only
+where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
+KnownLost. The branches that retain their object instead of deleting it (ambiguous
+settlement, single-use identity contradiction), and the pre-INSTALL failures that
+return the retryable sentinel **before reaching the conclusively-unsubmitted
+cleanup branch** (for example provisional-reference or delete-fence failures),
+emit nothing: the counter measures cleanup outcomes, not the retained-object
+population. The qualifier matters -- the conclusively-unsubmitted branch itself
+both emits `reason="preinstall_failed"` and returns the retryable sentinel, so
+"returns the sentinel" alone does not imply "emits nothing". See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
+
+The upload retry state machine is phase-aware. Only the initial store phase may
+mint and PUT a rowless `NeedsPut` target. The post-materialization confirmation
+phase may HEAD or repair a persisted canonical tuple, but a rowless `NeedsPut`
+probe returns retryable `canonical block state not visible` and retries the
+confirmation probe without re-entering the mint path. This prevents a successful
+K1 INSTALL from being followed by an untracked K2 during temporary Cassandra
+visibility lag. GC-fence and materialization failures retain the full-cycle retry
+needed to re-establish the exact physical object before metadata is retried.
+`InstallBlockMetadataResult.Submitted` records the DB authority boundary: it is
+false for validation, context, and representation-preparation returns, and true
+for every direct or settled outcome after the INSTALL LWT seam is entered. PUT
+success or transport acknowledgement is not treated as DB submission evidence.
+
+An uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
+detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
+different complete tuple or no row proves it lost, and incomplete/unavailable
+settlement remains ambiguous and authorizes no cleanup. A definite direct
+non-applied CAS returning the proposed tuple is not settlement evidence: it is a
+fail-closed single-use identity contradiction with no success, cleanup, or retry
+authority. The fresh authority boundary validates the target as this store's exact
+minted locator before writing a provisional reference. A proven loser is deleted
+only by its exact minted key with a separate bounded cleanup context. Unresolved
+install-uncertain state is request-local in P2; there is no durable reconciliation
+worker, so retained bytes are a possible X3 leak. This closes the P2
+materialization contract; it does not claim the broader R17/P3 repair work.
+
 #### Storage Config Formats
 
 The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path. `docker-compose.yaml` is only the local development/integration profile; it intentionally carries both formats, with modern classes on regional MinIO buckets and legacy `hot` on a separate compatibility bucket. Local Compose defaults the generic `S3_*` values for that legacy backend to `http://minio:9000` / `sesamefs-legacy-blocks` / `us-east-1` and lets `.env` override them; pointing `S3_BUCKET` back at the default class's bucket is refused by `Config.Validate` at startup rather than silently aliased. Note which bucket each variable names: the generic `S3_*` set configures the LEGACY backend only, while the `default_class` the server actually writes through takes `S3_CLASS_HOT_MINIO_LOCAL_*` overrides over the values `config.docker.yaml` declares. Anything verifying local block objects directly must follow the latter. Production behavior is defined by `docker-compose.prod.yml` and `configs/config.prod.yaml`, with environment overrides applied last.
@@ -409,10 +472,10 @@ policies:
 3. Server selects storage backend by class name and constructs an org-scoped
    BlockStore for `org_id`.
 
-4. Server uses the persisted `storage_key` to retrieve the object and returns it.
-   The current key remains deterministic (`blocks/<org_id>/ab/c1/abc123`); a
-   missing or conflicting persisted key fails closed rather than selecting a
-   replacement locator.
+4. Server validates and uses the persisted `storage_key` byte-for-byte to
+   retrieve the object and returns it. Both the legacy deterministic grammar and
+   the minted-incarnation grammar are valid; a missing, trimmed, malformed, or
+   block-mismatched key fails closed rather than selecting a replacement locator.
 ```
 
 ---
@@ -629,11 +692,11 @@ A reference row is `((org_id, block_id), referrer)` where:
 
 **Operations** (`block_references` steady-state INSERT/DELETE is idempotent and
 non-LWT; canonical metadata creation and lifecycle state transitions are separate):
-- **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
+- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or repair-capable `UpsertBlockMetadata` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`). Tuple-only registration wrappers are not production entrypoints.
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and the persisted `storage_key` is checked against the key that store derives (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through a `BlockStore` bound to the queued org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
-- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, and uses its `(org_id, storage_class, storage_key)` to issue the exact physical delete after checking that key against the one the resolved org-scoped store derives. An empty class/key, a key that is not this org's, an invalid org, a missing canonical row, a read error, or a discovery-token mismatch fails closed, leaves discovery state untouched, and does not advance the recovery cursor past that row when it is encountered in the current sweep. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL. The reload narrows stale-read windows but is not lifecycle exclusion; exact physical identity remains open X1 work.
+- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and `ValidatePhysicalLocator` verifies the exact persisted `storage_key` as a valid legacy-or-minted locator for that block (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through the backend selected by the persisted org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
+- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, resolves the backend from its persisted `(org_id, storage_class)`, and uses `ValidatePhysicalLocator` to verify its exact persisted `storage_key` as a valid legacy-or-minted locator before deleting that exact key from that backend. An empty class/key, a key that is not this org's, an invalid org, a missing canonical row, a read error, or a discovery-token mismatch fails closed, leaves discovery state untouched, and does not advance the recovery cursor past that row when it is encountered in the current sweep. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL. The reload narrows stale-read windows but is not lifecycle exclusion; exact physical identity remains open X1 work.
 
 **Lifecycle**:
 ```

@@ -513,14 +513,38 @@ blockStore, err := storage.NewOrgBlockStore(s3Store, "blocks/", orgID.String())
 if err != nil {
     return err
 }
-blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
-// Stored at: blocks/<org_id>/XX/XX/blockID (org scope + two-level sharding)
+legacyKey, err := blockStore.PutBlockData(ctx, &storage.BlockData{Hash: blockID, Data: content})
+// legacyKey: blocks/<org_id>/XX/XX/blockID
+
+mintedKey, err := blockStore.MintStorageKey(blockID)
+storedKey, err := blockStore.PutObjectAutoDirect(ctx, mintedKey, content)
+// storedKey: blocks/<org_id>/XX/XX/blockID.<lowercase-uuid>
 ```
 
+`PutBlockData` remains the deterministic legacy convenience API. Canonical
+writes that need a fresh physical incarnation use `MintStorageKey` and pass that
+exact key to `PutObjectAutoDirect`.
+
 There is no org-less `BlockStore` constructor. Manager-backed callers use
-`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC normalizes incidental
-whitespace, selects the canonical storage class, and never health-fails over a
-delete to another backend.
+`GetBlockStoreForOrg` or `GetHealthyBlockStoreForOrg`; GC requires the persisted
+class and key to already be canonical and never health-fails over a delete to
+another backend.
+
+Persisted `(storage_class, storage_key)` identity is byte-exact and is never
+trimmed. A key must match either the legacy deterministic grammar or the minted
+incarnation grammar above and must bind to the requested SHA-256 block. Fresh
+rowless uploads carry the complete minted target through PUT and the target-aware
+`InstallBlockMetadata` API. Existing canonical reuse/stub repair uses the stored
+tuple through `UpsertBlockMetadata`; it does not mint. If the one-shot INSTALL
+result is uncertain, SesameFS performs a bounded detached `SERIAL` settlement
+read. An exact tuple proves Applied; a different complete tuple or no row proves
+KnownLost and authorizes cleanup of only the attempted key; unavailable or
+malformed settlement remains ambiguous and retains the object. A definite direct
+CAS result that returns the proposed tuple is instead a single-use identity
+contradiction: it grants no success or cleanup and is not retryable. Fresh targets
+must pass strict minted-only locator validation before any provisional reference
+or metadata mutation. This is the P2 contract, not a claim that the out-of-scope
+R17/P3 repair design or durable reconciliation is complete.
 
 **Save Types:**
 - **Manual Save (Ctrl+S)**: Works with `forcesave: true` in config, sends status=6 callback

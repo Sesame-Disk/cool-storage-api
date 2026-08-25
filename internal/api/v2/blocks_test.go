@@ -878,7 +878,7 @@ func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
 	oldProbe := probeUploadedBlockReuseFn
 	oldPut := repairCanonicalBlockDirectFn
 	oldExists := reusableCanonicalObjectExistsFn
-	oldRegister := registerUploadedBlockForMaterializationFn
+	oldRegister := registerUploadedBlockTargetForMaterializationFn
 	oldMapping := writeVerifiedWebBlockMappingFn
 	oldTraffic := recordBlockUploadTrafficFn
 	t.Cleanup(func() {
@@ -888,7 +888,7 @@ func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
 		probeUploadedBlockReuseFn = oldProbe
 		repairCanonicalBlockDirectFn = oldPut
 		reusableCanonicalObjectExistsFn = oldExists
-		registerUploadedBlockForMaterializationFn = oldRegister
+		registerUploadedBlockTargetForMaterializationFn = oldRegister
 		writeVerifiedWebBlockMappingFn = oldMapping
 		recordBlockUploadTrafficFn = oldTraffic
 	})
@@ -937,7 +937,7 @@ func TestUploadBlockSessionRetriesWithSingleShotAccounting(t *testing.T) {
 		return true, nil
 	}
 	registerCalls := 0
-	registerUploadedBlockForMaterializationFn = func(*db.DB, string, string, string, string, int, string, string, string) error {
+	registerUploadedBlockTargetForMaterializationFn = func(context.Context, *db.DB, string, string, string, string, int, BlockMaterializationTarget, string) error {
 		registerCalls++
 		if registerCalls == 1 {
 			return ErrBlockDeleteInProgress
@@ -1093,15 +1093,15 @@ func TestRespondBlockMaterializeError(t *testing.T) {
 // unchanged (never swallow it or reshape it into a mapping conflict) so the handler
 // mapping above sees the real signal.
 func TestUploadBlockMaterializePropagatesFence(t *testing.T) {
-	old := registerUploadedBlockForMaterializationFn
-	t.Cleanup(func() { registerUploadedBlockForMaterializationFn = old })
-	registerUploadedBlockForMaterializationFn = func(_ *db.DB, _, _, _, _ string, _ int, _, _, _ string) error {
+	old := registerUploadedBlockTargetForMaterializationFn
+	t.Cleanup(func() { registerUploadedBlockTargetForMaterializationFn = old })
+	registerUploadedBlockTargetForMaterializationFn = func(context.Context, *db.DB, string, string, string, string, int, BlockMaterializationTarget, string) error {
 		return fmt.Errorf("%w: block fenced during web-session materialize", ErrBlockDeleteInProgress)
 	}
 
 	h := &BlockHandler{}
 	session := db.BlockUploadSession{SessionID: "sess-1", OrgID: "org-1", RepoID: "repo-1"}
-	err := h.materializeUploadedBlock(session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, "hot", "blocks/org/a")
+	err := h.materializeUploadedBlock(context.Background(), session, strings.Repeat("a", 64), strings.Repeat("b", 40), 5, BlockMaterializationTarget{StorageClass: "hot", StorageKey: "blocks/org/a"})
 	if !errors.Is(err, ErrBlockDeleteInProgress) {
 		t.Fatalf("materializeUploadedBlock err = %v, want ErrBlockDeleteInProgress propagated", err)
 	}

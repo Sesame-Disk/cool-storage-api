@@ -237,13 +237,12 @@ dispatchLocations:
 				return fmt.Errorf("no block store available for block %s", blockID)
 			}
 
-			storageKey := strings.TrimSpace(metadata.StorageKey)
-			if storageKey == "" {
+			storageKey := metadata.StorageKey
+			if strings.TrimSpace(storageKey) == "" {
 				return fmt.Errorf("canonical storage key is empty for block %s", blockID)
 			}
-			derivedKey := store.StorageKeyForHash(blockID)
-			if storageKey != derivedKey {
-				return fmt.Errorf("canonical storage key %q for block %s does not match derived org-scoped key %q", storageKey, blockID, derivedKey)
+			if validateErr := store.ValidatePhysicalLocator(blockID, storageKey); validateErr != nil {
+				return fmt.Errorf("canonical storage key %q for block %s is invalid: %w", storageKey, blockID, validateErr)
 			}
 
 			mu.Lock()

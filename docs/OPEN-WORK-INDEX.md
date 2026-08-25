@@ -164,7 +164,9 @@ new incarnation is created. Closure criteria are in Registry X1.
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md)** (2026-08-14), which replaces the
 abandoned generational-fence ADR. No X1 option is accepted. P1 locator authority
 and the P0/R12 serial-phase prerequisite are implemented foundations, not an X1
-closure; P2 mint/install remains pending.
+closure. P2/R9/R24 mint/install is closed as of 2026-08-24, including strict
+fresh-minted authority and fail-closed direct same-tuple contradictions; P3/P4 and
+X1 remain open.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
@@ -191,7 +193,7 @@ closure; P2 mint/install remains pending.
 | `ISSUE-SHARELINK-DOWNLOAD-CAP-RACE-01` | MEDIUM | Download cap and `single_use` are race-bypassable | Readiness NF-2 / SH-5 |
 | `ISSUE-SYNC-METADATA-CONCURRENCY-01` | MEDIUM | Sync metadata routes bound one body, not N — 16 concurrent `recv-fs` ≈ 2 GiB | Successor to X9; X10's equivalent for the block routes is closed |
 | `ISSUE-AUDIT-TRAIL-INCOMPLETE-01` | MEDIUM | `audit_log` records deletions but never grants | Readiness NF-6 / RB-3 |
-| `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` | MEDIUM | S3 PUT precedes durable intent; a crash leaves an undiscoverable object | Registry X3 |
+| `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01` | MEDIUM | S3 PUT precedes durable intent; minted keys broaden the possible undiscoverable-object leak beyond process crash to ambiguous PUT, unresolved install uncertainty, and failed exact cleanup. Pre-INSTALL retries now retain one target and exact cleanup has a final-outcome metric, but that metric covers only attempted cleanups — deliberate retention and the pre-INSTALL sentinel returns are uncounted | Registry X3; bounded request-local cleanup is not a durable outbox, sweeper, or eventual guarantee, so P2 still does not close this issue |
 | `ISSUE-QUOTA-RESERVATION-01` | MEDIUM | TOCTOU between quota pre-check and publish | Readiness UP-3 |
 | `ISSUE-DOWNLOAD-NO-404-01` | MEDIUM | Deleted file answers 503 forever; layers disagree | Registry X8 — **accepted cost of PR-6** |
 | `ISSUE-ACCOUNTS-M2M-PATH-01` | MEDIUM | Admin API key channel works; M2M lacks `source=accounts` + idempotency | Code-verified 2026-07-25 |

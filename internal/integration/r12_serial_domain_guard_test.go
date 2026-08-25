@@ -1,7 +1,9 @@
 package integration
 
 import (
+	"bytes"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -12,11 +14,153 @@ import (
 	"testing"
 )
 
+// TestR24CanonicalInstallQueryShape pins the distinction that makes settlement
+// safe: the mutation is one non-idempotent globally-serial LWT with no retry or
+// speculation, while settlement is a separate SELECT whose query consistency is
+// SERIAL (not its serial-consistency option).
+func TestR24CanonicalInstallQueryShape(t *testing.T) {
+	path := filepath.Join("..", "db", "block_references.go")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical install source: %v", err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, source, 0)
+	if err != nil {
+		t.Fatalf("parse canonical install source: %v", err)
+	}
+
+	install := r24PackageValueNode(t, file, "installBlockMetadataLWTFn")
+	installChain := r24UniqueTerminalChain(t, install, "MapScanCAS")
+	r24RequireChainArgument(t, installChain, "SerialConsistency", "gocql.Serial")
+	r24RequireChainArgument(t, installChain, "Idempotent", "false")
+	r24RequireChainArgument(t, installChain, "RetryPolicy", "&gocql.SimpleRetryPolicy{NumRetries: 0}")
+	r24RequireChainArgument(t, installChain, "SetSpeculativeExecutionPolicy", "&gocql.NonSpeculativeExecution{}")
+	installCQL := r24QueryCQL(t, installChain)
+	if !strings.Contains(installCQL, "INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)") || !strings.Contains(installCQL, "IF NOT EXISTS") {
+		t.Errorf("install CQL is not the canonical blocks IF NOT EXISTS statement: %q", installCQL)
+	}
+	ast.Inspect(install, func(node ast.Node) bool {
+		switch node.(type) {
+		case *ast.ForStmt, *ast.RangeStmt:
+			t.Error("install function must not loop or retry its ambiguous LWT")
+		}
+		return true
+	})
+
+	settlement := r24PackageValueNode(t, file, "settleInstalledBlockMetadataFn")
+	settlementChain := r24UniqueTerminalChain(t, settlement, "Scan")
+	r24RequireChainArgument(t, settlementChain, "Consistency", "gocql.Serial")
+	if len(settlementChain["SerialConsistency"]) != 0 {
+		t.Error("settlement SELECT must use query Consistency(SERIAL), not SerialConsistency")
+	}
+	settlementCQL := r24QueryCQL(t, settlementChain)
+	if !strings.Contains(settlementCQL, "SELECT storage_class, storage_key") || strings.Contains(settlementCQL, "INSERT INTO blocks") {
+		t.Errorf("settlement CQL is not the canonical tuple SELECT: %q", settlementCQL)
+	}
+}
+
+func r24PackageValueNode(t *testing.T, file *ast.File, name string) ast.Expr {
+	t.Helper()
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, specification := range general.Specs {
+			valueSpec, ok := specification.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, identifier := range valueSpec.Names {
+				if identifier.Name != name || index >= len(valueSpec.Values) {
+					continue
+				}
+				return valueSpec.Values[index]
+			}
+		}
+	}
+	t.Fatalf("package value %s not found", name)
+	return nil
+}
+
+func r24UniqueTerminalChain(t *testing.T, root ast.Node, terminal string) map[string][][]ast.Expr {
+	t.Helper()
+	var terminalCalls []*ast.CallExpr
+	ast.Inspect(root, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == terminal {
+			terminalCalls = append(terminalCalls, call)
+		}
+		return true
+	})
+	if len(terminalCalls) != 1 {
+		t.Fatalf("%s terminal count = %d, want exactly 1", terminal, len(terminalCalls))
+	}
+	chain := map[string][][]ast.Expr{}
+	var expression ast.Expr = terminalCalls[0]
+	for {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok {
+			break
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		chain[selector.Sel.Name] = append(chain[selector.Sel.Name], call.Args)
+		expression = selector.X
+	}
+	return chain
+}
+
+func r24RequireChainArgument(t *testing.T, chain map[string][][]ast.Expr, method, want string) {
+	t.Helper()
+	calls := chain[method]
+	if len(calls) != 1 || len(calls[0]) != 1 {
+		t.Fatalf("%s call shape = %v, want exactly one call with one argument", method, calls)
+	}
+	if got := r24NodeText(t, calls[0][0]); got != want {
+		t.Errorf("%s argument = %q, want %q", method, got, want)
+	}
+}
+
+func r24QueryCQL(t *testing.T, chain map[string][][]ast.Expr) string {
+	t.Helper()
+	calls := chain["Query"]
+	if len(calls) != 1 || len(calls[0]) == 0 {
+		t.Fatalf("Query call shape = %v, want exactly one call with CQL", calls)
+	}
+	literal, ok := calls[0][0].(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		t.Fatalf("Query CQL must be an inline string literal, got %T", calls[0][0])
+	}
+	value, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		t.Fatalf("unquote Query CQL: %v", err)
+	}
+	return value
+}
+
+func r24NodeText(t *testing.T, node ast.Node) string {
+	t.Helper()
+	var output bytes.Buffer
+	if err := format.Node(&output, token.NewFileSet(), node); err != nil {
+		t.Fatalf("format AST node: %v", err)
+	}
+	return output.String()
+}
+
 // R12 covers the conditional mutations that can participate in the canonical
 // block/orphan lifecycle. The candidate lifecycle is pinned in the same PR as
 // adjacent hardening, but is kept distinct in the labels below so the design
 // documents do not accidentally claim that candidate ordering closes X1.
 var r12ExpectedSerialOperations = map[string]string{
+	"installBlockMetadataLWTFn|blocks|INSERT":                                  "single-use metadata install",
 	"upsertBlockMetadataInsertWithRepresentationFn|blocks|INSERT":              "metadata first-writer",
 	"claimReleasedBlockStubForRepairFn|blocks|UPDATE":                          "released-stub repair claim",
 	"deleteRepairClaimedBlockStubFn|blocks|DELETE":                             "released-stub repair cleanup",

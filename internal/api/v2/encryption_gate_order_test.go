@@ -40,7 +40,7 @@ func TestEncryptionGateRunsBeforeShortCircuitsAndWrites(t *testing.T) {
 		},
 		{
 			file: "files.go", function: "UploadFile",
-			gate: "libraryIsEncrypted", mustFollow: "RetryUploadedBlockMaterializationContext",
+			gate: "libraryIsEncrypted", mustFollow: "RetryUploadedBlockMaterializationPhasedContext",
 			why: "failing open here would store plaintext into an encrypted library",
 		},
 	}

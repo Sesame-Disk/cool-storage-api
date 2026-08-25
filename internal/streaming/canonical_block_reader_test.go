@@ -62,7 +62,7 @@ func TestCanonicalBlockReaderRoutesCanonicalLocationsAndDeduplicates(t *testing.
 	idB := canonicalReaderTestID(202)
 	storeA := canonicalReaderTestStore(t)
 	storeB := canonicalReaderTestStore(t)
-	keyA := storeA.StorageKeyForHash(idA)
+	keyA := storeA.StorageKeyForHash(idA) + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
 	keyB := storeB.StorageKeyForHash(idB)
 	metadata := map[string]db.BlockStorageLocation{
 		idA: {SizeBytes: 11, StorageClass: "class-a", StorageKey: keyA, CreatedAt: canonicalReaderTestCreatedAt()},
@@ -311,8 +311,8 @@ func TestCanonicalBlockReaderRejectsForeignPersistedStorageKey(t *testing.T) {
 		}, true, nil
 	}
 	reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{blockID}, store, "fallback")
-	if reader != nil || err == nil || !strings.Contains(err.Error(), "does not match derived org-scoped key") {
-		t.Fatalf("NewCanonicalBlockReader() = (%v, %v), want derived-key mismatch error", reader, err)
+	if reader != nil || err == nil || !strings.Contains(err.Error(), "is invalid") {
+		t.Fatalf("NewCanonicalBlockReader() = (%v, %v), want invalid-locator error", reader, err)
 	}
 }
 
@@ -696,7 +696,7 @@ func TestCanonicalBlockReaderRejectsInvalidIDAndMismatchedKey(t *testing.T) {
 		}, true, nil
 	}
 	reader, err := NewCanonicalBlockReader(context.Background(), nil, nil, canonicalReaderTestOrg, []string{blockID}, store, "fallback")
-	if reader != nil || err == nil || !strings.Contains(err.Error(), "does not match derived org-scoped key") {
+	if reader != nil || err == nil || !strings.Contains(err.Error(), "is invalid") {
 		t.Fatalf("mismatched key = (%v, %v), want rejection", reader, err)
 	}
 }

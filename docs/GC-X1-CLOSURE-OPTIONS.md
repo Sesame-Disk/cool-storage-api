@@ -11,6 +11,20 @@ pin `SerialConsistency(gocql.Serial)` explicitly. The two conditional
 changes only the Paxos serial phase: regular commit consistency, serial
 settlement, exact physical identity and X1 closure remain open.
 
+**P2/R9/R24 status (2026-08-24): CLOSED.** Rowless attempts mint distinct
+`storage_key` incarnations, install one complete tuple with a single non-idempotent
+global-SERIAL LWT, and settle an unknown response with one `Consistency(SERIAL)`
+SELECT without repeating the install. A proven loser cleans only its own tuple;
+SERIAL settlement classifies no row as known lost and permits only exact attempted
+key cleanup; an ambiguous attempt retains its bytes. A direct non-applied result
+that returns the proposal is a non-authorizing single-use contradiction, not
+evidence of success. Legacy deterministic locators remain supported for canonical
+reads, while fresh authority requires the strict minted grammar. The real
+Cassandra/MinIO race proves winner agreement and the exact cleanup boundary;
+unit and AST guards pin production cleanup dispatch and fresh authority.
+This closes neither P3 (R10/R13/R17) nor P4 (R14/R19/R20/R26), does not close X1,
+and does not authorize destructive GC. `GC_ENABLED=false` remains mandatory.
+
 Even a future verified X1 implementation would not enable destructive GC by itself;
 removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
 the closure evidence and operational rollout checks pass.
@@ -101,11 +115,10 @@ refused before any destructive lifecycle state is written, where it previously
 could be discovered after the canonical row was already gone. The exact locator
 prevents a caller from silently deriving a different target, but it does not
 create a never-reused physical incarnation or solve the X1 publication-fence
-and per-attempt claim-ownership races. The equality remains the deterministic
-layout check; exact-key tenant isolation no longer relies on it after the
-structural prerequisite below. P2 still cannot remove that equality until its
-minted-key format and install properties replace it (see
-ISSUE-BLOCK-STORAGE-KEY-READS-01). Destructive GC remains disabled in production.
+and per-attempt claim-ownership races. At P1, the equality remained the
+deterministic layout check; exact-key tenant isolation no longer relied on it
+after the structural prerequisite below. P2 subsequently replaced that equality
+with legacy-or-minted locator validation. Destructive GC remains disabled in production.
 
 **Structural P2 prerequisite (2026-08-24, PR #184).** Every exact-key `BlockStore`
 operation now validates the raw key against that store's configured prefix plus
@@ -113,17 +126,18 @@ canonical org ID before any backend access, and a key that is exactly the tenant
 prefix — naming no object — is refused with it. `ValidatePhysicalLocator`
 centralizes the stronger destructive check used by both normal GC deletion and
 orphan recovery: a well-formed SHA-256 block id first, then tenant ownership,
-then the still-required deterministic `K == hashToKey(L)` equality. **The block-id
+then the then-required deterministic `K == hashToKey(L)` equality. **The block-id
 check is ordered first because the equality is otherwise satisfiable vacuously:**
 `hashToKey` returns the bare tenant prefix plus the id for an id shorter than
 four characters, so `("", "<prefix><org>/")` and `("ab", "<prefix><org>/ab")` both
 derived the key they were then compared against. This removes caller convention as
-the exact-key tenant boundary, but does not mint keys or change P2's definition.
-P2, R9, R24 and X1 remain open, and `GC_ENABLED=false` remains mandatory.
+the exact-key tenant boundary. This paragraph records the prerequisite at its
+landing; P2/R9/R24 subsequently closed. X1 remains open and `GC_ENABLED=false`
+remains mandatory.
 
-**What PR #184 deliberately did not centralize.** The equality is centralized for
-the two *destructive* callers only. Three non-destructive sites still compare
-`storage_key` against `StorageKeyForHash` inline, and P2 has to change all four
+**What PR #184 deliberately did not centralize (closed by P2).** The equality was centralized for
+the two *destructive* callers only. Three non-destructive sites then still compared
+`storage_key` against `StorageKeyForHash` inline, and P2 changed all four
 together: `internal/api/v2/upload_reuse.go` (`ResolveNeedsPutBlockStore` and the
 `Reusable` branch of `StoreUploadedBlockForProbe`) and
 `internal/streaming/canonical_block_reader.go`.
@@ -214,10 +228,10 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 - **Structural prerequisite before P2 (implemented 2026-08-24, PR #184).** Every
   exact-key `BlockStore` operation enforces configured prefix + canonical org ID
   before backend access, and destructive callers share `ValidatePhysicalLocator`,
-  which also requires a well-formed SHA-256 block id. The deterministic equality
-  remains in force at four sites — see the note above for the three P2 must find
-  outside `ValidatePhysicalLocator`. This is not minted-key or install work.
-- **P2 — mint and canonical install (R9, R24).** `K1 != K2` for distinct incarnations, SERIAL
+  which also requires a well-formed SHA-256 block id. At landing, the deterministic
+  equality remained in force at four sites — see the note above for the three P2
+  had to find outside `ValidatePhysicalLocator`. This was not minted-key or install work.
+- **P2 — mint and canonical install (R9, R24; closed 2026-08-24).** `K1 != K2` for distinct incarnations, SERIAL
   canonical winner, single-use install identity with `install-uncertain` settlement, exact
   losing-`P` cleanup.
 - **P3 — condemned-incarnation writer safety (R10, R13, R17).** Tuple-aware repair and writer
@@ -1588,7 +1602,7 @@ migration, preflight, binding bootstrap, or claim marker is required.
 | R6 | A non-local `QUORUM` GC read (2 of 3), writer LQ in the DC not contacted | **Forbidden.** Empirically red on the three-DC harness. |
 | R7 | One DC down during the authorizing read | Fail closed; no DELETE. Already the shipped behaviour. |
 | R8 | Who installs the next life, and with what CAS | `blocks` is one row per logical block and the install is `INSERT … IF NOT EXISTS`. **A+:** the writer waits until both the row and orphan are gone, then a plain insert creates `P2`. **B:** the writer waits only until GC drops the row, then may install `P2` while orphan `P1` remains. If the row still exists and is healthy, `NeedsPut` repairs the current `P` instead; it must not mint a losing second object. Neither needs a `P1→P2` successor CAS or a second generation table. |
-| R9 | Writers in two DCs both leave the wait and both mint a key | Exactly one incarnation becomes **canonical**. Before P0, `UpsertBlockMetadata` inherited the session's serial level, including `LOCAL_SERIAL` in the cluster profiles; P0 now pins its serial phase to `SERIAL`. That prerequisite is necessary for P2 but is not sufficient: `SERIAL` picks a canonical winner, does **not** prevent the loser's PUT, and does not settle ambiguous outcomes. The losing writer still needs exact-key cleanup or durable cleanup intent. A crash before any durable intent remains X3, not an X1 bucket-inventory requirement. |
+| R9 | Writers in two DCs both leave the wait and both mint a key | **CLOSED by P2.** Exactly one complete tuple becomes canonical through the global-SERIAL install. A direct different-tuple loser, or SERIAL settlement finding a different tuple or no row, cleans its exact attempted tuple; direct same-tuple contradiction and ambiguous settlement grant no cleanup. The real Cassandra/MinIO race proves winner agreement and the exact cleanup boundary, while unit tests pin production cleanup dispatch. P2 has no durable reconciliation for request-local install uncertainty. Minting broadens existing X3 leak cases beyond process crash to ambiguous PUT, pre-INSTALL retry/remint and cleanup failure; it does not close X3 or require bucket inventory for X1. |
 | R10 | Writer stalls after `Probe=Reusable(K1)`; GC fences, sees 0, authorizes `DELETE K1`; the writer resumes, finds the object missing, and repair-PUTs | Must not re-PUT a condemned key. Confirmed live: the `Reusable` branch of `StoreUploadedBlockForProbe` (`upload_reuse.go:152-174`) does `ObjectExists` → repair-PUT with **no** fence re-check, and `EnsureReusableBlockPresent` passes `beforePut = nil` (`:205`). The one caller that supplies `beforePut` (`v2/blocks.go:996`) uses it for the staging cap, not for the fence. Under minted keys the clean rule is **repair an active current incarnation with its current key; never repair a condemned incarnation — wait and mint a new key after the row is free**. |
 | R11 | `K1`'s delete completes, `K2` is created and live, then stale `K1` cleanup runs | **CLOSED by R11a/B.3.** Physical GC no longer deletes `block_id_mappings`, so the mapping survives independently of the physical lifecycle. The untagged `TestR11aPhysicalGCNeverDeletesBlockIDMappings` source gate pins that absence of physical-GC mapping-delete authority. `BlockExists` remains only in `pending_s3`, where it protects against repeating a physical S3 delete while a canonical block row exists; it is no longer consulted by `pending_mapping_cleanup`. This closes the mapping-loss race, but not the exact physical `P` identity problem tracked by R26 and the remaining X1 work. |
 | R12 | Any conditional statement on the `blocks` partition still runs at `LOCAL_SERIAL` after the others are raised | **Fails the whole fence.** The two levels are different quorum domains, so a `LOCAL_SERIAL` round can miss an in-flight `SERIAL` proposal and one straggler invalidates every other statement's guarantee. P0 pins the 11 `blocks` statements and the 4 canonical orphan statements explicitly; the adjacent candidate lifecycle is pinned in the same slice. |
@@ -1778,7 +1792,7 @@ recorded above and does not change the open X1 requirements.
 | `S3Store.Put(ctx, blockID, …)` | Second derivation layer: `s.key(blockID)` on what callers already pass as a key | Make the key parameter mean a key |
 | `canonical_block_reader.go:238` | Rejects persisted ≠ derived | Use the persisted key; validate org/hash/format instead |
 | `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Immediately before repair PUT, re-read the canonical row and require the same `storage_key`, no destructive/repair claim and no orphan. Repair/reuse that active key; mint only when a new incarnation is allowed; never repair a condemned incarnation (R10) |
-| `UpsertBlockMetadata` | `INSERT … IF NOT EXISTS` with an explicit `SERIAL` serial phase after P0 | Store the exact key; P2 must use that phase for canonical install and add the remaining incarnation/settlement rules (R9) |
+| canonical metadata install | P2 adds a dedicated, single-use `InstallBlockMetadata`; existing-incarnation paths retain `UpsertBlockMetadata` | **P2/R9/R24 delivered:** one non-retryable global-SERIAL install and one SERIAL settlement read after an unknown response. P3 must keep existing-incarnation repair non-creating (R17). |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND backend_identity = B1 AND storage_key = K1`, with fresh per-attempt claim identity (R14/R16) |
 | `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, explicitly pinned to serial phase `SERIAL` by P0 | The one-serial-domain rule admits no exceptions on this partition (R12); stale-read settlement and exact-`P` identity remain open |
 | `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007); R11b-1 removes the redundant `representation_id`, while R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |

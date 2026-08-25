@@ -1204,11 +1204,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to persist pending OnlyOffice block cleanup: %w", err)
 	}
 
-	var storageKey string
-	materializedStorageClass := storageClass
-	if err := RetryUploadedBlockMaterializationContext(ctx, "OnlyOffice", internalBlockID, func() error {
-		materializedStorageClass = storageClass
-		storageKey = ""
+	var materializationTarget BlockMaterializationTarget
+	if err := RetryUploadedBlockMaterializationPhasedContext(ctx, "OnlyOffice", internalBlockID, func(phase BlockMaterializationPhase) error {
+		materializationTarget = BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, internalBlockID)
 		if probeErr != nil {
 			return fmt.Errorf("probe block reuse for %s: %w", internalBlockID, probeErr)
@@ -1219,18 +1217,16 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			materializedStorageClass = probe.StorageClass
-			var ensureErr error
-			storageKey, ensureErr = EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID, phase)
+			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
-			putStore, resolvedClass, resolvedKey, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, internalBlockID)
+			target, resolveErr := ResolveNeedsPutBlockStoreForPhase(h.storageManager, blockStore, storageClass, probe, orgID, internalBlockID, phase)
 			if resolveErr != nil {
 				return resolveErr
 			}
-			materializedStorageClass = resolvedClass
-			var putErr error
-			storageKey, putErr = putUploadedBlockAutoDirectFn(ctx, putStore, resolvedKey, content)
+			materializationTarget = target
+			_, putErr := putUploadedBlockAutoDirectFn(ctx, target.Store, target.StorageKey, content)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
@@ -1243,7 +1239,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		// Materialize block metadata/provisional ref first and then the sync mapping.
 		// Keep the pending-cleanup row on mapping failure so the reconciler can clear
 		// bookkeeping while the provisional reference expires by Cassandra TTL.
-		materializeErr := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializedStorageClass, storageKey, externalBlockID)
+		materializeErr := RegisterUploadedBlockTargetAndMapping(ctx, h.db, orgID, repoID, internalBlockID, rollbackID, len(content), materializationTarget, externalBlockID)
 		if materializeErr == nil {
 			blockMetadataRegistered = true
 		}

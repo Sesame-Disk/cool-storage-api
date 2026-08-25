@@ -747,8 +747,8 @@ func (h *BlockHandler) checkBlocksForSession(c *gin.Context, session db.BlockUpl
 // only ever READS this mapping; it never mints one from the manifest, which is why
 // a forged manifest SHA-1 cannot poison resolution. The shared legacy/seafhttp
 // mapping path now uses the same fail-closed conflict contract.
-func (h *BlockHandler) materializeUploadedBlock(session db.BlockUploadSession, sha256ID, sha1ID string, size int, storageClass, storageKey string) error {
-	return RegisterWebUploadedBlockAndMapping(h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, storageClass, storageKey, sha1ID)
+func (h *BlockHandler) materializeUploadedBlock(ctx context.Context, session db.BlockUploadSession, sha256ID, sha1ID string, size int, target BlockMaterializationTarget) error {
+	return RegisterWebUploadedBlockTargetAndMapping(ctx, h.db, session.OrgID, session.RepoID, sha256ID, session.SessionID, size, target, sha1ID)
 }
 
 // respondBlockMaterializeError maps a materializeUploadedBlock failure to the web
@@ -771,6 +771,20 @@ func respondBlockMaterializeError(c *gin.Context, err error) bool {
 		c.JSON(http.StatusConflict, gin.H{
 			"code":  "block_delete_in_progress",
 			"error": "block is being deleted; retry the upload",
+		})
+		return true
+	}
+	// Exhausted confirmation convergence. The block IS installed and durable --
+	// only this request could not observe its canonical row before the budget ran
+	// out -- so this is the same class as the fence above: transient, retryable,
+	// and resolved by repeating the request. Mapping it to the default 500 would
+	// report a healthy block as a server fault and be indistinguishable from a
+	// real one in monitoring (finding F2).
+	if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{
+			"code":  "block_canonical_state_not_visible",
+			"error": "block state is still converging; retry the upload",
 		})
 		return true
 	}
@@ -1000,9 +1014,9 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return admissionErr
 	}
 
-	var storageKey, storageClass string
+	var target BlockMaterializationTarget
 	var didPutAny bool
-	storeErr := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadBlock", hash, func() error {
+	storeErr := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadBlock", hash, func(phase BlockMaterializationPhase) error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
 		if probeErr == nil {
 			probe, probeErr = prepareUploadedBlockProbeFn(h.db, session.OrgID, hash, probe)
@@ -1010,15 +1024,24 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		if probeErr != nil {
 			return probeErr
 		}
-		resolvedKey, resolvedClass, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
+		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbeForPhase(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut, phase)
 		if putErr != nil {
 			return putErr
 		}
-		storageKey, storageClass = resolvedKey, resolvedClass
-		didPutAny = didPutAny || didPut
+		target = resolvedTarget
+		// RESPONSE_CONTRACT: only the initial phase can make this block "new".
+		// A confirmation-phase write is a repair of an object that went missing
+		// between INSTALL and reconfirmation, not this request creating the block,
+		// so it must not turn a reused block's 200/New:false into 201/New:true.
+		// The consequence is deliberate: the same repair now answers 200 or 201
+		// depending on the phase it happened in, and New again means exactly
+		// "this request created the block".
+		if phase == BlockMaterializationInitial {
+			didPutAny = didPutAny || didPut
+		}
 		return nil
 	}, func() error {
-		return h.materializeUploadedBlock(session, hash, sha1Hash, len(data), storageClass, storageKey)
+		return h.materializeUploadedBlock(c.Request.Context(), session, hash, sha1Hash, len(data), target)
 	}, nil, nil)
 	if errors.Is(storeErr, errSessionStagingCapReached) {
 		metrics.BlockUploadSessionAdmissionRejectionsTotal.WithLabelValues("staged_blocks").Inc()
