@@ -73,6 +73,17 @@ The query is in
 incarnations use `RepairBlockMetadataIfCurrent`, whose tuple-bound conditional
 updates are also part of the writer authority boundary.
 
+P3 added a second coordination axis that this document must state explicitly:
+writer-side fence reads. They are deliberately NOT global-SERIAL on the
+deduplicated path. `ProbeBlockReuse`, `BlockDeleteFenceActive` and
+`RepairBlockMetadataIfCurrent` all read at ordinary consistency, because the
+fence publishers (`ClaimBlockDelete`, `StartBlockDeleteOrphan`) commit at
+`EACH_QUORUM` and the authority that admits a write is structural rather than
+read-derived. Exactly one read is linearizable: `ValidateBlockRepairAuthority`,
+immediately before a repair PUT, which runs only when an existing physical object
+turned out to be missing. `TestP3SerialReadsStayOffTheDedupPath` fails the build
+if another `gocql.Serial` read appears in `internal/db`.
+
 For a new block, the normal materialization cost is one metadata LWT attempt.
 The surrounding operations are not all LWTs:
 

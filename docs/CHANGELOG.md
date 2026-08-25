@@ -20,9 +20,33 @@ repair primitives.
 
 GC fence-publication LWTs pin `EachQuorum` plus `Serial`, while the final repair
 authority and negative fence reads use explicit `Consistency(Serial)` where the
-authority decision requires it. Unit, AST and non-tagged integration coverage
-includes the observed-fence race and the residual race that must not recreate a
-condemned row. Docker Cassandra/MinIO `go-all-test` evidence is green; final review remains pending.
+authority decision requires it. The observed-fence race and the residual race that must not recreate a condemned
+row are covered by tagged Cassandra/MinIO integration tests
+(`internal/integration/p3_condemned_repair_test.go`, `//go:build integration`);
+the untagged files are the AST guards. The test services now pin
+`SESAMEFS_REQUIRE_P{2,3}_EVIDENCE=1`, so a stack that never came up fails the run
+instead of skipping the evidence and reporting green.
+
+The writer fence reads the canonical row before the orphan on every path. GC
+writes gc_state, then the orphan, then removes the row, so reading the orphan
+first let a writer see no orphan, have GC complete both steps underneath it, read
+an absent row, and conclude there was no fence at all -- installing `P2` while
+`orphan(P1)` was still live, the overlapped state conservative A+ forbids.
+
+Global SERIAL reads are confined to the pre-PUT authority boundary. Existing
+metadata repair, the reuse probe and the delete-fence check read normally: their
+safety is structural (single-use INSTALL, or a non-creating tuple-bound CAS), and
+the fence publishers commit at EACH_QUORUM so an ordinary read already observes
+every committed fence. A physical PUT failure now keeps the class the authority
+boundary decided, so a permanently invalid locator is no longer re-tagged
+retryable -- which in the initial phase would have re-entered the minting phase.
+Session staging admission runs after authority is granted, so a fenced repair no
+longer burns bucket cap it cannot release.
+
+A `size_bytes` disagreement on an existing canonical row is now a permanent
+failure. The removed generic upsert never compared size; the block id is a
+SHA-256 of the content, so a mismatch is an identity contradiction and fails
+closed.
 
 R18 and R27 remain OPEN by design: a repair rejected by an orphan fence retains
 the provisional `up:` reference, and the deferred-orphan projection has no

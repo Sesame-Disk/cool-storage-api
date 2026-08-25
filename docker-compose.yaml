@@ -548,6 +548,11 @@ services:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
       - SESAMEFS_URL_3=http://sesamefs-node-3:8080
+      # P2/P3 race evidence is the point of running this suite against a real
+      # Cassandra and MinIO. Without these, a stack that never came up lets the
+      # evidence tests skip while the run still reports green.
+      - SESAMEFS_REQUIRE_P2_EVIDENCE=1
+      - SESAMEFS_REQUIRE_P3_EVIDENCE=1
       # The supported frontend nginx, so the D6 slow-client drill runs through
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.
@@ -582,6 +587,8 @@ services:
       - SESAMEFS_TEST_IN_CONTAINER=1
       - SESAMEFS_CLEAN_TEST_REPOS=1
       - SESAMEFS_FAIL_FAST=1
+      - SESAMEFS_REQUIRE_P2_EVIDENCE=1
+      - SESAMEFS_REQUIRE_P3_EVIDENCE=1
     depends_on:
       - sesamefs
       - sesamefs-node-2

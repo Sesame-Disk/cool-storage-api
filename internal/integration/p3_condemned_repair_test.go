@@ -85,7 +85,7 @@ func TestP3CondemnedIncarnationCannotBeRepaired(t *testing.T) {
 	_, err = v2.PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, content, func(ctx context.Context, store *storage.BlockStore, key string, data []byte) (string, error) {
 		putCalls++
 		return store.PutObjectAutoDirect(ctx, key, data)
-	})
+	}, nil)
 	if !errors.Is(err, v2.ErrBlockDeleteInProgress) || putCalls != 0 {
 		t.Fatalf("delayed P1 repair = err %v, PUTs %d; want fence and zero PUTs", err, putCalls)
 	}
@@ -121,7 +121,7 @@ func TestP3CondemnedIncarnationCannotBeRepaired(t *testing.T) {
 	p2Target := v2.BlockMaterializationTarget{Store: blockStore, StorageClass: storageClass, StorageKey: p2Key, FreshInstall: true}
 	if _, err := v2.PutBlockMaterializationTarget(ctx, database, orgID, blockID, p2Target, content, func(ctx context.Context, store *storage.BlockStore, key string, data []byte) (string, error) {
 		return store.PutObjectAutoDirect(ctx, key, data)
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("PUT fresh P2: %v", err)
 	}
 	t.Cleanup(func() { _ = blockStore.DeleteBlockByStorageKey(context.Background(), p2Key) })

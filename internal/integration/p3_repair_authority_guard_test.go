@@ -3,6 +3,7 @@ package integration
 import (
 	"go/ast"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -95,4 +96,82 @@ func p3CalledFunctionName(expression ast.Expr) string {
 	default:
 		return ""
 	}
+}
+
+// TestP3SerialReadsStayOffTheDedupPath keeps global-Paxos reads confined to the
+// two places that genuinely need linearizability. Every deduplicated block upload
+// crosses ProbeBlockReuse, BlockDeleteFenceActive and RepairBlockMetadataIfCurrent;
+// giving any of them a SERIAL read turns an ordinary re-upload into a handful of
+// cross-DC round trips. The fence publishers commit at EACH_QUORUM precisely so
+// these reads do not have to.
+func TestP3SerialReadsStayOffTheDedupPath(t *testing.T) {
+	program := p2LoadProductionProgram(t)
+	source := program.packages["github.com/Sesame-Disk/sesamefs/internal/db"]
+	if source == nil {
+		t.Fatal("internal/db production package not found")
+	}
+	// settleInstalledBlockMetadata is P2's post-install settlement read; apply is
+	// the single funnel through which BlockAuthorityStrong reaches a query.
+	allowed := map[string]bool{
+		"settleInstalledBlockMetadataFn": true,
+		"apply":                          true,
+	}
+	found := map[string]bool{}
+	for _, file := range source.files {
+		for _, declaration := range file.Decls {
+			enclosing := p3EnclosingName(declaration)
+			ast.Inspect(declaration, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok || len(call.Args) != 1 {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "Consistency" {
+					return true
+				}
+				value, ok := call.Args[0].(*ast.SelectorExpr)
+				if !ok || value.Sel.Name != "Serial" {
+					return true
+				}
+				if pkg, ok := value.X.(*ast.Ident); !ok || pkg.Name != "gocql" {
+					return true
+				}
+				found[enclosing] = true
+				return true
+			})
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("no gocql.Serial reads found in internal/db; the guard would pass vacuously")
+	}
+	for name := range found {
+		if !allowed[name] {
+			t.Errorf("%s issues a global SERIAL read; only %v may, and the writer fence relies on EACH_QUORUM publication instead", name, allowedNames(allowed))
+		}
+	}
+}
+
+func p3EnclosingName(declaration ast.Decl) string {
+	switch node := declaration.(type) {
+	case *ast.FuncDecl:
+		return node.Name.Name
+	case *ast.GenDecl:
+		for _, spec := range node.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Names) == 0 {
+				continue
+			}
+			return value.Names[0].Name
+		}
+	}
+	return "<unknown>"
+}
+
+func allowedNames(allowed map[string]bool) []string {
+	names := make([]string, 0, len(allowed))
+	for name := range allowed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

@@ -283,7 +283,7 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 		SELECT representation_id, sha1, storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at, created_at
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(
+	`, orgID, blockID).Scan(
 		&row.RepresentationID,
 		&row.Sha1,
 		&storageClass,
@@ -306,18 +306,48 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 	return row, true, nil
 }
 
+// BlockAuthorityRead selects how strongly a writer-side fence read must observe
+// the GC lifecycle.
+//
+// BlockAuthorityStrong is a linearizable SERIAL read. It costs a global Paxos
+// round trip, so it is reserved for the one decision that must observe a fence
+// published moments earlier: the exact-incarnation revalidation immediately
+// before a physical repair PUT (R10).
+//
+// BlockAuthorityAdvisory is an ordinary read. It is correct wherever the answer
+// only gates an early-out and the real authority is enforced structurally
+// downstream — by the single-use INSTALL LWT for a fresh incarnation, or by the
+// tuple-bound, non-creating CAS in RepairBlockMetadataIfCurrent (R17). Because
+// ClaimBlockDelete and StartBlockDeleteOrphan publish with EACH_QUORUM commit
+// visibility, an ordinary read already observes every committed fence; what it
+// may miss is a fence whose Paxos commit is still in flight, and every such
+// caller is one whose downstream authority rejects the stale observation.
+type BlockAuthorityRead int
+
+const (
+	BlockAuthorityAdvisory BlockAuthorityRead = iota
+	BlockAuthorityStrong
+)
+
+func (mode BlockAuthorityRead) apply(query *gocql.Query) *gocql.Query {
+	if mode == BlockAuthorityStrong {
+		return query.Consistency(gocql.Serial)
+	}
+	return query
+}
+
 // These seams keep existing-incarnation repair separate from create-only install.
 // Existing-incarnation repair is non-creating and must remain bound to the tuple
 // and lifecycle state that granted authority.
-var readBlockRepairAuthorityFn = func(database *DB, orgID, blockID string) (blockRepairAuthorityRow, bool, error) {
+var readBlockRepairAuthorityFn = func(database *DB, orgID, blockID string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 	var row blockRepairAuthorityRow
 	var storageClass *string
 	var storageKey *string
-	err := database.Session().Query(`
+	err := mode.apply(database.Session().Query(`
 		SELECT representation_id, sha1, size_bytes, storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at, created_at
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(
+	`, orgID, blockID)).Scan(
 		&row.RepresentationID,
 		&row.Sha1,
 		&row.SizeBytes,
@@ -345,11 +375,11 @@ var readBlockRepairAuthorityFn = func(database *DB, orgID, blockID string) (bloc
 	return row, true, nil
 }
 
-var blockRepairHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+var blockRepairHasS3OrphanFn = func(database *DB, orgID, blockID string, mode BlockAuthorityRead) (bool, error) {
 	var existingBlockID string
-	err := database.Session().Query(`
+	err := mode.apply(database.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
+	`, orgID, blockID)).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -716,12 +746,16 @@ func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, bloc
 // ValidateBlockRepairAuthority grants authority only for the exact canonical
 // physical incarnation the caller supplies. Under conservative A+, either GC
 // ownership shape or any gc_s3_orphans row blocks repair.
+// ValidateBlockRepairAuthority is the pre-PUT boundary (R10) and therefore always
+// reads at BlockAuthorityStrong: it is the one decision that must observe a fence
+// published moments earlier, and it runs only when an existing physical object
+// turned out to be missing and needs repair -- a cold path, not the dedup path.
 func (db *DB) ValidateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation) (BlockRepairAuthorityOutcome, error) {
-	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected)
+	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected, BlockAuthorityStrong)
 	return outcome, err
 }
 
-func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation) (blockRepairAuthorityRow, BlockRepairAuthorityOutcome, error) {
+func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation, mode BlockAuthorityRead) (blockRepairAuthorityRow, BlockRepairAuthorityOutcome, error) {
 	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
 		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block id %q is not a canonical lower-case SHA-256", blockID)
 	}
@@ -735,16 +769,23 @@ func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected Block
 		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("invalid storage key for block %s", blockID)
 	}
 
-	// Read the orphan fence first. The canonical row is the final authority read,
-	// so a fence already visible at this boundary cannot be hidden by an older
-	// blocks snapshot.
-	hasOrphan, err := blockRepairHasS3OrphanFn(db, orgID, blockID)
-	if err != nil {
-		return blockRepairAuthorityRow{}, BlockRepairAuthorityUnknown, fmt.Errorf("read S3 orphan repair fence for %s: %w", blockID, err)
-	}
-	row, found, err := readBlockRepairAuthorityFn(db, orgID, blockID)
+	// Read order is load-bearing, and the proof is the GC lifecycle's own write
+	// order: ClaimBlockDelete stamps gc_state, StartBlockDeleteOrphan writes the
+	// orphan, and only then does FinalizeBlockDelete remove the canonical row
+	// (worker.go). The orphan is therefore the LAST fence read on every path, so
+	// that an absent canonical row can never be mistaken for "no fence": if the
+	// row is already gone when we read it, that lifecycle's orphan was durably
+	// written strictly earlier, and the orphan read that follows must observe it.
+	// Reading the orphan first would leave exactly the window this ordering
+	// closes — orphan absent, then GC orphans and drops the row, then a rowless
+	// read reports no fence at all.
+	row, found, err := readBlockRepairAuthorityFn(db, orgID, blockID, mode)
 	if err != nil {
 		return blockRepairAuthorityRow{}, BlockRepairAuthorityUnknown, fmt.Errorf("read block repair authority for %s: %w", blockID, err)
+	}
+	hasOrphan, err := blockRepairHasS3OrphanFn(db, orgID, blockID, mode)
+	if err != nil {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityUnknown, fmt.Errorf("read S3 orphan repair fence for %s: %w", blockID, err)
 	}
 	if !found {
 		if hasOrphan {
@@ -795,7 +836,12 @@ func (db *DB) RepairBlockMetadataIfCurrent(orgID, representationID, blockID, sha
 		return blockRepairPermanentError("invalid negative block size for %s", blockID)
 	}
 
-	row, _, err := db.validateBlockRepairAuthority(orgID, blockID, expected)
+	// Advisory, not strong: this path never creates a row, and every mutation it
+	// can make is a tuple-bound CAS that re-checks gc_state at Paxos level. A
+	// stale read cannot grant authority here -- it can only fail to short-circuit
+	// early, and the CAS then rejects. Paying a global SERIAL round trip on every
+	// deduplicated block to shorten that early-out is not a trade worth making.
+	row, _, err := db.validateBlockRepairAuthority(orgID, blockID, expected, BlockAuthorityAdvisory)
 	if err != nil {
 		return err
 	}
@@ -1141,7 +1187,7 @@ var probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bo
 	var existingBlockID string
 	err := database.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
+	`, orgID, blockID).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -1394,22 +1440,6 @@ func (db *DB) BlockReferenceExists(orgID, blockID, referrer string) (bool, error
 	return true, nil
 }
 
-// BlockGCState returns the block's gc_state ("" when unset or the block row is
-// absent). Writers consult it to back off while the GC worker is mid-delete.
-func (db *DB) BlockGCState(orgID, blockID string) (string, error) {
-	var gcState string
-	err := db.Session().Query(`
-		SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&gcState)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return "", nil
-		}
-		return "", err
-	}
-	return gcState, nil
-}
-
 type BlockS3OrphanInfo struct {
 	StorageClass string
 	FirstSeenAt  time.Time
@@ -1426,32 +1456,62 @@ type BlockDeleteClaimInfo struct {
 // pending gc_s3_orphans row as an active fence; otherwise a re-upload can race
 // with orphan recovery and lose the object after the canonical block row was
 // already deleted.
+// The canonical row is read FIRST and the orphan LAST, and that order is the
+// whole correctness argument. GC writes gc_state, then the orphan, then removes
+// the row. Reading the orphan first admits this sequence:
+//
+//	writer reads orphan   -> absent
+//	GC     StartBlockDeleteOrphan  -> orphan(P1) now exists
+//	GC     FinalizeBlockDelete     -> blocks(L) removed
+//	writer reads blocks   -> absent, reported as "no fence"
+//	writer installs P2    -> blocks(L) -> P2 while orphan(P1) is live
+//
+// which is precisely the overlapped state conservative A+ forbids (R13). Reading
+// the row first inverts the dependency: an absent row proves the orphan of that
+// lifecycle was already durable, so the orphan read that follows observes it.
+// Both reads are ordinary. The fence publishers commit at EACH_QUORUM, so an
+// ordinary read already sees every committed fence, and the authority that
+// actually admits a write is downstream and structural -- the single-use INSTALL
+// LWT for a fresh incarnation, the tuple-bound non-creating CAS for a repair.
 func (db *DB) BlockDeleteFenceActive(orgID, blockID string) (bool, error) {
-	var existingBlockID string
-	err := db.Session().Query(`
-		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			existingBlockID = ""
-		} else {
-			return false, err
-		}
-	}
-	if existingBlockID != "" {
-		return true, nil
-	}
-	var gcState string
-	err = db.Session().Query(`
-		SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(&gcState)
-	if errors.Is(err, gocql.ErrNotFound) {
-		return false, nil
-	}
+	gcState, found, err := blockDeleteFenceGCStateFn(db, orgID, blockID)
 	if err != nil {
 		return false, err
 	}
-	return gcState == BlockGCStateDeleting, nil
+	if found && gcState == BlockGCStateDeleting {
+		return true, nil
+	}
+	// A rowless read is deliberately NOT an early "no fence" return: it is the
+	// exact observation the orphan read below exists to disambiguate.
+	return blockDeleteFenceHasS3OrphanFn(db, orgID, blockID)
+}
+
+var blockDeleteFenceGCStateFn = func(database *DB, orgID, blockID string) (string, bool, error) {
+	var gcState string
+	err := database.Session().Query(`
+		SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Scan(&gcState)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return gcState, true, nil
+}
+
+var blockDeleteFenceHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+	var existingBlockID string
+	err := database.Session().Query(`
+		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Scan(&existingBlockID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return existingBlockID != "", nil
 }
 
 func (db *DB) GetBlockS3OrphanInfo(orgID, blockID string) (BlockS3OrphanInfo, bool, error) {

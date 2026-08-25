@@ -2529,7 +2529,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := v2.PutBlockMaterializationTarget(ctx, h.db, token.OrgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectForUploadFn)
+			_, putErr := v2.PutBlockMaterializationTarget(ctx, h.db, token.OrgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectForUploadFn, nil)
 			if putErr == nil {
 				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s) via direct PUT", fileID[:16], sha256ID[:16])
 			}
@@ -3062,7 +3062,7 @@ readLoop:
 							return resolveErr
 						}
 						materializationTarget = target
-						_, putErr := v2.PutBlockMaterializationTarget(egCtx, h.db, token.OrgID, sha256ID, target, storedBlock, putUploadedBlockAutoDirectForUploadFn)
+						_, putErr := v2.PutBlockMaterializationTarget(egCtx, h.db, token.OrgID, sha256ID, target, storedBlock, putUploadedBlockAutoDirectForUploadFn, nil)
 						if putErr != nil {
 							return fmt.Errorf("failed to store block: %w", putErr)
 						}

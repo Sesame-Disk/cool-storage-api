@@ -1404,7 +1404,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					templateTarget = target
 					templateMaterializedStorageClass = target.StorageClass
 					var err error
-					templateStorageKey, err = PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, templateBlockData.Hash, target, templateBlockData.Data, putUploadedBlockAutoDirectFn)
+					templateStorageKey, err = PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, templateBlockData.Hash, target, templateBlockData.Data, putUploadedBlockAutoDirectFn, nil)
 					if err != nil {
 						return fmt.Errorf("failed to store file content: %w", err)
 					}
@@ -3483,7 +3483,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectFn)
+			_, putErr := PutBlockMaterializationTarget(c.Request.Context(), h.db, orgID, sha256ID, target, storedContent, putUploadedBlockAutoDirectFn, nil)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}

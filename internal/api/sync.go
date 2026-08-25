@@ -441,7 +441,7 @@ var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStoreForPhase
 var syncPutBlockMaterializationTargetFn = func(ctx context.Context, database *db.DB, orgID, blockID string, target v2.BlockMaterializationTarget, data []byte, put func(context.Context, *storage.BlockStore, string, []byte) (string, error)) (string, error) {
-	return v2.PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, put)
+	return v2.PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, put, nil)
 }
 var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresentForPhase
 var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping

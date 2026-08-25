@@ -348,10 +348,10 @@ func TestValidateBlockRepairAuthorityClassifiesExactIncarnation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) {
+			readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 				return test.row, test.found, nil
 			}
-			blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+			blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) {
 				return test.hasOrphan, nil
 			}
 			outcome, err := (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, expected)
@@ -364,8 +364,8 @@ func TestValidateBlockRepairAuthorityClassifiesExactIncarnation(t *testing.T) {
 
 func TestRepairBlockMetadataIfCurrentAbsentRowNeverInserts(t *testing.T) {
 	withBlockRepairSeams(t)
-	blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
-	readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) {
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 		return blockRepairAuthorityRow{}, false, nil
 	}
 
@@ -382,8 +382,10 @@ func TestRepairBlockMetadataIfCurrentBackfillsWithTupleBoundCAS(t *testing.T) {
 		withBlockRepairSeams(t)
 		row := completeBlockRepairAuthorityRow(expected)
 		row.RepresentationID = ""
-		readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) { return row, true, nil }
-		blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+		readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+			return row, true, nil
+		}
+		blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
 		backfillCurrentBlockRepresentationIDFn = func(_ *DB, orgID, blockID, representationID, current string, location BlockPhysicalLocation, createdAt time.Time, size int) (bool, error) {
 			if orgID != "org-1" || blockID != installTestBlockID || representationID != PlainBlockRepresentationID || current != "" || location != expected || !createdAt.Equal(*row.CreatedAt) || size != 123 {
 				t.Fatalf("representation CAS was not bound to the observed row: %s/%s/%s/%q/%+v/%v/%d", orgID, blockID, representationID, current, location, createdAt, size)
@@ -400,8 +402,10 @@ func TestRepairBlockMetadataIfCurrentBackfillsWithTupleBoundCAS(t *testing.T) {
 		withBlockRepairSeams(t)
 		row := completeBlockRepairAuthorityRow(expected)
 		row.Sha1 = ""
-		readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) { return row, true, nil }
-		blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+		readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+			return row, true, nil
+		}
+		blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
 		backfillCurrentBlockSHA1Fn = func(_ *DB, orgID, blockID, sha1, current, representationID string, location BlockPhysicalLocation, createdAt time.Time, size int) (bool, error) {
 			if orgID != "org-1" || blockID != installTestBlockID || sha1 != strings.Repeat("b", 40) || current != "" || representationID != PlainBlockRepresentationID || location != expected || !createdAt.Equal(*row.CreatedAt) || size != 123 {
 				t.Fatalf("sha1 CAS was not bound to the observed row: %s/%s/%s/%q/%s/%+v/%v/%d", orgID, blockID, sha1, current, representationID, location, createdAt, size)
@@ -419,8 +423,10 @@ func TestRepairBlockMetadataIfCurrentAcceptsCompleteAndLegacyRows(t *testing.T) 
 	withBlockRepairSeams(t)
 	legacy := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/org-1/bb/bb/" + installTestBlockID}
 	row := completeBlockRepairAuthorityRow(legacy)
-	readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) { return row, true, nil }
-	blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		return row, true, nil
+	}
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) { return false, nil }
 	backfillCurrentBlockRepresentationIDFn = func(*DB, string, string, string, string, BlockPhysicalLocation, time.Time, int) (bool, error) {
 		t.Fatal("complete row must not backfill representation")
 		return false, nil
@@ -439,9 +445,11 @@ func TestBlockRepairAuthorityRejectsMalformedStatePermanently(t *testing.T) {
 	expected := BlockPhysicalLocation{StorageClass: "hot", StorageKey: "canonical-key"}
 	row := completeBlockRepairAuthorityRow(expected)
 	row.GCClaimID = "claim-without-state"
-	readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) { return row, true, nil }
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		return row, true, nil
+	}
 	orphanRead := false
-	blockRepairHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+	blockRepairHasS3OrphanFn = func(*DB, string, string, BlockAuthorityRead) (bool, error) {
 		orphanRead = true
 		return false, nil
 	}
@@ -453,7 +461,7 @@ func TestBlockRepairAuthorityRejectsMalformedStatePermanently(t *testing.T) {
 		t.Fatal("authority validation must read the orphan fence before validating the canonical row")
 	}
 
-	readBlockRepairAuthorityFn = func(*DB, string, string) (blockRepairAuthorityRow, bool, error) {
+	readBlockRepairAuthorityFn = func(*DB, string, string, BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
 		t.Fatal("malformed locator input must fail before reading")
 		return blockRepairAuthorityRow{}, false, nil
 	}
@@ -1375,5 +1383,175 @@ func TestProbeBlockReuseReturnsUnknownErrorWhenMetadataReadFails(t *testing.T) {
 	}
 	if probe.Decision != BlockReuseUnknownError {
 		t.Fatalf("decision = %v, want BlockReuseUnknownError", probe.Decision)
+	}
+}
+
+// TestP3BlockDeleteFenceSurvivesOrphanHandoff pins the read order that closes the
+// A+ handoff race (R13). GC writes the orphan and only then removes the canonical
+// row, so a writer that reads the orphan FIRST can observe "no orphan", have GC
+// complete both steps underneath it, then read an absent row and conclude there is
+// no fence at all -- leaving orphan(P1) live while it installs P2.
+//
+// The seam below reproduces exactly that interleaving: the canonical read is the
+// moment GC finishes. With the canonical row read first the orphan read that
+// follows must observe the fence; swap the two reads back and this test fails.
+func TestP3BlockDeleteFenceSurvivesOrphanHandoff(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	orphanPublished := false
+	canonicalReads := 0
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		canonicalReads++
+		// GC's StartBlockDeleteOrphan then FinalizeBlockDelete land here.
+		orphanPublished = true
+		return "", false, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		return orphanPublished, nil
+	}
+
+	fenced, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID)
+	if err != nil {
+		t.Fatalf("BlockDeleteFenceActive() error = %v, want nil", err)
+	}
+	if !fenced {
+		t.Fatal("BlockDeleteFenceActive() = false; a rowless read must not be reported as unfenced while the lifecycle's orphan is live")
+	}
+	if canonicalReads != 1 {
+		t.Fatalf("canonical reads = %d, want 1", canonicalReads)
+	}
+}
+
+// TestP3BlockDeleteFenceReadsCanonicalRowBeforeOrphan states the ordering as a
+// property rather than as a consequence, so a refactor cannot satisfy the handoff
+// test by accident.
+func TestP3BlockDeleteFenceReadsCanonicalRowBeforeOrphan(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	var order []string
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		order = append(order, "blocks")
+		return "", true, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		order = append(order, "orphan")
+		return false, nil
+	}
+
+	if _, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID); err != nil {
+		t.Fatalf("BlockDeleteFenceActive() error = %v, want nil", err)
+	}
+	if len(order) != 2 || order[0] != "blocks" || order[1] != "orphan" {
+		t.Fatalf("fence read order = %v, want [blocks orphan]: the orphan must be the last fence read", order)
+	}
+}
+
+// TestP3BlockDeleteFenceStillCatchesAnActiveClaim keeps the short-circuit honest:
+// an in-row claim fences without needing the orphan read at all.
+func TestP3BlockDeleteFenceStillCatchesAnActiveClaim(t *testing.T) {
+	oldState := blockDeleteFenceGCStateFn
+	oldOrphan := blockDeleteFenceHasS3OrphanFn
+	t.Cleanup(func() {
+		blockDeleteFenceGCStateFn = oldState
+		blockDeleteFenceHasS3OrphanFn = oldOrphan
+	})
+
+	orphanReads := 0
+	blockDeleteFenceGCStateFn = func(*DB, string, string) (string, bool, error) {
+		return BlockGCStateDeleting, true, nil
+	}
+	blockDeleteFenceHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		orphanReads++
+		return false, nil
+	}
+
+	fenced, err := (&DB{}).BlockDeleteFenceActive("org-1", installTestBlockID)
+	if err != nil || !fenced {
+		t.Fatalf("BlockDeleteFenceActive() = %v, %v; want true, nil", fenced, err)
+	}
+	if orphanReads != 0 {
+		t.Fatalf("orphan reads = %d, want 0 for an already-claimed row", orphanReads)
+	}
+}
+
+// TestP3RepairAuthorityReadsCanonicalRowBeforeOrphan applies the same ordering
+// proof to the pre-PUT authority boundary.
+func TestP3RepairAuthorityReadsCanonicalRowBeforeOrphan(t *testing.T) {
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	t.Cleanup(func() {
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+	})
+
+	var order []string
+	var observedMode BlockAuthorityRead
+	readBlockRepairAuthorityFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		order = append(order, "blocks")
+		observedMode = mode
+		return blockRepairAuthorityRow{}, false, nil
+	}
+	blockRepairHasS3OrphanFn = func(_ *DB, _, _ string, _ BlockAuthorityRead) (bool, error) {
+		order = append(order, "orphan")
+		return true, nil
+	}
+
+	outcome, err := (&DB{}).ValidateBlockRepairAuthority("org-1", installTestBlockID, BlockPhysicalLocation{
+		StorageClass: "hot",
+		StorageKey:   "blocks/org-1/minted",
+	})
+	if outcome != BlockRepairAuthorityBlocked || !errors.Is(err, ErrBlockRepairBlocked) {
+		t.Fatalf("ValidateBlockRepairAuthority() = %v, %v; want Blocked with a fence error", outcome, err)
+	}
+	if len(order) != 2 || order[0] != "blocks" || order[1] != "orphan" {
+		t.Fatalf("authority read order = %v, want [blocks orphan]", order)
+	}
+	if observedMode != BlockAuthorityStrong {
+		t.Fatalf("pre-PUT authority read mode = %v, want BlockAuthorityStrong", observedMode)
+	}
+}
+
+// TestP3MetadataRepairUsesAdvisoryReads keeps the hot dedup path off global Paxos.
+// Its safety comes from the non-creating tuple-bound CAS, not from read freshness.
+func TestP3MetadataRepairUsesAdvisoryReads(t *testing.T) {
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	t.Cleanup(func() {
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+	})
+
+	modes := map[BlockAuthorityRead]int{}
+	readBlockRepairAuthorityFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		modes[mode]++
+		return blockRepairAuthorityRow{}, false, nil
+	}
+	blockRepairHasS3OrphanFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (bool, error) {
+		modes[mode]++
+		return false, nil
+	}
+
+	err := (&DB{}).RepairBlockMetadataIfCurrent("org-1", PlainBlockRepresentationID, installTestBlockID, "", 7, BlockPhysicalLocation{
+		StorageClass: "hot",
+		StorageKey:   "blocks/org-1/minted",
+	})
+	if !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+		t.Fatalf("RepairBlockMetadataIfCurrent() = %v, want authority changed for an absent row", err)
+	}
+	if modes[BlockAuthorityStrong] != 0 {
+		t.Fatalf("metadata repair issued %d SERIAL reads, want 0 on the deduplicated upload path", modes[BlockAuthorityStrong])
+	}
+	if modes[BlockAuthorityAdvisory] != 2 {
+		t.Fatalf("metadata repair advisory reads = %d, want 2", modes[BlockAuthorityAdvisory])
 	}
 }

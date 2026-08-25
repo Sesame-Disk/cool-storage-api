@@ -1226,7 +1226,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := PutBlockMaterializationTarget(ctx, h.db, orgID, internalBlockID, target, content, putUploadedBlockAutoDirectFn)
+			_, putErr := PutBlockMaterializationTarget(ctx, h.db, orgID, internalBlockID, target, content, putUploadedBlockAutoDirectFn, nil)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
