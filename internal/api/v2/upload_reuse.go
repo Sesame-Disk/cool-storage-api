@@ -93,9 +93,12 @@ type blockMaterializationPutFn func(context.Context, *storage.BlockStore, string
 // matters in both directions: running it earlier would charge a session staging
 // reservation for a PUT the fence then refuses (the ledger write has a TTL and no
 // inverse), and running it later would put a write between the authority decision
-// and the PUT it authorizes. Between the two, the single local ledger insert is
+// and the PUT it authorizes. Between the two, the staging ledger round trip is
 // the smaller cost, and the residual authority->PUT race is covered by R17's
-// non-creating repair rather than by shortening this window.
+// non-creating repair rather than by shortening this window. Note the ledger
+// operations inherit the session consistency (block_upload_staging.go) rather
+// than pinning one, so this window is "not a WAN authority read", not a
+// LOCAL_QUORUM guarantee.
 func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, blockID string, target BlockMaterializationTarget, data []byte, put blockMaterializationPutFn, admit func() error) (string, error) {
 	if target.Store == nil || put == nil {
 		return "", fmt.Errorf("block store PUT is unavailable for %s", blockID)
