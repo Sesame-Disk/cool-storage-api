@@ -129,11 +129,21 @@ func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, 
 	}
 	if admit != nil {
 		if admitErr := admit(); admitErr != nil {
-			return "", admitErr
+			return "", fmt.Errorf("%w: %w", errBlockAdmissionRejected, admitErr)
 		}
 	}
 	return put(ctx, target.Store, target.StorageKey, data)
 }
+
+// errBlockAdmissionRejected marks an error produced by the caller's admission
+// callback rather than by the store. Admission speaks the caller's own vocabulary
+// -- the session staging ledger answers with errSessionStagingCapReached, which
+// UploadBlock turns into 429 plus a Retry-After -- so it must reach the caller
+// with that sentinel intact and WITHOUT acquiring the transient tag. Tagging it
+// transient would both retry a decision that cannot change within the request
+// (admission is memoized per request) and strip the sentinel the handler matches
+// on, collapsing a precise 429 into a generic 500.
+var errBlockAdmissionRejected = errors.New("block admission rejected")
 
 // wrapBlockMaterializationPutError preserves the class the authority boundary
 // already decided. Blanket-tagging every PUT failure as transient would make a
@@ -142,14 +152,17 @@ func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, 
 // into a fresh incarnation. Fence and permanent errors therefore pass through
 // with their own sentinel intact.
 func wrapBlockMaterializationPutError(putErr error, format string, args ...interface{}) error {
-	detail := fmt.Errorf(format, args...)
 	switch {
+	case errors.Is(putErr, errBlockAdmissionRejected):
+		// Not a store failure. Hand it back untouched so the caller's own
+		// classification -- and its HTTP status -- survives.
+		return putErr
 	case errors.Is(putErr, ErrBlockDeleteInProgress):
-		return fmt.Errorf("%w: %s", ErrBlockDeleteInProgress, detail)
+		return fmt.Errorf("%w: %s: %w", ErrBlockDeleteInProgress, fmt.Sprintf(format, args...), putErr)
 	case errors.Is(putErr, db.ErrBlockMetadataPermanent):
-		return fmt.Errorf("%s: %w", detail, putErr)
+		return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), putErr)
 	default:
-		return fmt.Errorf("%w: %s", ErrBlockMaterializationTransient, detail)
+		return fmt.Errorf("%w: %s: %w", ErrBlockMaterializationTransient, fmt.Sprintf(format, args...), putErr)
 	}
 }
 
@@ -325,7 +338,7 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, database *db.DB, bl
 			return target, false, nil
 		}
 		if _, putErr := PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, repairCanonicalBlockDirectFn, beforePut); putErr != nil {
-			return target, false, wrapBlockMaterializationPutError(putErr, "repair canonical block %s in %s: %w", blockID, canonicalClass, putErr)
+			return target, false, wrapBlockMaterializationPutError(putErr, "repair canonical block %s in %s", blockID, canonicalClass)
 		}
 		return target, true, nil
 	case db.BlockReuseNeedsPut:
@@ -335,7 +348,7 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, database *db.DB, bl
 			return BlockMaterializationTarget{}, false, resolveErr
 		}
 		if _, putErr := PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, repairCanonicalBlockDirectFn, beforePut); putErr != nil {
-			return target, false, wrapBlockMaterializationPutError(putErr, "store block %s in %s: %w", blockID, target.StorageClass, putErr)
+			return target, false, wrapBlockMaterializationPutError(putErr, "store block %s in %s", blockID, target.StorageClass)
 		}
 		return target, true, nil
 	case db.BlockReuseBlockedByGC:

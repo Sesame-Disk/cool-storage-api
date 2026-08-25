@@ -43,6 +43,20 @@ retryable -- which in the initial phase would have re-entered the minting phase.
 Session staging admission runs after authority is granted, so a fenced repair no
 longer burns bucket cap it cannot release.
 
+Fence reads pin `LOCAL_QUORUM` instead of inheriting `database.consistency`,
+which accepts `ONE`. The advisory-read argument is an intersection between an
+`EACH_QUORUM` fence commit and the reader's quorum; a `ONE` read does not
+participate in it and could report no fence at all, letting a writer mint while
+the previous lifecycle's orphan was still live.
+
+Admission errors no longer pass through the physical-PUT error wrapper. Moving
+session staging admission inside the authority funnel had let
+`errSessionStagingCapReached` acquire the transient tag and lose its sentinel,
+which retried a decision that cannot change within a request and collapsed the
+web uploader's 429 plus `Retry-After` into a generic 500. The wrapper also now
+ends on the store's own error, so cancellation and backend sentinels stay
+matchable through it.
+
 A `size_bytes` disagreement on an existing canonical row is now a permanent
 failure. The removed generic upsert never compared size; the block id is a
 SHA-256 of the content, so a mismatch is an identity contradiction and fails

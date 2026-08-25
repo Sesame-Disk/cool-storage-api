@@ -1678,3 +1678,108 @@ func TestP3StagingAdmissionRunsOnlyAfterAuthority(t *testing.T) {
 		})
 	}
 }
+
+// TestP3AdmissionRejectionKeepsItsOwnClassification is the regression gate for
+// the staging cap contract. Admission speaks the caller's vocabulary, so its
+// error must reach UploadBlock with errSessionStagingCapReached intact and
+// WITHOUT the transient tag: the tag would retry a decision that cannot change
+// within the request, and the lost sentinel would turn a precise 429 into a
+// generic 500.
+func TestP3AdmissionRejectionKeepsItsOwnClassification(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "", nil
+	}
+
+	for _, sentinel := range []error{errSessionStagingCapReached, errSessionStagingCheck, errSessionStagingReserve} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			putCalls = 0
+			admit := func() error { return sentinel }
+			probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+			_, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, admit, BlockMaterializationInitial)
+
+			if didPut || putCalls != 0 {
+				t.Fatalf("didPut=%v putCalls=%d; a rejected admission must not write bytes", didPut, putCalls)
+			}
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("error = %v; want %v preserved so the handler can classify it", err, sentinel)
+			}
+			if errors.Is(err, ErrBlockMaterializationTransient) {
+				t.Fatalf("error = %v; an admission decision must not be tagged transient", err)
+			}
+			if IsRetryableBlockMaterializationError(err) {
+				t.Fatalf("IsRetryableBlockMaterializationError(%v) = true; admission is memoized per request and cannot change on retry", err)
+			}
+		})
+	}
+}
+
+// TestP3PutFailureKeepsItsCause pins the other half of the wrapper contract: the
+// transient tag is added to the store's error, never substituted for it, so
+// cancellation and backend sentinels stay matchable.
+func TestP3PutFailureKeepsItsCause(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldExists := reusableCanonicalObjectExistsFn
+	oldRepair := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		validateBlockRepairAuthorityFn = oldValidate
+		resolveCanonicalBlockStoreFn = oldResolve
+		reusableCanonicalObjectExistsFn = oldExists
+		repairCanonicalBlockDirectFn = oldRepair
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
+	}
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonicalStore, nil
+	}
+	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {
+		return false, nil
+	}
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		return "", context.Canceled
+	}
+
+	probe := db.BlockReuseProbe{Decision: db.BlockReuseReusable, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	_, _, err := StoreUploadedBlockForProbeForPhase(context.Background(), &db.DB{}, uploadReuseTestBlockID, probe, []byte("data"), nil, nil, "hot", orgID, nil, BlockMaterializationInitial)
+
+	if !errors.Is(err, ErrBlockMaterializationTransient) {
+		t.Fatalf("error = %v; want the transient tag", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v; want context.Canceled to survive the wrapper", err)
+	}
+}

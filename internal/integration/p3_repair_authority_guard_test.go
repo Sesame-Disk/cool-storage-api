@@ -2,8 +2,10 @@ package integration
 
 import (
 	"go/ast"
+	"go/token"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -13,7 +15,20 @@ import (
 // passes through the non-creating RepairBlockMetadataIfCurrent primitive.
 func TestP3RepairAuthorityFunnelsAreExclusive(t *testing.T) {
 	program := p2LoadProductionProgram(t)
+	// Both the known seam aliases AND the underlying storage operations they wrap.
+	// Naming only the aliases would let a future direct blockStore.PutObjectAutoDirect
+	// call slip past the authority funnel without tripping this guard.
 	directPuts := map[string]bool{
+		"putUploadedBlockAutoDirectFn":          true,
+		"syncPutBlockAutoDirectFn":              true,
+		"putUploadedBlockAutoDirectForUploadFn": true,
+		"repairCanonicalBlockDirectFn":          true,
+		"PutObjectAutoDirect":                   true,
+		"PutObject":                             true,
+	}
+	// The seam variables ARE the funnel's put functions, so the storage operation
+	// is expected inside their own bodies -- and only there.
+	putSeams := map[string]bool{
 		"putUploadedBlockAutoDirectFn":          true,
 		"syncPutBlockAutoDirectFn":              true,
 		"putUploadedBlockAutoDirectForUploadFn": true,
@@ -27,23 +42,26 @@ func TestP3RepairAuthorityFunnelsAreExclusive(t *testing.T) {
 			continue
 		}
 		for _, file := range source.files {
-			ast.Inspect(file, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
+			for _, declaration := range file.Decls {
+				enclosing := p3EnclosingName(declaration)
+				ast.Inspect(declaration, func(node ast.Node) bool {
+					call, ok := node.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					name := p3CalledFunctionName(call.Fun)
+					if directPuts[name] && !putSeams[enclosing] {
+						t.Errorf("%s: direct physical PUT through %s in %s bypasses P3 repair authority", filepath.Base(source.paths[file]), name, enclosing)
+					}
+					if name == "PutBlockMaterializationTarget" {
+						helperCalls++
+					}
+					if name == "RepairBlockMetadataIfCurrent" {
+						repairCalls++
+					}
 					return true
-				}
-				name := p3CalledFunctionName(call.Fun)
-				if directPuts[name] {
-					t.Errorf("%s: direct physical PUT through %s bypasses P3 repair authority", filepath.Base(source.paths[file]), name)
-				}
-				if name == "PutBlockMaterializationTarget" {
-					helperCalls++
-				}
-				if name == "RepairBlockMetadataIfCurrent" {
-					repairCalls++
-				}
-				return true
-			})
+				})
+			}
 		}
 	}
 
@@ -70,6 +88,14 @@ func TestP3MetadataRepairPrimitiveCannotCreate(t *testing.T) {
 			}
 			found = true
 			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if literal, ok := node.(*ast.BasicLit); ok && literal.Kind == token.STRING {
+					if text, err := strconv.Unquote(literal.Value); err == nil {
+						if strings.Contains(strings.ToUpper(text), "INSERT INTO") {
+							t.Errorf("RepairBlockMetadataIfCurrent embeds a CQL INSERT; repair must never create a row")
+						}
+					}
+					return true
+				}
 				call, ok := node.(*ast.CallExpr)
 				if !ok {
 					return true
@@ -174,4 +200,79 @@ func allowedNames(allowed map[string]bool) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// TestP3FenceReadsPinTheirOwnConsistency keeps the A+ fence argument independent
+// of operator configuration. `database.consistency` accepts ONE, and a ONE read
+// can land on a replica that never received an EACH_QUORUM fence commit -- which
+// would let a writer see no fence and mint while the previous lifecycle's orphan
+// is live. Every gc_s3_orphans read on a writer path must therefore state the
+// level its own correctness needs.
+func TestP3FenceReadsPinTheirOwnConsistency(t *testing.T) {
+	program := p2LoadProductionProgram(t)
+	source := program.packages["github.com/Sesame-Disk/sesamefs/internal/db"]
+	if source == nil {
+		t.Fatal("internal/db production package not found")
+	}
+	checked := 0
+	for _, file := range source.files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "Query" || len(call.Args) == 0 {
+				return true
+			}
+			literal, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			text, err := strconv.Unquote(literal.Value)
+			if err != nil || !strings.Contains(text, "FROM gc_s3_orphans") {
+				return true
+			}
+			checked++
+			if !p3QueryPinsConsistency(file, call) {
+				t.Errorf("a gc_s3_orphans read does not pin its consistency; inheriting the session level lets ONE miss a published fence:\n%s", strings.TrimSpace(text))
+			}
+			return true
+		})
+	}
+	if checked == 0 {
+		t.Fatal("no gc_s3_orphans reads found in internal/db; the guard would pass vacuously")
+	}
+}
+
+// p3QueryPinsConsistency reports whether the expression chain enclosing this
+// Query call applies an explicit Consistency, either directly or through the
+// BlockAuthorityRead.apply funnel.
+func p3QueryPinsConsistency(file *ast.File, query *ast.CallExpr) bool {
+	pinned := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		outer, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := outer.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if selector.Sel.Name != "Consistency" && selector.Sel.Name != "apply" {
+			return true
+		}
+		found := false
+		ast.Inspect(outer, func(inner ast.Node) bool {
+			if inner == query {
+				found = true
+			}
+			return true
+		})
+		if found {
+			pinned = true
+		}
+		return true
+	})
+	return pinned
 }

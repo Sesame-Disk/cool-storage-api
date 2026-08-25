@@ -314,14 +314,24 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 // published moments earlier: the exact-incarnation revalidation immediately
 // before a physical repair PUT (R10).
 //
-// BlockAuthorityAdvisory is an ordinary read. It is correct wherever the answer
-// only gates an early-out and the real authority is enforced structurally
-// downstream — by the single-use INSTALL LWT for a fresh incarnation, or by the
-// tuple-bound, non-creating CAS in RepairBlockMetadataIfCurrent (R17). Because
-// ClaimBlockDelete and StartBlockDeleteOrphan publish with EACH_QUORUM commit
-// visibility, an ordinary read already observes every committed fence; what it
-// may miss is a fence whose Paxos commit is still in flight, and every such
-// caller is one whose downstream authority rejects the stale observation.
+// BlockAuthorityAdvisory is a quorum read, not an inherited one. It is correct
+// wherever the answer gates an early-out and the real authority is enforced
+// structurally downstream — by the single-use INSTALL LWT for a fresh
+// incarnation, or by the tuple-bound, non-creating CAS in
+// RepairBlockMetadataIfCurrent (R17). Because ClaimBlockDelete and
+// StartBlockDeleteOrphan publish with EACH_QUORUM commit visibility, a
+// LOCAL_QUORUM read intersects that commit in every DC and therefore observes
+// every committed fence; what it may miss is a fence whose Paxos commit is still
+// in flight, and every such caller has downstream authority that rejects the
+// stale observation.
+//
+// The level is pinned rather than inherited BECAUSE that intersection is the
+// whole argument. `database.consistency` accepts ONE (config.go), and a ONE read
+// can land on a replica that never received the commit — which would let a writer
+// see no fence at all and mint a new incarnation while the previous lifecycle's
+// orphan is still live. A fence read therefore declares the consistency its own
+// correctness requires instead of trusting operator configuration, exactly as
+// BlockHasReferencesGlobal does for the destructive side.
 type BlockAuthorityRead int
 
 const (
@@ -329,11 +339,15 @@ const (
 	BlockAuthorityStrong
 )
 
+// BlockFenceReadConsistency is the weakest read that still intersects an
+// EACH_QUORUM fence publication in the reader's own DC.
+const BlockFenceReadConsistency = gocql.LocalQuorum
+
 func (mode BlockAuthorityRead) apply(query *gocql.Query) *gocql.Query {
 	if mode == BlockAuthorityStrong {
 		return query.Consistency(gocql.Serial)
 	}
-	return query
+	return query.Consistency(BlockFenceReadConsistency)
 }
 
 // These seams keep existing-incarnation repair separate from create-only install.
@@ -1187,7 +1201,7 @@ var probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bo
 	var existingBlockID string
 	err := database.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&existingBlockID)
+	`, orgID, blockID).Consistency(BlockFenceReadConsistency).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -1490,7 +1504,7 @@ var blockDeleteFenceGCStateFn = func(database *DB, orgID, blockID string) (strin
 	var gcState string
 	err := database.Session().Query(`
 		SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&gcState)
+	`, orgID, blockID).Consistency(BlockFenceReadConsistency).Scan(&gcState)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return "", false, nil
@@ -1504,7 +1518,7 @@ var blockDeleteFenceHasS3OrphanFn = func(database *DB, orgID, blockID string) (b
 	var existingBlockID string
 	err := database.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&existingBlockID)
+	`, orgID, blockID).Consistency(BlockFenceReadConsistency).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -1519,7 +1533,7 @@ func (db *DB) GetBlockS3OrphanInfo(orgID, blockID string) (BlockS3OrphanInfo, bo
 	err := db.Session().Query(`
 		SELECT storage_class, first_seen_at FROM gc_s3_orphans
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&info.StorageClass, &info.FirstSeenAt)
+	`, orgID, blockID).Consistency(BlockFenceReadConsistency).Scan(&info.StorageClass, &info.FirstSeenAt)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return BlockS3OrphanInfo{}, false, nil

@@ -534,9 +534,10 @@ Persisted `(storage_class, storage_key)` identity is byte-exact and is never
 trimmed. A key must match either the legacy deterministic grammar or the minted
 incarnation grammar above and must bind to the requested SHA-256 block. Fresh
 rowless uploads carry the complete minted target through PUT and the target-aware
-`InstallBlockMetadata` API. Existing canonical reuse/stub repair uses the stored
-tuple through the non-creating `RepairBlockMetadataIfCurrent` API; it does not
-mint or recreate an absent row. If the one-shot INSTALL
+`InstallBlockMetadata` API. Existing canonical reuse uses the stored tuple through the
+non-creating `RepairBlockMetadataIfCurrent` API; it does not mint or recreate an
+absent row. A released stub is instead removed by `RepairReleasedBlockStub` and
+then materializes as a fresh INSTALL. If the one-shot INSTALL
 result is uncertain, SesameFS performs a bounded detached `SERIAL` settlement
 read. An exact tuple proves Applied; a different complete tuple or no row proves
 KnownLost and authorizes cleanup of only the attempted key; unavailable or

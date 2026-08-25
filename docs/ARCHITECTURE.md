@@ -181,9 +181,11 @@ An org-scoped `BlockStore` accepts exactly two key forms for a SHA-256 block ID:
 
 Fresh, rowless materialization mints a new incarnation, PUTs that exact key, and
 uses the target-aware metadata API to `InstallBlockMetadata` once. Existing-row
-reuse and explicitly repairable stubs use the persisted tuple and the repair
-non-creating `RepairBlockMetadataIfCurrent` path; they do not mint or silently
-relocate the block. Fresh
+reuse uses the persisted tuple and the non-creating `RepairBlockMetadataIfCurrent`
+path; it does not mint or silently relocate the block. A repairable stub takes a
+different route: `RepairReleasedBlockStub` claims and removes the incomplete row,
+after which the block is rowless and materializes through the fresh-INSTALL
+contract -- it never reaches the repair primitive. Fresh
 INSTALL preparation first resolves the library's representation with the request
 context. Transient Cassandra resolution failures retry locally with bounded
 backoff while retaining the same already-PUT target; permanent identity/library
