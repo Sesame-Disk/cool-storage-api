@@ -114,7 +114,9 @@ func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, 
 			// The PUT below is deliberately adjacent to the authority decision.
 		case db.BlockRepairAuthorityBlocked:
 			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues("blocked_gc").Inc()
-			return "", fmt.Errorf("%w: %v", ErrBlockDeleteInProgress, authorityErr)
+			// Both sentinels stay matchable: the outer one is what the upload funnel
+			// classifies on, the inner one says which fence rejected the tuple.
+			return "", fmt.Errorf("%w: %w", ErrBlockDeleteInProgress, authorityErr)
 		case db.BlockRepairAuthorityPermanent:
 			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues("invalid").Inc()
 			return "", authorityErr
@@ -124,7 +126,7 @@ func PutBlockMaterializationTarget(ctx context.Context, database *db.DB, orgID, 
 				result = "changed"
 			}
 			metrics.BlockUploadRepairAuthorityTotal.WithLabelValues(result).Inc()
-			return "", fmt.Errorf("%w: revalidate repair authority for block %s: %v", ErrBlockMaterializationTransient, blockID, authorityErr)
+			return "", fmt.Errorf("%w: revalidate repair authority for block %s: %w", ErrBlockMaterializationTransient, blockID, authorityErr)
 		}
 	}
 	if admit != nil {

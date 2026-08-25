@@ -43,6 +43,18 @@ retryable -- which in the initial phase would have re-entered the minting phase.
 Session staging admission runs after authority is granted, so a fenced repair no
 longer burns bucket cap it cannot release.
 
+R13's status is split into the boundary P3 controls and the invariant it does
+not. The writer boundary is closed: a condemned incarnation cannot be reused,
+repaired or minted over by a writer that observes the fence, and the
+claim->orphan->row-delete handoff cannot be read as "rowless, no fence". Strict
+A+ non-overlap is a separate, OPEN row: `InstallBlockMetadata` never consults
+`gc_s3_orphans`, and although a well-formed lifecycle cannot produce an overlap
+(the orphan precedes the row delete), a stale worker still can, because
+`StartBlockDeleteOrphan` never proves it owns the claim while `FinalizeBlockDelete`
+does. `worker.go` already named that window and assigned it to per-attempt claim
+identity -- R14, in P4. If it occurs the result is a stuck fence plus a P1 leak,
+not deletion of live bytes, because recovery revalidates the canonical row.
+
 Fence reads pin `LOCAL_QUORUM` instead of inheriting `database.consistency`,
 which accepts `ONE`. The advisory-read argument is an intersection between an
 `EACH_QUORUM` fence commit and the reader's quorum; a `ONE` read does not

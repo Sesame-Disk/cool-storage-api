@@ -1783,3 +1783,45 @@ func TestP3PutFailureKeepsItsCause(t *testing.T) {
 		t.Fatalf("error = %v; want context.Canceled to survive the wrapper", err)
 	}
 }
+
+// TestP3AuthorityRejectionKeepsTheDBCause pins that the funnel's outer
+// classification is added to the authority error, never substituted for it, so a
+// caller can still tell which fence rejected the tuple.
+func TestP3AuthorityRejectionKeepsTheDBCause(t *testing.T) {
+	oldValidate := validateBlockRepairAuthorityFn
+	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldValidate })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonicalStore, storeErr := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if storeErr != nil {
+		t.Fatalf("NewOrgBlockStore() error = %v", storeErr)
+	}
+	target := BlockMaterializationTarget{Store: canonicalStore, StorageClass: "hot", StorageKey: canonicalStore.StorageKeyForHash(uploadReuseTestBlockID)}
+	put := func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		t.Fatal("PUT must not run when authority is refused")
+		return "", nil
+	}
+
+	for _, tc := range []struct {
+		name    string
+		outcome db.BlockRepairAuthorityOutcome
+		cause   error
+		outer   error
+	}{
+		{name: "fenced", outcome: db.BlockRepairAuthorityBlocked, cause: db.ErrBlockRepairBlocked, outer: ErrBlockDeleteInProgress},
+		{name: "changed", outcome: db.BlockRepairAuthorityChanged, cause: db.ErrBlockRepairAuthorityChanged, outer: ErrBlockMaterializationTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+				return tc.outcome, fmt.Errorf("%w: detail", tc.cause)
+			}
+			_, err := PutBlockMaterializationTarget(context.Background(), &db.DB{}, orgID, uploadReuseTestBlockID, target, []byte("data"), put, nil)
+			if !errors.Is(err, tc.outer) {
+				t.Fatalf("error = %v; want outer %v", err, tc.outer)
+			}
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("error = %v; want the db cause %v to survive", err, tc.cause)
+			}
+		})
+	}
+}

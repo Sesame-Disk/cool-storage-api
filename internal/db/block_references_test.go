@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // installTestBlockID is a real SHA-256 block id. InstallBlockMetadata validates
@@ -1553,5 +1554,17 @@ func TestP3MetadataRepairUsesAdvisoryReads(t *testing.T) {
 	}
 	if modes[BlockAuthorityAdvisory] != 2 {
 		t.Fatalf("metadata repair advisory reads = %d, want 2", modes[BlockAuthorityAdvisory])
+	}
+}
+
+// TestP3FenceReadConsistencyIsLocalQuorum pins the value, not just the fact that
+// fence reads declare one. The whole advisory-read argument is an intersection --
+// an EACH_QUORUM fence commit meets the reader's quorum in every DC -- and it
+// holds for LOCAL_QUORUM and stronger. Lowering this constant to ONE would leave
+// every fence read syntactically "pinned" while silently removing the guarantee,
+// which the AST guard alone cannot see.
+func TestP3FenceReadConsistencyIsLocalQuorum(t *testing.T) {
+	if BlockFenceReadConsistency != gocql.LocalQuorum {
+		t.Fatalf("BlockFenceReadConsistency = %v, want gocql.LocalQuorum; a weaker level does not intersect an EACH_QUORUM fence publication", BlockFenceReadConsistency)
 	}
 }
