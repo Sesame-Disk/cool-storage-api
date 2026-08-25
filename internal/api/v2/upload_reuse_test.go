@@ -316,13 +316,26 @@ func TestRetryUploadedBlockMaterializationRetriesTransientMaterialize(t *testing
 	}
 }
 
+// TestRetryUploadedBlockMaterializationRetriesTransientConfirmation pins that a
+// transient canonical HEAD/repair failure during confirmation retries the
+// CONFIRMATION probe and does not restart the whole cycle. The INSTALL is already
+// applied at this point, so the initial phase has nothing left to do -- and
+// re-entering it is the one path that can mint a second incarnation, which a
+// following rowless read would then be free to PUT. Keeping the retry local is a
+// strict narrowing of that window (finding F5).
+//
+// Before: store(Initial), materialize, store(Confirmation) fails transient,
+// store(Initial) again, materialize again, store(Confirmation) -> 4 stores / 2
+// materializes. Now the retry stays in confirmation -> 3 stores / 1 materialize.
 func TestRetryUploadedBlockMaterializationRetriesTransientConfirmation(t *testing.T) {
 	fastBlockMaterializationRetries(t)
 
 	storeCalls := 0
 	materializeCalls := 0
-	err := RetryUploadedBlockMaterialization("Confirmation", "block-1", func() error {
+	phases := []BlockMaterializationPhase{}
+	err := RetryUploadedBlockMaterializationPhasedContext(nil, "Confirmation", "block-1", func(phase BlockMaterializationPhase) error {
 		storeCalls++
+		phases = append(phases, phase)
 		if storeCalls == 2 {
 			return fmt.Errorf("HEAD timeout: %w", ErrBlockMaterializationTransient)
 		}
@@ -334,8 +347,54 @@ func TestRetryUploadedBlockMaterializationRetriesTransientConfirmation(t *testin
 	if err != nil {
 		t.Fatalf("error = %v, want nil", err)
 	}
+	if storeCalls != 3 || materializeCalls != 1 {
+		t.Fatalf("store/materialize calls = %d/%d, want 3/1", storeCalls, materializeCalls)
+	}
+	want := []BlockMaterializationPhase{BlockMaterializationInitial, BlockMaterializationConfirmation, BlockMaterializationConfirmation}
+	if len(phases) != len(want) {
+		t.Fatalf("phases = %v, want %v", phases, want)
+	}
+	for i, phase := range want {
+		if phases[i] != phase {
+			t.Fatalf("phases = %v, want %v; a transient confirmation failure must not re-enter the mint phase", phases, want)
+		}
+	}
+}
+
+// TestRetryUploadedBlockMaterializationRestartsCycleOnConfirmationFence is the
+// other half of the same contract: a GC delete FENCE observed during confirmation
+// still restarts the whole cycle. The fence invalidates the canonical state this
+// request installed and GC may have physically removed the object, so probe ->
+// prepare has to re-run from the initial phase and re-PUT. Narrowing the transient
+// case must not narrow this one.
+func TestRetryUploadedBlockMaterializationRestartsCycleOnConfirmationFence(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	storeCalls := 0
+	materializeCalls := 0
+	phases := []BlockMaterializationPhase{}
+	err := RetryUploadedBlockMaterializationPhasedContext(nil, "Confirmation", "block-1", func(phase BlockMaterializationPhase) error {
+		storeCalls++
+		phases = append(phases, phase)
+		if storeCalls == 2 {
+			return ErrBlockDeleteInProgress
+		}
+		return nil
+	}, func() error {
+		materializeCalls++
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
 	if storeCalls != 4 || materializeCalls != 2 {
-		t.Fatalf("store/materialize calls = %d/%d, want 4/2", storeCalls, materializeCalls)
+		t.Fatalf("store/materialize calls = %d/%d, want 4/2; a confirmation fence must repeat the full cycle so the object is re-PUT", storeCalls, materializeCalls)
+	}
+	want := []BlockMaterializationPhase{BlockMaterializationInitial, BlockMaterializationConfirmation, BlockMaterializationInitial, BlockMaterializationConfirmation}
+	for i, phase := range want {
+		if phases[i] != phase {
+			t.Fatalf("phases = %v, want %v", phases, want)
+		}
 	}
 }
 

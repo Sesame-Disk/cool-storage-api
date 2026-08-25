@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -19,6 +20,10 @@ import (
 // real Cassandra and MinIO: contenders own distinct physical incarnations, one
 // complete tuple wins, and cleanup can remove only the known loser.
 func TestP2ConcurrentCanonicalInstall(t *testing.T) {
+	// MUST be first: the gate can only convert a skip into a failure if it is
+	// registered before any helper that is able to skip.
+	evidence := p2RequireContentionEvidence(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -82,6 +87,7 @@ func TestP2ConcurrentCanonicalInstall(t *testing.T) {
 		t.Fatalf("contention gate received non-distinct candidates: %+v", contenders)
 	}
 	t.Logf("P2_CONTENTION_EVIDENCE candidates=%d keys=%q,%q", len(contenders), contenders[0].StorageKey, contenders[1].StorageKey)
+	evidence.record(len(contenders))
 	close(start)
 	attempts := []attempt{<-results, <-results}
 
@@ -142,4 +148,50 @@ func TestP2ConcurrentCanonicalInstall(t *testing.T) {
 	if !bytes.Equal(winnerBytes, content) {
 		t.Fatalf("winner bytes changed after loser cleanup: got %q want %q", winnerBytes, content)
 	}
+}
+
+// p2RequireEvidenceEnv turns TestP2ConcurrentCanonicalInstall's skips into
+// failures. P2/R9/R24 are documented as CLOSED on the strength of this one real
+// Cassandra+MinIO race, so the command that produces that evidence must not be
+// able to report success without it.
+//
+// It can: this test reaches t.Skip through its environment helpers -- an
+// unreachable MinIO store or bucket (newVerificationS3Store), an empty
+// storage_class, or a verification BlockStore pointed at a different bucket
+// (discoverStorageClass). A skipped Go test exits 0, so a bare `go test` here
+// prints "PASS / ok" and proves nothing. An earlier revision of this branch
+// guarded the command with greps for "--- PASS" and "P2_CONTENTION_EVIDENCE"
+// and against "--- SKIP"; that guard was dropped and this replaces it, in the
+// test itself rather than in shell the host has to quote correctly.
+const p2RequireEvidenceEnv = "SESAMEFS_REQUIRE_P2_EVIDENCE"
+
+// p2EvidenceGate records that the real two-candidate contention actually happened.
+type p2EvidenceGate struct{ candidates int }
+
+func (gate *p2EvidenceGate) record(candidates int) { gate.candidates = candidates }
+
+// p2RequireContentionEvidence arms the gate when p2RequireEvidenceEnv is set. The
+// check runs in a cleanup, which still executes after t.Skip and whose failure
+// overrides the skip -- so a skip anywhere in the helper chain becomes a FAIL and
+// a non-zero exit code. Unset, the test keeps its normal skip-on-missing-env
+// behavior for developers running the suite without a full stack.
+func p2RequireContentionEvidence(t *testing.T) *p2EvidenceGate {
+	t.Helper()
+	gate := &p2EvidenceGate{}
+	if os.Getenv(p2RequireEvidenceEnv) != "1" {
+		return gate
+	}
+	t.Cleanup(func() {
+		if t.Skipped() {
+			t.Errorf("%s=1 requires this test to run, but it skipped: the P2/R9/R24 closure evidence was not produced. Bring up Cassandra and MinIO (docker compose up -d) and re-run.", p2RequireEvidenceEnv)
+			return
+		}
+		if t.Failed() {
+			return
+		}
+		if gate.candidates != 2 {
+			t.Errorf("%s=1 requires P2_CONTENTION_EVIDENCE candidates=2, got candidates=%d: the run passed without two real contending incarnations.", p2RequireEvidenceEnv, gate.candidates)
+		}
+	})
+	return gate
 }

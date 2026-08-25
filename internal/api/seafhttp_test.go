@@ -3197,7 +3197,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		storeCalls.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
 		storeCalls.Add(1)
 		return "", nil
 	}
@@ -3455,7 +3455,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		directPuts.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
 		reusableChecks.Add(1)
 		return "", nil
 	}

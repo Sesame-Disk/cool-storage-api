@@ -1217,7 +1217,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			storageKey, ensureErr := EnsureReusableBlockPresent(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID, phase)
 			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:

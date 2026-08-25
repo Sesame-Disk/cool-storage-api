@@ -284,10 +284,19 @@ func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, pro
 // a Cassandra-reusable block and repairs it in place when it is missing. orgID
 // org-scopes the canonical locator (see ResolveCanonicalBlockStore).
 func EnsureReusableBlockPresent(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string) (string, error) {
+	return EnsureReusableBlockPresentForPhase(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, BlockMaterializationInitial)
+}
+
+// EnsureReusableBlockPresentForPhase is the phase-carrying form. The Reusable
+// branch never mints, so both phases behave identically today; forwarding the
+// phase anyway keeps every confirmation-phase funnel out of an initial-phase
+// helper, so no future change to the Reusable branch can silently regain mint
+// authority through this door (finding F4).
+func EnsureReusableBlockPresentForPhase(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, fallbackStore *storage.BlockStore, fallbackClass, orgID string, phase BlockMaterializationPhase) (string, error) {
 	if probe.Decision != db.BlockReuseReusable {
 		return "", fmt.Errorf("block %s is not reusable", blockID)
 	}
-	target, _, err := StoreUploadedBlockForProbe(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil)
+	target, _, err := StoreUploadedBlockForProbeForPhase(ctx, blockID, probe, data, storageManager, fallbackStore, fallbackClass, orgID, nil, phase)
 	return target.StorageKey, err
 }
 
@@ -383,14 +392,19 @@ func RetryUploadedBlockMaterializationPhasedContext(ctx context.Context, label, 
 				if !IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
 					return err
 				}
-				if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
-					if abortErr := retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err); abortErr != nil {
-						return abortErr
-					}
-					continue
-				}
 				if abortErr := retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err); abortErr != nil {
 					return abortErr
+				}
+				// Only a GC delete fence restarts the full cycle: the fence invalidates
+				// the canonical state this request just installed, so probe->prepare has
+				// to re-run from the initial phase. Every other retryable confirmation
+				// failure -- a transient canonical HEAD/repair error, or a canonical row
+				// that is not visible yet -- is convergence of state this request already
+				// installed, so it retries the confirmation probe instead. Staying here is
+				// what keeps a transient HEAD failure from handing the initial phase
+				// another chance to mint a second incarnation (finding F5).
+				if !errors.Is(err, ErrBlockDeleteInProgress) {
+					continue
 				}
 			}
 			break

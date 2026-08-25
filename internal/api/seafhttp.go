@@ -1846,7 +1846,7 @@ var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore
 }
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var prepareUploadedBlockProbeForUploadFn = v2.PrepareUploadedBlockProbe
-var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
+var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresentForPhase
 var resolveNeedsPutBlockStoreForUploadFn = v2.ResolveNeedsPutBlockStoreForPhase
 var registerUploadedBlockTargetAndMappingForUploadFn = v2.RegisterUploadedBlockTargetAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
@@ -2516,7 +2516,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+			storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(ctx, sha256ID, probe, storedContent, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
 			materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			if ensureErr != nil {
 				return ensureErr
@@ -2652,6 +2652,12 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
 	case errors.Is(err, v2.ErrBlockDeleteInProgress):
 		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+	// Same retryable class as the fence above: the block is installed and durable,
+	// only its canonical row stayed invisible for this request's whole confirmation
+	// budget. A 500 here would report a healthy block as a server fault (finding F2).
+	case errors.Is(err, v2.ErrBlockCanonicalStateNotVisible):
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the upload"})
 	case errors.Is(err, v2.ErrLibraryEncryptedNotUnlocked):
 		writeLibraryEncryptedNotUnlocked(c)
 	case errors.Is(err, errStorageQuotaExceeded):
@@ -2773,14 +2779,19 @@ func retrySeafHTTPBlockMaterializationContextPhased(ctx context.Context, label, 
 				if !v2.IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
 					return err
 				}
-				if errors.Is(err, v2.ErrBlockCanonicalStateNotVisible) {
-					if abortErr := retryBlocked(confirmationAttempt, "probe", err); abortErr != nil {
-						return abortErr
-					}
-					continue
-				}
 				if abortErr := retryBlocked(confirmationAttempt, "probe", err); abortErr != nil {
 					return abortErr
+				}
+				// Only a GC delete fence restarts the full cycle: the fence invalidates
+				// the canonical state this request just installed, so probe->prepare has
+				// to re-run from the initial phase. Every other retryable confirmation
+				// failure -- a transient canonical HEAD/repair error, or a canonical row
+				// that is not visible yet -- is convergence of state this request already
+				// installed, so it retries the confirmation probe instead. Staying here is
+				// what keeps a transient HEAD failure from handing the initial phase
+				// another chance to mint a second incarnation (finding F5).
+				if !errors.Is(err, v2.ErrBlockDeleteInProgress) {
+					continue
 				}
 			}
 			break
@@ -3042,7 +3053,7 @@ readLoop:
 					}
 					switch probe.Decision {
 					case db.BlockReuseReusable:
-						storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID)
+						storageKey, ensureErr := ensureReusableBlockPresentForUploadFn(egCtx, sha256ID, probe, storedBlock, h.storageManager, blockStore, actualStorageClass, token.OrgID, phase)
 						materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 						return ensureErr
 					case db.BlockReuseNeedsPut:

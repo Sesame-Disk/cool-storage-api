@@ -208,7 +208,7 @@ func TestSyncPutBlockNeedsPutSkipsLegacyExistsAndUsesDirectPut(t *testing.T) {
 		}, nil
 	}
 	ensureCalls := 0
-	syncEnsureReusableBlockPresentFn = func(context.Context, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string) (string, error) {
+	syncEnsureReusableBlockPresentFn = func(context.Context, string, db.BlockReuseProbe, []byte, *storage.Manager, *storage.BlockStore, string, string, v2.BlockMaterializationPhase) (string, error) {
 		ensureCalls++
 		return "", nil
 	}

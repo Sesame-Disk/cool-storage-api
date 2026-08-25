@@ -197,8 +197,12 @@ one final cleanup outcome, not each application or SDK attempt. It is emitted on
 where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
 KnownLost. The branches that retain their object instead of deleting it (ambiguous
 settlement, single-use identity contradiction), and the pre-INSTALL failures that
-return the retryable sentinel, emit nothing: the counter measures cleanup outcomes,
-not the retained-object population. See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
+return the retryable sentinel **before reaching the conclusively-unsubmitted
+cleanup branch** (for example provisional-reference or delete-fence failures),
+emit nothing: the counter measures cleanup outcomes, not the retained-object
+population. The qualifier matters -- the conclusively-unsubmitted branch itself
+both emits `reason="preinstall_failed"` and returns the retryable sentinel, so
+"returns the sentinel" alone does not imply "emits nothing". See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
 
 The upload retry state machine is phase-aware. Only the initial store phase may
 mint and PUT a rowless `NeedsPut` target. The post-materialization confirmation

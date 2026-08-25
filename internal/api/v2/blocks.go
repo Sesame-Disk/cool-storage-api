@@ -774,6 +774,20 @@ func respondBlockMaterializeError(c *gin.Context, err error) bool {
 		})
 		return true
 	}
+	// Exhausted confirmation convergence. The block IS installed and durable --
+	// only this request could not observe its canonical row before the budget ran
+	// out -- so this is the same class as the fence above: transient, retryable,
+	// and resolved by repeating the request. Mapping it to the default 500 would
+	// report a healthy block as a server fault and be indistinguishable from a
+	// real one in monitoring (finding F2).
+	if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusConflict, gin.H{
+			"code":  "block_canonical_state_not_visible",
+			"error": "block state is still converging; retry the upload",
+		})
+		return true
+	}
 	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register block"})
 	return true
 }
@@ -1015,6 +1029,13 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 			return putErr
 		}
 		target = resolvedTarget
+		// RESPONSE_CONTRACT: only the initial phase can make this block "new".
+		// A confirmation-phase write is a repair of an object that went missing
+		// between INSTALL and reconfirmation, not this request creating the block,
+		// so it must not turn a reused block's 200/New:false into 201/New:true.
+		// The consequence is deliberate: the same repair now answers 200 or 201
+		// depending on the phase it happened in, and New again means exactly
+		// "this request created the block".
 		if phase == BlockMaterializationInitial {
 			didPutAny = didPutAny || didPut
 		}

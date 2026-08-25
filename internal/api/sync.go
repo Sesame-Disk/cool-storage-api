@@ -440,7 +440,7 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStoreForPhase
-var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
+var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresentForPhase
 var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping
 var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationPhasedContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
@@ -2022,7 +2022,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID)
+				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID, phase)
 				materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 				return ensureErr
 			case db.BlockReuseNeedsPut:
@@ -2076,6 +2076,14 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
 				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+			} else if errors.Is(err, v2.ErrBlockCanonicalStateNotVisible) {
+				// Same retryable class as the fence above: the block is installed and
+				// durable, only its canonical row stayed invisible for this request's
+				// whole confirmation budget. A 500 would tell the desktop client this
+				// was a server fault and make a healthy block indistinguishable from a
+				// real failure in monitoring (finding F2).
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusConflict, gin.H{"error": "block state is still converging; retry the upload"})
 			} else if errors.Is(err, errSyncStorageQuotaExceeded) {
 				return
 			} else if errors.Is(err, errSyncBlockExistenceCheck) {

@@ -251,11 +251,18 @@ func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMateriali
 				if !IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
 					return err
 				}
-				if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
-					retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
+				retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
+				// Only a GC delete fence restarts the full cycle: the fence invalidates
+				// the canonical state this request just installed, so probe->prepare has
+				// to re-run from the initial phase. Every other retryable confirmation
+				// failure -- a transient canonical HEAD/repair error, or a canonical row
+				// that is not visible yet -- is convergence of state this request already
+				// installed, so it retries the confirmation probe instead. Staying here is
+				// what keeps a transient HEAD failure from handing the initial phase
+				// another chance to mint a second incarnation (finding F5).
+				if !errors.Is(err, ErrBlockDeleteInProgress) {
 					continue
 				}
-				retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
 			}
 			break
 		}
@@ -1372,7 +1379,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				case db.BlockReuseReusable:
 					templateMaterializedStorageClass = probe.StorageClass
 					var ensureErr error
-					templateStorageKey, ensureErr = EnsureReusableBlockPresent(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID)
+					templateStorageKey, ensureErr = EnsureReusableBlockPresentForPhase(c.Request.Context(), templateBlockData.Hash, probe, templateBlockData.Data, h.storageManager, templateBlockStore, templateStorageClass, orgID, phase)
 					if ensureErr != nil {
 						return fmt.Errorf("failed to verify reusable template block: %w", ensureErr)
 					}
@@ -3472,7 +3479,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		switch probe.Decision {
 		case db.BlockReuseReusable:
 			var ensureErr error
-			storageKey, ensureErr := EnsureReusableBlockPresent(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(c.Request.Context(), sha256ID, probe, storedContent, h.storageManager, blockStore, storageClass, orgID, phase)
 			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
