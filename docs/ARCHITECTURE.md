@@ -200,6 +200,19 @@ settlement, single-use identity contradiction), and the pre-INSTALL failures tha
 return the retryable sentinel, emit nothing: the counter measures cleanup outcomes,
 not the retained-object population. See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
 
+The upload retry state machine is phase-aware. Only the initial store phase may
+mint and PUT a rowless `NeedsPut` target. The post-materialization confirmation
+phase may HEAD or repair a persisted canonical tuple, but a rowless `NeedsPut`
+probe returns retryable `canonical block state not visible` and retries the
+confirmation probe without re-entering the mint path. This prevents a successful
+K1 INSTALL from being followed by an untracked K2 during temporary Cassandra
+visibility lag. GC-fence and materialization failures retain the full-cycle retry
+needed to re-establish the exact physical object before metadata is retried.
+`InstallBlockMetadataResult.Submitted` records the DB authority boundary: it is
+false for validation, context, and representation-preparation returns, and true
+for every direct or settled outcome after the INSTALL LWT seam is entered. PUT
+success or transport acknowledgement is not treated as DB submission evidence.
+
 An uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
 detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
 different complete tuple or no row proves it lost, and incomplete/unavailable

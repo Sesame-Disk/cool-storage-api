@@ -122,6 +122,9 @@ type BlockPhysicalLocation struct {
 type InstallBlockMetadataResult struct {
 	Outcome   InstallBlockMetadataOutcome
 	Canonical BlockPhysicalLocation
+	// Submitted is true once the single-use INSTALL LWT has been entered. It is
+	// provenance, not an authority signal; callers still branch on Outcome.
+	Submitted bool
 	// Cause is diagnostic only. It never grants authority to use or clean up a
 	// physical object; Outcome is the complete authority contract.
 	Cause error
@@ -779,12 +782,18 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 	}
 
 	now := time.Now().UTC()
+	// The seam is the DB execution boundary. Once it is entered, even a
+	// preflight/transport error from the driver is post-submit for cleanup
+	// purposes; the LWT itself is single-use and must not be repeated.
+	result.Submitted = true
 	applied, current, installErr := installBlockMetadataLWTFn(ctx, db, orgID, blockID, representationID, sha1, sizeBytes, proposed, now)
 	if installErr == nil {
 		if applied {
-			return InstallBlockMetadataResult{Outcome: InstallBlockMetadataApplied, Canonical: proposed}
+			return InstallBlockMetadataResult{Outcome: InstallBlockMetadataApplied, Canonical: proposed, Submitted: true}
 		}
-		return classifyInstalledBlockMetadataCAS(current, proposed)
+		classified := classifyInstalledBlockMetadataCAS(current, proposed)
+		classified.Submitted = true
+		return classified
 	}
 
 	settlementTimeout := db.config.Timeout
@@ -799,9 +808,10 @@ func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID,
 		return result
 	}
 	if !found {
-		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Cause: installErr}
+		return InstallBlockMetadataResult{Outcome: InstallBlockMetadataKnownLost, Submitted: true, Cause: installErr}
 	}
 	settled := classifySettledBlockMetadataRow(row, proposed)
+	settled.Submitted = true
 	settled.Cause = errors.Join(installErr, settled.Cause)
 	return settled
 }

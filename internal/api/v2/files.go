@@ -194,6 +194,12 @@ var createFileTemplateBlockRetryBackoffFn = RetryBackoff
 var createFileTemplateBlockSleepFn = time.Sleep
 
 func retryCreateFileTemplateBlockMaterialization(store func() error, register func() error, resetStored func()) error {
+	return retryCreateFileTemplateBlockMaterializationPhased(func(BlockMaterializationPhase) error {
+		return store()
+	}, register, resetStored)
+}
+
+func retryCreateFileTemplateBlockMaterializationPhased(store func(BlockMaterializationPhase) error, register func() error, resetStored func()) error {
 	attempts := createFileTemplateBlockRetryAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -219,7 +225,7 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if err := store(); err != nil {
+		if err := store(BlockMaterializationInitial); err != nil {
 			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
@@ -238,14 +244,21 @@ func retryCreateFileTemplateBlockMaterialization(store func() error, register fu
 		if resetStored != nil {
 			resetStored()
 		}
-		if err := store(); err != nil {
-			if !IsRetryableBlockMaterializationError(err) || attempt == attempts {
-				return err
+		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
+			if err := store(BlockMaterializationConfirmation); err == nil {
+				return nil
+			} else {
+				if !IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
+					return err
+				}
+				if errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+					retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
+					continue
+				}
+				retryBlocked(confirmationAttempt, blockMaterializationReasonProbe, err)
 			}
-			retryBlocked(attempt, blockMaterializationReasonProbe, err)
-			continue
+			break
 		}
-		return nil
 	}
 
 	return fmt.Errorf("unreachable template block materialization state")
@@ -1341,7 +1354,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				templateStorageClass = storageClass
 				templateMaterializedStorageClass = storageClass
 			}
-			if err := retryCreateFileTemplateBlockMaterialization(func() error {
+			if err := retryCreateFileTemplateBlockMaterializationPhased(func(phase BlockMaterializationPhase) error {
 				if templateBlockStored {
 					return nil
 				}
@@ -1367,7 +1380,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					templateBlockStored = true
 					return nil
 				case db.BlockReuseNeedsPut:
-					target, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash)
+					target, resolveErr := ResolveNeedsPutBlockStoreForPhase(h.storageManager, templateBlockStore, templateStorageClass, probe, orgID, templateBlockData.Hash, phase)
 					if resolveErr != nil {
 						return resolveErr
 					}
@@ -3446,7 +3459,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 	var materializationTarget BlockMaterializationTarget
-	if err := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadFile", sha256ID, func() error {
+	if err := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadFile", sha256ID, func(phase BlockMaterializationPhase) error {
 		materializationTarget = BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, orgID, sha256ID)
 		if probeErr != nil {
@@ -3463,7 +3476,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
-			target, resolveErr := ResolveNeedsPutBlockStore(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID)
+			target, resolveErr := ResolveNeedsPutBlockStoreForPhase(h.storageManager, blockStore, storageClass, probe, orgID, sha256ID, phase)
 			if resolveErr != nil {
 				return resolveErr
 			}

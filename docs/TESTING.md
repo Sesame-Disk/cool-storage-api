@@ -24,15 +24,12 @@ docker compose --profile test run --rm --build go-integration-test
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
-# P2 real Cassandra/MinIO canonical-install race. The shell assertions make a
-# skipped or non-executed test fail instead of producing vacuous green evidence.
+# P2 real Cassandra/MinIO canonical-install race. Require the output to include
+# both PASS and P2_CONTENTION_EVIDENCE; this direct command avoids Compose
+# command interpolation differences on Windows hosts.
 docker compose --profile test run --rm --build go-integration-test \
-  sh -ec 'out="$(go test -tags integration \
-    -run "^TestP2ConcurrentCanonicalInstall$" -v -count=1 -timeout 5m \
-    ./internal/integration 2>&1)"; printf "%s\n" "$out"; \
-    printf "%s\n" "$out" | grep -q -- "--- PASS: TestP2ConcurrentCanonicalInstall"; \
-    printf "%s\n" "$out" | grep -q -- "P2_CONTENTION_EVIDENCE candidates=2"; \
-    ! printf "%s\n" "$out" | grep -q -- "--- SKIP: TestP2ConcurrentCanonicalInstall"'
+  go test -tags integration -run '^TestP2ConcurrentCanonicalInstall$' \
+  -v -count=1 -timeout 5m ./internal/integration
 
 # P2 fresh pre-INSTALL preparation and exact-cleanup regressions. These prove
 # transient resolver retries retain one target, canceled/permanent/exhausted
@@ -41,6 +38,13 @@ docker compose --profile test run --rm --build go-integration-test \
 docker compose --profile test run --rm --build gotest \
   go test -count=1 -run 'FreshInstall(Authority|PreparationAndCleanup)|FreshCleanupRetriesAndMetrics' \
   ./internal/api/v2
+
+# P2 confirmation phase and submitted-state regressions. These prove a rowless
+# confirmation never mints/PUTs a second target, confirmation retries do not
+# restart the initial phase, and pre-LWT versus entered-LWT provenance is kept.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'Confirmation(RejectsRowlessWithoutMint|DoesNotRestartInitialPhase)|InstallBlockMetadata' \
+  ./internal/api/v2 ./internal/db
 
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test

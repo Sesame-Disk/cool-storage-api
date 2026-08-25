@@ -1002,7 +1002,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	var target BlockMaterializationTarget
 	var didPutAny bool
-	storeErr := RetryUploadedBlockMaterializationContext(c.Request.Context(), "UploadBlock", hash, func() error {
+	storeErr := RetryUploadedBlockMaterializationPhasedContext(c.Request.Context(), "UploadBlock", hash, func(phase BlockMaterializationPhase) error {
 		probe, probeErr := probeUploadedBlockReuseFn(h.db, session.OrgID, hash)
 		if probeErr == nil {
 			probe, probeErr = prepareUploadedBlockProbeFn(h.db, session.OrgID, hash, probe)
@@ -1010,12 +1010,14 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		if probeErr != nil {
 			return probeErr
 		}
-		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbe(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut)
+		resolvedTarget, didPut, putErr := StoreUploadedBlockForProbeForPhase(c.Request.Context(), hash, probe, data, h.storageManager, preferredStore, preferredClass, session.OrgID, beforePut, phase)
 		if putErr != nil {
 			return putErr
 		}
 		target = resolvedTarget
-		didPutAny = didPutAny || didPut
+		if phase == BlockMaterializationInitial {
+			didPutAny = didPutAny || didPut
+		}
 		return nil
 	}, func() error {
 		return h.materializeUploadedBlock(c.Request.Context(), session, hash, sha1Hash, len(data), target)

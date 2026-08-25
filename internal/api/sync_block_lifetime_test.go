@@ -524,7 +524,7 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 	syncPrepareUploadedBlockProbeFn = func(_ *db.DB, _, _ string, probe db.BlockReuseProbe) (db.BlockReuseProbe, error) {
 		return probe, nil
 	}
-	syncResolveNeedsPutBlockStoreFn = func(_ *storage.Manager, preferred *storage.BlockStore, class string, _ db.BlockReuseProbe, _, _ string) (v2.BlockMaterializationTarget, error) {
+	syncResolveNeedsPutBlockStoreFn = func(_ *storage.Manager, preferred *storage.BlockStore, class string, _ db.BlockReuseProbe, _, _ string, _ v2.BlockMaterializationPhase) (v2.BlockMaterializationTarget, error) {
 		return v2.BlockMaterializationTarget{Store: preferred, StorageClass: class, StorageKey: "key", FreshInstall: true}, nil
 	}
 	syncPutBlockAutoDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
@@ -537,15 +537,15 @@ func TestPutBlockRegisterSuccessStillRunsReconfirmationAfterLifetimeExpiry(t *te
 		return nil
 	}
 	secondStoreCalled := false
-	syncRetryUploadedBlockMaterializationFn = func(_ context.Context, _, _ string, store, materialize func() error, _ func(), _ func() (bool, error)) error {
-		if err := store(); err != nil {
+	syncRetryUploadedBlockMaterializationFn = func(_ context.Context, _, _ string, store func(v2.BlockMaterializationPhase) error, materialize func() error, _ func(), _ func() (bool, error)) error {
+		if err := store(v2.BlockMaterializationInitial); err != nil {
 			return err
 		}
 		if err := materialize(); err != nil {
 			return err
 		}
 		secondStoreCalled = true
-		return store()
+		return store(v2.BlockMaterializationConfirmation)
 	}
 
 	cfg := syncInflightConfig(1, 1, 5*time.Second)

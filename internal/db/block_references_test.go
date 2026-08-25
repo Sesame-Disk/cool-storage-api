@@ -56,6 +56,9 @@ func TestInstallBlockMetadataDirectOutcomesCompareCompleteTuple(t *testing.T) {
 			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
 				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
 			}
+			if !got.Submitted {
+				t.Fatal("InstallBlockMetadata() Submitted = false, want true after LWT seam entry")
+			}
 			if test.wantOutcome == InstallBlockMetadataIdentityContradiction && !errors.Is(got.Cause, ErrInstallBlockMetadataIdentityContradiction) {
 				t.Fatalf("InstallBlockMetadata() cause = %v, want identity contradiction", got.Cause)
 			}
@@ -124,6 +127,9 @@ func TestInstallBlockMetadataSettlesMutationErrorsWithoutRepeatingInstall(t *tes
 			if got.Outcome != test.wantOutcome || got.Canonical != test.want {
 				t.Fatalf("InstallBlockMetadata() = %+v, want outcome %v canonical %+v", got, test.wantOutcome, test.want)
 			}
+			if !got.Submitted {
+				t.Fatal("settled InstallBlockMetadata() Submitted = false, want true")
+			}
 			if installCalls != 1 || settleCalls != 1 {
 				t.Fatalf("install/settle calls = %d/%d, want 1/1", installCalls, settleCalls)
 			}
@@ -154,6 +160,9 @@ func TestInstallBlockMetadataSettlementSurvivesRequestCancellationAndIsBounded(t
 	if got.Outcome != InstallBlockMetadataApplied || got.Canonical != proposed {
 		t.Fatalf("InstallBlockMetadata() = %+v, want settled Applied", got)
 	}
+	if !got.Submitted {
+		t.Fatal("settled InstallBlockMetadata() Submitted = false, want true")
+	}
 }
 
 func TestInstallBlockMetadataRejectsInvalidInputBeforeInstall(t *testing.T) {
@@ -171,6 +180,9 @@ func TestInstallBlockMetadataRejectsInvalidInputBeforeInstall(t *testing.T) {
 		got := (&DB{}).InstallBlockMetadata(context.Background(), "org-1", PlainBlockRepresentationID, "block-1", "", 1, proposed)
 		if got.Outcome != InstallBlockMetadataAmbiguous || !errors.Is(got.Cause, ErrBlockMetadataPermanent) {
 			t.Fatalf("InstallBlockMetadata(%+v) = %+v, want non-authorizing permanent rejection", proposed, got)
+		}
+		if got.Submitted {
+			t.Fatalf("InstallBlockMetadata(%+v) Submitted = true before LWT", proposed)
 		}
 	}
 }

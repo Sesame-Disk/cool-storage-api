@@ -439,10 +439,10 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 }
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
-var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStore
+var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStoreForPhase
 var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresent
 var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping
-var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationContext
+var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationPhasedContext
 var syncNewCanonicalBlockReaderFn = streaming.NewCanonicalBlockReader
 var syncNewCanonicalBlockCheckReaderFn = streaming.NewCanonicalBlockCheckReaderWithFanout
 
@@ -2001,7 +2001,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		// The retryable returns write no response. If you add a new response-writing
 		// branch, it MUST return a non-retryable error or the response will be
 		// written twice on retry.
-		if err := syncRetryUploadedBlockMaterializationFn(c.Request.Context(), "PutBlock", internalID, func() error {
+		if err := syncRetryUploadedBlockMaterializationFn(c.Request.Context(), "PutBlock", internalID, func(phase v2.BlockMaterializationPhase) error {
 			if err := c.Request.Context().Err(); err != nil {
 				return err
 			}
@@ -2026,13 +2026,15 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 				materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 				return ensureErr
 			case db.BlockReuseNeedsPut:
-				if checker := getAPIQuotaChecker(); checker != nil {
-					if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
-						c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-						return errSyncStorageQuotaExceeded
+				if phase == v2.BlockMaterializationInitial {
+					if checker := getAPIQuotaChecker(); checker != nil {
+						if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+							c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+							return errSyncStorageQuotaExceeded
+						}
 					}
 				}
-				target, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID)
+				target, resolveErr := syncResolveNeedsPutBlockStoreFn(h.storageManager, blockStore, storageClass, probe, orgID, internalID, phase)
 				if resolveErr != nil {
 					return resolveErr
 				}

@@ -471,11 +471,11 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 		receiver string
 	}
 	wantValidations := map[expectedUse]int{
-		{file: "upload_reuse.go", symbol: "ResolveNeedsPutBlockStore", receiver: "canonicalStore"}:  1,
-		{file: "upload_reuse.go", symbol: "StoreUploadedBlockForProbe", receiver: "canonicalStore"}: 1,
-		{file: "canonical_block_reader.go", symbol: "newCanonicalBlockReader", receiver: "store"}:   1,
-		{file: "worker.go", symbol: "(*Worker).processBlock", receiver: "resolved"}:                 1,
-		{file: "worker.go", symbol: "(*Worker).RecoverS3Orphans", receiver: "blockStore"}:           1,
+		{file: "upload_reuse.go", symbol: "ResolveNeedsPutBlockStoreForPhase", receiver: "canonicalStore"}:  1,
+		{file: "upload_reuse.go", symbol: "StoreUploadedBlockForProbeForPhase", receiver: "canonicalStore"}: 1,
+		{file: "canonical_block_reader.go", symbol: "newCanonicalBlockReader", receiver: "store"}:           1,
+		{file: "worker.go", symbol: "(*Worker).processBlock", receiver: "resolved"}:                         1,
+		{file: "worker.go", symbol: "(*Worker).RecoverS3Orphans", receiver: "blockStore"}:                   1,
 	}
 	wantMintedValidations := map[expectedUse]int{
 		{file: "fs_helpers.go", symbol: "(*FSHelper).RegisterUploadedBlockTarget", receiver: "target.Store"}: 1,
@@ -595,7 +595,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					case "StorageKeyForHash":
 						storageKeyUses = append(storageKeyUses, site)
 					case "MintStorageKey":
-						if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStore" && receiver == "preferredStore" {
+						if filepath.Base(path) == "upload_reuse.go" && symbol == "ResolveNeedsPutBlockStoreForPhase" && receiver == "preferredStore" {
 							mintCount++
 						} else {
 							unexpectedMints = append(unexpectedMints, site)
@@ -620,7 +620,7 @@ func TestP2PhysicalIdentityAuthorityGuard(t *testing.T) {
 					return true
 				})
 
-				if !ok || function.Body == nil || filepath.Base(path) != "upload_reuse.go" || symbol != "ResolveNeedsPutBlockStore" {
+				if !ok || function.Body == nil || filepath.Base(path) != "upload_reuse.go" || symbol != "ResolveNeedsPutBlockStoreForPhase" {
 					continue
 				}
 				for _, statement := range function.Body.List {

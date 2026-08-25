@@ -1027,10 +1027,11 @@ func prepareFreshBlockInstall(ctx context.Context, h *FSHelper, orgID, libraryID
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return freshInstallPreparation{err: ctxErr}
 			}
-			return freshInstallPreparation{
-				result:    registerUploadedBlockInstallMetadataFn(ctx, h, orgID, representationID, blockID, sha1ID, sizeBytes, target),
-				submitted: true,
+			result := registerUploadedBlockInstallMetadataFn(ctx, h, orgID, representationID, blockID, sha1ID, sizeBytes, target)
+			if !result.Submitted && result.Cause == nil {
+				result.Cause = fmt.Errorf("%w: fresh install callback returned without submitting INSTALL for %s", db.ErrBlockMetadataPermanent, blockID)
 			}
+			return freshInstallPreparation{result: result, submitted: result.Submitted, err: result.Cause}
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return freshInstallPreparation{err: ctxErr}

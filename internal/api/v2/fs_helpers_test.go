@@ -523,7 +523,7 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 
 	t.Run("applied retains canonical object", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied, Submitted: true}
 		}
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
 			t.Fatal("applied canonical object must never be deleted")
@@ -534,9 +534,27 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		}
 	})
 
+	t.Run("unsubmitted result cannot report success", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+		}
+		deleteCalls := 0
+		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if got != target {
+				t.Fatalf("cleanup target = %+v, want exact %+v", got, target)
+			}
+			return nil
+		}
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if err == nil || IsRetryableBlockMaterializationError(err) || deleteCalls != 1 {
+			t.Fatalf("error/cleanup = %v/%d, want non-retryable error and one exact cleanup", err, deleteCalls)
+		}
+	})
+
 	t.Run("known loser deletes exact put tuple", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}, Submitted: true}
 		}
 		deleteCalls := 0
 		deleteFreshInstallLoserFn = func(cleanupCtx context.Context, got BlockMaterializationTarget) error {
@@ -561,7 +579,7 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 
 	t.Run("direct same-tuple contradiction never succeeds cleans or retries", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataIdentityContradiction, Cause: db.ErrInstallBlockMetadataIdentityContradiction}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataIdentityContradiction, Cause: db.ErrInstallBlockMetadataIdentityContradiction, Submitted: true}
 		}
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
 			t.Fatal("canonical tuple must never be deleted")
@@ -578,7 +596,7 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 
 	t.Run("cleanup failure leaks and still reprobes", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Submitted: true}
 		}
 		cleanupErr := errors.New("delete unavailable")
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error { return cleanupErr }
@@ -595,7 +613,7 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 		}
 		t.Run("ambiguous_"+name, func(t *testing.T) {
 			registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-				return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataAmbiguous, Cause: cause}
+				return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataAmbiguous, Cause: cause, Submitted: true}
 			}
 			deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
 				t.Fatal("ambiguous install must never authorize cleanup")
@@ -607,6 +625,22 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("cancellation after LWT entry retains exact target", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			cancel()
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataAmbiguous, Submitted: true, Cause: context.Canceled}
+		}
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+			t.Fatal("post-submit cancellation must not authorize cleanup")
+			return nil
+		}
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(ctx, orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		if err == nil || IsRetryableBlockMaterializationError(err) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want conservative post-submit cancellation", err)
+		}
+	})
 }
 
 func TestRegisterUploadedBlockTargetFreshInstallPreparationAndCleanup(t *testing.T) {
@@ -661,7 +695,7 @@ func TestRegisterUploadedBlockTargetFreshInstallPreparationAndCleanup(t *testing
 			if representationID != db.PlainBlockRepresentationID || got != target {
 				t.Fatalf("INSTALL representation/target = %q/%+v, want %q/%+v", representationID, got, db.PlainBlockRepresentationID, target)
 			}
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied, Submitted: true}
 		}
 		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
 			t.Fatal("successful local preparation must not clean or request a remint")
@@ -822,7 +856,7 @@ func TestRegisterUploadedBlockTargetFreshCleanupRetriesAndMetrics(t *testing.T) 
 
 	t.Run("known lost retries only exact target and counts final success", func(t *testing.T) {
 		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
-			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}, Submitted: true}
 		}
 		deleteCalls := 0
 		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
@@ -957,7 +991,7 @@ func TestRetryUploadedBlockMaterializationRemintsAfterPreInstallResolutionFailur
 	registerUploadedBlockInstallMetadataFn = func(_ context.Context, _ *FSHelper, _ string, _ string, _ string, _ string, _ int, got BlockMaterializationTarget) db.InstallBlockMetadataResult {
 		installCalls++
 		installedTarget = got
-		return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+		return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied, Submitted: true}
 	}
 
 	cleanupCalls := 0

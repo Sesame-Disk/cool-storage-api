@@ -853,6 +853,87 @@ func TestResolveNeedsPutBlockStoreMintsPerRowlessAttempt(t *testing.T) {
 	}
 }
 
+func TestResolveNeedsPutBlockStoreConfirmationRejectsRowlessWithoutMint(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := ResolveNeedsPutBlockStoreForPhase(nil, preferred, "preferred", db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut,
+	}, orgID, uploadReuseTestBlockID, BlockMaterializationConfirmation)
+	if !errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+		t.Fatalf("confirmation rowless error = %v, want ErrBlockCanonicalStateNotVisible", err)
+	}
+	if target != (BlockMaterializationTarget{}) {
+		t.Fatalf("confirmation rowless target = %+v, want zero target", target)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationConfirmationDoesNotRestartInitialPhase(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	initialCalls := 0
+	confirmationCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterializationPhasedContext(nil, "ConfirmationPhase", "block-1", func(phase BlockMaterializationPhase) error {
+		switch phase {
+		case BlockMaterializationInitial:
+			initialCalls++
+		case BlockMaterializationConfirmation:
+			confirmationCalls++
+			if confirmationCalls == 1 {
+				return ErrBlockCanonicalStateNotVisible
+			}
+		}
+		return nil
+	}, func() error {
+		materializeCalls++
+		return nil
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("RetryUploadedBlockMaterializationPhasedContext() error = %v, want nil", err)
+	}
+	if initialCalls != 1 || confirmationCalls != 2 || materializeCalls != 1 {
+		t.Fatalf("phase calls = initial:%d confirmation:%d materialize:%d, want 1/2/1", initialCalls, confirmationCalls, materializeCalls)
+	}
+}
+
+func TestRetryUploadedBlockMaterializationRowlessConfirmationNeverReportsSuccess(t *testing.T) {
+	fastBlockMaterializationRetries(t)
+
+	initialCalls := 0
+	confirmationCalls := 0
+	putCalls := 0
+	materializeCalls := 0
+	err := RetryUploadedBlockMaterializationPhasedContext(nil, "RowlessConfirmation", uploadReuseTestBlockID, func(phase BlockMaterializationPhase) error {
+		if phase == BlockMaterializationInitial {
+			initialCalls++
+			putCalls++ // K1 only.
+			return nil
+		}
+		confirmationCalls++
+		_, resolveErr := ResolveNeedsPutBlockStoreForPhase(nil, &storage.BlockStore{}, "preferred", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut,
+		}, "org-1", uploadReuseTestBlockID, phase)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		putCalls++ // Unreachable for a rowless confirmation.
+		return nil
+	}, func() error {
+		materializeCalls++
+		return nil
+	}, nil, nil)
+	if !errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+		t.Fatalf("error = %v, want ErrBlockCanonicalStateNotVisible", err)
+	}
+	if initialCalls != 1 || confirmationCalls != RetryAttempts() || materializeCalls != 1 || putCalls != 1 {
+		t.Fatalf("calls = initial:%d confirmation:%d materialize:%d puts:%d, want 1/%d/1/1", initialCalls, confirmationCalls, materializeCalls, putCalls, RetryAttempts())
+	}
+}
+
 func TestRetryUploadedBlockMaterializationMintsAfterRowlessKnownLoss(t *testing.T) {
 	fastBlockMaterializationRetries(t)
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
@@ -1095,6 +1176,40 @@ func TestStoreUploadedBlockForProbeReturnsCanonicalPlacementAndFence(t *testing.
 	_, _, err = StoreUploadedBlockForProbe(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{Decision: db.BlockReuseBlockedByGC}, []byte("data"), nil, canonical, "preferred", orgID, nil)
 	if !errors.Is(err, ErrBlockDeleteInProgress) || putCalls != 1 || admissionCalls != 1 {
 		t.Fatalf("fence error/put/admission = %v/%d/%d, want ErrBlockDeleteInProgress/1/1", err, putCalls, admissionCalls)
+	}
+}
+
+func TestStoreUploadedBlockForProbeConfirmationRepairsExactPersistedTarget(t *testing.T) {
+	oldResolve := resolveCanonicalBlockStoreFn
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() {
+		resolveCanonicalBlockStoreFn = oldResolve
+		repairCanonicalBlockDirectFn = oldPut
+	})
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	canonical, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := canonical.StorageKeyForHash(uploadReuseTestBlockID) + ".8f14e45f-ea4d-4f73-9f7c-63f4e7a5bc21"
+	resolveCanonicalBlockStoreFn = func(*storage.Manager, *storage.BlockStore, string, string, string) (*storage.BlockStore, error) {
+		return canonical, nil
+	}
+	putCalls := 0
+	repairCanonicalBlockDirectFn = func(_ context.Context, gotStore *storage.BlockStore, gotKey string, gotData []byte) (string, error) {
+		putCalls++
+		if gotStore != canonical || gotKey != wantKey || string(gotData) != "data" {
+			t.Fatalf("repair PUT = %p/%q/%q, want exact canonical target", gotStore, gotKey, gotData)
+		}
+		return gotKey, nil
+	}
+
+	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut, StorageClass: "archive", StorageKey: wantKey,
+	}, []byte("data"), nil, canonical, "preferred", orgID, nil, BlockMaterializationConfirmation)
+	if err != nil || target.Store != canonical || target.StorageKey != wantKey || target.FreshInstall || !didPut || putCalls != 1 {
+		t.Fatalf("target/didPut/error/puts = %+v/%v/%v/%d, want exact non-fresh repair/true/nil/1", target, didPut, err, putCalls)
 	}
 }
 

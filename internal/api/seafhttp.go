@@ -1847,7 +1847,7 @@ var putUploadedBlockAutoDirectForUploadFn = func(ctx context.Context, blockStore
 var probeUploadedBlockReuseForUploadFn = v2.ProbeUploadedBlockReuse
 var prepareUploadedBlockProbeForUploadFn = v2.PrepareUploadedBlockProbe
 var ensureReusableBlockPresentForUploadFn = v2.EnsureReusableBlockPresent
-var resolveNeedsPutBlockStoreForUploadFn = v2.ResolveNeedsPutBlockStore
+var resolveNeedsPutBlockStoreForUploadFn = v2.ResolveNeedsPutBlockStoreForPhase
 var registerUploadedBlockTargetAndMappingForUploadFn = v2.RegisterUploadedBlockTargetAndMapping
 var resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID, repoID string, blockIDs []string) ([]string, error) {
 	return fsHelper.ResolveStoredBlockIDs(orgID, repoID, blockIDs)
@@ -2504,7 +2504,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 	var materializationTarget v2.BlockMaterializationTarget
-	storeUploadedBlock := func() error {
+	storeUploadedBlock := func(phase v2.BlockMaterializationPhase) error {
 		materializationTarget = v2.BlockMaterializationTarget{}
 		probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 		if probeErr != nil {
@@ -2524,7 +2524,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			log.Printf("[HandleUpload] Reused canonical block %s (SHA-256: %s) after physical verification", fileID[:16], sha256ID[:16])
 			return nil
 		case db.BlockReuseNeedsPut:
-			target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+			target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID, phase)
 			if resolveErr != nil {
 				return resolveErr
 			}
@@ -2543,8 +2543,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit creates the permanent reference), then write the
 	// external SHA-1 mapping only after the block is durable in Cassandra.
-	if err := retrySeafHTTPBlockMaterializationContext(c.Request.Context(), "HandleUpload", sha256ID, func() error {
-		if putErr := storeUploadedBlock(); putErr != nil {
+	if err := retrySeafHTTPBlockMaterializationContextPhased(c.Request.Context(), "HandleUpload", sha256ID, func(phase v2.BlockMaterializationPhase) error {
+		if putErr := storeUploadedBlock(phase); putErr != nil {
 			return fmt.Errorf("failed to store block: %w", putErr)
 		}
 		return nil
@@ -2698,6 +2698,12 @@ func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageMan
 // uncancellable and routes it through seafHTTPBlockMaterializationSleepFn; every
 // production caller passes a real request context, so only tests rely on that.
 func retrySeafHTTPBlockMaterializationContext(ctx context.Context, label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
+	return retrySeafHTTPBlockMaterializationContextPhased(ctx, label, blockID, func(v2.BlockMaterializationPhase) error {
+		return store()
+	}, materialize, resolveFence)
+}
+
+func retrySeafHTTPBlockMaterializationContextPhased(ctx context.Context, label, blockID string, store func(v2.BlockMaterializationPhase) error, materialize func() error, resolveFence func() (bool, error)) error {
 	attempts := v2.RetryAttempts()
 	if attempts < 1 {
 		attempts = 1
@@ -2740,7 +2746,7 @@ func retrySeafHTTPBlockMaterializationContext(ctx context.Context, label, blockI
 	}
 
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if err := store(); err != nil {
+		if err := store(v2.BlockMaterializationInitial); err != nil {
 			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
 				return err
 			}
@@ -2760,16 +2766,25 @@ func retrySeafHTTPBlockMaterializationContext(ctx context.Context, label, blockI
 		}
 		// Confirm physical presence after the provisional reference is durable.
 		// This repairs a fast GC cycle whose fence cleared before materialization.
-		if err := store(); err != nil {
-			if !v2.IsRetryableBlockMaterializationError(err) || attempt == attempts {
-				return err
+		for confirmationAttempt := 1; confirmationAttempt <= attempts; confirmationAttempt++ {
+			if err := store(v2.BlockMaterializationConfirmation); err == nil {
+				return nil
+			} else {
+				if !v2.IsRetryableBlockMaterializationError(err) || confirmationAttempt == attempts {
+					return err
+				}
+				if errors.Is(err, v2.ErrBlockCanonicalStateNotVisible) {
+					if abortErr := retryBlocked(confirmationAttempt, "probe", err); abortErr != nil {
+						return abortErr
+					}
+					continue
+				}
+				if abortErr := retryBlocked(confirmationAttempt, "probe", err); abortErr != nil {
+					return abortErr
+				}
 			}
-			if abortErr := retryBlocked(attempt, "probe", err); abortErr != nil {
-				return abortErr
-			}
-			continue
+			break
 		}
-		return nil
 	}
 
 	return fmt.Errorf("%w: exhausted SeafHTTP block materialization retry budget for block %s", v2.ErrBlockDeleteInProgress, blockID)
@@ -3015,7 +3030,7 @@ readLoop:
 			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				var materializationTarget v2.BlockMaterializationTarget
-				return retrySeafHTTPBlockMaterializationContext(egCtx, "finalizeUploadStreaming", sha256ID, func() error {
+				return retrySeafHTTPBlockMaterializationContextPhased(egCtx, "finalizeUploadStreaming", sha256ID, func(phase v2.BlockMaterializationPhase) error {
 					materializationTarget = v2.BlockMaterializationTarget{}
 					probe, probeErr := probeUploadedBlockReuseForUploadFn(h.db, token.OrgID, sha256ID)
 					if probeErr != nil {
@@ -3031,7 +3046,7 @@ readLoop:
 						materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 						return ensureErr
 					case db.BlockReuseNeedsPut:
-						target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID)
+						target, resolveErr := resolveNeedsPutBlockStoreForUploadFn(h.storageManager, blockStore, actualStorageClass, probe, token.OrgID, sha256ID, phase)
 						if resolveErr != nil {
 							return resolveErr
 						}

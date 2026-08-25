@@ -2571,10 +2571,13 @@ discover safely. Pre-INSTALL representation retries now retain one already-PUT t
 including when Cassandra reports that a replica is bootstrapping, and a permanent,
 canceled, or exhausted representation preparation performs bounded detached exact
 cleanup without submitting INSTALL; KnownLost cleanup also retries the exact target.
-This only narrows the representation-resolution window. Cancellation races and
-provisional-reference or delete-fence failures before INSTALL can still return to an
-outer retry that remints while the prior target survives; those remain existing X3
-leak cases, not closed pre-INSTALL windows.
+This only narrows the representation-resolution window. The post-materialization
+confirmation probe is now phase-aware: a temporary rowless `NeedsPut` observation
+returns retryable `canonical state not visible` and retries confirmation without
+minting another target after a successful INSTALL. Cancellation races and
+provisional-reference or delete-fence failures before INSTALL can still return to
+an outer retry that remints while the prior target survives; those remain existing
+X3 leak cases, not closed pre-INSTALL windows.
 The final cleanup result is exposed by
 `block_upload_fresh_physical_cleanup_total{result,reason}`, but that process-local
 counter is not durable object intent and cannot reconcile a failed cleanup. P2 has no
@@ -2590,13 +2593,14 @@ pre-INSTALL branch and KnownLost. It is NOT emitted by the two branches that
 deliberately keep their object — ambiguous settlement and the direct single-use
 identity contradiction — nor by the provisional-reference and delete-fence failures
 described above, which return the retryable sentinel and leave the minted target
-behind for an outer remint. Those are precisely the retention paths with no other
-signal, so a counter showing no `result="failure"` samples is consistent with every
-retained object this issue describes and must not be quoted as evidence that none
-exist. Making the class observable means adding a `result="retained"` outcome on the
-deliberate-retention branches and counting the pre-INSTALL sentinel returns; that is
-a small, separable change, it is still not durable object intent, and it would not
-close X3 on its own.
+behind for an outer remint. The confirmation-only rowless state is deliberately
+different: it retains no new target and never authorizes a mint. The remaining
+pre-INSTALL retention paths still have no other signal, so a counter showing no
+`result="failure"` samples is consistent with every retained object this issue
+describes and must not be quoted as evidence that none exist. Making the class
+observable means adding a `result="retained"` outcome on the deliberate-retention
+branches and counting the pre-INSTALL sentinel returns; that is a small, separable
+change, it is still not durable object intent, and it would not close X3 on its own.
 
 ---
 
