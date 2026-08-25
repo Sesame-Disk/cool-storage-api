@@ -460,6 +460,68 @@ func p2MethodSelectionOn(selector *ast.SelectorExpr, method string, receiver typ
 	return expected != nil && selection.Obj() == expected.Obj() && info.Uses[selector.Sel] == expected.Obj()
 }
 
+func TestP2MaterializationPhaseGuardIsExhaustive(t *testing.T) {
+	program := p2LoadProductionProgram(t)
+	source := program.packages[p2TargetPackage]
+	if source == nil {
+		t.Fatalf("P2 package %s was not parsed", p2TargetPackage)
+	}
+	file := source.filesByName["upload_reuse.go"]
+	if file == nil {
+		t.Fatal("upload_reuse.go was not parsed")
+	}
+
+	for _, wanted := range []string{"ResolveNeedsPutBlockStoreForPhase", "StoreUploadedBlockForProbeForPhase"} {
+		var function *ast.FuncDecl
+		for _, declaration := range file.Decls {
+			candidate, ok := declaration.(*ast.FuncDecl)
+			if ok && candidate.Name.Name == wanted {
+				function = candidate
+				break
+			}
+		}
+		if function == nil || function.Body == nil {
+			t.Fatalf("production function %s was not found", wanted)
+		}
+
+		switchCount := 0
+		validPhases := map[string]bool{}
+		defaultRejects := false
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switchStatement, ok := node.(*ast.SwitchStmt)
+			if !ok || r24NodeText(t, switchStatement.Tag) != "phase" {
+				return true
+			}
+			switchCount++
+			for _, statement := range switchStatement.Body.List {
+				clause := statement.(*ast.CaseClause)
+				if clause.List == nil {
+					for _, bodyStatement := range clause.Body {
+						returnStatement, returnOK := bodyStatement.(*ast.ReturnStmt)
+						if !returnOK {
+							continue
+						}
+						for _, result := range returnStatement.Results {
+							if strings.Contains(r24NodeText(t, result), "ErrBlockMaterializationPhaseInvalid") {
+								defaultRejects = true
+							}
+						}
+					}
+					continue
+				}
+				for _, expression := range clause.List {
+					validPhases[r24NodeText(t, expression)] = true
+				}
+			}
+			return true
+		})
+
+		if switchCount != 1 || !validPhases["BlockMaterializationInitial"] || !validPhases["BlockMaterializationConfirmation"] || !defaultRejects {
+			t.Errorf("%s phase guard = switches:%d valid:%v defaultRejects:%v, want exhaustive initial/confirmation/default rejection", wanted, switchCount, validPhases, defaultRejects)
+		}
+	}
+}
+
 // TestP2PhysicalIdentityAuthorityGuard binds physical-locator authority to the
 // intended functions and BlockStore variables. Selector references are counted,
 // not only direct calls, so a method-value alias cannot evade the guard; a same-

@@ -871,6 +871,72 @@ func TestResolveNeedsPutBlockStoreConfirmationRejectsRowlessWithoutMint(t *testi
 	}
 }
 
+func TestResolveNeedsPutBlockStoreRejectsUnknownPhaseWithoutMint(t *testing.T) {
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, phase := range []BlockMaterializationPhase{-1, BlockMaterializationPhase(2)} {
+		target, err := ResolveNeedsPutBlockStoreForPhase(nil, preferred, "preferred", db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut,
+		}, orgID, uploadReuseTestBlockID, phase)
+		if !errors.Is(err, ErrBlockMaterializationPhaseInvalid) || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("phase %d error = %v, want non-retryable invalid-phase error", phase, err)
+		}
+		if target != (BlockMaterializationTarget{}) {
+			t.Fatalf("phase %d target = %+v, want zero target without mint", phase, target)
+		}
+	}
+}
+
+func TestStoreUploadedBlockForProbeForPhaseRejectsUnknownAndRowlessConfirmation(t *testing.T) {
+	oldPut := repairCanonicalBlockDirectFn
+	t.Cleanup(func() { repairCanonicalBlockDirectFn = oldPut })
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	preferred, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putCalls := 0
+	beforePutCalls := 0
+	repairCanonicalBlockDirectFn = func(context.Context, *storage.BlockStore, string, []byte) (string, error) {
+		putCalls++
+		return "unexpected", nil
+	}
+	beforePut := func() error {
+		beforePutCalls++
+		return nil
+	}
+
+	for _, phase := range []BlockMaterializationPhase{-1, BlockMaterializationPhase(2)} {
+		target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+			Decision: db.BlockReuseNeedsPut,
+		}, []byte("data"), nil, preferred, "preferred", orgID, beforePut, phase)
+		if !errors.Is(err, ErrBlockMaterializationPhaseInvalid) || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("phase %d error = %v, want non-retryable invalid-phase error", phase, err)
+		}
+		if target != (BlockMaterializationTarget{}) || didPut {
+			t.Fatalf("phase %d target/didPut = %+v/%v, want zero/false", phase, target, didPut)
+		}
+	}
+
+	target, didPut, err := StoreUploadedBlockForProbeForPhase(context.Background(), uploadReuseTestBlockID, db.BlockReuseProbe{
+		Decision: db.BlockReuseNeedsPut,
+	}, []byte("data"), nil, preferred, "preferred", orgID, beforePut, BlockMaterializationConfirmation)
+	if !errors.Is(err, ErrBlockCanonicalStateNotVisible) {
+		t.Fatalf("rowless confirmation error = %v, want ErrBlockCanonicalStateNotVisible", err)
+	}
+	if target != (BlockMaterializationTarget{}) || didPut {
+		t.Fatalf("rowless confirmation target/didPut = %+v/%v, want zero/false", target, didPut)
+	}
+	if putCalls != 0 || beforePutCalls != 0 {
+		t.Fatalf("put/admission calls = %d/%d, want 0/0", putCalls, beforePutCalls)
+	}
+}
+
 func TestRetryUploadedBlockMaterializationConfirmationDoesNotRestartInitialPhase(t *testing.T) {
 	fastBlockMaterializationRetries(t)
 

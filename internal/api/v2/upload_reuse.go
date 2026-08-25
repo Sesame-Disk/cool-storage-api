@@ -49,6 +49,10 @@ const (
 	BlockMaterializationConfirmation
 )
 
+// ErrBlockMaterializationPhaseInvalid marks a caller bug. An unknown phase is
+// never eligible for a physical write or a retry.
+var ErrBlockMaterializationPhaseInvalid = errors.New("invalid block materialization phase")
+
 // Retry reasons for BlockUploadMaterializationRetriesTotal. The reason is chosen
 // by the PHASE that failed (which callback returned it), never the sentinel, so a
 // materialize-phase metadata write is never labeled "probe" (finding F14).
@@ -151,6 +155,11 @@ func ResolveNeedsPutBlockStore(storageManager *storage.Manager, preferredStore *
 // ResolveNeedsPutBlockStoreForPhase resolves a NeedsPut destination without
 // allowing a confirmation probe to create a second physical incarnation.
 func ResolveNeedsPutBlockStoreForPhase(storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass string, probe db.BlockReuseProbe, orgID, blockID string, phase BlockMaterializationPhase) (BlockMaterializationTarget, error) {
+	switch phase {
+	case BlockMaterializationInitial, BlockMaterializationConfirmation:
+	default:
+		return BlockMaterializationTarget{}, fmt.Errorf("%w: %d", ErrBlockMaterializationPhaseInvalid, phase)
+	}
 	if probe.Decision != db.BlockReuseNeedsPut {
 		return BlockMaterializationTarget{}, fmt.Errorf("block %s does not need a PUT", blockID)
 	}
@@ -211,6 +220,11 @@ func StoreUploadedBlockForProbe(ctx context.Context, blockID string, probe db.Bl
 // target, but a rowless NeedsPut is retryable state convergence, not permission
 // to mint or PUT another target.
 func StoreUploadedBlockForProbeForPhase(ctx context.Context, blockID string, probe db.BlockReuseProbe, data []byte, storageManager *storage.Manager, preferredStore *storage.BlockStore, preferredClass, orgID string, beforePut func() error, phase BlockMaterializationPhase) (target BlockMaterializationTarget, didPut bool, err error) {
+	switch phase {
+	case BlockMaterializationInitial, BlockMaterializationConfirmation:
+	default:
+		return target, false, fmt.Errorf("%w: %d", ErrBlockMaterializationPhaseInvalid, phase)
+	}
 	switch probe.Decision {
 	case db.BlockReuseReusable:
 		// The class this returns is re-persisted by the caller, so it must be the
