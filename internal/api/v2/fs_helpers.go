@@ -992,7 +992,7 @@ func isTransientFreshInstallPreparationError(err error) bool {
 	var requestErr gocql.RequestError
 	if errors.As(err, &requestErr) {
 		switch requestErr.Code() {
-		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded,
+		case gocql.ErrCodeUnavailable, gocql.ErrCodeOverloaded, gocql.ErrCodeBootstrapping,
 			gocql.ErrCodeReadTimeout, gocql.ErrCodeWriteTimeout:
 			return true
 		}

@@ -2568,8 +2568,13 @@ state does not identify the stored object for reclamation. Minted keys broaden t
 existing leak beyond a process crash: an ambiguous PUT, unresolved request-local
 install uncertainty, or failed exact cleanup can also leave bytes no GC phase can
 discover safely. Pre-INSTALL representation retries now retain one already-PUT target,
-and a permanent, canceled, or exhausted preparation performs bounded detached exact
+including when Cassandra reports that a replica is bootstrapping, and a permanent,
+canceled, or exhausted representation preparation performs bounded detached exact
 cleanup without submitting INSTALL; KnownLost cleanup also retries the exact target.
+This only narrows the representation-resolution window. Cancellation races and
+provisional-reference or delete-fence failures before INSTALL can still return to an
+outer retry that remints while the prior target survives; those remain existing X3
+leak cases, not closed pre-INSTALL windows.
 The final cleanup result is exposed by
 `block_upload_fresh_physical_cleanup_total{result,reason}`, but that process-local
 counter is not durable object intent and cannot reconcile a failed cleanup. P2 has no

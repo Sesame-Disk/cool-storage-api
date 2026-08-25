@@ -16,6 +16,41 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+type freshInstallRequestError struct {
+	code int
+}
+
+func (e freshInstallRequestError) Code() int       { return e.code }
+func (e freshInstallRequestError) Message() string { return "request error" }
+func (e freshInstallRequestError) Error() string   { return e.Message() }
+
+func TestIsTransientFreshInstallPreparationErrorRequestCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		want bool
+	}{
+		{name: "unavailable", code: gocql.ErrCodeUnavailable, want: true},
+		{name: "overloaded", code: gocql.ErrCodeOverloaded, want: true},
+		{name: "bootstrapping", code: gocql.ErrCodeBootstrapping, want: true},
+		{name: "read timeout", code: gocql.ErrCodeReadTimeout, want: true},
+		{name: "write timeout", code: gocql.ErrCodeWriteTimeout, want: true},
+		{name: "read failure", code: gocql.ErrCodeReadFailure, want: false},
+		{name: "write failure", code: gocql.ErrCodeWriteFailure, want: false},
+		{name: "invalid query", code: gocql.ErrCodeInvalid, want: false},
+		{name: "syntax error", code: gocql.ErrCodeSyntax, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fmt.Errorf("resolve representation: %w", freshInstallRequestError{code: tt.code})
+			if got := isTransientFreshInstallPreparationError(err); got != tt.want {
+				t.Fatalf("isTransientFreshInstallPreparationError(code=%#x) = %v, want %v", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetCanonicalHeadCommit_LibraryStateErrorIsNotMaskedAsNotFound(t *testing.T) {
 	helper := &FSHelper{db: &db.DB{}}
 	original := resolveLiveLibraryStateByIDFn
@@ -617,7 +652,7 @@ func TestRegisterUploadedBlockTargetFreshInstallPreparationAndCleanup(t *testing
 				t.Fatalf("resolver context/identity = %v/%q/%q", ctx, gotOrg, gotLibrary)
 			}
 			if resolveCalls == 1 {
-				return "", gocql.ErrTimeoutNoResponse
+				return "", freshInstallRequestError{code: gocql.ErrCodeBootstrapping}
 			}
 			return db.PlainBlockRepresentationID, nil
 		}
