@@ -203,12 +203,9 @@ func seedProvisionalPhase0Fixture(t *testing.T, canonicalPresent, referencePrese
 	}
 	sha1ID := fmt.Sprintf("%040x", time.Now().UnixNano())
 
-	if err := session.Query(`
-		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, fixture.orgID.String(), fixture.blockID, db.PlainBlockRepresentationID, sha1ID, int64(1), "hot",
-		"blocks/"+fixture.blockID, time.Now().UTC(), time.Now().UTC()).Exec(); err != nil {
-		t.Fatalf("seed provisional Phase 0 block: %v", err)
+	installed := database.InstallBlockMetadata(context.Background(), fixture.orgID.String(), db.PlainBlockRepresentationID, fixture.blockID, sha1ID, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: "blocks/" + fixture.blockID})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed provisional Phase 0 block: outcome=%v cause=%v", installed.Outcome, installed.Cause)
 	}
 	if referencePresent {
 		if err := session.Query(`
@@ -1175,8 +1172,9 @@ func syntheticCanonicalStorageKeyForTest(orgID, blockID string) string {
 func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string) {
 	t.Helper()
 	database := shareProjectionDBForTest(t)
-	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)); err != nil {
-		t.Fatalf("failed to seed block metadata for %s/%s: %v", orgID, blockID, err)
+	installed := database.InstallBlockMetadata(context.Background(), orgID.String(), db.PlainBlockRepresentationID, blockID, "", 1, db.BlockPhysicalLocation{StorageClass: storageClass, StorageKey: syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("failed to seed block metadata for %s/%s: outcome=%v cause=%v", orgID, blockID, installed.Outcome, installed.Cause)
 	}
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgID, blockID)
@@ -1561,7 +1559,7 @@ func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 
 	orgUUID := uuid.New()
 	orgID := orgUUID.String()
-	blockID := fmt.Sprintf("rediscover-%d", time.Now().UnixNano())
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", time.Now().UTC().Add(-5*time.Second))
 	if !gcCandidateExists(t, orgID, blockID) {
@@ -1736,8 +1734,9 @@ func TestGC_WorkerPreservesForwardMappingAfterPhysicalDelete(t *testing.T) {
 
 	// Real zero-ref canonical row carrying blocks.sha1 = externalSHA1 (what every
 	// materialization path writes), plus the forward mapping it resolves to.
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)); err != nil {
-		t.Fatalf("seed block with sha1: %v", err)
+	installed := database.InstallBlockMetadata(context.Background(), orgID, db.PlainBlockRepresentationID, blockID, externalSHA1, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed block with sha1: outcome=%v cause=%v", installed.Outcome, installed.Cause)
 	}
 	if err := database.WriteBlockIDMapping(orgID, db.PlainBlockRepresentationID, externalSHA1, blockID, time.Now().UTC()); err != nil {
 		t.Fatalf("seed forward mapping: %v", err)
@@ -1795,11 +1794,13 @@ func TestGC_WorkerDeletingPlainBlockPreservesEncryptedSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)); err != nil {
-		t.Fatalf("seed plain block: %v", err)
+	plainInstalled := database.InstallBlockMetadata(context.Background(), orgID, plainRep, plainBlockID, externalSHA1, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)})
+	if plainInstalled.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed plain block: outcome=%v cause=%v", plainInstalled.Outcome, plainInstalled.Cause)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)); err != nil {
-		t.Fatalf("seed encrypted block: %v", err)
+	encInstalled := database.InstallBlockMetadata(context.Background(), orgID, encRep, encBlockID, externalSHA1, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)})
+	if encInstalled.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed encrypted block: outcome=%v cause=%v", encInstalled.Outcome, encInstalled.Cause)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
 		t.Fatalf("seed plain mapping: %v", err)
@@ -1869,11 +1870,13 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	encBlockID := fmt.Sprintf("%064x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, plainRep, plainBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)); err != nil {
-		t.Fatalf("seed plain block: %v", err)
+	plainInstalled := database.InstallBlockMetadata(context.Background(), orgID, plainRep, plainBlockID, externalSHA1, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), plainBlockID)})
+	if plainInstalled.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed plain block: outcome=%v cause=%v", plainInstalled.Outcome, plainInstalled.Cause)
 	}
-	if err := database.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, encRep, encBlockID, externalSHA1, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)); err != nil {
-		t.Fatalf("seed encrypted block: %v", err)
+	encInstalled := database.InstallBlockMetadata(context.Background(), orgID, encRep, encBlockID, externalSHA1, 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), encBlockID)})
+	if encInstalled.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed encrypted block: outcome=%v cause=%v", encInstalled.Outcome, encInstalled.Cause)
 	}
 	if err := database.WriteBlockIDMapping(orgID, plainRep, externalSHA1, plainBlockID, time.Now().UTC()); err != nil {
 		t.Fatalf("seed plain mapping: %v", err)
@@ -2044,12 +2047,18 @@ func TestGC_ReleasedBlockStub_ProbeRepairAndMaterialize(t *testing.T) {
 		t.Fatal("RepairReleasedBlockStub did not apply")
 	}
 
-	// Re-seed the stub and drive the unprobed materialization backstop.
+	// Re-seed the released stub, remove it through the explicit stub-repair path,
+	// then install a fresh canonical incarnation without probing first.
 	if err := database.Session().Query(`INSERT INTO blocks (org_id, block_id) VALUES (?, ?)`, orgID, blockID).Exec(); err != nil {
 		t.Fatalf("reseed released stub: %v", err)
 	}
-	if err := database.UpsertBlockMetadataWithSHA1(orgID, blockID, sha1ID, 123, "hot", syntheticCanonicalStorageKeyForTest(orgID, blockID)); err != nil {
-		t.Fatalf("UpsertBlockMetadataWithSHA1(stub backstop): %v", err)
+	repaired, err = database.RepairReleasedBlockStub(orgID, blockID)
+	if err != nil || !repaired {
+		t.Fatalf("RepairReleasedBlockStub(reseeded stub) = %v, %v; want true, nil", repaired, err)
+	}
+	installed := database.InstallBlockMetadata(context.Background(), orgID, db.PlainBlockRepresentationID, blockID, sha1ID, 123, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgID, blockID)})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed materialized block: outcome=%v cause=%v", installed.Outcome, installed.Cause)
 	}
 	if err := database.AddBlockReference(orgID, blockID, "test:live", uuid.New().String(), 0); err != nil {
 		t.Fatalf("AddBlockReference: %v", err)
@@ -2114,7 +2123,7 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
 	orgID := uuid.New()
-	blockID := fmt.Sprintf("cand-repair-%d", time.Now().UnixNano())
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
 	seedSyntheticZeroRefBlockForTest(t, orgID, blockID, "hot")
 
@@ -2320,7 +2329,7 @@ func TestGC_GracePeriodEnforcement(t *testing.T) {
 
 	orgUUID := uuid.New()
 	orgID := orgUUID.String()
-	blockID := fmt.Sprintf("grace-%d", time.Now().UnixNano())
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
 	enqueuedAt := time.Now().UTC().Truncate(time.Millisecond)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", enqueuedAt)
@@ -2354,7 +2363,7 @@ func TestGC_QueueSizeTracking(t *testing.T) {
 	snapshotBefore := readGCQueueSnapshotTotal(t)
 	orgUUID := uuid.New()
 	orgID := orgUUID.String()
-	blockID := fmt.Sprintf("qsize-%d", time.Now().UnixNano())
+	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
 	queuedAt := time.Now().UTC().Truncate(time.Millisecond)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
@@ -2977,8 +2986,9 @@ func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 
 	// Seed a real, singly-referenced block: canonical blocks row + one fs: reference, the
 	// fs_object that owns that reference, and the pre-existing gc_block_candidate.
-	if err := database.UpsertBlockMetadata(orgID, blockID, 1, "hot", syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)); err != nil {
-		t.Fatalf("seed blocks row: %v", err)
+	installed := database.InstallBlockMetadata(context.Background(), orgID, db.PlainBlockRepresentationID, blockID, "", 1, db.BlockPhysicalLocation{StorageClass: "hot", StorageKey: syntheticCanonicalStorageKeyForTest(orgUUID.String(), blockID)})
+	if installed.Outcome != db.InstallBlockMetadataApplied {
+		t.Fatalf("seed blocks row: outcome=%v cause=%v", installed.Outcome, installed.Cause)
 	}
 	if err := database.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {
 		t.Fatalf("seed fs: block_reference: %v", err)

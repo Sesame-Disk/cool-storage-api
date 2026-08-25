@@ -1217,7 +1217,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 		switch probe.Decision {
 		case db.BlockReuseReusable:
-			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(ctx, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID, phase)
+			storageKey, ensureErr := EnsureReusableBlockPresentForPhase(ctx, h.db, internalBlockID, probe, content, h.storageManager, blockStore, storageClass, orgID, phase)
 			materializationTarget = BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 			return ensureErr
 		case db.BlockReuseNeedsPut:
@@ -1226,7 +1226,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 				return resolveErr
 			}
 			materializationTarget = target
-			_, putErr := putUploadedBlockAutoDirectFn(ctx, target.Store, target.StorageKey, content)
+			_, putErr := PutBlockMaterializationTarget(ctx, h.db, orgID, internalBlockID, target, content, putUploadedBlockAutoDirectFn)
 			if putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}

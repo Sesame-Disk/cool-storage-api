@@ -144,16 +144,22 @@ Add to `.github/workflows/test.yml`:
 ## 20. Block Metadata Hot-Path LWT (DEFERRED)
 
 ### Current State
-The row-per-reference migration removed Paxos from `block_references`, but block materialization still uses `INSERT ... IF NOT EXISTS` in `UpsertBlockMetadata` for the canonical `blocks` row.
+The row-per-reference migration removed Paxos from `block_references`. Canonical
+block materialization now uses `InstallBlockMetadata` for first-writer
+`INSERT ... IF NOT EXISTS`, while existing-incarnation repair uses conditional
+updates through `RepairBlockMetadataIfCurrent` and never creates a row.
 
 ### Why It Was Deferred
-This branch keeps the LWT because it still pins one canonical `(storage_class, storage_key)` for a content-addressed block. A blind last-writer-wins rewrite could repoint reads and GC to a backend that does not actually hold the canonical copy.
+The first-writer LWT remains because it pins one canonical
+`(storage_class, storage_key)` for a content-addressed block. A blind
+last-writer-wins rewrite could repoint reads and GC to a backend that does not
+actually hold the canonical copy. The repair split is complete; performance
+measurement of the remaining install/repair CAS cost is still deferred.
 
 ### Follow-Up Plan
-1. Split block materialization into a hot re-upload path and a cold-create path.
-2. Use a cheap read/confirmation path for already-known blocks.
-3. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
-4. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
+1. Measure the remaining first-writer install and tuple-bound repair CAS cost.
+2. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
+3. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
 
 ### Regression Tests To Keep
 - `TestConcurrentV2UploadsNoLostCommits`

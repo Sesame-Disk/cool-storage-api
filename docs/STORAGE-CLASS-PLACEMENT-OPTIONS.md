@@ -277,7 +277,7 @@ used as an arbitrary authoritative locator.
 
 ### Install LWT and measured design numbers
 
-`UpsertBlockMetadataWithRepresentationAndSHA1` uses:
+`InstallBlockMetadata` uses:
 
 ```sql
 INSERT INTO blocks (...)

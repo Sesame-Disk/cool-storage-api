@@ -440,6 +440,9 @@ var syncPutBlockAutoDirectFn = func(ctx context.Context, blockStore *storage.Blo
 var syncProbeUploadedBlockReuseFn = v2.ProbeUploadedBlockReuse
 var syncPrepareUploadedBlockProbeFn = v2.PrepareUploadedBlockProbe
 var syncResolveNeedsPutBlockStoreFn = v2.ResolveNeedsPutBlockStoreForPhase
+var syncPutBlockMaterializationTargetFn = func(ctx context.Context, database *db.DB, orgID, blockID string, target v2.BlockMaterializationTarget, data []byte, put func(context.Context, *storage.BlockStore, string, []byte) (string, error)) (string, error) {
+	return v2.PutBlockMaterializationTarget(ctx, database, orgID, blockID, target, data, put)
+}
 var syncEnsureReusableBlockPresentFn = v2.EnsureReusableBlockPresentForPhase
 var registerUploadedBlockTargetAndMappingForSyncFn = v2.RegisterUploadedBlockTargetAndMapping
 var syncRetryUploadedBlockMaterializationFn = v2.RetryUploadedBlockMaterializationPhasedContext
@@ -2022,7 +2025,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			}
 			switch probe.Decision {
 			case db.BlockReuseReusable:
-				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), internalID, probe, data, h.storageManager, blockStore, storageClass, orgID, phase)
+				storageKey, ensureErr := syncEnsureReusableBlockPresentFn(c.Request.Context(), h.db, internalID, probe, data, h.storageManager, blockStore, storageClass, orgID, phase)
 				materializationTarget = v2.BlockMaterializationTarget{StorageClass: probe.StorageClass, StorageKey: storageKey}
 				return ensureErr
 			case db.BlockReuseNeedsPut:
@@ -2039,7 +2042,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 					return resolveErr
 				}
 				materializationTarget = target
-				_, putErr := syncPutBlockAutoDirectFn(c.Request.Context(), target.Store, target.StorageKey, data)
+				_, putErr := syncPutBlockMaterializationTargetFn(c.Request.Context(), h.db, orgID, internalID, target, data, syncPutBlockAutoDirectFn)
 				if putErr != nil {
 					return fmt.Errorf("%w: %w", errSyncStoreBackend, putErr)
 				}

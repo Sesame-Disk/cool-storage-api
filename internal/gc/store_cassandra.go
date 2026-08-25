@@ -1675,6 +1675,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, storage_key, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
 	`, orgID.String(), blockID, storageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").
+		Consistency(gocql.EachQuorum).
 		SerialConsistency(gocql.Serial).
 		MapScanCAS(existing)
 	if err != nil {
@@ -1697,6 +1698,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storag
 			WHERE org_id = ? AND block_id = ?
 			IF EXISTS
 		`, effectiveStorageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).
+			Consistency(gocql.EachQuorum).
 			SerialConsistency(gocql.Serial).
 			MapScanCAS(updateState)
 		if err != nil {
@@ -2318,6 +2320,7 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID stri
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state != ?
 	`, db.BlockGCStateDeleting, claimID, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).
+		Consistency(gocql.EachQuorum).
 		SerialConsistency(gocql.Serial).
 		MapScanCAS(existing)
 	if err != nil {

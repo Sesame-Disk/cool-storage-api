@@ -68,10 +68,10 @@ IF NOT EXISTS
 
 The query is in
 [`internal/db/block_references.go`](../internal/db/block_references.go), in
-`upsertBlockMetadataInsertWithRepresentationFn`.
-`UpsertBlockMetadataWithRepresentationAndSHA1` calls it for every materialized
-block and retries only for the specific released-stub repair path in the same
-file.
+`installBlockMetadataLWTFn`.
+`InstallBlockMetadata` is used for every fresh materialization; existing
+incarnations use `RepairBlockMetadataIfCurrent`, whose tuple-bound conditional
+updates are also part of the writer authority boundary.
 
 For a new block, the normal materialization cost is one metadata LWT attempt.
 The surrounding operations are not all LWTs:
@@ -261,7 +261,7 @@ The current metadata comments explicitly state that `storage_class` and
 one physical location because writers can arrive with different classes:
 
 [`internal/db/block_references.go`](../internal/db/block_references.go), in the
-`UpsertBlockMetadata` placement contract comments.
+  `InstallBlockMetadata` and `RepairBlockMetadataIfCurrent` placement contract comments.
 
 The resolver has three materially different cases:
 

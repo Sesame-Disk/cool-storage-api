@@ -3197,7 +3197,7 @@ func TestFinalizeUploadStreamingEncryptedLibraryWithoutDecryptSessionReturnsSent
 		storeCalls.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ *db.DB, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
 		storeCalls.Add(1)
 		return "", nil
 	}
@@ -3258,6 +3258,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalDirectPut := putUploadedBlockAutoDirectForUploadFn
+	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	t.Cleanup(func() {
 		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
@@ -3265,6 +3266,7 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalDirectPut
+		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 	})
 
 	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
@@ -3276,9 +3278,14 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 
 	putStarted := make(chan struct{})
 	var putStartedOnce sync.Once
+	var probeCalls atomic.Int32
 	probeUploadedBlockReuseForUploadFn = func(_ *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		if probeCalls.Add(1) == 1 {
+			// A rowless NeedsPut is the only state that may mint a fresh target.
+			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		}
 		return db.BlockReuseProbe{
-			Decision:     db.BlockReuseNeedsPut,
+			Decision:     db.BlockReuseReusable,
 			StorageClass: "hot",
 			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
 		}, nil
@@ -3286,6 +3293,9 @@ func TestFinalizeUploadStreamingDoesNotWrapS3PutInMetadataPermit(t *testing.T) {
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		putStartedOnce.Do(func() { close(putStarted) })
 		return hash, nil
+	}
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ *db.DB, _ string, probe db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
+		return probe.StorageKey, nil
 	}
 
 	registerCalled := make(chan struct{}, 1)
@@ -3455,7 +3465,7 @@ func finalizeUploadStreamingReuseFixture(t *testing.T, decision db.BlockReusePro
 		directPuts.Add(1)
 		return hash, nil
 	}
-	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ *db.DB, _ string, _ db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
 		reusableChecks.Add(1)
 		return "", nil
 	}
@@ -3579,6 +3589,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	originalProbe := probeUploadedBlockReuseForUploadFn
 	originalPut := putUploadedBlockAutoDirectForUploadFn
 	originalRegister := registerUploadedBlockTargetAndMappingForUploadFn
+	originalEnsureReusable := ensureReusableBlockPresentForUploadFn
 	originalCommit := commitSeafHTTPUploadedFileMultiBlockFn
 	t.Cleanup(func() {
 		checkUploadStorageQuotaForCurrentHeadFn = originalQuota
@@ -3586,6 +3597,7 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 		probeUploadedBlockReuseForUploadFn = originalProbe
 		putUploadedBlockAutoDirectForUploadFn = originalPut
 		registerUploadedBlockTargetAndMappingForUploadFn = originalRegister
+		ensureReusableBlockPresentForUploadFn = originalEnsureReusable
 		commitSeafHTTPUploadedFileMultiBlockFn = originalCommit
 	})
 
@@ -3595,18 +3607,26 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
 		return true, nil
 	}
+	var probeCalls atomic.Int32
 	probeUploadedBlockReuseForUploadFn = func(database *db.DB, orgID, blockID string) (db.BlockReuseProbe, error) {
+		if probeCalls.Add(1) == 1 {
+			return db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut}, nil
+		}
 		return db.BlockReuseProbe{
-			Decision:     db.BlockReuseNeedsPut,
+			Decision:     db.BlockReuseReusable,
 			StorageClass: "hot",
 			StorageKey:   fmt.Sprintf("blocks/%s/%s/%s/%s", orgID, blockID[:2], blockID[2:4], blockID),
 		}, nil
 	}
 
-	var putCalls, registerCalls, commitCalls atomic.Int32
+	var putCalls, ensureCalls, registerCalls, commitCalls atomic.Int32
 	putUploadedBlockAutoDirectForUploadFn = func(_ context.Context, _ *storage.BlockStore, hash string, data []byte) (string, error) {
 		putCalls.Add(1)
 		return hash, nil
+	}
+	ensureReusableBlockPresentForUploadFn = func(_ context.Context, _ *db.DB, _ string, probe db.BlockReuseProbe, _ []byte, _ *storage.Manager, _ *storage.BlockStore, _ string, _ string, _ v2.BlockMaterializationPhase) (string, error) {
+		ensureCalls.Add(1)
+		return probe.StorageKey, nil
 	}
 	registerUploadedBlockTargetAndMappingForUploadFn = func(context.Context, *db.DB, string, string, string, string, int, v2.BlockMaterializationTarget, string) error {
 		registerCalls.Add(1)
@@ -3685,8 +3705,11 @@ func TestSeafHTTPHandlerUploadChunkedEncryptedLibraryUnlockRetryReusesTrackerAnd
 	if got := strings.TrimSpace(w2.Body.String()); got != expectedFileID {
 		t.Fatalf("retry body = %q, want file id %q", got, expectedFileID)
 	}
-	if got := putCalls.Load(); got != 2 {
-		t.Fatalf("putCalls after unlock retry = %d, want 2 including confirmation", got)
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("putCalls after unlock retry = %d, want 1 for the initial fresh install", got)
+	}
+	if got := ensureCalls.Load(); got != 1 {
+		t.Fatalf("ensureCalls after unlock retry = %d, want 1 for canonical confirmation", got)
 	}
 	if got := registerCalls.Load(); got != 1 {
 		t.Fatalf("registerCalls after unlock retry = %d, want 1", got)
@@ -3746,7 +3769,7 @@ func TestFinalizeUploadStreamingReusableVerifiesCanonicalNotLegacyPut(t *testing
 // block reference + mapping registration.
 func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 	directPuts, reusableChecks, _, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
-		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut, StorageClass: "hot"})
+		db.BlockReuseProbe{Decision: db.BlockReuseNeedsPut})
 
 	expectedSHA1 := sha1.Sum([]byte("hello"))
 	expectedBlockID := hex.EncodeToString(expectedSHA1[:])
@@ -3771,7 +3794,7 @@ func TestFinalizeUploadStreamingNeedsPutUsesDirectPut(t *testing.T) {
 
 func TestFinalizeUploadStreamingRepairableStubRepairsBeforeDirectPut(t *testing.T) {
 	directPuts, reusableChecks, repairCalls, registerCalls, run := finalizeUploadStreamingReuseFixture(t,
-		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub, StorageClass: "hot"})
+		db.BlockReuseProbe{Decision: db.BlockReuseRepairableStub})
 
 	if _, err := run(); err != nil {
 		t.Fatalf("finalizeUploadStreaming error = %v, want nil", err)

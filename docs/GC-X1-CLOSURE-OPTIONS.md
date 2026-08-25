@@ -4,6 +4,24 @@
 not an ADR.** P1's locator-authority foundation is implemented separately; it
 does not close X1 or authorize destructive GC.
 
+**P3 implementation note (2026-08-25):** The current X1/P3 branch implements the
+R10/R13/R17 writer boundary for existing incarnations. Existing physical PUTs
+must pass an exact tuple authority check immediately before the PUT, and
+`RepairBlockMetadataIfCurrent` only conditionally updates a canonical row that
+still names that tuple; it never creates `blocks` metadata. R10 evidence covers
+both a fence observed before the PUT and the residual race where one last PUT may
+already have passed the check but a later repair must not recreate a deleted row.
+This is implementation status, not full X1 closure: Docker Cassandra/MinIO
+evidence is green, final review is still required, and P4 is not included.
+
+**R18/R27 remain OPEN.** P3 intentionally preserves the provisional `up:`
+reference when `RegisterUploadedBlockTarget` rejects an existing-incarnation
+repair because GC has fenced it. That conservative choice can keep the orphan
+fenced until the reference expires. The current `gc_s3_orphans_by_day`
+projection has no durable future retry schedule for that deferred orphan, so the
+R18(a) recovery behavior is not yet implementable and must not be described as
+closed. `GC_ENABLED=false` remains mandatory.
+
 **P0/R12 serial-phase prerequisite (2026-08-23):** The 11 conditional statements
 on `blocks` and the four conditional statements on canonical `gc_s3_orphans` now
 pin `SerialConsistency(gocql.Serial)` explicitly. The two conditional
@@ -22,8 +40,9 @@ evidence of success. Legacy deterministic locators remain supported for canonica
 reads, while fresh authority requires the strict minted grammar. The real
 Cassandra/MinIO race proves winner agreement and the exact cleanup boundary;
 unit and AST guards pin production cleanup dispatch and fresh authority.
-This closes neither P3 (R10/R13/R17) nor P4 (R14/R19/R20/R26), does not close X1,
-and does not authorize destructive GC. `GC_ENABLED=false` remains mandatory.
+P3 (R10/R13/R17) is implemented and evidence-backed separately; this does not
+close X1 or P4 (R14/R19/R20/R26), and does not authorize destructive GC.
+`GC_ENABLED=false` remains mandatory.
 
 Even a future verified X1 implementation would not enable destructive GC by itself;
 removing the fleet-wide `GC_ENABLED=false` gate is a separate activation change after
@@ -528,9 +547,9 @@ partial backend set.
 
 **The canon holds at the persistence boundary, not only at admission.** A stored
 `storage_class` is the identity, so the write funnel
-(`UpsertBlockMetadataWithRepresentationAndSHA1`) rejects a non-canonical value as a
-permanent error rather than normalizing it, and `ProbeBlockReuse` rejects one it
-reads back. Readers resolve the raw stored value: the trims that canonical block
+(`InstallBlockMetadata` and `RepairBlockMetadataIfCurrent`) reject a non-canonical
+value as a permanent error rather than normalizing it, and `ProbeBlockReuse`
+rejects one it reads back. Readers resolve the raw stored value: the trims that canonical block
 reading, upload reuse and GC used to apply are gone, because trimming resolves a
 label the writer never persisted — a silent rebind performed by the reader. The
 same reasoning removes the trim from GC's orphan-recovery state comparison, which
@@ -1247,7 +1266,8 @@ NEW INSTALL            EXISTING INCARNATION        pub: STAGING
 
 This is a specification ambiguity, not a race found in the code: the existing
 write-ref-then-check-fence order already matches the `NEW INSTALL` column
-(`RegisterUploadedBlock` writes `up:`, checks the fence, then calls `UpsertBlockMetadata`).
+(`RegisterUploadedBlock` writes `up:`, checks the fence, then calls the fresh-install or
+tuple-bound repair metadata path).
 What R17 adds is that the pre-install check no longer authorizes a *repair* to create the
 row, and what R3 adds is the post-write half.
 
@@ -1592,6 +1612,12 @@ optional same-metadata historical-rebind hardening; a namespace claim marker is 
 cross-install ownership one. Both are outside R23, R24 and X1, and no historical
 migration, preflight, binding bootstrap, or claim marker is required.
 
+**P3 status note (2026-08-25):** The R10 and R17 rows below retain the original
+failure sequence as analysis, but the current branch implements the required
+split: existing-incarnation PUTs use exact authority revalidation and
+`RepairBlockMetadataIfCurrent`; only fresh attempts use `InstallBlockMetadata`.
+The P3 evidence table near the end of this document is the current status source.
+
 | # | Sequence | Required outcome |
 |---|---|---|
 | R1 | EU `up:` acked, then NA GC reads at `EACH_QUORUM` | GC sees the reference; no DELETE. Closed by X2. |
@@ -1695,12 +1721,12 @@ all the others, so the count is not a detail.
 
 | # | Statement | Location |
 |---|---|---|
-| 1 | `upsertBlockMetadataInsertWithRepresentationFn` — first-writer `INSERT … IF NOT EXISTS` | `internal/db/block_references.go:169` |
+| 1 | `installBlockMetadataLWTFn` — first-writer `INSERT … IF NOT EXISTS` | `internal/db/block_references.go` |
 | 2 | `claimReleasedBlockStubForRepairFn` | `internal/db/block_references.go:204` |
 | 3 | `deleteRepairClaimedBlockStubFn` | `internal/db/block_references.go:217` |
 | 4 | `deleteClaimedBlockStubFn` | `internal/db/block_references.go:237` |
-| 5 | `backfillBlockSHA1Fn` | `internal/db/block_references.go:253` |
-| 6 | `backfillBlockRepresentationIDFn` | `internal/db/block_references.go:262` |
+| 5 | `backfillCurrentBlockSHA1Fn` | `internal/db/block_references.go` |
+| 6 | `backfillCurrentBlockRepresentationIDFn` | `internal/db/block_references.go` |
 | 7 | `ReleaseBlockDeleteClaim` | `internal/db/block_references.go:1180` |
 | 8 | `ReleaseStaleBlockClaim` | `internal/gc/store_cassandra.go` |
 | 9 | `ClaimBlockDelete` | `internal/gc/store_cassandra.go` |
@@ -1792,7 +1818,7 @@ recorded above and does not change the open X1 requirements.
 | `S3Store.Put(ctx, blockID, …)` | Second derivation layer: `s.key(blockID)` on what callers already pass as a key | Make the key parameter mean a key |
 | `canonical_block_reader.go:238` | Rejects persisted ≠ derived | Use the persisted key; validate org/hash/format instead |
 | `upload_reuse.go` — `ResolveNeedsPutBlockStore` **and** the `Reusable` branch of `StoreUploadedBlockForProbe` | Two reject sites; the second also repair-PUTs at the derived key | Immediately before repair PUT, re-read the canonical row and require the same `storage_key`, no destructive/repair claim and no orphan. Repair/reuse that active key; mint only when a new incarnation is allowed; never repair a condemned incarnation (R10) |
-| canonical metadata install | P2 adds a dedicated, single-use `InstallBlockMetadata`; existing-incarnation paths retain `UpsertBlockMetadata` | **P2/R9/R24 delivered:** one non-retryable global-SERIAL install and one SERIAL settlement read after an unknown response. P3 must keep existing-incarnation repair non-creating (R17). |
+| canonical metadata install | P2 adds a dedicated, single-use `InstallBlockMetadata`; P3 existing-incarnation paths use `RepairBlockMetadataIfCurrent` | **P2/R9/R24 delivered:** one non-retryable global-SERIAL install and one SERIAL settlement read after an unknown response. **P3/R17 implemented:** existing-incarnation repair is tuple-bound and non-creating. |
 | `ClaimBlockDelete` / `FinalizeBlockDelete` | Conditional on `gc_state` / `gc_claim_id` only | Bind the life: `AND backend_identity = B1 AND storage_key = K1`, with fresh per-attempt claim identity (R14/R16) |
 | `ReleaseBlockClaim`, `ReleaseStaleBlockClaim`, `ReleaseBlockDeleteClaim`, the stub-repair pair, both backfills | Conditional statements on `blocks`, explicitly pinned to serial phase `SERIAL` by P0 | The one-serial-domain rule admits no exceptions on this partition (R12); stale-read settlement and exact-`P` identity remain open |
 | `gc_s3_orphans` (+ `gc_s3_orphans_by_day`) | Canonical `gc_s3_orphans` has PK `((org_id, block_id))` and carries `external_sha1`/`recovery_phase` (migration 007); R11b-1 removes the redundant `representation_id`, while R22b makes `gc_s3_orphans_by_day` identity-only with PK `((first_seen_day, bucket), first_seen_at, org_id, block_id)` (migration 014) | Add exact `(B, storage_key)` to both; the concrete backend field is `storage_class` only if R23 selects it as `B`. Recovery and `ListS3OrphansByDay` must not `hashToKey`; the clear becomes conditional on both tuple fields |
@@ -1801,7 +1827,7 @@ recorded above and does not change the open X1 requirements.
 | `RecoverS3Orphans` | Re-verifies `BlockExists(L)` and `BlockHasReferencesGlobal(L)` | **A+:** retain `BlockHasReferencesGlobal(L)` and the canonical-row check, then delete exact validated `P1`. **B:** the orphan may carry the historical authorization for `P1`, but recovery still validates the canonical locator and legacy/keyless rows fail closed. |
 | `block_id_mappings` physical-GC cleanup | Before R11a, `processBlock` and `RecoverS3Orphans` deleted the forward mapping after physical cleanup | **R11a/B.3 delivered:** physical GC never deletes the logical mapping. A future logical-death reaper is intentionally separate. |
 | `StagePublishAttemptReferences` | Insert only | Post-check the active canonical incarnation. **A+:** any orphan for `L` blocks success. **B:** the canonical `P` must differ from the pending orphan `P1`; both also require no destructive/repair claim. Roll back this call's `pub:` rows on failure. |
-| `RegisterUploadedBlock` | Write `up:` then check the logical fence, then `UpsertBlockMetadata`; the provisional ref is **not** rolled back when the fence is found active (`fs_helpers.go:989-1003`) | Split repair from install (**R17**): a repair may only update a row that still names the same `P`, never create an absent one. Make the path tuple-aware: reuse/repair the active canonical `P`, block a condemned/deleting one, mint only for a genuine new incarnation. And settle what the surviving `up:` row does to recovery (**R18**) |
+| `RegisterUploadedBlock` | Write `up:` and route fresh identities through `InstallBlockMetadata`; existing-incarnation materialization uses `RepairBlockMetadataIfCurrent`. The provisional ref is **not** rolled back when a repair is fenced (`fs_helpers.go`) | **R17 implemented:** repair only updates a row that still names the same `P` and never creates an absent one. R18 remains open for the retained `up:` row. |
 | `UpdateS3OrphanAttempt` | Reads the expected `first_seen_at`, then performs `UPDATE … IF first_seen_at = ?` with a bound TTL; absent or differently-tokened rows are no-ops, while an existing-row lifecycle reset can still reuse the token | Guard the actual non-reusable lifecycle identity `P` and fail when the row is gone or reset to another lifecycle (**R19**) |
 | `RecordS3Orphan` | **Removed by the R21 authority-surface PR.** It was a second `INSERT … IF NOT EXISTS` creator of `gc_s3_orphans` with no production caller. | Test fixtures use `StartBlockDeleteOrphan` and `UpdateS3OrphanAttempt`; the untagged R21 gate requires exactly one production creator (**R21 closed**) |
 | `RecoverS3Orphans` discovery | **R22a implemented, R22b made structural:** `ListS3OrphansByDay` returns only `(org_id, block_id, first_seen_at)`, and migration 014 dropped the projection's payload columns so no other value exists to return; recovery reloads canonical state at `EACH_QUORUM` and uses it for phase and backend selection. R11a removes mapping deletion from both recovery phases. A second canonical reload guards each irreversible action or orphan finalization. | Missing/error canonical reads and discovery-token mismatches fail closed and retain the cursor when the row is encountered. Missing-canonical repair remains gated on R20's serial-settlement requirement; token-mismatch cleanup remains conservatively deferred until lifecycle/projection identity rules are finalized. This is not exact `P` matching or lifecycle exclusion; R20/R26 remain open. |
@@ -1820,14 +1846,15 @@ Item 0 comes first because it is a direct same-physical-identity path that reope
 R24 is the corresponding stale-install form. The rest are ordered so the cheapest
 decisions come first.
 
-0. **R17 — repair must never become install.** One of the direct same-physical-identity
+0. **R17 — repair must never become install. ✅ IMPLEMENTED IN P3.** One of the direct same-physical-identity
    paths that reopens X1. Split the metadata path in two: `REPAIR(P1)`
    updates a canonical row that still names `P1` and **may not create an absent row**;
    only `INSTALL(P2)`, on a key minted in this attempt, may `INSERT … IF NOT EXISTS`.
-   Settle this before anything else, because "revalidate before the repair PUT" reads
-   like a fix and is not one. Settle the three linearization shapes with it — the
+   The implementation uses separate `InstallBlockMetadata` and
+   `RepairBlockMetadataIfCurrent` paths, with the exact authority check adjacent to
+   existing-incarnation PUTs. The three linearization shapes remain distinct: the
    pre-install fence check, the post-install success check, and the post-stage `pub:`
-   check are different observations and the ADR must say so.
+   check are different observations. Docker evidence covers the P3 writer boundary.
 0b. **R25 — every known promote path must first establish `pub:`. ✅ SETTLED
    structurally by implementation.** It was the other place where the design's argument,
    not just its implementation, was untrue. The fix shape chosen was **fresh-ID stage on
@@ -1911,9 +1938,9 @@ decisions come first.
    repair claim, and a usable non-orphaned key. A failed post-check must roll back the
    `pub:` rows staged by that call, with rollback failure treated as recovery/error rather
    than publication success.
-9. **R10 — never repair a condemned incarnation.** Revalidate the exact canonical key,
-   claim state and orphan state immediately before repair PUT. Necessary but not
-   sufficient on its own — see R17.
+9. **R10 — never repair a condemned incarnation. ✅ IMPLEMENTED IN P3.** Revalidate the
+    exact canonical key, claim state and orphan state immediately before repair PUT.
+    The residual post-check race is handled by R17's non-creating repair path.
 10. **R19 / R28 — partial and undiscoverable orphans. ⚠️ PARTLY SETTLED.**
    `UpdateS3OrphanAttempt` now carries the expected `first_seen_at` and performs
    `IF first_seen_at = ?`, so an absent row and a row with a different observed
@@ -1969,7 +1996,9 @@ It closed when a three-DC fixture plus two mutations went red on live data. X1 h
 such instrument at all: every race above was prose. That is the difference between the two
 blockers today, and it is a bigger difference than the difficulty of either design.
 
-All instruments live in `internal/api/sync_publish_handshake_test.go` unless noted.
+The pre-P3 publication instruments live in `internal/api/sync_publish_handshake_test.go`;
+P3 writer-boundary instruments live in the `internal/gc` and
+`internal/integration` files named in the table below.
 
 | Leg | Property | Status |
 |---|---|---|
@@ -1988,6 +2017,9 @@ All instruments live in `internal/api/sync_publish_handshake_test.go` unless not
 | R28b other orphan writers | All canonical/projection writers must preserve one row-wide expiry schedule | **OPEN** |
 | R28 expiry | An orphan whose recovery keeps failing must not lose its durable record | not built — the TTL is still in the schema; removing it is blocked on R27's retry-scheduling partitioning |
 | R3 safety | A block under an active delete fence must not gain a permanent `fs:` reference through the retry path | not built — needs a second instance for a cold memo, and cannot go green until R3's post-check exists on any path |
+| **P3/R10** | Existing-incarnation PUT is denied when the exact canonical tuple is fenced or changed immediately before the write | **GREEN** — `internal/integration/p3_condemned_repair_test.go` covers the observed-fence and residual-race cases; `go-all-test` passes |
+| **P3/R13** | Final authority and negative orphan-fence reads use the required serial consistency | **GREEN** — AST guards in `internal/gc/p3_fence_consistency_test.go` and integration evidence |
+| **P3/R17** | Existing-incarnation metadata repair cannot recreate an absent or changed canonical row | **GREEN** — `internal/integration/p3_repair_authority_guard_test.go` and residual-race integration evidence |
 | Physical ABA | An authorized DELETE landing after a byte-identical rematerialization destroys live bytes | not built — needs deterministic control of the S3 delete between authorization and landing |
 
 **What the unit gate does not cover.** It gates the idempotent-repair handshake directly and

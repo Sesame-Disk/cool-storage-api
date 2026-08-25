@@ -53,13 +53,6 @@ const (
 // closed instead of overwriting such a row.
 var ErrBlockIDMappingConflict = errors.New("block id mapping conflict")
 
-// ErrBlockStubRepairContended indicates a metadata upsert could not repair a
-// released claim stub because the row changed under it — another uploader
-// finished materializing, or GC re-fenced the block. It is a benign concurrency
-// loss, not corruption: callers should re-probe and retry rather than surface a
-// hard error. Upload funnels translate it into their retryable GC-fence signal.
-var ErrBlockStubRepairContended = errors.New("block stub repair contended")
-
 // ErrBlockMetadataPermanent marks a metadata-write failure that is
 // deterministically irrecoverable — an invalid argument (missing storage class,
 // malformed sha1/representation id), a conflicting first-writer identity, or a
@@ -76,6 +69,19 @@ var ErrBlockMetadataPermanent = errors.New("block metadata write is permanently 
 // from an earlier use of the minted identity, so it grants neither success nor
 // cleanup authority and must never be retried.
 var ErrInstallBlockMetadataIdentityContradiction = errors.New("single-use block install identity was already present")
+
+// ErrBlockRepairAuthorityChanged means the canonical row is absent or no longer
+// names the physical tuple the caller verified. The caller may re-probe and retry
+// against the newly observed incarnation, but must not repair the stale tuple.
+var ErrBlockRepairAuthorityChanged = errors.New("block repair authority changed")
+
+// ErrBlockRepairBlocked means GC currently owns or fences the logical block.
+// Repair must wait until both the in-row claim and the A+ orphan fence are clear.
+var ErrBlockRepairBlocked = errors.New("block repair blocked by GC")
+
+// ErrBlockRepairAuthorityPermanent marks malformed input or canonical row state.
+// Re-reading cannot make corrupt locator, ownership, or immutable metadata valid.
+var ErrBlockRepairAuthorityPermanent = errors.New("block repair authority is permanently invalid")
 
 type BlockReuseDecision int
 
@@ -119,6 +125,18 @@ type BlockPhysicalLocation struct {
 	StorageKey   string
 }
 
+// BlockRepairAuthorityOutcome classifies authority to repair one exact existing
+// physical incarnation. Callers must not treat an unknown outcome as authority.
+type BlockRepairAuthorityOutcome int
+
+const (
+	BlockRepairAuthorityUnknown BlockRepairAuthorityOutcome = iota
+	BlockRepairAuthorityAuthorized
+	BlockRepairAuthorityChanged
+	BlockRepairAuthorityBlocked
+	BlockRepairAuthorityPermanent
+)
+
 type InstallBlockMetadataResult struct {
 	Outcome   InstallBlockMetadataOutcome
 	Canonical BlockPhysicalLocation
@@ -151,6 +169,7 @@ type blockReuseMetadataRow struct {
 type blockIdentityRepairRow struct {
 	RepresentationID    string
 	Sha1                string
+	SizeBytes           int
 	StorageClass        string
 	StorageClassPresent bool
 	StorageKey          string
@@ -158,6 +177,11 @@ type blockIdentityRepairRow struct {
 	GCClaimID           string
 	GCClaimedAt         *time.Time
 	CreatedAt           *time.Time
+}
+
+type blockRepairAuthorityRow struct {
+	blockIdentityRepairRow
+	StorageKeyPresent bool
 }
 
 // BlockReferrerForFSObject builds the permanent referrer for a block referenced
@@ -205,25 +229,8 @@ var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referre
 	return database.RemoveBlockReference(orgID, blockID, referrer)
 }
 
-// upsertBlockMetadataInsertFn does the first-writer-wins INSERT IF NOT EXISTS (the
-// one LWT this path has always taken) and reports whether the row was created by
-// this call. When applied, the row now holds exactly the sha1 and representation
-// id passed here, so the caller can skip any read/repair entirely.
-var upsertBlockMetadataInsertFn = func(database *DB, orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-	return upsertBlockMetadataInsertWithRepresentationFn(database, orgID, blockID, PlainBlockRepresentationID, sha1, sizeBytes, storageClass, storageKey, now)
-}
-
-var upsertBlockMetadataInsertWithRepresentationFn = func(database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, storageClass, storageKey string, now time.Time) (bool, error) {
-	return database.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, representation_id, sha1, size_bytes, storage_class, storage_key, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now, now).
-		SerialConsistency(gocql.Serial).
-		MapScanCAS(map[string]interface{}{})
-}
-
 // installBlockMetadataLWTFn is deliberately separate from the repair-capable
-// upsert path. A proposed physical incarnation is single-use, so this statement
+// create path. A proposed physical incarnation is single-use, so this statement
 // gets exactly one driver attempt and is never repeated by settlement.
 var installBlockMetadataLWTFn = func(ctx context.Context, database *DB, orgID, blockID, representationID, sha1 string, sizeBytes int, proposed BlockPhysicalLocation, now time.Time) (bool, map[string]interface{}, error) {
 	current := map[string]interface{}{}
@@ -276,7 +283,7 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 		SELECT representation_id, sha1, storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at, created_at
 		FROM blocks
 		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(
 		&row.RepresentationID,
 		&row.Sha1,
 		&storageClass,
@@ -297,6 +304,87 @@ var readBlockIdentityForRepairFn = func(database *DB, orgID, blockID string) (bl
 		row.StorageClassPresent = true
 	}
 	return row, true, nil
+}
+
+// These seams keep existing-incarnation repair separate from create-only install.
+// Existing-incarnation repair is non-creating and must remain bound to the tuple
+// and lifecycle state that granted authority.
+var readBlockRepairAuthorityFn = func(database *DB, orgID, blockID string) (blockRepairAuthorityRow, bool, error) {
+	var row blockRepairAuthorityRow
+	var storageClass *string
+	var storageKey *string
+	err := database.Session().Query(`
+		SELECT representation_id, sha1, size_bytes, storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at, created_at
+		FROM blocks
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(
+		&row.RepresentationID,
+		&row.Sha1,
+		&row.SizeBytes,
+		&storageClass,
+		&storageKey,
+		&row.GCState,
+		&row.GCClaimID,
+		&row.GCClaimedAt,
+		&row.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return blockRepairAuthorityRow{}, false, nil
+		}
+		return blockRepairAuthorityRow{}, false, err
+	}
+	if storageClass != nil {
+		row.StorageClass = *storageClass
+		row.StorageClassPresent = true
+	}
+	if storageKey != nil {
+		row.StorageKey = *storageKey
+		row.StorageKeyPresent = true
+	}
+	return row, true, nil
+}
+
+var blockRepairHasS3OrphanFn = func(database *DB, orgID, blockID string) (bool, error) {
+	var existingBlockID string
+	err := database.Session().Query(`
+		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return existingBlockID != "", nil
+}
+
+var backfillCurrentBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string, expected BlockPhysicalLocation, expectedCreatedAt time.Time, expectedSizeBytes int) (bool, error) {
+	return database.Session().Query(`
+		UPDATE blocks
+		SET representation_id = ?
+		WHERE org_id = ? AND block_id = ?
+		IF representation_id = ?
+		AND storage_class = ? AND storage_key = ?
+		AND created_at = ? AND size_bytes = ?
+		AND gc_state = null AND gc_claim_id = null AND gc_claimed_at = null
+	`, representationID, orgID, blockID, expectedCurrent, expected.StorageClass, expected.StorageKey, expectedCreatedAt, expectedSizeBytes).
+		SerialConsistency(gocql.Serial).
+		ScanCAS()
+}
+
+var backfillCurrentBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent, expectedRepresentationID string, expected BlockPhysicalLocation, expectedCreatedAt time.Time, expectedSizeBytes int) (bool, error) {
+	return database.Session().Query(`
+		UPDATE blocks
+		SET sha1 = ?
+		WHERE org_id = ? AND block_id = ?
+		IF sha1 = ? AND representation_id = ?
+		AND storage_class = ? AND storage_key = ?
+		AND created_at = ? AND size_bytes = ?
+		AND gc_state = null AND gc_claim_id = null AND gc_claimed_at = null
+	`, sha1, orgID, blockID, expectedCurrent, expectedRepresentationID, expected.StorageClass, expected.StorageKey, expectedCreatedAt, expectedSizeBytes).
+		SerialConsistency(gocql.Serial).
+		ScanCAS()
 }
 
 var claimReleasedBlockStubForRepairFn = func(database *DB, orgID, blockID, repairID string, claimedAt time.Time) (bool, error) {
@@ -332,10 +420,6 @@ var blockStubRepairIDFn = func(orgID, blockID string) string {
 	return "upload-repair:" + orgID + ":" + blockID
 }
 
-var repairReleasedBlockStubForUpsertFn = func(database *DB, orgID, blockID string) (bool, error) {
-	return database.RepairReleasedBlockStub(orgID, blockID)
-}
-
 var deleteClaimedBlockStubFn = func(database *DB, orgID, blockID, claimID string) (bool, error) {
 	return database.Session().Query(`
 		DELETE FROM blocks
@@ -348,33 +432,6 @@ var deleteClaimedBlockStubFn = func(database *DB, orgID, blockID, claimID string
 	`, orgID, blockID, BlockGCStateDeleting, claimID).
 		SerialConsistency(gocql.Serial).
 		MapScanCAS(map[string]interface{}{})
-}
-
-// backfillBlockSHA1Fn fills in a missing sha1 with a compare-and-set against the
-// sha1 value the caller just observed. That keeps the repair fail-closed in both
-// races we care about:
-//   - if the row was GC'd between read and write, applied=false (no phantom row),
-//   - if another writer populated sha1 concurrently, applied=false (no overwrite).
-var backfillBlockSHA1Fn = func(database *DB, orgID, blockID, sha1, expectedCurrent string) (bool, error) {
-	return database.Session().Query(`
-		UPDATE blocks
-		SET sha1 = ?
-		WHERE org_id = ? AND block_id = ?
-		IF sha1 = ?
-	`, sha1, orgID, blockID, expectedCurrent).
-		SerialConsistency(gocql.Serial).
-		ScanCAS()
-}
-
-var backfillBlockRepresentationIDFn = func(database *DB, orgID, blockID, representationID, expectedCurrent string) (bool, error) {
-	return database.Session().Query(`
-		UPDATE blocks
-		SET representation_id = ?
-		WHERE org_id = ? AND block_id = ?
-		IF representation_id = ?
-	`, representationID, orgID, blockID, expectedCurrent).
-		SerialConsistency(gocql.Serial).
-		ScanCAS()
 }
 
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
@@ -656,99 +713,136 @@ func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, bloc
 	return lastErr
 }
 
-// UpsertBlockMetadata stores immutable block metadata (size, storage class/key)
-// if the row does not already exist. It never sets liveness — that lives in
-// block_references — so it is safe to call on every (deduplicated) upload of the
-// same content.
-//
-// Uses INSERT ... IF NOT EXISTS (a per-block LWT) deliberately. For an absent
-// block, storage_class and storage_key are not globally fixed by the hash: a
-// mutable library preference or request routing can lead different writers to
-// propose different classes (see resolveLibraryBlockStore). Existing canonical
-// rows retain their persisted class regardless of later preference changes.
-// First-writer-wins pins ONE canonical physical location so reads and GC resolve
-// the backend where the block actually landed; a plain last-writer-wins INSERT
-// could repoint metadata at a class that holds no copy, breaking downloads and
-// making GC act on the wrong physical copy.
-// This LWT is scoped to the (org, block) partition, so writers for different
-// blocks never contend — it is NOT globally serialized (the old process-wide
-// concurrency permit that did serialize it has been removed).
-func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	return db.UpsertBlockMetadataWithSHA1(orgID, blockID, "", sizeBytes, storageClass, storageKey)
+// ValidateBlockRepairAuthority grants authority only for the exact canonical
+// physical incarnation the caller supplies. Under conservative A+, either GC
+// ownership shape or any gc_s3_orphans row blocks repair.
+func (db *DB) ValidateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation) (BlockRepairAuthorityOutcome, error) {
+	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected)
+	return outcome, err
 }
 
-// UpsertBlockMetadataWithSHA1 stores immutable block metadata plus the
-// authoritative SHA-1 of the real block bytes when that value is available at
-// write time. Callers that do not know the SHA-1 can keep using
-// UpsertBlockMetadata, which passes an empty string.
-func (db *DB) UpsertBlockMetadataWithSHA1(orgID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
-	return db.UpsertBlockMetadataWithRepresentationAndSHA1(orgID, PlainBlockRepresentationID, blockID, sha1, sizeBytes, storageClass, storageKey)
+func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation) (blockRepairAuthorityRow, BlockRepairAuthorityOutcome, error) {
+	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block id %q is not a canonical lower-case SHA-256", blockID)
+	}
+	if !config.IsCanonicalStorageClassName(expected.StorageClass) {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("non-canonical storage class %q for block %s", expected.StorageClass, blockID)
+	}
+	// DB authority accepts both minted and legacy deterministic keys. The storage
+	// layer verifies tenant/block binding; this boundary only rejects an incomplete
+	// or textually malformed persisted locator.
+	if expected.StorageKey == "" || strings.TrimSpace(expected.StorageKey) != expected.StorageKey {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("invalid storage key for block %s", blockID)
+	}
+
+	// Read the orphan fence first. The canonical row is the final authority read,
+	// so a fence already visible at this boundary cannot be hidden by an older
+	// blocks snapshot.
+	hasOrphan, err := blockRepairHasS3OrphanFn(db, orgID, blockID)
+	if err != nil {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityUnknown, fmt.Errorf("read S3 orphan repair fence for %s: %w", blockID, err)
+	}
+	row, found, err := readBlockRepairAuthorityFn(db, orgID, blockID)
+	if err != nil {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityUnknown, fmt.Errorf("read block repair authority for %s: %w", blockID, err)
+	}
+	if !found {
+		if hasOrphan {
+			return blockRepairAuthorityRow{}, BlockRepairAuthorityBlocked, fmt.Errorf("%w: block %s has an orphan fence without a canonical row", ErrBlockRepairBlocked, blockID)
+		}
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityChanged, fmt.Errorf("%w: canonical row for block %s is absent", ErrBlockRepairAuthorityChanged, blockID)
+	}
+	if row.CreatedAt == nil || !row.StorageClassPresent || !row.StorageKeyPresent || !config.IsCanonicalStorageClassName(row.StorageClass) || row.StorageKey == "" || strings.TrimSpace(row.StorageKey) != row.StorageKey {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block %s has incomplete or malformed canonical locator", blockID)
+	}
+	if row.SizeBytes < 0 {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block %s has invalid negative size", blockID)
+	}
+	activeClaim, repairClaim, ownershipErr := classifyBlockClaimOwnership(row.GCState, row.GCClaimID, row.GCClaimedAt)
+	if ownershipErr != nil {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block %s has malformed GC ownership: %v", blockID, ownershipErr)
+	}
+	current := BlockPhysicalLocation{StorageClass: row.StorageClass, StorageKey: row.StorageKey}
+	if current != expected {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityChanged, fmt.Errorf("%w: block %s now names %s/%s", ErrBlockRepairAuthorityChanged, blockID, current.StorageClass, current.StorageKey)
+	}
+	if activeClaim || repairClaim {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityBlocked, fmt.Errorf("%w: block %s has an active %s claim", ErrBlockRepairBlocked, blockID, strings.TrimSpace(row.GCState))
+	}
+	if hasOrphan {
+		return blockRepairAuthorityRow{}, BlockRepairAuthorityBlocked, fmt.Errorf("%w: block %s has an S3 orphan fence", ErrBlockRepairBlocked, blockID)
+	}
+	return row, BlockRepairAuthorityAuthorized, nil
 }
 
-func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representationID, blockID, sha1 string, sizeBytes int, storageClass, storageKey string) error {
-	if err := ValidateBlockRepresentationID(representationID); err != nil {
-		return fmt.Errorf("%w: %w", ErrBlockMetadataPermanent, err)
-	}
-	// R23a: the persisted storage_class is the physical namespace identity, so this
-	// funnel is the last door a non-canonical value could enter through. Normalizing
-	// here instead would persist an identity the writer never named, and every reader
-	// downstream — GC included — resolves the raw stored value.
-	if storageClass == "" {
-		return fmt.Errorf("%w: missing canonical storage class for block %s", ErrBlockMetadataPermanent, blockID)
-	}
-	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		return fmt.Errorf("%w: missing canonical storage key for block %s", ErrBlockMetadataPermanent, blockID)
-	}
-	if !config.IsCanonicalStorageClassName(storageClass) {
-		return fmt.Errorf("%w: non-canonical storage class %q for block %s", ErrBlockMetadataPermanent, storageClass, blockID)
+func blockRepairPermanentError(format string, args ...interface{}) error {
+	detail := fmt.Sprintf(format, args...)
+	return fmt.Errorf("%w: %w: %s", ErrBlockRepairAuthorityPermanent, ErrBlockMetadataPermanent, detail)
+}
+
+// RepairBlockMetadataIfCurrent repairs immutable identity metadata only while the
+// canonical row still names expected and remains outside every A+ GC fence. It
+// never executes INSERT and its conditional UPDATE statements cannot create a row.
+func (db *DB) RepairBlockMetadataIfCurrent(orgID, representationID, blockID, sha1 string, sizeBytes int, expected BlockPhysicalLocation) error {
+	if !IsCanonicalBlockRepresentationID(representationID) {
+		return blockRepairPermanentError("invalid block representation id %q", representationID)
 	}
 	sha1 = NormalizeBlockID(sha1)
-	if sha1 != "" && !isHexN(sha1, 40) {
-		return fmt.Errorf("%w: invalid block sha1 for %s", ErrBlockMetadataPermanent, blockID)
+	if sha1 != "" && !IsSHA1BlockID(sha1) {
+		return blockRepairPermanentError("invalid block sha1 for %s", blockID)
 	}
-	now := time.Now().UTC()
-	insert := func() (bool, error) {
-		if representationID == PlainBlockRepresentationID {
-			return upsertBlockMetadataInsertFn(db, orgID, blockID, sha1, sizeBytes, storageClass, storageKey, now)
-		}
-		return upsertBlockMetadataInsertWithRepresentationFn(db, orgID, blockID, representationID, sha1, sizeBytes, storageClass, storageKey, now)
+	if sizeBytes < 0 {
+		return blockRepairPermanentError("invalid negative block size for %s", blockID)
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		applied, err := insert()
-		if err != nil {
-			return err
-		}
-		if applied {
-			return nil
-		}
-
-		row, found, err := readBlockIdentityForRepairFn(db, orgID, blockID)
-		if err != nil {
-			return fmt.Errorf("read block identity for %s: %w", blockID, err)
-		}
-		if !found {
-			return fmt.Errorf("block metadata for %s disappeared before identity repair", blockID)
-		}
-		if isRepairableBlockStub(orgID, blockID, row.CreatedAt, row.StorageClassPresent, row.GCState, row.GCClaimID, row.GCClaimedAt) {
-			if attempt > 0 {
-				return fmt.Errorf("block metadata stub for %s persisted after repair", blockID)
-			}
-			repaired, repairErr := repairReleasedBlockStubForUpsertFn(db, orgID, blockID)
-			if repairErr != nil {
-				return fmt.Errorf("repair released block metadata stub for %s: %w", blockID, repairErr)
-			}
-			if !repaired {
-				// The stub changed under us (a concurrent uploader completed it, or a
-				// GC orphan fence reappeared). Both are transient: signal the retryable
-				// sentinel so the funnel re-probes instead of failing the upload.
-				return fmt.Errorf("%w: block %s changed before stub repair", ErrBlockStubRepairContended, blockID)
-			}
-			continue
-		}
-		return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, storageKey, row)
+	row, _, err := db.validateBlockRepairAuthority(orgID, blockID, expected)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("exhausted metadata stub repair for block %s", blockID)
+	if row.SizeBytes != sizeBytes {
+		return blockRepairPermanentError("block %s already has conflicting size %d", blockID, row.SizeBytes)
+	}
+	currentRepresentationID := row.RepresentationID
+	if currentRepresentationID != "" {
+		if strings.TrimSpace(currentRepresentationID) != currentRepresentationID || !IsCanonicalBlockRepresentationID(currentRepresentationID) {
+			return blockRepairPermanentError("block %s has malformed representation id %q", blockID, currentRepresentationID)
+		}
+		if currentRepresentationID != representationID {
+			return blockRepairPermanentError("block %s already has conflicting representation id %s", blockID, currentRepresentationID)
+		}
+	}
+	currentSHA1 := row.Sha1
+	if currentSHA1 != "" {
+		if strings.TrimSpace(currentSHA1) != currentSHA1 || !IsSHA1BlockID(currentSHA1) {
+			return blockRepairPermanentError("block %s has malformed sha1 %q", blockID, currentSHA1)
+		}
+		if sha1 != "" && currentSHA1 != sha1 {
+			return blockRepairPermanentError("block %s already has conflicting sha1 %s", blockID, currentSHA1)
+		}
+	}
+
+	createdAt := row.CreatedAt.UTC()
+	if currentRepresentationID == "" {
+		applied, err := backfillCurrentBlockRepresentationIDFn(db, orgID, blockID, representationID, "", expected, createdAt, sizeBytes)
+		if err != nil {
+			return fmt.Errorf("backfill current block representation id for %s: %w", blockID, err)
+		}
+		if !applied {
+			return fmt.Errorf("%w: block %s changed before representation repair", ErrBlockRepairAuthorityChanged, blockID)
+		}
+		currentRepresentationID = representationID
+	}
+	if sha1 == "" || currentSHA1 != "" {
+		return nil
+	}
+	applied, err := backfillCurrentBlockSHA1Fn(db, orgID, blockID, sha1, "", currentRepresentationID, expected, createdAt, sizeBytes)
+	if err != nil {
+		return fmt.Errorf("backfill current block sha1 for %s: %w", blockID, err)
+	}
+	if !applied {
+		return fmt.Errorf("%w: block %s changed before sha1 repair", ErrBlockRepairAuthorityChanged, blockID)
+	}
+	return nil
 }
 
 // InstallBlockMetadata performs a create-only canonical install for one freshly
@@ -757,7 +851,7 @@ func (db *DB) UpsertBlockMetadataWithRepresentationAndSHA1(orgID, representation
 // repeats the proposed install.
 //
 // Production upload paths use this only for a freshly minted-and-PUT target;
-// canonical reuse and repair continue through UpsertBlockMetadata.
+// canonical reuse and repair continue through RepairBlockMetadataIfCurrent.
 func (db *DB) InstallBlockMetadata(ctx context.Context, orgID, representationID, blockID, sha1 string, sizeBytes int, proposed BlockPhysicalLocation) InstallBlockMetadataResult {
 	result := InstallBlockMetadataResult{Outcome: InstallBlockMetadataAmbiguous}
 	if err := ValidateBlockRepresentationID(representationID); err != nil {
@@ -895,80 +989,6 @@ func malformedInstalledBlockMetadataResult(reason string) InstallBlockMetadataRe
 	}
 }
 
-func (db *DB) ensureBlockIdentity(orgID, blockID, representationID, sha1 string) error {
-	row, found, err := readBlockIdentityForRepairFn(db, orgID, blockID)
-	if err != nil {
-		return fmt.Errorf("read block identity for %s: %w", blockID, err)
-	}
-	if !found {
-		return fmt.Errorf("block metadata for %s disappeared before identity repair", blockID)
-	}
-	return db.ensureBlockIdentityRow(orgID, blockID, representationID, sha1, "", row)
-}
-
-func (db *DB) ensureBlockIdentityRow(orgID, blockID, representationID, sha1, storageKey string, row blockIdentityRepairRow) error {
-	activeClaim, repairClaim, ownershipErr := classifyBlockClaimOwnership(row.GCState, row.GCClaimID, row.GCClaimedAt)
-	if ownershipErr != nil {
-		// A malformed lifecycle/ownership combination is row corruption, not a
-		// transient mid-write state (LWTs mutate the row atomically). Fail closed
-		// rather than retry into the same corrupt row or mask it.
-		return fmt.Errorf("%w: block %s has malformed GC ownership: %w", ErrBlockMetadataPermanent, blockID, ownershipErr)
-	}
-	if activeClaim || repairClaim || row.CreatedAt == nil || !row.StorageClassPresent || row.StorageClass == "" {
-		// Deliberately transient (unmarked): an active/repair claim or a still-stub
-		// row can converge on a re-probe (GC abandons, or a concurrent uploader
-		// completes it), so the caller retries instead of failing the upload.
-		return fmt.Errorf("block %s has incomplete canonical metadata", blockID)
-	}
-	// R23a: validating only the incoming argument is not enough. When the INSERT
-	// loses, the caller INHERITS the identity already on the row, and reporting
-	// success would hand back a physical identity that no reader can resolve --
-	// ProbeBlockReuse and GC both refuse a non-canonical stored class. Permanent,
-	// not transient: unlike a claim or a stub, a corrupt label never converges.
-	if !config.IsCanonicalStorageClassName(row.StorageClass) {
-		return fmt.Errorf("%w: block %s has non-canonical storage class %q", ErrBlockMetadataPermanent, blockID, row.StorageClass)
-	}
-	currentStorageKey := row.StorageKey
-	if currentStorageKey == "" || strings.TrimSpace(currentStorageKey) != currentStorageKey {
-		return fmt.Errorf("%w: block %s has empty canonical storage key", ErrBlockMetadataPermanent, blockID)
-	}
-	if storageKey != "" && currentStorageKey != storageKey {
-		return fmt.Errorf("%w: block %s already has conflicting storage key %q", ErrBlockMetadataPermanent, blockID, currentStorageKey)
-	}
-
-	currentRepresentationID := strings.TrimSpace(row.RepresentationID)
-	currentSHA1 := strings.TrimSpace(row.Sha1)
-	if currentRepresentationID != "" && currentRepresentationID != representationID {
-		return fmt.Errorf("%w: block %s already has conflicting representation id %s", ErrBlockMetadataPermanent, blockID, currentRepresentationID)
-	}
-	if sha1 != "" && currentSHA1 != "" && currentSHA1 != sha1 {
-		return fmt.Errorf("%w: block %s already has conflicting sha1 %s", ErrBlockMetadataPermanent, blockID, currentSHA1)
-	}
-	if currentRepresentationID == "" {
-		applied, err := backfillBlockRepresentationIDFn(db, orgID, blockID, representationID, currentRepresentationID)
-		if err != nil {
-			return fmt.Errorf("backfill block representation id for %s: %w", blockID, err)
-		}
-		if !applied {
-			return fmt.Errorf("block metadata for %s changed before representation repair", blockID)
-		}
-	}
-	if sha1 == "" {
-		return nil
-	}
-	if currentSHA1 == "" {
-		applied, err := backfillBlockSHA1Fn(db, orgID, blockID, sha1, currentSHA1)
-		if err != nil {
-			return fmt.Errorf("backfill block sha1 for %s: %w", blockID, err)
-		}
-		if !applied {
-			return fmt.Errorf("block metadata for %s changed before sha1 repair", blockID)
-		}
-		return nil
-	}
-	return nil
-}
-
 func classifyBlockClaimOwnership(gcState, claimID string, claimedAt *time.Time) (bool, bool, error) {
 	gcState = strings.TrimSpace(gcState)
 	claimID = strings.TrimSpace(claimID)
@@ -985,17 +1005,6 @@ func classifyBlockClaimOwnership(gcState, claimID string, claimedAt *time.Time) 
 		return false, false, errors.New("lifecycle state is missing claim identity")
 	}
 	return gcState == BlockGCStateDeleting, gcState == BlockGCStateRepairingStub, nil
-}
-
-func isRepairableBlockStub(orgID, blockID string, createdAt *time.Time, storageClassPresent bool, gcState, claimID string, claimedAt *time.Time) bool {
-	if createdAt != nil || storageClassPresent {
-		return false
-	}
-	active, repairing, err := classifyBlockClaimOwnership(gcState, claimID, claimedAt)
-	if err != nil || active {
-		return false
-	}
-	return !repairing || strings.TrimSpace(claimID) == blockStubRepairIDFn(orgID, blockID)
 }
 
 func (db *DB) RepairReleasedBlockStub(orgID, blockID string) (bool, error) {
@@ -1132,7 +1141,7 @@ var probeBlockReuseHasS3OrphanFn = func(database *DB, orgID, blockID string) (bo
 	var existingBlockID string
 	err := database.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&existingBlockID)
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -1418,24 +1427,31 @@ type BlockDeleteClaimInfo struct {
 // with orphan recovery and lose the object after the canonical block row was
 // already deleted.
 func (db *DB) BlockDeleteFenceActive(orgID, blockID string) (bool, error) {
-	gcState, err := db.BlockGCState(orgID, blockID)
-	if err != nil {
-		return false, err
-	}
-	if gcState == BlockGCStateDeleting {
-		return true, nil
-	}
 	var existingBlockID string
-	err = db.Session().Query(`
+	err := db.Session().Query(`
 		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
-	`, orgID, blockID).Scan(&existingBlockID)
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(&existingBlockID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
+			existingBlockID = ""
+		} else {
+			return false, err
 		}
+	}
+	if existingBlockID != "" {
+		return true, nil
+	}
+	var gcState string
+	err = db.Session().Query(`
+		SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(&gcState)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
 		return false, err
 	}
-	return existingBlockID != "", nil
+	return gcState == BlockGCStateDeleting, nil
 }
 
 func (db *DB) GetBlockS3OrphanInfo(orgID, blockID string) (BlockS3OrphanInfo, bool, error) {

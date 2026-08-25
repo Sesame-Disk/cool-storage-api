@@ -8,6 +8,26 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-25 - P3/R10/R13/R17 writer-fence implementation
+
+Implemented the existing-incarnation writer boundary on the X1/P3 branch.
+Physical repair PUTs now pass through one authority funnel that revalidates the
+exact persisted `(storage_class, storage_key)` tuple immediately before writing.
+Metadata repair uses `RepairBlockMetadataIfCurrent`, a tuple-bound conditional
+UPDATE path that never creates a `blocks` row; the former generic metadata-upsert
+APIs were removed and test fixtures now use explicit INSTALL or released-stub
+repair primitives.
+
+GC fence-publication LWTs pin `EachQuorum` plus `Serial`, while the final repair
+authority and negative fence reads use explicit `Consistency(Serial)` where the
+authority decision requires it. Unit, AST and non-tagged integration coverage
+includes the observed-fence race and the residual race that must not recreate a
+condemned row. Docker Cassandra/MinIO `go-all-test` evidence is green; final review remains pending.
+
+R18 and R27 remain OPEN by design: a repair rejected by an orphan fence retains
+the provisional `up:` reference, and the deferred-orphan projection has no
+durable future retry schedule. `GC_ENABLED=false` remains mandatory.
+
 ## 2026-08-24 - P2/R9/R24 minted canonical install closure
 
 Closed the P2 canonical-install tranche. Rowless materialization attempts now

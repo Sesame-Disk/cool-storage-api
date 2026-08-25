@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-08-24
-**Session**: X1 foundations — P2 minted incarnations and canonical install closed; P3 next
+**Last Updated**: 2026-08-25
+**Session**: X1/P3 writer-fence implementation — R10/R13/R17 evidence verified; final review pending; R18/R27 remain open
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -45,8 +45,8 @@ production blocker, and no status document should say that it is.
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
 5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — so the *deletion-activation* gate genuinely rests on X1 alone. The upload-fence PR series addresses separate writer/GC races and does not close it. **Product go-live is a different gate** and is not held by X1: see the table above and blocker #4.
-6. **X1 design state**: **no accepted design.** The r3 generational fence was abandoned 2026-08-14 (PR #166 closed unmerged; branch `docs/gc-x1-x2-generation-fence-final` kept as investigative reference only). Closure options, race matrix and open questions are in [`docs/GC-X1-CLOSURE-OPTIONS.md`](docs/GC-X1-CLOSURE-OPTIONS.md) — analysis, not a decision. `GC_ENABLED=false` is now pinned explicitly in `docker-compose.prod.yml`.
-7. **Current X1 key:** P1 locator authority merged 2026-08-21 (PR #181), P0/R12 landed 2026-08-23 (PR #183), and P2/R9/R24 closed 2026-08-24 after its structural prerequisite (PR #184). New rowless materializations mint `K.<uuid>`, install one complete `(storage_class, storage_key)` tuple through a single non-retryable global-SERIAL LWT, settle ambiguous outcomes with a SERIAL read, and clean only a proven losing tuple. Legacy deterministic keys remain readable and repairable. P2 does **not** close condemned-incarnation writer safety (P3: R10/R13/R17), exact-`P` destructive lifecycle (P4: R14/R19/R20/R26), or X1. P3 is next. Keep `GC_ENABLED=false` on every replica in every DC.
+6. **X1 design state**: **no accepted full-X1 design.** The r3 generational fence was abandoned 2026-08-14 (PR #166 closed unmerged; branch `docs/gc-x1-x2-generation-fence-final` kept as investigative reference only). Closure options, race matrix and open questions are in [`docs/GC-X1-CLOSURE-OPTIONS.md`](docs/GC-X1-CLOSURE-OPTIONS.md) — analysis, not a decision. `GC_ENABLED=false` is pinned explicitly in `docker-compose.prod.yml`.
+7. **Current X1/P3 key:** P1 locator authority merged 2026-08-21 (PR #181), P0/R12 landed 2026-08-23 (PR #183), and P2/R9/R24 closed 2026-08-24 after its structural prerequisite (PR #184). This branch implements the P3 writer boundary: existing-incarnation PUTs revalidate exact `(storage_class, storage_key)` authority immediately before PUT, and metadata repair is non-creating and tuple-bound. Docker `go-all-test` evidence for R10/R13/R17 is green; final diff review and commit remain. R18/R27 are explicitly open because rejected `up:` references are retained and deferred-orphan rescheduling is not implemented. Keep `GC_ENABLED=false` on every replica in every DC.
 
 ### Inter-session Update (2026-05-21)
 

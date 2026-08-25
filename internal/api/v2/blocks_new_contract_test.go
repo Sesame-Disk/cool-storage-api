@@ -65,6 +65,7 @@ func uploadBlockNewContractHarness(
 	oldProbe := probeUploadedBlockReuseFn
 	oldFreshPut := putUploadedBlockAutoDirectFn
 	oldRepairPut := repairCanonicalBlockDirectFn
+	oldAuthority := validateBlockRepairAuthorityFn
 	oldExists := reusableCanonicalObjectExistsFn
 	oldRegister := registerUploadedBlockTargetForMaterializationFn
 	oldMapping := writeVerifiedWebBlockMappingFn
@@ -76,6 +77,7 @@ func uploadBlockNewContractHarness(
 		probeUploadedBlockReuseFn = oldProbe
 		putUploadedBlockAutoDirectFn = oldFreshPut
 		repairCanonicalBlockDirectFn = oldRepairPut
+		validateBlockRepairAuthorityFn = oldAuthority
 		reusableCanonicalObjectExistsFn = oldExists
 		registerUploadedBlockTargetForMaterializationFn = oldRegister
 		writeVerifiedWebBlockMappingFn = oldMapping
@@ -105,6 +107,9 @@ func uploadBlockNewContractHarness(
 	repairCanonicalBlockDirectFn = func(_ context.Context, _ *storage.BlockStore, key string, _ []byte) (string, error) {
 		counts.puts++
 		return key, nil
+	}
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		return db.BlockRepairAuthorityAuthorized, nil
 	}
 	existsCalls := 0
 	reusableCanonicalObjectExistsFn = func(context.Context, *storage.BlockStore, string) (bool, error) {

@@ -40,6 +40,7 @@ var ephemeralLibraryExactNames = []string{
 }
 
 func TestMain(m *testing.M) {
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" || os.Getenv("SESAMEFS_REQUIRE_P3_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
 		baseURL = "http://localhost:3000"
@@ -51,6 +52,9 @@ func TestMain(m *testing.M) {
 		fmt.Println("")
 		fmt.Println("Start the backend with:")
 		fmt.Println("  docker compose up -d")
+		if requireEvidence {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 	baseURL = resolvedBaseURL
@@ -60,6 +64,9 @@ func TestMain(m *testing.M) {
 		fmt.Println("")
 		fmt.Println("The running backend is reachable, but the standard dev tokens are not enabled.")
 		fmt.Println("Set SESAMEFS_URL to an environment with dev tokens, or run the backend with AUTH_DEV_MODE and seeded dev tokens.")
+		if requireEvidence {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
