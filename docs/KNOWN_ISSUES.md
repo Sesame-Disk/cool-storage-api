@@ -2583,6 +2583,21 @@ Closing it requires durable
 physical-object intent before PUT or a sweeper with a safe ownership proof. Tracking:
 `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X3.
 
+**The cleanup counter is narrower than the set of paths that retain bytes, and must
+not be read as coverage of this issue.** `block_upload_fresh_physical_cleanup_total`
+is emitted only where a cleanup is actually attempted: the conclusively unsubmitted
+pre-INSTALL branch and KnownLost. It is NOT emitted by the two branches that
+deliberately keep their object — ambiguous settlement and the direct single-use
+identity contradiction — nor by the provisional-reference and delete-fence failures
+described above, which return the retryable sentinel and leave the minted target
+behind for an outer remint. Those are precisely the retention paths with no other
+signal, so a counter showing no `result="failure"` samples is consistent with every
+retained object this issue describes and must not be quoted as evidence that none
+exist. Making the class observable means adding a `result="retained"` outcome on the
+deliberate-retention branches and counting the pre-INSTALL sentinel returns; that is
+a small, separable change, it is still not durable object intent, and it would not
+close X3 on its own.
+
 ---
 
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening

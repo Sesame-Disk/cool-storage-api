@@ -193,7 +193,12 @@ installs the deleted target; a failed cleanup is an observable X3 leak and does
 not authorize an outer remint while that target survives. A KnownLost target is
 similarly deleted with bounded application-level retries against only its exact
 store and key. `block_upload_fresh_physical_cleanup_total{result,reason}` records
-one final cleanup outcome, not each application or SDK attempt.
+one final cleanup outcome, not each application or SDK attempt. It is emitted only
+where a cleanup is attempted — the conclusively unsubmitted pre-INSTALL branch and
+KnownLost. The branches that retain their object instead of deleting it (ambiguous
+settlement, single-use identity contradiction), and the pre-INSTALL failures that
+return the retryable sentinel, emit nothing: the counter measures cleanup outcomes,
+not the retained-object population. See `ISSUE-UPLOAD-PUT-BEFORE-INTENT-01`.
 
 An uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
 detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
