@@ -182,8 +182,20 @@ An org-scoped `BlockStore` accepts exactly two key forms for a SHA-256 block ID:
 Fresh, rowless materialization mints a new incarnation, PUTs that exact key, and
 uses the target-aware metadata API to `InstallBlockMetadata` once. Existing-row
 reuse and explicitly repairable stubs use the persisted tuple and the repair
-`UpsertBlockMetadata` path; they do not mint or silently relocate the block. An
-uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
+`UpsertBlockMetadata` path; they do not mint or silently relocate the block. Fresh
+INSTALL preparation first resolves the library's representation with the request
+context. Transient Cassandra resolution failures retry locally with bounded
+backoff while retaining the same already-PUT target; permanent identity/library
+failures, cancellation, and exhaustion submit no INSTALL. A conclusively
+unsubmitted target receives bounded detached cleanup of that exact key. The
+provisional logical reference may remain until its TTL, but no metadata row ever
+installs the deleted target; a failed cleanup is an observable X3 leak and does
+not authorize an outer remint while that target survives. A KnownLost target is
+similarly deleted with bounded application-level retries against only its exact
+store and key. `block_upload_fresh_physical_cleanup_total{result,reason}` records
+one final cleanup outcome, not each application or SDK attempt.
+
+An uncertain fresh INSTALL is never resubmitted. It is settled by a bounded,
 detached `SERIAL` read: an exact tuple match proves the proposal canonical, a
 different complete tuple or no row proves it lost, and incomplete/unavailable
 settlement remains ambiguous and authorizes no cleanup. A definite direct

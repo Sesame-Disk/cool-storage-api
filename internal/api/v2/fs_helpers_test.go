@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestGetCanonicalHeadCommit_LibraryStateErrorIsNotMaskedAsNotFound(t *testing.T) {
@@ -451,12 +453,14 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldResolve := resolveFreshInstallRepresentationFn
 	oldInstall := registerUploadedBlockInstallMetadataFn
 	oldDelete := deleteFreshInstallLoserFn
 	t.Cleanup(func() {
 		registerUploadedBlockAddProvisionalRefFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		resolveFreshInstallRepresentationFn = oldResolve
 		registerUploadedBlockInstallMetadataFn = oldInstall
 		deleteFreshInstallLoserFn = oldDelete
 	})
@@ -466,6 +470,9 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 	registerUploadedBlockUpsertMetadataFn = func(*FSHelper, string, string, string, string, int, string, string) error {
 		t.Fatal("fresh target must not use repair-capable metadata upsert")
 		return nil
+	}
+	resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
 	}
 
 	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
@@ -511,9 +518,7 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 			}
 			return nil
 		}
-		requestCtx, cancelRequest := context.WithCancel(context.Background())
-		cancelRequest()
-		err := (&FSHelper{}).RegisterUploadedBlockTarget(requestCtx, orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+		err := (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
 		if !errors.Is(err, ErrBlockMaterializationTransient) || deleteCalls != 1 {
 			t.Fatalf("error/deletes = %v/%d, want retryable/1", err, deleteCalls)
 		}
@@ -567,6 +572,269 @@ func TestRegisterUploadedBlockTargetFreshInstallAuthority(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRegisterUploadedBlockTargetFreshInstallPreparationAndCleanup(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldResolve := resolveFreshInstallRepresentationFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	oldDelete := deleteFreshInstallLoserFn
+	oldBackoff := freshInstallRetryBackoffFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		resolveFreshInstallRepresentationFn = oldResolve
+		registerUploadedBlockInstallMetadataFn = oldInstall
+		deleteFreshInstallLoserFn = oldDelete
+		freshInstallRetryBackoffFn = oldBackoff
+	})
+
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	freshInstallRetryBackoffFn = func(int) time.Duration { return 0 }
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.MintStorageKey(uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := BlockMaterializationTarget{Store: store, StorageClass: "hot", StorageKey: key, FreshInstall: true}
+	register := func(ctx context.Context) error {
+		return (&FSHelper{}).RegisterUploadedBlockTarget(ctx, orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+	}
+
+	t.Run("transient resolution retries same target then submits once", func(t *testing.T) {
+		resolveCalls := 0
+		installCalls := 0
+		resolveFreshInstallRepresentationFn = func(ctx context.Context, _ *FSHelper, gotOrg, gotLibrary string) (string, error) {
+			resolveCalls++
+			if ctx == nil || gotOrg != orgID || gotLibrary != "lib" {
+				t.Fatalf("resolver context/identity = %v/%q/%q", ctx, gotOrg, gotLibrary)
+			}
+			if resolveCalls == 1 {
+				return "", gocql.ErrTimeoutNoResponse
+			}
+			return db.PlainBlockRepresentationID, nil
+		}
+		registerUploadedBlockInstallMetadataFn = func(_ context.Context, _ *FSHelper, _ string, representationID, _ string, _ string, _ int, got BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			installCalls++
+			if representationID != db.PlainBlockRepresentationID || got != target {
+				t.Fatalf("INSTALL representation/target = %q/%+v, want %q/%+v", representationID, got, db.PlainBlockRepresentationID, target)
+			}
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataApplied}
+		}
+		deleteFreshInstallLoserFn = func(context.Context, BlockMaterializationTarget) error {
+			t.Fatal("successful local preparation must not clean or request a remint")
+			return nil
+		}
+
+		if err := register(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if resolveCalls != 2 || installCalls != 1 {
+			t.Fatalf("resolver/INSTALL calls = %d/%d, want 2/1", resolveCalls, installCalls)
+		}
+	})
+
+	t.Run("permanent resolution failure never submits and cleans exact target", func(t *testing.T) {
+		sequence := []string{}
+		registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error {
+			sequence = append(sequence, "provisional")
+			return nil
+		}
+		resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+			sequence = append(sequence, "resolve")
+			return "", db.ErrLibraryDeleted
+		}
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			t.Fatal("permanent preparation failure must submit zero INSTALLs")
+			return db.InstallBlockMetadataResult{}
+		}
+		deleteFreshInstallLoserFn = func(ctx context.Context, got BlockMaterializationTarget) error {
+			sequence = append(sequence, "cleanup")
+			if ctx.Err() != nil || got != target {
+				t.Fatalf("cleanup context/target = %v/%+v, want detached exact %+v", ctx.Err(), got, target)
+			}
+			return nil
+		}
+
+		err := register(context.Background())
+		if !errors.Is(err, db.ErrBlockMetadataPermanent) || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want permanent non-retryable preparation failure", err)
+		}
+		if strings.Join(sequence, ",") != "provisional,resolve,cleanup" {
+			t.Fatalf("sequence = %v, want provisional reference then resolution then exact cleanup", sequence)
+		}
+	})
+
+	t.Run("exhausted resolution cleans before returning transient", func(t *testing.T) {
+		resolveCalls := 0
+		deleteCalls := 0
+		resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+			resolveCalls++
+			return "", gocql.ErrNoConnections
+		}
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			t.Fatal("exhausted preparation must submit zero INSTALLs")
+			return db.InstallBlockMetadataResult{}
+		}
+		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if got != target {
+				t.Fatalf("cleanup target = %+v, want %+v", got, target)
+			}
+			return nil
+		}
+
+		err := register(context.Background())
+		if !errors.Is(err, ErrBlockMaterializationTransient) || resolveCalls != freshInstallPreparationAttempts || deleteCalls != 1 {
+			t.Fatalf("error/resolves/deletes = %v/%d/%d", err, resolveCalls, deleteCalls)
+		}
+	})
+
+	t.Run("resolver cancellation is observed and detached cleanup still runs", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		deleteCalls := 0
+		resolveFreshInstallRepresentationFn = func(gotCtx context.Context, _ *FSHelper, _, _ string) (string, error) {
+			cancel()
+			<-gotCtx.Done()
+			return "", gotCtx.Err()
+		}
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			t.Fatal("canceled preparation must submit zero INSTALLs")
+			return db.InstallBlockMetadataResult{}
+		}
+		deleteFreshInstallLoserFn = func(cleanupCtx context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if cleanupCtx.Err() != nil || got != target {
+				t.Fatalf("cleanup inherited cancellation or changed target: %v/%+v", cleanupCtx.Err(), got)
+			}
+			return nil
+		}
+
+		err := register(ctx)
+		if !errors.Is(err, context.Canceled) || deleteCalls != 1 || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error/deletes = %v/%d, want canceled/1", err, deleteCalls)
+		}
+	})
+
+	t.Run("cancellation after resolution still submits zero installs", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		deleteCalls := 0
+		resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+			cancel()
+			return db.PlainBlockRepresentationID, nil
+		}
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			t.Fatal("cancellation observed after resolution must submit zero INSTALLs")
+			return db.InstallBlockMetadataResult{}
+		}
+		deleteFreshInstallLoserFn = func(cleanupCtx context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if cleanupCtx.Err() != nil || got != target {
+				t.Fatalf("cleanup inherited cancellation or changed target: %v/%+v", cleanupCtx.Err(), got)
+			}
+			return nil
+		}
+
+		err := register(ctx)
+		if !errors.Is(err, context.Canceled) || deleteCalls != 1 {
+			t.Fatalf("error/deletes = %v/%d, want canceled/1", err, deleteCalls)
+		}
+	})
+}
+
+func TestRegisterUploadedBlockTargetFreshCleanupRetriesAndMetrics(t *testing.T) {
+	oldAdd := registerUploadedBlockAddProvisionalRefFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldResolve := resolveFreshInstallRepresentationFn
+	oldInstall := registerUploadedBlockInstallMetadataFn
+	oldDelete := deleteFreshInstallLoserFn
+	oldBackoff := freshInstallRetryBackoffFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddProvisionalRefFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		resolveFreshInstallRepresentationFn = oldResolve
+		registerUploadedBlockInstallMetadataFn = oldInstall
+		deleteFreshInstallLoserFn = oldDelete
+		freshInstallRetryBackoffFn = oldBackoff
+	})
+	registerUploadedBlockAddProvisionalRefFn = func(*FSHelper, string, string, string, string, string, time.Time) error { return nil }
+	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) { return false, nil }
+	resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+		return db.PlainBlockRepresentationID, nil
+	}
+	freshInstallRetryBackoffFn = func(int) time.Duration { return 0 }
+
+	const orgID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+	store, err := storage.NewOrgBlockStore(&storage.S3Store{}, "blocks/", orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.MintStorageKey(uploadReuseTestBlockID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := BlockMaterializationTarget{Store: store, StorageClass: "hot", StorageKey: key, FreshInstall: true}
+	register := func() error {
+		return (&FSHelper{}).RegisterUploadedBlockTarget(context.Background(), orgID, "lib", uploadReuseTestBlockID, "op", 1, target, "")
+	}
+
+	t.Run("known lost retries only exact target and counts final success", func(t *testing.T) {
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			return db.InstallBlockMetadataResult{Outcome: db.InstallBlockMetadataKnownLost, Canonical: db.BlockPhysicalLocation{StorageClass: "winner", StorageKey: "winner-key"}}
+		}
+		deleteCalls := 0
+		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if got != target {
+				t.Fatalf("cleanup attempt %d changed target to %+v", deleteCalls, got)
+			}
+			if deleteCalls < freshInstallCleanupAttempts {
+				return errors.New("temporary delete failure")
+			}
+			return nil
+		}
+		before := testutil.ToFloat64(metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("success", "known_lost"))
+		err := register()
+		after := testutil.ToFloat64(metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("success", "known_lost"))
+		if !errors.Is(err, ErrBlockMaterializationTransient) || deleteCalls != freshInstallCleanupAttempts || after-before != 1 {
+			t.Fatalf("error/deletes/metric delta = %v/%d/%v", err, deleteCalls, after-before)
+		}
+	})
+
+	t.Run("preinstall cleanup exhaustion counts failure and prevents outer remint", func(t *testing.T) {
+		resolveFreshInstallRepresentationFn = func(context.Context, *FSHelper, string, string) (string, error) {
+			return "", gocql.ErrTimeoutNoResponse
+		}
+		registerUploadedBlockInstallMetadataFn = func(context.Context, *FSHelper, string, string, string, string, int, BlockMaterializationTarget) db.InstallBlockMetadataResult {
+			t.Fatal("failed preparation must submit zero INSTALLs")
+			return db.InstallBlockMetadataResult{}
+		}
+		deleteCalls := 0
+		cleanupErr := errors.New("delete unavailable")
+		deleteFreshInstallLoserFn = func(_ context.Context, got BlockMaterializationTarget) error {
+			deleteCalls++
+			if got != target {
+				t.Fatalf("cleanup attempt %d changed target to %+v", deleteCalls, got)
+			}
+			return cleanupErr
+		}
+		before := testutil.ToFloat64(metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("failure", "preinstall_failed"))
+		err := register()
+		after := testutil.ToFloat64(metrics.BlockUploadFreshPhysicalCleanupTotal.WithLabelValues("failure", "preinstall_failed"))
+		if !errors.Is(err, cleanupErr) || IsRetryableBlockMaterializationError(err) {
+			t.Fatalf("error = %v, want observable cleanup failure without outer retry authority", err)
+		}
+		if deleteCalls != freshInstallCleanupAttempts || after-before != 1 {
+			t.Fatalf("deletes/metric delta = %d/%v, want %d/1", deleteCalls, after-before, freshInstallCleanupAttempts)
+		}
+	})
 }
 
 func TestRegisterUploadedBlockTargetRejectsForgedFreshLocatorBeforeAuthority(t *testing.T) {

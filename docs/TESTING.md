@@ -34,6 +34,14 @@ docker compose --profile test run --rm --build go-integration-test \
     printf "%s\n" "$out" | grep -q -- "P2_CONTENTION_EVIDENCE candidates=2"; \
     ! printf "%s\n" "$out" | grep -q -- "--- SKIP: TestP2ConcurrentCanonicalInstall"'
 
+# P2 fresh pre-INSTALL preparation and exact-cleanup regressions. These prove
+# transient resolver retries retain one target, canceled/permanent/exhausted
+# preparation submits no INSTALL, post-submit ambiguity grants no cleanup, and
+# KnownLost/pre-INSTALL cleanup retries and final metrics stay exact-key scoped.
+docker compose --profile test run --rm --build gotest \
+  go test -count=1 -run 'FreshInstall(Authority|PreparationAndCleanup)|FreshCleanupRetriesAndMetrics' \
+  ./internal/api/v2
+
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 

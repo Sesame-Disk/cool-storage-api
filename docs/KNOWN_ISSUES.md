@@ -2565,12 +2565,16 @@ and the evidence for that decision live in the document above.
 The physical PUT precedes any GC-discoverable block metadata/reference or durable
 physical-object intent. A session may already have staged accounting state, but that
 state does not identify the stored object for reclamation. Minted keys broaden the
-existing leak beyond a process crash: an ambiguous PUT, a pre-INSTALL retry that
-remints, unresolved request-local install uncertainty, or failed exact-loser cleanup
-can also leave bytes no GC phase can discover safely. P2 has no durable attempt table
-or reconciliation worker, and no dedicated durable signal identifies every retained
-minted object; reconciliation and observability remain open rather than being implied
-by request-local logs. P2 therefore does not close X3. Closing it requires durable
+existing leak beyond a process crash: an ambiguous PUT, unresolved request-local
+install uncertainty, or failed exact cleanup can also leave bytes no GC phase can
+discover safely. Pre-INSTALL representation retries now retain one already-PUT target,
+and a permanent, canceled, or exhausted preparation performs bounded detached exact
+cleanup without submitting INSTALL; KnownLost cleanup also retries the exact target.
+The final cleanup result is exposed by
+`block_upload_fresh_physical_cleanup_total{result,reason}`, but that process-local
+counter is not durable object intent and cannot reconcile a failed cleanup. P2 has no
+durable attempt table or reconciliation worker. P2 therefore does not close X3.
+Closing it requires durable
 physical-object intent before PUT or a sweeper with a safe ownership proof. Tracking:
 `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X3.
 
