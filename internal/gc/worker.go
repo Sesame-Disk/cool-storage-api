@@ -629,12 +629,10 @@ const (
 // held before another attempt may hand it back on the owner's behalf.
 //
 // Age is the only thing that distinguishes an abandoned claim from a live one here.
-// claimID is derived from the candidate timestamp, so it identifies a candidate, not
-// an attempt: it is shared by every attempt on the same candidate (concurrent ones
-// included) and differs across candidates on the same block. Releasing by identity
-// therefore fails in both directions — it can drop the fence under a live attempt
-// that shares the id, and it cannot lift a claim from a candidate that no longer
-// exists. The threshold only has to exceed the longest possible single processBlock
+// claimID is a fresh UUID per attempt, and post-claim releases compare the exact
+// (P, claimID, claimed_at), so they cannot drop another live attempt's fence.
+// Staleness authorizes only a pre-claim worker to hand back the exact prior authority
+// it observed. The threshold only has to exceed the longest possible single processBlock
 // walk — a handful of statements, each bounded by the driver timeout — so a wide
 // margin costs nothing: it delays unwedging a genuinely abandoned claim, and never
 // races a live one.

@@ -90,7 +90,8 @@ because each one was a real gap in the first cut, not polish:
   `GetBlockInfo` re-read.** That read is ordinary (`database.consistency` accepts `ONE`)
   while the claim commits at EACH_QUORUM in the serial domain, so it can show a different
   incarnation — the same "re-read and destroy what is there now" one step below the claim.
-  Both now use `attempt.Target`, and any divergence releases the claim and fails closed.
+  Both now use `attempt.Target`; a divergent read releases the exact claim, preserves the
+  candidate, and postpones without consuming retry budget.
 - **`ErrBlockCandidateTargetUnavailable` was fatal at all three enqueue sites**, contrary
   to its own documented contract. On the fs_object path it was self-poisoning: the delete
   aborted, retried, re-derived the same zero-ref block through an idempotent reference
@@ -129,9 +130,10 @@ and is then recognised by the settling read — was untestable.
 - Real Cassandra: `internal/integration/p4a_claim_authority_test.go`, gated by
   `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` (pinned in `docker-compose.yaml` and wired into the
   integration `TestMain` OR-chain, so a stack that never came up FAILS instead of
-  skipping to a green run). Three legs: exclusive ownership plus exact takeover, the ABA
-  case, and retry semantics under the engine's real CAS returns.
-- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-one deliberate mutations, each
+  skipping to a green run). Four legs: exclusive ownership plus exact takeover, the ABA
+  case, retry semantics under the engine's real CAS returns, and stale-claim release
+  bound to the observed physical incarnation.
+- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations, each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
   earned their keep during the second pass: one exposed that a mutation which fails to
   COMPILE proves nothing, and one exposed that the incarnation check lives in two mirrored
@@ -184,6 +186,19 @@ Three smaller fixes landed with it:
   (`block_candidate_within_grace`), as does a claim whose owner cannot be named at all —
   `gc_state='deleting'` with a null `gc_claim_id` is not a takeable stale owner, because
   every recovery route from it is a CAS against an authority that does not exist.
+
+**Fourth review pass — post-claim canonical read failures.** A successful claim proves its
+exact target in the serial domain, while `GetBlockInfo` is an ordinary read. The existing
+stub-shaped-read handling released the exact claim and postponed, but an ordinary read
+error returned through `failClosedIfUnavailable`, and a non-empty divergent locator
+returned a generic error after release. The former retained this attempt's fence; the
+latter exhausted the retry budget and moved the candidate's queue item to the DLQ.
+
+All three unreliable outcomes now use `releaseAndPostponeUnreliableRead`: stub-shaped
+read, read error, and divergent locator. It releases the exact authority, preserves the
+candidate, and returns `block_canonical_read_unreliable`, which requeues without a retry
+increment. Unit regressions hold each failure across more than the DLQ threshold, and the
+two added mutations prove that restoring either retrying path turns the P4a gate red.
 
 **Scope, and what is still open.** `StartBlockDeleteOrphan` is deliberately untouched:
 `blocks` and `gc_s3_orphans` are separate Paxos partitions, and binding publication to

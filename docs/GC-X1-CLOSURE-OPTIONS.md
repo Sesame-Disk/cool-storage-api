@@ -1626,6 +1626,15 @@ split: existing-incarnation PUTs use exact authority revalidation and
 `RepairBlockMetadataIfCurrent`; only fresh attempts use `InstallBlockMetadata`.
 The P3 evidence table near the end of this document is the current status source.
 
+**P4a evidence update (2026-08-26):** The R14a row below is GREEN only for the
+claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
+ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
+the observed incarnation — plus 23 red-form mutations in
+`scripts/p4a-mutation-validation.sh`. This supersedes older counts of 17 or 21. A fourth
+review pass made every non-authoritative post-claim `GetBlockInfo` outcome (stub-shaped,
+error, or divergent locator) release the exact claim and postpone with the candidate
+preserved. R14b/P4b, the orphan-publication half, remains open.
+
 | # | Sequence | Required outcome |
 |---|---|---|
 | R1 | EU `up:` acked, then NA GC reads at `EACH_QUORUM` | GC sees the reference; no DELETE. Closed by X2. |
