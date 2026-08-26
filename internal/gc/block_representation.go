@@ -87,6 +87,23 @@ func validateQueueItemBlockRepresentation(item QueueItem) error {
 	return nil
 }
 
+func validateQueueItemBlockCandidateIdentity(item QueueItem) error {
+	candidate := item.BlockGCCandidateIdentity
+	if item.ItemType != ItemBlock {
+		if !candidate.Target.IsZero() || !candidate.CandidateAt.IsZero() {
+			return fmt.Errorf("gc: non-block item type %s (%s) must not carry a block candidate identity", item.ItemType, item.ItemID)
+		}
+		return nil
+	}
+	if candidate.Target.IsZero() || candidate.CandidateAt.IsZero() {
+		return fmt.Errorf("gc: block item %s requires an exact block GC candidate identity", item.ItemID)
+	}
+	if !item.IdentityAt.Equal(candidate.CandidateAt) {
+		return fmt.Errorf("gc: block item %s identity_at must equal candidate_at", item.ItemID)
+	}
+	return nil
+}
+
 // resolveRequiredLibraryBlockRepresentation resolves the canonical block
 // representation for a library at enqueue time. It uses providedRepresentationID
 // (already persisted on the queue item) when present, otherwise reads it from the

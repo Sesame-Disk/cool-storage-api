@@ -17,12 +17,12 @@ func TestStore_EnsureBlockGCCandidate_RepairsMissingProjection(t *testing.T) {
 	store.AddBlockGCCandidate(orgID, "block-repair", "hot", candidateAt)
 	store.DeleteBlockGCCandidateProjectionForTest(orgID, "block-repair", candidateAt)
 
-	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, "block-repair", "cold", time.Now())
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, "block-repair", "cold", time.Now())
 	if err != nil {
-		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+		t.Fatalf("EnsureBlockGCCandidateExact failed: %v", err)
 	}
-	if !effectiveCandidateAt.Equal(candidateAt) {
-		t.Fatalf("effective candidate_at = %v, want %v", effectiveCandidateAt, candidateAt)
+	if !candidate.CandidateAt.Equal(candidateAt) {
+		t.Fatalf("effective candidate_at = %v, want %v", candidate.CandidateAt, candidateAt)
 	}
 
 	candidates, err := store.ListBlockGCCandidatesByDay(candidateAt, db.GCDiscoveryBucket(orgID.String(), "block-repair"))
@@ -49,12 +49,12 @@ func TestStore_EnsureBlockGCCandidate_PrefersEarlierCandidateAt(t *testing.T) {
 	store.AddBlock(orgID, "block-earlier", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "block-earlier", "hot", later)
 
-	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, "block-earlier", "cold", earlier)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, "block-earlier", "cold", earlier)
 	if err != nil {
-		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+		t.Fatalf("EnsureBlockGCCandidateExact failed: %v", err)
 	}
-	if !effectiveCandidateAt.Equal(earlier) {
-		t.Fatalf("effective candidate_at = %v, want %v", effectiveCandidateAt, earlier)
+	if !candidate.CandidateAt.Equal(earlier) {
+		t.Fatalf("effective candidate_at = %v, want %v", candidate.CandidateAt, earlier)
 	}
 
 	olderDayCandidates, err := store.ListBlockGCCandidatesByDay(earlier, db.GCDiscoveryBucket(orgID.String(), "block-earlier"))
@@ -77,6 +77,52 @@ func TestStore_EnsureBlockGCCandidate_PrefersEarlierCandidateAt(t *testing.T) {
 	}
 	if len(laterDayCandidates) != 0 {
 		t.Fatalf("expected stale later projection to be removed, got %d rows", len(laterDayCandidates))
+	}
+}
+
+func TestStore_BlockGCCandidatesKeepMultipleIncarnationsAndRequireExactIdentity(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	now := time.Now().UTC()
+	p1At := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC).Add(-24 * time.Hour)
+	p2At := p1At.Add(time.Hour)
+
+	store.AddBlock(orgID, "block-incarnations", "hot", 0)
+	p1, err := store.EnsureBlockGCCandidateExact(orgID, "block-incarnations", "hot", p1At)
+	if err != nil {
+		t.Fatalf("ensure P1: %v", err)
+	}
+	store.SetBlockStorageKeyForTest(orgID, "block-incarnations", p1.Target.StorageKey+".remint")
+	p2, err := store.EnsureBlockGCCandidateExact(orgID, "block-incarnations", "hot", p2At)
+	if err != nil {
+		t.Fatalf("ensure P2: %v", err)
+	}
+	if p1.Target == p2.Target {
+		t.Fatal("P2 candidate reused P1's physical identity")
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 2 {
+		t.Fatalf("candidate rows = %d, want 2 coexisting incarnations", len(got))
+	}
+	bucket := db.GCDiscoveryBucket(orgID.String(), "block-incarnations")
+	if projected, err := store.ListBlockGCCandidatesByDay(p1At, bucket); err != nil || len(projected) != 2 {
+		t.Fatalf("coexisting projections: rows=%d err=%v, want 2", len(projected), err)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, "block-incarnations", p1.Identity()); err != nil || !ok {
+		t.Fatalf("exact P1 get: ok=%v err=%v", ok, err)
+	}
+	stale := p1.Identity()
+	stale.CandidateAt = stale.CandidateAt.Add(time.Millisecond)
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, "block-incarnations", stale); err != nil || ok {
+		t.Fatalf("stale exact get: ok=%v err=%v, want stale refusal", ok, err)
+	}
+	if err := store.DeleteBlockGCCandidate(orgID, "block-incarnations", p1.Identity()); err != nil {
+		t.Fatalf("delete P1: %v", err)
+	}
+	if projected, err := store.ListBlockGCCandidatesByDay(p1At, bucket); err != nil || len(projected) != 1 || projected[0].Target != p2.Target {
+		t.Fatalf("P1 projection cleanup: rows=%+v err=%v, want only P2", projected, err)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, "block-incarnations", p2.Identity()); err != nil || !ok {
+		t.Fatalf("exact P2 after P1 delete: ok=%v err=%v", ok, err)
 	}
 }
 

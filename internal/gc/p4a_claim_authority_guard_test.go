@@ -68,17 +68,12 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 		{
 			function: "DeleteBlockGCCandidate",
 			query:    "DELETE FROM gc_block_candidates",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
+			columns:  []string{"candidate_at = ?"},
 		},
 		{
 			function: "advanceBlockGCCandidateAt",
 			query:    "UPDATE gc_block_candidates SET candidate_at",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
-		},
-		{
-			function: "replaceBlockGCCandidateIncarnation",
-			query:    "UPDATE gc_block_candidates SET candidate_at",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
+			columns:  []string{"candidate_at = ?"},
 		},
 	} {
 		fn := findGCFunction(file, want.function)
@@ -99,6 +94,13 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 		for _, column := range want.columns {
 			if !strings.Contains(condition, column) {
 				t.Errorf("%s statement %q must condition on %q; without it a lifecycle for one incarnation can act on another (R14). Got IF clause: %s", want.function, want.query, column, condition)
+			}
+		}
+		if want.function == "DeleteBlockGCCandidate" || want.function == "advanceBlockGCCandidateAt" {
+			for _, column := range []string{"storage_class = ?", "storage_key = ?"} {
+				if !strings.Contains(statement, column) {
+					t.Errorf("%s statement %q must name %q in its exact v2 key: %s", want.function, want.query, column, statement)
+				}
 			}
 		}
 	}
@@ -178,10 +180,10 @@ func TestP4ACandidatesCarryTheExactKeyAndNeverDeriveIt(t *testing.T) {
 	file := p4aParseStore(t)
 
 	for _, want := range []struct{ function, query string }{
-		{"EnsureBlockGCCandidate", "INSERT INTO gc_block_candidates"},
+		{"EnsureBlockGCCandidateExact", "INSERT INTO gc_block_candidates"},
 		{"upsertBlockGCCandidateProjection", "INSERT INTO gc_block_candidates_by_day"},
 		{"moveBlockGCCandidateProjection", "INSERT INTO gc_block_candidates_by_day"},
-		{"GetBlockGCCandidate", "FROM gc_block_candidates"},
+		{"GetBlockGCCandidateExact", "FROM gc_block_candidates"},
 		{"ListBlockGCCandidatesByDay", "FROM gc_block_candidates_by_day"},
 	} {
 		fn := findGCFunction(file, want.function)
@@ -309,13 +311,8 @@ func TestP4AStaleClaimReleaseNamesAnIncarnation(t *testing.T) {
 	}
 }
 
-// TestP4ACandidateCaptureUsesTheSerialDomain: the read that decides whether an existing
-// candidate is REPLACED must be linearizable.
-//
-// A lagging read can move a candidate backward — canonical row already at P2, candidate
-// correctly at P2, stale read returns P1, the two differ, replacement fires — and the
-// worker then claims P1, gets TargetChanged, settles the candidate, and leaves P2 with no
-// work item at all.
+// TestP4ACandidateCaptureUsesTheSerialDomain: the read that captures a new candidate
+// must be linearizable.
 func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 	file := p4aParseStore(t)
 	fn := findGCFunction(file, "resolveBlockDeleteTarget")
@@ -323,7 +320,7 @@ func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 		t.Fatal("resolveBlockDeleteTarget not found; candidate capture cannot be verified")
 	}
 	if !gcQueryMethodHas(fn, "FROM blocks", "Consistency", "Serial") {
-		t.Error("resolveBlockDeleteTarget must read at Consistency(gocql.Serial): a lagging read here silently replaces a correct candidate with a dead incarnation and loses the live one's work item")
+		t.Error("resolveBlockDeleteTarget must read at Consistency(gocql.Serial): a lagging read here can create a candidate for a dead incarnation")
 	}
 }
 

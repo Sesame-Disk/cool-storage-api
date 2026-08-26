@@ -92,11 +92,11 @@ type GCStore interface {
 	// or library cascades must use EnqueueBatch with QueueItem.
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
 	EnqueueBatch(items []QueueItem) error
-	QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error)
-	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error)
+	QueueItemExists(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) (bool, error)
+	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
-	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
-	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error
+	CompleteItem(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
+	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode, candidate ...BlockGCCandidateIdentity) error
 	FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
@@ -106,9 +106,9 @@ type GCStore interface {
 	ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error)
 	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
 	ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GCFailedItemExpiryInfo, error)
-	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
+	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
 	DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error)
-	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
+	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidate ...BlockGCCandidateIdentity) error
 	MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error
 	RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error
 	MarkOrgDirty(orgID uuid.UUID, dirtyAt time.Time) error
@@ -242,11 +242,18 @@ type GCStore interface {
 	// it as fatal aborts every sibling block in the same call and, on the fs_object path,
 	// is self-poisoning — the retry re-derives the same zero-ref block, finds the same
 	// missing row, and fails again forever.
+	// EnsureBlockGCCandidateExact returns the full candidate identity, including the
+	// exact physical incarnation captured from the canonical block row.
+	EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (BlockGCCandidateInfo, error)
+	// EnsureBlockGCCandidate is a temporary compatibility wrapper. New callers must
+	// retain the BlockGCCandidateInfo returned by EnsureBlockGCCandidateExact.
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
-	// GetBlockGCCandidate loads the candidate's own record of the incarnation it was
-	// created for. This — never a fresh read of `blocks` — is what authorizes a
-	// destructive claim: re-reading `blocks` here would simply observe P2 and go on to
-	// delete it, which is the whole of R14.
+	// GetBlockGCCandidateExact loads a candidate only when the supplied full identity
+	// still matches its captured timestamp. A stale candidate_at is not a match.
+	GetBlockGCCandidateExact(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) (BlockGCCandidateInfo, bool, error)
+	// GetBlockGCCandidate is a temporary compatibility wrapper for callers that have
+	// not yet carried candidate identity. It refuses an ambiguous logical block.
+	// New callers must use GetBlockGCCandidateExact.
 	GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error)
 	// DeleteBlockGCCandidate removes the candidate only while it is still exactly the
 	// one that was observed. A delayed lifecycle for P1 must not consume a candidate
@@ -454,8 +461,8 @@ type GCStore interface {
 // remains context-free for the worker hot path; the service uses this optional
 // interface only for the DLQ endpoints.
 type GCAdminContextStore interface {
-	DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
-	RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
+	DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
+	RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidate ...BlockGCCandidateIdentity) error
 }
 
 // ItemType constants for new GC item types
@@ -582,33 +589,46 @@ type GCFailedItemOrgInfo struct {
 
 // GCFailedItemInfo represents an item moved to the GC dead-letter queue.
 type GCFailedItemInfo struct {
-	OrgID                       uuid.UUID        `json:"org_id"`
-	FailedAt                    time.Time        `json:"failed_at"`
-	ExpiresAt                   time.Time        `json:"expires_at"`
-	QueuedAt                    time.Time        `json:"queued_at"`
-	IdentityAt                  time.Time        `json:"identity_at"`
-	RequiresLibraryDeletedCheck bool             `json:"requires_library_deleted_check"`
-	LibraryGuardMode            LibraryGuardMode `json:"library_guard_mode"`
-	ItemType                    ItemType         `json:"item_type"`
-	ItemID                      string           `json:"item_id"`
-	LibraryID                   uuid.UUID        `json:"library_id"`
-	BlockRepresentationID       string           `json:"block_representation_id"`
-	StorageClass                string           `json:"storage_class"`
-	RetryCount                  int              `json:"retry_count"`
-	LastError                   string           `json:"last_error"`
-	FailureCode                 string           `json:"failure_code"`
-	ResolvedAt                  *time.Time       `json:"resolved_at"`
-	ResolvedState               string           `json:"resolved_state"`
+	OrgID                       uuid.UUID                `json:"org_id"`
+	FailedAt                    time.Time                `json:"failed_at"`
+	ExpiresAt                   time.Time                `json:"expires_at"`
+	QueuedAt                    time.Time                `json:"queued_at"`
+	IdentityAt                  time.Time                `json:"identity_at"`
+	RequiresLibraryDeletedCheck bool                     `json:"requires_library_deleted_check"`
+	LibraryGuardMode            LibraryGuardMode         `json:"library_guard_mode"`
+	ItemType                    ItemType                 `json:"item_type"`
+	ItemID                      string                   `json:"item_id"`
+	LibraryID                   uuid.UUID                `json:"library_id"`
+	BlockRepresentationID       string                   `json:"block_representation_id"`
+	StorageClass                string                   `json:"storage_class"`
+	BlockGCCandidateIdentity    BlockGCCandidateIdentity `json:"block_gc_candidate_identity"`
+	RetryCount                  int                      `json:"retry_count"`
+	LastError                   string                   `json:"last_error"`
+	FailureCode                 string                   `json:"failure_code"`
+	ResolvedAt                  *time.Time               `json:"resolved_at"`
+	ResolvedState               string                   `json:"resolved_state"`
 }
 
 // GCFailedItemExpiryInfo is the lightweight discovery row used by the scanner
 // to expire DLQ rows through the store, preserving failed-depth counters.
 type GCFailedItemExpiryInfo struct {
-	OrgID     uuid.UUID
-	FailedAt  time.Time
-	ExpiresAt time.Time
-	ItemType  ItemType
-	ItemID    string
+	OrgID                    uuid.UUID
+	FailedAt                 time.Time
+	ExpiresAt                time.Time
+	IdentityAt               time.Time
+	ItemType                 ItemType
+	ItemID                   string
+	BlockGCCandidateIdentity BlockGCCandidateIdentity
+}
+
+func effectiveFailedItemExpiryIdentity(expiry GCFailedItemExpiryInfo) time.Time {
+	if !expiry.IdentityAt.IsZero() {
+		return expiry.IdentityAt.UTC()
+	}
+	if !expiry.BlockGCCandidateIdentity.CandidateAt.IsZero() {
+		return expiry.BlockGCCandidateIdentity.CandidateAt.UTC()
+	}
+	return expiry.FailedAt.UTC()
 }
 
 // GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.

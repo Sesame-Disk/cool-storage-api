@@ -882,7 +882,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 				if incErr := w.queue.IncrementRetry(item); incErr != nil {
 					log.Printf("[GC Worker] Failed to requeue item %s/%s after error %v: %v",
 						item.OrgID, item.ItemID, err, incErr)
-					stillExists, checkErr := w.store.QueueItemExists(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID)
+					stillExists, checkErr := w.store.QueueItemExists(item.OrgID, item.QueuedAt, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.ItemType, item.ItemID, item.BlockGCCandidateIdentity)
 					if checkErr != nil {
 						log.Printf("[GC Worker] Cannot verify requeue state for %s/%s (%v); leaving item untouched to avoid double-processing",
 							item.OrgID, item.ItemID, checkErr)
@@ -911,7 +911,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		}
 
 		// Remove from queue
-		if err := w.queue.Complete(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID); err != nil {
+		if err := w.queue.completeItem(item); err != nil {
 			log.Printf("[GC Worker] Failed to complete item %s/%s: %v",
 				item.OrgID, item.ItemID, err)
 		}
@@ -959,6 +959,7 @@ func (w *Worker) postponeItem(item QueueItem) error {
 		effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 		item.RequiresLibraryDeletedCheck,
 		item.LibraryGuardMode,
+		item.BlockGCCandidateIdentity,
 	)
 }
 
@@ -1003,9 +1004,18 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// candidate_at comes from the same row for the same reason: it is what the candidate
 	// cleanup CAS is bound to, so a value carried on the queue item (which can outlive
 	// the candidate it was built from) must not stand in for it.
-	candidate, candidateFound, err := w.store.GetBlockGCCandidate(item.OrgID, item.ItemID)
+	if err := validateQueueItemBlockCandidateIdentity(item); err != nil {
+		return err
+	}
+	candidate, candidateFound, err := w.store.GetBlockGCCandidateExact(item.OrgID, item.ItemID, item.BlockGCCandidateIdentity)
 	if err != nil {
 		return w.failClosedIfUnavailable("failed to load block GC candidate authority", item.ItemID, err)
+	}
+	if !candidateFound {
+		metrics.GCBlockDeleteClaimTotal.WithLabelValues("no_candidate").Inc()
+		log.Printf("[GC Worker] Block %s queue identity names no current GC candidate; stale discovery no-op", item.ItemID)
+		metrics.GCItemsSkippedTotal.Inc()
+		return nil
 	}
 
 	// A FRESH UUID PER ATTEMPT, never a value derived from candidate_at. The old
@@ -1119,16 +1129,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// From here the walk can reach a destructive claim, and that needs an authority. A
-	// queue item with no candidate row behind it has nothing that ever decided this
-	// block was garbage — the candidate was already settled by another lifecycle, or the
-	// item outlived it. Settle without touching `blocks`.
-	if !candidateFound {
-		metrics.GCBlockDeleteClaimTotal.WithLabelValues("no_candidate").Inc()
-		log.Printf("[GC Worker] Block %s has no GC candidate row; nothing authorized its deletion, skipping", item.ItemID)
-		metrics.GCItemsSkippedTotal.Inc()
-		return nil
-	}
+	// From here the walk can reach a destructive claim, and its candidate must name a
+	// usable physical incarnation.
 	if candidate.Target.IsZero() {
 		// A candidate that cannot name its incarnation can never authorize anything, and
 		// it must not be consumed either: deleting it would drop the only work item that
@@ -2888,7 +2890,7 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 	var blockBatch []QueueItem
 	var candidateProjectionErr error
 	for _, blockID := range blockIDs {
-		candidateAt, candidateErr := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+		candidate, candidateErr := w.store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, time.Now())
 		if errors.Is(candidateErr, ErrBlockCandidateTargetUnavailable) {
 			// Nothing reclaimable: no canonical row, or one with no usable locator. That is
 			// a normal observation — processBlock treats the same state as routine further
@@ -2902,10 +2904,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			log.Printf("[GC Worker] block %s in org=%s has nothing reclaimable (%v); skipping it and continuing with its siblings", blockID, orgID, candidateErr)
 			continue
 		}
-		if candidateErr != nil && candidateAt.IsZero() {
+		if candidateErr != nil && candidate.CandidateAt.IsZero() {
 			return candidateErr
 		}
-		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
+		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, blockID, candidate.Identity())
 		if err != nil {
 			return errors.Join(candidateErr, candidateProjectionErr, err)
 		}
@@ -2918,10 +2920,11 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			candidateProjectionErr = errors.Join(candidateProjectionErr, fmt.Errorf("ensure block GC candidate projection for block %s: %w", blockID, candidateErr))
 		}
 		blockBatch = append(blockBatch, QueueItem{
-			OrgID:    orgID,
-			QueuedAt: candidateAt,
-			ItemType: ItemBlock,
-			ItemID:   blockID,
+			OrgID:      orgID,
+			QueuedAt:   candidate.CandidateAt,
+			IdentityAt: candidate.CandidateAt,
+			ItemType:   ItemBlock,
+			ItemID:     blockID,
 			// Blocks are content-addressed and library-independent: processBlock only
 			// uses OrgID+ItemID. Enqueue every block under uuid.Nil, matching the
 			// uuid.Nil dedup check above and the scanner's orphan-block path. A single
@@ -2936,9 +2939,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			// under uuid.Nil collapses them to one pending row. The store-level pending
 			// helpers coerce ItemBlock to uuid.Nil as the backstop.
 			// See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01.
-			LibraryID:    uuid.Nil,
-			StorageClass: storageClass,
-			RetryCount:   0,
+			LibraryID:                uuid.Nil,
+			StorageClass:             candidate.StorageClass(),
+			BlockGCCandidateIdentity: candidate.Identity(),
+			RetryCount:               0,
 		})
 	}
 	if len(blockBatch) == 0 {

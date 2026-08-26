@@ -221,12 +221,21 @@ class GC extends Component {
     };
 
     getFailedItemPayload = (item) => {
-        return {
+        const payload = {
             org_id: item.org_id || item.orgID,
             failed_at: item.failed_at || item.failedAt,
             item_type: item.item_type || item.itemType,
             item_id: item.item_id || item.itemID,
+            identity_at: item.identity_at || item.identityAt,
         };
+        const candidate = item.block_gc_candidate_identity || item.blockGCCandidateIdentity;
+        if (candidate) {
+            const target = candidate.target || candidate.Target || {};
+            payload.candidate_storage_class = target.storage_class || target.StorageClass;
+            payload.candidate_storage_key = target.storage_key || target.StorageKey;
+            payload.candidate_at = candidate.candidate_at || candidate.CandidateAt;
+        }
+        return payload;
     };
 
     operateFailedItem = (action, item) => {

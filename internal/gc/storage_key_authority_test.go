@@ -56,9 +56,7 @@ func TestWorker_ProcessBlock_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 	store.SetBlockStorageKeyForTest(orgID, blockID, MockCanonicalStorageKey(victimOrgID.String(), blockID))
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", queuedAt, 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v", err)
@@ -97,9 +95,9 @@ func TestWorker_ProcessBlock_RefusesEmptyStorageKey(t *testing.T) {
 	store.SetBlockStorageKeyForTest(orgID, blockID, "   ")
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
+	candidate := store.AllBlockGCCandidates()[0]
+	store.SeedExactBlockQueueItemForTest(orgID, queuedAt, blockID, "hot", candidate.Identity(), 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v", err)
@@ -133,9 +131,7 @@ func TestWorker_ProcessBlock_RefusesPaddedStorageKeyWithoutRetargeting(t *testin
 	store.SetBlockStorageKeyForTest(orgID, blockID, persistedKey)
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", queuedAt, 0)
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v", err)
 	}
@@ -170,9 +166,7 @@ func TestWorker_ProcessBlock_UnresolvableStoreFailsClosedBeforeDeletingTheRow(t 
 	store.AddBlock(orgID, blockID, "hot", 0)
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", queuedAt, 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v", err)

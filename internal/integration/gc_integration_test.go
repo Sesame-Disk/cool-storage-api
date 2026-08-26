@@ -177,6 +177,13 @@ func (s *provisionalPhase0FailureStore) EnsureBlockGCCandidate(orgID uuid.UUID, 
 	return s.GCStore.EnsureBlockGCCandidate(orgID, blockID, storageClass, candidateAt)
 }
 
+func (s *provisionalPhase0FailureStore) EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (gcpkg.BlockGCCandidateInfo, error) {
+	if s.fail && blockID == s.candidateFailureBlock {
+		return gcpkg.BlockGCCandidateInfo{}, errors.New("injected provisional candidate persistence failure")
+	}
+	return s.GCStore.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, candidateAt)
+}
+
 func (s *provisionalPhase0FailureStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
 	if s.fail && blockID == s.projectionFailureBlock {
 		return errors.New("injected provisional projection delete failure")
@@ -236,15 +243,19 @@ func seedProvisionalPhase0Fixture(t *testing.T, canonicalPresent, referencePrese
 	t.Cleanup(func() {
 		var candidateAt time.Time
 		if err := session.Query(`
-			SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
-		`, fixture.orgID.String(), fixture.blockID).Scan(&candidateAt); err == nil {
+			SELECT candidate_at FROM gc_block_candidates
+			WHERE org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+		`, fixture.orgID.String(), fixture.blockID, "hot", "blocks/"+fixture.blockID).Scan(&candidateAt); err == nil {
 			_ = session.Query(`
 				DELETE FROM gc_block_candidates_by_day
-				WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+				WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
 			`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(fixture.orgID.String(), fixture.blockID),
-				candidateAt.UTC(), fixture.orgID.String(), fixture.blockID).Exec()
+				candidateAt.UTC(), fixture.orgID.String(), fixture.blockID, "hot", "blocks/"+fixture.blockID).Exec()
 		}
-		_ = session.Query(`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, fixture.orgID.String(), fixture.blockID).Exec()
+		_ = session.Query(`
+			DELETE FROM gc_block_candidates
+			WHERE org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+		`, fixture.orgID.String(), fixture.blockID, "hot", "blocks/"+fixture.blockID).Exec()
 		_ = session.Query(`
 			DELETE FROM gc_provisional_block_refs_by_day
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
@@ -316,8 +327,9 @@ func provisionalCandidateExists(t *testing.T, fixture provisionalPhase0Fixture) 
 	t.Helper()
 	var candidateAt time.Time
 	err := shareProjectionDBForTest(t).Session().Query(`
-		SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
-	`, fixture.orgID.String(), fixture.blockID).Scan(&candidateAt)
+		SELECT candidate_at FROM gc_block_candidates
+		WHERE org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+	`, fixture.orgID.String(), fixture.blockID, "hot", "blocks/"+fixture.blockID).Scan(&candidateAt)
 	if !provisionalRowExists(t, err, "gc_block_candidates") {
 		return false
 	}
@@ -615,24 +627,61 @@ func blockExistsInDB(t *testing.T, orgID, blockID string) bool {
 	return readBlockRefCount(t, orgID, blockID) != -999
 }
 
+func gcCandidateIdentitiesForTest(t *testing.T, orgID, blockID string) []gcpkg.BlockGCCandidateIdentity {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	iter := session.Query(`
+		SELECT storage_class, storage_key, candidate_at FROM gc_block_candidates
+		WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Iter()
+	var storageClass, storageKey string
+	var candidateAt time.Time
+	var candidates []gcpkg.BlockGCCandidateIdentity
+	for iter.Scan(&storageClass, &storageKey, &candidateAt) {
+		candidates = append(candidates, gcpkg.BlockGCCandidateIdentity{
+			Target:      gcpkg.BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey},
+			CandidateAt: candidateAt.UTC(),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("scan gc_block_candidates for %s/%s: %v", orgID, blockID, err)
+	}
+	return candidates
+}
+
 // gcCandidateExists returns true if the block has a gc_block_candidates entry.
 func gcCandidateExists(t *testing.T, orgID, blockID string) bool {
 	t.Helper()
-	session := shareProjectionDBForTest(t).Session()
-	var ts time.Time
-	err := session.Query(`SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&ts)
-	return err == nil
+	return len(gcCandidateIdentitiesForTest(t, orgID, blockID)) > 0
 }
 
 func gcCandidateProjectionExists(t *testing.T, orgID, blockID string, candidateAt time.Time) bool {
 	t.Helper()
-	session := shareProjectionDBForTest(t).Session()
+	for _, candidate := range gcCandidateIdentitiesForTest(t, orgID, blockID) {
+		if !candidate.CandidateAt.Equal(candidateAt.UTC()) {
+			continue
+		}
+		if gcCandidateProjectionExistsForTarget(t, orgID, blockID, candidateAt, candidate.Target) {
+			return true
+		}
+	}
+	return false
+}
+
+func gcCandidateProjectionExistsForTarget(t *testing.T, orgID, blockID string, candidateAt time.Time, target gcpkg.BlockDeleteTarget) bool {
+	t.Helper()
 	var storedBlockID string
-	err := session.Query(`
+	err := shareProjectionDBForTest(t).Session().Query(`
 		SELECT block_id FROM gc_block_candidates_by_day
-		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
-	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID).Scan(&storedBlockID)
-	return err == nil && storedBlockID == blockID
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, target.StorageClass, target.StorageKey).Scan(&storedBlockID)
+	if err == nil && storedBlockID == blockID {
+		return true
+	}
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("check gc_block_candidates_by_day for %s/%s: %v", orgID, blockID, err)
+	}
+	return false
 }
 
 func blockIDMappingExists(t *testing.T, orgID, externalID string) bool {
@@ -834,8 +883,8 @@ func gcQueueItemExistsSince(t *testing.T, orgID string, itemType string, itemID 
 	return false
 }
 
-func gcFailedItemExpiryBucketForTest(orgID string, itemType string, itemID string, failedAt time.Time) int {
-	return db.GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano))
+func gcFailedItemExpiryBucketForTest(orgID string, itemType string, itemID string, failedAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) int {
+	return db.GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano))
 }
 
 func deleteGCQueueItemsByIdentity(t *testing.T, orgID string, itemType string, itemID string) {
@@ -846,7 +895,7 @@ func deleteGCQueueItemsByIdentitySince(t *testing.T, orgID string, itemType stri
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
 	for bucket := 0; bucket < 32; bucket++ {
-		query := `SELECT queued_at, item_type, item_id FROM gc_queue WHERE org_id = ? AND bucket = ?`
+		query := `SELECT queued_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at FROM gc_queue WHERE org_id = ? AND bucket = ?`
 		args := []interface{}{orgID, bucket}
 		if !queuedAfter.IsZero() {
 			query += ` AND queued_at >= ?`
@@ -856,9 +905,14 @@ func deleteGCQueueItemsByIdentitySince(t *testing.T, orgID string, itemType stri
 		var queuedAt time.Time
 		var queuedItemType string
 		var queuedItemID string
-		for iter.Scan(&queuedAt, &queuedItemType, &queuedItemID) {
+		var candidateStorageClass, candidateStorageKey string
+		var identityAt time.Time
+		for iter.Scan(&queuedAt, &queuedItemType, &queuedItemID, &candidateStorageClass, &candidateStorageKey, &identityAt) {
 			if queuedItemType == itemType && queuedItemID == itemID {
-				if err := session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`, orgID, bucket, queuedAt, queuedItemType, queuedItemID).Exec(); err != nil {
+				if err := session.Query(`
+					DELETE FROM gc_queue
+					WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+				`, orgID, bucket, queuedAt, queuedItemType, queuedItemID, candidateStorageClass, candidateStorageKey, identityAt).Exec(); err != nil {
 					t.Fatalf("failed to delete gc_queue row for %s/%s: %v", orgID, itemID, err)
 				}
 			}
@@ -888,8 +942,8 @@ func gcPendingLibraryCascadeExistsForTest(t *testing.T, session *gocql.Session, 
 	var identityAt time.Time
 	err := session.Query(`
 		SELECT identity_at FROM gc_pending_items
-		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? LIMIT 1
-	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Scan(&identityAt)
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? LIMIT 1
+	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, "", "").Scan(&identityAt)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return false
 	}
@@ -904,14 +958,14 @@ func deleteGCPendingLibraryCascadeItemsForTest(t *testing.T, session *gocql.Sess
 	bucket := gcpkg.PendingItemBucket(orgUUID, uuid.Nil, gcpkg.ItemLibraryCascade, repoID)
 	iter := session.Query(`
 		SELECT identity_at FROM gc_pending_items
-		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
-	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID).Iter()
+		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ?
+	`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, "", "").Iter()
 	var identityAt time.Time
 	for iter.Scan(&identityAt) {
 		if err := session.Query(`
 			DELETE FROM gc_pending_items
-			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, identityAt).Exec(); err != nil {
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID, bucket, "library_cascade", uuid.Nil.String(), repoID, "", "", identityAt).Exec(); err != nil {
 			t.Fatalf("delete gc_pending_items library_cascade for %s/%s: %v", orgID, repoID, err)
 		}
 	}
@@ -1013,24 +1067,29 @@ func readGCOrgQueueStats(t *testing.T, orgID uuid.UUID) (int, int) {
 func deleteGCFailedItemsByIdentity(t *testing.T, orgID string, itemType string, itemID string) {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	iter := session.Query(`SELECT failed_at, expires_at, item_type, item_id FROM gc_failed_items WHERE org_id = ?`, orgID).Iter()
+	iter := session.Query(`SELECT failed_at, expires_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at FROM gc_failed_items WHERE org_id = ?`, orgID).Iter()
 	var failedAt time.Time
 	var expiresAt time.Time
 	var failedItemType string
 	var failedItemID string
-	for iter.Scan(&failedAt, &expiresAt, &failedItemType, &failedItemID) {
+	var candidateStorageClass, candidateStorageKey string
+	var identityAt time.Time
+	for iter.Scan(&failedAt, &expiresAt, &failedItemType, &failedItemID, &candidateStorageClass, &candidateStorageKey, &identityAt) {
 		if failedItemType != itemType || failedItemID != itemID {
 			continue
 		}
-		if err := session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID, failedAt, failedItemType, failedItemID).Exec(); err != nil {
+		if err := session.Query(`
+			DELETE FROM gc_failed_items
+			WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID, failedAt, failedItemType, failedItemID, candidateStorageClass, candidateStorageKey, identityAt).Exec(); err != nil {
 			t.Fatalf("failed to delete gc_failed_items row for %s/%s: %v", orgID, itemID, err)
 		}
 		if !expiresAt.IsZero() {
-			bucket := gcFailedItemExpiryBucketForTest(orgID, failedItemType, failedItemID, failedAt)
+			bucket := gcFailedItemExpiryBucketForTest(orgID, failedItemType, failedItemID, failedAt, candidateStorageClass, candidateStorageKey, identityAt)
 			if err := session.Query(`
 				DELETE FROM gc_failed_items_by_expiry
-				WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
-			`, db.GCProjectionUTCDate(expiresAt), bucket, expiresAt, orgID, failedAt, failedItemType, failedItemID).Exec(); err != nil {
+				WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+			`, db.GCProjectionUTCDate(expiresAt), bucket, expiresAt, orgID, failedAt, failedItemType, failedItemID, candidateStorageClass, candidateStorageKey, identityAt).Exec(); err != nil {
 				t.Fatalf("failed to delete gc_failed_items_by_expiry row for %s/%s: %v", orgID, itemID, err)
 			}
 		}
@@ -1055,22 +1114,28 @@ func deleteGCPendingItemsByIdentity(t *testing.T, orgID, libraryID uuid.UUID, it
 	session := shareProjectionDBForTest(t).Session()
 	bucket := gcpkg.PendingItemBucket(orgID, libraryID, itemType, itemID)
 	iter := session.Query(`
-		SELECT identity_at FROM gc_pending_items
+		SELECT candidate_storage_class, candidate_storage_key, identity_at FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
 	`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID).Iter()
-	var identityAts []time.Time
+	type pendingIdentity struct {
+		storageClass string
+		storageKey   string
+		identityAt   time.Time
+	}
+	var identities []pendingIdentity
+	var storageClass, storageKey string
 	var identityAt time.Time
-	for iter.Scan(&identityAt) {
-		identityAts = append(identityAts, identityAt)
+	for iter.Scan(&storageClass, &storageKey, &identityAt) {
+		identities = append(identities, pendingIdentity{storageClass: storageClass, storageKey: storageKey, identityAt: identityAt})
 	}
 	if err := iter.Close(); err != nil {
 		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, itemID, err)
 	}
-	for _, at := range identityAts {
+	for _, identity := range identities {
 		if err := session.Query(`
 			DELETE FROM gc_pending_items
-			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID, at).Exec(); err != nil {
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), bucket, string(itemType), libraryID.String(), itemID, identity.storageClass, identity.storageKey, identity.identityAt).Exec(); err != nil {
 			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, itemID, err)
 		}
 	}
@@ -1119,28 +1184,21 @@ func deleteGCBlockFixtureRowsForTest(t *testing.T, orgID uuid.UUID, blockID stri
 	// every trace of this fixture" is a different job, and borrowing the production
 	// primitive for it would either fail to clean up or quietly weaken that binding.
 	database := shareProjectionDBForTest(t)
-	var candidateAt time.Time
-	err := database.Session().Query(
-		`SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`,
-		orgID.String(), blockID,
-	).Scan(&candidateAt)
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		t.Fatalf("failed to read gc_block_candidate for %s/%s: %v", orgID, blockID, err)
-	}
-	if err := database.Session().Query(
-		`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`,
-		orgID.String(), blockID,
-	).Exec(); err != nil {
-		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
-	}
-	if !candidateAt.IsZero() {
+	for _, candidate := range gcCandidateIdentitiesForTest(t, orgID.String(), blockID) {
 		if err := database.Session().Query(
 			`DELETE FROM gc_block_candidates_by_day
-			 WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?`,
-			db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID),
-			candidateAt.UTC(), orgID.String(), blockID,
+			 WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?`,
+			db.GCProjectionUTCDate(candidate.CandidateAt), db.GCDiscoveryBucket(orgID.String(), blockID),
+			candidate.CandidateAt.UTC(), orgID.String(), blockID, candidate.Target.StorageClass, candidate.Target.StorageKey,
 		).Exec(); err != nil {
 			t.Fatalf("failed to delete gc_block_candidates_by_day for %s/%s: %v", orgID, blockID, err)
+		}
+		if err := database.Session().Query(
+			`DELETE FROM gc_block_candidates
+			 WHERE org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?`,
+			orgID.String(), blockID, candidate.Target.StorageClass, candidate.Target.StorageKey,
+		).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
 		}
 	}
 }
@@ -1226,14 +1284,21 @@ func ensureSyntheticBlockCandidateForTest(t *testing.T, orgID uuid.UUID, blockID
 
 func enqueueSyntheticBlockQueueItemForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string, queuedAt time.Time) {
 	t.Helper()
-	queue := gcpkg.NewQueue(gcpkg.NewCassandraStore(shareProjectionDBForTest(t)))
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, queuedAt.UTC().Truncate(time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to ensure synthetic block candidate for %s/%s: %v", orgID, blockID, err)
+	}
+	queue := gcpkg.NewQueue(store)
 	if err := queue.EnqueueBatch([]gcpkg.QueueItem{{
-		OrgID:        orgID,
-		QueuedAt:     queuedAt.UTC().Truncate(time.Millisecond),
-		ItemType:     gcpkg.ItemBlock,
-		ItemID:       blockID,
-		LibraryID:    uuid.Nil,
-		StorageClass: storageClass,
+		OrgID:                    orgID,
+		QueuedAt:                 queuedAt.UTC().Truncate(time.Millisecond),
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 gcpkg.ItemBlock,
+		ItemID:                   blockID,
+		LibraryID:                uuid.Nil,
+		StorageClass:             candidate.StorageClass(),
+		BlockGCCandidateIdentity: candidate.Identity(),
 	}}); err != nil {
 		t.Fatalf("failed to enqueue synthetic block queue item for %s/%s: %v", orgID, blockID, err)
 	}
@@ -1679,7 +1744,7 @@ func TestGC_DeleteBlockGCCandidate_IsBoundToTheExactIncarnation(t *testing.T) {
 	if gcCandidateExists(t, orgID.String(), blockID) {
 		t.Fatal("expected canonical gc_block_candidates row to be removed")
 	}
-	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+	if gcCandidateProjectionExistsForTarget(t, orgID.String(), blockID, candidateAt, p2) {
 		t.Fatal("expected gc_block_candidates_by_day projection row to be removed")
 	}
 }
@@ -1719,7 +1784,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	// The candidate captures its incarnation from the canonical row, so it must be
 	// created while that row exists — and the row then disappears underneath it. That is
 	// the real shape of this case: a work item carrying an incarnation already gone.
-	seedCanonicalBlockRowForTest(t, database, orgUUID, blockID, "hot")
+	target := seedCanonicalBlockRowForTest(t, database, orgUUID, blockID, "hot")
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
 	if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
@@ -1759,7 +1824,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	// as intentional logical metadata retention.
 	for attempt := 0; attempt < 8; attempt++ {
 		if !gcCandidateExists(t, orgID, blockID) &&
-			!gcCandidateProjectionExists(t, orgID, blockID, candidateAt) &&
+			!gcCandidateProjectionExistsForTarget(t, orgID, blockID, candidateAt, target) &&
 			!gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) &&
 			!failedQueueItemExists(t, orgID, "block", blockID) &&
 			!blockExistsInDB(t, orgID, blockID) {
@@ -1779,14 +1844,14 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	}
 
 	if gcCandidateExists(t, orgID, blockID) ||
-		gcCandidateProjectionExists(t, orgID, blockID, candidateAt) ||
+		gcCandidateProjectionExistsForTarget(t, orgID, blockID, candidateAt, target) ||
 		gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) ||
 		failedQueueItemExists(t, orgID, "block", blockID) ||
 		blockExistsInDB(t, orgID, blockID) {
 		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v",
 			blockExistsInDB(t, orgID, blockID),
 			gcCandidateExists(t, orgID, blockID),
-			gcCandidateProjectionExists(t, orgID, blockID, candidateAt),
+			gcCandidateProjectionExistsForTarget(t, orgID, blockID, candidateAt, target),
 			gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)),
 			failedQueueItemExists(t, orgID, "block", blockID),
 		)
@@ -2203,8 +2268,8 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	}
 	if err := database.Session().Query(`
 		DELETE FROM gc_block_candidates_by_day
-		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
-	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)).Exec(); err != nil {
 		t.Fatalf("delete block candidate projection row: %v", err)
 	}
 	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
@@ -2475,9 +2540,9 @@ func TestGC_StatusSnapshotReconcilesDirtyQueueRows(t *testing.T) {
 	queueBucket := gcpkg.QueueBucket(orgID, gcpkg.ItemBlock, itemID)
 	libraryID := uuid.New()
 	if err := session.Query(`
-		INSERT INTO gc_queue (org_id, bucket, queued_at, item_type, item_id, library_id, storage_class, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queueBucket, queuedAt, "block", itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, item_type, item_id, library_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), queueBucket, queuedAt, queuedAt, "block", itemID, libraryID.String(), "hot", "", "", 0).Exec(); err != nil {
 		t.Fatalf("failed to insert synthetic gc_queue row: %v", err)
 	}
 	if err := session.Query(`
@@ -2495,8 +2560,8 @@ func TestGC_StatusSnapshotReconcilesDirtyQueueRows(t *testing.T) {
 	t.Cleanup(func() {
 		_ = session.Query(`
 			DELETE FROM gc_queue
-			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-		`, orgID.String(), queueBucket, queuedAt, "block", itemID).Exec()
+			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), queueBucket, queuedAt, "block", itemID, "", "", queuedAt).Exec()
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		repairGCSnapshotsForTest(t, orgID)
@@ -2573,9 +2638,9 @@ func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
 		if err := session.Query(`
 			INSERT INTO gc_queue (
 				org_id, bucket, queued_at, identity_at, requires_library_deleted_check,
-				library_guard_mode, item_type, item_id, library_id, storage_class, retry_count
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.queuedAt, requiresLibraryDeletedCheck, libraryGuardMode, fixture.itemType, fixture.itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+				library_guard_mode, item_type, item_id, library_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.queuedAt, requiresLibraryDeletedCheck, libraryGuardMode, fixture.itemType, fixture.itemID, libraryID.String(), "hot", "", "", 0).Exec(); err != nil {
 			t.Fatalf("failed to insert gc_queue fixture %s: %v", fixture.itemID, err)
 		}
 	}
@@ -2583,8 +2648,8 @@ func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
 		for _, fixture := range fixtures {
 			_ = session.Query(`
 				DELETE FROM gc_queue
-				WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-			`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.itemType, fixture.itemID).Exec()
+				WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+			`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.itemType, fixture.itemID, "", "", fixture.queuedAt).Exec()
 		}
 	})
 
@@ -2626,16 +2691,16 @@ func TestGC_LegacyLibraryGuardModeNullHydratesAsDeletedAtIdentity(t *testing.T) 
 	if err := session.Query(`
 		INSERT INTO gc_queue (
 			org_id, bucket, queued_at, identity_at, requires_library_deleted_check,
-			item_type, item_id, library_id, storage_class, retry_count
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), bucket, queuedAt, queuedAt, true, string(gcpkg.ItemCommit), itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+			item_type, item_id, library_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), bucket, queuedAt, queuedAt, true, string(gcpkg.ItemCommit), itemID, libraryID.String(), "hot", "", "", 0).Exec(); err != nil {
 		t.Fatalf("failed to insert legacy gc_queue row: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = session.Query(`
 			DELETE FROM gc_queue
-			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-		`, orgID.String(), bucket, queuedAt, string(gcpkg.ItemCommit), itemID).Exec()
+			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), bucket, queuedAt, string(gcpkg.ItemCommit), itemID, "", "", queuedAt).Exec()
 	})
 
 	items, err := store.DequeueBatch(orgID, 1, queuedAt.Add(time.Second))
@@ -2731,9 +2796,9 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 	failedBefore := readGCFailedSnapshotTotal(t)
 
 	if err := session.Query(`
-		INSERT INTO gc_queue (org_id, bucket, queued_at, item_type, item_id, library_id, storage_class, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queueBucket, queuedAt, "unknown_type", itemID, libraryID.String(), "hot", 5).Exec(); err != nil {
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, item_type, item_id, library_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), queueBucket, queuedAt, queuedAt, "unknown_type", itemID, libraryID.String(), "hot", "", "", 5).Exec(); err != nil {
 		t.Fatalf("failed to insert max-retry queue row: %v", err)
 	}
 	if err := session.Query(`
@@ -2779,8 +2844,8 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 		var lingering string
 		err := session.Query(`
 			SELECT item_id FROM gc_queue
-			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-		`, orgID.String(), queueBucket, queuedAt, "unknown_type", itemID).Scan(&lingering)
+			WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), queueBucket, queuedAt, "unknown_type", itemID, "", "", queuedAt).Scan(&lingering)
 		return errors.Is(err, gocql.ErrNotFound) && getGCStatus(t).FailedItemsTotal > failedBefore
 	})
 	if !ok {
@@ -2788,11 +2853,11 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = session.Query(`
-			DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-		`, orgID.String(), queueBucket, queuedAt, "unknown_type", itemID).Exec()
+			DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), queueBucket, queuedAt, "unknown_type", itemID, "", "", queuedAt).Exec()
 		_ = session.Query(`
-			DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
-		`, orgID.String(), failedAt, "unknown_type", itemID).Exec()
+			DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), failedAt, "unknown_type", itemID, "", "", queuedAt).Exec()
 		// FailItem writes gc_pending_items on the way to the DLQ, and this item
 		// type never completes, so nothing else removes that row.
 		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemType("unknown_type"), itemID)
@@ -2844,11 +2909,12 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 	insertFailed := func(failedAt time.Time, itemID string) {
 		t.Helper()
 		expiresAt := failedAt.Add(30 * 24 * time.Hour)
+		queuedAt := failedAt.Add(-time.Minute)
 		if err := session.Query(`
 			INSERT INTO gc_failed_items (
-				org_id, failed_at, expires_at, queued_at, item_type, item_id, library_id, storage_class, retry_count, last_error, resolution_status
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), failedAt, expiresAt, failedAt.Add(-time.Minute), "unknown_type", itemID, libraryID.String(), "hot", 5, "boom", "open").Exec(); err != nil {
+				org_id, failed_at, expires_at, queued_at, identity_at, item_type, item_id, library_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count, last_error, resolution_status
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), failedAt, expiresAt, queuedAt, queuedAt, "unknown_type", itemID, libraryID.String(), "hot", "", "", 5, "boom", "open").Exec(); err != nil {
 			t.Fatalf("failed to insert gc_failed_items row for %s: %v", itemID, err)
 		}
 		if err := session.Query(`
@@ -2867,8 +2933,8 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		t.Fatalf("failed to insert gc_org_stats row: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtA, "unknown_type", itemIDA).Exec()
-		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtB, "unknown_type", itemIDB).Exec()
+		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`, orgID.String(), failedAtA, "unknown_type", itemIDA, "", "", failedAtA.Add(-time.Minute)).Exec()
+		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`, orgID.String(), failedAtB, "unknown_type", itemIDB, "", "", failedAtB.Add(-time.Minute)).Exec()
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDA)
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDB)
 		// The admin requeue below moves a DLQ row back through the canonical
@@ -2973,12 +3039,13 @@ func countPendingBlockRows(t *testing.T, orgID, libraryID uuid.UUID, blockID str
 	session := shareProjectionDBForTest(t).Session()
 	bucket := gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemBlock, blockID)
 	iter := session.Query(`
-		SELECT identity_at FROM gc_pending_items
+		SELECT candidate_storage_class, candidate_storage_key, identity_at FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
 	`, orgID.String(), bucket, "block", libraryID.String(), blockID).Iter()
+	var candidateStorageClass, candidateStorageKey string
 	var identityAt time.Time
 	count := 0
-	for iter.Scan(&identityAt) {
+	for iter.Scan(&candidateStorageClass, &candidateStorageKey, &identityAt) {
 		count++
 	}
 	if err := iter.Close(); err != nil {
@@ -2996,15 +3063,16 @@ func deletePendingBlockRowsUnderLibraryBucket(t *testing.T, orgID, libraryID uui
 	session := shareProjectionDBForTest(t).Session()
 	bucket := gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemBlock, blockID)
 	iter := session.Query(`
-		SELECT identity_at FROM gc_pending_items
+		SELECT candidate_storage_class, candidate_storage_key, identity_at FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ?
 	`, orgID.String(), bucket, "block", libraryID.String(), blockID).Iter()
+	var candidateStorageClass, candidateStorageKey string
 	var identityAt time.Time
-	for iter.Scan(&identityAt) {
+	for iter.Scan(&candidateStorageClass, &candidateStorageKey, &identityAt) {
 		_ = session.Query(`
 			DELETE FROM gc_pending_items
-			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
-		`, orgID.String(), bucket, "block", libraryID.String(), blockID, identityAt).Exec()
+			WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		`, orgID.String(), bucket, "block", libraryID.String(), blockID, candidateStorageClass, candidateStorageKey, identityAt).Exec()
 	}
 	_ = iter.Close()
 }

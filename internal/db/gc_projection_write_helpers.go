@@ -115,18 +115,18 @@ func AddDeleteLibraryPolicyQuery(batch *gocql.Batch, policyType, orgID, libraryI
 	`, policyType, GCDiscoveryBucket(libraryID), orgID, libraryID)
 }
 
-func AddUpsertBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass string, candidateAt time.Time) {
+func AddUpsertBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass, storageKey string, candidateAt time.Time) {
 	batch.Query(`
-		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass)
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class, storage_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass, storageKey)
 }
 
-func AddDeleteBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID string, candidateAt time.Time) {
+func AddDeleteBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass, storageKey string, candidateAt time.Time) {
 	batch.Query(`
 		DELETE FROM gc_block_candidates_by_day
-		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
-	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID)
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass, storageKey)
 }
 
 func AddUpsertProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID, blockID, referrer, storageClass string, expiresAt time.Time) {
@@ -155,20 +155,21 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 // TestR22aDiscoveryWriterSurface fails if a second writer or helper caller
 // reappears.
 
-func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
+func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) {
 	batch.Query(`
 		INSERT INTO gc_failed_items_by_expiry (
-			expiry_day, bucket, expires_at, org_id, failed_at, item_type, item_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID)
+			expiry_day, bucket, expires_at, org_id, failed_at, item_type, item_id,
+			candidate_storage_class, candidate_storage_key, identity_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
 }
 
-func AddDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
+func AddDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) {
 	if expiresAt.IsZero() {
 		return
 	}
 	batch.Query(`
 		DELETE FROM gc_failed_items_by_expiry
-		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
-	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID)
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
 }

@@ -203,7 +203,7 @@ func (s *Scanner) promoteBlockIfUnreferenced(orgID uuid.UUID, blockID, storageCl
 	if hasRefs {
 		return nil
 	}
-	if _, err := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, now); err != nil {
+	if _, err := s.store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, now); err != nil {
 		if errors.Is(err, ErrBlockCandidateTargetUnavailable) {
 			// Nothing reclaimable: the block has no canonical row, or none with a usable
 			// locator. Reporting that as a phase error would keep the expiry projection
@@ -407,7 +407,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 
 			var batch []QueueItem
 			for _, candidate := range candidates {
-				exists, err := s.store.PendingItemExists(candidate.OrgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID)
+				exists, err := s.store.PendingItemExists(candidate.OrgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID, candidate.Identity())
 				if err != nil {
 					log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, candidate.OrgID, err)
 					if phaseErr == nil {
@@ -419,12 +419,14 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 					continue
 				}
 				batch = append(batch, QueueItem{
-					OrgID:        candidate.OrgID,
-					QueuedAt:     candidate.CandidateAt,
-					ItemType:     ItemBlock,
-					ItemID:       candidate.BlockID,
-					LibraryID:    uuid.Nil,
-					StorageClass: candidate.StorageClass(),
+					OrgID:                    candidate.OrgID,
+					QueuedAt:                 candidate.CandidateAt,
+					IdentityAt:               candidate.CandidateAt,
+					ItemType:                 ItemBlock,
+					ItemID:                   candidate.BlockID,
+					LibraryID:                uuid.Nil,
+					StorageClass:             candidate.StorageClass(),
+					BlockGCCandidateIdentity: candidate.Identity(),
 				})
 			}
 			if len(batch) > 0 {

@@ -3,6 +3,7 @@ package gc
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,4 +28,62 @@ func testSHA256BlockID(label string) string {
 // convention.
 func (m *MockStore) SeedQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) {
 	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, storageClass, retryCount)
+}
+
+// enqueueExactBlockCandidateForTest queues a block only after its exact candidate
+// has been captured. Tests use this instead of the legacy single-row enqueue path.
+func enqueueExactBlockCandidateForTest(t testing.TB, store *MockStore, candidate BlockGCCandidateInfo, retryCount int) {
+	enqueueExactBlockCandidateAtForTest(t, store, candidate, candidate.CandidateAt, retryCount)
+}
+
+func enqueueExactBlockCandidateAtForTest(t testing.TB, store *MockStore, candidate BlockGCCandidateInfo, queuedAt time.Time, retryCount int) {
+	t.Helper()
+	if err := NewQueue(store).EnqueueBatch([]QueueItem{{
+		OrgID:                    candidate.OrgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 ItemBlock,
+		ItemID:                   candidate.BlockID,
+		LibraryID:                uuid.Nil,
+		StorageClass:             candidate.StorageClass(),
+		BlockGCCandidateIdentity: candidate.Identity(),
+		RetryCount:               retryCount,
+	}}); err != nil {
+		t.Fatalf("enqueue exact block candidate: %v", err)
+	}
+}
+
+func ensureAndEnqueueBlockForTest(t testing.TB, store *MockStore, orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time, retryCount int) BlockGCCandidateInfo {
+	t.Helper()
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, candidateAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact(%s): %v", blockID, err)
+	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, retryCount)
+	return candidate
+}
+
+// SeedExactBlockQueueItemForTest models a queue row written before exact-P
+// validation. It is reserved for tests that deliberately exercise malformed
+// candidates which production enqueue paths must reject.
+func (m *MockStore) SeedExactBlockQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, blockID, storageClass string, candidate BlockGCCandidateIdentity, retryCount int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item := QueueItem{
+		OrgID:                    orgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 ItemBlock,
+		ItemID:                   blockID,
+		LibraryID:                uuid.Nil,
+		StorageClass:             storageClass,
+		BlockGCCandidateIdentity: candidate,
+		RetryCount:               retryCount,
+	}
+	m.queue[orgID] = append(m.queue[orgID], item)
+	m.pendingItems[newMockPendingItemKey(orgID, uuid.Nil, ItemBlock, blockID, candidate.CandidateAt, candidate)] = nil
+	now := time.Now().UTC()
+	m.activeQueueOrgs[orgID] = now
+	m.dirtyQueueOrgs[orgID] = now
 }
