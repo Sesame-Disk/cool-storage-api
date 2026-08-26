@@ -680,9 +680,10 @@ succeed and leave the third DC blind.
 ```
 --p3                 leg 1  dc-na stopped: ClaimBlockDelete and StartBlockDeleteOrphan
                             must BOTH refuse to publish
-                     leg 2  all DCs up: a fence published from dc-eu blocks the
-                            rowless-mint gate AND the pre-PUT repair authority when
-                            read from dc-na
+                     leg 2  all DCs up: dc-eu runs the real lifecycle
+                            (claim -> orphan -> finalize); dc-na then sees no
+                            canonical row and a live orphan, and must refuse to
+                            mint -- the cross-DC form of the A+ handoff
 
 --p3-mutate          publishers -> LOCAL_QUORUM: publication succeeds with dc-na
                             down, dc-na is blind, leg 1 goes RED
@@ -698,6 +699,13 @@ Cannot achieve consistency level EACH_QUORUM in DC dc-na
 
 for both the claim and the orphan — and under either mutation, `applied=true`
 instead.
+
+Leg 1 does not accept that as `err != nil`. A lightweight transaction that times
+out (`WriteType: CAS`) may still have been accepted, so "it errored" is not proof
+that nothing was published. The leg requires the error to be specifically
+`Unavailable` **naming EACH_QUORUM**, and then reads the fence back from dc-eu and
+dc-asia -- the two datacenters that were reachable and could therefore have taken a
+partial write -- and requires both to report no fence. Anything else fails the leg.
 
 ### Why three datacenters, again
 
@@ -736,14 +744,36 @@ docker run --rm --network sesamefs-cassandra-3dc_default \
   -e CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   sesamefs-p3-3dc go run ./cmd/sesamefs migrate
 
-# leg 1 (dc-na stopped), then leg 2 (all up)
+# leg 1 -- fail-closed publication. dc-na MUST be stopped, and the harness must be
+# pointed at a surviving DC or TestMain's own cleanup cannot reach Cassandra.
 docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-na
 docker exec -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
   -e SESAMEFS_URL=http://sesamefs:8080 -e CASSANDRA_HOSTS=cassandra-eu:9042 \
   -e CASSANDRA_LOCAL_DC=dc-eu -e P3_EXPECT_DC_DOWN=1 \
   p3run go test -tags integration -count=1 ./internal/integration/ \
   -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v
+
+# leg 2 -- the claim->orphan->finalize handoff seen from dc-na. Every DC up, and
+# P3_EXPECT_DC_DOWN deliberately NOT set: the leg skips itself if it is, so the two
+# legs can never be run against the wrong cluster shape.
+docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-na
+docker exec -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
+  -e SESAMEFS_URL=http://sesamefs:8080 -e CASSANDRA_HOSTS=cassandra-na:9042 \
+  -e CASSANDRA_LOCAL_DC=dc-na \
+  p3run go test -tags integration -count=1 ./internal/integration/ \
+  -run TestP3_WriterInAnotherDatacenterObservesTheFence -v
+
+# tear down
+docker rm -f p3run
+docker compose -f docker-compose.cassandra-3dc.yaml down -v
 ```
+
+Two details that are easy to get wrong, both of which produce a run that looks like
+a pass while proving nothing: the container needs **both** networks (the fixture
+network to reach Cassandra by name, `sesamefs_default` so `TestMain` can reach the
+app -- it exits 0 when `SESAMEFS_URL` is unreachable), and Git Bash rewrites the
+colons in `X2_DC_HOSTS` unless the command is prefixed with `MSYS_NO_PATHCONV=1`.
+`docs/TESTING.md` carries the same procedure with the surrounding context.
 
 `P3_EXPECT_DC_DOWN=1` is required for leg 1 and is what keeps it from passing
 vacuously against a healthy cluster.

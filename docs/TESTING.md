@@ -21,6 +21,9 @@ docker compose --profile test run --rm --build gotest
 # Go integration tests against the running multi-node backend
 docker compose --profile test run --rm --build go-integration-test
 
+# Cross-datacenter (3-DC) closure legs for X2 and P3 do NOT run here -- they need a
+# separate three-datacenter Cassandra fixture. See "Cross-datacenter (3-DC) legs".
+
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
@@ -793,6 +796,154 @@ Manual test flow to verify the full GC pipeline:
 6. **Verify** block deleted from S3 and `blocks` table
 7. **Delete** the library
 8. **Verify** all commits and fs_objects enqueued and eventually cleaned up
+
+---
+
+## Cross-datacenter (3-DC) legs
+
+Two closure properties can only be observed across real datacenters, so they run
+against a separate fixture from everything above: **X2** (a destructive read must
+intersect every DC that could have acknowledged a reference) and **P3** (GC must not
+publish a fence a writer in another DC cannot see).
+
+A single process cannot observe a consistency level. That is the entire reason this
+fixture exists, and it is why these legs are not part of `go-all-test`.
+
+### TL;DR for an agent picking this up cold
+
+```bash
+# 1. Three real Cassandra datacenters: dc-na, dc-eu, dc-asia, RF 1 each.
+docker compose -f docker-compose.cassandra-3dc.yaml up -d
+
+# 2. Everything below runs INSIDE a container (see "Windows / blocked binaries").
+docker build -f Dockerfile.gotest -t sesamefs-3dc .
+docker run -d --name dc3run --network sesamefs-cassandra-3dc_default sesamefs-3dc sleep 7200
+docker network connect sesamefs_default dc3run     # so TestMain can reach the app
+
+# 3. Schema.
+docker run --rm --network sesamefs-cassandra-3dc_default \
+  -e CASSANDRA_HOSTS=cassandra-na:9042 -e CASSANDRA_LOCAL_DC=dc-na \
+  -e CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
+  -e CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
+  sesamefs-3dc go run ./cmd/sesamefs migrate
+
+# 4. P3 leg 1 -- fail-closed publication. dc-na MUST be stopped.
+docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-na
+docker exec \
+  -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
+  -e SESAMEFS_URL=http://sesamefs:8080 \
+  -e CASSANDRA_HOSTS=cassandra-eu:9042 -e CASSANDRA_LOCAL_DC=dc-eu \
+  -e P3_EXPECT_DC_DOWN=1 \
+  dc3run go test -tags integration -count=1 ./internal/integration/ \
+  -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v
+
+# 5. P3 leg 2 -- the claim->orphan->finalize handoff, observed from dc-na.
+#    All three DCs must be up, and P3_EXPECT_DC_DOWN must NOT be set.
+docker compose -f docker-compose.cassandra-3dc.yaml start cassandra-na
+docker exec \
+  -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
+  -e SESAMEFS_URL=http://sesamefs:8080 \
+  -e CASSANDRA_HOSTS=cassandra-na:9042 -e CASSANDRA_LOCAL_DC=dc-na \
+  dc3run go test -tags integration -count=1 ./internal/integration/ \
+  -run TestP3_WriterInAnotherDatacenterObservesTheFence -v
+
+# 6. Tear down.
+docker rm -f dc3run
+docker compose -f docker-compose.cassandra-3dc.yaml down -v
+```
+
+### On a host where Go binaries run normally
+
+The script does all of the above in one command:
+
+```bash
+./scripts/x2-multidc-validation.sh --keep     # X2 legs, leaves the fixture up
+./scripts/x2-multidc-validation.sh --p3       # P3 legs (skips the X2 legs entirely)
+```
+
+`--p3` runs the schema step and then the P3 legs, and exits before X2's
+hinted-handoff disable and divergence build. It does NOT inherit X2 fixture state.
+
+### Windows / blocked binaries
+
+On hosts where an Application Control policy blocks executing freshly built
+binaries, `go run` and `go test` fail from the host with:
+
+```
+fork/exec ...\xxx.test.exe: An Application Control policy has blocked this file.
+```
+
+`go build` and `go vet` still work; only *execution* is blocked. The script drives
+`go` from the host, so it cannot be used there. Use the container route in the
+TL;DR above -- that is how the current evidence in
+`docs/GC-X2-MULTIDC-VALIDATION.md` was actually produced.
+
+Two details that are easy to get wrong:
+
+- **Two networks.** The test container needs `sesamefs-cassandra-3dc_default` to
+  reach the three Cassandra nodes by name, *and* `sesamefs_default` to reach the
+  app, because the integration `TestMain` exits 0 when `SESAMEFS_URL` is
+  unreachable -- a run that proved nothing would look like a pass. `docker run`
+  takes one network, so attach the second with `docker network connect`.
+- **Git Bash mangles the env values.** `X2_DC_HOSTS` and
+  `CASSANDRA_REPLICATION_DCS` contain colons and are rewritten by MSYS path
+  conversion. Prefix the command with `MSYS_NO_PATHCONV=1`, or run it from
+  PowerShell.
+
+### The guards that stop a vacuous pass
+
+Each of these exists because the obvious version of the test proves nothing.
+
+| Guard | What it prevents |
+|---|---|
+| `P3_EXPECT_DC_DOWN=1` | leg 1 passing against a healthy cluster, where the publications would simply succeed |
+| leg 2 skips when `P3_EXPECT_DC_DOWN` is set | running the handoff leg against a cluster with a DC missing |
+| `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted |
+| post-refusal fence read from dc-eu **and** dc-asia | "the call failed" being mistaken for "nothing was published" |
+| `BlockExists` check after finalize in leg 2 | measuring an orphan read instead of the rowless-mint gate |
+| fresh org/block id per run | a previous run's rows deciding this run's assertions |
+| script requires the `--- PASS:` line | a skipped package reporting success |
+
+### Proving the legs can fail
+
+A green leg means nothing until it has been shown to go red against the defect it
+exists to catch. Both mutations are entry points, and both need a fixture that is
+already up:
+
+```bash
+./scripts/x2-multidc-validation.sh --p3-mutate          # publishers -> LOCAL_QUORUM
+./scripts/x2-multidc-validation.sh --p3-mutate-quorum   # publishers -> QUORUM
+```
+
+Each patches `internal/gc/store_cassandra.go`, re-runs leg 1, requires it to FAIL
+with a `P3 REGRESSION` assertion, and restores the file. **`--p3-mutate-quorum` is
+why the fixture has three datacenters**: at two DCs with RF 1, `QUORUM` is 2 of 2
+and fails with a DC down exactly like `EACH_QUORUM`, so leg 1 would stay green and
+the wrong fix would hide.
+
+To run a mutation by hand in the container route, patch inside the container and
+restore afterwards -- note the pattern has **no leading dot**, unlike X2's, because
+the GC store puts `Consistency(...)` on its own line:
+
+```bash
+docker exec dc3run sh -c 'cp internal/gc/store_cassandra.go /tmp/sc.bak &&
+  perl -0pi -e "s/\QConsistency(gocql.EachQuorum)\E/Consistency(gocql.Quorum)/g" \
+  internal/gc/store_cassandra.go'
+# ... re-run leg 1, expect FAIL ...
+docker exec dc3run sh -c 'cp /tmp/sc.bak internal/gc/store_cassandra.go'
+```
+
+### What these legs do NOT cover
+
+The pinned **read** level. `BlockFenceReadConsistency` is `LOCAL_QUORUM` because
+`database.consistency` accepts `ONE` and a `ONE` read can miss a committed fence.
+With RF 1 per datacenter, `LOCAL_QUORUM` and `ONE` both resolve to the single local
+replica, so they are indistinguishable on this fixture. That pin defends a
+deployment with RF > 1 inside a datacenter, and stays covered by
+`TestP3FenceReadConsistencyIsLocalQuorum` and the AST guard in
+`internal/integration/p3_repair_authority_guard_test.go`.
+
+Full runbook and closure findings: `docs/GC-X2-MULTIDC-VALIDATION.md`.
 
 ---
 

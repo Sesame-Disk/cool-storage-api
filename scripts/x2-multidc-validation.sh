@@ -396,45 +396,14 @@ CASSANDRA_HOSTS="127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242}" CASSANDRA_LOCAL_DC=d
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   go run ./cmd/sesamefs migrate
 
-step "3. Disable hinted handoff (load-bearing: hints would erase the divergence)"
-for n in "${NODES[@]}"; do
-  docker exec "sesamefs-cassandra-$n" nodetool disablehandoff
-done
-
-step "4. Build the divergent state: write the reference in dc-eu alone"
-build_divergence
-
-step "5. LEG 1 — visibility: LOCAL_QUORUM(dc-na)=false AND EACH_QUORUM(dc-na)=true"
-run_leg "leg 1 (divergent visibility)" "$LEG1"
-
-step "6. LEG 2 — fail closed: with dc-asia down the destructive read must ERROR"
-# No need to guard the restart: the EXIT trap brings every node back however this
-# leg ends, so a failure here still leaves the fixture usable.
-"${COMPOSE[@]}" stop cassandra-asia
-X2_EXPECT_DC_DOWN=1 run_leg "leg 2 (fail closed with a DC down)" TestX2_EachQuorumFailsClosedWhenADatacenterIsDown
-"${COMPOSE[@]}" start cassandra-asia
-wait_healthy asia
-
-step "6b. LEG 2b — the DC holding the ONLY reference is down; the read must ERROR, never zero"
-# A FRESH divergence is mandatory. Leg 1's EACH_QUORUM read performed blocking read
-# repair to satisfy its own consistency level, so the row it was testing now exists in
-# dc-na — and against a healed cluster this leg would pass for the wrong reason,
-# proving nothing about which consistency level was used.
-build_divergence
-"${COMPOSE[@]}" stop cassandra-eu
-require_stopped eu "before the leg 2b read"
-X2_EXPECT_REFERENCE_DC_DOWN=1 run_leg "leg 2b (fail closed with the reference DC down)" "$LEG2B"
-require_stopped eu "for the whole leg 2b read"
-"${COMPOSE[@]}" start cassandra-eu
-wait_healthy eu
-point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
-
-step "7. LEG 3 — topology gate: accepts the declared map, refuses an under-declared one"
-run_leg "leg 3a (gate accepts the declared 3-DC map)" TestX2_TopologyGateAcceptsThreeDCNetworkTopology
-run_leg "leg 3b (gate refuses an under-declared map)" TestX2_TopologyGateRejectsAnUnderDeclaredMap
-
 # ---------------------------------------------------------------------------
 # P3 writer-fence legs, on the same fixture.
+#
+# Placed here deliberately: after the schema, BEFORE X2's hinted-handoff disable and
+# divergence build. P3 needs a healthy cluster and a schema and nothing else, and an
+# earlier version of this block sat after the X2 legs -- so `--p3` quietly ran the
+# whole X2 suite first and measured P3 against whatever fixture state X2 left behind.
+# These legs exit as soon as they are done, so nothing below runs in P3 mode.
 #
 # X2 asks whether a destructive READ intersects every datacenter. P3 asks the
 # mirror question about the fence WRITE: can GC condemn an incarnation whose fence
@@ -504,6 +473,43 @@ if [ "${DO_P3:-0}" = "1" ]; then
   printf 'Mutations are separate entry points: --p3-mutate (vs LOCAL_QUORUM), --p3-mutate-quorum (vs QUORUM, the leg that needs three DCs).\n'
   exit 0
 fi
+
+step "3. Disable hinted handoff (load-bearing: hints would erase the divergence)"
+for n in "${NODES[@]}"; do
+  docker exec "sesamefs-cassandra-$n" nodetool disablehandoff
+done
+
+step "4. Build the divergent state: write the reference in dc-eu alone"
+build_divergence
+
+step "5. LEG 1 — visibility: LOCAL_QUORUM(dc-na)=false AND EACH_QUORUM(dc-na)=true"
+run_leg "leg 1 (divergent visibility)" "$LEG1"
+
+step "6. LEG 2 — fail closed: with dc-asia down the destructive read must ERROR"
+# No need to guard the restart: the EXIT trap brings every node back however this
+# leg ends, so a failure here still leaves the fixture usable.
+"${COMPOSE[@]}" stop cassandra-asia
+X2_EXPECT_DC_DOWN=1 run_leg "leg 2 (fail closed with a DC down)" TestX2_EachQuorumFailsClosedWhenADatacenterIsDown
+"${COMPOSE[@]}" start cassandra-asia
+wait_healthy asia
+
+step "6b. LEG 2b — the DC holding the ONLY reference is down; the read must ERROR, never zero"
+# A FRESH divergence is mandatory. Leg 1's EACH_QUORUM read performed blocking read
+# repair to satisfy its own consistency level, so the row it was testing now exists in
+# dc-na — and against a healed cluster this leg would pass for the wrong reason,
+# proving nothing about which consistency level was used.
+build_divergence
+"${COMPOSE[@]}" stop cassandra-eu
+require_stopped eu "before the leg 2b read"
+X2_EXPECT_REFERENCE_DC_DOWN=1 run_leg "leg 2b (fail closed with the reference DC down)" "$LEG2B"
+require_stopped eu "for the whole leg 2b read"
+"${COMPOSE[@]}" start cassandra-eu
+wait_healthy eu
+point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
+
+step "7. LEG 3 — topology gate: accepts the declared map, refuses an under-declared one"
+run_leg "leg 3a (gate accepts the declared 3-DC map)" TestX2_TopologyGateAcceptsThreeDCNetworkTopology
+run_leg "leg 3b (gate refuses an under-declared map)" TestX2_TopologyGateRejectsAnUnderDeclaredMap
 
 printf '\n\033[32mAll X2 closure legs green (1, 2, 2b, 3a, 3b).\033[0m\n'
 printf 'Mutation legs are separate entry points: --mutate (leg 1 vs LOCAL_QUORUM), --mutate-quorum (leg 2b vs QUORUM).\n'
