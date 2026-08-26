@@ -39,7 +39,7 @@ func TestWorker_ProcessBlock_S3RetrySucceeds(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("s3-retry")
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -79,7 +79,7 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	blockID := testSHA256BlockID("s3-retry-exhausted")
 	store.AddBlock(orgID, blockID, "cold", 0)
 	store.AddBlockMapping(orgID, "sha1-xyz", blockID)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "cold", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "cold", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -134,7 +134,7 @@ func TestWorker_ProcessBlock_UsesExistingOrphanFirstSeenAtForCleanup(t *testing.
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddBlock(orgID, blockID, "hot", 0)
 	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", firstSeenAt)
-	if err := store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+	if err := store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
 

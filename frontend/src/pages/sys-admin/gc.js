@@ -216,26 +216,51 @@ class GC extends Component {
         this.loadFailedItems();
     };
 
+    // getFailedItemIdentity extracts the durable identity of one DLQ row.
+    // identity_at is part of the primary key for EVERY item type, and a block row
+    // additionally names the exact physical incarnation its candidate authorized.
+    getFailedItemIdentity = (item) => {
+        const identity = {
+            identity_at: item.identity_at || item.identityAt
+        };
+        const candidate = item.block_gc_candidate_identity || item.blockGCCandidateIdentity;
+        const target = (candidate && (candidate.target || candidate.Target)) || {};
+        const storageClass = target.storage_class || target.StorageClass;
+        const storageKey = target.storage_key || target.StorageKey;
+        if (storageClass || storageKey) {
+            identity.candidate_storage_class = storageClass;
+            identity.candidate_storage_key = storageKey;
+            identity.candidate_at = (candidate && (candidate.candidate_at || candidate.CandidateAt)) || identity.identity_at;
+        }
+        return identity;
+    };
+
+    // The action key must carry the same identity the server requires, or two DLQ
+    // rows for one item — two physical incarnations of a block, or two lifecycles
+    // of a non-block item — share a key: clicking one marks BOTH rows busy and the
+    // operator cannot tell which action is actually in flight.
     getFailedItemActionKey = (action, item) => {
-        return `${action}:${item.org_id || item.orgID}:${item.failed_at || item.failedAt}:${item.item_type || item.itemType}:${item.item_id || item.itemID}`;
+        const identity = this.getFailedItemIdentity(item);
+        return [
+            action,
+            item.org_id || item.orgID,
+            item.failed_at || item.failedAt,
+            item.item_type || item.itemType,
+            item.item_id || item.itemID,
+            identity.identity_at || '',
+            identity.candidate_storage_class || '',
+            identity.candidate_storage_key || ''
+        ].join(':');
     };
 
     getFailedItemPayload = (item) => {
-        const payload = {
+        return {
             org_id: item.org_id || item.orgID,
             failed_at: item.failed_at || item.failedAt,
             item_type: item.item_type || item.itemType,
             item_id: item.item_id || item.itemID,
-            identity_at: item.identity_at || item.identityAt,
+            ...this.getFailedItemIdentity(item)
         };
-        const candidate = item.block_gc_candidate_identity || item.blockGCCandidateIdentity;
-        if (candidate) {
-            const target = candidate.target || candidate.Target || {};
-            payload.candidate_storage_class = target.storage_class || target.StorageClass;
-            payload.candidate_storage_key = target.storage_key || target.StorageKey;
-            payload.candidate_at = candidate.candidate_at || candidate.CandidateAt;
-        }
-        return payload;
     };
 
     operateFailedItem = (action, item) => {

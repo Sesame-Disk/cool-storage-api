@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,6 +99,9 @@ func (m *Migrator) Run() error {
 			continue
 		}
 
+		if err := m.preflightDestructive(mf); err != nil {
+			return err
+		}
 		if err := m.apply(mf); err != nil {
 			return fmt.Errorf("migrator: applying %03d_%s: %w", mf.Version, mf.Name, err)
 		}
@@ -362,4 +366,124 @@ func parseCQLStatements(content string) []string {
 		}
 	}
 	return stmts
+}
+
+// --- Destructive-migration preflight -----------------------------------------
+//
+// A migration that DROPs a table is not an upgrade: it discards whatever the
+// table held. Migration 018 is exactly that — the exact-P GC identity model
+// cannot be reached with ALTER, because Cassandra will not change a PRIMARY KEY
+// — and it is correct ONLY under the contract it states: a clean keyspace, put
+// into service before any node starts producing GC work.
+//
+// A comment cannot enforce that contract. This preflight can: before applying
+// any migration that drops tables, every table it is about to drop must be
+// empty. Running the release against a keyspace that already accumulated GC
+// work then fails loudly at startup with the table named, instead of silently
+// erasing queue, pending and DLQ rows — including the non-block item types that
+// have nothing to do with this change.
+//
+// The check is deliberately generic rather than keyed to version 018, so the
+// next destructive migration inherits the barrier instead of having to remember
+// it.
+
+var dropTablePattern = regexp.MustCompile(`(?is)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_."]+)`)
+
+// droppedTables returns the tables a migration drops, in statement order.
+func (mf MigrationFile) droppedTables() []string {
+	var tables []string
+	for _, stmt := range mf.Statements {
+		for _, match := range dropTablePattern.FindAllStringSubmatch(stmt, -1) {
+			name := strings.Trim(strings.TrimSpace(match[1]), `";`)
+			if idx := strings.LastIndex(name, "."); idx >= 0 {
+				name = name[idx+1:]
+			}
+			if name != "" {
+				tables = append(tables, name)
+			}
+		}
+	}
+	return tables
+}
+
+// missingTableError reports whether err says the table is not there. A table
+// this migration was going to drop anyway is not something to protect, so a
+// re-run after a partially-applied destructive migration still converges.
+func missingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"unconfigured table",
+		"unconfigured columnfamily",
+		"does not exist",
+		"non-existent table",
+		"cannot be found",
+		"table not found",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// preflightDestructive refuses a table-dropping migration whose targets still
+// hold rows.
+func (m *Migrator) preflightDestructive(mf MigrationFile) error {
+	tables := mf.droppedTables()
+	if len(tables) == 0 {
+		return nil
+	}
+	for _, table := range tables {
+		// LIMIT 1 over the whole table: this only has to answer "is there anything
+		// here", and it runs once, at startup, before the drop.
+		//
+		// NumRows, not Scan: the probe deliberately binds no columns, because it
+		// must work for any schema, and Scan with no destinations is a driver error
+		// rather than an empty result.
+		iter := m.session.Query(fmt.Sprintf(`SELECT * FROM %s LIMIT 1`, table)).Iter()
+		occupied := iter.NumRows() > 0
+		err := iter.Close()
+		if err != nil {
+			if missingTableError(err) {
+				continue
+			}
+			return fmt.Errorf(
+				"migrator: %s drops %s, and whether that table is empty could not be established: %w — "+
+					"refusing to run a destructive migration on an unverified table",
+				mf.label(), table, err)
+		}
+		if occupied {
+			return fmt.Errorf(
+				"migrator: %s drops %s, but that table still holds rows.\n"+
+					"This migration is NOT an upgrade — it discards the tables it drops — and is only "+
+					"correct against a clean keyspace deployed before any node produces GC work.\n"+
+					"Refusing to erase live state. Either deploy this release onto an empty keyspace, or "+
+					"drain and truncate the GC tables deliberately before starting the server.",
+				mf.label(), table)
+		}
+	}
+	return nil
+}
+
+// PreflightDestructiveForTest runs the destructive preflight over a migration's
+// CQL against an arbitrary session.
+//
+// It exists so the barrier can be proven against a REAL cluster: the whole check
+// is a live read of a live table, so a unit test cannot show it closing. The
+// integration test seeds a scratch table and asserts the refusal, which is the
+// only way to demonstrate that deploying this release onto a keyspace with
+// existing GC work fails loudly instead of erasing it.
+//
+// It is a test seam, not an API: production always reaches this through Run.
+func PreflightDestructiveForTest(session *gocql.Session, migrationCQL string) error {
+	m := &Migrator{session: session}
+	return m.preflightDestructive(MigrationFile{
+		Version:    0,
+		Name:       "preflight_probe",
+		Content:    migrationCQL,
+		Statements: parseCQLStatements(migrationCQL),
+	})
 }

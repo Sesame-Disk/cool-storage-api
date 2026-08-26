@@ -170,13 +170,6 @@ func (s *provisionalPhase0FailureStore) BlockHasReferences(orgID uuid.UUID, bloc
 	return s.GCStore.BlockHasReferences(orgID, blockID)
 }
 
-func (s *provisionalPhase0FailureStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	if s.fail && blockID == s.candidateFailureBlock {
-		return time.Time{}, errors.New("injected provisional candidate persistence failure")
-	}
-	return s.GCStore.EnsureBlockGCCandidate(orgID, blockID, storageClass, candidateAt)
-}
-
 func (s *provisionalPhase0FailureStore) EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (gcpkg.BlockGCCandidateInfo, error) {
 	if s.fail && blockID == s.candidateFailureBlock {
 		return gcpkg.BlockGCCandidateInfo{}, errors.New("injected provisional candidate persistence failure")
@@ -1275,11 +1268,11 @@ func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, st
 func ensureSyntheticBlockCandidateForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) time.Time {
 	t.Helper()
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, candidateAt.UTC().Truncate(time.Millisecond))
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, candidateAt.UTC().Truncate(time.Millisecond))
 	if err != nil {
-		t.Fatalf("EnsureBlockGCCandidate(%s/%s): %v", orgID, blockID, err)
+		t.Fatalf("EnsureBlockGCCandidateExact(%s/%s): %v", orgID, blockID, err)
 	}
-	return effectiveCandidateAt
+	return candidate.CandidateAt
 }
 
 func enqueueSyntheticBlockQueueItemForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string, queuedAt time.Time) {
@@ -1703,10 +1696,11 @@ func TestGC_DeleteBlockGCCandidate_IsBoundToTheExactIncarnation(t *testing.T) {
 	p2 := seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
 	p1 := gcpkg.BlockDeleteTarget{StorageClass: "hot", StorageKey: p2.StorageKey + ".dead"}
 
-	candidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond))
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond))
 	if err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
+	candidateAt := candidate.CandidateAt
 	if !gcCandidateExists(t, orgID.String(), blockID) {
 		t.Fatal("expected canonical gc_block_candidates row to exist")
 	}
@@ -2259,10 +2253,11 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
 	seedSyntheticZeroRefBlockForTest(t, orgID, blockID, "hot")
 
-	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt)
+	initial, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", candidateAt)
 	if err != nil {
-		t.Fatalf("initial EnsureBlockGCCandidate: %v", err)
+		t.Fatalf("initial EnsureBlockGCCandidateExact: %v", err)
 	}
+	effectiveCandidateAt := initial.CandidateAt
 	if !effectiveCandidateAt.Equal(candidateAt) {
 		t.Fatalf("effective candidate_at = %v, want %v", effectiveCandidateAt, candidateAt)
 	}
@@ -2276,10 +2271,11 @@ func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 		t.Fatal("expected block candidate projection row to be deleted before repair")
 	}
 
-	repairedCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "cold", time.Now().UTC())
+	repaired, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "cold", time.Now().UTC())
 	if err != nil {
-		t.Fatalf("repair EnsureBlockGCCandidate: %v", err)
+		t.Fatalf("repair EnsureBlockGCCandidateExact: %v", err)
 	}
+	repairedCandidateAt := repaired.CandidateAt
 	if !repairedCandidateAt.Equal(candidateAt) {
 		t.Fatalf("repaired candidate_at = %v, want original %v", repairedCandidateAt, candidateAt)
 	}
@@ -2990,12 +2986,12 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		t.Fatalf("expected at least 2 failed items in admin list, got %#v", listBody["items"])
 	}
 
-	requeueResp := superadminClient.PostJSON(t, "/api/v2.1/admin/gc/failed-items/requeue", map[string]string{
-		"org_id":    orgID.String(),
-		"failed_at": failedAtA.Format(time.RFC3339Nano),
-		"item_type": "unknown_type",
-		"item_id":   itemIDA,
-	})
+	// The selector carries identity_at, exactly as the admin UI does. It is a
+	// clustering column of gc_failed_items for EVERY item type, so a request that
+	// omits it names a row prefix and is refused: an operator must act on the row
+	// they are looking at, not on whichever row sorts first under a prefix.
+	requeueResp := superadminClient.PostJSON(t, "/api/v2.1/admin/gc/failed-items/requeue",
+		failedItemSelectorFromListing(t, items, orgID.String(), "unknown_type", itemIDA))
 	if requeueResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected failed-item requeue HTTP 200, got %d", requeueResp.StatusCode)
 	}
@@ -3006,12 +3002,8 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		t.Fatalf("expected requeued failed item %s to appear in gc_queue", itemIDA)
 	}
 
-	deleteResp := superadminClient.DeleteJSON(t, "/api/v2.1/admin/gc/failed-items", map[string]string{
-		"org_id":    orgID.String(),
-		"failed_at": failedAtB.Format(time.RFC3339Nano),
-		"item_type": "unknown_type",
-		"item_id":   itemIDB,
-	})
+	deleteResp := superadminClient.DeleteJSON(t, "/api/v2.1/admin/gc/failed-items",
+		failedItemSelectorFromListing(t, items, orgID.String(), "unknown_type", itemIDB))
 	if deleteResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected failed-item delete HTTP 200, got %d", deleteResp.StatusCode)
 	}
@@ -3026,6 +3018,57 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 	if orgFailedDepth != 0 {
 		t.Fatalf("expected org failed depth to be 0 after requeue+delete, got %d", orgFailedDepth)
 	}
+}
+
+// failedItemSelectorFromListing builds a DLQ admin selector the way the admin UI
+// does: read the listing, then act on exactly the row you saw.
+//
+// Every DLQ mutation names the row's full primary key, identity_at included, and
+// a block row additionally names the exact physical incarnation its candidate
+// authorized. Constructing the selector from the listing rather than from local
+// variables is the point: it proves the API exposes everything a client needs to
+// address one lifecycle unambiguously.
+func failedItemSelectorFromListing(t *testing.T, items []interface{}, orgID, itemType, itemID string) map[string]string {
+	t.Helper()
+	for _, entry := range items {
+		item, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if got, _ := item["item_type"].(string); got != itemType {
+			continue
+		}
+		if got, _ := item["item_id"].(string); got != itemID {
+			continue
+		}
+		failedAt, _ := item["failed_at"].(string)
+		identityAt, _ := item["identity_at"].(string)
+		if failedAt == "" || identityAt == "" {
+			t.Fatalf("failed item %s/%s is missing failed_at or identity_at in the admin listing (%#v); "+
+				"a client cannot address it without them", itemType, itemID, item)
+		}
+		selector := map[string]string{
+			"org_id":      orgID,
+			"failed_at":   failedAt,
+			"item_type":   itemType,
+			"item_id":     itemID,
+			"identity_at": identityAt,
+		}
+		if candidate, ok := item["block_gc_candidate_identity"].(map[string]interface{}); ok {
+			target, _ := candidate["target"].(map[string]interface{})
+			storageClass, _ := target["storage_class"].(string)
+			storageKey, _ := target["storage_key"].(string)
+			if storageClass != "" || storageKey != "" {
+				candidateAt, _ := candidate["candidate_at"].(string)
+				selector["candidate_storage_class"] = storageClass
+				selector["candidate_storage_key"] = storageKey
+				selector["candidate_at"] = candidateAt
+			}
+		}
+		return selector
+	}
+	t.Fatalf("failed item %s/%s not found in the admin listing: %#v", itemType, itemID, items)
+	return nil
 }
 
 // countPendingBlockRows counts gc_pending_items block rows for blockID under the

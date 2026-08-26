@@ -115,20 +115,6 @@ func AddDeleteLibraryPolicyQuery(batch *gocql.Batch, policyType, orgID, libraryI
 	`, policyType, GCDiscoveryBucket(libraryID), orgID, libraryID)
 }
 
-func AddUpsertBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass, storageKey string, candidateAt time.Time) {
-	batch.Query(`
-		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class, storage_key)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass, storageKey)
-}
-
-func AddDeleteBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass, storageKey string, candidateAt time.Time) {
-	batch.Query(`
-		DELETE FROM gc_block_candidates_by_day
-		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
-	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass, storageKey)
-}
-
 func AddUpsertProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID, blockID, referrer, storageClass string, expiresAt time.Time) {
 	batch.Query(`
 		INSERT INTO gc_provisional_block_refs_by_day (expiry_day, bucket, expires_at, org_id, block_id, referrer, storage_class)
@@ -155,13 +141,26 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 // TestR22aDiscoveryWriterSurface fails if a second writer or helper caller
 // reappears.
 
+// GCFailedItemExpiryBucket is the ONE definition of the expiry projection's
+// bucket. Both halves of the key — the columns and this hash — must be derived
+// identically by every writer, so the formula is named and exported rather than
+// re-spelled at each call site.
+func GCFailedItemExpiryBucket(orgID string, failedAt time.Time, itemType, itemID, candidateStorageClass, candidateStorageKey string, identityAt time.Time) int {
+	return GCDiscoveryBucket(
+		orgID, itemType, itemID,
+		failedAt.UTC().Format(time.RFC3339Nano),
+		candidateStorageClass, candidateStorageKey,
+		identityAt.UTC().Format(time.RFC3339Nano),
+	)
+}
+
 func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) {
 	batch.Query(`
 		INSERT INTO gc_failed_items_by_expiry (
 			expiry_day, bucket, expires_at, org_id, failed_at, item_type, item_id,
 			candidate_storage_class, candidate_storage_key, identity_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
+	`, GCProjectionUTCDate(expiresAt), GCFailedItemExpiryBucket(orgID, failedAt, itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
 }
 
 func AddDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) {
@@ -171,5 +170,5 @@ func AddDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt t
 	batch.Query(`
 		DELETE FROM gc_failed_items_by_expiry
 		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
+	`, GCProjectionUTCDate(expiresAt), GCFailedItemExpiryBucket(orgID, failedAt, itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt.UTC())
 }

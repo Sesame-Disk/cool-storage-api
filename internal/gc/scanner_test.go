@@ -916,7 +916,7 @@ func TestScanner_ScanOrphanedBlocks_EnqueuesFromCandidatesByDay(t *testing.T) {
 
 	// Refcount-decrement paths invoke EnsureBlockGCCandidate when they reach
 	// zero; here we register the candidate row directly to simulate that.
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-zero-ref", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-zero-ref", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 
@@ -957,7 +957,7 @@ func TestScanner_ScanOrphanedBlocks_DiscoversAcrossDistinctBuckets(t *testing.T)
 	for i := 0; i < blockCount; i++ {
 		blockID := fmt.Sprintf("block-%04d", i)
 		store.AddBlock(orgID, blockID, "hot", 0)
-		if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now()); err != nil {
+		if _, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now()); err != nil {
 			t.Fatalf("EnsureBlockGCCandidate failed for %s: %v", blockID, err)
 		}
 	}
@@ -989,7 +989,7 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 
 	// Seed a recent candidate the scanner must pick up on the first pass.
 	store.AddBlock(orgID, "block-recent", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-recent", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-recent", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 
@@ -1010,7 +1010,7 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 		t.Fatalf("DequeueBatch failed: %v", err)
 	}
 	candidate := store.AllBlockGCCandidates()[0]
-	if err := store.CompleteItem(orgID, candidate.CandidateAt, candidate.CandidateAt, ItemBlock, "block-recent", candidate.Identity()); err != nil {
+	if err := store.CompleteItem(orgID, candidate.CandidateAt, ItemBlock, "block-recent", candidate.ItemIdentity()); err != nil {
 		t.Fatalf("CompleteItem failed: %v", err)
 	}
 
@@ -1638,7 +1638,7 @@ func TestScanner_ScanOrphanedBlocks_EnqueueFailureKeepsCursorUnchanged(t *testin
 	}
 
 	store.AddBlock(orgID, "block-enqueue-fail", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 	store.enqueueBatchErr = fmt.Errorf("enqueue failed")

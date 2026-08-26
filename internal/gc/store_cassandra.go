@@ -324,16 +324,14 @@ func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemTy
 	if itemTypeRequiresBlockRepresentation(itemType) {
 		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
 	}
+	// ItemBlock is refused here for the same reason Queue.Enqueue refuses it, and
+	// it matters more at this layer: a block work item is only legitimate when a
+	// zero-ref DECISION already produced a candidate for an exact P, and this raw
+	// path has no P to carry. Minting one here would let "enqueue" fabricate
+	// destructive authority — the inverse of the rule the whole slice rests on.
+	// Producers go through EnqueueBatch with the identity the decision returned.
 	if itemType == ItemBlock {
-		candidate, err := s.EnsureBlockGCCandidateExact(orgID, itemID, storageClass, queuedAt)
-		if err != nil {
-			return err
-		}
-		return s.EnqueueBatch([]QueueItem{{
-			OrgID: orgID, QueuedAt: queuedAt, IdentityAt: candidate.CandidateAt,
-			ItemType: ItemBlock, ItemID: itemID, LibraryID: uuid.Nil,
-			StorageClass: candidate.StorageClass(), BlockGCCandidateIdentity: candidate.Identity(), RetryCount: retryCount,
-		}})
+		return fmt.Errorf("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType)
 	}
 	now := time.Now().UTC()
 	queueBucket := gcQueueBucket(orgID, itemType, itemID)
@@ -342,7 +340,7 @@ func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemTy
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, orgID.String(), queueBucket, queuedAt, queuedAt, false, string(LibraryGuardNone), string(itemType), itemID, libraryID.String(), "", storageClass, "", "", retryCount)
-	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, queuedAt, BlockGCCandidateIdentity{})
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, GCItemIdentityAt(queuedAt))
 	batch.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 		VALUES (?, ?, ?)
@@ -378,15 +376,15 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 		batch := s.db.Session().Batch(gocql.LoggedBatch)
 		activeAtByOrg := make(map[string]time.Time)
 		for _, item := range chunk {
-			identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+			identity := item.Identity()
 			guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
 			requiresLibraryDeletedCheck := guardMode != LibraryGuardNone
 			queueBucket := gcQueueBucket(item.OrgID, item.ItemType, item.ItemID)
 			batch.Query(`
 				INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`, item.OrgID.String(), queueBucket, item.QueuedAt, identityAt, requiresLibraryDeletedCheck, string(guardMode), string(item.ItemType), item.ItemID, item.LibraryID.String(), strings.TrimSpace(item.BlockRepresentationID), item.StorageClass, item.BlockGCCandidateIdentity.Target.StorageClass, item.BlockGCCandidateIdentity.Target.StorageKey, item.RetryCount)
-			addPendingItemBatchQuery(batch, item.OrgID, item.LibraryID, item.ItemType, item.ItemID, identityAt, item.BlockGCCandidateIdentity)
+			`, item.OrgID.String(), queueBucket, item.QueuedAt, identity.IdentityAt, requiresLibraryDeletedCheck, string(guardMode), string(item.ItemType), item.ItemID, item.LibraryID.String(), strings.TrimSpace(item.BlockRepresentationID), item.StorageClass, identity.Target().StorageClass, identity.Target().StorageKey, item.RetryCount)
+			addPendingItemBatchQuery(batch, item.OrgID, item.LibraryID, item.ItemType, item.ItemID, identity)
 			activeAtByOrg[item.OrgID.String()] = time.Now().UTC()
 		}
 		for orgIDStr, activeAt := range activeAtByOrg {
@@ -406,13 +404,13 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 	return nil
 }
 
-func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) (bool, error) {
-	candidate := queueCandidateIdentity(candidates)
+func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
+	identity = identity.resolved(queuedAt)
 	var existingItemID string
 	err := s.db.Session().Query(`
 		SELECT item_id FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, queueIdentityAt(queuedAt, identityAt, candidate)).Scan(&existingItemID)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt).Scan(&existingItemID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -422,20 +420,21 @@ func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt, identityAt t
 	return true, nil
 }
 
-func (s *CassandraStore) PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) (bool, error) {
+func (s *CassandraStore) PendingItemExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
 	// Read under the same coerced key the write/delete helpers use, so a block dedup
 	// probe always inspects the canonical uuid.Nil partition regardless of the caller.
 	libraryID = pendingItemLibraryID(itemType, libraryID)
-	candidate := queueCandidateIdentity(candidates)
 	var existingItemID string
 	query := `
 		SELECT item_id FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ?
 	`
-	args := []interface{}{orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey}
-	if !identityAt.IsZero() {
+	args := []interface{}{orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identity.Target().StorageClass, identity.Target().StorageKey}
+	// A zero identity_at is the deliberate AnyGCItemIdentity probe: "is this item
+	// pending under any lifecycle". Mutations never take that path.
+	if !identity.IdentityAt.IsZero() {
 		query += ` AND identity_at = ?`
-		args = append(args, identityAt)
+		args = append(args, identity.IdentityAt)
 	}
 	query += ` LIMIT 1`
 	err := s.db.Session().Query(query, args...).Scan(&existingItemID)
@@ -467,50 +466,37 @@ func pendingItemLibraryID(itemType ItemType, libraryID uuid.UUID) uuid.UUID {
 	return libraryID
 }
 
-func queueCandidateIdentity(candidates []BlockGCCandidateIdentity) BlockGCCandidateIdentity {
-	if len(candidates) > 0 {
-		return candidates[0]
+// storedGCItemIdentity rebuilds a durable identity from the columns of a row that
+// was read back. It coerces the P columns to zero for non-block types so a stray
+// value in the table can never re-enter the code as block authority.
+func storedGCItemIdentity(itemType ItemType, storageClass, storageKey string, identityAt time.Time) GCItemIdentity {
+	identity := GCItemIdentity{IdentityAt: identityAt.UTC()}
+	if itemType == ItemBlock {
+		identity.BlockCandidate = BlockGCCandidateIdentity{
+			Target:      BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey},
+			CandidateAt: identityAt.UTC(),
+		}
 	}
-	return BlockGCCandidateIdentity{}
+	return identity
 }
 
-func queueIdentityAt(queuedAt, identityAt time.Time, candidate BlockGCCandidateIdentity) time.Time {
-	if !identityAt.IsZero() {
-		return identityAt
-	}
-	if !candidate.CandidateAt.IsZero() {
-		return candidate.CandidateAt
-	}
-	return queuedAt
-}
-
-func storedBlockGCCandidateIdentity(itemType ItemType, storageClass, storageKey string, identityAt time.Time) BlockGCCandidateIdentity {
-	if itemType != ItemBlock {
-		return BlockGCCandidateIdentity{}
-	}
-	return BlockGCCandidateIdentity{
-		Target:      BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey},
-		CandidateAt: identityAt.UTC(),
-	}
-}
-
-func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity) {
+func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) {
 	libraryID = pendingItemLibraryID(itemType, libraryID)
 	batch.Query(`
 		INSERT INTO gc_pending_items (org_id, bucket, item_type, library_id, item_id, candidate_storage_class, candidate_storage_key, identity_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
+	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 }
 
-func addPendingItemDeleteBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity) {
+func addPendingItemDeleteBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) {
 	libraryID = pendingItemLibraryID(itemType, libraryID)
 	batch.Query(`
 		DELETE FROM gc_pending_items
 		WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
+	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 }
 
-func (s *CassandraStore) queueItemPendingInfo(orgID uuid.UUID, queuedAt, requestedIdentityAt time.Time, itemType ItemType, itemID string, candidate BlockGCCandidateIdentity) (time.Time, uuid.UUID, string, BlockGCCandidateIdentity, error) {
+func (s *CassandraStore) queueItemPendingInfo(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (time.Time, uuid.UUID, string, GCItemIdentity, error) {
 	var identityAt time.Time
 	var libraryIDStr string
 	var blockRepresentationID string
@@ -518,11 +504,11 @@ func (s *CassandraStore) queueItemPendingInfo(orgID uuid.UUID, queuedAt, request
 	err := s.db.Session().Query(`
 		SELECT identity_at, library_id, block_representation_id, candidate_storage_class, candidate_storage_key FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, queueIdentityAt(queuedAt, requestedIdentityAt, candidate)).Scan(&identityAt, &libraryIDStr, &blockRepresentationID, &candidateStorageClass, &candidateStorageKey)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.resolved(queuedAt).IdentityAt).Scan(&identityAt, &libraryIDStr, &blockRepresentationID, &candidateStorageClass, &candidateStorageKey)
 	if err != nil {
-		return time.Time{}, uuid.Nil, "", BlockGCCandidateIdentity{}, err
+		return time.Time{}, uuid.Nil, "", GCItemIdentity{}, err
 	}
-	return identityAt, parseUUID(libraryIDStr), strings.TrimSpace(blockRepresentationID), storedBlockGCCandidateIdentity(itemType, candidateStorageClass, candidateStorageKey, identityAt), nil
+	return identityAt, parseUUID(libraryIDStr), strings.TrimSpace(blockRepresentationID), storedGCItemIdentity(itemType, candidateStorageClass, candidateStorageKey, identityAt), nil
 }
 
 type failedItemRow struct {
@@ -534,34 +520,38 @@ type failedItemRow struct {
 	LibraryID                   uuid.UUID
 	BlockRepresentationID       string
 	StorageClass                string
-	BlockGCCandidateIdentity    BlockGCCandidateIdentity
+	Identity                    GCItemIdentity
 }
 
-func (s *CassandraStore) failedItemInfo(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate BlockGCCandidateIdentity) (failedItemRow, error) {
-	return s.failedItemInfoContext(context.Background(), orgID, failedAt, itemType, itemID, candidate)
+func (s *CassandraStore) failedItemInfo(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (failedItemRow, error) {
+	return s.failedItemInfoContext(context.Background(), orgID, failedAt, itemType, itemID, identity)
 }
 
-func (s *CassandraStore) failedItemInfoContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate BlockGCCandidateIdentity) (failedItemRow, error) {
+// failedItemInfoContext addresses ONE DLQ row by its full primary key.
+//
+// identity_at is a clustering column of gc_failed_items for every item type, not
+// only for blocks. Selecting on a prefix and taking LIMIT 1 would let an admin
+// delete or requeue pick a different lifecycle's row than the one the operator
+// is looking at — so the predicate is unconditional here, and the caller is
+// required to produce the identity it observed.
+func (s *CassandraStore) failedItemInfoContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (failedItemRow, error) {
+	identity = identity.resolved(failedAt)
 	var row failedItemRow
 	var libraryIDStr string
 	var blockRepresentationID string
 	var candidateStorageClass, candidateStorageKey string
-	query := `
+	err := s.db.Session().Query(`
 		SELECT queued_at, identity_at, expires_at, requires_library_deleted_check, library_guard_mode, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key FROM gc_failed_items
-		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ?`
-	args := []interface{}{orgID.String(), failedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey}
-	if itemType == ItemBlock {
-		query += ` AND identity_at = ?`
-		args = append(args, candidate.CandidateAt)
-	}
-	query += ` LIMIT 1`
-	err := s.db.Session().Query(query, args...).WithContext(ctx).Scan(&row.QueuedAt, &row.IdentityAt, &row.ExpiresAt, &row.RequiresLibraryDeletedCheck, &row.LibraryGuardMode, &libraryIDStr, &blockRepresentationID, &row.StorageClass, &candidateStorageClass, &candidateStorageKey)
+		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+	`, orgID.String(), failedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt).
+		WithContext(ctx).
+		Scan(&row.QueuedAt, &row.IdentityAt, &row.ExpiresAt, &row.RequiresLibraryDeletedCheck, &row.LibraryGuardMode, &libraryIDStr, &blockRepresentationID, &row.StorageClass, &candidateStorageClass, &candidateStorageKey)
 	if err != nil {
 		return failedItemRow{}, err
 	}
 	row.LibraryID = parseUUID(libraryIDStr)
 	row.BlockRepresentationID = strings.TrimSpace(blockRepresentationID)
-	row.BlockGCCandidateIdentity = storedBlockGCCandidateIdentity(itemType, candidateStorageClass, candidateStorageKey, row.IdentityAt)
+	row.Identity = storedGCItemIdentity(itemType, candidateStorageClass, candidateStorageKey, row.IdentityAt)
 	return row, nil
 }
 
@@ -598,7 +588,7 @@ func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff tim
 				LibraryID:                   parseUUID(libIDStr),
 				BlockRepresentationID:       strings.TrimSpace(blockRepresentationID),
 				StorageClass:                storageClass,
-				BlockGCCandidateIdentity:    storedBlockGCCandidateIdentity(ItemType(itemTypeStr), candidateStorageClass, candidateStorageKey, identityAt),
+				BlockGCCandidateIdentity:    storedGCItemIdentity(ItemType(itemTypeStr), candidateStorageClass, candidateStorageKey, identityAt).BlockCandidate,
 				RetryCount:                  retryCount,
 			})
 		}
@@ -622,44 +612,42 @@ func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff tim
 	return items, nil
 }
 
-func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	candidate := queueCandidateIdentity(candidates)
-	storedIdentityAt, libraryID, _, storedCandidate, err := s.queueItemPendingInfo(orgID, queuedAt, identityAt, itemType, itemID, candidate)
+func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	identity = identity.resolved(queuedAt)
+	storedIdentityAt, libraryID, _, storedIdentity, err := s.queueItemPendingInfo(orgID, queuedAt, itemType, itemID, identity)
 	hadQueueRow := err == nil
 	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return fmt.Errorf("load queue identity for complete %s/%s: %w", orgID, itemID, err)
 	}
-	queueIdentity := queueIdentityAt(queuedAt, identityAt, candidate)
-	pendingIdentity := queueIdentity
-	pendingCandidate := candidate
+	// The pending row is keyed on what was WRITTEN, which the queue row records.
+	// When the queue row is already gone the caller's identity is the best (and
+	// only) description of the lifecycle being completed.
+	pendingIdentity := identity
 	if hadQueueRow {
-		pendingIdentity = storedIdentityAt
-		pendingCandidate = storedCandidate
+		pendingIdentity = storedIdentity
+		pendingIdentity.IdentityAt = storedIdentityAt
 	}
 	now := time.Now().UTC()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, queueIdentity)
-	addPendingItemDeleteBatchQuery(batch, orgID, libraryID, itemType, itemID, pendingIdentity, pendingCandidate)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
+	addPendingItemDeleteBatchQuery(batch, orgID, libraryID, itemType, itemID, pendingIdentity)
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	if !hadQueueRow {
-		return nil
-	}
-	return nil
+	return batch.Exec()
 }
 
 // RequeueItem moves a failed item to the back of the queue to prevent head-of-line blocking.
 // It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
-func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode, candidates ...BlockGCCandidateIdentity) error {
-	candidate := queueCandidateIdentity(candidates)
+func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
+	// A requeue keeps the lifecycle it was already serving: same identity_at, same
+	// P. Only queued_at moves, so the item goes to the back of the queue without
+	// becoming a different work item.
+	identity = identity.resolved(oldQueuedAt)
 	now := time.Now().UTC()
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
@@ -668,14 +656,14 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, queueIdentityAt(oldQueuedAt, identityAt, candidate))
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 
 	// Insert new item at the end of the queue
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, effectiveIdentityAt(oldQueuedAt, identityAt), guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, candidate.Target.StorageClass, candidate.Target.StorageKey, newRetryCount)
-	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(oldQueuedAt, identityAt), candidate)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, identity.IdentityAt, guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, identity.Target().StorageClass, identity.Target().StorageKey, newRetryCount)
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, identity)
 	batch.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 		VALUES (?, ?, ?)
@@ -689,7 +677,7 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 }
 
 func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error {
-	identityAt, libraryID, blockRepresentationID, storedCandidate, err := s.queueItemPendingInfo(item.OrgID, item.QueuedAt, item.IdentityAt, item.ItemType, item.ItemID, item.BlockGCCandidateIdentity)
+	identityAt, libraryID, blockRepresentationID, storedIdentity, err := s.queueItemPendingInfo(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID, item.Identity())
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			log.Printf("[GC] Skipping DLQ move for missing queue row org=%s item_type=%s item_id=%s queued_at=%s", item.OrgID, item.ItemType, item.ItemID, item.QueuedAt.Format(time.RFC3339Nano))
@@ -698,7 +686,8 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 		return fmt.Errorf("load queue identity for fail %s/%s: %w", item.OrgID, item.ItemID, err)
 	}
 	expiresAt := failedAt.UTC().Add(gcFailedItemRetention)
-	effectiveIdentity := effectiveIdentityAt(item.QueuedAt, identityAt)
+	storedIdentity.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
+	effectiveIdentity := storedIdentity.IdentityAt
 	guardMode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck)
 	queueBucket := gcQueueBucket(item.OrgID, item.ItemType, item.ItemID)
 	now := time.Now().UTC()
@@ -708,13 +697,13 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 		INSERT INTO gc_failed_items (
 			org_id, failed_at, expires_at, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count, last_error, failure_code, resolution_status
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, item.OrgID.String(), failedAt, expiresAt, item.QueuedAt, effectiveIdentity, guardMode != LibraryGuardNone, string(guardMode), string(item.ItemType), item.ItemID, libraryID.String(), blockRepresentationID, item.StorageClass, storedCandidate.Target.StorageClass, storedCandidate.Target.StorageKey, item.RetryCount, lastError, failureCode, "open")
-	addUpsertFailedItemExpiryV2Query(batch, item.OrgID.String(), failedAt, string(item.ItemType), item.ItemID, expiresAt, effectiveIdentity, storedCandidate)
-	addPendingItemBatchQuery(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, effectiveIdentity, storedCandidate)
+	`, item.OrgID.String(), failedAt, expiresAt, item.QueuedAt, effectiveIdentity, guardMode != LibraryGuardNone, string(guardMode), string(item.ItemType), item.ItemID, libraryID.String(), blockRepresentationID, item.StorageClass, storedIdentity.Target().StorageClass, storedIdentity.Target().StorageKey, item.RetryCount, lastError, failureCode, "open")
+	addUpsertFailedItemExpiryQuery(batch, item.OrgID.String(), failedAt, string(item.ItemType), item.ItemID, expiresAt, storedIdentity)
+	addPendingItemBatchQuery(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, storedIdentity)
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, item.OrgID.String(), queueBucket, item.QueuedAt, string(item.ItemType), item.ItemID, storedCandidate.Target.StorageClass, storedCandidate.Target.StorageKey, effectiveIdentity)
+	`, item.OrgID.String(), queueBucket, item.QueuedAt, string(item.ItemType), item.ItemID, storedIdentity.Target().StorageClass, storedIdentity.Target().StorageKey, effectiveIdentity)
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
@@ -722,22 +711,19 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 	return batch.Exec()
 }
 
-func failedItemExpiryBucket(orgID string, failedAt time.Time, itemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity) int {
-	return db.GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt.UTC().Format(time.RFC3339Nano))
+// The DLQ expiry projection has exactly ONE writer surface, in internal/db,
+// which owns both halves of the key: the column tuple AND the bucket hash. These
+// two thin adapters exist only to turn a GCItemIdentity into the primitives that
+// package takes — deliberately not a second copy of the CQL. A duplicate would
+// be free to drift in the bucket formula or the UTC normalisation, and an upsert
+// and a delete that hash differently leak expiry rows until the TTL. This is the
+// same single-writer rule R22a enforces for the orphan projection.
+func addUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, identity GCItemIdentity) {
+	db.AddUpsertFailedItemExpiryQuery(batch, orgID, failedAt, itemType, itemID, expiresAt, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 }
 
-func addUpsertFailedItemExpiryV2Query(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt, identityAt time.Time, candidate BlockGCCandidateIdentity) {
-	batch.Query(`
-		INSERT INTO gc_failed_items_by_expiry (expiry_day, bucket, expires_at, org_id, failed_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(expiresAt), failedItemExpiryBucket(orgID, failedAt, itemType, itemID, identityAt, candidate), expiresAt, orgID, failedAt, itemType, itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
-}
-
-func addDeleteFailedItemExpiryV2Query(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt, identityAt time.Time, candidate BlockGCCandidateIdentity) {
-	batch.Query(`
-		DELETE FROM gc_failed_items_by_expiry
-		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, db.GCProjectionUTCDate(expiresAt), failedItemExpiryBucket(orgID, failedAt, itemType, itemID, identityAt, candidate), expiresAt, orgID, failedAt, itemType, itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
+func addDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time, identity GCItemIdentity) {
+	db.AddDeleteFailedItemExpiryQuery(batch, orgID, failedAt, itemType, itemID, expiresAt, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {
@@ -819,7 +805,7 @@ func (s *CassandraStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailed
 			LibraryID:                   parseUUID(libraryIDStr),
 			BlockRepresentationID:       strings.TrimSpace(blockRepresentationID),
 			StorageClass:                storageClass,
-			BlockGCCandidateIdentity:    storedBlockGCCandidateIdentity(ItemType(itemType), candidateStorageClass, candidateStorageKey, identityAt),
+			BlockGCCandidateIdentity:    storedGCItemIdentity(ItemType(itemType), candidateStorageClass, candidateStorageKey, identityAt).BlockCandidate,
 			RetryCount:                  retryCount,
 			LastError:                   lastError,
 			FailureCode:                 failureCode,
@@ -858,7 +844,7 @@ func (s *CassandraStore) ListFailedItemExpiriesByDay(day time.Time, bucket int) 
 			IdentityAt:               identityAt,
 			ItemType:                 ItemType(itemType),
 			ItemID:                   itemID,
-			BlockGCCandidateIdentity: storedBlockGCCandidateIdentity(ItemType(itemType), candidateStorageClass, candidateStorageKey, identityAt),
+			BlockGCCandidateIdentity: storedGCItemIdentity(ItemType(itemType), candidateStorageClass, candidateStorageKey, identityAt).BlockCandidate,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -945,8 +931,8 @@ func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgIn
 	return orgs, nil
 }
 
-func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, candidates...)
+func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, identity)
 }
 
 // DeleteFailedItemContext is cancellable up to its commit point, and no further.
@@ -964,9 +950,8 @@ func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, i
 // committing mutation can never overlap a new leader's destructive work.
 //
 // RequeueFailedItemContext follows the same contract.
-func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	candidate := queueCandidateIdentity(candidates)
-	row, err := s.failedItemInfoContext(ctx, orgID, failedAt, itemType, itemID, candidate)
+func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	row, err := s.failedItemInfoContext(ctx, orgID, failedAt, itemType, itemID, identity)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return nil
 	}
@@ -991,9 +976,9 @@ func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid
 	batch.Query(`
 		DELETE FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), failedAt, string(itemType), itemID, row.BlockGCCandidateIdentity.Target.StorageClass, row.BlockGCCandidateIdentity.Target.StorageKey, row.IdentityAt)
-	addDeleteFailedItemExpiryV2Query(batch, orgID.String(), failedAt, string(itemType), itemID, row.ExpiresAt, row.IdentityAt, row.BlockGCCandidateIdentity)
-	addPendingItemDeleteBatchQuery(batch, orgID, row.LibraryID, itemType, itemID, effectiveIdentityAt(row.QueuedAt, row.IdentityAt), row.BlockGCCandidateIdentity)
+	`, orgID.String(), failedAt, string(itemType), itemID, row.Identity.Target().StorageClass, row.Identity.Target().StorageKey, row.IdentityAt)
+	addDeleteFailedItemExpiryQuery(batch, orgID.String(), failedAt, string(itemType), itemID, row.ExpiresAt, row.Identity)
+	addPendingItemDeleteBatchQuery(batch, orgID, row.LibraryID, itemType, itemID, row.Identity)
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
@@ -1002,12 +987,13 @@ func (s *CassandraStore) DeleteFailedItemContext(ctx context.Context, orgID uuid
 }
 
 func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error) {
-	row, err := s.failedItemInfo(expiry.OrgID, expiry.FailedAt, expiry.ItemType, expiry.ItemID, expiry.BlockGCCandidateIdentity)
+	expiryIdentity := expiry.Identity()
+	row, err := s.failedItemInfo(expiry.OrgID, expiry.FailedAt, expiry.ItemType, expiry.ItemID, expiry.Identity())
 	if errors.Is(err, gocql.ErrNotFound) {
 		if err := s.db.Session().Query(`
 			DELETE FROM gc_failed_items_by_expiry
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-		`, db.GCProjectionUTCDate(expiry.ExpiresAt), failedItemExpiryBucket(expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, effectiveFailedItemExpiryIdentity(expiry), expiry.BlockGCCandidateIdentity), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID, expiry.BlockGCCandidateIdentity.Target.StorageClass, expiry.BlockGCCandidateIdentity.Target.StorageKey, effectiveFailedItemExpiryIdentity(expiry)).Exec(); err != nil {
+		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCFailedItemExpiryBucket(expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, expiryIdentity.Target().StorageClass, expiryIdentity.Target().StorageKey, expiryIdentity.IdentityAt), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID, expiryIdentity.Target().StorageClass, expiryIdentity.Target().StorageKey, expiryIdentity.IdentityAt).Exec(); err != nil {
 			return false, fmt.Errorf("delete orphaned failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
 		}
 		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
@@ -1025,7 +1011,7 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 		if err := s.db.Session().Query(`
 			DELETE FROM gc_failed_items_by_expiry
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-		`, db.GCProjectionUTCDate(expiry.ExpiresAt), failedItemExpiryBucket(expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, effectiveFailedItemExpiryIdentity(expiry), expiry.BlockGCCandidateIdentity), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID, expiry.BlockGCCandidateIdentity.Target.StorageClass, expiry.BlockGCCandidateIdentity.Target.StorageKey, effectiveFailedItemExpiryIdentity(expiry)).Exec(); err != nil {
+		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCFailedItemExpiryBucket(expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, expiryIdentity.Target().StorageClass, expiryIdentity.Target().StorageKey, expiryIdentity.IdentityAt), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID, expiryIdentity.Target().StorageClass, expiryIdentity.Target().StorageKey, expiryIdentity.IdentityAt).Exec(); err != nil {
 			return false, fmt.Errorf("delete stale failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
 		}
 		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
@@ -1042,9 +1028,9 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 	batch.Query(`
 		DELETE FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, row.BlockGCCandidateIdentity.Target.StorageClass, row.BlockGCCandidateIdentity.Target.StorageKey, row.IdentityAt)
-	addDeleteFailedItemExpiryV2Query(batch, expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, row.ExpiresAt, row.IdentityAt, row.BlockGCCandidateIdentity)
-	addPendingItemDeleteBatchQuery(batch, expiry.OrgID, row.LibraryID, expiry.ItemType, expiry.ItemID, effectiveIdentityAt(row.QueuedAt, row.IdentityAt), row.BlockGCCandidateIdentity)
+	`, expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, row.Identity.Target().StorageClass, row.Identity.Target().StorageKey, row.IdentityAt)
+	addDeleteFailedItemExpiryQuery(batch, expiry.OrgID.String(), expiry.FailedAt, string(expiry.ItemType), expiry.ItemID, row.ExpiresAt, row.Identity)
+	addPendingItemDeleteBatchQuery(batch, expiry.OrgID, row.LibraryID, expiry.ItemType, expiry.ItemID, row.Identity)
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
@@ -1074,12 +1060,12 @@ func parseStoredQueueLibraryID(raw string) (uuid.UUID, string, error) {
 	return parsed, parsed.String(), nil
 }
 
-func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidates ...BlockGCCandidateIdentity) error {
-	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt, candidates...)
+func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error {
+	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt, identity)
 }
 
-func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidates ...BlockGCCandidateIdentity) error {
-	candidate := queueCandidateIdentity(candidates)
+func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error {
+	identity = identity.resolved(failedAt)
 	var (
 		failedQueuedAt              time.Time
 		identityAt                  time.Time
@@ -1090,16 +1076,14 @@ func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uui
 		blockRepresentationID       string
 		storageClass                string
 	)
-	query := `
+	// Same rule as failedItemInfoContext: identity_at is part of the key for every
+	// item type, so an admin requeue names the exact lifecycle it observed.
+	err := s.db.Session().Query(`
 		SELECT queued_at, identity_at, expires_at, requires_library_deleted_check, library_guard_mode, library_id, block_representation_id, storage_class
-		FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ?`
-	args := []interface{}{orgID.String(), failedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey}
-	if itemType == ItemBlock {
-		query += ` AND identity_at = ?`
-		args = append(args, candidate.CandidateAt)
-	}
-	query += ` LIMIT 1`
-	err := s.db.Session().Query(query, args...).WithContext(ctx).Scan(&failedQueuedAt, &identityAt, &expiresAt, &requiresLibraryDeletedCheck, &libraryGuardMode, &libraryIDStr, &blockRepresentationID, &storageClass)
+		FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+	`, orgID.String(), failedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt).
+		WithContext(ctx).
+		Scan(&failedQueuedAt, &identityAt, &expiresAt, &requiresLibraryDeletedCheck, &libraryGuardMode, &libraryIDStr, &blockRepresentationID, &storageClass)
 	if err != nil {
 		// Same reason as DeleteFailedItemContext: a cancelled read reports the
 		// context error, not a wrapped driver error.
@@ -1145,18 +1129,18 @@ func (s *CassandraStore) RequeueFailedItemContext(ctx context.Context, orgID uui
 	}
 	requeueAt := failedQueuedAt
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
-	candidate = storedBlockGCCandidateIdentity(itemType, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
+	identity = storedGCItemIdentity(itemType, identity.Target().StorageClass, identity.Target().StorageKey, identityAt)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, queueLibraryID, strings.TrimSpace(blockRepresentationID), storageClass, candidate.Target.StorageClass, candidate.Target.StorageKey, 0)
-	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt), candidate)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, identity.IdentityAt, guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, queueLibraryID, strings.TrimSpace(blockRepresentationID), storageClass, identity.Target().StorageClass, identity.Target().StorageKey, 0)
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, identity)
 	batch.Query(`
 		DELETE FROM gc_failed_items
 		WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), failedAt, string(itemType), itemID, candidate.Target.StorageClass, candidate.Target.StorageKey, identityAt)
-	addDeleteFailedItemExpiryV2Query(batch, orgID.String(), failedAt, string(itemType), itemID, expiresAt, identityAt, candidate)
+	`, orgID.String(), failedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identityAt)
+	addDeleteFailedItemExpiryQuery(batch, orgID.String(), failedAt, string(itemType), itemID, expiresAt, identity)
 	batch.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 		VALUES (?, ?, ?)
@@ -1627,12 +1611,6 @@ func (s *CassandraStore) EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, s
 	return BlockGCCandidateInfo{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s %s did not settle after %d conditional attempts", orgID, blockID, target, ensureBlockGCCandidateMaxAttempts)
 }
 
-// EnsureBlockGCCandidate preserves the timestamp-only API until queue rows carry P.
-func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	candidate, err := s.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, candidateAt)
-	return candidate.CandidateAt, err
-}
-
 // ensureBlockGCCandidateMaxAttempts bounds the candidate CAS retry loop. Contention on
 // one candidate is rare and self-limiting — the losers of a round observe the winner's
 // value on the next — so this only has to exceed plausible concurrency, not plausible
@@ -1678,28 +1656,6 @@ func (s *CassandraStore) GetBlockGCCandidateExact(orgID uuid.UUID, blockID strin
 	return BlockGCCandidateInfo{OrgID: orgID, BlockID: blockID, Target: candidate.Target, CandidateAt: candidateAt.UTC()}, true, nil
 }
 
-// GetBlockGCCandidate is a compatibility read for consumers that have not yet carried
-// P in their queue identity. It deliberately refuses multiple candidates for one L.
-func (s *CassandraStore) GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error) {
-	iter := s.db.Session().Query(`
-		SELECT storage_class, storage_key, candidate_at FROM gc_block_candidates
-		WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Iter()
-	var candidates []BlockGCCandidateInfo
-	var storageClass, storageKey string
-	var candidateAt time.Time
-	for iter.Scan(&storageClass, &storageKey, &candidateAt) {
-		candidates = append(candidates, BlockGCCandidateInfo{OrgID: orgID, BlockID: blockID, Target: BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey}, CandidateAt: candidateAt.UTC()})
-	}
-	if err := iter.Close(); err != nil {
-		return BlockGCCandidateInfo{}, false, err
-	}
-	if len(candidates) != 1 {
-		return BlockGCCandidateInfo{}, false, nil
-	}
-	return candidates[0], true, nil
-}
-
 // DeleteBlockGCCandidate removes both the canonical row and the matching discovery row,
 // but only while the candidate is still exactly the one the caller observed.
 //
@@ -1711,9 +1667,28 @@ func (s *CassandraStore) GetBlockGCCandidate(orgID uuid.UUID, blockID string) (B
 // with no fence left behind to notice. Naming (storage_class, storage_key, candidate_at)
 // makes that a no-op instead.
 //
-// A no-op is a normal outcome, not an error: it means another lifecycle already settled
-// this candidate or replaced it. The discovery row is then left alone too, because it
-// belongs to whatever candidate now owns the identity.
+// A canonical no-op is a normal outcome, not an error: it means another lifecycle
+// already settled this candidate or advanced it.
+//
+// THE DISCOVERY ROW IS CLEARED EITHER WAY, AND THAT IS WHAT MAKES THIS SELF-HEALING.
+// It used to be reached only when the canonical CAS applied, and only best-effort:
+// a failed projection delete was logged and swallowed. That left a shape with no
+// exit — canonical gone, projection present — and the projection is what discovery
+// enumerates, so the scanner rebuilt a queue item for a candidate that no longer
+// existed, the worker correctly no-op'd it as stale, and the next scan produced it
+// again. Liveness, not data loss, but permanent: nothing in the system was able to
+// remove that row.
+//
+// Deleting it unconditionally is safe ONLY because the projection is now keyed by
+// the full identity (candidate_at, org, block, storage_class, storage_key). That is
+// the whole point of putting P in the discovery key: this statement can name P1's
+// row and nothing else, so a delayed P1 lifecycle cannot erase P2's discoverability
+// — the exact failure R26 names. Under the old L-keyed projection the same delete
+// would have been the bug.
+//
+// The error is returned rather than logged: an uncleared projection is a work item
+// that will come back, so the caller should retry rather than believe the candidate
+// was settled.
 func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error {
 	if candidate.CandidateAt.IsZero() || candidate.Target.IsZero() {
 		return fmt.Errorf("block %s: refusing to delete a gc candidate without its exact identity", blockID)
@@ -1729,17 +1704,38 @@ func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string,
 		return err
 	}
 	if !applied {
-		log.Printf("[GC] block candidate for org=%s block=%s %s at %s was not deleted: it is no longer the candidate that was observed", orgID, blockID, candidate.Target, candidateAt.Format(time.RFC3339Nano))
-		return nil
+		log.Printf("[GC] block candidate for org=%s block=%s %s at %s was not deleted: it is no longer the candidate that was observed; clearing its discovery row so it cannot be rediscovered forever", orgID, blockID, candidate.Target, candidateAt.Format(time.RFC3339Nano))
 	}
 
-	if err := s.db.Session().Query(`
-		DELETE FROM gc_block_candidates_by_day
-		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
-	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt, orgID.String(), blockID, candidate.Target.StorageClass, candidate.Target.StorageKey).Exec(); err != nil {
-		log.Printf("[GC] WARNING: failed to delete gc_block_candidates_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
+	if err := s.deleteBlockGCCandidateProjection(orgID, blockID, candidate.Target, candidateAt); err != nil {
+		return fmt.Errorf("delete gc_block_candidates_by_day discovery row for org=%s block=%s %s: %w", orgID, blockID, candidate.Target, err)
 	}
 	return nil
+}
+
+// deleteBlockGCCandidateProjection removes exactly one discovery row: (day, bucket,
+// candidate_at, org, block, P). No other candidate's row shares that key.
+func (s *CassandraStore) deleteBlockGCCandidateProjection(orgID uuid.UUID, blockID string, target BlockDeleteTarget, candidateAt time.Time) error {
+	return s.db.Session().Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, target.StorageClass, target.StorageKey).Exec()
+}
+
+// DeleteBlockGCCandidateDiscovery removes a discovery row whose canonical candidate
+// is gone, and touches nothing else.
+//
+// This is the other half of the self-heal: a work item that reaches the worker and
+// finds no canonical candidate for its exact identity was produced by a projection
+// row that outlived its candidate. Completing the queue item alone would leave that
+// row to regenerate the same item on the next scan, forever. Removing it is safe for
+// the same reason as above — the row is named by the full identity, so it is this
+// lifecycle's row or it does not exist.
+func (s *CassandraStore) DeleteBlockGCCandidateDiscovery(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error {
+	if candidate.CandidateAt.IsZero() || candidate.Target.IsZero() {
+		return fmt.Errorf("block %s: refusing to delete a gc candidate discovery row without its exact identity", blockID)
+	}
+	return s.deleteBlockGCCandidateProjection(orgID, blockID, candidate.Target, candidate.CandidateAt)
 }
 
 // ListBlockGCCandidatesByDay enumerates candidates for one (UTC day, discovery

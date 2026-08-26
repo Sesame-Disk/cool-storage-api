@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 #
-# P4a mutation evidence: prove the exact-incarnation, per-attempt claim guards actually
-# fail when the invariant they protect is removed.
+# P4a + R26 mutation evidence: prove the exact-incarnation guards actually fail when
+# the invariant they protect is removed.
+#
+# P4a covers destructive AUTHORITY: which incarnation a claim, release or finalize may
+# act on. R26 covers durable IDENTITY: that the same incarnation is part of the primary
+# key of the candidate, its discovery row, the queue row and the pending row, so two
+# lives of one logical block can never collapse into one row.
 #
 #   ./scripts/p4a-mutation-validation.sh          # run every mutation
 #   ./scripts/p4a-mutation-validation.sh <name>   # run one (see --list)
@@ -116,9 +121,67 @@ m_finalize_drops_claimed_at() {
 }
 
 m_candidate_delete_unconditional() {
-  mutate "$STORE" 's{DELETE FROM gc_block_candidates WHERE org_id = \? AND block_id = \?(\s+)IF candidate_at = \? AND storage_class = \? AND storage_key = \?}{DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?}'
+  mutate "$STORE" 's{DELETE FROM gc_block_candidates WHERE org_id = \? AND block_id = \? AND storage_class = \? AND storage_key = \?(\s+)IF candidate_at = \?}{DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ? AND storage_class = ? AND storage_key = ?}'
   expect_red 'TestP4ADestructiveMutationsNameTheExactIncarnation' 'has no IF clause' \
     'unconditional candidate delete (a late P1 lifecycle erases P2 work item)'
+  restore
+}
+
+# --- R26: exact-P identity across the durable surfaces ------------------------
+#
+# P4a bound destructive AUTHORITY to an exact incarnation. R26 makes the exact
+# incarnation part of the durable IDENTITY of the candidate, its discovery row,
+# the queue row and the pending row. That invariant lives in six primary keys and
+# in the Go code that names them; none of it is protected by the type system, and
+# dropping any one column keeps compiling. Each mutation below removes exactly one
+# of those columns and requires the R26 gates to go red.
+
+m_candidate_delete_drops_p_from_key() {
+  mutate "$STORE" 's{DELETE FROM gc_block_candidates WHERE org_id = \? AND block_id = \? AND storage_class = \? AND storage_key = \?(\s+)IF candidate_at = \?}{DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?$1IF candidate_at = ?}'
+  expect_red 'TestP4ADestructiveMutationsNameTheExactIncarnation' 'must name' \
+    'candidate delete keyed on the logical block (a P1 lifecycle consumes P2 candidate)'
+  restore
+}
+
+m_candidate_projection_delete_drops_p() {
+  mutate "$STORE" 's{DELETE FROM gc_block_candidates_by_day(\s+)WHERE candidate_day = \? AND bucket = \? AND candidate_at = \? AND org_id = \? AND block_id = \? AND storage_class = \? AND storage_key = \?}{DELETE FROM gc_block_candidates_by_day$1WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?}'
+  expect_red 'TestR26MutationsNameTheExactIdentity' 'does not name' \
+    'discovery delete keyed without P (a stale P1 cleanup erases P2 discoverability, R26)'
+  restore
+}
+
+m_stale_discovery_is_not_retired() {
+  mutate "$WORKER" 's{w\.store\.DeleteBlockGCCandidateDiscovery\(item\.OrgID, item\.ItemID, item\.BlockGCCandidateIdentity\)}{error\(nil\)}'
+  expect_red 'TestR26_StaleDiscoveryNoOpRetiresItsOwnRowInsteadOfLoopingForever' 'discovery rows after the no-op' \
+    'stale discovery row left standing (the work item is rebuilt on every scan, forever)'
+  restore
+}
+
+m_settlement_skips_projection_when_cas_missed() {
+  mutate "$STORE" 's{(if !applied \{\s+log\.Printf\("\[GC\] block candidate for org=%s block=%s %s at %s was not deleted[^\n]*\n\t\})}{$1\n\tif !applied \{\n\t\treturn nil\n\t\}}'
+  expect_red 'TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow' 'returns early' \
+    'settlement leaves the projection when the canonical CAS misses (no exit from rediscovery)'
+  restore
+}
+
+m_dlq_selector_drops_identity_at() {
+  mutate "$STORE" 's{WHERE org_id = \? AND failed_at = \? AND item_type = \? AND item_id = \? AND candidate_storage_class = \? AND candidate_storage_key = \? AND identity_at = \?(\s+)`, orgID\.String\(\), failedAt, string\(itemType\), itemID, identity\.Target\(\)\.StorageClass, identity\.Target\(\)\.StorageKey, identity\.IdentityAt\)\.(\s+)WithContext}{WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? LIMIT 1$1`, orgID.String(), failedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey).$2WithContext}'
+  expect_red 'TestR26SingleRowReadsNameTheExactIdentity' 'without selecting on' \
+    'DLQ selector ignores identity_at (an admin delete hits a different lifecycle than the one on screen)'
+  restore
+}
+
+m_queue_complete_drops_p() {
+  mutate "$STORE" 's{DELETE FROM gc_queue(\s+)WHERE org_id = \? AND bucket = \? AND queued_at = \? AND item_type = \? AND item_id = \? AND candidate_storage_class = \? AND candidate_storage_key = \? AND identity_at = \?(\s+)`, orgID\.String\(\), gcQueueBucket\(orgID, itemType, itemID\), queuedAt, string\(itemType\), itemID, identity\.Target\(\)\.StorageClass, identity\.Target\(\)\.StorageKey, identity\.IdentityAt\)}{DELETE FROM gc_queue$1WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND identity_at = ?$2`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, identity.IdentityAt)}'
+  expect_red 'TestR26MutationsNameTheExactIdentity' 'does not name' \
+    'queue completion keyed without P (completing P1 removes P2 work item)'
+  restore
+}
+
+m_enqueue_item_mints_block_candidate() {
+  mutate "$STORE" 's{\tif itemType == ItemBlock \{\n\t\treturn fmt\.Errorf\("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType\)\n\t\}\n}{}'
+  expect_red 'TestEnqueueItemRefusesBlockItems' 'reached the database' \
+    'raw enqueue accepts ItemBlock again (enqueue fabricates destructive authority with no zero-ref decision)'
   restore
 }
 
@@ -144,7 +207,7 @@ m_claim_id_from_candidate_at() {
 }
 
 m_fresh_owner_completes_candidate() {
-  mutate "$WORKER" 's{\tcase BlockClaimFreshOwner:}{\tcase BlockClaimFreshOwner:\n\t\tif err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {\n\t\t\treturn err\n\t\t}\n\t\treturn nil\n\tcase BlockClaimOutcome(-1):}'
+  mutate "$WORKER" 's{\tcase BlockClaimFreshOwner:}{\tcase BlockClaimFreshOwner:\n\t\tif err := w.settleBlockCandidate(item, candidate); err != nil {\n\t\t\treturn err\n\t\t}\n\t\treturn nil\n\tcase BlockClaimOutcome(-1):}'
   expect_red 'TestP4A_FreshOwnerDoesNotSettleTheCandidate' 'a live owner is not completion' \
     'fresh owner treated as completion (consumes the only item able to lift the fence, R16)'
   restore
@@ -262,6 +325,13 @@ MUTATIONS=(
   m_release_drops_claimed_at
   m_finalize_drops_claimed_at
   m_candidate_delete_unconditional
+  m_candidate_delete_drops_p_from_key
+  m_candidate_projection_delete_drops_p
+  m_stale_discovery_is_not_retired
+  m_settlement_skips_projection_when_cas_missed
+  m_dlq_selector_drops_identity_at
+  m_queue_complete_drops_p
+  m_enqueue_item_mints_block_candidate
   m_settlement_read_is_ordinary
   m_candidate_drops_storage_key
   m_claim_id_from_candidate_at

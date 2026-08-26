@@ -130,17 +130,13 @@ func (q *Queue) Complete(item QueueItem) error {
 	if err := validateQueueItemBlockCandidateIdentity(item); err != nil {
 		return fmt.Errorf("cannot complete queue item: %w", err)
 	}
-	return q.store.CompleteItem(item.OrgID, item.QueuedAt, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.ItemType, item.ItemID, item.BlockGCCandidateIdentity)
-}
-
-func (q *Queue) completeItem(item QueueItem) error {
-	return q.Complete(item)
+	return q.store.CompleteItem(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID, item.Identity())
 }
 
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck, item.LibraryGuardMode, item.BlockGCCandidateIdentity)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, item.Identity(), item.RequiresLibraryDeletedCheck, item.LibraryGuardMode)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.

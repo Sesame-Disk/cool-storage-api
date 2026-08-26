@@ -92,11 +92,11 @@ type GCStore interface {
 	// or library cascades must use EnqueueBatch with QueueItem.
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
 	EnqueueBatch(items []QueueItem) error
-	QueueItemExists(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) (bool, error)
-	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) (bool, error)
+	QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error)
+	PendingItemExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
-	CompleteItem(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
-	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode, candidate ...BlockGCCandidateIdentity) error
+	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error
+	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error
 	FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
@@ -106,9 +106,9 @@ type GCStore interface {
 	ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error)
 	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
 	ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GCFailedItemExpiryInfo, error)
-	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
+	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error
 	DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error)
-	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidate ...BlockGCCandidateIdentity) error
+	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error
 	MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error
 	RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error
 	MarkOrgDirty(orgID uuid.UUID, dirtyAt time.Time) error
@@ -245,16 +245,13 @@ type GCStore interface {
 	// EnsureBlockGCCandidateExact returns the full candidate identity, including the
 	// exact physical incarnation captured from the canonical block row.
 	EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (BlockGCCandidateInfo, error)
-	// EnsureBlockGCCandidate is a temporary compatibility wrapper. New callers must
-	// retain the BlockGCCandidateInfo returned by EnsureBlockGCCandidateExact.
-	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	// GetBlockGCCandidateExact loads a candidate only when the supplied full identity
 	// still matches its captured timestamp. A stale candidate_at is not a match.
 	GetBlockGCCandidateExact(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) (BlockGCCandidateInfo, bool, error)
-	// GetBlockGCCandidate is a temporary compatibility wrapper for callers that have
-	// not yet carried candidate identity. It refuses an ambiguous logical block.
-	// New callers must use GetBlockGCCandidateExact.
-	GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error)
+	// DeleteBlockGCCandidateDiscovery removes a discovery row whose canonical
+	// candidate no longer exists. Without it a projection that outlived its
+	// candidate regenerates the same work item on every scan, forever.
+	DeleteBlockGCCandidateDiscovery(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error
 	// DeleteBlockGCCandidate removes the candidate only while it is still exactly the
 	// one that was observed. A delayed lifecycle for P1 must not consume a candidate
 	// that now belongs to P2.
@@ -461,8 +458,8 @@ type GCStore interface {
 // remains context-free for the worker hot path; the service uses this optional
 // interface only for the DLQ endpoints.
 type GCAdminContextStore interface {
-	DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidate ...BlockGCCandidateIdentity) error
-	RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidate ...BlockGCCandidateIdentity) error
+	DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error
+	RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error
 }
 
 // ItemType constants for new GC item types
@@ -521,16 +518,79 @@ func (c BlockGCCandidateInfo) Identity() BlockGCCandidateIdentity {
 // period, and it is reused across successive lives of the same logical block, so a
 // delete keyed on it alone can consume another incarnation's work item.
 type BlockGCCandidateIdentity struct {
-	Target      BlockDeleteTarget
-	CandidateAt time.Time
+	Target      BlockDeleteTarget `json:"target"`
+	CandidateAt time.Time         `json:"candidate_at"`
+}
+
+// GCItemIdentity is the durable identity of one GC work item, and the only thing
+// that addresses its rows in gc_queue, gc_pending_items, gc_failed_items and
+// gc_failed_items_by_expiry.
+//
+// `identity_at` is a clustering column of ALL FOUR of those primary keys, for
+// EVERY item type — not just for blocks. An operation that names less than the
+// full identity can therefore address a different lifecycle's row, or address
+// nothing at all while reporting success, which is the class of defect this
+// slice exists to remove. So the identity is one value, passed explicitly, and
+// omitting it does not compile.
+//
+// For ItemBlock the identity also carries the exact physical incarnation
+// P = (storage_class, storage_key) the candidate was created for, and IdentityAt
+// is that candidate's candidate_at — the two are the same instant by construction
+// (validateQueueItemBlockCandidateIdentity enforces it). For every other item
+// type BlockCandidate is the zero value and the P columns are stored empty.
+type GCItemIdentity struct {
+	IdentityAt     time.Time                `json:"identity_at"`
+	BlockCandidate BlockGCCandidateIdentity `json:"block_candidate"`
+}
+
+// GCItemIdentityAt builds the identity of a non-block item, whose lifecycle is
+// named by `identity_at` alone.
+func GCItemIdentityAt(identityAt time.Time) GCItemIdentity {
+	return GCItemIdentity{IdentityAt: identityAt}
+}
+
+// AnyGCItemIdentity is the deliberate "any lifecycle of this item" probe used by
+// the dedup checks that only ask whether an item is pending at all. It is NOT
+// valid for a mutation: every delete/insert names a full identity.
+func AnyGCItemIdentity() GCItemIdentity { return GCItemIdentity{} }
+
+// Target reports the physical incarnation this identity names, zero for non-block
+// items.
+func (i GCItemIdentity) Target() BlockDeleteTarget { return i.BlockCandidate.Target }
+
+// resolved fills in an identity_at that the caller left implicit. Queue rows
+// written before an explicit identity existed stored queued_at in the column, so
+// a lifecycle that carries no identity_at of its own still addresses its row.
+func (i GCItemIdentity) resolved(fallback time.Time) GCItemIdentity {
+	if i.IdentityAt.IsZero() {
+		if !i.BlockCandidate.CandidateAt.IsZero() {
+			i.IdentityAt = i.BlockCandidate.CandidateAt
+		} else {
+			i.IdentityAt = fallback
+		}
+	}
+	return i
+}
+
+// ItemIdentity is the durable work-item identity this candidate authorizes.
+func (c BlockGCCandidateInfo) ItemIdentity() GCItemIdentity {
+	return GCItemIdentity{IdentityAt: c.CandidateAt, BlockCandidate: c.Identity()}
+}
+
+// Identity is the durable identity of this queue item's own lifecycle.
+func (q QueueItem) Identity() GCItemIdentity {
+	return GCItemIdentity{
+		IdentityAt:     effectiveIdentityAt(q.QueuedAt, q.IdentityAt),
+		BlockCandidate: q.BlockGCCandidateIdentity,
+	}
 }
 
 // BlockDeleteTarget is the exact physical incarnation P = (storage_class, storage_key)
 // of a block. Nothing may reconstruct it from block_id: storage keys are minted, so
 // deriving one yields a DIFFERENT incarnation's key that merely looks plausible.
 type BlockDeleteTarget struct {
-	StorageClass string
-	StorageKey   string
+	StorageClass string `json:"storage_class"`
+	StorageKey   string `json:"storage_key"`
 }
 
 // IsZero reports whether the target is unusable as destructive authority.
@@ -619,6 +679,22 @@ type GCFailedItemExpiryInfo struct {
 	ItemType                 ItemType
 	ItemID                   string
 	BlockGCCandidateIdentity BlockGCCandidateIdentity
+}
+
+// Identity is the durable identity of the DLQ row this expiry row points at.
+func (e GCFailedItemExpiryInfo) Identity() GCItemIdentity {
+	return GCItemIdentity{
+		IdentityAt:     effectiveFailedItemExpiryIdentity(e),
+		BlockCandidate: e.BlockGCCandidateIdentity,
+	}
+}
+
+// Identity is the durable identity of this DLQ row.
+func (f GCFailedItemInfo) Identity() GCItemIdentity {
+	return GCItemIdentity{
+		IdentityAt:     effectiveIdentityAt(f.QueuedAt, f.IdentityAt),
+		BlockCandidate: f.BlockGCCandidateIdentity,
+	}
 }
 
 func effectiveFailedItemExpiryIdentity(expiry GCFailedItemExpiryInfo) time.Time {

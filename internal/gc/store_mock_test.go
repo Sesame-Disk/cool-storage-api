@@ -295,11 +295,11 @@ func TestMockStore_FailedItemsUseFullBlockCandidateIdentity(t *testing.T) {
 		CandidateAt: candidateAt,
 	}
 	p2 := p1
-	p1Bucket := failedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.CandidateAt, p1)
+	p1Bucket := db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.Target.StorageClass, p1.Target.StorageKey, p1.CandidateAt)
 	foundDistinctBucket := false
 	for i := 0; i < 1000; i++ {
 		p2.Target.StorageKey = fmt.Sprintf("p2-%d", i)
-		if p1Bucket != failedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p2.CandidateAt, p2) {
+		if p1Bucket != db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p2.Target.StorageClass, p2.Target.StorageKey, p2.CandidateAt) {
 			foundDistinctBucket = true
 			break
 		}
@@ -351,7 +351,7 @@ func TestMockStore_FailedItemsUseFullBlockCandidateIdentity(t *testing.T) {
 
 	t.Run("DeleteFailedItem", func(t *testing.T) {
 		store := seedFailed(t)
-		if err := store.DeleteFailedItem(orgID, failedAt, ItemBlock, "same-block", p1); err != nil {
+		if err := store.DeleteFailedItem(orgID, failedAt, ItemBlock, "same-block", GCItemIdentity{IdentityAt: p1.CandidateAt, BlockCandidate: p1}); err != nil {
 			t.Fatalf("DeleteFailedItem(P1): %v", err)
 		}
 		if failed := store.FailedItems(orgID); len(failed) != 1 || failed[0].BlockGCCandidateIdentity != p2 {
@@ -361,7 +361,7 @@ func TestMockStore_FailedItemsUseFullBlockCandidateIdentity(t *testing.T) {
 
 	t.Run("RequeueFailedItem", func(t *testing.T) {
 		store := seedFailed(t)
-		if err := store.RequeueFailedItem(orgID, failedAt, ItemBlock, "same-block", failedAt.Add(time.Minute), p1); err != nil {
+		if err := store.RequeueFailedItem(orgID, failedAt, ItemBlock, "same-block", failedAt.Add(time.Minute), GCItemIdentity{IdentityAt: p1.CandidateAt, BlockCandidate: p1}); err != nil {
 			t.Fatalf("RequeueFailedItem(P1): %v", err)
 		}
 		if failed := store.FailedItems(orgID); len(failed) != 1 || failed[0].BlockGCCandidateIdentity != p2 {
@@ -393,7 +393,7 @@ func TestMockStore_FailedItemsUseFullBlockCandidateIdentity(t *testing.T) {
 
 	t.Run("expiry bucket", func(t *testing.T) {
 		store := seedFailed(t)
-		bucket := failedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.CandidateAt, p1)
+		bucket := db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.Target.StorageClass, p1.Target.StorageKey, p1.CandidateAt)
 		expiries, err := store.ListFailedItemExpiriesByDay(failedAt.Add(gcFailedItemRetention), bucket)
 		if err != nil {
 			t.Fatalf("ListFailedItemExpiriesByDay: %v", err)

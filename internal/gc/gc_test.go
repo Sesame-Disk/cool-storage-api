@@ -334,7 +334,7 @@ func TestService_RunWorkerOnce_SkipsWithoutLeadership(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "lease-block", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "lease-block", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "lease-block", "hot", 0)
 
 	svc := &Service{
 		store:   store,
@@ -365,7 +365,7 @@ func TestService_RunWorkerOnce_ProcessesWithLeadership(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "lease-block", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "lease-block", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "lease-block", "hot", 0)
 
 	svc := &Service{
 		store:   store,
@@ -517,7 +517,7 @@ func TestService_DeleteFailedItem_RequiresLeadership(t *testing.T) {
 	}
 	svc.acceptingWork.Store(true)
 
-	err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "blocked")
+	err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "blocked", gcItemIdentityForTest(store, orgID, failedAt, ItemBlock, "blocked"))
 	if !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("DeleteFailedItem error = %v, want ErrNotLeader", err)
 	}
@@ -629,7 +629,7 @@ func TestService_RunWorkerOnce_RecoversQueuedOrgsFromSnapshotWhenActiveSetIsMiss
 	orgID := uuid.New()
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour)
 	store.AddBlock(orgID, "stuck-block", "hot", 0)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "stuck-block", uuid.Nil, "hot", 0); err != nil {
+	if err := store.EnqueueBlockForTest(orgID, queuedAt, "stuck-block", "hot", 0); err != nil {
 		t.Fatalf("enqueue stuck item: %v", err)
 	}
 	delete(store.activeQueueOrgs, orgID)
@@ -967,11 +967,11 @@ func TestService_DLQOps_SerializeUnderConcurrency(t *testing.T) {
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_ = svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "race-item-a")
+		_ = svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "race-item-a", gcItemIdentityForTest(store, orgID, failedAt, ItemBlock, "race-item-a"))
 		done <- struct{}{}
 	}()
 	go func() {
-		_ = svc.DeleteFailedItem(orgID, failedAt.Add(time.Second), ItemBlock, "race-item-b")
+		_ = svc.DeleteFailedItem(orgID, failedAt.Add(time.Second), ItemBlock, "race-item-b", gcItemIdentityForTest(store, orgID, failedAt.Add(time.Second), ItemBlock, "race-item-b"))
 		done <- struct{}{}
 	}()
 
@@ -1022,7 +1022,7 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	}
 	svc.acceptingWork.Store(true)
 
-	if err := svc.RequeueFailedItem(orgID, failedAt, ItemLibraryCascade, itemID); err != nil {
+	if err := svc.RequeueFailedItem(orgID, failedAt, ItemLibraryCascade, itemID, gcItemIdentityForTest(store, orgID, failedAt, ItemLibraryCascade, itemID)); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)
 	}
 
@@ -1081,7 +1081,7 @@ func TestService_RequeueFailedItem_RejectsNonCanonicalRepresentation(t *testing.
 			}
 			svc.acceptingWork.Store(true)
 
-			err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID)
+			err := svc.RequeueFailedItem(orgID, failedAt, ItemFSObject, itemID, gcItemIdentityForTest(store, orgID, failedAt, ItemFSObject, itemID))
 			if err == nil {
 				t.Fatalf("expected RequeueFailedItem to reject representation %q, got nil", tc.representation)
 			}
@@ -1151,10 +1151,10 @@ func TestService_AdminFailedItemOps_RefreshSnapshotImmediately(t *testing.T) {
 	}
 	svc.acceptingWork.Store(true)
 
-	if err := svc.RequeueFailedItem(orgID, failedAtA, ItemBlock, "admin-requeue"); err != nil {
+	if err := svc.RequeueFailedItem(orgID, failedAtA, ItemBlock, "admin-requeue", gcItemIdentityForTest(store, orgID, failedAtA, ItemBlock, "admin-requeue")); err != nil {
 		t.Fatalf("RequeueFailedItem failed: %v", err)
 	}
-	if err := svc.DeleteFailedItem(orgID, failedAtB, ItemBlock, "admin-delete"); err != nil {
+	if err := svc.DeleteFailedItem(orgID, failedAtB, ItemBlock, "admin-delete", gcItemIdentityForTest(store, orgID, failedAtB, ItemBlock, "admin-delete")); err != nil {
 		t.Fatalf("DeleteFailedItem failed: %v", err)
 	}
 
@@ -1618,10 +1618,10 @@ func TestService_EnqueueBlock_ExistingPendingItemSuppressesRepairWarning(t *test
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
 	store.AddBlock(orgID, "block-already-pending", "hot", 0)
 
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-already-pending", "hot", candidateAt); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-already-pending", "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate seed failed: %v", err)
 	}
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-already-pending", uuid.Nil, "hot", 0); err != nil {
+	if err := store.EnqueueBlockForTest(orgID, candidateAt, "block-already-pending", "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem seed failed: %v", err)
 	}
 	store.ensureBlockGCCandidateErrAfterMutate = errors.New("repair projection failed")

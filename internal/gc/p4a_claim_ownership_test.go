@@ -23,12 +23,9 @@ import (
 func p4aSeedBlockCandidate(t *testing.T, store *MockStore, orgID uuid.UUID, blockID string) BlockGCCandidateInfo {
 	t.Helper()
 	store.AddBlock(orgID, blockID, "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().Add(-2*time.Hour)); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
-	}
-	candidate, ok, err := store.GetBlockGCCandidate(orgID, blockID)
-	if err != nil || !ok {
-		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().Add(-2*time.Hour))
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
 	return candidate
 }
@@ -263,10 +260,10 @@ func TestP4A_DelayedP1EnqueueSettlesOnlyP1AndLeavesP2Claimable(t *testing.T) {
 		if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
 			t.Fatalf("exact candidate %s: ok=%v err=%v", candidate.Target, ok, err)
 		}
-		if exists, err := store.QueueItemExists(orgID, candidate.CandidateAt, candidate.CandidateAt, ItemBlock, blockID, candidate.Identity()); err != nil || !exists {
+		if exists, err := store.QueueItemExists(orgID, candidate.CandidateAt, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
 			t.Fatalf("queue identity for %s: exists=%v err=%v", candidate.Target, exists, err)
 		}
-		if exists, err := store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, blockID, candidate.Identity()); err != nil || !exists {
+		if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
 			t.Fatalf("pending identity for %s: exists=%v err=%v", candidate.Target, exists, err)
 		}
 	}
@@ -294,10 +291,10 @@ func TestP4A_DelayedP1EnqueueSettlesOnlyP1AndLeavesP2Claimable(t *testing.T) {
 	if queued := store.QueueItems(orgID); len(queued) != 1 || queued[0].BlockGCCandidateIdentity != p2.Identity() {
 		t.Fatalf("queue after P1 TargetChanged = %+v, want only P2", queued)
 	}
-	if exists, err := store.PendingItemExists(orgID, uuid.Nil, p1.CandidateAt, ItemBlock, blockID, p1.Identity()); err != nil || exists {
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
 		t.Fatalf("P1 pending after settlement: exists=%v err=%v, want removed", exists, err)
 	}
-	if exists, err := store.PendingItemExists(orgID, uuid.Nil, p2.CandidateAt, ItemBlock, blockID, p2.Identity()); err != nil || !exists {
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
 		t.Fatalf("P2 pending after P1 settlement: exists=%v err=%v, want preserved", exists, err)
 	}
 	if deletes := storage.ScopedBlockDeletes(); len(deletes) != 0 {
@@ -321,7 +318,7 @@ func TestP4A_DelayedP1EnqueueSettlesOnlyP1AndLeavesP2Claimable(t *testing.T) {
 	if queued := store.QueueItems(orgID); len(queued) != 0 {
 		t.Fatalf("queue after P2 lifecycle = %+v, want empty", queued)
 	}
-	if exists, err := store.PendingItemExists(orgID, uuid.Nil, p2.CandidateAt, ItemBlock, blockID, p2.Identity()); err != nil || exists {
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || exists {
 		t.Fatalf("P2 pending after lifecycle: exists=%v err=%v, want removed", exists, err)
 	}
 	if deletes := storage.ScopedBlockDeletes(); len(deletes) != 1 || deletes[0].StorageKey != p2.Target.StorageKey {
@@ -370,10 +367,10 @@ func TestP4A_SameCandidateAtDistinctTargetsKeepIndependentQueueAndPendingIdentit
 	}
 
 	for _, candidate := range []BlockGCCandidateInfo{p1, p2} {
-		if exists, err := store.QueueItemExists(orgID, candidateAt, candidateAt, ItemBlock, blockID, candidate.Identity()); err != nil || !exists {
+		if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
 			t.Fatalf("queue identity for %s: exists=%v err=%v", candidate.Target, exists, err)
 		}
-		if exists, err := store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID, candidate.Identity()); err != nil || !exists {
+		if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
 			t.Fatalf("pending identity for %s: exists=%v err=%v", candidate.Target, exists, err)
 		}
 	}
@@ -383,19 +380,19 @@ func TestP4A_SameCandidateAtDistinctTargetsKeepIndependentQueueAndPendingIdentit
 
 	// Exact completion of P1 must leave the physically distinct P2 row and pending
 	// identity in place; this is the operation a collapsed physical queue key loses.
-	if err := store.CompleteItem(orgID, candidateAt, candidateAt, ItemBlock, blockID, p1.Identity()); err != nil {
+	if err := store.CompleteItem(orgID, candidateAt, ItemBlock, blockID, p1.ItemIdentity()); err != nil {
 		t.Fatalf("CompleteItem(P1): %v", err)
 	}
-	if exists, err := store.QueueItemExists(orgID, candidateAt, candidateAt, ItemBlock, blockID, p1.Identity()); err != nil || exists {
+	if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
 		t.Fatalf("P1 queue after exact completion: exists=%v err=%v, want removed", exists, err)
 	}
-	if exists, err := store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID, p1.Identity()); err != nil || exists {
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
 		t.Fatalf("P1 pending after exact completion: exists=%v err=%v, want removed", exists, err)
 	}
-	if exists, err := store.QueueItemExists(orgID, candidateAt, candidateAt, ItemBlock, blockID, p2.Identity()); err != nil || !exists {
+	if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
 		t.Fatalf("P2 queue after P1 completion: exists=%v err=%v, want preserved", exists, err)
 	}
-	if exists, err := store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID, p2.Identity()); err != nil || !exists {
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
 		t.Fatalf("P2 pending after P1 completion: exists=%v err=%v, want preserved", exists, err)
 	}
 }
@@ -629,12 +626,12 @@ func TestP4A_EnsureBlockGCCandidateRefusesWithoutAnExactIncarnation(t *testing.T
 	store := NewMockStore()
 	orgID := uuid.New()
 
-	if _, err := store.EnsureBlockGCCandidate(orgID, "blk-absent", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(no canonical row) = %v, want ErrBlockCandidateTargetUnavailable", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "blk-absent", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(no canonical row) = %v, want ErrBlockCandidateTargetUnavailable", err)
 	}
 	store.AddStubBlockForTest(orgID, "blk-locatorless")
-	if _, err := store.EnsureBlockGCCandidate(orgID, "blk-locatorless", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(no locator) = %v, want ErrBlockCandidateTargetUnavailable", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "blk-locatorless", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(no locator) = %v, want ErrBlockCandidateTargetUnavailable", err)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("candidate rows = %d, want 0: a refused capture must leave no destructive authority behind", got)
@@ -678,7 +675,7 @@ func TestP4A_EachWorkerAttemptMintsItsOwnClaimID(t *testing.T) {
 		}
 		// The re-referenced path settles the candidate; restore it so the second pass
 		// is a genuine second attempt on the same candidate rather than a no-op.
-		if _, ok, _ := store.GetBlockGCCandidate(orgID, "blk-per-attempt"); !ok {
+		if _, ok := store.GetBlockGCCandidateForTest(orgID, "blk-per-attempt"); !ok {
 			store.AddBlockGCCandidate(orgID, "blk-per-attempt", "hot", candidate.CandidateAt)
 			enqueueExactBlockCandidateForTest(t, store, store.AllBlockGCCandidates()[0], 0)
 		}
@@ -801,21 +798,27 @@ func TestP4A_ReplacedCandidateServesItsOwnGracePeriod(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, grace, false, &Stats{})
 
 	orgID := uuid.New()
-	candidate := p4aSeedBlockCandidate(t, store, orgID, testSHA256BlockID("blk-grace"))
-	// An old queue item that has long since cleared the grace period.
-	enqueueExactBlockCandidateAtForTest(t, store, candidate, time.Now().Add(-24*time.Hour), 0)
+	blockID := testSHA256BlockID("blk-grace")
+	store.AddBlock(orgID, blockID, "hot", 0)
 
-	// The candidate is re-decided and carries a fresh candidate_at. The incarnation is
-	// deliberately left ALONE: changing it would make the walk abort on locator
-	// validation instead, and the test would pass without ever reaching the grace check.
-	store.AddBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"), "hot", time.Now())
-	fresh, ok, err := store.GetBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"))
-	if err != nil || !ok {
-		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
+	// THE GRACE PERIOD BELONGS TO THE CANDIDATE, NOT TO THE QUEUE ROW, and this is
+	// the state that separates the two: a queue row whose queued_at cleared the
+	// grace window long ago, pointing at a candidate decided moments ago.
+	//
+	// The item carries that candidate's EXACT identity, which is what makes this
+	// test reach the grace check at all. An earlier version re-decided the
+	// candidate with a fresh candidate_at and left the queue item on the old one;
+	// under exact-P identity the worker then settled it as unauthorized and
+	// returned long before the grace comparison, so the gate it meant to pin was
+	// never executed and the mutation harness could not turn it red.
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now())
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
-	if fresh.Target.IsZero() {
-		t.Fatal("the re-decided candidate lost its incarnation; this test must reach the grace check, not a locator refusal")
+	if candidate.Target.IsZero() {
+		t.Fatal("the candidate lost its incarnation; this test must reach the grace check, not a locator refusal")
 	}
+	enqueueExactBlockCandidateAtForTest(t, store, candidate, time.Now().Add(-24*time.Hour), 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Logf("ProcessOnce returned %v (a postponement is the correct outcome)", err)
@@ -823,7 +826,7 @@ func TestP4A_ReplacedCandidateServesItsOwnGracePeriod(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Fatalf("deleted a freshly decided incarnation inside its grace period: %+v", deletes)
 	}
-	if blk := store.GetBlock(orgID, testSHA256BlockID("blk-grace")); blk == nil || blk.GCState != "" {
+	if blk := store.GetBlock(orgID, blockID); blk == nil || blk.GCState != "" {
 		t.Fatalf("claimed a freshly decided incarnation inside its grace period (block=%+v)", blk)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 1 {

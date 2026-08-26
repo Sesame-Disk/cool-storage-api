@@ -82,8 +82,27 @@ func (m *MockStore) SeedExactBlockQueueItemForTest(orgID uuid.UUID, queuedAt tim
 		RetryCount:               retryCount,
 	}
 	m.queue[orgID] = append(m.queue[orgID], item)
-	m.pendingItems[newMockPendingItemKey(orgID, uuid.Nil, ItemBlock, blockID, candidate.CandidateAt, candidate)] = nil
+	m.pendingItems[newMockPendingItemKey(orgID, uuid.Nil, ItemBlock, blockID, item.Identity())] = nil
 	now := time.Now().UTC()
 	m.activeQueueOrgs[orgID] = now
 	m.dirtyQueueOrgs[orgID] = now
+}
+
+// gcItemIdentityForTest looks up the durable identity of a DLQ row the way an
+// admin client does: read the listing, then act on exactly the row you saw.
+// Every DLQ mutation now requires that identity, so a test cannot accidentally
+// exercise a prefix match that production can no longer perform.
+func gcItemIdentityForTest(store *MockStore, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) GCItemIdentity {
+	items, err := store.ListFailedItems(orgID, 0)
+	if err != nil {
+		return GCItemIdentityAt(failedAt)
+	}
+	for _, item := range items {
+		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			return item.Identity()
+		}
+	}
+	// No such row: hand back a well-formed identity so the call still exercises
+	// the not-found path rather than an argument-validation error.
+	return GCItemIdentityAt(failedAt)
 }

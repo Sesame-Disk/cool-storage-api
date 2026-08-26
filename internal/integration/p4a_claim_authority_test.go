@@ -158,13 +158,14 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	}
 
 	// The candidate survived every refusal — nothing settled it on a lost race.
-	if _, ok, err := store.GetBlockGCCandidate(orgID, blockID); err != nil || !ok {
+	// Named by its exact identity: with exact-P a logical block can hold several
+	// candidates, so "some candidate exists" would not be the assertion meant here.
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
 		t.Fatalf("P4A REGRESSION: the candidate was consumed by a losing attempt (ok=%v err=%v)", ok, err)
 	}
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, attemptC); err != nil || released != gcpkg.BlockReleaseReleased {
 		t.Fatalf("cleanup release = %s, %v", released, err)
 	}
-	_ = candidate
 
 	gate.observed = true
 	t.Logf("P4A_CLAIM_AUTHORITY_EVIDENCE owners=1 refused_releases=2 refused_finalizes=2 takeovers=1")

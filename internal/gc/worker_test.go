@@ -456,8 +456,8 @@ func TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork(t *testing.T) {
 	store.AddBlockMapping(orgID, "sha1-stub", "block-stub")
 
 	// Gate 1: a stub cannot become a candidate.
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(stub) = %v, want ErrBlockCandidateTargetUnavailable: a row with no locator must never become destructive work", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-stub", "hot", candidateAt); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(stub) = %v, want ErrBlockCandidateTargetUnavailable: a row with no locator must never become destructive work", err)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("a stub row produced %d candidate rows, want 0", got)
@@ -506,7 +506,7 @@ func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *test
 	// SHA-1→SHA-256 resolution happens at registration time, not at GC time).
 	store.AddFSObjectReferenceForTest(orgID, "internal-block", libraryID, "fs-mapped")
 	store.AddFSObject(libraryID, "fs-mapped", "file", []string{externalBlockID})
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "internal-block", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "internal-block", "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -533,7 +533,7 @@ func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-1", "hot", 0)
 
 	ctx := context.Background()
 	n, _ := w.ProcessOnce(ctx)
@@ -1114,7 +1114,7 @@ func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testi
 
 	store.AddBlock(orgID, "blk-rereferenced", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "blk-rereferenced", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-rereferenced", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-rereferenced", "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -1155,7 +1155,7 @@ func TestWorker_ProcessBlock_ReReferencedClaimedStubIsDeleted(t *testing.T) {
 	}
 	store.AddStubBlockForTest(orgID, "blk-stub-rereferenced")
 	store.AddBlockGCCandidate(orgID, "blk-stub-rereferenced", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-rereferenced", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-stub-rereferenced", "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v, want nil", err)
@@ -1181,7 +1181,6 @@ func TestWorker_ProcessBlock_ClaimedStubDeleteLostRaceFailsClosed(t *testing.T) 
 	store := NewMockStore()
 	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
 	orgID := uuid.New()
-	libID := uuid.New()
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	checks := 0
 	store.blockHasReferencesHook = func(uuid.UUID, string, bool) (bool, error) {
@@ -1190,7 +1189,7 @@ func TestWorker_ProcessBlock_ClaimedStubDeleteLostRaceFailsClosed(t *testing.T) 
 	}
 	store.AddStubBlockForTest(orgID, "blk-stub-race")
 	store.AddBlockGCCandidate(orgID, "blk-stub-race", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-race", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-stub-race", "hot", 0)
 	store.deleteClaimedBlockStubForceFalse = true
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -1934,7 +1933,7 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	// Enqueue several items
 	for i := 0; i < 10; i++ {
 		store.AddBlock(orgID, "block-"+string(rune('a'+i)), "hot", 0)
-		store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-"+string(rune('a'+i)), uuid.Nil, "hot", 0)
+		store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-"+string(rune('a'+i)), "hot", 0)
 	}
 
 	// Cancel context immediately

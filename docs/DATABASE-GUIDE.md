@@ -1290,7 +1290,7 @@ Set appropriate consistency levels per operation:
 | Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
 | Block metadata first-writer (`INSERT ... IF NOT EXISTS`) | `SERIAL` (explicit statement pin) | Pins one canonical storage class/key per `(org_id, block_id)`; one `SERIAL` LWT/Paxos transaction per metadata-registering uploaded block. Network round-trips depend on Cassandra's Paxos variant. |
 | Block identity repair (`representation_id` / `sha1` backfill) | `SERIAL` (explicit statement pin) | Conditional repair of pre-existing metadata; not taken by the successful first-writer hot path |
-| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional replacement) | `SERIAL` (explicit statement pin) | Preserves the canonical candidate timestamp under concurrent enqueue/replacement |
+| GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional grace advance and cleanup) | `SERIAL` (explicit statement pin) | Preserves the candidate timestamp under concurrent enqueue. Since migration `018` the candidate is keyed by `((org_id, block_id), storage_class, storage_key)`, so each of these addresses ONE physical incarnation: there is no longer any "replace one incarnation with another" operation, and a delayed lifecycle for a dead incarnation cannot reach a live one's row |
 | GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (explicit statement pin) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
@@ -1299,8 +1299,9 @@ The four rows marked **explicit statement pin** do not derive their level from
 `serial_consistency` at all. Since P0/R12 (2026-08-23) each of those statements
 calls `SerialConsistency(gocql.Serial)` itself, so the level holds even where a
 deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
-`blocks` statements, 4 canonical `gc_s3_orphans` and 2 `gc_block_candidates` —
-is pinned by the untagged source gate `TestR12SerialDomainGuard`
+`blocks` statements, 4 canonical `gc_s3_orphans` and 3 `gc_block_candidates`
+(create, grace advance, tuple-bound cleanup) — is pinned by the untagged source
+gate `TestR12SerialDomainGuard`
 (`internal/integration/`).
 
 The gate keys discovery on **the CQL, not on the Go method that executes it**.

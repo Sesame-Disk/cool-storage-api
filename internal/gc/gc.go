@@ -664,7 +664,7 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 	if candidateErr != nil && candidate.CandidateAt.IsZero() {
 		return candidateErr
 	}
-	exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, blockID, candidate.Identity())
+	exists, err := s.store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity())
 	if err != nil {
 		return errors.Join(candidateErr, err)
 	}
@@ -1028,9 +1028,9 @@ func (s *Service) retryAutoRecoverableFailedItems(ctx context.Context) int {
 
 				queuedAt := time.Now().UTC()
 				if store, ok := s.store.(GCAdminContextStore); ok {
-					err = store.RequeueFailedItemContext(ctx, item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt, item.BlockGCCandidateIdentity)
+					err = store.RequeueFailedItemContext(ctx, item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt, item.Identity())
 				} else {
-					err = s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt, item.BlockGCCandidateIdentity)
+					err = s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, queuedAt, item.Identity())
 				}
 				if err != nil {
 					log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
@@ -1342,13 +1342,13 @@ func (s *Service) refreshOrgQueueStatsNow(orgID uuid.UUID) error {
 	return nil
 }
 
-func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, candidates...)
+func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	return s.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, identity)
 }
 
-func (s *Service) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (s *Service) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 	return s.withDLQOperation(ctx, func(ctx context.Context) error {
-		return s.deleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID, candidates...)
+		return s.deleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID, identity)
 	})
 }
 
@@ -1376,7 +1376,7 @@ func (s *Service) withDLQOperation(ctx context.Context, fn func(context.Context)
 	return fn(opCtx)
 }
 
-func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
 	// GC is disabled fleet-wide today; once it is activated, only the designated GC
@@ -1390,11 +1390,11 @@ func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, 
 		return ErrNotLeader
 	}
 	if store, ok := s.store.(GCAdminContextStore); ok {
-		err := store.DeleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID, candidates...)
+		err := store.DeleteFailedItemContext(ctx, orgID, failedAt, itemType, itemID, identity)
 		if err != nil {
 			return err
 		}
-	} else if err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID, candidates...); err != nil {
+	} else if err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID, identity); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {
@@ -1403,17 +1403,17 @@ func (s *Service) deleteFailedItemContext(ctx context.Context, orgID uuid.UUID, 
 	return nil
 }
 
-func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, candidates...)
+func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	return s.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, identity)
 }
 
-func (s *Service) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (s *Service) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 	return s.withDLQOperation(ctx, func(ctx context.Context) error {
-		return s.requeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, candidates...)
+		return s.requeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, identity)
 	})
 }
 
-func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 
 	// Refuse before tryClaimLeadershipForAdmin, which CLAIMS the lease. Destructive
 	// GC is disabled fleet-wide today; once it is activated, only the designated GC
@@ -1434,10 +1434,10 @@ func (s *Service) requeueFailedItemContext(ctx context.Context, orgID uuid.UUID,
 	// process twice.
 	queuedAt := time.Now().UTC()
 	if store, ok := s.store.(GCAdminContextStore); ok {
-		if err := store.RequeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, queuedAt, candidates...); err != nil {
+		if err := store.RequeueFailedItemContext(ctx, orgID, failedAt, itemType, itemID, queuedAt, identity); err != nil {
 			return err
 		}
-	} else if err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, queuedAt, candidates...); err != nil {
+	} else if err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, queuedAt, identity); err != nil {
 		return err
 	}
 	if err := s.refreshOrgQueueStatsNow(orgID); err != nil {

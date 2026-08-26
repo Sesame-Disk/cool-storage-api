@@ -882,7 +882,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 				if incErr := w.queue.IncrementRetry(item); incErr != nil {
 					log.Printf("[GC Worker] Failed to requeue item %s/%s after error %v: %v",
 						item.OrgID, item.ItemID, err, incErr)
-					stillExists, checkErr := w.store.QueueItemExists(item.OrgID, item.QueuedAt, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.ItemType, item.ItemID, item.BlockGCCandidateIdentity)
+					stillExists, checkErr := w.store.QueueItemExists(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID, item.Identity())
 					if checkErr != nil {
 						log.Printf("[GC Worker] Cannot verify requeue state for %s/%s (%v); leaving item untouched to avoid double-processing",
 							item.OrgID, item.ItemID, checkErr)
@@ -911,7 +911,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		}
 
 		// Remove from queue
-		if err := w.queue.completeItem(item); err != nil {
+		if err := w.queue.Complete(item); err != nil {
 			log.Printf("[GC Worker] Failed to complete item %s/%s: %v",
 				item.OrgID, item.ItemID, err)
 		}
@@ -956,10 +956,9 @@ func (w *Worker) postponeItem(item QueueItem) error {
 		item.BlockRepresentationID,
 		item.StorageClass,
 		item.RetryCount,
-		effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
+		item.Identity(),
 		item.RequiresLibraryDeletedCheck,
 		item.LibraryGuardMode,
-		item.BlockGCCandidateIdentity,
 	)
 }
 
@@ -1012,8 +1011,23 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return w.failClosedIfUnavailable("failed to load block GC candidate authority", item.ItemID, err)
 	}
 	if !candidateFound {
+		// Nothing authorized this work item: its candidate was settled by its own
+		// lifecycle, or advanced to a different candidate_at, and this row outlived it.
+		// Touch neither `blocks` nor any other candidate.
+		//
+		// BUT THE DISCOVERY ROW THAT PRODUCED THIS ITEM MUST GO WITH IT. Completing the
+		// queue item alone leaves the projection standing, the next scan enumerates it,
+		// rebuilds this same item, and lands here again — a rediscovery loop with no
+		// exit, because the canonical candidate it points at is already gone. Retiring
+		// the row by the item's own exact identity is safe for the reason the whole
+		// slice exists: that key names P1's row and cannot name P2's.
+		if err := w.store.DeleteBlockGCCandidateDiscovery(item.OrgID, item.ItemID, item.BlockGCCandidateIdentity); err != nil {
+			metrics.GCErrorsTotal.WithLabelValues("stale_candidate_discovery_cleanup_failed").Inc()
+			log.Printf("[GC Worker] Block %s: could not retire the stale discovery row behind an unauthorized work item; postponing so it is not rediscovered forever: %v", item.ItemID, err)
+			return w.failClosedIfUnavailable("failed to clear stale block GC candidate discovery row", item.ItemID, err)
+		}
 		metrics.GCBlockDeleteClaimTotal.WithLabelValues("no_candidate").Inc()
-		log.Printf("[GC Worker] Block %s queue identity names no current GC candidate; stale discovery no-op", item.ItemID)
+		log.Printf("[GC Worker] Block %s queue identity names no current GC candidate; retired its stale discovery row and completed the item", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
@@ -1071,15 +1085,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// consumes a candidate while a fence is up), so P2's fence gets lifted by P2's
 		// work item, not by ours.
 		//
-		// With no candidate there is no incarnation to name and therefore no authority to
-		// act on: skip the release entirely rather than falling back to a looser one.
-		var outcome BlockClaimReleaseOutcome
-		var relErr error
-		if candidateFound {
-			outcome, relErr = w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, candidate.Target, w.clock().Add(-blockDeleteClaimStaleAfter))
-		} else {
-			log.Printf("[GC Worker] Block %s is referenced and has no GC candidate; no incarnation is named, so any standing fence is left for the candidate that owns it", item.ItemID)
-		}
+		// The candidate is guaranteed present here: an item whose exact identity names
+		// no candidate returned above without reaching any claim surface.
+		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, candidate.Target, w.clock().Add(-blockDeleteClaimStaleAfter))
 		if relErr != nil {
 			// Postpone for EVERY failure reason, not just the ones
 			// isClusterUnavailableError recognises. "Do not clear the candidate" is
@@ -1122,25 +1130,19 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			log.Printf("[GC Worker] Block %s is referenced but still carries a recent delete claim; postponing until it ages out", item.ItemID)
 			return blockClaimNotYetStaleError{ItemID: item.ItemID}
 		}
-		if err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {
+		if err := w.settleBlockCandidate(item, candidate); err != nil {
 			return err
 		}
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
 
-	// From here the walk can reach a destructive claim, and its candidate must name a
-	// usable physical incarnation.
-	if candidate.Target.IsZero() {
-		// A candidate that cannot name its incarnation can never authorize anything, and
-		// it must not be consumed either: deleting it would drop the only work item that
-		// could ever revisit this block. With a clean deploy this is unreachable —
-		// EnsureBlockGCCandidate refuses to write such a row — so reaching it means the
-		// table was written by something that bypassed that helper.
-		metrics.GCBlockDeleteClaimTotal.WithLabelValues("invalid").Inc()
-		log.Printf("[GC Worker] Block %s: GC candidate carries no exact physical incarnation; refusing every destructive step and postponing — this will NOT self-heal and needs a human", item.ItemID)
-		return blockCandidateAuthorityInvalidError{ItemID: item.ItemID}
-	}
+	// A candidate with no usable incarnation cannot be reached from here any more:
+	// validateQueueItemBlockCandidateIdentity refuses such a queue item, and
+	// GetBlockGCCandidateExact refuses to answer without a complete identity, so the
+	// candidate loaded above always names one. The check that used to stand here is
+	// pinned by TestP4A_CandidateWithoutAnExactIncarnationIsNeverDestructiveAndNeverConsumed
+	// at the surfaces that can still be handed a zero target.
 
 	// THE GRACE PERIOD BELONGS TO THE CANDIDATE, NOT TO THE QUEUE ROW.
 	//
@@ -1173,7 +1175,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if !exists {
 		// The canonical row is already gone. The forward SHA-1 mapping belongs to
 		// the logical block, not this physical GC candidate, so leave it alone.
-		if err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {
+		if err := w.settleBlockCandidate(item, candidate); err != nil {
 			return err
 		}
 		log.Printf("[GC Worker] Block %s missing canonical row, skipping deletion", item.ItemID)
@@ -1229,7 +1231,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// installed now was never decided to be garbage by anything, so it must not be
 		// touched. Settle the stale candidate — by its OWN exact identity, so this
 		// cannot consume a candidate that already belongs to the new incarnation.
-		if err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {
+		if err := w.settleBlockCandidate(item, candidate); err != nil {
 			return err
 		}
 		log.Printf("[GC Worker] Block %s: candidate authorized %s but the canonical row now holds a different incarnation; settling the stale candidate without touching it", item.ItemID, candidate.Target)
@@ -1248,7 +1250,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// unconditional clear, and re-classify rather than assume the takeover holds.
 		return w.takeOverStaleBlockClaim(item, claim.Owner)
 	case BlockClaimMissing:
-		if err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {
+		if err := w.settleBlockCandidate(item, candidate); err != nil {
 			return err
 		}
 		log.Printf("[GC Worker] Block %s claim found no canonical row, skipping S3 deletion", item.ItemID)
@@ -1587,10 +1589,7 @@ func (w *Worker) releaseAndPostponeUnreliableRead(item QueueItem, attempt BlockD
 // carried on the queue item. A queue item can outlive the candidate it was built from,
 // so using its timestamp would let a late lifecycle for P1 erase a candidate that by
 // then belongs to P2, destroying the only work item authorized to reclaim P2.
-func (w *Worker) settleBlockCandidate(item QueueItem, candidate BlockGCCandidateInfo, candidateFound bool) error {
-	if !candidateFound {
-		return nil
-	}
+func (w *Worker) settleBlockCandidate(item QueueItem, candidate BlockGCCandidateInfo) error {
 	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
 		return w.failClosedIfUnavailable("failed to clear block GC candidate", item.ItemID, err)
 	}
@@ -2144,7 +2143,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 	// the root fs_object becomes an orphan with no GC entry. The next scanner
 	// sweep will re-discover and re-enqueue this commit.
 	if commit.RootFSID != "" {
-		exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, time.Time{}, ItemFSObject, commit.RootFSID)
+		exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, ItemFSObject, commit.RootFSID, AnyGCItemIdentity())
 		if err != nil {
 			return fmt.Errorf("failed to inspect root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
 		}
@@ -2209,7 +2208,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	if len(fsObj.DirEntries) > 0 {
 		var batch []QueueItem
 		for _, childID := range fsObj.DirEntries {
-			exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, time.Time{}, ItemFSObject, childID)
+			exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, ItemFSObject, childID, AnyGCItemIdentity())
 			if err != nil {
 				return fmt.Errorf("failed to inspect child fs_object %s for parent %s: %w", childID, item.ItemID, err)
 			}
@@ -2907,7 +2906,7 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 		if candidateErr != nil && candidate.CandidateAt.IsZero() {
 			return candidateErr
 		}
-		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, blockID, candidate.Identity())
+		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity())
 		if err != nil {
 			return errors.Join(candidateErr, candidateProjectionErr, err)
 		}
@@ -2980,7 +2979,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 	if len(commits) > 0 {
 		batch := make([]QueueItem, 0, len(commits))
 		for _, c := range commits {
-			exists, err := w.store.PendingItemExists(orgID, libraryID, identityAt, ItemCommit, c.CommitID)
+			exists, err := w.store.PendingItemExists(orgID, libraryID, ItemCommit, c.CommitID, GCItemIdentityAt(identityAt))
 			if err != nil {
 				return fmt.Errorf("failed to check commit queue state for library %s: %w", libraryID, err)
 			}
@@ -3007,7 +3006,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, blockRepre
 	if len(fsObjects) > 0 {
 		batch := make([]QueueItem, 0, len(fsObjects))
 		for _, obj := range fsObjects {
-			exists, err := w.store.PendingItemExists(orgID, libraryID, identityAt, ItemFSObject, obj.FSID)
+			exists, err := w.store.PendingItemExists(orgID, libraryID, ItemFSObject, obj.FSID, GCItemIdentityAt(identityAt))
 			if err != nil {
 				return fmt.Errorf("failed to check fs_object queue state for library %s: %w", libraryID, err)
 			}

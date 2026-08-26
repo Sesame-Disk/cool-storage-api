@@ -302,6 +302,7 @@ var r12AllowedUnresolvedCAS = map[string]r12UnresolvedAllowance{
 	"(*OrgAdminHandler).updateOrgSetting": {count: 1, reason: "fmt.Sprintf interpolates an allowlisted settings map key into a literal `UPDATE organizations` statement; the relation is fixed in the format string"},
 	"(*AdminHandler).UpdateOrganization":  {count: 1, reason: "fmt.Sprintf interpolates a column name into a literal `UPDATE organizations` statement; the relation is fixed in the format string"},
 	"(*Migrator).apply":                   {count: 1, reason: "applies checked-in DDL statements read from migrations/*.cql at startup; not a runtime mutation path and not conditional DML"},
+	"(*Migrator).preflightDestructive":    {count: 1, reason: "startup-only emptiness probe before a table-dropping migration; a plain SELECT ... LIMIT 1, not a mutation and not conditional DML. The interpolated name comes from DROP TABLE statements parsed out of the checked-in migrations, and internal/db TestShippedDestructiveMigrationsAreDetected pins that set"},
 }
 
 // r12HardDeleteLockHelpers are the only CAS helpers allowed to build their CQL

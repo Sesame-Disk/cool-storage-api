@@ -96,11 +96,20 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 				t.Errorf("%s statement %q must condition on %q; without it a lifecycle for one incarnation can act on another (R14). Got IF clause: %s", want.function, want.query, column, condition)
 			}
 		}
+		// gc_block_candidates is keyed by ((org_id, block_id), storage_class,
+		// storage_key), so P lives in the WHERE clause rather than the IF. Both
+		// halves are load-bearing and are asserted separately: the IF pins the
+		// lifecycle instant, the WHERE pins the incarnation. Dropping the WHERE
+		// half restores exactly the R26 defect — a delayed P1 lifecycle addressing
+		// whatever candidate now sits on the logical block.
 		if want.function == "DeleteBlockGCCandidate" || want.function == "advanceBlockGCCandidateAt" {
 			for _, column := range []string{"storage_class = ?", "storage_key = ?"} {
 				if !strings.Contains(statement, column) {
-					t.Errorf("%s statement %q must name %q in its exact v2 key: %s", want.function, want.query, column, statement)
+					t.Errorf("%s statement %q must name %q in its exact key, or a lifecycle for one incarnation addresses another (R26): %s", want.function, want.query, column, statement)
 				}
+			}
+			if strings.Contains(condition, "storage_class = ?") || strings.Contains(condition, "storage_key = ?") {
+				t.Errorf("%s statement %q puts P in the IF clause; P is part of the PRIMARY KEY and belongs in WHERE, where it selects the row rather than merely checking it: %s", want.function, want.query, statement)
 			}
 		}
 	}
@@ -328,25 +337,38 @@ func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 // read moments earlier, so genuine contention converges. An unbounded loop only stays
 // safe while every not-applied outcome is transient, and one is not — a CAS naming a
 // value that can never match spins forever, one Paxos round per iteration, silently.
+// TestP4ACandidateRetryLoopIsBounded inspects EnsureBlockGCCandidateExact, which
+// is where the CAS retry loop actually lives.
+//
+// It used to name EnsureBlockGCCandidate. That was correct until the exact-P
+// split moved the loop into the *Exact variant and left the old name as a
+// two-line wrapper — at which point the guard was inspecting a function with no
+// loop in it at all and would have stayed green through any regression. A source
+// guard that no longer looks at the code it protects is worse than no guard, so
+// this asserts the loop is present as well as bounded.
 func TestP4ACandidateRetryLoopIsBounded(t *testing.T) {
 	file := p4aParseStore(t)
-	fn := findGCFunction(file, "EnsureBlockGCCandidate")
+	fn := findGCFunction(file, "EnsureBlockGCCandidateExact")
 	if fn == nil {
-		t.Fatal("EnsureBlockGCCandidate not found")
+		t.Fatal("EnsureBlockGCCandidateExact not found; the CAS retry loop guard cannot be verified")
 	}
-	var unbounded bool
+	var loops, unbounded int
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		loop, ok := node.(*ast.ForStmt)
 		if !ok {
 			return true
 		}
+		loops++
 		if loop.Cond == nil {
-			unbounded = true
+			unbounded++
 		}
 		return true
 	})
-	if unbounded {
-		t.Error("EnsureBlockGCCandidate's CAS retry loop must be bounded; a non-converging condition otherwise becomes a silent Paxos hot loop")
+	if loops == 0 {
+		t.Fatal("EnsureBlockGCCandidateExact has no retry loop; either the CAS retry moved again and this guard is now vacuous, or the bound was removed with it")
+	}
+	if unbounded > 0 {
+		t.Error("EnsureBlockGCCandidateExact's CAS retry loop must be bounded; a non-converging condition otherwise becomes a silent Paxos hot loop")
 	}
 }
 

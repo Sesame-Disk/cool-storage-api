@@ -159,43 +159,44 @@ type MockStore struct {
 	deleteLibraryStorageCounterErr error
 	// libraryDestructiveCalls records HardDeleteLibrary / DeleteLibraryStorageCounter
 	// in call order so tests can assert the hard delete precedes the counter cleanup.
-	libraryDestructiveCalls        []string
-	deleteLibraryStorageCounterFor map[uuid.UUID]int
-	deleteGroupFullErr             error
-	reconcileStorageCountersHook   func()
-	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
-	beginOrgPurgeHook              func(orgID uuid.UUID)
-	getBlockRefCountErr            error
-	blockExistsErr                 error
-	blockExistsCalls               int
-	libraryExistsErr               error
-	canonicalLibraryExistsErr      error
-	forceRenewLibraryLockNotOwned  bool
-	groupExistsErr                 error
-	groupExistsCalls               atomic.Int64
-	findOrgForLibraryErr           error
-	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
-	blockHasReferencesErr          error
-	blockHasReferencesGlobalErr    error
-	blockHasReferencesLocalCalls   int
-	blockHasReferencesGlobalCalls  int
-	releaseStaleBlockClaimErr      error
-	getBlockGCCandidateErr         error
-	claimBlockDeleteSettleErr      error
-	getBlockInfoHook               func(BlockInfo) BlockInfo
-	getBlockInfoErr                error
-	claimAttempts                  []BlockDeleteAuthority
-	releaseBlockClaimErr           error
-	claimBlockDeleteErr            error
-	validateDestructiveTopologyErr error
-	blockReferenceExistsErr        error
-	ensureBlockGCCandidateErr      error
-	deleteProvisionalProjectionErr error
-	getS3OrphanGlobalErr           error
-	getS3OrphanGlobalCalls         int
-	getS3OrphanGlobalHook          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
-	deleteS3OrphanErrOnce          error
-	markS3OrphanErrOnce            error
+	libraryDestructiveCalls            []string
+	deleteLibraryStorageCounterFor     map[uuid.UUID]int
+	deleteGroupFullErr                 error
+	reconcileStorageCountersHook       func()
+	acquireOrgHardDeleteLockHook       func(orgID uuid.UUID)
+	beginOrgPurgeHook                  func(orgID uuid.UUID)
+	getBlockRefCountErr                error
+	blockExistsErr                     error
+	blockExistsCalls                   int
+	libraryExistsErr                   error
+	canonicalLibraryExistsErr          error
+	forceRenewLibraryLockNotOwned      bool
+	groupExistsErr                     error
+	groupExistsCalls                   atomic.Int64
+	findOrgForLibraryErr               error
+	blockHasReferencesHook             func(orgID uuid.UUID, blockID string, current bool) (bool, error)
+	blockHasReferencesErr              error
+	blockHasReferencesGlobalErr        error
+	blockHasReferencesLocalCalls       int
+	blockHasReferencesGlobalCalls      int
+	releaseStaleBlockClaimErr          error
+	getBlockGCCandidateErr             error
+	deleteBlockGCCandidateDiscoveryErr error
+	claimBlockDeleteSettleErr          error
+	getBlockInfoHook                   func(BlockInfo) BlockInfo
+	getBlockInfoErr                    error
+	claimAttempts                      []BlockDeleteAuthority
+	releaseBlockClaimErr               error
+	claimBlockDeleteErr                error
+	validateDestructiveTopologyErr     error
+	blockReferenceExistsErr            error
+	ensureBlockGCCandidateErr          error
+	deleteProvisionalProjectionErr     error
+	getS3OrphanGlobalErr               error
+	getS3OrphanGlobalCalls             int
+	getS3OrphanGlobalHook              func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
+	deleteS3OrphanErrOnce              error
+	markS3OrphanErrOnce                error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook                func(orgID uuid.UUID, size int)
@@ -476,19 +477,25 @@ func NewMockStore() *MockStore {
 	}
 }
 
-func newMockPendingItemKey(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity) mockPendingItemKey {
+func newMockPendingItemKey(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) mockPendingItemKey {
 	return mockPendingItemKey{
 		OrgID:      orgID,
 		LibraryID:  libraryID,
 		ItemType:   itemType,
 		ItemID:     itemID,
-		IdentityAt: identityAt,
-		Target:     candidate.Target,
+		IdentityAt: identity.IdentityAt,
+		Target:     identity.Target(),
 	}
 }
 
 func sameBlockGCCandidateIdentity(left, right BlockGCCandidateIdentity) bool {
 	return left.Target == right.Target && left.CandidateAt.Equal(right.CandidateAt)
+}
+
+// sameGCItemIdentity mirrors the Cassandra primary key: two rows are the same
+// work item only when every clustering column matches.
+func sameGCItemIdentity(left, right GCItemIdentity) bool {
+	return left.IdentityAt.Equal(right.IdentityAt) && left.Target() == right.Target()
 }
 
 func newMockBlockGCCandidateKey(orgID uuid.UUID, blockID string, target BlockDeleteTarget) mockBlockGCCandidateKey {
@@ -603,10 +610,10 @@ func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvis
 	}
 }
 
-func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity, expiresAt *time.Time) {
+func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity, expiresAt *time.Time) {
 	// Mirror the Cassandra store: block pending rows are always keyed under uuid.Nil.
 	libraryID = pendingItemLibraryID(itemType, libraryID)
-	key := newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt, candidate)
+	key := newMockPendingItemKey(orgID, libraryID, itemType, itemID, identity)
 	if expiresAt == nil {
 		m.pendingItems[key] = nil
 		return
@@ -615,9 +622,9 @@ func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemT
 	m.pendingItems[key] = &expiry
 }
 
-func (m *MockStore) deletePendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, candidate BlockGCCandidateIdentity) {
+func (m *MockStore) deletePendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) {
 	libraryID = pendingItemLibraryID(itemType, libraryID)
-	delete(m.pendingItems, newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt, candidate))
+	delete(m.pendingItems, newMockPendingItemKey(orgID, libraryID, itemType, itemID, identity))
 }
 
 // --- Test helpers for seeding data ---
@@ -769,9 +776,27 @@ func (m *MockStore) SetBlockGCCandidateTargetForTest(orgID uuid.UUID, blockID st
 }
 
 // GetBlockGCCandidateForTest exposes the stored candidate for assertions.
+//
+// It deliberately REFUSES an ambiguous logical block: with exact-P identity a
+// block can legitimately hold several candidates, and answering with one of them
+// would let a test assert against whichever the map happened to yield. A test
+// that means a specific incarnation uses GetBlockGCCandidateExact.
 func (m *MockStore) GetBlockGCCandidateForTest(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool) {
-	info, ok, _ := m.GetBlockGCCandidate(orgID, blockID)
-	return info, ok
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var found BlockGCCandidateInfo
+	matches := 0
+	for _, c := range m.blockGCCandidates {
+		if c.OrgID != orgID || c.BlockID != blockID {
+			continue
+		}
+		matches++
+		found = BlockGCCandidateInfo{OrgID: c.OrgID, BlockID: c.BlockID, Target: c.Target, CandidateAt: c.CandidateAt}
+	}
+	if matches != 1 {
+		return BlockGCCandidateInfo{}, false
+	}
+	return found, true
 }
 
 func (m *MockStore) AddProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer, storageClass string, expiresAt time.Time) {
@@ -1502,22 +1527,12 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	if itemTypeRequiresBlockRepresentation(itemType) {
 		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
 	}
+	// Mirror the production guard exactly: a block work item must carry the exact
+	// incarnation a zero-ref decision authorized, and this path cannot. Tests that
+	// want a processable block item use EnqueueBlockForTest, which performs the
+	// decision first and then enqueues its identity.
 	if itemType == ItemBlock {
-		candidate, err := m.EnsureBlockGCCandidateExact(orgID, itemID, storageClass, queuedAt)
-		if err != nil {
-			return err
-		}
-		return m.EnqueueBatch([]QueueItem{{
-			OrgID:                    orgID,
-			QueuedAt:                 queuedAt,
-			IdentityAt:               candidate.CandidateAt,
-			ItemType:                 ItemBlock,
-			ItemID:                   itemID,
-			LibraryID:                uuid.Nil,
-			StorageClass:             candidate.StorageClass(),
-			BlockGCCandidateIdentity: candidate.Identity(),
-			RetryCount:               retryCount,
-		}})
+		return fmt.Errorf("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType)
 	}
 	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, storageClass, retryCount)
 	return nil
@@ -1555,7 +1570,7 @@ func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemTy
 		RetryCount:                  retryCount,
 	}
 	m.queue[orgID] = append(m.queue[orgID], item)
-	m.upsertPendingItem(orgID, libraryID, itemType, itemID, queuedAt, BlockGCCandidateIdentity{}, nil)
+	m.upsertPendingItem(orgID, libraryID, itemType, itemID, GCItemIdentityAt(queuedAt), nil)
 	m.activeQueueOrgs[orgID] = time.Now().UTC()
 	m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 }
@@ -1577,46 +1592,44 @@ func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 	for _, item := range items {
 		item.IdentityAt = effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 		m.queue[item.OrgID] = append(m.queue[item.OrgID], item)
-		m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, item.IdentityAt, item.BlockGCCandidateIdentity, nil)
+		m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, item.Identity(), nil)
 		m.activeQueueOrgs[item.OrgID] = time.Now().UTC()
 		m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
 	}
 	return nil
 }
 
-func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) (bool, error) {
+func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	candidate := queueCandidateIdentity(candidates)
-	wantedIdentityAt := queueIdentityAt(queuedAt, identityAt, candidate)
+	identity = identity.resolved(queuedAt)
 	for _, item := range m.queue[orgID] {
-		if item.QueuedAt.Equal(queuedAt) && effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(wantedIdentityAt) && item.ItemType == itemType && item.ItemID == itemID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) {
+		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (m *MockStore) PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) (bool, error) {
+func (m *MockStore) PendingItemExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	libraryID = pendingItemLibraryID(itemType, libraryID)
-	candidate := queueCandidateIdentity(candidates)
 	now := time.Now().UTC()
 	for key, expiresAt := range m.pendingItems {
-		if key.OrgID != orgID || key.LibraryID != libraryID || key.ItemType != itemType || key.ItemID != itemID || key.Target != candidate.Target {
+		if key.OrgID != orgID || key.LibraryID != libraryID || key.ItemType != itemType || key.ItemID != itemID || key.Target != identity.Target() {
 			continue
 		}
 		if expiresAt != nil && !expiresAt.After(now) {
 			delete(m.pendingItems, key)
 			continue
 		}
-		if identityAt.IsZero() || key.IdentityAt.Equal(identityAt) {
+		if identity.IdentityAt.IsZero() || key.IdentityAt.Equal(identity.IdentityAt) {
 			return true, nil
 		}
 	}
 	for _, item := range m.failedItems[orgID] {
-		if item.ItemType == itemType && item.ItemID == itemID && item.LibraryID == libraryID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) && (identityAt.IsZero() || effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(identityAt)) {
+		if item.ItemType == itemType && item.ItemID == itemID && item.LibraryID == libraryID && item.BlockGCCandidateIdentity.Target == identity.Target() && (identity.IdentityAt.IsZero() || effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(identity.IdentityAt)) {
 			return true, nil
 		}
 	}
@@ -1645,17 +1658,16 @@ func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Tim
 	return result, nil
 }
 
-func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt, identityAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	candidate := queueCandidateIdentity(candidates)
-	wantedIdentityAt := queueIdentityAt(queuedAt, identityAt, candidate)
+	identity = identity.resolved(queuedAt)
 
 	items := m.queue[orgID]
 	for i, item := range items {
-		if item.QueuedAt.Equal(queuedAt) && effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(wantedIdentityAt) && item.ItemType == itemType && item.ItemID == itemID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) {
+		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			m.queue[orgID] = append(items[:i], items[i+1:]...)
-			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.BlockGCCandidateIdentity)
+			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, item.Identity())
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 			return nil
 		}
@@ -1663,11 +1675,10 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt, identityAt time.Time
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode, candidates ...BlockGCCandidateIdentity) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	candidate := queueCandidateIdentity(candidates)
-	wantedIdentityAt := queueIdentityAt(oldQueuedAt, identityAt, candidate)
+	identity = identity.resolved(oldQueuedAt)
 
 	if m.requeueItemErr != nil {
 		return m.requeueItemErr
@@ -1675,20 +1686,20 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 
 	items := m.queue[orgID]
 	for i, item := range items {
-		if item.QueuedAt.Equal(oldQueuedAt) && effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(wantedIdentityAt) && item.ItemType == itemType && item.ItemID == itemID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) {
+		if item.QueuedAt.Equal(oldQueuedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			// Remove the old item
 			m.queue[orgID] = append(items[:i], items[i+1:]...)
 
 			// Append the new recreated item
 			newItem := item
 			newItem.QueuedAt = newQueuedAt
-			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
+			newItem.IdentityAt = identity.IdentityAt
 			newItem.RequiresLibraryDeletedCheck = item.RequiresLibraryDeletedCheck
 			newItem.LibraryGuardMode = effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 			newItem.BlockRepresentationID = strings.TrimSpace(blockRepresentationID)
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
-			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.IdentityAt, newItem.BlockGCCandidateIdentity, nil)
+			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.Identity(), nil)
 			m.activeQueueOrgs[orgID] = time.Now().UTC()
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 
@@ -1736,7 +1747,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, fail
 		FailureCode:                 failureCode,
 	})
 	expiresAt := failedAt.Add(gcFailedItemRetention)
-	m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.BlockGCCandidateIdentity, &expiresAt)
+	m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, item.Identity(), &expiresAt)
 	m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
 	return nil
 }
@@ -1808,7 +1819,7 @@ func (m *MockStore) ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GC
 			if !db.GCProjectionUTCDate(expiresAt).Equal(projectionDay) {
 				continue
 			}
-			if failedItemExpiryBucket(orgID.String(), item.FailedAt, string(item.ItemType), item.ItemID, identityAt, item.BlockGCCandidateIdentity) != bucket {
+			if db.GCFailedItemExpiryBucket(orgID.String(), item.FailedAt, string(item.ItemType), item.ItemID, item.BlockGCCandidateIdentity.Target.StorageClass, item.BlockGCCandidateIdentity.Target.StorageKey, identityAt) != bucket {
 				continue
 			}
 			result = append(result, GCFailedItemExpiryInfo{
@@ -1818,7 +1829,7 @@ func (m *MockStore) ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GC
 				IdentityAt:               identityAt,
 				ItemType:                 item.ItemType,
 				ItemID:                   item.ItemID,
-				BlockGCCandidateIdentity: storedBlockGCCandidateIdentity(item.ItemType, item.BlockGCCandidateIdentity.Target.StorageClass, item.BlockGCCandidateIdentity.Target.StorageKey, identityAt),
+				BlockGCCandidateIdentity: storedGCItemIdentity(item.ItemType, item.BlockGCCandidateIdentity.Target.StorageClass, item.BlockGCCandidateIdentity.Target.StorageKey, identityAt).BlockCandidate,
 			})
 		}
 	}
@@ -1869,11 +1880,11 @@ func (m *MockStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, e
 	return results, nil
 }
 
-func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
-	return m.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, candidates...)
+func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	return m.DeleteFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, identity)
 }
 
-func (m *MockStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, candidates ...BlockGCCandidateIdentity) error {
+func (m *MockStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1885,12 +1896,12 @@ func (m *MockStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	candidate := queueCandidateIdentity(candidates)
+	identity = identity.resolved(failedAt)
 	items := m.failedItems[orgID]
 	for i, item := range items {
-		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) {
+		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
-			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.BlockGCCandidateIdentity)
+			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, item.Identity())
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 			return nil
 		}
@@ -1903,7 +1914,7 @@ func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now t
 	defer m.mu.Unlock()
 	items := m.failedItems[expiry.OrgID]
 	for i, item := range items {
-		if item.FailedAt.Equal(expiry.FailedAt) && item.ItemType == expiry.ItemType && item.ItemID == expiry.ItemID && effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(effectiveFailedItemExpiryIdentity(expiry)) && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, expiry.BlockGCCandidateIdentity) {
+		if item.FailedAt.Equal(expiry.FailedAt) && item.ItemType == expiry.ItemType && item.ItemID == expiry.ItemID && sameGCItemIdentity(item.Identity(), expiry.Identity()) {
 			expiresAt := item.ExpiresAt
 			if expiresAt.IsZero() {
 				expiresAt = item.FailedAt.Add(gcFailedItemRetention)
@@ -1912,7 +1923,7 @@ func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now t
 				return false, nil
 			}
 			m.failedItems[expiry.OrgID] = append(items[:i], items[i+1:]...)
-			m.deletePendingItem(expiry.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.BlockGCCandidateIdentity)
+			m.deletePendingItem(expiry.OrgID, item.LibraryID, item.ItemType, item.ItemID, item.Identity())
 			m.dirtyQueueOrgs[expiry.OrgID] = time.Now().UTC()
 			return true, nil
 		}
@@ -1921,11 +1932,11 @@ func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now t
 	return false, nil
 }
 
-func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidates ...BlockGCCandidateIdentity) error {
-	return m.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt, candidates...)
+func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error {
+	return m.RequeueFailedItemContext(context.Background(), orgID, failedAt, itemType, itemID, queuedAt, identity)
 }
 
-func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, candidates ...BlockGCCandidateIdentity) error {
+func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time, identity GCItemIdentity) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1937,10 +1948,10 @@ func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUI
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	candidate := queueCandidateIdentity(candidates)
+	identity = identity.resolved(failedAt)
 	items := m.failedItems[orgID]
 	for i, item := range items {
-		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameBlockGCCandidateIdentity(item.BlockGCCandidateIdentity, candidate) {
+		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			// Mirror CassandraStore.RequeueFailedItem: this path writes straight
 			// into the queue, so re-assert the block-representation invariant that
 			// EnqueueBatch would otherwise enforce.
@@ -1967,7 +1978,7 @@ func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUI
 				BlockGCCandidateIdentity:    item.BlockGCCandidateIdentity,
 				RetryCount:                  0,
 			})
-			m.upsertPendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.BlockGCCandidateIdentity, nil)
+			m.upsertPendingItem(orgID, item.LibraryID, itemType, itemID, item.Identity(), nil)
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
 			m.activeQueueOrgs[orgID] = queuedAt
 			m.dirtyQueueOrgs[orgID] = queuedAt
@@ -2502,11 +2513,6 @@ func (m *MockStore) EnsureBlockGCCandidateExact(orgID uuid.UUID, blockID, storag
 	return BlockGCCandidateInfo{OrgID: candidate.OrgID, BlockID: candidate.BlockID, Target: candidate.Target, CandidateAt: candidate.CandidateAt}, m.ensureBlockGCCandidateErrAfterMutate
 }
 
-func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	candidate, err := m.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, candidateAt)
-	return candidate.CandidateAt, err
-}
-
 // resolveBlockDeleteTargetLocked mirrors the Cassandra store: a candidate cannot exist
 // without the exact incarnation it is authorized for.
 func (m *MockStore) resolveBlockDeleteTargetLocked(orgID uuid.UUID, blockID string) (BlockDeleteTarget, error) {
@@ -2519,24 +2525,6 @@ func (m *MockStore) resolveBlockDeleteTargetLocked(orgID uuid.UUID, blockID stri
 		return BlockDeleteTarget{}, fmt.Errorf("%w: org=%s block=%s canonical row has no usable locator %s", ErrBlockCandidateTargetUnavailable, orgID, blockID, target)
 	}
 	return target, nil
-}
-
-func (m *MockStore) GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.getBlockGCCandidateErr != nil {
-		return BlockGCCandidateInfo{}, false, m.getBlockGCCandidateErr
-	}
-	c, ok := m.legacyBlockGCCandidateLocked(orgID, blockID)
-	if !ok {
-		return BlockGCCandidateInfo{}, false, nil
-	}
-	return BlockGCCandidateInfo{
-		OrgID:       c.OrgID,
-		BlockID:     c.BlockID,
-		Target:      c.Target,
-		CandidateAt: c.CandidateAt,
-	}, true, nil
 }
 
 func (m *MockStore) GetBlockGCCandidateExact(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) (BlockGCCandidateInfo, bool, error) {
@@ -2583,23 +2571,38 @@ func (m *MockStore) SetGetBlockGCCandidateErrForTest(err error) {
 	m.getBlockGCCandidateErr = err
 }
 
+// DeleteBlockGCCandidateDiscovery mirrors the Cassandra store: it retires exactly
+// one discovery row and never touches a canonical candidate.
+func (m *MockStore) DeleteBlockGCCandidateDiscovery(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if candidate.CandidateAt.IsZero() || candidate.Target.IsZero() {
+		return fmt.Errorf("block %s: refusing to delete a gc candidate discovery row without its exact identity", blockID)
+	}
+	if m.deleteBlockGCCandidateDiscoveryErr != nil {
+		return m.deleteBlockGCCandidateDiscoveryErr
+	}
+	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidate.Target, candidate.CandidateAt))
+	return nil
+}
+
 func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if candidate.CandidateAt.IsZero() || candidate.Target.IsZero() {
 		return fmt.Errorf("block %s: refusing to delete a gc candidate without its exact identity", blockID)
 	}
+	if m.deleteBlockGCCandidateDiscoveryErr != nil {
+		return m.deleteBlockGCCandidateDiscoveryErr
+	}
 	key := newMockBlockGCCandidateKey(orgID, blockID, candidate.Target)
-	existing, ok := m.blockGCCandidates[key]
-	if !ok {
-		return nil
+	if existing, ok := m.blockGCCandidates[key]; ok && existing.CandidateAt.Equal(candidate.CandidateAt.UTC()) {
+		delete(m.blockGCCandidates, key)
 	}
-	if existing.Target != candidate.Target || !existing.CandidateAt.Equal(candidate.CandidateAt.UTC()) {
-		// No longer the candidate that was observed: another lifecycle owns it now.
-		return nil
-	}
-	delete(m.blockGCCandidates, key)
-	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, existing.Target, existing.CandidateAt))
+	// Whether or not the canonical row was still ours, the discovery row for THIS
+	// exact identity is retired: it can only be this lifecycle's row, and leaving
+	// it standing is what makes a settled candidate rediscoverable forever.
+	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidate.Target, candidate.CandidateAt))
 	return nil
 }
 
@@ -4486,4 +4489,82 @@ func (m *MockStore) AllBlockGCCandidates() []BlockGCCandidateInfo {
 		return out[i].BlockID < out[j].BlockID
 	})
 	return out
+}
+
+// SetDeleteBlockGCCandidateDiscoveryErr makes the discovery cleanup fail, so a
+// test can prove that a projection which cannot be retired postpones the item
+// instead of completing it and leaving the row to be rediscovered forever.
+func (m *MockStore) SetDeleteBlockGCCandidateDiscoveryErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleteBlockGCCandidateDiscoveryErr = err
+}
+
+// BlockGCCandidateProjectionsForTest returns every discovery row currently
+// published, so a test can assert that a settled candidate left none behind.
+func (m *MockStore) BlockGCCandidateProjectionsForTest(orgID uuid.UUID, blockID string) []BlockGCCandidateInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var rows []BlockGCCandidateInfo
+	for key := range m.blockGCCandidateProjections {
+		if key.OrgID != orgID || key.BlockID != blockID {
+			continue
+		}
+		rows = append(rows, BlockGCCandidateInfo{OrgID: key.OrgID, BlockID: key.BlockID, Target: key.Target, CandidateAt: key.CandidateAt})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].CandidateAt.Equal(rows[j].CandidateAt) {
+			return rows[i].CandidateAt.Before(rows[j].CandidateAt)
+		}
+		return rows[i].Target.StorageKey < rows[j].Target.StorageKey
+	})
+	return rows
+}
+
+// EnqueueBlockForTest is the test-support replacement for the raw EnqueueItem
+// path that used to accept ItemBlock.
+//
+// That path was removed from production because "enqueue" must not be able to
+// mint destructive authority: a block work item is legitimate only when a
+// zero-ref decision already produced a candidate for an exact P. Tests still
+// need a one-liner that sets up a processable block item, so the decision and
+// the enqueue happen here, explicitly and in that order — exactly what
+// Service.EnqueueBlock and Worker.enqueueZeroRefBlocks do.
+func (m *MockStore) EnqueueBlockForTest(orgID uuid.UUID, queuedAt time.Time, blockID string, storageClass string, retryCount int) error {
+	candidate, err := m.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, queuedAt)
+	if err != nil {
+		return err
+	}
+	return m.EnqueueBatch([]QueueItem{{
+		OrgID:                    orgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 ItemBlock,
+		ItemID:                   blockID,
+		LibraryID:                uuid.Nil,
+		StorageClass:             candidate.StorageClass(),
+		BlockGCCandidateIdentity: candidate.Identity(),
+		RetryCount:               retryCount,
+	}})
+}
+
+// AddFailedItemForTest seeds a DLQ row directly, so a test can construct two
+// lifecycles that differ only in identity_at.
+func (m *MockStore) AddFailedItemForTest(item GCFailedItemInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if item.ExpiresAt.IsZero() {
+		item.ExpiresAt = item.FailedAt.Add(gcFailedItemRetention)
+	}
+	m.failedItems[item.OrgID] = append(m.failedItems[item.OrgID], item)
+}
+
+// DeleteBlockGCCandidateCanonicalForTest removes ONLY the canonical candidate row,
+// leaving its discovery row standing. That is the shape a settlement leaves behind
+// when the canonical delete commits and the projection delete does not, and it is
+// the state the R26 self-heal has to converge from.
+func (m *MockStore) DeleteBlockGCCandidateCanonicalForTest(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blockGCCandidates, newMockBlockGCCandidateKey(orgID, blockID, candidate.Target))
 }

@@ -313,7 +313,7 @@ func TestQueue_BlockCandidateIdentityIsRequiredAndSurvivesRetryAndDLQ(t *testing
 	if len(failed) != 1 || failed[0].BlockGCCandidateIdentity != candidate.Identity() {
 		t.Fatalf("failed item identity = %+v, want %+v", failed, candidate.Identity())
 	}
-	if err := store.RequeueFailedItem(orgID, failed[0].FailedAt, ItemBlock, candidate.BlockID, time.Now().UTC(), candidate.Identity()); err != nil {
+	if err := store.RequeueFailedItem(orgID, failed[0].FailedAt, ItemBlock, candidate.BlockID, time.Now().UTC(), candidate.ItemIdentity()); err != nil {
 		t.Fatalf("RequeueFailedItem: %v", err)
 	}
 	if requeued := store.QueueItems(orgID); len(requeued) != 1 || requeued[0].BlockGCCandidateIdentity != candidate.Identity() || !requeued[0].IdentityAt.Equal(candidate.CandidateAt) {

@@ -432,10 +432,10 @@ func TestService_DLQMutationsRefusedWhenDisabled(t *testing.T) {
 	orgID := uuid.New()
 	failedAt := time.Now().UTC()
 
-	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCDisabled) {
+	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt)); !errors.Is(err, ErrGCDisabled) {
 		t.Errorf("DeleteFailedItem error = %v, want ErrGCDisabled", err)
 	}
-	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCDisabled) {
+	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt)); !errors.Is(err, ErrGCDisabled) {
 		t.Errorf("RequeueFailedItem error = %v, want ErrGCDisabled", err)
 	}
 }
@@ -453,10 +453,10 @@ func TestService_DLQMutationsRefusedBeforeStart(t *testing.T) {
 	orgID := uuid.New()
 	failedAt := time.Now().UTC()
 
-	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCNotRunning) {
+	if err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt)); !errors.Is(err, ErrGCNotRunning) {
 		t.Errorf("DeleteFailedItem error = %v, want ErrGCNotRunning", err)
 	}
-	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1"); !errors.Is(err, ErrGCNotRunning) {
+	if err := svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt)); !errors.Is(err, ErrGCNotRunning) {
 		t.Errorf("RequeueFailedItem error = %v, want ErrGCNotRunning", err)
 	}
 }
@@ -484,10 +484,10 @@ func TestService_DLQMutationsRefusedAfterStopWithoutReclaimingLease(t *testing.T
 		fn   func() error
 	}{
 		{name: "delete", fn: func() error {
-			return svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1")
+			return svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt))
 		}},
 		{name: "requeue", fn: func() error {
-			return svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1")
+			return svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "block-1", GCItemIdentityAt(failedAt))
 		}},
 	} {
 		t.Run(op.name, func(t *testing.T) {
@@ -520,7 +520,7 @@ func TestService_StopWaitsForInFlightDLQClaimBeforeReleasingLease(t *testing.T) 
 	lease.delay = 100 * time.Millisecond
 	dlqDone := make(chan struct{})
 	go func() {
-		_ = svc.RequeueFailedItem(uuid.New(), time.Now().UTC(), ItemBlock, "block-1")
+		_ = svc.RequeueFailedItem(uuid.New(), time.Now().UTC(), ItemBlock, "block-1", GCItemIdentityAt(time.Now().UTC()))
 		close(dlqDone)
 	}()
 

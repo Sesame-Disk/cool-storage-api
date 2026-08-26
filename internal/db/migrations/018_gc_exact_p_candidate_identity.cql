@@ -1,14 +1,34 @@
 -- Migration 018: make the exact physical candidate identity part of every GC key.
 --
 -- A block candidate is identified by P = (storage_class, storage_key) and the
--- candidate_at lifecycle instant. The legacy tables cannot add clustering keys.
+-- candidate_at lifecycle instant. Two lives of one logical block must occupy two
+-- rows, everywhere GC work is durable: the canonical candidate, its discovery
+-- projection, the queue, the pending markers and the DLQ. Cassandra cannot add
+-- clustering columns to an existing table, so these are recreated.
 --
--- This migration is intentionally destructive: this release is deployed into a
--- clean Cassandra keyspace with no GC state and no mixed-version traffic. It MUST
--- run before any DC starts a SesameFS process. Dropping the old tables makes an
--- accidental rolling upgrade fail visibly instead of silently collapsing P1 and
--- P2 back into one queue, pending, or DLQ row. It is not an upgrade migration.
--- Non-block GC rows use empty P values.
+-- THIS MIGRATION IS DESTRUCTIVE AND IS NOT AN UPGRADE. It drops the tables it
+-- recreates. It is correct only for the contract this release ships under: a
+-- clean keyspace, migrated before any node starts producing GC work.
+--
+-- That contract is ENFORCED, not merely documented. Migrator.preflightDestructive
+-- refuses to apply any table-dropping migration whose targets still hold rows, so
+-- running this release against a keyspace that already accumulated GC work fails
+-- at startup with the offending table named, instead of silently erasing queue,
+-- pending and DLQ state — including the non-block item types that have nothing to
+-- do with this change. See internal/db/migrator.go.
+--
+-- Dropping rather than altering also makes an accidental rolling upgrade fail
+-- visibly: a binary from before this release inserts into gc_queue without the
+-- clustering columns and is rejected by the engine, rather than collapsing P1 and
+-- P2 back into one row.
+--
+-- Migration 017 added storage_key to gc_block_candidates as a payload column and
+-- recorded that folding P into the projection's PRIMARY KEY was deliberately out
+-- of scope. This migration is that follow-up; 017 still applies first on a fresh
+-- keyspace and is then superseded here. It is left untouched because editing an
+-- applied migration breaks its recorded checksum.
+--
+-- Non-block GC rows carry empty P values, and are identified by identity_at.
 
 DROP TABLE IF EXISTS gc_failed_items_by_expiry;
 DROP TABLE IF EXISTS gc_failed_items;

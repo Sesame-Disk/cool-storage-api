@@ -8,6 +8,92 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-26 - R26 exact-`P` GC work-item identity (candidate / projection / queue / pending / DLQ)
+
+Makes the exact physical incarnation part of the durable IDENTITY of a GC work item,
+not a payload column riding beside it. P4a bound destructive AUTHORITY to an exact
+`P = (storage_class, storage_key)`; this binds the ROWS. Two lives of one logical block
+now occupy two rows on every surface that carries GC work.
+
+**The defect this closes.** `gc_block_candidates` was keyed `((org_id, block_id))` — one
+logical row per block — so a lifecycle that started on `P1` and finished after `P2` was
+minted had to *decide* which life owned that row. `replaceBlockGCCandidateIncarnation`
+made that decision by rewriting the row from one incarnation to another, and a delayed
+`Ensure(P1)` could therefore destroy the only candidate authorizing `P2`. Not a wrong
+delete — a lost work item, silently, with no fence left behind to notice. The queue,
+pending and DLQ tables had the same shape one layer out: keyed on the logical block, so
+`P1` and `P2` collapsed back into one row immediately after discovery.
+
+CAS could not fix this. `blocks` and `gc_block_candidates` are different surfaces, so an
+extra `SERIAL` read only moves the TOCTOU; the fix is structural.
+
+**What changed**
+- Migration `018` recreates the six GC tables with `P` — and `identity_at` — as
+  clustering columns: `gc_block_candidates`, `gc_block_candidates_by_day`, `gc_queue`,
+  `gc_pending_items`, `gc_failed_items`, `gc_failed_items_by_expiry`. Cassandra cannot
+  add clustering columns by `ALTER`, so these are dropped and recreated. It consolidates
+  everything `003`/`010`/`011` had added (LCS + tombstone settings, `block_representation_id`,
+  `library_guard_mode`, TTLs, clustering order).
+- `replaceBlockGCCandidateIncarnation` is DELETED. The operation it expressed — one
+  incarnation replacing another inside a single row — no longer exists, and with it the
+  ~25 lines of pre-017 legacy handling: a candidate with a NULL `storage_key` cannot exist
+  when the key is part of the primary key. Earliest-wins is now scoped to one `P`.
+- `GCItemIdentity{IdentityAt, BlockCandidate}` is a REQUIRED argument on every store
+  method that addresses a durable row. It replaces variadic `candidate ...` parameters
+  where omitting the identity compiled and silently operated on the `('','')` row. The
+  compiler now rejects that.
+- The DLQ admin selector names `identity_at` for EVERY item type, not just blocks.
+  `identity_at` is a clustering column of `gc_failed_items` for all of them, so the old
+  prefix + `LIMIT 1` read could delete or requeue a different lifecycle than the operator
+  was looking at.
+- `DeleteBlockGCCandidate` retires its discovery row on BOTH CAS outcomes, and reports a
+  failure instead of logging it. Previously a settlement whose canonical half applied and
+  whose projection half failed left a shape with no exit: the scanner re-enumerated the
+  orphaned projection, rebuilt the same work item, the worker correctly no-op'd it, and
+  the next scan produced it again — forever. The worker retires the row on that path too.
+  Deleting it unconditionally is safe ONLY because the projection is now keyed by the full
+  identity: the statement can name `P1`'s row and nothing else.
+- `EnqueueItem` refuses `ItemBlock`. A block work item is legitimate only when a zero-ref
+  DECISION produced a candidate for an exact `P`; the raw single-row path has none to
+  carry, and minting one there let "enqueue" fabricate destructive authority.
+- The DLQ expiry projection has ONE writer surface again. `internal/db` owns both halves
+  of its key — the columns and the bucket hash, now named `GCFailedItemExpiryBucket` — and
+  the duplicate copies in the GC store are gone, along with two block-candidate discovery
+  helpers that had no production caller. Same single-writer rule R22a enforces for orphans.
+
+**Migration 018 is destructive, and the contract is now ENFORCED.** It drops the tables it
+recreates, which is correct only for this release's contract: a clean keyspace, migrated
+before any node produces GC work. `Migrator.preflightDestructive` refuses any
+table-dropping migration whose targets still hold rows, so running this against a keyspace
+with existing GC work fails at startup with the table named rather than erasing queue,
+pending and DLQ state — including the non-block item types unrelated to this change. The
+check is generic, so the next destructive migration inherits the barrier.
+
+**Evidence**
+- Mock: the `A captures P1 / P2 installed / delayed P1 enqueue` race, `same candidate_at
+  distinct P`, the rediscovery-loop self-heal, the earliest-wins stale-item path, and the
+  non-block DLQ selector.
+- Real Cassandra (`SESAMEFS_REQUIRE_R26_EVIDENCE=1`): `TestR26_TwoIncarnationsCoexistAcrossEveryDurableSurface`
+  proves candidate, projection, queue and pending each hold `P1` and `P2` as separate rows
+  and that settling `P1` leaves every `P2` row standing. A map-backed mock keeps rows apart
+  under any key the Go code invents; only the engine can answer this. Plus the exact-identity
+  discovery retire, the non-block DLQ selector, and the destructive preflight closing on a
+  table that holds a row.
+- Source gates: `TestR26MutationsNameTheExactIdentity` (no mutation may address a row
+  prefix), `TestR26SingleRowReadsNameTheExactIdentity`, and
+  `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`.
+- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: 30 mutations, each removing
+  one invariant and each required to go red with the matching assertion. Seven are new;
+  one existing P4a mutation had silently stopped applying when the candidate `DELETE`
+  moved `P` from its `IF` into its `WHERE`, and `TestP4A_ReplacedCandidateServesItsOwnGracePeriod`
+  had stopped reaching the grace check at all — both are repaired here.
+
+**Scope.** This closes the block-candidate / work-item half of R26. The `gc_s3_orphans` and
+`gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains
+OPEN, as do P4b/R14b, R15 and the orphan-side R20. `GC_ENABLED=false` continues.
+
+---
+
 ## 2026-08-26 - P4a exact-`P`, per-attempt GC claim authority (R14a / R16 / R20 claim path)
 
 Fixes the identity of the destructive claim. A candidate created for one physical

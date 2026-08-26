@@ -2401,7 +2401,7 @@ func (s *Server) handleGCRun(c *gin.Context) {
 	}
 }
 
-func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemType, string, gc.BlockGCCandidateIdentity, error) {
+func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemType, string, gc.GCItemIdentity, error) {
 	orgIDStr := strings.TrimSpace(c.Query("org_id"))
 	if orgIDStr == "" {
 		orgIDStr = strings.TrimSpace(c.PostForm("org_id"))
@@ -2452,7 +2452,7 @@ func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemTyp
 			IdentityAt            string `json:"identity_at"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
-			return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("invalid json body: %w", err)
+			return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("invalid json body: %w", err)
 		}
 		if orgIDStr == "" {
 			orgIDStr = strings.TrimSpace(body.OrgID)
@@ -2482,39 +2482,50 @@ func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemTyp
 
 	orgID, err := uuid.Parse(orgIDStr)
 	if err != nil {
-		return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("invalid org_id")
+		return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("invalid org_id")
 	}
 	failedAt, err := time.Parse(time.RFC3339Nano, failedAtStr)
 	if err != nil {
 		failedAt, err = time.Parse(time.RFC3339, failedAtStr)
 		if err != nil {
-			return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("invalid failed_at")
+			return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("invalid failed_at")
 		}
 	}
 	if itemTypeStr == "" {
-		return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("item_type is required")
+		return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("item_type is required")
 	}
 	if itemID == "" {
-		return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("item_id is required")
+		return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("item_id is required")
 	}
-	candidate := gc.BlockGCCandidateIdentity{Target: gc.BlockDeleteTarget{StorageClass: candidateStorageClass, StorageKey: candidateStorageKey}}
-	if gc.ItemType(itemTypeStr) == gc.ItemBlock {
+	// identity_at is a clustering column of gc_failed_items for EVERY item type, so
+	// every admin mutation must name it — not just the block ones. A selector that
+	// omits it addresses a prefix, and the row an operator sees is not necessarily
+	// the row the delete or requeue would hit.
+	itemType := gc.ItemType(itemTypeStr)
+	identityAt, err := time.Parse(time.RFC3339Nano, identityAtStr)
+	if err != nil {
+		return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("identity_at is required and must be RFC3339")
+	}
+	identity := gc.GCItemIdentity{IdentityAt: identityAt}
+	if itemType == gc.ItemBlock {
+		// A block item additionally names the exact physical incarnation. Fail closed:
+		// nothing may guess a storage key, and candidate_at IS the identity instant.
 		candidateAt, err := time.Parse(time.RFC3339Nano, candidateAtStr)
 		if err != nil {
-			return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("invalid candidate_at")
+			return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("invalid candidate_at")
 		}
-		candidate.CandidateAt = candidateAt
-		if candidate.Target.IsZero() {
-			return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("block failed item requires exact candidate identity")
+		if !candidateAt.Equal(identityAt) {
+			return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("block failed item requires candidate_at to equal identity_at")
 		}
-	} else if identityAtStr != "" {
-		identityAt, err := time.Parse(time.RFC3339Nano, identityAtStr)
-		if err != nil {
-			return uuid.Nil, time.Time{}, "", "", gc.BlockGCCandidateIdentity{}, fmt.Errorf("invalid identity_at")
+		identity.BlockCandidate = gc.BlockGCCandidateIdentity{
+			Target:      gc.BlockDeleteTarget{StorageClass: candidateStorageClass, StorageKey: candidateStorageKey},
+			CandidateAt: candidateAt,
 		}
-		candidate.CandidateAt = identityAt
+		if identity.BlockCandidate.Target.IsZero() {
+			return uuid.Nil, time.Time{}, "", "", gc.GCItemIdentity{}, fmt.Errorf("block failed item requires exact candidate identity")
+		}
 	}
-	return orgID, failedAt, gc.ItemType(itemTypeStr), itemID, candidate, nil
+	return orgID, failedAt, itemType, itemID, identity, nil
 }
 
 func (s *Server) handleGCFailedItems(c *gin.Context) {
@@ -2615,12 +2626,12 @@ func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 	if s.rejectGCFailedItemMutationBeforeSelector(c) {
 		return
 	}
-	orgID, failedAt, itemType, itemID, candidate, err := parseGCFailedItemSelector(c)
+	orgID, failedAt, itemType, itemID, identity, err := parseGCFailedItemSelector(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.RequeueFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID, candidate); err != nil {
+	if err := s.gcService.RequeueFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID, identity); err != nil {
 		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
@@ -2635,12 +2646,12 @@ func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
 	if s.rejectGCFailedItemMutationBeforeSelector(c) {
 		return
 	}
-	orgID, failedAt, itemType, itemID, candidate, err := parseGCFailedItemSelector(c)
+	orgID, failedAt, itemType, itemID, identity, err := parseGCFailedItemSelector(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.gcService.DeleteFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID, candidate); err != nil {
+	if err := s.gcService.DeleteFailedItemContext(c.Request.Context(), orgID, failedAt, itemType, itemID, identity); err != nil {
 		if isGCAdminMutationRefusal(err) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
