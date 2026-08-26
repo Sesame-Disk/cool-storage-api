@@ -156,8 +156,7 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// An earlier attempt claimed the row and its process died before releasing.
-	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
-	_ = seededClaim
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	// A writer republishes the content afterwards.
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
@@ -209,8 +208,7 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// Another worker is walking this same candidate right now and holds the claim.
-	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
-	_ = seededClaim
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -303,8 +301,7 @@ func TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget(t *testing.T) {
 	// via the store rather than by moving the worker's clock forward — see
 	// BackdateBlockClaimForTest for why a future clock would make the multi-pass
 	// assertion below vacuous.
-	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
-	_ = seededClaim
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
 
 	// Permanent and item-specific — the shape of an unknown column or a serialization
@@ -570,8 +567,7 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	// "a failed release of an actual fence preserves the candidate". Those differ
 	// exactly where it matters: the second is the case where consuming the candidate
 	// strands the block.
-	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
-	_ = seededClaim
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	// Age the claim past the staleness threshold so the release is one that WOULD
 	// succeed. Done on the row rather than by moving w.clock() forward: a future
 	// worker clock requeues postponed items past DequeueBatch's time.Now() cutoff, so

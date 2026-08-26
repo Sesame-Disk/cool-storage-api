@@ -248,9 +248,9 @@ func TestP3_WriterInAnotherDatacenterObservesTheFence(t *testing.T) {
 		ClaimID:   "p3-multidc-" + uuid.NewString(),
 		ClaimedAt: time.Now().UTC(),
 	}
-	outcome2, err := store.ClaimBlockDelete(orgUUID, blockID, authority)
-	if err != nil || outcome2 != gcpkg.BlockClaimAcquired {
-		t.Fatalf("claim P1 from dc-eu = %s, %v; want acquired", outcome2, err)
+	outcome2Res, err := store.ClaimBlockDelete(orgUUID, blockID, authority)
+	if err != nil || outcome2Res.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("claim P1 from dc-eu = %s, %v; want acquired", outcome2Res.Outcome, err)
 	}
 	if _, err := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC()); err != nil {
 		t.Fatalf("publish orphan fence from dc-eu: %v", err)

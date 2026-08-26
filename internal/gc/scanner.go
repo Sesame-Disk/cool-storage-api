@@ -204,6 +204,15 @@ func (s *Scanner) promoteBlockIfUnreferenced(orgID uuid.UUID, blockID, storageCl
 		return nil
 	}
 	if _, err := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, now); err != nil {
+		if errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+			// Nothing reclaimable: the block has no canonical row, or none with a usable
+			// locator. Reporting that as a phase error would keep the expiry projection
+			// row alive and re-fail on it every Phase 0 cycle, forever, over a block that
+			// has nothing to collect.
+			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("scanner").Inc()
+			log.Printf("[GC Scanner] Phase 0: block %s in org=%s has nothing reclaimable (%v); resolving the expired provisional ref without a candidate", blockID, orgID, err)
+			return nil
+		}
 		return fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", orgID, blockID, err)
 	}
 	return nil

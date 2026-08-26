@@ -744,9 +744,9 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 		t.Fatalf("advance stale orphan phase: %v", err)
 	}
 	authority := store.BlockDeleteAuthorityForTest(orgID, blockID, "claim-1", time.Now().UTC())
-	outcome, err := store.ClaimBlockDelete(orgID, blockID, authority)
-	if err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("claim block delete: outcome=%s err=%v", outcome, err)
+	claim, err := store.ClaimBlockDelete(orgID, blockID, authority)
+	if err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
 	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
@@ -1044,9 +1044,9 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "orph-claimed", "hot", 0)
 	claimed := store.BlockDeleteAuthorityForTest(orgID, "orph-claimed", "claim-1", time.Now().UTC())
-	outcome, err := store.ClaimBlockDelete(orgID, "orph-claimed", claimed)
-	if err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("claim block delete: outcome=%s err=%v", outcome, err)
+	claim, err := store.ClaimBlockDelete(orgID, "orph-claimed", claimed)
+	if err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
 	seedS3Orphan(t, store, orgID, "orph-claimed", "hot", "", "", time.Now())
 

@@ -24,10 +24,14 @@ logical block (R14), and it would overwrite `gc_state='repairing_stub'`, a claim
 the upload path.
 
 **What changed**
-- Migration `017` adds `storage_key` to `gc_block_candidates` and its `_by_day`
-  projection. `EnsureBlockGCCandidate` captures `P` from the canonical row itself and
-  refuses (`ErrBlockCandidateTargetUnavailable`) rather than writing a candidate it
-  cannot name an incarnation for — so no caller can create authority-less work.
+- Migration `017` adds the `storage_key` COLUMN to `gc_block_candidates` and its
+  `_by_day` projection. It deliberately backfills no values: a row written before it was
+  authorized for whatever incarnation was live then, and adopting today's `P` would
+  manufacture a destructive authorization nothing ever decided. Pre-017 rows are refused,
+  not repaired, and reconciling them is a pre-activation requirement (technical debt #24).
+  `EnsureBlockGCCandidate` captures `P` from the canonical row itself and refuses
+  (`ErrBlockCandidateTargetUnavailable`) rather than writing a candidate it cannot name an
+  incarnation for — so no caller can create authority-less work.
 - `BlockDeleteTarget` / `BlockDeleteAuthority` / `BlockGCCandidateIdentity` make it hard
   by construction to pass only `(org, block_id)` to a destructive primitive.
 - The claim CAS is now `IF storage_class = ? AND storage_key = ? AND gc_state = null AND
@@ -56,14 +60,61 @@ is inverted into `..._CannotMaterializeAStubRow`. As a result GC no longer delet
 metadata-free stub rows: it has no exact authority over a row with no locator, and it
 refuses without fencing and without consuming the work item. That is safe because an
 unclaimed stub is not an upload fence (`BlockDeleteFenceActive` keys on
-`gc_state='deleting'` and on orphan rows) and the only producer of a CLAIMED stub was the
-old claim CAS itself. Filed as technical debt so the writer-side owner is explicit.
+`gc_state='deleting'` and on orphan rows) and the only producer of a **`deleting`**
+metadata-free stub was the old GC claim CAS itself. Note the precision: the writer path
+does claim metadata-free rows, under `gc_state='repairing_stub'`
+(`claimReleasedBlockStubForRepairFn`), and cleans them up itself. Filed as technical debt
+so the writer-side owner is explicit.
 
 **Recovery from an abandoned claim is now by staleness, not by identity.** The previous
 shape let any later pass retry the release because it shared the claim id; that is gone,
 and with it the ability of one worker to release another's fence. An abandoned claim is
 lifted by stale takeover — a CAS against the exact previous authority — which works even
 when the attempt that left it never returns.
+
+**Second review pass — four defects found and fixed before merge.** They are recorded
+because each one was a real gap in the first cut, not polish:
+
+- **The stale takeover was not exact.** It called `ReleaseStaleBlockClaim`, which re-read
+  the row and released whatever owner it found — so a worker authorized for `P1` could
+  drop `P2`'s fence. `ClaimBlockDelete` now returns the OWNER it observed
+  (`BlockClaimResult`) and the takeover CASes against exactly that. The test that was
+  supposed to cover this seeded a FRESH replacement owner, which the staleness check
+  rejects on its own, so it passed without exercising the CAS at all; it now uses stale
+  replacements, in both the same-incarnation and different-incarnation shapes.
+- **The same hole existed at the pre-check call site**, which is deliberately
+  owner-agnostic but was also incarnation-agnostic — reachable with no clock skew, just an
+  ordinary re-minted block. `ReleaseStaleBlockClaim` now takes the caller's expected
+  `BlockDeleteTarget`.
+- **The orphan publication and the S3 delete took their locator from a post-claim
+  `GetBlockInfo` re-read.** That read is ordinary (`database.consistency` accepts `ONE`)
+  while the claim commits at EACH_QUORUM in the serial domain, so it can show a different
+  incarnation — the same "re-read and destroy what is there now" one step below the claim.
+  Both now use `attempt.Target`, and any divergence releases the claim and fails closed.
+- **`ErrBlockCandidateTargetUnavailable` was fatal at all three enqueue sites**, contrary
+  to its own documented contract. On the fs_object path it was self-poisoning: the delete
+  aborted, retried, re-derived the same zero-ref block through an idempotent reference
+  removal, and never completed. All three sites now test the sentinel with `errors.Is`
+  and carry on.
+
+Three smaller ones landed with them: `EnsureBlockGCCandidate`'s CAS retry loop is bounded
+(a pre-017 row made it spin forever, one Paxos round per iteration, because `IF
+storage_key = ''` never matches a NULL column); `resolveBlockDeleteTarget` reads at
+`Consistency(gocql.Serial)`, because a lagging read there silently replaced a correct
+candidate with a dead incarnation and lost the live one's work item; and the grace period
+is re-checked against `candidate_at`, since an old queue row that had already cleared
+grace would otherwise process a freshly replaced candidate immediately.
+
+**One doctrine change worth flagging.** An unsettleable claim now postpones instead of
+reaching the DLQ, and `TestX2_NonAvailabilityErrorStillReachesTheDLQ` is replaced by
+`TestX2_UnsettleableClaimStaysVisibleWithoutReachingTheDLQ`. The old test's concern —
+"an error that only postpones is invisible" — was right, but the DLQ is the wrong
+destination when the claim's outcome is unknown: `ItemBlock` never returns from there, so
+parking the item makes any fence the LWT committed permanent. Visibility now comes from
+`gc_errors_total{type="block_claim_unsettled"}` and a loud log, and the block unwedges
+itself once the cause is fixed. The mock was also made faithful here: it could only ever
+report `Ambiguous`, so the case that matters most — an LWT that timed out AFTER committing
+and is then recognised by the settling read — was untestable.
 
 **Evidence**
 - Unit: `internal/gc/p4a_claim_ownership_test.go` — shared-ownership, loser cannot
@@ -80,8 +131,11 @@ when the attempt that left it never returns.
   integration `TestMain` OR-chain, so a stack that never came up FAILS instead of
   skipping to a green run). Three legs: exclusive ownership plus exact takeover, the ABA
   case, and retry semantics under the engine's real CAS returns.
-- Mutation: `scripts/p4a-mutation-validation.sh` — ten deliberate mutations, each
-  required to go red WITH a P4a assertion rather than for an unrelated reason.
+- Mutation: `scripts/p4a-mutation-validation.sh` — seventeen deliberate mutations, each
+  required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
+  earned their keep during this pass: one exposed that a mutation which fails to COMPILE
+  proves nothing, and one exposed that the incarnation check lives in two mirrored places
+  (store and mock) with neither protecting the other.
 
 **Scope, and what is still open.** `StartBlockDeleteOrphan` is deliberately untouched:
 `blocks` and `gc_s3_orphans` are separate Paxos partitions, and binding publication to

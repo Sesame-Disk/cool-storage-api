@@ -2059,12 +2059,12 @@ func TestGC_ClaimBlockDelete_CannotMaterializeAStubRow(t *testing.T) {
 		ClaimID:   uuid.NewString(),
 		ClaimedAt: time.Now().UTC(),
 	}
-	outcome, err := store.ClaimBlockDelete(orgUUID, blockID, attempt)
+	claim, err := store.ClaimBlockDelete(orgUUID, blockID, attempt)
 	if err != nil {
 		t.Fatalf("ClaimBlockDelete: %v", err)
 	}
-	if outcome != gcpkg.BlockClaimMissing {
-		t.Fatalf("ClaimBlockDelete over a missing row = %s, want missing", outcome)
+	if claim.Outcome != gcpkg.BlockClaimMissing {
+		t.Fatalf("ClaimBlockDelete over a missing row = %s, want missing", claim.Outcome)
 	}
 
 	exists, err := store.BlockExists(orgUUID, blockID)

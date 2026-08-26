@@ -654,6 +654,13 @@ func (s *Service) Queue() *Queue {
 // EnqueueBlock is a convenience method for enqueuing a block from application code.
 func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.UUID, storageClass string) error {
 	candidateAt, candidateErr := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+	if errors.Is(candidateErr, ErrBlockCandidateTargetUnavailable) {
+		// Nothing reclaimable for this block: no canonical row, or one with no usable
+		// locator. A normal observation, not a failure of the caller's operation.
+		metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service").Inc()
+		log.Printf("[GC] block %s in org=%s has nothing reclaimable (%v); not enqueuing", blockID, orgID, candidateErr)
+		return nil
+	}
 	if candidateErr != nil && candidateAt.IsZero() {
 		return candidateErr
 	}

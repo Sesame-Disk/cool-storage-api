@@ -968,7 +968,25 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// fence in exactly the window it exists to cover; an owner-only release would
 		// leave a claim from an abandoned candidate up forever. Age separates the two
 		// cleanly, because nothing live survives blockDeleteClaimStaleAfter.
-		outcome, relErr := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, w.clock().Add(-blockDeleteClaimStaleAfter))
+		//
+		// OWNER-AGNOSTIC IS NOT THE SAME AS INCARNATION-AGNOSTIC, and the difference is
+		// load-bearing. This path may lift a fence whose owner will never return, but only
+		// on the incarnation THIS candidate names. `blocks` can perfectly ordinarily hold
+		// a different life by now — P1 died, P2 was installed, a lifecycle for P2 claimed
+		// it and was abandoned — and releasing that fence would be a worker authorized for
+		// P1 acting on P2. P2's own candidate survives any standing claim (nothing here
+		// consumes a candidate while a fence is up), so P2's fence gets lifted by P2's
+		// work item, not by ours.
+		//
+		// With no candidate there is no incarnation to name and therefore no authority to
+		// act on: skip the release entirely rather than falling back to a looser one.
+		var outcome BlockClaimReleaseOutcome
+		var relErr error
+		if candidateFound {
+			outcome, relErr = w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, candidate.Target, w.clock().Add(-blockDeleteClaimStaleAfter))
+		} else {
+			log.Printf("[GC Worker] Block %s is referenced and has no GC candidate; no incarnation is named, so any standing fence is left for the candidate that owns it", item.ItemID)
+		}
 		if relErr != nil {
 			// Postpone for EVERY failure reason, not just the ones
 			// isClusterUnavailableError recognises. "Do not clear the candidate" is
@@ -1039,6 +1057,20 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return blockCandidateAuthorityInvalidError{ItemID: item.ItemID}
 	}
 
+	// THE GRACE PERIOD BELONGS TO THE CANDIDATE, NOT TO THE QUEUE ROW.
+	//
+	// DequeueBatch applies it to the queue item's own timestamp, which is right for an
+	// item whose candidate has not changed. But a candidate that was REPLACED gets a new
+	// candidate_at precisely so the new incarnation serves its own grace — and an old
+	// queue row that already cleared grace would otherwise pick that fresh candidate up
+	// and process it immediately, handing the new life exactly the head start replacement
+	// exists to deny it. Re-checking here closes that, and costs nothing when the two
+	// timestamps agree.
+	if w.gracePeriod > 0 && candidate.CandidateAt.After(w.clock().Add(-w.gracePeriod)) {
+		log.Printf("[GC Worker] Block %s: the GC candidate is younger than the grace period; postponing so the incarnation it names serves its own grace", item.ItemID)
+		return blockClaimNotYetStaleError{ItemID: item.ItemID}
+	}
+
 	// Topology gate: from here the walk can reach a physical delete. The
 	// EACH_QUORUM verify below only closes X2 if the keyspace actually gives
 	// EACH_QUORUM a per-datacenter meaning; under an unsupported replication class
@@ -1066,15 +1098,35 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// 1. Claim the block (gc_state='deleting') via LWT, bound to the exact incarnation
 	// this candidate was created for and to this attempt's own ownership token.
-	outcome, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID, attempt)
+	claim, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID, attempt)
+	outcome := claim.Outcome
 	if err != nil {
+		metrics.GCBlockDeleteClaimTotal.WithLabelValues(outcome.String()).Inc()
+		// AN UNSETTLED CLAIM POSTPONES, WHATEVER KIND OF ERROR PRODUCED IT. This branch
+		// used to hand everything to failClosedIfUnavailable, which spends a retry on
+		// anything it does not recognise as an outage — so the MOST uncertain state in the
+		// walk (the LWT may have committed, and the serial settling read could not tell
+		// us) was the one that could reach the DLQ with a fence possibly standing. The
+		// same ambiguity arriving through a non-applied CAS already postpones; these are
+		// the same state and must get the same answer (R20).
+		if outcome == BlockClaimAmbiguous {
+			// Loud and alertable, but never the DLQ. The DLQ is where an item goes to be
+			// seen by a human and never processed again — and ItemBlock does not come back
+			// from it — so parking an item there while its fence may be standing makes the
+			// fence permanent. A metric and a log get the same human attention without
+			// throwing away the only thing that can still lift it, and the moment the
+			// underlying cause is fixed the next pass takes the stale claim over.
+			metrics.GCErrorsTotal.WithLabelValues("block_claim_unsettled").Inc()
+			w.recordDestructiveBlocked(destructivePathBlock)
+			log.Printf("[GC Worker] Block %s: the delete claim could not be settled even in the serial domain; retaining claim and candidate and postponing: %v", item.ItemID, err)
+			return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: err}
+		}
 		// An LWT is more exposed than a plain read — Paxos needs its serial quorum on
 		// top of the ordinary one, and contention or a degraded cluster shows up here
 		// first. Whether a given outage defeats it depends on the serial consistency
 		// and the replica count, not on any simple "a DC is down" rule (see
 		// isClusterUnavailableError). Either way an availability failure here says
 		// nothing about the item, so it must not spend the item's retry budget.
-		metrics.GCBlockDeleteClaimTotal.WithLabelValues(outcome.String()).Inc()
 		return w.failClosedIfUnavailable("failed to claim block record for deletion", item.ItemID, err)
 	}
 	metrics.GCBlockDeleteClaimTotal.WithLabelValues(outcome.String()).Inc()
@@ -1109,7 +1161,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// The owner is old enough that no live walk can still be running under it. Take
 		// over — but only through a CAS against that exact previous authority, never an
 		// unconditional clear, and re-classify rather than assume the takeover holds.
-		return w.takeOverStaleBlockClaim(ctx, item, candidate, candidateFound, attempt)
+		return w.takeOverStaleBlockClaim(item, claim.Owner)
 	case BlockClaimMissing:
 		if err := w.settleBlockCandidate(item, candidate, candidateFound); err != nil {
 			return err
@@ -1252,8 +1304,30 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return w.failClosedIfUnavailable("failed to load canonical block info", item.ItemID, err)
 	}
-	storageClass := blockInfo.StorageClass
-	if storageClass == "" {
+	// THE DESTRUCTIVE LOCATOR IS THE ONE THE CLAIM AUTHORIZED, NOT THE ONE READ BACK.
+	//
+	// GetBlockInfo is an ordinary read — `database.consistency` accepts ONE — while the
+	// claim commits at EACH_QUORUM in the serial domain, so this read can legitimately
+	// land on a replica that never saw what the claim serialized. Taking the orphan and
+	// the S3 delete from it would mean publishing and destroying whatever incarnation
+	// happens to be visible here, which is the same "re-read blocks and destroy what is
+	// there now" that the candidate authority at the top of this walk exists to forbid.
+	// FinalizeBlockDelete was already bound to `attempt`; the two steps that actually
+	// touch bytes were not.
+	//
+	// So blockInfo is used only for what the claim cannot carry — the stub discriminator
+	// and sha1 — and any disagreement about the incarnation aborts before anything is
+	// published or deleted.
+	storageClass := attempt.Target.StorageClass
+	storageKey := attempt.Target.StorageKey
+	if observed := (BlockDeleteTarget{StorageClass: blockInfo.StorageClass, StorageKey: blockInfo.StorageKey}); !observed.IsZero() && observed != attempt.Target {
+		metrics.GCErrorsTotal.WithLabelValues("block_incarnation_divergence").Inc()
+		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+			return relErr
+		}
+		return fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, attempt.Target)
+	}
+	if blockInfo.StorageClass == "" {
 		if blockInfo.CreatedAt == nil {
 			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, attempt.ClaimID)
 			if deleteErr != nil {
@@ -1287,7 +1361,6 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
 	}
-	storageKey := blockInfo.StorageKey
 	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
 		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			return relErr
@@ -1431,8 +1504,21 @@ func (w *Worker) settleBlockCandidate(item QueueItem, candidate BlockGCCandidate
 // the observation and the write keeps its row. And a failed takeover NEVER settles the
 // candidate: the whole point of the fresh/stale split is that a claim which cannot be
 // lifted yet still has to be lifted eventually, and this candidate is what will do it.
-func (w *Worker) takeOverStaleBlockClaim(ctx context.Context, item QueueItem, candidate BlockGCCandidateInfo, candidateFound bool, attempt BlockDeleteAuthority) error {
-	outcome, err := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter))
+func (w *Worker) takeOverStaleBlockClaim(item QueueItem, observed BlockDeleteAuthority) error {
+	// THE CAS NAMES THE AUTHORITY THE CLAIM ACTUALLY OBSERVED, and that is the whole
+	// point of this function.
+	//
+	// The tempting shape — re-read the row, see whether whatever is there now is old,
+	// release that — is a different operation wearing the same name. Between the claim's
+	// observation and this call the row can have become a different incarnation with its
+	// own stale owner, and releasing THAT is a worker authorized for `P1` dropping `P2`'s
+	// fence: the exact authority violation R14a exists to prevent, with nothing but the
+	// staleness window standing between it and a delete under a lifted fence.
+	//
+	// So this is ReleaseBlockClaim, not ReleaseStaleBlockClaim. Staleness was already
+	// decided when the claim classified this owner; what remains is one question the CAS
+	// answers on its own: is that exact owner still there?
+	outcome, err := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, observed)
 	if err != nil {
 		metrics.GCBlockDeleteTakeoverTotal.WithLabelValues("failed").Inc()
 		if isClusterUnavailableError(err) {
@@ -1444,12 +1530,13 @@ func (w *Worker) takeOverStaleBlockClaim(ctx context.Context, item QueueItem, ca
 		log.Printf("[GC Worker] Block %s: taking over a stale delete claim failed; postponing with the fence still up: %v", item.ItemID, err)
 		return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: err}
 	}
-	if outcome != BlockClaimReleased {
+	if outcome != BlockReleaseReleased {
 		// Ownership changed between the claim's classification and this release: the old
-		// owner came back, or a third attempt took it. Re-classify on a later pass;
-		// never conclude the candidate is finished from a failed takeover.
+		// owner came back, a third attempt took it, or the row became a different
+		// incarnation. Re-classify on a later pass; never conclude the candidate is
+		// finished from a failed takeover.
 		metrics.GCBlockDeleteTakeoverTotal.WithLabelValues("lost").Inc()
-		log.Printf("[GC Worker] Block %s: a stale delete claim changed owner before takeover (%s); postponing and preserving the candidate", item.ItemID, outcome)
+		log.Printf("[GC Worker] Block %s: the stale delete claim %s was no longer the owner at takeover time; postponing and preserving the candidate", item.ItemID, observed.ClaimID)
 		return blockClaimNotYetStaleError{ItemID: item.ItemID}
 	}
 	metrics.GCBlockDeleteTakeoverTotal.WithLabelValues("released").Inc()
@@ -2703,6 +2790,19 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 	var candidateProjectionErr error
 	for _, blockID := range blockIDs {
 		candidateAt, candidateErr := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+		if errors.Is(candidateErr, ErrBlockCandidateTargetUnavailable) {
+			// Nothing reclaimable: no canonical row, or one with no usable locator. That is
+			// a normal observation — processBlock treats the same state as routine further
+			// down the walk — and it must not fail the batch.
+			//
+			// Failing here was self-poisoning on this path specifically. The caller aborts
+			// the whole fs_object delete, the item retries, removeFSObjectBlockReferences
+			// is idempotent so the same block comes back zero-ref, the canonical row is
+			// still gone, and the fs_object never gets deleted at all.
+			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker").Inc()
+			log.Printf("[GC Worker] block %s in org=%s has nothing reclaimable (%v); skipping it and continuing with its siblings", blockID, orgID, candidateErr)
+			continue
+		}
 		if candidateErr != nil && candidateAt.IsZero() {
 			return candidateErr
 		}

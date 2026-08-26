@@ -35,6 +35,7 @@ cd "$(dirname "$0")/.."
 
 STORE=internal/gc/store_cassandra.go
 WORKER=internal/gc/worker.go
+MOCK=internal/gc/store_mock.go
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -149,6 +150,69 @@ m_fresh_owner_completes_candidate() {
   restore
 }
 
+m_destructive_locator_from_readback() {
+  mutate "$WORKER" 's{storageClass := attempt\.Target\.StorageClass(\s+)storageKey := attempt\.Target\.StorageKey}{storageClass := blockInfo.StorageClass$1storageKey := blockInfo.StorageKey}'
+  expect_red 'TestP4ADestructiveStepsUseTheClaimsLocator' 'must take storageClass and storageKey from attempt.Target' \
+    'orphan and S3 delete taking their locator from a post-claim re-read (publishes and destroys whichever incarnation that ordinary read happens to show)'
+  restore
+}
+
+m_takeover_rereads_the_row() {
+  # Type-correct on purpose: a mutation that fails to COMPILE proves nothing about the
+  # guard it was aimed at, so this restores the old behaviour in a form the compiler
+  # accepts and lets the guard be the thing that objects.
+  mutate "$WORKER" 's{outcome, err := w\.store\.ReleaseBlockClaim\(item\.OrgID, item\.ItemID, observed\)}{staleOutcome, err := w.store.ReleaseStaleBlockClaim(item.OrgID, item.ItemID, observed.Target, observed.ClaimedAt.Add(-blockDeleteClaimStaleAfter))
+	outcome := BlockReleaseNotOwner
+	if staleOutcome == BlockClaimReleased {
+		outcome = BlockReleaseReleased
+	}}'
+  expect_red 'TestP4AStaleTakeoverUsesTheObservedAuthority' 'must not call ReleaseStaleBlockClaim' \
+    'takeover re-reading the row instead of CASing against the authority it observed'
+  restore
+}
+
+m_stale_release_ignores_incarnation() {
+  # BOTH implementations, and that is worth stating rather than hiding. The unit suite
+  # drives MockStore, so mutating store_cassandra.go alone leaves it green — the
+  # incarnation check lives in two mirrored places and neither copy is protected by the
+  # other. The production copy is separately pinned by
+  # TestP4AStaleClaimReleaseNamesAnIncarnation and by the real-Cassandra leg in
+  # internal/integration/p4a_claim_authority_test.go.
+  mutate "$STORE" 's~\tif row\.Target != expectedTarget \{~\tif false \&\& row.Target != expectedTarget \{~'
+  mutate "$MOCK" 's~!= expectedTarget \{~!= expectedTarget \&\& false \{~'
+  expect_red 'TestP4A_StaleClaimReleaseIsBoundToTheCandidatesIncarnation' 'released a fence belonging to P2' \
+    'age-based release ignoring the incarnation (a candidate for P1 hands back P2 fence)'
+  restore
+}
+
+m_candidate_capture_not_serial() {
+  mutate "$STORE" 's{\t\tConsistency\(gocql\.Serial\)\.(\s+)Scan\(&storageClass, &storageKey\)}{\t\tScan(&storageClass, \&storageKey)}'
+  expect_red 'TestP4ACandidateCaptureUsesTheSerialDomain' 'must read at Consistency(gocql.Serial)' \
+    'candidate capture at session consistency (a lagging read replaces a correct candidate with a dead incarnation)'
+  restore
+}
+
+m_candidate_loop_unbounded() {
+  mutate "$STORE" 's~for attempt := 0; attempt < ensureBlockGCCandidateMaxAttempts; attempt\+\+ \{~for \{~'
+  expect_red 'TestP4ACandidateRetryLoopIsBounded' 'must be bounded' \
+    'unbounded candidate CAS retry loop (a non-converging condition becomes a silent Paxos hot loop)'
+  restore
+}
+
+m_enqueue_sentinel_is_fatal() {
+  mutate "$WORKER" 's~if errors\.Is\(candidateErr, ErrBlockCandidateTargetUnavailable\) \{~if false \&\& errors.Is(candidateErr, ErrBlockCandidateTargetUnavailable) \{~'
+  expect_red 'TestP4A_MissingCanonicalRowDoesNotAbortTheEnqueueBatch' 'aborted on a block with nothing reclaimable' \
+    'a block with nothing reclaimable aborting the whole enqueue batch (self-poisoning on the fs_object path)'
+  restore
+}
+
+m_grace_ignores_candidate_at() {
+  mutate "$WORKER" 's~if w\.gracePeriod > 0 \&\& candidate\.CandidateAt\.After\(w\.clock\(\)\.Add\(-w\.gracePeriod\)\) \{~if false \{~'
+  expect_red 'TestP4A_ReplacedCandidateServesItsOwnGracePeriod' 'inside its grace period' \
+    'grace measured only on the queue row (a replaced candidate skips the grace its replacement bought it)'
+  restore
+}
+
 MUTATIONS=(
   m_claim_drops_storage_key
   m_claim_drops_storage_class
@@ -160,6 +224,13 @@ MUTATIONS=(
   m_candidate_drops_storage_key
   m_claim_id_from_candidate_at
   m_fresh_owner_completes_candidate
+  m_destructive_locator_from_readback
+  m_takeover_rereads_the_row
+  m_stale_release_ignores_incarnation
+  m_candidate_capture_not_serial
+  m_candidate_loop_unbounded
+  m_enqueue_sentinel_is_fatal
+  m_grace_ignores_candidate_at
 )
 
 if [ "${1:-}" = "--list" ]; then

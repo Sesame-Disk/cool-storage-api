@@ -140,9 +140,11 @@ type GCStore interface {
 	// (claim-then-verify). Verifying with the local read reopens
 	// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01.
 	//
-	// The outcome is classified rather than boolean because a non-applied CAS is not
-	// completion (R16): see BlockClaimOutcome.
-	ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimOutcome, error)
+	// The result is classified rather than boolean because a non-applied CAS is not
+	// completion (R16): see BlockClaimOutcome. It also carries the OWNER it observed, so
+	// a caller that decides to take a stale claim over can CAS against exactly that
+	// authority instead of re-reading and adopting whoever it finds the second time.
+	ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error)
 	// ReleaseBlockClaim clears gc_state only while the exact authority — incarnation,
 	// claim id AND claimed_at — still owns the row. This stops an attempt from releasing
 	// a claim it did not win, and stops an attempt that already lost the row to a stale
@@ -173,7 +175,16 @@ type GCStore interface {
 	// because that fence still has to come off later and this candidate is what will
 	// do it. Collapsing them into a single false is how a live block ends up fenced
 	// forever — see BlockClaimTooFresh.
-	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
+	//
+	// IT IS OWNER-AGNOSTIC BUT NOT INCARNATION-AGNOSTIC. expectedTarget is the physical
+	// incarnation the CALLER is authorized for, and a claim on any other incarnation is
+	// left alone however old it is. Without that binding a candidate for `P1` could hand
+	// back a fence belonging to `P2` — the exact authority violation R14a exists to
+	// prevent — and the age test would be the only thing standing between it and a live
+	// delete. Callers that DID observe a specific owner and want to take it over must use
+	// ReleaseBlockClaim with that exact authority instead; this is for the pre-check path,
+	// which by construction never observed one.
+	ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, expectedTarget BlockDeleteTarget, staleBefore time.Time) (BlockClaimReleaseOutcome, error)
 	// DeleteClaimedBlockStub removes only a metadata-free stub owned by claimID.
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
@@ -196,6 +207,12 @@ type GCStore interface {
 	// its capture a mandatory side effect of candidate creation means no caller can
 	// forget it. A block with no canonical row, or one with no usable storage key,
 	// yields ErrBlockCandidateTargetUnavailable and writes NO candidate row.
+	//
+	// Callers MUST distinguish that sentinel with errors.Is and carry on: "this block has
+	// nothing reclaimable" is a normal observation, not a failure of the batch. Treating
+	// it as fatal aborts every sibling block in the same call and, on the fs_object path,
+	// is self-poisoning — the retry re-derives the same zero-ref block, finds the same
+	// missing row, and fails again forever.
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	// GetBlockGCCandidate loads the candidate's own record of the incarnation it was
 	// created for. This — never a fresh read of `blocks` — is what authorizes a
@@ -824,6 +841,19 @@ func (o BlockClaimReleaseOutcome) String() string {
 	}
 }
 
+// BlockClaimResult is what ClaimBlockDelete observed.
+//
+// Owner is populated for BlockClaimFreshOwner and BlockClaimStaleOwner and is the EXACT
+// authority found on the row — incarnation, claim id and claimed_at. Carrying it back to
+// the caller is what lets a stale takeover be a CAS against that authority rather than a
+// second read that adopts whichever owner happens to be there by then. Those are not the
+// same operation: between the two reads the row can become a different incarnation, and
+// releasing THAT is precisely the P1-acts-on-P2 violation this package exists to prevent.
+type BlockClaimResult struct {
+	Outcome BlockClaimOutcome
+	Owner   BlockDeleteAuthority
+}
+
 // BlockClaimOutcome classifies what ClaimBlockDelete found. A boolean cannot carry
 // this: the four ways a claim can fail to apply demand four different responses, and
 // collapsing them is exactly the defect R16 names — treating any non-applied CAS as
@@ -918,9 +948,15 @@ func (o BlockReleaseOutcome) String() string {
 // block's exact physical incarnation cannot be captured, so no candidate is written.
 //
 // This is fail-closed by construction rather than by convention: with no candidate row
-// there is no destructive authority to misuse later. The enqueue paths already treat a
-// candidate error as discovery degradation and carry on, which is the right response —
-// a block whose canonical row is missing has nothing to reclaim anyway.
+// there is no destructive authority to misuse later.
+//
+// EVERY CALLER MUST TEST FOR IT WITH errors.Is AND CARRY ON. A block whose canonical row
+// is already gone has nothing to reclaim, and processBlock itself treats that state as
+// routine further down the walk ("missing canonical row, skipping deletion"), so failing
+// the enqueue hard is incoherent with the rest of the lifecycle. On the fs_object path it
+// is worse than incoherent: the delete aborts, retries, re-derives the same zero-ref
+// block through an idempotent reference removal, hits the same missing row, and the
+// fs_object never gets deleted at all.
 var ErrBlockCandidateTargetUnavailable = errors.New("block gc candidate: exact physical incarnation unavailable")
 
 // BlockStoreDeleter validates and deletes physical block locators.

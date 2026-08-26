@@ -2344,10 +2344,16 @@ stub row left by some other path is no longer swept by GC.
 ### Why This Is Acceptable, And Why It Is Not Silently Fine
 It is acceptable because an *unclaimed* stub is not an upload fence:
 `BlockDeleteFenceActive` keys on `gc_state='deleting'` and on `gc_s3_orphans` rows, so a
-locator-free row with no claim blocks nothing. The only producer of a *claimed*
-metadata-free stub was the old claim CAS itself — `IF gc_state != 'deleting'` applies
+locator-free row with no claim blocks nothing. The only producer of a **`deleting`**
+metadata-free stub was the old GC claim CAS itself — `IF gc_state != 'deleting'` applies
 against a missing partition in Cassandra, which is how the stub was materialized in the
 first place — and that can no longer happen.
+
+Be precise about the scope of that claim: metadata-free rows CAN be claimed by the writer
+path, under `gc_state='repairing_stub'` (`claimReleasedBlockStubForRepairFn`). Those are
+not a delete fence and the writer cleans them up through
+`deleteRepairClaimedBlockStubFn`; they are simply not GC's to touch, which is the same
+conclusion by a different route.
 
 It is not silently fine because the cleanup responsibility has moved rather than
 disappeared. Stub rows originating on the writer side (`claimReleasedBlockStubForRepairFn`
@@ -2366,3 +2372,48 @@ currently sweeps one abandoned there.
 `TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork` and
 `TestP4A_CandidateWithoutAnExactIncarnationIsNeverDestructiveAndNeverConsumed` pin the
 refusal in both directions: nothing destructive happens, and the work item survives.
+
+
+## 24. Pre-migration-017 candidate rows need a reconcile before GC activation (PRE-ACTIVATION)
+
+### Current State
+Migration `017` adds the `storage_key` column to `gc_block_candidates` and its `_by_day`
+projection. It adds the COLUMN only; it backfills no values, so any candidate row written
+before it carries `storage_key = NULL`.
+
+The system is safe in that state and stays safe: `EnsureBlockGCCandidate` refuses such a
+row with `ErrBlockCandidateTargetUnavailable`, and `processBlock` classifies it as
+`invalid` — nothing is claimed, nothing is fenced, nothing is deleted, and the candidate
+is not consumed either.
+
+### Why It Is Not Backfilled
+Because the obvious backfill is wrong. A pre-017 candidate was authorized for whatever
+incarnation was live when the zero-ref decision was made. Reading the canonical row today
+and writing that `P` onto it would manufacture a destructive authorization that nothing
+ever decided — precisely the ABA the exact-`P` work exists to prevent, performed by the
+migration instead of by a race.
+
+It is also why `EnsureBlockGCCandidate` refuses rather than repairing in place: the CAS
+that would repair it names `storage_key`, and `IF storage_key = ''` never matches a NULL
+column, so the pre-fix code spun on it forever. The loop is now bounded and the row is
+reported instead.
+
+### Follow-Up Plan (before `GC_ENABLED=true`, not before merge)
+1. Enumerate `gc_block_candidates` rows with a null/empty `storage_key`.
+2. For each, make a FRESH candidacy decision rather than a backfill: re-check global
+   liveness / zero references, read the current `P`, and write a new candidate with its
+   own `candidate_at` so the incarnation serves its own grace period.
+3. Or delete the legacy row outright and let the ordinary discovery paths rediscover the
+   block, which is equivalent and simpler where the block is still referenced.
+4. Do NOT relax the refusal to make this go away.
+
+### Why This Does Not Block The Merge
+`GC_ENABLED=false` remains mandatory on every replica in every DC, so no candidate is
+processed at all. The deployment target is a clean server with no legacy candidate rows;
+this exists for any docker or staging stack that populated `gc_block_candidates` before
+the upgrade.
+
+### Gates
+`TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted` pins both halves: the row is
+refused, and it is neither consumed nor silently adopted as today's incarnation.
+`TestP4ACandidateRetryLoopIsBounded` pins that the refusal cannot become a hot loop again.

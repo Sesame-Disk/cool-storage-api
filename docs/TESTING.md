@@ -906,7 +906,9 @@ Each of these exists because the obvious version of the test proves nothing.
 | `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` | the P4a claim-authority legs skipping their way to exit 0 against a stack that never came up. It is pinned in `docker-compose.yaml` **and** listed in the integration `TestMain` OR-chain — a gate missing from that chain still fails its own skip, but cannot stop `TestMain` from exiting 0 when nothing ran at all |
 | `p4aRequireEvidence`'s `gate.observed` check | a leg that runs, passes, and asserts nothing: the test must reach its evidence log line, not merely avoid failing |
 | `mutate()` in `scripts/p4a-mutation-validation.sh` compares the file after patching | a mutation whose pattern matched nothing being reported as "the guard held". Line endings and indentation differ between the working tree and the container's COPY, which is exactly how the X2 script caught an inert mutation |
-| `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at |
+| `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at. A mutation that fails to COMPILE trips this too, which is how the takeover mutation was caught proving nothing |
+| `m_stale_release_ignores_incarnation` mutates the store AND the mock | a green run hiding that the incarnation check lives in two mirrored places with neither protecting the other: the unit suite drives `MockStore`, so mutating production alone leaves it green |
+| `TestP4A_*` destructive-path tests use `testSHA256BlockID` | passing for the wrong reason. A non-SHA-256 id is rejected by `ValidatePhysicalLocator` before the walk reaches the step under test, so the assertion would hold whether or not the invariant does |
 
 ### Proving the legs can fail
 

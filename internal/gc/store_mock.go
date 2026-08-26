@@ -181,6 +181,8 @@ type MockStore struct {
 	blockHasReferencesGlobalCalls  int
 	releaseStaleBlockClaimErr      error
 	getBlockGCCandidateErr         error
+	claimBlockDeleteSettleErr      error
+	getBlockInfoHook               func(BlockInfo) BlockInfo
 	claimAttempts                  []BlockDeleteAuthority
 	releaseBlockClaimErr           error
 	claimBlockDeleteErr            error
@@ -1367,7 +1369,23 @@ func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, er
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, StorageKey: block.StorageKey, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
+	info := BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, StorageKey: block.StorageKey, CreatedAt: block.CreatedAt, Sha1: block.Sha1}
+	if m.getBlockInfoHook != nil {
+		info = m.getBlockInfoHook(info)
+	}
+	return info, nil
+}
+
+// SetGetBlockInfoHookForTest rewrites what the post-claim canonical re-read returns.
+//
+// It models the one thing the in-memory store cannot otherwise reach: GetBlockInfo is an
+// ordinary read while the claim commits in the serial domain, so in production the two
+// can legitimately disagree about which incarnation the row holds. Nothing downstream may
+// publish or delete on the strength of that read.
+func (m *MockStore) SetGetBlockInfoHookForTest(hook func(BlockInfo) BlockInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlockInfoHook = hook
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -2165,10 +2183,13 @@ func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
 // errors nor warns; a stale claim is released regardless of which attempt owns it;
 // and a real failure is injectable to prove that callers refuse to settle a candidate
 // whose fence they could not confirm gone.
-func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, expectedTarget BlockDeleteTarget, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if expectedTarget.IsZero() {
+		return BlockClaimAbsent, fmt.Errorf("block %s: refusing to release a stale claim without naming the incarnation it belongs to", blockID)
+	}
 	if m.releaseStaleBlockClaimErr != nil {
 		return BlockClaimAbsent, m.releaseStaleBlockClaimErr
 	}
@@ -2178,6 +2199,10 @@ func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, stal
 	}
 	if b.GCState != db.BlockGCStateDeleting {
 		return BlockClaimAbsent, nil
+	}
+	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != expectedTarget {
+		// A fence on a different incarnation than the caller is authorized for.
+		return BlockClaimTooFresh, nil
 	}
 	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
 		return BlockClaimTooFresh, nil
@@ -2374,6 +2399,12 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	if err != nil {
 		return time.Time{}, err
 	}
+	if existing, ok := m.blockGCCandidates[fmt.Sprintf("%s:%s", orgID, blockID)]; ok && existing.Target.StorageKey == "" {
+		// Mirrors the Cassandra store: a candidate row written before migration 017 has a
+		// NULL storage_key, cannot be repaired by a CAS that names it, and must not be
+		// silently reinterpreted as today's incarnation.
+		return time.Time{}, fmt.Errorf("%w: org=%s block=%s has a gc_block_candidates row written before migration 017 (no storage_key); it needs a fresh zero-ref decision, not a backfill", ErrBlockCandidateTargetUnavailable, orgID, blockID)
+	}
 	candidateAt = candidateAt.UTC()
 	if candidateAt.IsZero() {
 		candidateAt = time.Now().UTC()
@@ -2448,6 +2479,16 @@ func (m *MockStore) ClaimAttemptsForTest() []BlockDeleteAuthority {
 	out := make([]BlockDeleteAuthority, len(m.claimAttempts))
 	copy(out, m.claimAttempts)
 	return out
+}
+
+// SetClaimBlockDeleteSettleErrForTest makes the serial settling read fail too, so an
+// injected LWT failure becomes genuinely unsettleable. Both knobs together are the only
+// way to reach BlockClaimAmbiguous — which is the point: ambiguity is rare, and a test
+// that reaches it by accident is testing the wrong thing.
+func (m *MockStore) SetClaimBlockDeleteSettleErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimBlockDeleteSettleErr = err
 }
 
 // SetGetBlockGCCandidateErrForTest injects a failure into the candidate authority read.
@@ -2569,21 +2610,42 @@ func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, b
 // Note what it can no longer do: materialize a row. The production IF names
 // storage_class, which no absent partition can satisfy, so a missing block is
 // BlockClaimMissing rather than a freshly created stub.
-func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimOutcome, error) {
+func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.claimAttempts = append(m.claimAttempts, attempt)
 	if attempt.IsZero() {
-		return BlockClaimInvalid, fmt.Errorf("block %s: refusing to claim without a complete delete authority", blockID)
-	}
-	if m.claimBlockDeleteErr != nil {
-		return BlockClaimAmbiguous, m.claimBlockDeleteErr
+		return BlockClaimResult{Outcome: BlockClaimInvalid}, fmt.Errorf("block %s: refusing to claim without a complete delete authority", blockID)
 	}
 	staleBefore := attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter)
+	if m.claimBlockDeleteErr != nil {
+		// Mirror the production shape rather than collapsing it. A failed LWT is NOT
+		// automatically ambiguous: the store settles it in the serial domain first, and
+		// only a settlement that ALSO fails leaves the outcome unknown. Reporting every
+		// injected error as ambiguous made the mock unable to express the case that
+		// matters most — an LWT that timed out after committing, which the settling read
+		// then recognises as our own claim.
+		if m.claimBlockDeleteSettleErr != nil {
+			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, m.claimBlockDeleteErr, m.claimBlockDeleteSettleErr)
+		}
+		b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+		if !ok {
+			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
+		}
+		settled := blockDeleteClaimRow{
+			Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+			GCState:   b.GCState,
+			GCClaimID: b.GCClaimID,
+		}
+		if b.GCClaimedAt != nil {
+			settled.GCClaimedAt = *b.GCClaimedAt
+		}
+		return settled.result(attempt, staleBefore), nil
+	}
 	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if !ok {
-		return BlockClaimMissing, nil
+		return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 	}
 	row := blockDeleteClaimRow{
 		Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
@@ -2593,9 +2655,9 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 	if b.GCClaimedAt != nil {
 		row.GCClaimedAt = *b.GCClaimedAt
 	}
-	outcome := row.classify(attempt, staleBefore)
-	if outcome != BlockClaimAmbiguous {
-		return outcome, nil
+	result := row.result(attempt, staleBefore)
+	if result.Outcome != BlockClaimAmbiguous {
+		return result, nil
 	}
 	// classify returns Ambiguous for "exact incarnation, present, unowned" because in
 	// production that combination means the CAS should have applied and did not. Here it
@@ -2604,7 +2666,7 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 	b.GCClaimID = attempt.ClaimID
 	claimedAt := attempt.ClaimedAt
 	b.GCClaimedAt = &claimedAt
-	return BlockClaimAcquired, nil
+	return BlockClaimResult{Outcome: BlockClaimAcquired, Owner: attempt}, nil
 }
 
 // SetReleaseBlockClaimErrForTest injects a failure into the post-claim release.

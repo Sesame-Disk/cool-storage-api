@@ -1423,11 +1423,26 @@ func casTimeValue(row map[string]interface{}, key string) (time.Time, error) {
 // for a destructive transition: by the time a candidate is processed the row may hold a
 // different incarnation, which is precisely why the claim CAS compares against the
 // value captured HERE rather than against a fresh read.
+// It reads in the SERIAL domain, and that is not belt-and-braces. This value decides
+// whether an EXISTING candidate is replaced, so a lagging read can move a candidate
+// BACKWARD: with `blocks` already at P2 and the candidate correctly at P2, a stale read
+// returning P1 makes the two differ, the replacement fires, and the candidate becomes P1.
+// The worker then claims P1, gets TargetChanged, settles the candidate — and P2 is left
+// with no work item at all. That is a silent loss of valid reclamation work through
+// exactly the ABA shape this package exists to close.
+//
+// The cost is acceptable because this is a cold GC path, not the upload hot path, and it
+// is immediately followed by LWTs whose identity depends on the value read. P0/R12 put
+// every conditional mutation on `blocks` in one global serial domain, so this read
+// intersects them. It pins its own level rather than inheriting `database.consistency`,
+// which accepts ONE, for the same reason db.BlockAuthorityRead does.
 func (s *CassandraStore) resolveBlockDeleteTarget(orgID uuid.UUID, blockID string) (BlockDeleteTarget, error) {
 	var storageClass, storageKey *string
 	err := s.db.Session().Query(`
 		SELECT storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&storageClass, &storageKey)
+	`, orgID.String(), blockID).
+		Consistency(gocql.Serial).
+		Scan(&storageClass, &storageKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return BlockDeleteTarget{}, fmt.Errorf("%w: org=%s block=%s has no canonical row", ErrBlockCandidateTargetUnavailable, orgID, blockID)
@@ -1471,7 +1486,13 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 	if storageClass != "" && storageClass != target.StorageClass {
 		log.Printf("[GC] WARNING: block candidate for org=%s block=%s requested storage_class=%s but the canonical row holds %s; using the canonical value", orgID, blockID, storageClass, target.StorageClass)
 	}
-	for {
+	// THE RETRY LOOP IS BOUNDED. Every CAS in it names a value read moments earlier, so
+	// a genuine concurrent writer costs one extra round and converges. An unbounded loop
+	// only stays safe while every not-applied outcome is transient — and one of them is
+	// not: a CAS naming a column value that can never match spins forever, one Paxos
+	// round per iteration, with nothing in the logs to say why. The bound turns that from
+	// a silent hot loop into an error a human can read.
+	for attempt := 0; attempt < ensureBlockGCCandidateMaxAttempts; attempt++ {
 		existing := map[string]interface{}{}
 		applied, err := s.db.Session().Query(`
 			INSERT INTO gc_block_candidates (org_id, block_id, storage_class, storage_key, candidate_at)
@@ -1499,6 +1520,19 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 		existingTarget, err := parseBlockGCCandidateCAS(existing)
 		if err != nil {
 			return time.Time{}, err
+		}
+		if existingTarget.StorageKey == "" {
+			// A candidate written before migration 017: the column exists but the value is
+			// NULL, which casStringValue surfaces as "".
+			//
+			// It cannot be repaired here, and the attempt is what used to spin: the
+			// replacement CAS would name `IF storage_key = ''`, which never matches a NULL
+			// column, so the loop retried forever. It must not be silently reinterpreted as
+			// the current incarnation either — the row was authorized for whatever `P` was
+			// live when it was created, and adopting today's `P` would manufacture a
+			// destructive authorization nothing ever decided. Promoting it needs a fresh
+			// zero-ref decision, which is a reconciliation job and not this function's.
+			return time.Time{}, fmt.Errorf("%w: org=%s block=%s has a gc_block_candidates row written before migration 017 (no storage_key); it needs a fresh zero-ref decision, not a backfill", ErrBlockCandidateTargetUnavailable, orgID, blockID)
 		}
 
 		if existingTarget == target {
@@ -1538,7 +1572,14 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 		log.Printf("[GC] block candidate for org=%s block=%s replaced a stale candidate for %s with %s", orgID, blockID, existingTarget, target)
 		return effectiveCandidateAt, nil
 	}
+	return time.Time{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s did not settle after %d conditional attempts", orgID, blockID, ensureBlockGCCandidateMaxAttempts)
 }
+
+// ensureBlockGCCandidateMaxAttempts bounds the candidate CAS retry loop. Contention on
+// one candidate is rare and self-limiting — the losers of a round observe the winner's
+// value on the next — so this only has to exceed plausible concurrency, not plausible
+// load.
+const ensureBlockGCCandidateMaxAttempts = 8
 
 // advanceBlockGCCandidateAt moves an existing candidate EARLIER in time within the same
 // physical incarnation, so an explicit zero-ref enqueue is not delayed behind a
@@ -2176,7 +2217,10 @@ func (s *CassandraStore) BlockHasReferencesGlobal(orgID uuid.UUID, blockID strin
 // gc_claimed_at it observed, so a claim released and re-taken between the read and the
 // write is not the one this call hands back, and a claim belonging to a DIFFERENT
 // incarnation is never handed back at all.
-func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, expectedTarget BlockDeleteTarget, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+	if expectedTarget.IsZero() {
+		return BlockClaimAbsent, fmt.Errorf("block %s: refusing to release a stale claim without naming the incarnation it belongs to", blockID)
+	}
 	row, found, err := s.settleBlockDeleteClaimState(orgID, blockID)
 	if err != nil {
 		return BlockClaimAbsent, err
@@ -2188,6 +2232,13 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string,
 		// A claimed row whose own physical identity is unusable cannot be released by an
 		// exact CAS, and must not be released by a looser one. Report it as a live claim
 		// so the caller postpones instead of consuming the candidate.
+		return BlockClaimTooFresh, nil
+	}
+	if row.Target != expectedTarget {
+		// The fence belongs to a DIFFERENT incarnation. Age says nothing about whether we
+		// may touch it, because we were never authorized for it at all: the caller's
+		// candidate names another life. Report it as a live claim so the caller postpones
+		// rather than settling — its own candidate is what will lift it.
 		return BlockClaimTooFresh, nil
 	}
 	if row.GCClaimedAt.IsZero() || row.GCClaimedAt.After(staleBefore) {
@@ -2486,6 +2537,19 @@ type blockDeleteClaimRow struct {
 // staleBefore is the boundary between "an owner that may still be working" and "an
 // owner no live walk can still be running under". It is passed in rather than computed
 // here so the worker's clock stays the single source of that judgement.
+// result pairs the classification with the exact authority observed, so a caller that
+// takes a stale claim over CASes against THAT rather than re-reading the row.
+func (row blockDeleteClaimRow) result(attempt BlockDeleteAuthority, staleBefore time.Time) BlockClaimResult {
+	out := BlockClaimResult{Outcome: row.classify(attempt, staleBefore)}
+	switch out.Outcome {
+	case BlockClaimFreshOwner, BlockClaimStaleOwner:
+		out.Owner = BlockDeleteAuthority{Target: row.Target, ClaimID: row.GCClaimID, ClaimedAt: row.GCClaimedAt}
+	case BlockClaimAcquired:
+		out.Owner = attempt
+	}
+	return out
+}
+
 func (row blockDeleteClaimRow) classify(attempt BlockDeleteAuthority, staleBefore time.Time) BlockClaimOutcome {
 	if row.Target.IsZero() {
 		return BlockClaimInvalid
@@ -2519,9 +2583,9 @@ func (row blockDeleteClaimRow) classify(attempt BlockDeleteAuthority, staleBefor
 //
 // The IF names the exact incarnation AND requires the row to be unowned. See the
 // GCStore interface for why both halves are required.
-func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimOutcome, error) {
+func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error) {
 	if attempt.IsZero() {
-		return BlockClaimInvalid, fmt.Errorf("block %s: refusing to claim without a complete delete authority", blockID)
+		return BlockClaimResult{Outcome: BlockClaimInvalid}, fmt.Errorf("block %s: refusing to claim without a complete delete authority", blockID)
 	}
 	staleBefore := attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter)
 	existing := map[string]interface{}{}
@@ -2542,28 +2606,28 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		// ambiguous — the caller then retains claim and candidate and stops (R20).
 		row, found, settleErr := s.settleBlockDeleteClaimState(orgID, blockID)
 		if settleErr != nil {
-			return BlockClaimAmbiguous, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, err, settleErr)
+			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, err, settleErr)
 		}
 		if !found {
-			return BlockClaimMissing, nil
+			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 		}
-		return row.classify(attempt, staleBefore), nil
+		return row.result(attempt, staleBefore), nil
 	}
 	if applied {
-		return BlockClaimAcquired, nil
+		return BlockClaimResult{Outcome: BlockClaimAcquired, Owner: attempt}, nil
 	}
 
 	// A non-applied CAS returns the row's CURRENT values, which is a serial-domain
 	// observation and therefore authoritative — no extra read needed. An empty map is
 	// the exception: Cassandra returns no columns when the partition does not exist.
 	if len(existing) == 0 {
-		return BlockClaimMissing, nil
+		return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 	}
 	row, parseErr := parseBlockDeleteClaimCAS(existing)
 	if parseErr != nil {
-		return BlockClaimAmbiguous, fmt.Errorf("claim block %s: unreadable CAS result: %w", blockID, parseErr)
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: unreadable CAS result: %w", blockID, parseErr)
 	}
-	return row.classify(attempt, staleBefore), nil
+	return row.result(attempt, staleBefore), nil
 }
 
 func parseBlockDeleteClaimCAS(existing map[string]interface{}) (blockDeleteClaimRow, error) {

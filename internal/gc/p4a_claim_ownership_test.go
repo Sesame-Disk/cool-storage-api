@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -52,18 +53,18 @@ func TestP4A_TwoAttemptsOnOneCandidateDoNotShareOwnership(t *testing.T) {
 		t.Fatal("two attempts on one candidate produced the same claim id; ownership is not per-attempt")
 	}
 
-	if outcome, err := store.ClaimBlockDelete(orgID, "blk-shared", attemptA); err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("A claim = %s, %v; want acquired", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, "blk-shared", attemptA); err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("A claim = %s, %v; want acquired", claim.Outcome, err)
 	}
-	outcome, err := store.ClaimBlockDelete(orgID, "blk-shared", attemptB)
+	claim, err := store.ClaimBlockDelete(orgID, "blk-shared", attemptB)
 	if err != nil {
 		t.Fatalf("B claim: %v", err)
 	}
-	if outcome == BlockClaimAcquired {
+	if claim.Outcome == BlockClaimAcquired {
 		t.Fatal("both attempts acquired the same row; either could then delete the bytes while the other drops the fence")
 	}
-	if outcome != BlockClaimFreshOwner {
-		t.Fatalf("B claim = %s, want fresh_owner: A's claim is live, so B must postpone and preserve the candidate", outcome)
+	if claim.Outcome != BlockClaimFreshOwner {
+		t.Fatalf("B claim = %s, want fresh_owner: A's claim is live, so B must postpone and preserve the candidate", claim.Outcome)
 	}
 }
 
@@ -79,8 +80,8 @@ func TestP4A_LoserCannotReleaseOrFinalizeTheWinnersClaim(t *testing.T) {
 	now := time.Now().UTC()
 	winner := p4aAttempt(candidate, now)
 	loser := p4aAttempt(candidate, now)
-	if outcome, err := store.ClaimBlockDelete(orgID, "blk-loser", winner); err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("winner claim = %s, %v", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, "blk-loser", winner); err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("winner claim = %s, %v", claim.Outcome, err)
 	}
 
 	outcome, err := store.ReleaseBlockClaim(orgID, "blk-loser", loser)
@@ -110,18 +111,31 @@ func TestP4A_TakenOverAttemptCannotActAfterwards(t *testing.T) {
 	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-takeover")
 
 	attemptA := p4aAttempt(candidate, time.Now().UTC())
-	if outcome, err := store.ClaimBlockDelete(orgID, "blk-takeover", attemptA); err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("A claim = %s, %v", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, "blk-takeover", attemptA); err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("A claim = %s, %v", claim.Outcome, err)
 	}
 
 	store.BackdateBlockClaimForTest(orgID, "blk-takeover", time.Now().Add(-2*blockDeleteClaimStaleAfter))
-	if outcome, err := store.ReleaseStaleBlockClaim(orgID, "blk-takeover", time.Now().Add(-blockDeleteClaimStaleAfter)); err != nil || outcome != BlockClaimReleased {
-		t.Fatalf("stale takeover = %s, %v; want released", outcome, err)
+
+	// B observes A as stale through its own claim attempt and takes over using the exact
+	// authority that attempt reported — the production flow. The observed ClaimedAt is
+	// the aged one rather than what A originally wrote, which is precisely why a takeover
+	// must use what it SAW instead of anything it remembers.
+	observe := p4aAttempt(candidate, time.Now().UTC())
+	observed, err := store.ClaimBlockDelete(orgID, "blk-takeover", observe)
+	if err != nil || observed.Outcome != BlockClaimStaleOwner {
+		t.Fatalf("B observing A = %s, %v; want stale_owner", observed.Outcome, err)
+	}
+	if observed.Owner.ClaimID != attemptA.ClaimID {
+		t.Fatalf("the claim reported owner %q, want the abandoned attempt %q", observed.Owner.ClaimID, attemptA.ClaimID)
+	}
+	if released, err := store.ReleaseBlockClaim(orgID, "blk-takeover", observed.Owner); err != nil || released != BlockReleaseReleased {
+		t.Fatalf("stale takeover = %s, %v; want released", released, err)
 	}
 
 	attemptB := p4aAttempt(candidate, time.Now().UTC())
-	if outcome, err := store.ClaimBlockDelete(orgID, "blk-takeover", attemptB); err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("B claim after takeover = %s, %v", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, "blk-takeover", attemptB); err != nil || claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("B claim after takeover = %s, %v", claim.Outcome, err)
 	}
 
 	// A wakes up. Both of its transitions must be refused.
@@ -151,12 +165,12 @@ func TestP4A_CandidateForDeadIncarnationCannotTouchTheLiveOne(t *testing.T) {
 	store.SetBlockStorageKeyForTest(orgID, "blk-aba", p2.StorageKey)
 
 	staleAttempt := p4aAttempt(candidate, time.Now().UTC())
-	outcome, err := store.ClaimBlockDelete(orgID, "blk-aba", staleAttempt)
+	claim, err := store.ClaimBlockDelete(orgID, "blk-aba", staleAttempt)
 	if err != nil {
 		t.Fatalf("stale claim: %v", err)
 	}
-	if outcome != BlockClaimTargetChanged {
-		t.Fatalf("claim for the dead incarnation = %s, want target_changed", outcome)
+	if claim.Outcome != BlockClaimTargetChanged {
+		t.Fatalf("claim for the dead incarnation = %s, want target_changed", claim.Outcome)
 	}
 	blk := store.GetBlock(orgID, "blk-aba")
 	if blk == nil {
@@ -243,34 +257,104 @@ func TestP4A_FreshOwnerDoesNotSettleTheCandidate(t *testing.T) {
 	}
 }
 
-// TestP4A_StaleTakeoverRequiresTheExactPreviousAuthority: takeover is a CAS, not a
-// clear. An owner that re-claimed between the observation and the write keeps its row.
+// TestP4A_StaleTakeoverRequiresTheExactPreviousAuthority: a takeover is a CAS against
+// the authority the claim OBSERVED, not a fresh look at whoever owns the row now.
+//
+// The previous version of this test seeded a FRESH replacement owner, which the staleness
+// check rejects on its own — so it passed without ever exercising the CAS, and would have
+// stayed green against a takeover that re-read the row and released whatever it found.
+// Both cases below replace the observed owner with another STALE one, so age cannot be
+// what saves the row and only the exact-authority CAS can.
 func TestP4A_StaleTakeoverRequiresTheExactPreviousAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		replaceKey bool
+		why        string
+	}{
+		{
+			name: "same incarnation, different attempt",
+			why:  "the claim id is load-bearing on its own: another attempt took the row over first, and only IT may hand its own claim back",
+		},
+		{
+			name:       "different incarnation",
+			replaceKey: true,
+			why:        "a worker authorized for P1 must never drop P2's fence, however old that fence is",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			orgID := uuid.New()
+			candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-stale-cas")
+
+			// A claims and is abandoned; this is the authority a worker would observe.
+			observed := p4aAttempt(candidate, time.Now().UTC())
+			if claim, err := store.ClaimBlockDelete(orgID, "blk-stale-cas", observed); err != nil || claim.Outcome != BlockClaimAcquired {
+				t.Fatalf("A claim = %s, %v", claim.Outcome, err)
+			}
+
+			// Between that observation and the takeover, a DIFFERENT owner takes the row —
+			// and is itself already stale, so nothing but exact authority can refuse it.
+			if tc.replaceKey {
+				store.SetBlockStorageKeyForTest(orgID, "blk-stale-cas", candidate.Target.StorageKey+".remint")
+			}
+			survivor := store.SeedBlockClaimForTest(orgID, "blk-stale-cas", "attempt-c", time.Now().Add(-2*blockDeleteClaimStaleAfter))
+
+			released, err := store.ReleaseBlockClaim(orgID, "blk-stale-cas", observed)
+			if err != nil {
+				t.Fatalf("takeover release: %v", err)
+			}
+			if released != BlockReleaseNotOwner {
+				t.Fatalf("takeover of a claim that changed hands = %s, want not_owner: %s", released, tc.why)
+			}
+			blk := store.GetBlock(orgID, "blk-stale-cas")
+			if blk == nil {
+				t.Fatal("the canonical row disappeared")
+			}
+			if blk.GCClaimID != survivor.ClaimID || blk.GCState != db.BlockGCStateDeleting {
+				t.Fatalf("the surviving owner's fence was dropped by a worker that never observed it (block=%+v): %s", blk, tc.why)
+			}
+		})
+	}
+}
+
+// TestP4A_StaleClaimReleaseIsBoundToTheCandidatesIncarnation covers the OTHER caller of
+// the age-based release: the pre-check path, which runs on a still-referenced block and
+// is deliberately owner-agnostic so it can lift a fence whose owner will never return.
+//
+// Owner-agnostic is not incarnation-agnostic. `blocks` can perfectly ordinarily hold a
+// different life by the time this runs — P1 died, P2 was installed, a lifecycle for P2
+// claimed it and was abandoned — and a candidate for P1 has no authority over P2's fence.
+// No clock skew or unusual interleaving is needed to reach this; it is the ordinary
+// shape of a re-minted block.
+func TestP4A_StaleClaimReleaseIsBoundToTheCandidatesIncarnation(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
-	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-stale-cas")
+	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-precheck")
+	p1 := candidate.Target
 
-	attemptA := p4aAttempt(candidate, time.Now().UTC())
-	if outcome, err := store.ClaimBlockDelete(orgID, "blk-stale-cas", attemptA); err != nil || outcome != BlockClaimAcquired {
-		t.Fatalf("A claim = %s, %v", outcome, err)
-	}
-	store.BackdateBlockClaimForTest(orgID, "blk-stale-cas", time.Now().Add(-2*blockDeleteClaimStaleAfter))
+	// The block is re-minted, and a GC lifecycle for the NEW incarnation fences it and
+	// is abandoned.
+	store.SetBlockStorageKeyForTest(orgID, "blk-precheck", p1.StorageKey+".remint")
+	survivor := store.SeedBlockClaimForTest(orgID, "blk-precheck", "p2-lifecycle", time.Now().Add(-2*blockDeleteClaimStaleAfter))
 
-	// A fresh claim lands in the window between "observed stale" and the release.
-	store.SeedBlockClaimForTest(orgID, "blk-stale-cas", "attempt-c", time.Now())
-
-	outcome, err := store.ReleaseStaleBlockClaim(orgID, "blk-stale-cas", time.Now().Add(-blockDeleteClaimStaleAfter))
+	outcome, err := store.ReleaseStaleBlockClaim(orgID, "blk-precheck", p1, time.Now().Add(-blockDeleteClaimStaleAfter))
 	if err != nil {
 		t.Fatalf("ReleaseStaleBlockClaim: %v", err)
 	}
 	if outcome == BlockClaimReleased {
-		t.Fatal("a re-claimed row was released as stale; the new owner's fence was dropped mid-delete")
+		t.Fatal("a candidate for P1 released a fence belonging to P2; age is not authority over an incarnation this worker was never given")
 	}
 	if outcome != BlockClaimTooFresh {
-		t.Fatalf("stale release over a re-claimed row = %s, want too_fresh", outcome)
+		t.Fatalf("stale release across incarnations = %s, want too_fresh so the caller postpones instead of settling", outcome)
 	}
-	if blk := store.GetBlock(orgID, "blk-stale-cas"); blk == nil || blk.GCClaimID != "attempt-c" {
-		t.Fatalf("the new owner's claim did not survive (block=%+v)", blk)
+	blk := store.GetBlock(orgID, "blk-precheck")
+	if blk == nil || blk.GCClaimID != survivor.ClaimID || blk.GCState != db.BlockGCStateDeleting {
+		t.Fatalf("P2's fence did not survive a P1 worker's stale release (block=%+v)", blk)
+	}
+
+	// And the same call, correctly named, still lifts P2's own abandoned fence.
+	if outcome, err := store.ReleaseStaleBlockClaim(orgID, "blk-precheck", survivor.Target, time.Now().Add(-blockDeleteClaimStaleAfter)); err != nil || outcome != BlockClaimReleased {
+		t.Fatalf("stale release naming the right incarnation = %s, %v; want released — binding to P must not cost the unwedging this path exists for", outcome, err)
 	}
 }
 
@@ -283,11 +367,11 @@ func TestP4A_DeleteClaimNeverOverwritesARepairingStub(t *testing.T) {
 	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-repairing")
 	store.SetBlockGCStateForTest(orgID, "blk-repairing", "repairing_stub", "upload-repair-claim", time.Now())
 
-	outcome, err := store.ClaimBlockDelete(orgID, "blk-repairing", p4aAttempt(candidate, time.Now().UTC()))
+	claim, err := store.ClaimBlockDelete(orgID, "blk-repairing", p4aAttempt(candidate, time.Now().UTC()))
 	if err != nil {
 		t.Fatalf("claim over repairing_stub: %v", err)
 	}
-	if outcome == BlockClaimAcquired {
+	if claim.Outcome == BlockClaimAcquired {
 		t.Fatal("GC claimed a row owned by the upload path's repair claim")
 	}
 	blk := store.GetBlock(orgID, "blk-repairing")
@@ -350,7 +434,9 @@ func TestP4A_AmbiguousClaimSettlesBeforeAnyCleanup(t *testing.T) {
 	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, "blk-ambiguous", uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem: %v", err)
 	}
-	store.SetClaimBlockDeleteErrForTest(errors.New("gocql: no response received from cassandra within timeout period"))
+	timeout := errors.New("gocql: no response received from cassandra within timeout period")
+	store.SetClaimBlockDeleteErrForTest(timeout)
+	store.SetClaimBlockDeleteSettleErrForTest(timeout)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce: %v", err)
@@ -449,5 +535,161 @@ func TestP4A_EachWorkerAttemptMintsItsOwnClaimID(t *testing.T) {
 		if a.Target != candidate.Target {
 			t.Fatalf("an attempt claimed incarnation %s, but the candidate authorized %s", a.Target, candidate.Target)
 		}
+	}
+}
+
+// TestP4A_DestructiveLocatorComesFromTheClaimNotAReadBack is the orphan/S3 half of R14.
+//
+// The claim binds to the incarnation the candidate authorized, and FinalizeBlockDelete
+// was already bound to it — but the two steps that actually touch bytes, the orphan
+// publication and the S3 delete, used to take their locator from a GetBlockInfo re-read.
+// That read is an ordinary one (`database.consistency` accepts ONE) while the claim
+// commits at EACH_QUORUM in the serial domain, so it can legitimately show a different
+// incarnation. Publishing and deleting THAT is the same "re-read blocks and destroy what
+// is there now" the candidate authority exists to forbid, one step further down.
+func TestP4A_DestructiveLocatorComesFromTheClaimNotAReadBack(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	candidate := p4aSeedBlockCandidate(t, store, orgID, testSHA256BlockID("blk-readback"))
+	p1 := candidate.Target
+	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, testSHA256BlockID("blk-readback"), uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem: %v", err)
+	}
+
+	// The claim succeeds against P1, and only afterwards does the canonical row read
+	// back as a different incarnation — the divergence a ONE-consistency read can show.
+	p2Key := p1.StorageKey + ".remint"
+	store.SetGetBlockInfoHookForTest(func(info BlockInfo) BlockInfo {
+		info.StorageKey = p2Key
+		return info
+	})
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		// A refusal here is expected to surface as an ordinary error; what must not
+		// happen is a publication or a delete naming P2.
+		t.Logf("ProcessOnce returned %v (a refusal is the correct outcome)", err)
+	}
+
+	for _, orphan := range store.AllS3Orphans() {
+		if orphan.StorageKey == p2Key {
+			t.Fatalf("published an orphan for %q, an incarnation the claim never authorized", p2Key)
+		}
+	}
+	for _, deleted := range sp.ScopedBlockDeletes() {
+		if deleted.StorageKey == p2Key {
+			t.Fatalf("deleted %q from S3, an incarnation the claim never authorized", p2Key)
+		}
+	}
+	if blk := store.GetBlock(orgID, testSHA256BlockID("blk-readback")); blk != nil && blk.GCState != "" {
+		t.Errorf("refused the divergent row but left its fence up (gc_state=%q)", blk.GCState)
+	}
+}
+
+// TestP4A_MissingCanonicalRowDoesNotAbortTheEnqueueBatch pins the sentinel contract.
+//
+// A block with no canonical row has nothing reclaimable, which processBlock itself treats
+// as routine further down the walk. Failing the enqueue hard on it is not just
+// inconsistent: on the fs_object path it is self-poisoning, because the caller aborts the
+// whole delete, the retry re-derives the same zero-ref block through an idempotent
+// reference removal, and the fs_object is never deleted at all.
+func TestP4A_MissingCanonicalRowDoesNotAbortTheEnqueueBatch(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+
+	// One collectable block either side of one that has nothing to collect.
+	store.AddBlock(orgID, "blk-before", "hot", 0)
+	store.AddBlock(orgID, "blk-after", "hot", 0)
+
+	err := w.enqueueZeroRefBlocks(orgID, uuid.Nil, []string{"blk-before", "blk-gone", "blk-after"}, "hot")
+	if err != nil {
+		t.Fatalf("enqueueZeroRefBlocks aborted on a block with nothing reclaimable: %v", err)
+	}
+
+	queued := map[string]bool{}
+	for _, item := range store.QueueItems(orgID) {
+		queued[item.ItemID] = true
+	}
+	if !queued["blk-before"] || !queued["blk-after"] {
+		t.Fatalf("siblings of an unreclaimable block were dropped from the batch (queued=%v)", queued)
+	}
+	if queued["blk-gone"] {
+		t.Fatal("a block with no canonical row was enqueued; there is no incarnation to authorize its deletion")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 2 {
+		t.Fatalf("candidate rows = %d, want 2: one per collectable block and none for the missing one", got)
+	}
+}
+
+// TestP4A_ReplacedCandidateServesItsOwnGracePeriod: replacement gives the new incarnation
+// a fresh candidate_at precisely so it serves its own grace. The queue's grace check runs
+// against the QUEUE row's timestamp, so an old item that already cleared grace would
+// otherwise pick the fresh candidate up immediately and hand the new life exactly the
+// head start replacement exists to deny it.
+func TestP4A_ReplacedCandidateServesItsOwnGracePeriod(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	const grace = time.Hour
+	w := NewWorker(store, sp, NewQueue(store), 100, grace, false, &Stats{})
+
+	orgID := uuid.New()
+	p4aSeedBlockCandidate(t, store, orgID, testSHA256BlockID("blk-grace"))
+	// An old queue item that has long since cleared the grace period.
+	if err := store.EnqueueItem(orgID, time.Now().Add(-24*time.Hour), ItemBlock, testSHA256BlockID("blk-grace"), uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem: %v", err)
+	}
+
+	// The candidate is re-decided and carries a fresh candidate_at. The incarnation is
+	// deliberately left ALONE: changing it would make the walk abort on locator
+	// validation instead, and the test would pass without ever reaching the grace check.
+	store.AddBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"), "hot", time.Now())
+	fresh, ok, err := store.GetBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"))
+	if err != nil || !ok {
+		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
+	}
+	if fresh.Target.IsZero() {
+		t.Fatal("the re-decided candidate lost its incarnation; this test must reach the grace check, not a locator refusal")
+	}
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Logf("ProcessOnce returned %v (a postponement is the correct outcome)", err)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted a freshly decided incarnation inside its grace period: %+v", deletes)
+	}
+	if blk := store.GetBlock(orgID, testSHA256BlockID("blk-grace")); blk == nil || blk.GCState != "" {
+		t.Fatalf("claimed a freshly decided incarnation inside its grace period (block=%+v)", blk)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 1 {
+		t.Fatalf("candidate rows = %d, want 1: postponing must not consume the work item", got)
+	}
+}
+
+// TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted: a candidate row written before
+// migration 017 has a NULL storage_key. It cannot be repaired by a CAS that names the
+// key — which is what used to spin the retry loop forever, one Paxos round at a time —
+// and it must not be silently adopted as today's incarnation either, because it was
+// authorized for whatever incarnation was live when it was created.
+func TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	store.AddBlock(orgID, "blk-legacy", "hot", 0)
+	store.AddBlockGCCandidate(orgID, "blk-legacy", "hot", time.Now().Add(-24*time.Hour))
+	store.SetBlockGCCandidateTargetForTest(orgID, "blk-legacy", BlockDeleteTarget{StorageClass: "hot"})
+
+	_, err := store.EnsureBlockGCCandidate(orgID, "blk-legacy", "hot", time.Now())
+	if !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidate over a pre-017 row = %v, want ErrBlockCandidateTargetUnavailable", err)
+	}
+	got, ok, _ := store.GetBlockGCCandidate(orgID, "blk-legacy")
+	if !ok {
+		t.Fatal("the pre-017 candidate was consumed; promoting it needs a fresh zero-ref decision, not a delete")
+	}
+	if got.Target.StorageKey != "" {
+		t.Fatalf("the pre-017 candidate was reinterpreted as %s; nothing ever decided that incarnation was garbage", got.Target)
 	}
 }

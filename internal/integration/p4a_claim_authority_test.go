@@ -92,18 +92,18 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	attemptA := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: now}
 	attemptB := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: now}
 
-	if outcome, err := store.ClaimBlockDelete(orgID, blockID, attemptA); err != nil || outcome != gcpkg.BlockClaimAcquired {
-		t.Fatalf("A claim = %s, %v; want acquired", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, blockID, attemptA); err != nil || claim.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("A claim = %s, %v; want acquired", claim.Outcome, err)
 	}
 
 	// B loses. The engine must return the CURRENT values so the loser can tell "a live
 	// attempt owns this" from "the row is gone" without a second, non-serial read.
-	outcome, err := store.ClaimBlockDelete(orgID, blockID, attemptB)
+	claim, err := store.ClaimBlockDelete(orgID, blockID, attemptB)
 	if err != nil {
 		t.Fatalf("B claim: %v", err)
 	}
-	if outcome != gcpkg.BlockClaimFreshOwner {
-		t.Fatalf("P4A REGRESSION: B claim = %s, want fresh_owner; two attempts must not both own one incarnation", outcome)
+	if claim.Outcome != gcpkg.BlockClaimFreshOwner {
+		t.Fatalf("P4A REGRESSION: B claim = %s, want fresh_owner; two attempts must not both own one incarnation", claim.Outcome)
 	}
 
 	// The loser holds no fence and may not touch the winner's row.
@@ -124,14 +124,25 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	).Exec(); err != nil {
 		t.Fatalf("age A's claim: %v", err)
 	}
-	staleOutcome, err := store.ReleaseStaleBlockClaim(orgID, blockID, now.Add(-time.Hour))
-	if err != nil || staleOutcome != gcpkg.BlockClaimReleased {
-		t.Fatalf("stale takeover = %s, %v; want released", staleOutcome, err)
-	}
-
+	// The takeover names the authority a claim attempt OBSERVED, and it has to be
+	// re-observed AFTER the ageing above: gc_claimed_at is part of the identity, so the
+	// value A originally wrote is no longer what owns the row. That is the whole reason a
+	// takeover must use what it saw rather than anything it remembers — and why
+	// re-reading and releasing "the current stale owner" is a different operation, since
+	// between two reads the row can be a different incarnation entirely.
 	attemptC := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: time.Now().UTC().Truncate(time.Millisecond)}
-	if outcome, err := store.ClaimBlockDelete(orgID, blockID, attemptC); err != nil || outcome != gcpkg.BlockClaimAcquired {
-		t.Fatalf("C claim after takeover = %s, %v; want acquired", outcome, err)
+	observed, err := store.ClaimBlockDelete(orgID, blockID, attemptC)
+	if err != nil || observed.Outcome != gcpkg.BlockClaimStaleOwner {
+		t.Fatalf("C observing the abandoned claim = %s, %v; want stale_owner", observed.Outcome, err)
+	}
+	if observed.Owner.ClaimID != attemptA.ClaimID {
+		t.Fatalf("the claim reported owner %q, want the abandoned attempt %q; without the observed owner a takeover cannot be exact", observed.Owner.ClaimID, attemptA.ClaimID)
+	}
+	if released, err := store.ReleaseBlockClaim(orgID, blockID, observed.Owner); err != nil || released != gcpkg.BlockReleaseReleased {
+		t.Fatalf("stale takeover = %s, %v; want released", released, err)
+	}
+	if claim, err := store.ClaimBlockDelete(orgID, blockID, attemptC); err != nil || claim.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("C claim after takeover = %s, %v; want acquired", claim.Outcome, err)
 	}
 
 	// A wakes up late. Both transitions must be refused against the real CAS.
@@ -186,12 +197,12 @@ func TestP4A_StaleIncarnationCannotActOnTheLiveOne(t *testing.T) {
 	}
 
 	stale := gcpkg.BlockDeleteAuthority{Target: p1, ClaimID: uuid.NewString(), ClaimedAt: time.Now().UTC().Truncate(time.Millisecond)}
-	outcome, err := store.ClaimBlockDelete(orgID, blockID, stale)
+	claim, err := store.ClaimBlockDelete(orgID, blockID, stale)
 	if err != nil {
 		t.Fatalf("stale claim: %v", err)
 	}
-	if outcome != gcpkg.BlockClaimTargetChanged {
-		t.Fatalf("P4A REGRESSION: a candidate for a dead incarnation claimed %s against the live one; want target_changed", outcome)
+	if claim.Outcome != gcpkg.BlockClaimTargetChanged {
+		t.Fatalf("P4A REGRESSION: a candidate for a dead incarnation claimed %s against the live one; want target_changed", claim.Outcome)
 	}
 
 	var gcState, gcClaimID string
@@ -275,18 +286,18 @@ func TestP4A_RetryOfTheSameCandidateUnderRealCAS(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	first := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: now}
-	if outcome, err := store.ClaimBlockDelete(orgID, blockID, first); err != nil || outcome != gcpkg.BlockClaimAcquired {
-		t.Fatalf("first claim = %s, %v", outcome, err)
+	if claim, err := store.ClaimBlockDelete(orgID, blockID, first); err != nil || claim.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("first claim = %s, %v", claim.Outcome, err)
 	}
 
 	// The same logical candidate, retried. A fresh attempt id is the whole point.
 	retry := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: time.Now().UTC().Truncate(time.Millisecond)}
-	outcome, err := store.ClaimBlockDelete(orgID, blockID, retry)
+	claim, err := store.ClaimBlockDelete(orgID, blockID, retry)
 	if err != nil {
 		t.Fatalf("retry claim: %v", err)
 	}
-	if outcome != gcpkg.BlockClaimFreshOwner {
-		t.Fatalf("retry of the same candidate = %s, want fresh_owner: a retry must not inherit the previous attempt's ownership", outcome)
+	if claim.Outcome != gcpkg.BlockClaimFreshOwner {
+		t.Fatalf("retry of the same candidate = %s, want fresh_owner: a retry must not inherit the previous attempt's ownership", claim.Outcome)
 	}
 
 	// Age the abandoned claim; the retry then takes it over and acquires under its own
@@ -297,12 +308,16 @@ func TestP4A_RetryOfTheSameCandidateUnderRealCAS(t *testing.T) {
 	).Exec(); err != nil {
 		t.Fatalf("age the abandoned claim: %v", err)
 	}
-	if staleOutcome, err := store.ReleaseStaleBlockClaim(orgID, blockID, now.Add(-time.Hour)); err != nil || staleOutcome != gcpkg.BlockClaimReleased {
-		t.Fatalf("stale takeover = %s, %v; want released", staleOutcome, err)
-	}
 	second := gcpkg.BlockDeleteAuthority{Target: target, ClaimID: uuid.NewString(), ClaimedAt: time.Now().UTC().Truncate(time.Millisecond)}
-	if outcome, err := store.ClaimBlockDelete(orgID, blockID, second); err != nil || outcome != gcpkg.BlockClaimAcquired {
-		t.Fatalf("claim after takeover = %s, %v; an abandoned claim must not fence the block forever", outcome, err)
+	aged, err := store.ClaimBlockDelete(orgID, blockID, second)
+	if err != nil || aged.Outcome != gcpkg.BlockClaimStaleOwner {
+		t.Fatalf("observing the aged claim = %s, %v; want stale_owner", aged.Outcome, err)
+	}
+	if released, err := store.ReleaseBlockClaim(orgID, blockID, aged.Owner); err != nil || released != gcpkg.BlockReleaseReleased {
+		t.Fatalf("stale takeover = %s, %v; want released", released, err)
+	}
+	if claim, err := store.ClaimBlockDelete(orgID, blockID, second); err != nil || claim.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("claim after takeover = %s, %v; an abandoned claim must not fence the block forever", claim.Outcome, err)
 	}
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, second); err != nil || released != gcpkg.BlockReleaseReleased {
 		t.Fatalf("cleanup release = %s, %v", released, err)
@@ -310,4 +325,64 @@ func TestP4A_RetryOfTheSameCandidateUnderRealCAS(t *testing.T) {
 
 	gate.observed = true
 	t.Logf("P4A_RETRY_EVIDENCE retry_outcome=fresh_owner recovery=stale_takeover")
+}
+
+// TestP4A_StaleClaimReleaseIsBoundToTheIncarnation is the pre-check half of the authority
+// contract, against real Cassandra.
+//
+// The age-based release exists so a fence whose owner will never return can still be
+// lifted. That is owner-agnostic by design — but it must not be INCARNATION-agnostic. A
+// re-minted block ordinarily ends up holding a different life with its own abandoned
+// fence, and a candidate for the previous life has no authority over it. No clock skew or
+// unusual interleaving is needed to reach this; it is the plain shape of a re-mint.
+func TestP4A_StaleClaimReleaseIsBoundToTheIncarnation(t *testing.T) {
+	requireCassandra(t)
+	gate := p4aRequireEvidence(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("p4a-precheck-%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupGCBlockRowsForTest(t, orgID, blockID) })
+
+	_, p1 := p4aSeedCandidate(t, orgID, blockID)
+
+	// The block is re-minted, and a lifecycle for the NEW incarnation fences it and is
+	// then abandoned long enough to look stale.
+	p2 := gcpkg.BlockDeleteTarget{StorageClass: p1.StorageClass, StorageKey: p1.StorageKey + ".remint"}
+	abandoned := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	if err := database.Session().Query(
+		`UPDATE blocks SET storage_key = ?, gc_state = ?, gc_claim_id = ?, gc_claimed_at = ?
+		 WHERE org_id = ? AND block_id = ?`,
+		p2.StorageKey, "deleting", "p2-lifecycle", abandoned, orgID.String(), blockID,
+	).Exec(); err != nil {
+		t.Fatalf("install P2 with an abandoned fence: %v", err)
+	}
+
+	// A worker authorized only for P1 must leave that fence alone.
+	outcome, err := store.ReleaseStaleBlockClaim(orgID, blockID, p1, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ReleaseStaleBlockClaim: %v", err)
+	}
+	if outcome == gcpkg.BlockClaimReleased {
+		t.Fatal("P4A REGRESSION: a candidate for P1 released a fence belonging to P2; age is not authority over an incarnation this worker was never given")
+	}
+	var gcState, gcClaimID string
+	if err := database.Session().Query(
+		`SELECT gc_state, gc_claim_id FROM blocks WHERE org_id = ? AND block_id = ?`,
+		orgID.String(), blockID,
+	).Scan(&gcState, &gcClaimID); err != nil {
+		t.Fatalf("read P2's fence after the refused release: %v", err)
+	}
+	if gcState != "deleting" || gcClaimID != "p2-lifecycle" {
+		t.Fatalf("P4A REGRESSION: P2's fence did not survive a P1 worker's stale release (gc_state=%q gc_claim_id=%q)", gcState, gcClaimID)
+	}
+
+	// Correctly named, the same call still does the unwedging it exists for.
+	if outcome, err := store.ReleaseStaleBlockClaim(orgID, blockID, p2, time.Now().Add(-time.Hour)); err != nil || outcome != gcpkg.BlockClaimReleased {
+		t.Fatalf("stale release naming the right incarnation = %s, %v; want released — binding to P must not cost the liveness this path provides", outcome, err)
+	}
+
+	gate.observed = true
+	t.Logf("P4A_PRECHECK_EVIDENCE refused_cross_incarnation=1 released_own_incarnation=1")
 }
