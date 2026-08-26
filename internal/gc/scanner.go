@@ -415,7 +415,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 					ItemType:     ItemBlock,
 					ItemID:       candidate.BlockID,
 					LibraryID:    uuid.Nil,
-					StorageClass: candidate.StorageClass,
+					StorageClass: candidate.StorageClass(),
 				})
 			}
 			if len(batch) > 0 {

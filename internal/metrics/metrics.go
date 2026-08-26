@@ -372,6 +372,30 @@ var (
 		[]string{"action"},
 	)
 
+	// GCBlockDeleteClaimTotal counts block-delete claim attempts by classified outcome.
+	//
+	// The label set is a closed enum — acquired, target_changed, fresh_owner,
+	// stale_owner, missing, invalid, ambiguous, no_candidate, plus release_* — and
+	// deliberately carries NO org id, block id, storage key or claim UUID. Those are
+	// unbounded, and a per-tenant or per-object label here would turn one busy org into
+	// a cardinality incident on every scrape.
+	GCBlockDeleteClaimTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_block_delete_claim_total",
+			Help: "Total block-delete claim attempts by outcome. A rising fresh_owner or ambiguous rate means candidates are being postponed rather than settled; target_changed means candidates are outliving their physical incarnation.",
+		},
+		[]string{"result"},
+	)
+
+	// GCBlockDeleteTakeoverTotal counts stale-claim takeovers by outcome.
+	GCBlockDeleteTakeoverTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_block_delete_takeover_total",
+			Help: "Total stale block-delete claim takeovers by outcome (released, lost, failed).",
+		},
+		[]string{"result"},
+	)
+
 	// LibraryDeleteRepresentationResolutionFailures counts library delete
 	// operations that could not resolve a canonical block representation before
 	// writing the GC marker. A non-zero rate signals a delete path or migration
@@ -1177,6 +1201,8 @@ func Register() {
 		GCActiveOrgRecoveriesTotal,
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
+		GCBlockDeleteClaimTotal,
+		GCBlockDeleteTakeoverTotal,
 		LibraryDeleteRepresentationResolutionFailures,
 		ChunkUploadTempOrphansCleaned,
 		ChunkUploadFinalizationAttemptsTotal,

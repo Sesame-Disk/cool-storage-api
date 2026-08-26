@@ -120,6 +120,12 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	}
 
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	// The candidate captures the (corrupt) foreign locator now on the canonical row,
+	// so the claim can bind to it and the walk reaches the locator validation this test
+	// is about rather than stopping earlier for want of authority.
+	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, queuedAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	}
 	if err := store.EnqueueItem(orgID, queuedAt, gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
 		t.Fatalf("EnqueueItem: %v", err)
 	}

@@ -8,6 +8,94 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-26 - P4a exact-`P`, per-attempt GC claim authority (R14a / R16 / R20 claim path)
+
+Fixes the identity of the destructive claim. A candidate created for one physical
+incarnation can no longer claim, release, finalize or clear work belonging to another,
+and two attempts on one candidate can no longer share ownership of a row.
+
+**The two defects this closes.** `blockDeleteClaimID(candidateAt)` derived the claim id
+from the CANDIDATE, so every attempt on that candidate — concurrent ones included —
+presented the same id, the CAS answered applied to all of them, and any one could drop
+the fence another was deleting under. Separately, `ClaimBlockDelete` was
+`IF gc_state != 'deleting'`: it never named the physical locator, so a candidate enqueued
+for `P1` would happily claim `P2` after `P1` died and `P2` was minted onto the same
+logical block (R14), and it would overwrite `gc_state='repairing_stub'`, a claim owned by
+the upload path.
+
+**What changed**
+- Migration `017` adds `storage_key` to `gc_block_candidates` and its `_by_day`
+  projection. `EnsureBlockGCCandidate` captures `P` from the canonical row itself and
+  refuses (`ErrBlockCandidateTargetUnavailable`) rather than writing a candidate it
+  cannot name an incarnation for — so no caller can create authority-less work.
+- `BlockDeleteTarget` / `BlockDeleteAuthority` / `BlockGCCandidateIdentity` make it hard
+  by construction to pass only `(org, block_id)` to a destructive primitive.
+- The claim CAS is now `IF storage_class = ? AND storage_key = ? AND gc_state = null AND
+  gc_claim_id = null AND gc_claimed_at = null`, and `claimID` is a fresh UUID per
+  ATTEMPT. Release, stale takeover and finalize each condition on the exact
+  `(P, claimID, claimed_at)`; `DeleteBlockGCCandidate` is a CAS on the candidate's own
+  `(storage_class, storage_key, candidate_at)`.
+- `ClaimBlockDelete` returns a classified outcome instead of a bool. `!applied` is no
+  longer completion: `fresh_owner` postpones and preserves the candidate, `target_changed`
+  settles only the stale candidate, `invalid` and `ambiguous` mutate and consume nothing.
+- `ReleaseBlockClaim` returns an outcome rather than an error, because under per-attempt
+  identity a lost race is expected. Reporting it as an error spent the retry budget and,
+  since the release error dominates the caller's, buried the real reason for the unwind.
+- `EnsureBlockGCCandidate`'s earliest-wins rule is now scoped to one incarnation. A new
+  incarnation gets its OWN `candidate_at` instead of inheriting its predecessor's, which
+  would have handed it an artificially old timestamp and let it skip the grace period.
+- Deleted `(*DB).ReleaseBlockDeleteClaim` and `GetBlockDeleteClaimInfo`: an unreferenced
+  claim-release primitive with no owner check and no incarnation binding. Every release
+  of a GC claim in the binary is now exact.
+
+**Two behavioural consequences, stated rather than buried.** Requiring all three `gc_*`
+columns to be null removes stub materialization at the root — in Cassandra an `UPDATE`
+whose `IF` only tests for null/inequality applies against a MISSING partition, while one
+naming `storage_class` cannot — so `TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned`
+is inverted into `..._CannotMaterializeAStubRow`. As a result GC no longer deletes
+metadata-free stub rows: it has no exact authority over a row with no locator, and it
+refuses without fencing and without consuming the work item. That is safe because an
+unclaimed stub is not an upload fence (`BlockDeleteFenceActive` keys on
+`gc_state='deleting'` and on orphan rows) and the only producer of a CLAIMED stub was the
+old claim CAS itself. Filed as technical debt so the writer-side owner is explicit.
+
+**Recovery from an abandoned claim is now by staleness, not by identity.** The previous
+shape let any later pass retry the release because it shared the claim id; that is gone,
+and with it the ability of one worker to release another's fence. An abandoned claim is
+lifted by stale takeover — a CAS against the exact previous authority — which works even
+when the attempt that left it never returns.
+
+**Evidence**
+- Unit: `internal/gc/p4a_claim_ownership_test.go` — shared-ownership, loser cannot
+  release or finalize, taken-over attempt cannot act, the ABA case in both directions,
+  fresh-owner is not completion, takeover requires the exact previous authority,
+  `repairing_stub` is never overwritten, invalid identity is neither destructive nor
+  consumed, ambiguous settles before any cleanup, and each worker attempt mints its own id.
+- Source guards: `internal/gc/p4a_claim_authority_guard_test.go` fails if any destructive
+  mutation stops naming the incarnation or the owner, if a candidate-derived claim id
+  returns, if a candidate stops carrying `storage_key`, if GC starts deriving keys, or if
+  a settling read leaves the serial domain.
+- Real Cassandra: `internal/integration/p4a_claim_authority_test.go`, gated by
+  `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` (pinned in `docker-compose.yaml` and wired into the
+  integration `TestMain` OR-chain, so a stack that never came up FAILS instead of
+  skipping to a green run). Three legs: exclusive ownership plus exact takeover, the ABA
+  case, and retry semantics under the engine's real CAS returns.
+- Mutation: `scripts/p4a-mutation-validation.sh` — ten deliberate mutations, each
+  required to go red WITH a P4a assertion rather than for an unrelated reason.
+
+**Scope, and what is still open.** `StartBlockDeleteOrphan` is deliberately untouched:
+`blocks` and `gc_s3_orphans` are separate Paxos partitions, and binding publication to
+the claim is R14b/P4b. R14 is therefore split into R14a (GREEN) and R14b (OPEN); R16 is
+GREEN; R20 is PARTIAL — the claim path settles in the serial domain, the orphan path does
+not. Strict A+ non-overlap, R15, R19, R26, R3, R18/R27, R28 and X3 all remain OPEN, and
+X1 is not closed. No change to the upload hot path or to the physical S3 delete.
+`GC_ENABLED=false` remains mandatory on every replica in every DC.
+
+Closes technical debt #21 (Cassandra-real coverage for GC claim retry) and #22
+(`ReleaseStaleBlockClaim` reading at session consistency).
+
+---
+
 ## 2026-08-25 - P3 cross-DC fence evidence on the three-datacenter fixture
 
 The P3 consistency row moves from "implementation complete, cross-DC evidence

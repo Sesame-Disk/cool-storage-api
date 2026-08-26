@@ -2,6 +2,9 @@ package gc
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +21,9 @@ const (
 	// yet because a delete claim on its block is too young to hand back safely. The
 	// item is postponed, not retried and not failed.
 	GCFailureCodeBlockClaimNotYetStale = "block_claim_not_yet_stale"
+	// GCFailureCodeBlockAuthorityInvalid marks a candidate whose physical identity is
+	// unusable as destructive authority. Postponed, never retried and never consumed.
+	GCFailureCodeBlockAuthorityInvalid = "block_authority_invalid"
 	// GCFailureCodeDestructiveFailClosed marks a delete refused because the
 	// environment could not authorize it — an unreachable datacenter, or a
 	// replication map that no longer carries the per-DC EACH_QUORUM argument. These
@@ -117,18 +123,35 @@ type GCStore interface {
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID, libraryID uuid.UUID, blockRepresentationID string, blockIDs []string) ([]string, error)
-	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
-	// and records the deterministic claimID for the logical delete attempt.
-	// Callers MUST re-check BlockHasReferencesGlobal — the EACH_QUORUM form, never
-	// the session-consistency one — after a successful claim before deleting from S3
+	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT,
+	// but ONLY while the row is still the exact physical incarnation the candidate was
+	// created for and carries no owner at all.
+	//
+	// Both halves of that condition are load-bearing. Naming the incarnation is R14: a
+	// candidate enqueued for P1 must not claim P2 after P1 died and P2 was installed on
+	// the same logical block. Requiring NO owner — rather than merely "not deleting" —
+	// keeps GC off gc_state='repairing_stub', which belongs to the upload path, and
+	// stops the LWT from materializing a stub row: in Cassandra an UPDATE whose IF only
+	// tests columns for null applies against a MISSING partition, while an IF that names
+	// storage_class cannot.
+	//
+	// Callers MUST re-check BlockHasReferencesGlobal — the EACH_QUORUM form, never the
+	// session-consistency one — after a successful claim before deleting from S3
 	// (claim-then-verify). Verifying with the local read reopens
 	// ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01.
-	ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error)
-	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
-	// row. This prevents another attempt from releasing a claim it did not win.
-	// It returns an error when the conditional update does not apply, so callers
-	// that must observe the release use it rather than ReleaseStaleBlockClaim.
-	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	//
+	// The outcome is classified rather than boolean because a non-applied CAS is not
+	// completion (R16): see BlockClaimOutcome.
+	ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimOutcome, error)
+	// ReleaseBlockClaim clears gc_state only while the exact authority — incarnation,
+	// claim id AND claimed_at — still owns the row. This stops an attempt from releasing
+	// a claim it did not win, and stops an attempt that already lost the row to a stale
+	// takeover from dropping the new owner's fence.
+	//
+	// It returns an outcome rather than an error for the not-applied case, because under
+	// per-attempt identity a lost race is an EXPECTED result and not a failure. See
+	// BlockReleaseNotOwner.
+	ReleaseBlockClaim(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockReleaseOutcome, error)
 	// ReleaseStaleBlockClaim clears gc_state on a block whose delete claim was taken
 	// at or before staleBefore, WHICHEVER attempt owns it. Age is the only criterion,
 	// and that is the point: an unconditional release would let one worker drop the
@@ -155,11 +178,34 @@ type GCStore interface {
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
 	DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error)
-	// FinalizeBlockDelete removes the block row only when the same claimID still
-	// owns the row.
-	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
+	// FinalizeBlockDelete removes the block row only while the exact authority still
+	// owns it — incarnation, claim id and claimed_at.
+	//
+	// It deliberately does NOT pin Consistency(EACH_QUORUM) the way ClaimBlockDelete
+	// does. The window this DELETE opens — a writer in another DC that has not yet seen
+	// the row vanish — is covered by the gc_s3_orphans row, which IS published at
+	// EACH_QUORUM and is written BEFORE this call. That row, not this one, is the fence
+	// that spans the physical delete; see db.BlockAuthorityRead for the intersection
+	// argument this relies on.
+	FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) error
+	// EnsureBlockGCCandidate records a block as a delete candidate together with the
+	// EXACT physical incarnation it was observed at.
+	//
+	// Capturing P happens HERE, inside the helper, rather than at the three enqueue call
+	// sites: a candidate with no exact incarnation cannot authorize anything, so making
+	// its capture a mandatory side effect of candidate creation means no caller can
+	// forget it. A block with no canonical row, or one with no usable storage key,
+	// yields ErrBlockCandidateTargetUnavailable and writes NO candidate row.
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
-	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
+	// GetBlockGCCandidate loads the candidate's own record of the incarnation it was
+	// created for. This — never a fresh read of `blocks` — is what authorizes a
+	// destructive claim: re-reading `blocks` here would simply observe P2 and go on to
+	// delete it, which is the whole of R14.
+	GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error)
+	// DeleteBlockGCCandidate removes the candidate only while it is still exactly the
+	// one that was observed. A delayed lifecycle for P1 must not consume a candidate
+	// that now belongs to P2.
+	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
 	// falls on the given UTC day for one discovery bucket. Bucket indices
 	// range over [0, db.GCDiscoveryBucketCount). Replaces the old per-org
@@ -399,10 +445,67 @@ type BlockInfo struct {
 }
 
 type BlockGCCandidateInfo struct {
-	OrgID        uuid.UUID
-	BlockID      string
+	OrgID       uuid.UUID
+	BlockID     string
+	Target      BlockDeleteTarget
+	CandidateAt time.Time
+}
+
+// StorageClass reports the candidate's captured storage class. It is an accessor so
+// the class can only be read through the incarnation it belongs to, never as a
+// free-floating string that has lost its key.
+func (c BlockGCCandidateInfo) StorageClass() string { return c.Target.StorageClass }
+
+// Identity is the exact tuple DeleteBlockGCCandidate conditions on.
+func (c BlockGCCandidateInfo) Identity() BlockGCCandidateIdentity {
+	return BlockGCCandidateIdentity{Target: c.Target, CandidateAt: c.CandidateAt}
+}
+
+// BlockGCCandidateIdentity is the full identity of one candidate row: which physical
+// incarnation it was created for, and when.
+//
+// candidate_at alone is NOT identity. It orders discovery and measures the grace
+// period, and it is reused across successive lives of the same logical block, so a
+// delete keyed on it alone can consume another incarnation's work item.
+type BlockGCCandidateIdentity struct {
+	Target      BlockDeleteTarget
+	CandidateAt time.Time
+}
+
+// BlockDeleteTarget is the exact physical incarnation P = (storage_class, storage_key)
+// of a block. Nothing may reconstruct it from block_id: storage keys are minted, so
+// deriving one yields a DIFFERENT incarnation's key that merely looks plausible.
+type BlockDeleteTarget struct {
 	StorageClass string
-	CandidateAt  time.Time
+	StorageKey   string
+}
+
+// IsZero reports whether the target is unusable as destructive authority.
+func (t BlockDeleteTarget) IsZero() bool {
+	return strings.TrimSpace(t.StorageClass) == "" || strings.TrimSpace(t.StorageKey) == ""
+}
+
+func (t BlockDeleteTarget) String() string {
+	return fmt.Sprintf("(class=%s key=%s)", t.StorageClass, t.StorageKey)
+}
+
+// BlockDeleteAuthority is everything that authorizes one attempt to mutate one block
+// row: the incarnation it may act on, plus the per-attempt ownership token.
+//
+// ClaimID is a fresh UUID per ATTEMPT, never a value derived from candidate_at. A
+// candidate-derived id is shared by every concurrent attempt on the same candidate, so
+// the claim CAS answers "applied" to both and either one can release the other's
+// fence.
+type BlockDeleteAuthority struct {
+	Target    BlockDeleteTarget
+	ClaimID   string
+	ClaimedAt time.Time
+}
+
+// IsZero reports whether the authority is incomplete and therefore cannot be used for
+// any destructive transition.
+func (a BlockDeleteAuthority) IsZero() bool {
+	return a.Target.IsZero() || strings.TrimSpace(a.ClaimID) == "" || a.ClaimedAt.IsZero()
 }
 
 type ProvisionalBlockRefExpiryInfo struct {
@@ -707,6 +810,118 @@ const (
 	// let a later pass release the claim once it has aged out.
 	BlockClaimTooFresh
 )
+
+func (o BlockClaimReleaseOutcome) String() string {
+	switch o {
+	case BlockClaimAbsent:
+		return "absent"
+	case BlockClaimReleased:
+		return "released"
+	case BlockClaimTooFresh:
+		return "too_fresh"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockClaimOutcome classifies what ClaimBlockDelete found. A boolean cannot carry
+// this: the four ways a claim can fail to apply demand four different responses, and
+// collapsing them is exactly the defect R16 names — treating any non-applied CAS as
+// "someone already handled it" and consuming the candidate.
+type BlockClaimOutcome int
+
+const (
+	// BlockClaimAcquired: this attempt owns the row. Proceed to claim-then-verify.
+	BlockClaimAcquired BlockClaimOutcome = iota
+	// BlockClaimTargetChanged: the row is a DIFFERENT physical incarnation than the one
+	// this candidate was created for. The candidate's work is finished and irrelevant;
+	// the current incarnation was never authorized by anything and must not be touched.
+	// Settle the candidate, mutate nothing.
+	BlockClaimTargetChanged
+	// BlockClaimFreshOwner: the exact incarnation is already claimed by an attempt too
+	// young to be presumed dead. Another worker is very likely mid-delete under it.
+	//
+	// The caller must NOT settle: if that owner turns out to be dead, this candidate is
+	// what will eventually take the claim over, and consuming it now leaves the fence
+	// standing with nothing left to lift it. Postpone without spending a retry.
+	BlockClaimFreshOwner
+	// BlockClaimStaleOwner: the exact incarnation is claimed by an attempt old enough
+	// that no live walk can still be running under it. Eligible for takeover — which is
+	// still a CAS against that exact previous authority, never an unconditional clear.
+	BlockClaimStaleOwner
+	// BlockClaimMissing: there is no canonical row at all. Nothing to delete; settle.
+	BlockClaimMissing
+	// BlockClaimInvalid: the row exists but its own physical identity is unusable — a
+	// present partition with no storage class or no storage key. Never destructive, and
+	// never settled either: consuming the candidate would drop the only work item that
+	// could ever revisit the block, so this postpones and asks for a human.
+	BlockClaimInvalid
+	// BlockClaimAmbiguous: the LWT's result could not be established, and a SERIAL
+	// settling read could not establish it either. Retain the claim, retain the
+	// candidate, finalize nothing, release nothing. Fail closed (R20).
+	BlockClaimAmbiguous
+)
+
+func (o BlockClaimOutcome) String() string {
+	switch o {
+	case BlockClaimAcquired:
+		return "acquired"
+	case BlockClaimTargetChanged:
+		return "target_changed"
+	case BlockClaimFreshOwner:
+		return "fresh_owner"
+	case BlockClaimStaleOwner:
+		return "stale_owner"
+	case BlockClaimMissing:
+		return "missing"
+	case BlockClaimInvalid:
+		return "invalid"
+	case BlockClaimAmbiguous:
+		return "ambiguous"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockReleaseOutcome classifies what ReleaseBlockClaim did.
+//
+// Under the candidate-derived claim id this was a bare error, because a release that
+// did not apply meant something was genuinely wrong. Per-attempt identity changes that:
+// an attempt whose claim was taken over while it worked SHOULD fail to release, and
+// reporting that as an error would spend the item's retry budget and — because
+// releaseBlockClaim's error dominates the caller's original one — bury the real reason
+// the walk was unwinding.
+type BlockReleaseOutcome int
+
+const (
+	// BlockReleaseReleased: this authority owned the row and the fence is now off.
+	BlockReleaseReleased BlockReleaseOutcome = iota
+	// BlockReleaseNotOwner: the row is no longer owned by this authority — taken over,
+	// already released, already finalized, or now a different incarnation. Benign: this
+	// attempt has no fence left to drop, so there is nothing to repair and no retry to
+	// spend.
+	BlockReleaseNotOwner
+)
+
+func (o BlockReleaseOutcome) String() string {
+	switch o {
+	case BlockReleaseReleased:
+		return "released"
+	case BlockReleaseNotOwner:
+		return "not_owner"
+	default:
+		return "unknown"
+	}
+}
+
+// ErrBlockCandidateTargetUnavailable is returned by EnsureBlockGCCandidate when the
+// block's exact physical incarnation cannot be captured, so no candidate is written.
+//
+// This is fail-closed by construction rather than by convention: with no candidate row
+// there is no destructive authority to misuse later. The enqueue paths already treat a
+// candidate error as discovery degradation and carry on, which is the right response —
+// a block whose canonical row is missing has nothing to reclaim anyway.
+var ErrBlockCandidateTargetUnavailable = errors.New("block gc candidate: exact physical incarnation unavailable")
 
 // BlockStoreDeleter validates and deletes physical block locators.
 // Allows mocking the storage layer in tests.

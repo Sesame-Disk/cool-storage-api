@@ -365,8 +365,8 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesExistingCandidateAndRe
 	if !candidates[0].CandidateAt.Equal(candidateAt) {
 		t.Fatalf("candidate_at = %v, want preserved earliest identity %v", candidates[0].CandidateAt, candidateAt)
 	}
-	if candidates[0].StorageClass != "hot" {
-		t.Fatalf("storage_class = %q, want preserved canonical value %q", candidates[0].StorageClass, "hot")
+	if candidates[0].StorageClass() != "hot" {
+		t.Fatalf("storage_class = %q, want preserved canonical value %q", candidates[0].StorageClass(), "hot")
 	}
 }
 
@@ -958,6 +958,7 @@ func TestScanner_ScanOrphanedBlocks_DiscoversAcrossDistinctBuckets(t *testing.T)
 	blockCount := 1000
 	for i := 0; i < blockCount; i++ {
 		blockID := fmt.Sprintf("block-%04d", i)
+		store.AddBlock(orgID, blockID, "hot", 0)
 		if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now()); err != nil {
 			t.Fatalf("EnsureBlockGCCandidate failed for %s: %v", blockID, err)
 		}
@@ -989,6 +990,7 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 	store.AddOrganization(orgID)
 
 	// Seed a recent candidate the scanner must pick up on the first pass.
+	store.AddBlock(orgID, "block-recent", "hot", 0)
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-recent", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
@@ -1636,6 +1638,7 @@ func TestScanner_ScanOrphanedBlocks_EnqueueFailureKeepsCursorUnchanged(t *testin
 		t.Fatalf("SaveGCStats() failed: %v", err)
 	}
 
+	store.AddBlock(orgID, "block-enqueue-fail", "hot", 0)
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}

@@ -49,17 +49,12 @@ func TestX2_StaleClaimFromAnotherCandidateIsReleased(t *testing.T) {
 
 	// The abandoned claim belongs to an OLDER candidate whose queue item is gone —
 	// the shape an owner-only release can never clean up.
-	abandonedCandidateAt := time.Now().Add(-6 * time.Hour)
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(abandonedCandidateAt))
-	if err != nil || !applied {
-		t.Fatalf("seed abandoned claim from an earlier candidate: applied=%v err=%v", applied, err)
-	}
+	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-abandonedCandidateAt", time.Now())
+	_ = seededClaim
 
-	// A new candidate for the same block, carrying its own distinct claim id.
+	// A new candidate for the same block. Its attempt gets its own fresh UUID, which is
+	// now true by construction rather than by candidate timestamps happening to differ.
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	if got, want := blockDeleteClaimID(queuedAt), blockDeleteClaimID(abandonedCandidateAt); got == want {
-		t.Fatalf("test is not exercising the cross-candidate case: both candidates derive claim id %q", got)
-	}
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
@@ -101,11 +96,8 @@ func TestX2_FreshClaimFromAnotherCandidateIsLeftAlone(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 
-	otherCandidateAt := time.Now().Add(-6 * time.Hour)
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(otherCandidateAt))
-	if err != nil || !applied {
-		t.Fatalf("seed concurrent claim from another candidate: applied=%v err=%v", applied, err)
-	}
+	seededClaim := store.SeedBlockClaimForTest(orgID, "block-1", "attempt-otherCandidateAt", time.Now())
+	_ = seededClaim
 
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)

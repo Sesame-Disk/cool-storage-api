@@ -1588,6 +1588,7 @@ func TestService_EnqueueBlock_ContinuesWhenCandidateRepairDegraded(t *testing.T)
 	store.ensureBlockGCCandidateErrAfterMutate = errors.New("repair projection failed")
 	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
 	orgID := uuid.New()
+	store.AddBlock(orgID, "block-repair-warning", "hot", 0)
 	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service"))
 
 	if err := svc.EnqueueBlock(orgID, "block-repair-warning", uuid.Nil, "hot"); err != nil {
@@ -1615,6 +1616,7 @@ func TestService_EnqueueBlock_ExistingPendingItemSuppressesRepairWarning(t *test
 	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
 	orgID := uuid.New()
 	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+	store.AddBlock(orgID, "block-already-pending", "hot", 0)
 
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-already-pending", "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate seed failed: %v", err)

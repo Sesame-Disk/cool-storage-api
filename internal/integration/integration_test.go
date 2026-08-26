@@ -40,7 +40,12 @@ var ephemeralLibraryExactNames = []string{
 }
 
 func TestMain(m *testing.M) {
-	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" || os.Getenv("SESAMEFS_REQUIRE_P3_EVIDENCE") == "1"
+	// Every evidence gate must be listed here. A gate that is not in this chain still
+	// fails a SKIP inside its own test, but it cannot stop TestMain from exiting 0 when
+	// the stack never came up at all — the run would print "ok" having executed nothing.
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_P3_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_P4A_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
 		baseURL = "http://localhost:3000"

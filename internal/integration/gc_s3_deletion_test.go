@@ -437,10 +437,19 @@ func TestGC_BlockDeletion_RemovesObjectFromS3(t *testing.T) {
 			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
 	})
 
+	// The candidate is what authorizes the delete, and it carries the exact incarnation
+	// the claim CAS will be bound to. Production reaches the queue only through
+	// EnsureBlockGCCandidate (Service.EnqueueBlock, enqueueZeroRefBlocks,
+	// promoteBlockIfUnreferenced), so a test that enqueues a raw queue row without one
+	// is not exercising a state production can produce.
+	queuedAt := time.Now().Add(-2 * time.Hour)
+	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, queuedAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	}
 	// Enqueue the block directly with a past timestamp so it clears the grace
 	// period immediately; EnqueueItem also marks the org active so the real
 	// server worker will dequeue it.
-	if err := store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
+	if err := store.EnqueueItem(orgID, queuedAt, gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
 		t.Fatalf("EnqueueItem: %v", err)
 	}
 

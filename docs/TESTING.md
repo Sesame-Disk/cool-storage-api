@@ -903,6 +903,10 @@ Each of these exists because the obvious version of the test proves nothing.
 | `BlockExists` check after finalize in leg 2 | measuring an orphan read instead of the rowless-mint gate |
 | fresh org/block id per run | a previous run's rows deciding this run's assertions |
 | script requires the `--- PASS:` line | a skipped package reporting success |
+| `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` | the P4a claim-authority legs skipping their way to exit 0 against a stack that never came up. It is pinned in `docker-compose.yaml` **and** listed in the integration `TestMain` OR-chain — a gate missing from that chain still fails its own skip, but cannot stop `TestMain` from exiting 0 when nothing ran at all |
+| `p4aRequireEvidence`'s `gate.observed` check | a leg that runs, passes, and asserts nothing: the test must reach its evidence log line, not merely avoid failing |
+| `mutate()` in `scripts/p4a-mutation-validation.sh` compares the file after patching | a mutation whose pattern matched nothing being reported as "the guard held". Line endings and indentation differ between the working tree and the container's COPY, which is exactly how the X2 script caught an inert mutation |
+| `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at |
 
 ### Proving the legs can fail
 

@@ -743,14 +743,15 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("advance stale orphan phase: %v", err)
 	}
-	applied, err := store.ClaimBlockDelete(orgID, blockID, "claim-1")
-	if err != nil || !applied {
-		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
+	authority := store.BlockDeleteAuthorityForTest(orgID, blockID, "claim-1", time.Now().UTC())
+	outcome, err := store.ClaimBlockDelete(orgID, blockID, authority)
+	if err != nil || outcome != BlockClaimAcquired {
+		t.Fatalf("claim block delete: outcome=%s err=%v", outcome, err)
 	}
 	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC()); err != nil {
 		t.Fatalf("StartBlockDeleteOrphan: %v", err)
 	}
-	if err := store.FinalizeBlockDelete(orgID, blockID, "claim-1"); err != nil {
+	if err := store.FinalizeBlockDelete(orgID, blockID, authority); err != nil {
 		t.Fatalf("FinalizeBlockDelete: %v", err)
 	}
 
@@ -1042,9 +1043,10 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "orph-claimed", "hot", 0)
-	applied, err := store.ClaimBlockDelete(orgID, "orph-claimed", "claim-1")
-	if err != nil || !applied {
-		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
+	claimed := store.BlockDeleteAuthorityForTest(orgID, "orph-claimed", "claim-1", time.Now().UTC())
+	outcome, err := store.ClaimBlockDelete(orgID, "orph-claimed", claimed)
+	if err != nil || outcome != BlockClaimAcquired {
+		t.Fatalf("claim block delete: outcome=%s err=%v", outcome, err)
 	}
 	seedS3Orphan(t, store, orgID, "orph-claimed", "hot", "", "", time.Now())
 
