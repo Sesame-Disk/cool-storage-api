@@ -53,6 +53,15 @@ extra `SERIAL` read only moves the TOCTOU; the fix is structural.
   the next scan produced it again — forever. The worker retires the row on that path too.
   Deleting it unconditionally is safe ONLY because the projection is now keyed by the full
   identity: the statement can name `P1`'s row and nothing else.
+- A failed discovery cleanup POSTPONES for every failure reason, not only the ones
+  the availability classifier recognises. It previously routed through
+  `failClosedIfUnavailable`, which postpones an outage but returns a plain error for
+  anything else — so a permanent failure spent a retry, five of them parked the item
+  in a DLQ `ItemBlock` never leaves, and the discovery row it could not retire
+  re-enqueued the identical item once the DLQ row expired. The same loop the fix
+  above closes, running at retention pace instead of scan pace. The classifier now
+  drives the signal, never the queue policy — the rule the stale-claim release beside
+  it already followed.
 - `EnqueueItem` refuses `ItemBlock`. A block work item is legitimate only when a zero-ref
   DECISION produced a candidate for an exact `P`; the raw single-row path has none to
   carry, and minting one there let "enqueue" fabricate destructive authority.
@@ -75,18 +84,33 @@ check is generic, so the next destructive migration inherits the barrier.
   non-block DLQ selector.
 - Real Cassandra (`SESAMEFS_REQUIRE_R26_EVIDENCE=1`): `TestR26_TwoIncarnationsCoexistAcrossEveryDurableSurface`
   proves candidate, projection, queue and pending each hold `P1` and `P2` as separate rows
-  and that settling `P1` leaves every `P2` row standing. A map-backed mock keeps rows apart
+  and that settling `P1` leaves every `P2` row standing. `TestR26_SameIdentityAtDistinctPRemainIndependent`
+  is the load-bearing half: it pins `candidate_at`, `identity_at` and `queued_at` to ONE
+  instant, so `P` is the only thing Cassandra can use to keep the two lifecycles apart.
+  Three of the four keys carry a timestamp of their own, so a fixture with distinct
+  timestamps would hold two rows whether or not `P` is in the key. A map-backed mock keeps rows apart
   under any key the Go code invents; only the engine can answer this. Plus the exact-identity
   discovery retire, the non-block DLQ selector, and the destructive preflight closing on a
   table that holds a row.
 - Source gates: `TestR26MutationsNameTheExactIdentity` (no mutation may address a row
-  prefix), `TestR26SingleRowReadsNameTheExactIdentity`, and
-  `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`.
+  prefix), `TestR26SingleRowReadsNameTheExactIdentity`,
+  `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`, and
+  `TestR26AnyIdentityIsNeverPassedToAMutation` — the "any lifecycle" dedup probe is
+  the one value that resolves its row from a fallback, and it must never reach a write.
+- SCHEMA gates, because everything above reads Go and the keys live in CQL: dropping
+  `P` from a PRIMARY KEY in migration `018` changes no runtime statement, so every
+  other gate stays green while a freshly migrated keyspace collapses `P1` and `P2`
+  back into one row. `TestR26MigrationDeclaresTheExactIdentityKeys` asserts the
+  identity columns as an ORDERED SUFFIX of each key, and
+  `TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey` asserts the matching
+  absence — `candidate_at` must stay a mutable value or every re-decision becomes
+  another row.
 - `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: 30 mutations, each removing
   one invariant and each required to go red with the matching assertion. Seven are new;
   one existing P4a mutation had silently stopped applying when the candidate `DELETE`
   moved `P` from its `IF` into its `WHERE`, and `TestP4A_ReplacedCandidateServesItsOwnGracePeriod`
-  had stopped reaching the grace check at all — both are repaired here.
+  had stopped reaching the grace check at all — both are repaired here. 33 in total,
+  including two that edit the MIGRATION itself.
 
 **Scope.** This closes the block-candidate / work-item half of R26. The `gc_s3_orphans` and
 `gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains

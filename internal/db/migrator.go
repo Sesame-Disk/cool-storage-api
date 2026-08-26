@@ -390,14 +390,18 @@ func parseCQLStatements(content string) []string {
 var dropTablePattern = regexp.MustCompile(`(?is)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_."]+)`)
 
 // droppedTables returns the tables a migration drops, in statement order.
+//
+// A keyspace-qualified name is returned AS WRITTEN, not stripped down to the bare
+// table. The probe runs against the migrator's session, which is bound to one
+// keyspace: silently discarding the qualifier would make it check
+// `<session keyspace>.foo` while the DROP removes `otherks.foo`, so the barrier
+// would report a different table empty than the one about to be destroyed. Passing
+// the qualifier through keeps the probe and the drop pointed at the same table.
 func (mf MigrationFile) droppedTables() []string {
 	var tables []string
 	for _, stmt := range mf.Statements {
 		for _, match := range dropTablePattern.FindAllStringSubmatch(stmt, -1) {
 			name := strings.Trim(strings.TrimSpace(match[1]), `";`)
-			if idx := strings.LastIndex(name, "."); idx >= 0 {
-				name = name[idx+1:]
-			}
 			if name != "" {
 				tables = append(tables, name)
 			}

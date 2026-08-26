@@ -33,9 +33,12 @@ func TestDroppedTablesFindsEveryDropTarget(t *testing.T) {
 			want:    []string{"gc_block_candidates"},
 		},
 		{
+			// The qualifier is PRESERVED: the probe must read the same table the
+			// DROP removes. Stripping it would check the session keyspace's copy
+			// and pronounce a different table empty.
 			name:    "keyspace_qualified",
 			content: "DROP TABLE IF EXISTS sesamefs.gc_pending_items;",
-			want:    []string{"gc_pending_items"},
+			want:    []string{"sesamefs.gc_pending_items"},
 		},
 		{
 			name:    "case_and_whitespace",
@@ -94,7 +97,9 @@ func TestShippedDestructiveMigrationsAreDetected(t *testing.T) {
 	}
 
 	// 018 is the destructive GC identity migration. Every table it drops must be
-	// seen by the preflight, or that table's rows are erased without a check.
+	// seen by the preflight, or that table's rows are erased without a check. Its
+	// DROPs are unqualified by design — they run in the session keyspace — so the
+	// names below are bare.
 	tables, ok := dropped["018_gc_exact_p_candidate_identity"]
 	if !ok {
 		t.Fatalf("018_gc_exact_p_candidate_identity is not recognised as destructive; the preflight would not protect it. Detected: %v", dropped)

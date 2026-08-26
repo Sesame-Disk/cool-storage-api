@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -264,4 +265,85 @@ func r26NamesColumn(statement, column string) bool {
 // it somewhere, which a SELECT projection list would do.
 func r26PredicateBinds(statement, column string) bool {
 	return regexp.MustCompile(`(?i)(^|[^a-z_])` + regexp.QuoteMeta(column) + `\s*=\s*\?`).MatchString(statement)
+}
+
+// r26MutatingStoreMethods are the store methods that WRITE or DELETE a durable
+// row. None of them may be handed the "any lifecycle" probe.
+var r26MutatingStoreMethods = map[string]bool{
+	"CompleteItem":             true,
+	"RequeueItem":              true,
+	"DeleteFailedItem":         true,
+	"DeleteFailedItemContext":  true,
+	"RequeueFailedItem":        true,
+	"RequeueFailedItemContext": true,
+	"EnqueueBatch":             true,
+	"FailItem":                 true,
+}
+
+// TestR26AnyIdentityIsNeverPassedToAMutation closes the last place where the
+// identity contract rests on convention rather than on a check.
+//
+// AnyGCItemIdentity() is the deliberate "is this item pending under ANY
+// lifecycle" probe: it carries a zero identity_at and no P, and PendingItemExists
+// answers it by omitting the identity_at predicate. That is correct for a dedup
+// read. Handed to a mutation it is the opposite of correct — the row addressed
+// would be resolved from a fallback rather than named, which is the prefix
+// addressing every other gate here forbids.
+//
+// Nothing in production does this today; the type system cannot say so, because
+// AnyGCItemIdentity returns the same type a mutation legitimately takes. This
+// gate says it instead.
+func TestR26AnyIdentityIsNeverPassedToAMutation(t *testing.T) {
+	fset := token.NewFileSet()
+	pkg, err := parser.ParseDir(fset, ".", func(info os.FileInfo) bool {
+		return !strings.HasSuffix(info.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	checked := 0
+	for _, files := range pkg {
+		for path, file := range files.Files {
+			ast.Inspect(file, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !r26MutatingStoreMethods[selector.Sel.Name] {
+					return true
+				}
+				checked++
+				for _, arg := range call.Args {
+					if r26IsAnyIdentityCall(arg) {
+						t.Errorf("R26 REGRESSION: %s is passed AnyGCItemIdentity() at %s.\n"+
+							"That value carries no identity_at and no P, so the row this mutation addresses is "+
+							"resolved from a fallback instead of named — a prefix write or delete. It is the "+
+							"dedup probe, and it belongs only in PendingItemExists.",
+							selector.Sel.Name, fset.Position(arg.Pos()))
+					}
+				}
+				return true
+			})
+			_ = path
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no calls to any mutating store method were found; this guard is vacuous")
+	}
+}
+
+func r26IsAnyIdentityCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name == "AnyGCItemIdentity"
+	case *ast.SelectorExpr:
+		return fn.Sel.Name == "AnyGCItemIdentity"
+	}
+	return false
 }

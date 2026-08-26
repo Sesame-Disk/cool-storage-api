@@ -1022,9 +1022,28 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// the row by the item's own exact identity is safe for the reason the whole
 		// slice exists: that key names P1's row and cannot name P2's.
 		if err := w.store.DeleteBlockGCCandidateDiscovery(item.OrgID, item.ItemID, item.BlockGCCandidateIdentity); err != nil {
-			metrics.GCErrorsTotal.WithLabelValues("stale_candidate_discovery_cleanup_failed").Inc()
-			log.Printf("[GC Worker] Block %s: could not retire the stale discovery row behind an unauthorized work item; postponing so it is not rediscovered forever: %v", item.ItemID, err)
-			return w.failClosedIfUnavailable("failed to clear stale block GC candidate discovery row", item.ItemID, err)
+			// POSTPONE FOR EVERY FAILURE REASON, not just the ones
+			// isClusterUnavailableError recognises — the same rule the stale-claim
+			// release below follows, and for the same reason. Spending a retry here
+			// walks the item into the DLQ, ItemBlock never comes back from there,
+			// and the discovery row it failed to retire outlives it: the scanner
+			// re-enqueues the identical item once the DLQ row expires. That is the
+			// rediscovery loop this branch exists to end, running at retention pace
+			// instead of scan pace.
+			//
+			// So the classifier drives the SIGNAL, never the queue policy. An
+			// availability failure keeps the cluster_unavailable accounting; a
+			// permanent one gets its own reason and says plainly that it will not
+			// self-heal.
+			if isClusterUnavailableError(err) {
+				metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
+				w.recordDestructiveBlocked(destructivePathBlock)
+				log.Printf("[GC Worker] Block %s: could not retire the stale discovery row because the cluster was unavailable; postponing without burning a retry: %v", item.ItemID, err)
+			} else {
+				metrics.GCErrorsTotal.WithLabelValues("stale_candidate_discovery_cleanup_failed").Inc()
+				log.Printf("[GC Worker] Block %s: could not retire the stale discovery row behind an unauthorized work item, for a non-availability reason; postponing rather than spending the retry that would park it in the DLQ and leave the row to be rediscovered forever — this will NOT self-heal and needs a human: %v", item.ItemID, err)
+			}
+			return failedClosedError{Reason: "failed to clear stale block GC candidate discovery row", ItemID: item.ItemID, Err: err}
 		}
 		metrics.GCBlockDeleteClaimTotal.WithLabelValues("no_candidate").Inc()
 		log.Printf("[GC Worker] Block %s queue identity names no current GC candidate; retired its stale discovery row and completed the item", item.ItemID)

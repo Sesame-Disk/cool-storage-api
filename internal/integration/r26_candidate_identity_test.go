@@ -337,3 +337,116 @@ func r26FailedIdentityAts(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, fai
 	}
 	return out
 }
+
+// TestR26_SameIdentityAtDistinctPRemainIndependent is the load-bearing half of
+// the coexistence evidence, and it exists because the test above is not.
+//
+// TestR26_TwoIncarnationsCoexistAcrossEveryDurableSurface gives P1 and P2
+// different timestamps, which is realistic but weak: three of the four keys carry
+// a timestamp of their own —
+//
+//	gc_block_candidates_by_day  (…, candidate_at, …, storage_class, storage_key)
+//	gc_queue                    (…, queued_at, …, candidate_storage_*, identity_at)
+//	gc_pending_items            (…, candidate_storage_*, identity_at)
+//
+// — so with T1 != T2 those tables hold two rows whether or not P is part of the
+// key. That test would stay green through a migration that dropped P from all
+// three. Only gc_block_candidates, whose key is ((org_id, block_id),
+// storage_class, storage_key) with no timestamp at all, is load-bearing there.
+//
+// So this one pins every timestamp: same candidate_at, same identity_at, same
+// queued_at, one logical block. The ONLY thing Cassandra can use to keep the two
+// lifecycles apart is P. If P leaves any of these primary keys, the second write
+// overwrites the first and the row counts collapse here.
+func TestR26_SameIdentityAtDistinctPRemainIndependent(t *testing.T) {
+	requireCassandra(t)
+	gate := r26RequireEvidence(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("r26-same-t-%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupGCBlockRowsForTest(t, orgID, blockID) })
+
+	// ONE instant, used for candidate_at, identity_at and queued_at on both lives.
+	at := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+
+	target1 := seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
+	p1, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", at)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact(P1): %v", err)
+	}
+
+	target2 := r26RemintCanonicalBlock(t, database, orgID, blockID)
+	if target2 == target1 {
+		t.Fatal("the re-mint reused P1's storage key; the fixture proves nothing")
+	}
+	p2, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", at)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact(P2): %v", err)
+	}
+
+	// The fixture's whole point: everything except P is identical.
+	if !p1.CandidateAt.Equal(p2.CandidateAt) {
+		t.Fatalf("fixture is not load-bearing: candidate_at differs (%v vs %v), so a timestamp could separate the rows instead of P",
+			p1.CandidateAt, p2.CandidateAt)
+	}
+	if p1.Target == p2.Target {
+		t.Fatal("fixture is not load-bearing: both candidates carry the same P")
+	}
+
+	for _, candidate := range []gcpkg.BlockGCCandidateInfo{p1, p2} {
+		if err := enqueueExactBlockCandidateForTest(store, candidate, at); err != nil {
+			t.Fatalf("enqueue %s: %v", candidate.Target, err)
+		}
+	}
+
+	// Four surfaces, two rows each, separated by nothing but P.
+	for _, candidate := range []gcpkg.BlockGCCandidateInfo{p1, p2} {
+		if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
+			t.Fatalf("R26 REGRESSION: canonical candidate %s missing: ok=%v err=%v", candidate.Target, ok, err)
+		}
+		if exists, err := store.QueueItemExists(orgID, at, gcpkg.ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("R26 REGRESSION: queue row for %s missing at a shared queued_at/identity_at: exists=%v err=%v — P is not separating the rows", candidate.Target, exists, err)
+		}
+		if exists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("R26 REGRESSION: pending row for %s missing at a shared identity_at: exists=%v err=%v — P is not separating the rows", candidate.Target, exists, err)
+		}
+	}
+	if got := r26ProjectedTargets(t, store, orgID, blockID, at); len(got) != 2 {
+		t.Fatalf("R26 REGRESSION: discovery rows at a shared candidate_at = %v, want P1 and P2 as separate rows — P is not part of the projection key", got)
+	}
+
+	// Settling P1 must leave every P2 row standing, with no timestamp available to
+	// tell the statements apart.
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, p1.Identity()); err != nil {
+		t.Fatalf("settle P1 candidate: %v", err)
+	}
+	if err := store.CompleteItem(orgID, at, gcpkg.ItemBlock, blockID, p1.ItemIdentity()); err != nil {
+		t.Fatalf("complete P1 queue item: %v", err)
+	}
+
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, p1.Identity()); err != nil || ok {
+		t.Fatalf("P1 candidate after settlement: ok=%v err=%v, want removed", ok, err)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, p2.Identity()); err != nil || !ok {
+		t.Fatalf("R26 REGRESSION: settling P1 consumed P2's candidate at a shared candidate_at: ok=%v err=%v", ok, err)
+	}
+	got := r26ProjectedTargets(t, store, orgID, blockID, at)
+	if len(got) != 1 || got[0] != p2.Target {
+		t.Fatalf("R26 REGRESSION: discovery rows after settling P1 = %v, want only P2", got)
+	}
+	if exists, err := store.QueueItemExists(orgID, at, gcpkg.ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P1 queue row after completion: exists=%v err=%v, want removed", exists, err)
+	}
+	if exists, err := store.QueueItemExists(orgID, at, gcpkg.ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
+		t.Fatalf("R26 REGRESSION: completing P1 removed P2's queue row at a shared queued_at: exists=%v err=%v", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P1 pending row after completion: exists=%v err=%v, want removed", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
+		t.Fatalf("R26 REGRESSION: completing P1 removed P2's pending row at a shared identity_at: exists=%v err=%v", exists, err)
+	}
+	gate.observed = true
+}

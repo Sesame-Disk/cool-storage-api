@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -128,31 +129,66 @@ func TestR26_StaleDiscoveryNoOpRetiresItsOwnRowInsteadOfLoopingForever(t *testin
 // TestR26_UnretireableDiscoveryRowPostponesInsteadOfCompleting: if the discovery
 // row cannot be removed, completing the queue item anyway would hide the problem
 // and the row would come back forever. Postpone instead, so the next pass retries.
+//
+// POSTPONING MEANS "no retry burned", and the assertion has to say so. An earlier
+// version only checked that one item was still queued, which is equally true of a
+// retry — and a retry is precisely the wrong outcome: five of them park the item
+// in the DLQ, ItemBlock never returns from there, and the discovery row outlives
+// it and re-enqueues the identical item once the DLQ row expires. Same loop, at
+// retention pace. It also injected a plain errors.New("cluster unavailable"),
+// which is not a gocql error, so it silently exercised only the non-availability
+// branch while reading as though it covered the availability one.
+//
+// Both branches are covered here, and both must postpone.
 func TestR26_UnretireableDiscoveryRowPostponesInsteadOfCompleting(t *testing.T) {
-	store := NewMockStore()
-	storage := &MockStorageProvider{}
-	queue := NewQueue(store)
-	worker := NewWorker(store, storage, queue, 10, 0, false, &Stats{})
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "cluster_unavailable", err: gocql.ErrNoConnections},
+		{name: "permanent_failure", err: errors.New("write failure: schema disagreement")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			storage := &MockStorageProvider{}
+			queue := NewQueue(store)
+			worker := NewWorker(store, storage, queue, 10, 0, false, &Stats{})
 
-	orgID := uuid.New()
-	blockID := testSHA256BlockID("blk-r26-unretireable")
-	store.AddBlock(orgID, blockID, "hot", 0)
-	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
-	}
-	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
-	store.DeleteBlockGCCandidateCanonicalForTest(orgID, blockID, candidate.Identity())
-	store.SetDeleteBlockGCCandidateDiscoveryErr(errors.New("cluster unavailable"))
+			orgID := uuid.New()
+			blockID := testSHA256BlockID("blk-r26-unretireable-" + tc.name)
+			store.AddBlock(orgID, blockID, "hot", 0)
+			candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().Add(-time.Hour))
+			if err != nil {
+				t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
+			}
+			enqueueExactBlockCandidateForTest(t, store, candidate, 0)
+			store.DeleteBlockGCCandidateCanonicalForTest(orgID, blockID, candidate.Identity())
+			store.SetDeleteBlockGCCandidateDiscoveryErr(tc.err)
 
-	if _, err := worker.ProcessOrgOnce(context.Background(), orgID); err != nil {
-		t.Fatalf("ProcessOrgOnce: %v", err)
-	}
-	if queued := store.QueueItems(orgID); len(queued) != 1 {
-		t.Fatalf("queue after a failed discovery cleanup = %+v, want the item preserved for a retry", queued)
-	}
-	if queued := store.QueueItems(orgID); queued[0].BlockGCCandidateIdentity != candidate.Identity() {
-		t.Fatalf("the preserved item lost its exact identity: %+v", queued[0])
+			if _, err := worker.ProcessOrgOnce(context.Background(), orgID); err != nil {
+				t.Fatalf("ProcessOrgOnce: %v", err)
+			}
+
+			queued := store.QueueItems(orgID)
+			if len(queued) != 1 {
+				t.Fatalf("queue after a failed discovery cleanup = %+v, want the item preserved for a retry", queued)
+			}
+			if queued[0].BlockGCCandidateIdentity != candidate.Identity() {
+				t.Fatalf("the preserved item lost its exact identity: %+v", queued[0])
+			}
+			// THE ASSERTION THAT MAKES THIS TEST LOAD-BEARING.
+			if queued[0].RetryCount != 0 {
+				t.Fatalf("retry_count = %d, want 0: a failed discovery cleanup must POSTPONE, not retry. "+
+					"Five retries park an ItemBlock in the DLQ it never leaves, while the discovery row it "+
+					"could not retire keeps re-enqueuing the same item after the DLQ row expires", queued[0].RetryCount)
+			}
+			if failed := store.FailedItems(orgID); len(failed) != 0 {
+				t.Fatalf("DLQ after a failed discovery cleanup = %+v, want empty", failed)
+			}
+			if deletes := storage.ScopedBlockDeletes(); len(deletes) != 0 {
+				t.Fatalf("an unauthorized item reached physical deletion: %+v", deletes)
+			}
+		})
 	}
 }
 

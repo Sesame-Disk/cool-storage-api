@@ -41,6 +41,7 @@ cd "$(dirname "$0")/.."
 STORE=internal/gc/store_cassandra.go
 WORKER=internal/gc/worker.go
 MOCK=internal/gc/store_mock.go
+MIGRATION=internal/db/migrations/018_gc_exact_p_candidate_identity.cql
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -70,7 +71,8 @@ mutate() {
 # expect_red <test-regex> <assertion-substring> <description>
 expect_red() {
   local pattern="$1" needle="$2" what="$3" out status
-  out="$(go test ./internal/gc/ -count=1 -run "$pattern" 2>&1)"
+  # internal/db carries the migration schema guard; internal/gc carries the rest.
+  out="$(go test ./internal/gc/ ./internal/db/ -count=1 -run "$pattern" 2>&1)"
   status=$?
   if [ $status -eq 0 ]; then
     printf '%s\n' "$out" | tail -15 >&2
@@ -175,6 +177,28 @@ m_queue_complete_drops_p() {
   mutate "$STORE" 's{DELETE FROM gc_queue(\s+)WHERE org_id = \? AND bucket = \? AND queued_at = \? AND item_type = \? AND item_id = \? AND candidate_storage_class = \? AND candidate_storage_key = \? AND identity_at = \?(\s+)`, orgID\.String\(\), gcQueueBucket\(orgID, itemType, itemID\), queuedAt, string\(itemType\), itemID, identity\.Target\(\)\.StorageClass, identity\.Target\(\)\.StorageKey, identity\.IdentityAt\)}{DELETE FROM gc_queue$1WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND identity_at = ?$2`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID, identity.IdentityAt)}'
   expect_red 'TestR26MutationsNameTheExactIdentity' 'does not name' \
     'queue completion keyed without P (completing P1 removes P2 work item)'
+  restore
+}
+
+# The migration's PRIMARY KEYs are the one part of R26 that no Go-level gate can
+# see: dropping P from a key changes no runtime CQL, so every source guard and
+# every mutation above stays green while a freshly migrated keyspace collapses P1
+# and P2 back into one row. These two prove the schema guard is load-bearing.
+m_migration_queue_key_drops_p() {
+  mutate "$MIGRATION" 's{PRIMARY KEY \(\(org_id, bucket\), queued_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at\)}{PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id, identity_at)}'
+  expect_red 'TestR26MigrationDeclaresTheExactIdentityKeys' 'must END with'     'migration drops P from the gc_queue key (two lives of one block share a queue row again)'
+  restore
+}
+
+m_migration_candidate_key_adds_candidate_at() {
+  mutate "$MIGRATION" 's{PRIMARY KEY \(\(org_id, block_id\), storage_class, storage_key\)}{PRIMARY KEY ((org_id, block_id), storage_class, storage_key, candidate_at)}'
+  expect_red 'TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey' 'includes candidate_at'     'candidate_at promoted into the candidate key (every re-decision becomes another row; settling one strands the rest)'
+  restore
+}
+
+m_stale_discovery_failure_burns_a_retry() {
+  mutate "$WORKER" 's{return failedClosedError\{Reason: "failed to clear stale block GC candidate discovery row", ItemID: item\.ItemID, Err: err\}}{return w.failClosedIfUnavailable("failed to clear stale block GC candidate discovery row", item.ItemID, err)}'
+  expect_red 'TestR26_UnretireableDiscoveryRowPostponesInsteadOfCompleting' 'want 0: a failed discovery cleanup must POSTPONE'     'discovery cleanup failure spends a retry (five of them park an ItemBlock in a DLQ it never leaves, and the row it could not retire re-enqueues the same item after expiry)'
   restore
 }
 
@@ -332,6 +356,9 @@ MUTATIONS=(
   m_dlq_selector_drops_identity_at
   m_queue_complete_drops_p
   m_enqueue_item_mints_block_candidate
+  m_migration_queue_key_drops_p
+  m_migration_candidate_key_adds_candidate_at
+  m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
   m_candidate_drops_storage_key
   m_claim_id_from_candidate_at
@@ -357,7 +384,7 @@ if [ "${1:-}" = "--list" ]; then
 fi
 
 printf 'Baseline (unmutated) must be green...\n'
-if ! go test ./internal/gc/ -count=1 >/dev/null 2>&1; then
+if ! go test ./internal/gc/ ./internal/db/ -count=1 >/dev/null 2>&1; then
   fail 'the unmutated tree is already red; fix that before running mutations'
 fi
 green '  baseline green'
