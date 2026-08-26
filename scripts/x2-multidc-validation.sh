@@ -64,12 +64,17 @@ DO_UP=1
 DO_DOWN=1
 DO_MUTATE=0
 MUTATE_TO=""
+DO_P3=0
+P3_MUTATE=0
 for arg in "$@"; do
   case "$arg" in
     --keep)   DO_DOWN=0 ;;
     --no-up)  DO_UP=0 ;;
     --mutate)        DO_MUTATE=1; MUTATE_TO=LocalQuorum; DO_UP=0; DO_DOWN=0 ;;
     --mutate-quorum) DO_MUTATE=1; MUTATE_TO=Quorum;      DO_UP=0; DO_DOWN=0 ;;
+    --p3)               DO_P3=1; DO_UP=0; DO_DOWN=0 ;;
+    --p3-mutate)        DO_P3=1; P3_MUTATE=1; MUTATE_TO=LocalQuorum; DO_UP=0; DO_DOWN=0 ;;
+    --p3-mutate-quorum) DO_P3=1; P3_MUTATE=1; MUTATE_TO=Quorum;      DO_UP=0; DO_DOWN=0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -390,6 +395,84 @@ CASSANDRA_HOSTS="127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242}" CASSANDRA_LOCAL_DC=d
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   go run ./cmd/sesamefs migrate
+
+# ---------------------------------------------------------------------------
+# P3 writer-fence legs, on the same fixture.
+#
+# Placed here deliberately: after the schema, BEFORE X2's hinted-handoff disable and
+# divergence build. P3 needs a healthy cluster and a schema and nothing else, and an
+# earlier version of this block sat after the X2 legs -- so `--p3` quietly ran the
+# whole X2 suite first and measured P3 against whatever fixture state X2 left behind.
+# These legs exit as soon as they are done, so nothing below runs in P3 mode.
+#
+# X2 asks whether a destructive READ intersects every datacenter. P3 asks the
+# mirror question about the fence WRITE: can GC condemn an incarnation whose fence
+# a writer in another datacenter cannot see? The answer must be no, and the proof
+# has a different shape from X2's.
+#
+# X2 builds a divergent cluster and reads it two ways. P3 cannot: with a DC down an
+# EACH_QUORUM publication does not complete at all. That is the property, not an
+# obstacle -- the publication either obtains a quorum in every DC, or it fails and
+# nothing is condemned. So the green leg asserts the failure, and the mutations
+# show that the weaker levels succeed and leave dc-na blind.
+#
+# --p3-mutate-quorum is the one that needs three datacenters. At two DCs with RF 1,
+# QUORUM is 2 of 2 and fails with a DC down exactly like EACH_QUORUM, so a two-DC
+# fixture cannot tell the right fix from the wrong one.
+if [ "${DO_P3:-0}" = "1" ]; then
+  for n in "${NODES[@]}"; do wait_healthy "$n"; done
+
+  if [ "${P3_MUTATE:-0}" = "1" ]; then
+    step "P3 MUTATION -- downgrade the fence publishers to ${MUTATE_TO}; the fail-closed leg must FAIL"
+    psrc=internal/gc/store_cassandra.go
+    cp "$psrc" "$psrc.p3bak"
+    restore_p3src() { [ -f "$psrc.p3bak" ] && mv "$psrc.p3bak" "$psrc"; }
+    trap 'restore_p3src; cleanup' EXIT
+    # No leading dot, unlike X2's mutation. block_references.go writes
+    # `.Consistency(gocql.EachQuorum)` inline; the GC store puts the call on its own
+    # line, so the dot belongs to the previous line and a pattern anchored on it
+    # silently matches nothing here. The cmp below is what caught that.
+    perl -0pi -e "s/\QConsistency(gocql.EachQuorum)\E/Consistency(gocql.${MUTATE_TO})/g" "$psrc"
+    cmp -s "$psrc" "$psrc.p3bak" && fail "P3 mutation did not apply -- did the EACH_QUORUM pins move out of $psrc?"
+  fi
+
+  step "P3 LEG 1 -- with dc-na stopped, neither fence publication may succeed"
+  point_harness_at "${CASSANDRA_EU_HOST_PORT:-9243}" dc-eu
+  "${COMPOSE[@]}" stop cassandra-na
+  require_stopped na "for the whole P3 publication attempt"
+
+  set +e
+  p3out="$(P3_EXPECT_DC_DOWN=1 go test -tags integration -count=1 ./internal/integration/ -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v 2>&1)"
+  p3rc=$?
+  set -e
+  require_stopped na "for the whole P3 publication attempt"
+  "${COMPOSE[@]}" start cassandra-na
+  wait_healthy na
+  point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
+  echo "$p3out"
+
+  if [ "${P3_MUTATE:-0}" = "1" ]; then
+    restore_p3src
+    trap cleanup EXIT
+    grep -qE "^--- FAIL: TestP3_FencePublicationFailsClosedWhenADatacenterIsDown( |$)" <<<"$p3out" \
+      || fail "the publishers were downgraded to ${MUTATE_TO} but the fail-closed leg did not fail -- it proves nothing"
+    grep -q "P3 REGRESSION" <<<"$p3out" \
+      || fail "the leg failed under ${MUTATE_TO} publishers but NOT with a P3 REGRESSION assertion -- it failed for some other reason"
+    printf '\n\033[32mP3 mutation confirmed: at %s the fence publishes while dc-na cannot see it, and the leg goes RED.\033[0m\n' "$MUTATE_TO"
+    exit 0
+  fi
+
+  grep -qE "^--- PASS: TestP3_FencePublicationFailsClosedWhenADatacenterIsDown" <<<"$p3out" \
+    || fail "P3 leg 1 -- no PASS line (skipped, or never ran)"
+  [ $p3rc -eq 0 ] || fail "P3 leg 1 -- the test passed but the package run failed; see above"
+
+  step "P3 LEG 2 -- a fence published in dc-eu blocks a writer reading from dc-na"
+  run_leg "P3 leg 2 (cross-DC fence visibility)" TestP3_WriterInAnotherDatacenterObservesTheFence
+
+  printf '\n\033[32mP3 cross-DC legs green (fail-closed publication, cross-DC fence visibility).\033[0m\n'
+  printf 'Mutations are separate entry points: --p3-mutate (vs LOCAL_QUORUM), --p3-mutate-quorum (vs QUORUM, the leg that needs three DCs).\n'
+  exit 0
+fi
 
 step "3. Disable hinted handoff (load-bearing: hints would erase the divergence)"
 for n in "${NODES[@]}"; do
