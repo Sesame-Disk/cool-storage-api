@@ -227,6 +227,13 @@ m_unreliable_read_skips_release() {
   restore
 }
 
+m_post_claim_read_error_skips_release() {
+  mutate "$WORKER" 's{return w\.releaseAndPostponeUnreliableRead\(item, attempt, fmt\.Sprintf\("failed to load re-referenced block info: %v", infoErr\)\)}{return w.failClosedIfUnavailable("failed to load re-referenced block info", item.ItemID, infoErr)}; s{return w\.releaseAndPostponeUnreliableRead\(item, attempt, fmt\.Sprintf\("failed to load canonical block info: %v", err\)\)}{return w.failClosedIfUnavailable("failed to load canonical block info", item.ItemID, err)}'
+  expect_red 'TestP4A_PostClaimReadErrorHandsTheFenceBackAndPostpones' 'fence left standing' \
+    'a failed post-claim canonical read returns without handing its fence back'
+  restore
+}
+
 m_authority_invalid_retries() {
   mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockClaimForeignOwner,}{GCFailureCodeBlockClaimForeignOwner,}'
   expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'is documented as postponing but spends the retry budget' \
@@ -261,6 +268,7 @@ MUTATIONS=(
   m_grace_ignores_candidate_at
   m_late_loser_settles_candidate
   m_unreliable_read_skips_release
+  m_post_claim_read_error_skips_release
   m_authority_invalid_retries
   m_foreign_owner_retries
 )

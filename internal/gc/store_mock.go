@@ -183,6 +183,7 @@ type MockStore struct {
 	getBlockGCCandidateErr         error
 	claimBlockDeleteSettleErr      error
 	getBlockInfoHook               func(BlockInfo) BlockInfo
+	getBlockInfoErr                error
 	claimAttempts                  []BlockDeleteAuthority
 	releaseBlockClaimErr           error
 	claimBlockDeleteErr            error
@@ -1365,6 +1366,9 @@ func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.getBlockInfoErr != nil {
+		return BlockInfo{}, m.getBlockInfoErr
+	}
 	block := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
@@ -1386,6 +1390,13 @@ func (m *MockStore) SetGetBlockInfoHookForTest(hook func(BlockInfo) BlockInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getBlockInfoHook = hook
+}
+
+// SetGetBlockInfoErrorForTest makes the post-claim canonical re-read fail.
+func (m *MockStore) SetGetBlockInfoErrorForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlockInfoErr = err
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.

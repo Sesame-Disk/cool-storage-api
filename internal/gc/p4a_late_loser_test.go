@@ -2,10 +2,12 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -205,5 +207,69 @@ func TestP4A_StalePostClaimReadHandsTheFenceBackAndPostpones(t *testing.T) {
 	}
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Fatalf("deleted bytes on the strength of a read the claim had already contradicted: %+v", deletes)
+	}
+}
+
+// TestP4A_PostClaimReadErrorHandsTheFenceBackAndPostpones applies the same rule as a
+// stale read to an ordinary read that returned no data at all. The claim remains the
+// authoritative proof of its target, but the worker cannot safely continue, so it must
+// release its exact claim while preserving the candidate for a later pass.
+func TestP4A_PostClaimReadErrorHandsTheFenceBackAndPostpones(t *testing.T) {
+	cases := []struct {
+		name          string
+		postClaimRefs bool
+		err           error
+	}{
+		{name: "re-referenced generic error", postClaimRefs: true, err: errors.New("canonical read failed")},
+		{name: "re-referenced read failure", postClaimRefs: true, err: fakeRequestError{code: gocql.ErrCodeReadFailure, msg: "replica read failure"}},
+		{name: "re-referenced timeout", postClaimRefs: true, err: context.DeadlineExceeded},
+		{name: "zero-ref generic error", err: errors.New("canonical read failed")},
+		{name: "zero-ref read failure", err: fakeRequestError{code: gocql.ErrCodeReadFailure, msg: "replica read failure"}},
+		{name: "zero-ref timeout", err: context.DeadlineExceeded},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			sp := &MockStorageProvider{}
+			q := NewQueue(store)
+			w := NewWorker(store, sp, q, 100, 0, false, &Stats{})
+
+			orgID := uuid.New()
+			blockID := testSHA256BlockID("blk-post-claim-read-error-" + tc.name)
+			candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
+			if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+				t.Fatalf("EnqueueItem: %v", err)
+			}
+			if tc.postClaimRefs {
+				var reads int
+				store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
+					reads++
+					return reads > 1, nil
+				})
+			}
+			store.SetGetBlockInfoErrorForTest(tc.err)
+
+			if _, err := w.ProcessOnce(context.Background()); err != nil {
+				t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+			}
+
+			if blk := store.GetBlock(orgID, blockID); blk == nil {
+				t.Fatal("canonical row disappeared: a failed read must never authorize a delete")
+			} else if blk.GCState != "" {
+				t.Errorf("fence left standing (gc_state=%q) after post-claim read error", blk.GCState)
+			}
+			if failed, err := store.GetTotalFailedItems(); err != nil {
+				t.Fatalf("GetTotalFailedItems: %v", err)
+			} else if failed != 0 {
+				t.Errorf("items in the DLQ = %d, want 0: a post-claim read error must not spend its retry budget", failed)
+			}
+			if got := store.AllBlockGCCandidates(); len(got) != 1 {
+				t.Errorf("candidate rows = %d, want 1: a failed read did not decide the block", len(got))
+			}
+			if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+				t.Fatalf("deleted bytes after post-claim read error: %+v", deletes)
+			}
+		})
 	}
 }

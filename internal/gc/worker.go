@@ -1340,7 +1340,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if hasRefs {
 		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 		if infoErr != nil {
-			return w.failClosedIfUnavailable("failed to load re-referenced block info", item.ItemID, infoErr)
+			return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("failed to load re-referenced block info: %v", infoErr))
 		}
 		if blockInfo.CreatedAt == nil || blockInfo.StorageClass == "" {
 			// A STUB-SHAPED READ HERE IS A STALE READ, NOT A STUB. The claim CAS named
@@ -1401,7 +1401,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// before recording recovery metadata for the later S3 delete.
 	blockInfo, err := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 	if err != nil {
-		return w.failClosedIfUnavailable("failed to load canonical block info", item.ItemID, err)
+		return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("failed to load canonical block info: %v", err))
 	}
 	// THE DESTRUCTIVE LOCATOR IS THE ONE THE CLAIM AUTHORIZED, NOT THE ONE READ BACK.
 	//
@@ -1562,9 +1562,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	return nil
 }
 
-// releaseAndPostponeUnreliableRead hands this attempt's fence back and postpones,
-// for the case where the post-claim canonical read contradicts what the claim already
-// established in the serial domain.
+// releaseAndPostponeUnreliableRead hands this attempt's fence back and postpones when a
+// post-claim canonical read cannot reliably confirm what the claim established in the
+// serial domain.
 //
 // BOTH HALVES MATTER. Releasing is not optional: the walk is abandoning a claim it
 // legitimately holds, and leaving it up turns a lagging replica into a permanent upload
@@ -1578,7 +1578,7 @@ func (w *Worker) releaseAndPostponeUnreliableRead(item QueueItem, attempt BlockD
 	if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 		return relErr
 	}
-	log.Printf("[GC Worker] Block %s: %s, which contradicts what the claim CAS proved in the serial domain; handed the fence back and postponing rather than acting on a stale read", item.ItemID, reason)
+	log.Printf("[GC Worker] Block %s: %s after the claim CAS proved its target in the serial domain; handed the fence back and postponing rather than acting without a reliable read", item.ItemID, reason)
 	return blockCanonicalReadUnreliableError{ItemID: item.ItemID, Reason: reason}
 }
 
