@@ -234,6 +234,13 @@ m_post_claim_read_error_skips_release() {
   restore
 }
 
+m_divergent_read_retries() {
+  mutate "$WORKER" 's{return w\.releaseAndPostponeUnreliableRead\(item, attempt, fmt\.Sprintf\("canonical row reads back as %s but claim authorized %s", observed, attempt\.Target\)\)}{if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {\n\t\t\treturn relErr\n\t\t}\n\t\treturn fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, attempt.Target)}'
+  expect_red 'TestP4A_DivergentPostClaimReadHandsTheFenceBackAndPostpones' 'items in the DLQ' \
+    'a divergent post-claim canonical read spends retries and moves its recovery candidate to the DLQ'
+  restore
+}
+
 m_authority_invalid_retries() {
   mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockClaimForeignOwner,}{GCFailureCodeBlockClaimForeignOwner,}'
   expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'is documented as postponing but spends the retry budget' \
@@ -269,6 +276,7 @@ MUTATIONS=(
   m_late_loser_settles_candidate
   m_unreliable_read_skips_release
   m_post_claim_read_error_skips_release
+  m_divergent_read_retries
   m_authority_invalid_retries
   m_foreign_owner_retries
 )

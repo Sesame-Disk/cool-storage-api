@@ -1421,10 +1421,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	storageKey := attempt.Target.StorageKey
 	if observed := (BlockDeleteTarget{StorageClass: blockInfo.StorageClass, StorageKey: blockInfo.StorageKey}); !observed.IsZero() && observed != attempt.Target {
 		metrics.GCErrorsTotal.WithLabelValues("block_incarnation_divergence").Inc()
-		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-			return relErr
-		}
-		return fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, attempt.Target)
+		return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("canonical row reads back as %s but claim authorized %s", observed, attempt.Target))
 	}
 	if blockInfo.StorageClass == "" {
 		// SAME RULE AS THE RE-REFERENCED BRANCH, AND FOR THE SAME REASON. The claim

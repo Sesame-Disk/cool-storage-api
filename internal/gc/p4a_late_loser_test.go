@@ -273,3 +273,55 @@ func TestP4A_PostClaimReadErrorHandsTheFenceBackAndPostpones(t *testing.T) {
 		})
 	}
 }
+
+// TestP4A_DivergentPostClaimReadHandsTheFenceBackAndPostpones covers the third
+// non-authoritative outcome of GetBlockInfo. A read from a lagging replica can show a
+// different non-empty incarnation even though the claim proved its target in the serial
+// domain. That observation must not consume the candidate through the retry budget.
+func TestP4A_DivergentPostClaimReadHandsTheFenceBackAndPostpones(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("blk-divergent-readback")
+	candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
+	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem: %v", err)
+	}
+	store.SetGetBlockInfoHookForTest(func(info BlockInfo) BlockInfo {
+		info.StorageKey = candidate.Target.StorageKey + ".stale"
+		return info
+	})
+
+	// Six generic errors used to consume all five retries and move the only recovery
+	// candidate to the DLQ. Keep the divergence present for twice that boundary.
+	for i := 0; i < 12; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("ProcessOnce %d returned a fatal error: %v", i, err)
+		}
+	}
+
+	if blk := store.GetBlock(orgID, blockID); blk == nil {
+		t.Fatal("canonical row disappeared: a divergent ordinary read must not authorize a delete")
+	} else if blk.GCState != "" {
+		t.Errorf("fence left standing (gc_state=%q) after divergent post-claim read", blk.GCState)
+	}
+	if failed, err := store.GetTotalFailedItems(); err != nil {
+		t.Fatalf("GetTotalFailedItems: %v", err)
+	} else if failed != 0 {
+		t.Errorf("items in the DLQ = %d, want 0: a divergent ordinary read must not consume the recovery candidate", failed)
+	}
+	if got := store.AllBlockGCCandidates(); len(got) != 1 {
+		t.Errorf("candidate rows = %d, want 1: a divergent ordinary read did not decide the block", len(got))
+	}
+	if queued := store.QueueItems(orgID); len(queued) != 1 {
+		t.Errorf("live queue items = %d, want 1: the candidate must remain reachable after a divergent ordinary read", len(queued))
+	} else if queued[0].RetryCount != 0 {
+		t.Errorf("live queue retry count = %d, want 0: a divergent ordinary read must not spend a retry", queued[0].RetryCount)
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted bytes after divergent post-claim read: %+v", deletes)
+	}
+}
