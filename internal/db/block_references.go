@@ -1459,12 +1459,6 @@ type BlockS3OrphanInfo struct {
 	FirstSeenAt  time.Time
 }
 
-type BlockDeleteClaimInfo struct {
-	StorageClass string
-	GCState      string
-	GCClaimID    string
-}
-
 // BlockDeleteFenceActive reports whether GC still owns the physical object for
 // this block. Writers must treat both an in-row gc_state='deleting' claim and a
 // pending gc_s3_orphans row as an active fence; otherwise a re-upload can race
@@ -1541,29 +1535,4 @@ func (db *DB) GetBlockS3OrphanInfo(orgID, blockID string) (BlockS3OrphanInfo, bo
 		return BlockS3OrphanInfo{}, false, err
 	}
 	return info, true, nil
-}
-
-func (db *DB) GetBlockDeleteClaimInfo(orgID, blockID string) (BlockDeleteClaimInfo, bool, error) {
-	var info BlockDeleteClaimInfo
-	err := db.Session().Query(`
-		SELECT storage_class, gc_state, gc_claim_id FROM blocks
-		WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&info.StorageClass, &info.GCState, &info.GCClaimID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return BlockDeleteClaimInfo{}, false, nil
-		}
-		return BlockDeleteClaimInfo{}, false, err
-	}
-	return info, true, nil
-}
-
-func (db *DB) ReleaseBlockDeleteClaim(orgID, blockID, claimID string) (bool, error) {
-	return db.Session().Query(`
-		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
-		WHERE org_id = ? AND block_id = ?
-		IF gc_state = ? AND gc_claim_id = ?
-	`, orgID, blockID, BlockGCStateDeleting, claimID).
-		SerialConsistency(gocql.Serial).
-		MapScanCAS(map[string]interface{}{})
 }

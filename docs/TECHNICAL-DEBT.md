@@ -170,19 +170,27 @@ measurement of the remaining install/repair CAS cost is still deferred.
 
 ---
 
-## 21. Cassandra-Real Coverage For GC Claim Retry (DEFERRED)
+## 21. Cassandra-Real Coverage For GC Claim Retry (RESOLVED 2026-08-26, P4a)
 
-### Current State
-`ClaimBlockDelete` now does an explicit `SELECT gc_state, gc_claim_id` after a failed CAS, instead of trusting the partial row returned by Cassandra for `UPDATE ... IF`.
+### Resolution
+`TestP4A_RetryOfTheSameCandidateUnderRealCAS` in
+`internal/integration/p4a_claim_authority_test.go` exercises a retry of the same logical
+candidate against real Cassandra, and the sibling legs cover the interleaved-owner and
+ABA cases. The explicit post-CAS `SELECT` this entry described is gone: a non-applied LWT
+returns the row's current values, which is a serial-domain observation, so the classifier
+reads those directly and only falls back to a SERIAL settling read when the LWT's outcome
+is genuinely unknown.
 
-### Why It Was Deferred
-The code path is corrected, but the current tree still lacks a real Cassandra regression that proves a retry of the same logical candidate recognizes its prior claim under Cassandra's actual CAS return semantics.
+### What The Answer Turned Out To Be
+Not what this entry assumed. It expected a retry to "recognize its prior claim", which was
+true only because the claim id derived from `candidateAt` and was therefore shared by
+every attempt — the same property that let two concurrent workers both own a row. Under
+per-attempt identity a retry is a NEW attempt with a new id: it observes a live owner and
+postpones, and an abandoned claim is recovered by stale takeover rather than by inheriting
+the id. The test pins that behaviour explicitly so the old expectation cannot creep back.
 
-### Follow-Up Plan
-1. Add a Cassandra-backed store test that seeds a claimed block row.
-2. Retry `ClaimBlockDelete` with the same `claimID` and assert ownership is recognized.
-3. Retry with a different `claimID` and assert it is rejected.
-4. Keep the existing S3-orphan recovery tests green alongside the new coverage.
+### Gates
+`TestP4A_RetryOfTheSameCandidateUnderRealCAS`, under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`.
 
 ---
 
@@ -2297,16 +2305,131 @@ change than the P3 writer boundary.
 ### Regression Tests To Keep
 - `TestP3StagingAdmissionRunsOnlyAfterAuthority`
 
-## 22. `ReleaseStaleBlockClaim` reads at session consistency (LOW, pre-existing)
+## 22. `ReleaseStaleBlockClaim` reads at session consistency (RESOLVED 2026-08-26, P4a)
+
+### Resolution
+The observing read is now `settleBlockDeleteClaimState`, a `SELECT` on the `blocks`
+partition at query consistency `SERIAL` — not `Query.SerialConsistency`, which configures
+conditional mutations and is ignored for ordinary SELECTs. It is the single observing
+read for both `ReleaseStaleBlockClaim` and the ambiguous-claim path, and the release it
+drives is a CAS against the exact `(storage_class, storage_key, gc_claim_id,
+gc_claimed_at)` it observed.
+
+### Why It Was Safe To Fix Now And Not Before
+The original objection was that a global SERIAL read need not intersect a claim committed
+under LOCAL_SERIAL, and that mixing the two levels on `blocks` is the one-serial-domain
+violation R12 tracks. P0/R12 settled that on 2026-08-23 by pinning every conditional
+mutation on `blocks` to `SerialConsistency(gocql.Serial)`: there is now exactly one global
+serial domain, so a global SERIAL read intersects it. The stale code comment arguing
+against the fix has been rewritten rather than deleted, so the reasoning survives.
+
+### Gates
+`TestP4ASettlementReadsUseTheSerialDomain`, plus the `m_settlement_read_is_ordinary`
+mutation in `scripts/p4a-mutation-validation.sh`, which requires the guard to go red when
+the read is downgraded.
+
+## 23. GC no longer cleans metadata-free stub rows (LOW, introduced deliberately by P4a)
 
 ### Current State
-`internal/gc/store_cassandra.go` releases a stale claim after an ordinary read, so a
-claim owned by a worker in another DC may not be observed and the fence can stay stuck.
+`ClaimBlockDelete` requires `IF storage_class = ? AND storage_key = ?`, so GC has no
+exact authority over a `blocks` row that carries no physical locator. `processBlock`
+classifies such a row as `invalid`: it mutates nothing, fences nothing, and — importantly
+— does not consume the candidate. `EnsureBlockGCCandidate` refuses to create a candidate
+for such a row in the first place.
 
-### Why It Was Deferred
-Fail-closed: the consequence is an un-released fence, never deleted live data. It is GC
-worker liveness and predates P3; the P3 boundary does not depend on it. It belongs with
-the P4 work that binds claim identity to the exact physical tuple (R14).
+The consequence is that the stub-cleanup branches in `processBlock` are unreachable
+through a candidate, and a metadata-free stub row left by some other path is no longer
+swept by GC.
+
+**Those branches have since been REMOVED rather than retained (third P4a pass), because
+"unreachable by truth" turned out not to mean "unreachable".** `GetBlockInfo` is an
+ordinary read while the claim commits at `EACH_QUORUM` in the serial domain, so a
+post-claim read CAN show an empty row — a replica holding only the `gc_*` columns the
+claim itself just wrote. The branches then fired on a stale read, `DeleteClaimedBlockStub`
+correctly refused in the serial domain, and the refusal surfaced as a plain error: retry
+spent, fence still up, and after enough cycles a DLQ entry with `gc_state='deleting'`
+standing. A read that contradicts what the claim already proved is now treated as an
+unreliable observation — hand the fence back, postpone, touch nothing.
+
+`DeleteClaimedBlockStub` itself is retained on `GCStore` and in both stores. It is
+currently unreferenced by the worker, and that is the seam this entry is about: whoever
+takes the follow-up below needs the primitive, and deleting it would hide the gap rather
+than close it.
+
+### Why This Is Acceptable, And Why It Is Not Silently Fine
+It is acceptable because an *unclaimed* stub is not an upload fence:
+`BlockDeleteFenceActive` keys on `gc_state='deleting'` and on `gc_s3_orphans` rows, so a
+locator-free row with no claim blocks nothing. The only producer of a **`deleting`**
+metadata-free stub was the old GC claim CAS itself — `IF gc_state != 'deleting'` applies
+against a missing partition in Cassandra, which is how the stub was materialized in the
+first place — and that can no longer happen.
+
+Be precise about the scope of that claim: metadata-free rows CAN be claimed by the writer
+path, under `gc_state='repairing_stub'` (`claimReleasedBlockStubForRepairFn`). Those are
+not a delete fence and the writer cleans them up through
+`deleteRepairClaimedBlockStubFn`; they are simply not GC's to touch, which is the same
+conclusion by a different route.
+
+It is not silently fine because the cleanup responsibility has moved rather than
+disappeared. Stub rows originating on the writer side (`claimReleasedBlockStubForRepairFn`
+and friends in `internal/db/block_references.go`) belong to the upload path, and nothing
+currently sweeps one abandoned there.
 
 ### Follow-Up Plan
-1. Fold into P4's claim-identity work rather than patching the read in isolation.
+1. Decide the owner explicitly: either the upload path cleans up its own abandoned stubs,
+   or a separate non-destructive sweeper does, keyed on rows with no locator and no claim.
+2. Do NOT solve it by loosening the claim CAS. A destructive primitive that can act on a
+   row it cannot name is the defect P4a removed.
+3. Until then, `DeleteClaimedBlockStub` is retained (unreferenced by the worker) so the
+   seam is visible to whoever picks this up. Do NOT reinstate the `processBlock` branches:
+   they were driven by a read the claim had already contradicted.
+
+### Gates
+`TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork` and
+`TestP4A_CandidateWithoutAnExactIncarnationIsNeverDestructiveAndNeverConsumed` pin the
+refusal in both directions: nothing destructive happens, and the work item survives.
+
+
+## 24. Pre-migration-017 candidate rows need a reconcile before GC activation (PRE-ACTIVATION)
+
+### Current State
+Migration `017` adds the `storage_key` column to `gc_block_candidates` and its `_by_day`
+projection. It adds the COLUMN only; it backfills no values, so any candidate row written
+before it carries `storage_key = NULL`.
+
+The system is safe in that state and stays safe: `EnsureBlockGCCandidate` refuses such a
+row with `ErrBlockCandidateTargetUnavailable`, and `processBlock` classifies it as
+`invalid` — nothing is claimed, nothing is fenced, nothing is deleted, and the candidate
+is not consumed either.
+
+### Why It Is Not Backfilled
+Because the obvious backfill is wrong. A pre-017 candidate was authorized for whatever
+incarnation was live when the zero-ref decision was made. Reading the canonical row today
+and writing that `P` onto it would manufacture a destructive authorization that nothing
+ever decided — precisely the ABA the exact-`P` work exists to prevent, performed by the
+migration instead of by a race.
+
+It is also why `EnsureBlockGCCandidate` refuses rather than repairing in place: the CAS
+that would repair it names `storage_key`, and `IF storage_key = ''` never matches a NULL
+column, so the pre-fix code spun on it forever. The loop is now bounded and the row is
+reported instead.
+
+### Follow-Up Plan (before `GC_ENABLED=true`, not before merge)
+1. Enumerate `gc_block_candidates` rows with a null/empty `storage_key`.
+2. For each, make a FRESH candidacy decision rather than a backfill: re-check global
+   liveness / zero references, read the current `P`, and write a new candidate with its
+   own `candidate_at` so the incarnation serves its own grace period.
+3. Or delete the legacy row outright and let the ordinary discovery paths rediscover the
+   block, which is equivalent and simpler where the block is still referenced.
+4. Do NOT relax the refusal to make this go away.
+
+### Why This Does Not Block The Merge
+`GC_ENABLED=false` remains mandatory on every replica in every DC, so no candidate is
+processed at all. The deployment target is a clean server with no legacy candidate rows;
+this exists for any docker or staging stack that populated `gc_block_candidates` before
+the upgrade.
+
+### Gates
+`TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted` pins both halves: the row is
+refused, and it is neither consumed nor silently adopted as today's incarnation.
+`TestP4ACandidateRetryLoopIsBounded` pins that the refusal cannot become a hot loop again.

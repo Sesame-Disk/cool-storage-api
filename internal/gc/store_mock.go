@@ -180,6 +180,11 @@ type MockStore struct {
 	blockHasReferencesLocalCalls   int
 	blockHasReferencesGlobalCalls  int
 	releaseStaleBlockClaimErr      error
+	getBlockGCCandidateErr         error
+	claimBlockDeleteSettleErr      error
+	getBlockInfoHook               func(BlockInfo) BlockInfo
+	getBlockInfoErr                error
+	claimAttempts                  []BlockDeleteAuthority
 	releaseBlockClaimErr           error
 	claimBlockDeleteErr            error
 	validateDestructiveTopologyErr error
@@ -253,10 +258,10 @@ type mockPendingItemKey struct {
 }
 
 type mockBlockGCCandidate struct {
-	OrgID        uuid.UUID
-	BlockID      string
-	StorageClass string
-	CandidateAt  time.Time
+	OrgID       uuid.UUID
+	BlockID     string
+	Target      BlockDeleteTarget
+	CandidateAt time.Time
 }
 
 type mockBlockGCCandidateProjectionKey struct {
@@ -510,10 +515,10 @@ func newMockProvisionalBlockRefExpiryProjectionKey(orgID uuid.UUID, blockID, ref
 func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandidate) {
 	key := newMockBlockGCCandidateProjectionKey(candidate.OrgID, candidate.BlockID, candidate.CandidateAt)
 	m.blockGCCandidateProjections[key] = BlockGCCandidateInfo{
-		OrgID:        candidate.OrgID,
-		BlockID:      candidate.BlockID,
-		StorageClass: candidate.StorageClass,
-		CandidateAt:  candidate.CandidateAt.UTC(),
+		OrgID:       candidate.OrgID,
+		BlockID:     candidate.BlockID,
+		Target:      candidate.Target,
+		CandidateAt: candidate.CandidateAt.UTC(),
 	}
 }
 
@@ -656,18 +661,97 @@ func (m *MockStore) SetBlockStorageKeyForTest(orgID uuid.UUID, blockID, storageK
 	}
 }
 
+// AddBlockGCCandidate seeds a candidate. It captures the exact incarnation from the
+// seeded canonical row when one exists, so a test that seeds a block and a candidate
+// gets the same consistent pair production would have produced. Tests that deliberately
+// model a candidate for a DEAD incarnation seed it first and mutate the block after.
 func (m *MockStore) AddBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addBlockGCCandidateLocked(orgID, blockID, storageClass, candidateAt)
+}
+
+func (m *MockStore) addBlockGCCandidateLocked(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) {
+	target := BlockDeleteTarget{StorageClass: storageClass, StorageKey: MockCanonicalStorageKey(orgID.String(), blockID)}
+	if resolved, err := m.resolveBlockDeleteTargetLocked(orgID, blockID); err == nil {
+		target = resolved
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	candidate := &mockBlockGCCandidate{
-		OrgID:        orgID,
-		BlockID:      blockID,
-		StorageClass: storageClass,
-		CandidateAt:  candidateAt.UTC(),
+		OrgID:       orgID,
+		BlockID:     blockID,
+		Target:      target,
+		CandidateAt: candidateAt.UTC(),
 	}
 	m.blockGCCandidates[key] = candidate
 	m.upsertBlockGCCandidateProjection(candidate)
+}
+
+// BlockDeleteAuthorityForTest builds an authority bound to the block's CURRENT
+// incarnation. Tests that need an authority for a DEAD incarnation build the struct
+// themselves — the point of most of these tests is that the two differ.
+func (m *MockStore) BlockDeleteAuthorityForTest(orgID uuid.UUID, blockID, claimID string, claimedAt time.Time) BlockDeleteAuthority {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var target BlockDeleteTarget
+	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		target = BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}
+	}
+	return BlockDeleteAuthority{Target: target, ClaimID: claimID, ClaimedAt: claimedAt.UTC()}
+}
+
+// SeedBlockClaimForTest installs a delete claim directly, modelling an attempt that
+// claimed the row and then vanished. It returns the authority that owns it so a test
+// can assert who may and may not release it.
+func (m *MockStore) SeedBlockClaimForTest(orgID uuid.UUID, blockID, claimID string, claimedAt time.Time) BlockDeleteAuthority {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockDeleteAuthority{}
+	}
+	claimedAtUTC := claimedAt.UTC()
+	b.GCState = db.BlockGCStateDeleting
+	b.GCClaimID = claimID
+	b.GCClaimedAt = &claimedAtUTC
+	return BlockDeleteAuthority{
+		Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+		ClaimID:   claimID,
+		ClaimedAt: claimedAtUTC,
+	}
+}
+
+// SetBlockGCStateForTest installs an arbitrary gc_state owner, so a test can model a
+// claim belonging to another subsystem — notably the upload path's repairing_stub.
+func (m *MockStore) SetBlockGCStateForTest(orgID uuid.UUID, blockID, gcState, claimID string, claimedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return
+	}
+	at := claimedAt.UTC()
+	b.GCState = gcState
+	b.GCClaimID = claimID
+	b.GCClaimedAt = &at
+}
+
+// SetBlockGCCandidateTargetForTest rewrites a candidate's captured incarnation, so a
+// test can model "this candidate was created for P1" independently of what the
+// canonical row holds now.
+func (m *MockStore) SetBlockGCCandidateTargetForTest(orgID uuid.UUID, blockID string, target BlockDeleteTarget) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.blockGCCandidates[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		c.Target = target
+		m.upsertBlockGCCandidateProjection(c)
+	}
+}
+
+// GetBlockGCCandidateForTest exposes the stored candidate for assertions.
+func (m *MockStore) GetBlockGCCandidateForTest(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool) {
+	info, ok, _ := m.GetBlockGCCandidate(orgID, blockID)
+	return info, ok
 }
 
 func (m *MockStore) AddProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer, storageClass string, expiresAt time.Time) {
@@ -1264,6 +1348,15 @@ func (m *MockStore) AuditLogEntries() []AuditLogEntry {
 }
 
 // GetBlock returns a block for test assertions.
+// RemoveBlockForTest deletes the canonical row, modelling an incarnation that died
+// after its candidate was created. The candidate survives, which is the point: it is
+// what carries the dead incarnation into the claim.
+func (m *MockStore) RemoveBlockForTest(orgID uuid.UUID, blockID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blocks, fmt.Sprintf("%s:%s", orgID, blockID))
+}
+
 func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1273,11 +1366,37 @@ func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.getBlockInfoErr != nil {
+		return BlockInfo{}, m.getBlockInfoErr
+	}
 	block := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if block == nil {
 		return BlockInfo{}, gocql.ErrNotFound
 	}
-	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, StorageKey: block.StorageKey, CreatedAt: block.CreatedAt, Sha1: block.Sha1}, nil
+	info := BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass, StorageKey: block.StorageKey, CreatedAt: block.CreatedAt, Sha1: block.Sha1}
+	if m.getBlockInfoHook != nil {
+		info = m.getBlockInfoHook(info)
+	}
+	return info, nil
+}
+
+// SetGetBlockInfoHookForTest rewrites what the post-claim canonical re-read returns.
+//
+// It models the one thing the in-memory store cannot otherwise reach: GetBlockInfo is an
+// ordinary read while the claim commits in the serial domain, so in production the two
+// can legitimately disagree about which incarnation the row holds. Nothing downstream may
+// publish or delete on the strength of that read.
+func (m *MockStore) SetGetBlockInfoHookForTest(hook func(BlockInfo) BlockInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlockInfoHook = hook
+}
+
+// SetGetBlockInfoErrorForTest makes the post-claim canonical re-read fail.
+func (m *MockStore) SetGetBlockInfoErrorForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlockInfoErr = err
 }
 
 // BlockReferenceCount returns how many reference rows a block currently has.
@@ -1350,9 +1469,28 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 // It backs both the guarded EnqueueItem and the test-only SeedQueueItemForTest
 // (defined in a _test.go file so it never compiles into a production build); the
 // block representation is intentionally always empty on this raw single-row path.
+//
+// FOR ItemBlock IT ALSO ENSURES THE CANDIDATE, because in production a block cannot
+// reach the queue any other way: all three enqueue sites (Service.EnqueueBlock,
+// Worker.enqueueZeroRefBlocks, Scanner.promoteBlockIfUnreferenced) call
+// EnsureBlockGCCandidate first, and the scanner's own items come FROM the candidate
+// projection. A mock that let a block item exist with no candidate behind it would let
+// tests assert deletions that production would refuse for want of authority — the mock
+// agreeing with the test while production disagreed, which is exactly how R19 hid.
+//
+// It is conditional on a canonical row existing, because the candidate captures its
+// incarnation from one. Tests that deliberately model "no candidate" seed no block, or
+// delete the candidate afterwards.
 func (m *MockStore) seedQueueItemRow(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if itemType == ItemBlock {
+		if _, ok := m.blockGCCandidates[fmt.Sprintf("%s:%s", orgID, itemID)]; !ok {
+			if _, err := m.resolveBlockDeleteTargetLocked(orgID, itemID); err == nil {
+				m.addBlockGCCandidateLocked(orgID, itemID, storageClass, queuedAt)
+			}
+		}
+	}
 	item := QueueItem{
 		OrgID:                       orgID,
 		QueuedAt:                    queuedAt,
@@ -2056,10 +2194,13 @@ func (m *MockStore) SetValidateDestructiveGCTopologyErrForTest(err error) {
 // errors nor warns; a stale claim is released regardless of which attempt owns it;
 // and a real failure is injectable to prove that callers refuse to settle a candidate
 // whose fence they could not confirm gone.
-func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
+func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, expectedTarget BlockDeleteTarget, staleBefore time.Time) (BlockClaimReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if expectedTarget.IsZero() {
+		return BlockClaimAbsent, fmt.Errorf("block %s: refusing to release a stale claim without naming the incarnation it belongs to", blockID)
+	}
 	if m.releaseStaleBlockClaimErr != nil {
 		return BlockClaimAbsent, m.releaseStaleBlockClaimErr
 	}
@@ -2069,6 +2210,10 @@ func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, stal
 	}
 	if b.GCState != db.BlockGCStateDeleting {
 		return BlockClaimAbsent, nil
+	}
+	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != expectedTarget {
+		// A fence on a different incarnation than the caller is authorized for.
+		return BlockClaimTooFresh, nil
 	}
 	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
 		return BlockClaimTooFresh, nil
@@ -2102,6 +2247,14 @@ func (m *MockStore) BackdateBlockClaimForTest(orgID uuid.UUID, blockID string, c
 	defer m.mu.Unlock()
 	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if !ok {
+		return
+	}
+	// Only ages an EXISTING claim. Stamping gc_claimed_at onto an unclaimed row would
+	// fabricate a state production cannot reach — the claim CAS sets and clears
+	// gc_state, gc_claim_id and gc_claimed_at together — and a row with a timestamp but
+	// no owner classifies as another attempt's live claim, silently wedging any test that
+	// backdates in a loop.
+	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID == "" {
 		return
 	}
 	at := claimedAt.UTC()
@@ -2253,39 +2406,126 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	if m.ensureBlockGCCandidateErr != nil {
 		return time.Time{}, m.ensureBlockGCCandidateErr
 	}
+	target, err := m.resolveBlockDeleteTargetLocked(orgID, blockID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if existing, ok := m.blockGCCandidates[fmt.Sprintf("%s:%s", orgID, blockID)]; ok && existing.Target.StorageKey == "" {
+		// Mirrors the Cassandra store: a candidate row written before migration 017 has a
+		// NULL storage_key, cannot be repaired by a CAS that names it, and must not be
+		// silently reinterpreted as today's incarnation.
+		return time.Time{}, fmt.Errorf("%w: org=%s block=%s has a gc_block_candidates row written before migration 017 (no storage_key); it needs a fresh zero-ref decision, not a backfill", ErrBlockCandidateTargetUnavailable, orgID, blockID)
+	}
+	candidateAt = candidateAt.UTC()
+	if candidateAt.IsZero() {
+		candidateAt = time.Now().UTC()
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
-		if candidateAt = candidateAt.UTC(); !candidateAt.IsZero() && candidateAt.Before(existing.CandidateAt) {
-			delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(existing.OrgID, existing.BlockID, existing.CandidateAt))
-			existing.CandidateAt = candidateAt
+		if existing.Target == target {
+			if candidateAt.Before(existing.CandidateAt) {
+				delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(existing.OrgID, existing.BlockID, existing.CandidateAt))
+				existing.CandidateAt = candidateAt
+			}
+			m.upsertBlockGCCandidateProjection(existing)
+			return existing.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 		}
+		// A candidate for a different incarnation is stale work; it is replaced
+		// wholesale rather than having its candidate_at inherited by the new life.
+		delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(existing.OrgID, existing.BlockID, existing.CandidateAt))
+		existing.Target = target
+		existing.CandidateAt = candidateAt
 		m.upsertBlockGCCandidateProjection(existing)
 		return existing.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 	}
 	candidate := &mockBlockGCCandidate{
-		OrgID:        orgID,
-		BlockID:      blockID,
-		StorageClass: storageClass,
-		CandidateAt:  candidateAt.UTC(),
+		OrgID:       orgID,
+		BlockID:     blockID,
+		Target:      target,
+		CandidateAt: candidateAt,
 	}
 	m.blockGCCandidates[key] = candidate
 	m.upsertBlockGCCandidateProjection(candidate)
 	return candidate.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 }
 
-func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
+// resolveBlockDeleteTargetLocked mirrors the Cassandra store: a candidate cannot exist
+// without the exact incarnation it is authorized for.
+func (m *MockStore) resolveBlockDeleteTargetLocked(orgID uuid.UUID, blockID string) (BlockDeleteTarget, error) {
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockDeleteTarget{}, fmt.Errorf("%w: org=%s block=%s has no canonical row", ErrBlockCandidateTargetUnavailable, orgID, blockID)
+	}
+	target := BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}
+	if target.IsZero() {
+		return BlockDeleteTarget{}, fmt.Errorf("%w: org=%s block=%s canonical row has no usable locator %s", ErrBlockCandidateTargetUnavailable, orgID, blockID, target)
+	}
+	return target, nil
+}
+
+func (m *MockStore) GetBlockGCCandidate(orgID uuid.UUID, blockID string) (BlockGCCandidateInfo, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.getBlockGCCandidateErr != nil {
+		return BlockGCCandidateInfo{}, false, m.getBlockGCCandidateErr
+	}
+	c, ok := m.blockGCCandidates[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockGCCandidateInfo{}, false, nil
+	}
+	return BlockGCCandidateInfo{
+		OrgID:       c.OrgID,
+		BlockID:     c.BlockID,
+		Target:      c.Target,
+		CandidateAt: c.CandidateAt,
+	}, true, nil
+}
+
+// ClaimAttemptsForTest returns every authority ClaimBlockDelete was called with, in
+// order. It is how a test can assert that each ATTEMPT minted its own identity rather
+// than inheriting one from the candidate.
+func (m *MockStore) ClaimAttemptsForTest() []BlockDeleteAuthority {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]BlockDeleteAuthority, len(m.claimAttempts))
+	copy(out, m.claimAttempts)
+	return out
+}
+
+// SetClaimBlockDeleteSettleErrForTest makes the serial settling read fail too, so an
+// injected LWT failure becomes genuinely unsettleable. Both knobs together are the only
+// way to reach BlockClaimAmbiguous — which is the point: ambiguity is rare, and a test
+// that reaches it by accident is testing the wrong thing.
+func (m *MockStore) SetClaimBlockDeleteSettleErrForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.claimBlockDeleteSettleErr = err
+}
+
+// SetGetBlockGCCandidateErrForTest injects a failure into the candidate authority read.
+func (m *MockStore) SetGetBlockGCCandidateErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getBlockGCCandidateErr = err
+}
+
+func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidate BlockGCCandidateIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if candidate.CandidateAt.IsZero() || candidate.Target.IsZero() {
+		return fmt.Errorf("block %s: refusing to delete a gc candidate without its exact identity", blockID)
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	if candidateAt.IsZero() {
-		if existing, ok := m.blockGCCandidates[key]; ok {
-			candidateAt = existing.CandidateAt
-		}
+	existing, ok := m.blockGCCandidates[key]
+	if !ok {
+		return nil
+	}
+	if existing.Target != candidate.Target || !existing.CandidateAt.Equal(candidate.CandidateAt.UTC()) {
+		// No longer the candidate that was observed: another lifecycle owns it now.
+		return nil
 	}
 	delete(m.blockGCCandidates, key)
-	if !candidateAt.IsZero() {
-		delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
-	}
+	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, existing.CandidateAt))
 	return nil
 }
 
@@ -2376,34 +2616,68 @@ func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, b
 	return nil
 }
 
-func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+// ClaimBlockDelete mirrors the exact-incarnation CAS.
+//
+// Note what it can no longer do: materialize a row. The production IF names
+// storage_class, which no absent partition can satisfy, so a missing block is
+// BlockClaimMissing rather than a freshly created stub.
+func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.claimAttempts = append(m.claimAttempts, attempt)
+	if attempt.IsZero() {
+		return BlockClaimResult{Outcome: BlockClaimInvalid}, fmt.Errorf("block %s: refusing to claim without a complete delete authority", blockID)
+	}
+	staleBefore := attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter)
 	if m.claimBlockDeleteErr != nil {
-		return false, m.claimBlockDeleteErr
-	}
-	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	b, ok := m.blocks[key]
-	if !ok {
-		claimedAt := time.Now().UTC()
-		m.blocks[key] = &mockBlock{
-			OrgID:       orgID,
-			BlockID:     blockID,
-			GCState:     db.BlockGCStateDeleting,
-			GCClaimID:   claimID,
-			GCClaimedAt: &claimedAt,
+		// Mirror the production shape rather than collapsing it. A failed LWT is NOT
+		// automatically ambiguous: the store settles it in the serial domain first, and
+		// only a settlement that ALSO fails leaves the outcome unknown. Reporting every
+		// injected error as ambiguous made the mock unable to express the case that
+		// matters most — an LWT that timed out after committing, which the settling read
+		// then recognises as our own claim.
+		if m.claimBlockDeleteSettleErr != nil {
+			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, m.claimBlockDeleteErr, m.claimBlockDeleteSettleErr)
 		}
-		return true, nil
+		b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+		if !ok {
+			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
+		}
+		settled := blockDeleteClaimRow{
+			Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+			GCState:   b.GCState,
+			GCClaimID: b.GCClaimID,
+		}
+		if b.GCClaimedAt != nil {
+			settled.GCClaimedAt = *b.GCClaimedAt
+		}
+		return settled.result(attempt, staleBefore), nil
 	}
-	if b.GCState == db.BlockGCStateDeleting {
-		return b.GCClaimID == claimID, nil
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 	}
+	row := blockDeleteClaimRow{
+		Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+		GCState:   b.GCState,
+		GCClaimID: b.GCClaimID,
+	}
+	if b.GCClaimedAt != nil {
+		row.GCClaimedAt = *b.GCClaimedAt
+	}
+	result := row.result(attempt, staleBefore)
+	if result.Outcome != BlockClaimAmbiguous {
+		return result, nil
+	}
+	// classify returns Ambiguous for "exact incarnation, present, unowned" because in
+	// production that combination means the CAS should have applied and did not. Here it
+	// IS the applying case.
 	b.GCState = db.BlockGCStateDeleting
-	b.GCClaimID = claimID
-	claimedAt := time.Now().UTC()
+	b.GCClaimID = attempt.ClaimID
+	claimedAt := attempt.ClaimedAt
 	b.GCClaimedAt = &claimedAt
-	return true, nil
+	return BlockClaimResult{Outcome: BlockClaimAcquired, Owner: attempt}, nil
 }
 
 // SetReleaseBlockClaimErrForTest injects a failure into the post-claim release.
@@ -2418,23 +2692,36 @@ func (m *MockStore) SetReleaseBlockClaimErrForTest(err error) {
 	m.releaseBlockClaimErr = err
 }
 
-func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
+func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.releaseBlockClaimLocked(orgID, blockID, authority)
+}
 
+func (m *MockStore) releaseBlockClaimLocked(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockReleaseOutcome, error) {
+	if authority.IsZero() {
+		return BlockReleaseNotOwner, fmt.Errorf("block %s: refusing to release without a complete delete authority", blockID)
+	}
 	if m.releaseBlockClaimErr != nil {
-		return m.releaseBlockClaimErr
+		return BlockReleaseNotOwner, m.releaseBlockClaimErr
 	}
-	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
-		if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
-			return fmt.Errorf("block delete claim release not applied for %s", blockID)
-		}
-		b.GCState = ""
-		b.GCClaimID = ""
-		b.GCClaimedAt = nil
-		return nil
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockReleaseNotOwner, nil
 	}
-	return fmt.Errorf("block delete claim release not applied for %s", blockID)
+	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != authority.ClaimID {
+		return BlockReleaseNotOwner, nil
+	}
+	if b.GCClaimedAt == nil || !b.GCClaimedAt.Equal(authority.ClaimedAt) {
+		return BlockReleaseNotOwner, nil
+	}
+	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != authority.Target {
+		return BlockReleaseNotOwner, nil
+	}
+	b.GCState = ""
+	b.GCClaimID = ""
+	b.GCClaimedAt = nil
+	return BlockReleaseReleased, nil
 }
 
 func (m *MockStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error) {
@@ -2453,12 +2740,22 @@ func (m *MockStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID str
 	return true, nil
 }
 
-func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
+func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if authority.IsZero() {
+		return fmt.Errorf("block %s: refusing to finalize without a complete delete authority", blockID)
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	if b, ok := m.blocks[key]; !ok || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
+	b, ok := m.blocks[key]
+	if !ok || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != authority.ClaimID {
+		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
+	if b.GCClaimedAt == nil || !b.GCClaimedAt.Equal(authority.ClaimedAt) {
+		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
+	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != authority.Target {
 		return fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	delete(m.blocks, key)
@@ -4102,10 +4399,10 @@ func (m *MockStore) AllBlockGCCandidates() []BlockGCCandidateInfo {
 	out := make([]BlockGCCandidateInfo, 0, len(m.blockGCCandidates))
 	for _, c := range m.blockGCCandidates {
 		out = append(out, BlockGCCandidateInfo{
-			OrgID:        c.OrgID,
-			BlockID:      c.BlockID,
-			StorageClass: c.StorageClass,
-			CandidateAt:  c.CandidateAt,
+			OrgID:       c.OrgID,
+			BlockID:     c.BlockID,
+			Target:      c.Target,
+			CandidateAt: c.CandidateAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

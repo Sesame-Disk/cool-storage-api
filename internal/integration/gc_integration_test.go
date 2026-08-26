@@ -1112,9 +1112,36 @@ func deleteGCBlockFixtureRowsForTest(t *testing.T, orgID uuid.UUID, blockID stri
 	deleteGCQueueItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCPendingBlockItems(t, orgID, blockID)
-	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
+	// Fixture teardown deletes unconditionally, on purpose, and therefore does NOT go
+	// through the store. The production primitive is bound to the candidate's exact
+	// (storage_class, storage_key, candidate_at) precisely so it cannot erase a
+	// candidate belonging to another incarnation; a test cleanup that wants "remove
+	// every trace of this fixture" is a different job, and borrowing the production
+	// primitive for it would either fail to clean up or quietly weaken that binding.
+	database := shareProjectionDBForTest(t)
+	var candidateAt time.Time
+	err := database.Session().Query(
+		`SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`,
+		orgID.String(), blockID,
+	).Scan(&candidateAt)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("failed to read gc_block_candidate for %s/%s: %v", orgID, blockID, err)
+	}
+	if err := database.Session().Query(
+		`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`,
+		orgID.String(), blockID,
+	).Exec(); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
+	}
+	if !candidateAt.IsZero() {
+		if err := database.Session().Query(
+			`DELETE FROM gc_block_candidates_by_day
+			 WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?`,
+			db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID),
+			candidateAt.UTC(), orgID.String(), blockID,
+		).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_block_candidates_by_day for %s/%s: %v", orgID, blockID, err)
+		}
 	}
 }
 
@@ -1587,20 +1614,32 @@ func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 	t.Log("scanner discovery: candidate row was re-enqueued from the discovery projection — correct")
 }
 
-// TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical verifies
-// the store can still clear gc_block_candidates_by_day when the canonical
-// gc_block_candidates row is already gone, as long as the caller provides the
-// original candidate_at from the queue item / scanner row.
-func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
+// TestGC_DeleteBlockGCCandidate_IsBoundToTheExactIncarnation is the inverted successor
+// of the old "clears the projection even without a canonical row" test.
+//
+// That behavior was the defect, not the feature. Deleting on (org, block) alone erases
+// whatever candidate happens to occupy the identity, so a lifecycle that started on P1
+// and finished late would consume a candidate that by then belonged to P2 — destroying
+// the only work item authorized to reclaim P2, silently. The delete is now a CAS on the
+// candidate's exact (storage_class, storage_key, candidate_at), and both halves of that
+// are asserted here: a stale identity is a safe no-op that leaves P2 intact, and the
+// matching identity still cleans both rows.
+func TestGC_DeleteBlockGCCandidate_IsBoundToTheExactIncarnation(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
 	orgID := uuid.New()
 	blockID := fmt.Sprintf("cand-cleanup-%d", time.Now().UnixNano())
-	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+	t.Cleanup(func() { cleanupGCBlockRowsForTest(t, orgID, blockID) })
 
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt); err != nil {
+	// P2 is what the candidate is really for; P1 is the incarnation a stale lifecycle
+	// would still be carrying.
+	p2 := seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
+	p1 := gcpkg.BlockDeleteTarget{StorageClass: "hot", StorageKey: p2.StorageKey + ".dead"}
+
+	candidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond))
+	if err != nil {
 		t.Fatalf("EnsureBlockGCCandidate: %v", err)
 	}
 	if !gcCandidateExists(t, orgID.String(), blockID) {
@@ -1610,20 +1649,59 @@ func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testin
 		t.Fatal("expected gc_block_candidates_by_day projection row to exist")
 	}
 
-	if err := database.Session().Query(fmt.Sprintf(
-		"DELETE FROM gc_block_candidates WHERE org_id = %s AND block_id = '%s'",
-		orgID.String(),
-		blockID,
-	)).Exec(); err != nil {
-		t.Fatalf("delete canonical gc_block_candidates row: %v", err)
+	// A delayed lifecycle for the DEAD incarnation must not consume P2's candidate.
+	stale := gcpkg.BlockGCCandidateIdentity{Target: p1, CandidateAt: candidateAt}
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, stale); err != nil {
+		t.Fatalf("DeleteBlockGCCandidate(stale incarnation) must be a safe no-op, got: %v", err)
+	}
+	if !gcCandidateExists(t, orgID.String(), blockID) {
+		t.Fatal("a candidate for the live incarnation was consumed by a stale lifecycle's cleanup")
+	}
+	if !gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("a discovery row for the live incarnation was removed by a stale lifecycle's cleanup")
 	}
 
-	if err := store.DeleteBlockGCCandidate(orgID, blockID, candidateAt); err != nil {
-		t.Fatalf("DeleteBlockGCCandidate: %v", err)
+	// A stale candidate_at with the RIGHT incarnation must be rejected too: both halves
+	// of the identity are load-bearing.
+	wrongWhen := gcpkg.BlockGCCandidateIdentity{Target: p2, CandidateAt: candidateAt.Add(-time.Hour)}
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, wrongWhen); err != nil {
+		t.Fatalf("DeleteBlockGCCandidate(stale candidate_at) must be a safe no-op, got: %v", err)
+	}
+	if !gcCandidateExists(t, orgID.String(), blockID) {
+		t.Fatal("a candidate was consumed by a cleanup naming the wrong candidate_at")
+	}
+
+	// The exact identity settles both rows.
+	exact := gcpkg.BlockGCCandidateIdentity{Target: p2, CandidateAt: candidateAt}
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, exact); err != nil {
+		t.Fatalf("DeleteBlockGCCandidate(exact identity): %v", err)
+	}
+	if gcCandidateExists(t, orgID.String(), blockID) {
+		t.Fatal("expected canonical gc_block_candidates row to be removed")
 	}
 	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
 		t.Fatal("expected gc_block_candidates_by_day projection row to be removed")
 	}
+}
+
+// seedCanonicalBlockRowForTest installs a minimal canonical `blocks` row and returns the
+// exact incarnation it holds. A candidate cannot exist without one, because
+// EnsureBlockGCCandidate captures P from it.
+func seedCanonicalBlockRowForTest(t *testing.T, database *db.DB, orgID uuid.UUID, blockID, storageClass string) gcpkg.BlockDeleteTarget {
+	t.Helper()
+	target := gcpkg.BlockDeleteTarget{
+		StorageClass: storageClass,
+		StorageKey:   fmt.Sprintf("blocks/%s/%s.%s", orgID, blockID, uuid.NewString()),
+	}
+	if err := database.Session().Query(
+		`INSERT INTO blocks (org_id, block_id, storage_class, storage_key, size_bytes, created_at, last_accessed)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), blockID, target.StorageClass, target.StorageKey, 1,
+		time.Now().UTC(), time.Now().UTC(),
+	).Exec(); err != nil {
+		t.Fatalf("seed canonical block row for %s/%s: %v", orgID, blockID, err)
+	}
+	return target
 }
 
 func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
@@ -1638,8 +1716,15 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	blockID := fmt.Sprintf("%064x", time.Now().UnixNano())
 	externalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano())
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	// The candidate captures its incarnation from the canonical row, so it must be
+	// created while that row exists — and the row then disappears underneath it. That is
+	// the real shape of this case: a work item carrying an incarnation already gone.
+	seedCanonicalBlockRowForTest(t, database, orgUUID, blockID, "hot")
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
+	if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
+		t.Fatalf("remove the canonical row for %s/%s: %v", orgID, blockID, err)
+	}
 	if err := database.WriteBlockIDMapping(orgID, db.PlainBlockRepresentationID, externalBlockID, blockID, time.Now().UTC()); err != nil {
 		t.Fatalf("failed to seed block mapping for %s/%s: %v", orgID, blockID, err)
 	}
@@ -1929,20 +2014,25 @@ func TestGC_WorkerDeletingEncryptedBlockPreservesPlainSibling(t *testing.T) {
 	}
 }
 
-// TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned pins the real
-// Cassandra/Scylla LWT behavior that motivates the stub-cleanup branch in
-// processBlock: an `UPDATE ... IF gc_state != 'deleting'` against a missing
-// canonical row may (engine-dependent) materialize a metadata-free "stub" row.
+// TestGC_ClaimBlockDelete_CannotMaterializeAStubRow is the inverted successor of
+// TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned.
 //
-// processBlock's own pre-claim BlockExists guard short-circuits before the claim
-// when the row is missing, so the post-claim stub branch is unreachable through
-// processBlock except via a narrow TOCTOU. This test therefore drives the store
-// primitives directly to (a) empirically pin what the deployed engine does on a
-// conditional UPDATE over a missing row, and (b) confirm GetBlockInfo's created_at
-// discriminator + FinalizeBlockDelete actually clean the stub end-to-end. If the
-// engine does NOT materialize a stub, the defensive branch is confirmed
-// unreachable here and the test records that rather than failing.
-func TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned(t *testing.T) {
+// The old test pinned an engine behavior the old CAS depended on: `UPDATE ... IF
+// gc_state != 'deleting'` against a MISSING canonical row can apply, because in
+// Cassandra a conditional UPDATE whose IF tests only for absence/inequality is an
+// upsert. That materialized a metadata-free "stub" row carrying a delete claim — a
+// live upload fence on a block that does not exist — and the worker grew a whole
+// defensive branch to clean it up afterwards.
+//
+// The exact-incarnation claim removes the behavior at its root rather than cleaning up
+// after it: `IF storage_class = ? AND storage_key = ?` cannot be satisfied by an absent
+// partition, whatever the engine does with nulls. So the claim reports Missing and
+// writes nothing at all.
+//
+// This test therefore asserts the ABSENCE of the stub, and it is engine-empirical in
+// the same way the old one was: it drives the real primitive against real Cassandra,
+// and it fails if a row appears.
+func TestGC_ClaimBlockDelete_CannotMaterializeAStubRow(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
@@ -1950,8 +2040,6 @@ func TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned(t *testing.T) {
 	orgUUID := uuid.New()
 	orgID := orgUUID.String()
 	blockID := fmt.Sprintf("stub-claim-%d", time.Now().UnixNano())
-	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
-	claimID := candidateAt.Format(time.RFC3339Nano)
 	t.Cleanup(func() {
 		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
 			t.Fatalf("cleanup blocks row for %s/%s: %v", orgID, blockID, err)
@@ -1964,49 +2052,28 @@ func TestGC_ClaimBlockDelete_StubRowMaterializationIsCleaned(t *testing.T) {
 		t.Fatal("expected no canonical block row before claim")
 	}
 
-	// Claim against the missing row — the exact LWT processBlock would issue if
-	// the canonical row vanished between its pre-claim check and the claim.
-	applied, err := store.ClaimBlockDelete(orgUUID, blockID, claimID)
+	// The exact LWT processBlock would issue if the canonical row vanished between its
+	// pre-claim check and the claim.
+	attempt := gcpkg.BlockDeleteAuthority{
+		Target:    gcpkg.BlockDeleteTarget{StorageClass: "hot", StorageKey: fmt.Sprintf("blocks/%s/%s", orgID, blockID)},
+		ClaimID:   uuid.NewString(),
+		ClaimedAt: time.Now().UTC(),
+	}
+	claim, err := store.ClaimBlockDelete(orgUUID, blockID, attempt)
 	if err != nil {
 		t.Fatalf("ClaimBlockDelete: %v", err)
+	}
+	if claim.Outcome != gcpkg.BlockClaimMissing {
+		t.Fatalf("ClaimBlockDelete over a missing row = %s, want missing", claim.Outcome)
 	}
 
 	exists, err := store.BlockExists(orgUUID, blockID)
 	if err != nil {
 		t.Fatalf("BlockExists(after claim): %v", err)
 	}
-	if !exists {
-		// Engine did not materialize a stub; the defensive branch is unreachable
-		// on this engine. Nothing to clean — pin the observation and finish.
-		t.Logf("engine did not materialize a stub row on conditional UPDATE over a missing row (claim applied=%v); processBlock stub branch is unreachable here", applied)
-		return
-	}
-
-	// Engine materialized a stub: assert it is exactly the metadata-free shape the
-	// worker keys off (empty storage_class, nil created_at).
-	info, err := store.GetBlockInfo(orgUUID, blockID)
-	if err != nil {
-		t.Fatalf("GetBlockInfo(stub): %v", err)
-	}
-	if strings.TrimSpace(info.StorageClass) != "" {
-		t.Fatalf("materialized stub should have empty storage_class, got %q", info.StorageClass)
-	}
-	if info.CreatedAt != nil {
-		t.Fatalf("materialized stub should have nil created_at, got %v", info.CreatedAt)
-	}
-
-	// The narrow claimed-stub primitive must remove the stub with the same claimID.
-	deleted, err := store.DeleteClaimedBlockStub(orgUUID, blockID, claimID)
-	if err != nil {
-		t.Fatalf("DeleteClaimedBlockStub(stub): %v", err)
-	}
-	if !deleted {
-		t.Fatal("DeleteClaimedBlockStub(stub) did not apply")
-	}
-	if exists, err := store.BlockExists(orgUUID, blockID); err != nil {
-		t.Fatalf("BlockExists(after finalize): %v", err)
-	} else if exists {
-		t.Fatal("stub row still present after FinalizeBlockDelete")
+	if exists {
+		info, infoErr := store.GetBlockInfo(orgUUID, blockID)
+		t.Fatalf("the exact-incarnation claim materialized a stub row over a missing partition (info=%+v err=%v); that row is a live upload fence on a block that does not exist", info, infoErr)
 	}
 }
 

@@ -175,8 +175,15 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 	store := gcpkg.NewCassandraStore(publisher)
 	orgUUID := uuid.MustParse(orgID)
 
-	// The in-row claim: the earliest fence a writer can observe.
-	_, claimErr := store.ClaimBlockDelete(orgUUID, blockID, "p3-multidc-"+uuid.NewString())
+	// The in-row claim: the earliest fence a writer can observe. It names the exact
+	// incarnation just installed, so the call is refused for the consistency reason this
+	// leg is measuring rather than for failing to match the row.
+	attempt := gcpkg.BlockDeleteAuthority{
+		Target:    gcpkg.BlockDeleteTarget{StorageClass: location.StorageClass, StorageKey: location.StorageKey},
+		ClaimID:   "p3-multidc-" + uuid.NewString(),
+		ClaimedAt: time.Now().UTC(),
+	}
+	_, claimErr := store.ClaimBlockDelete(orgUUID, blockID, attempt)
 	p3RequireUnavailableAtEachQuorum(t, "ClaimBlockDelete", claimErr)
 
 	// The orphan: the fence that gates a rowless mint, so a publication invisible to
@@ -236,15 +243,19 @@ func TestP3_WriterInAnotherDatacenterObservesTheFence(t *testing.T) {
 	// The real lifecycle, in the order GC runs it.
 	store := gcpkg.NewCassandraStore(publisher)
 	orgUUID := uuid.MustParse(orgID)
-	claimID := "p3-multidc-" + uuid.NewString()
-	applied, err := store.ClaimBlockDelete(orgUUID, blockID, claimID)
-	if err != nil || !applied {
-		t.Fatalf("claim P1 from dc-eu = %v, %v; want applied", applied, err)
+	authority := gcpkg.BlockDeleteAuthority{
+		Target:    gcpkg.BlockDeleteTarget{StorageClass: location.StorageClass, StorageKey: location.StorageKey},
+		ClaimID:   "p3-multidc-" + uuid.NewString(),
+		ClaimedAt: time.Now().UTC(),
+	}
+	outcome2Res, err := store.ClaimBlockDelete(orgUUID, blockID, authority)
+	if err != nil || outcome2Res.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("claim P1 from dc-eu = %s, %v; want acquired", outcome2Res.Outcome, err)
 	}
 	if _, err := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC()); err != nil {
 		t.Fatalf("publish orphan fence from dc-eu: %v", err)
 	}
-	if err := store.FinalizeBlockDelete(orgUUID, blockID, claimID); err != nil {
+	if err := store.FinalizeBlockDelete(orgUUID, blockID, authority); err != nil {
 		t.Fatalf("finalize P1 from dc-eu: %v", err)
 	}
 

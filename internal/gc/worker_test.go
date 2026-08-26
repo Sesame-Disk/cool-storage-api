@@ -225,6 +225,7 @@ func TestWorker_EnqueueZeroRefBlocks_RecordsProjectionDegradationMetric(t *testi
 	q := NewQueue(store)
 	w := NewWorker(store, nil, q, 100, 0, false, stats)
 	orgID := uuid.New()
+	store.AddBlock(orgID, "block-worker-degraded", "hot", 0)
 	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker"))
 
 	if err := w.enqueueZeroRefBlocks(orgID, uuid.Nil, []string{"block-worker-degraded"}, "hot"); err != nil {
@@ -257,6 +258,7 @@ func TestWorker_EnqueueZeroRefBlocks_KeysBlockUnderNil(t *testing.T) {
 	w := NewWorker(store, nil, q, 100, 0, false, &Stats{})
 	orgID := uuid.New()
 	libraryID := uuid.New() // a real, non-nil library — the cascade's owning library
+	store.AddBlock(orgID, "block-lib-scope", "hot", 0)
 
 	if err := w.enqueueZeroRefBlocks(orgID, libraryID, []string{"block-lib-scope"}, "hot"); err != nil {
 		t.Fatalf("enqueueZeroRefBlocks: %v", err)
@@ -403,12 +405,17 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddBlockMapping(orgID, "sha1-missing", "block-missing")
+	// The candidate must be created while the incarnation still exists — it captures P
+	// from the canonical row — and the row then disappears underneath it. That is the
+	// real shape of this case: a work item carrying an incarnation that is already gone.
+	store.AddBlock(orgID, "block-missing", "hot", 0)
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-missing", "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-missing", uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
+	store.RemoveBlockForTest(orgID, "block-missing")
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -433,7 +440,25 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	}
 }
 
-func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) {
+// TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork replaces
+// TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ.
+//
+// The old test asserted that GC cleaned up a metadata-free stub row it found after
+// claiming. Under exact-incarnation authority that situation cannot arise, and the
+// guarantee is now the stronger, earlier one: a row with no physical locator can never
+// become destructive work at all.
+//
+// Two gates enforce it, and both are checked here. EnsureBlockGCCandidate refuses to
+// create a candidate for a row it cannot capture a P from, so a stub never enters GC.
+// And if a work item reaches the worker anyway, the claim classifies the stub as
+// Invalid: nothing is mutated, and — critically — the candidate is NOT consumed, so no
+// fence can ever be left with nothing able to lift it.
+//
+// GC no longer deleting stub rows is a deliberate narrowing. An unclaimed metadata-free
+// row is not an upload fence (BlockDeleteFenceActive keys on gc_state='deleting' and on
+// orphan rows), and the only thing that used to produce a CLAIMED stub was the old
+// claim CAS itself, which can no longer apply against a missing or locator-free row.
+func TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -443,28 +468,36 @@ func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) 
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddStubBlockForTest(orgID, "block-stub")
 	store.AddBlockMapping(orgID, "sha1-stub", "block-stub")
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+
+	// Gate 1: a stub cannot become a candidate.
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidate(stub) = %v, want ErrBlockCandidateTargetUnavailable: a row with no locator must never become destructive work", err)
 	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("a stub row produced %d candidate rows, want 0", got)
+	}
+
+	// Gate 2: even if a work item exists anyway, the claim refuses and preserves it.
+	store.AddBlockGCCandidate(orgID, "block-stub", "hot", candidateAt)
 	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-stub", uuid.Nil, "hot", 0); err != nil {
 		t.Fatalf("EnqueueItem failed: %v", err)
 	}
 
-	n, err := w.ProcessOnce(context.Background())
-	if err != nil {
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected 1 processed skip, got %d", n)
+	blk := store.GetBlock(orgID, "block-stub")
+	if blk == nil {
+		t.Fatal("the stub row was deleted on an identity that could not authorize anything")
 	}
-	if store.GetBlock(orgID, "block-stub") != nil {
-		t.Fatal("stub block row should be removed after cleanup")
+	if blk.GCState != "" {
+		t.Fatalf("a locator-free row was fenced (gc_state=%q); nothing can lift a fence on a row GC cannot name", blk.GCState)
 	}
-	if got := len(store.AllBlockGCCandidates()); got != 0 {
-		t.Fatalf("expected block candidate cleanup, got %d rows", got)
+	if got := len(store.AllBlockGCCandidates()); got != 1 {
+		t.Fatalf("candidate rows = %d, want 1: refusing to act must never consume the work item", got)
 	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-stub") {
-		t.Fatal("expected stub cleanup to preserve the logical forward mapping")
+		t.Fatal("expected the logical forward mapping to be preserved")
 	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)
@@ -1139,15 +1172,23 @@ func TestWorker_ProcessBlock_ReReferencedClaimedStubIsDeleted(t *testing.T) {
 	store.AddBlockGCCandidate(orgID, "blk-stub-rereferenced", "hot", candidateAt)
 	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-rereferenced", libID, "hot", 0)
 
-	n, err := w.ProcessOnce(context.Background())
-	if err != nil {
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v, want nil", err)
 	}
-	if n != 1 || store.GetBlock(orgID, "blk-stub-rereferenced") != nil {
-		t.Fatalf("processed/block = %d/%v, want 1/nil", n, store.GetBlock(orgID, "blk-stub-rereferenced"))
+	// The stub survives, and that is the guarantee now. A row with no physical locator
+	// cannot be named by the claim CAS, so GC has no authority to remove it and does not
+	// pretend to: it refuses without fencing and without consuming the work item. The
+	// old expectation — GC deleting the stub after claiming it — depended on the claim
+	// being able to apply against a locator-free row, which is exactly what P4a removed.
+	blk := store.GetBlock(orgID, "blk-stub-rereferenced")
+	if blk == nil {
+		t.Fatal("GC deleted a row it had no exact-incarnation authority over")
 	}
-	if len(store.AllBlockGCCandidates()) != 0 {
-		t.Fatal("candidate should be cleared after claimed stub deletion")
+	if blk.GCState != "" {
+		t.Fatalf("a locator-free row was fenced (gc_state=%q)", blk.GCState)
+	}
+	if len(store.AllBlockGCCandidates()) != 1 {
+		t.Fatal("refusing to act on an unusable identity must not consume the candidate")
 	}
 }
 

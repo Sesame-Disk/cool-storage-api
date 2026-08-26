@@ -553,6 +553,7 @@ services:
       # evidence tests skip while the run still reports green.
       - SESAMEFS_REQUIRE_P2_EVIDENCE=1
       - SESAMEFS_REQUIRE_P3_EVIDENCE=1
+      - SESAMEFS_REQUIRE_P4A_EVIDENCE=1
       # The supported frontend nginx, so the D6 slow-client drill runs through
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.
@@ -589,6 +590,7 @@ services:
       - SESAMEFS_FAIL_FAST=1
       - SESAMEFS_REQUIRE_P2_EVIDENCE=1
       - SESAMEFS_REQUIRE_P3_EVIDENCE=1
+      - SESAMEFS_REQUIRE_P4A_EVIDENCE=1
     depends_on:
       - sesamefs
       - sesamefs-node-2

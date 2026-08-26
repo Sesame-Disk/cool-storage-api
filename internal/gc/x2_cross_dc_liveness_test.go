@@ -156,10 +156,7 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// An earlier attempt claimed the row and its process died before releasing.
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
-	if err != nil || !applied {
-		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	// A writer republishes the content afterwards.
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
@@ -211,10 +208,7 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 
 	// Another worker is walking this same candidate right now and holds the claim.
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
-	if err != nil || !applied {
-		t.Fatalf("seed concurrent claim: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -307,10 +301,7 @@ func TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget(t *testing.T) {
 	// via the store rather than by moving the worker's clock forward — see
 	// BackdateBlockClaimForTest for why a future clock would make the multi-pass
 	// assertion below vacuous.
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
-	if err != nil || !applied {
-		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
 
 	// Permanent and item-specific — the shape of an unknown column or a serialization
@@ -434,22 +425,46 @@ func TestX2_ReReferencedBlockSurvivesAFailedClaimRelease(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Fatalf("deleted a block the global verify reported as referenced: %+v", deletes)
 	}
-	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed")) - before; got != 8 {
-		t.Errorf("gc_errors_total{type=\"block_claim_release_failed\"} rose by %v over 8 refused passes, want 8", got)
+	// The release is attempted ONCE, not on all eight passes, and that is a consequence
+	// of per-attempt claim identity rather than a weakening. Pass one claims, fails to
+	// release, and leaves its own fence standing. Passes two onward are DIFFERENT
+	// attempts with different claim ids: they find the row owned by someone else and too
+	// young to presume dead, so they postpone at the claim without ever reaching a
+	// release. Under the old shared claim id every pass "owned" the same claim and could
+	// retry the release — which is also precisely what let one worker drop another's
+	// fence mid-delete.
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed")) - before; got != 1 {
+		t.Errorf("gc_errors_total{type=\"block_claim_release_failed\"} rose by %v, want 1: only the owning attempt may try to release", got)
 	}
 
-	// Once the store recovers, the same item lifts the fence and settles.
+	// RECOVERY IS BY STALE TAKEOVER, and it must still be automatic. Clearing the
+	// injected error is not enough on its own: the abandoned claim belongs to an attempt
+	// that is gone, so nothing can release it by ownership. What lifts it is age — once
+	// the claim is older than blockDeleteClaimStaleAfter, the next pass takes it over by
+	// CAS against that exact previous authority and the fence comes off.
+	//
+	// This is the property that actually matters, and it is stronger than what the old
+	// shape provided: it works even when the attempt that left the fence never returns.
 	store.SetReleaseBlockClaimErrForTest(nil)
-	if _, err := w.ProcessOnce(context.Background()); err != nil {
-		t.Fatalf("recovery ProcessOnce returned a fatal error: %v", err)
+	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
+
+	// Two passes: one to take the stale claim over and lift the fence, one to settle the
+	// candidate through the pre-check now that no claim stands in the way.
+	for i := 0; i < 2; i++ {
+		if _, err := w.ProcessOnce(context.Background()); err != nil {
+			t.Fatalf("recovery ProcessOnce %d returned a fatal error: %v", i, err)
+		}
 	}
 	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
 		t.Fatal("canonical block row disappeared for a referenced block")
 	} else if blk.GCState != "" {
-		t.Errorf("fence still up (gc_state=%q) after the release recovered", blk.GCState)
+		t.Errorf("fence still up (gc_state=%q) after the abandoned claim aged out; a referenced block would stay fenced forever", blk.GCState)
 	}
 	if got := store.AllBlockGCCandidates(); len(got) != 0 {
 		t.Errorf("candidate rows = %d after recovery, want the item settled", len(got))
+	}
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("recovery deleted a block the global verify reported as referenced: %+v", deletes)
 	}
 }
 
@@ -502,22 +517,29 @@ func TestX2_FailedVerifyPlusFailedReleaseDoesNotBurnTheBudget(t *testing.T) {
 		t.Fatalf("deleted a block whose liveness could not be established: %+v", deletes)
 	}
 
-	// Release recovers; the ReadFailure resumes its own (correct) march to the DLQ.
+	// Release recovers, and the abandoned claim ages out so a later attempt can take it
+	// over. Both are needed: per-attempt identity means the attempt that left the fence
+	// is the only one that could have released it by ownership, and it is gone — so age
+	// is what unblocks the row. Once the fence is off, the ReadFailure resumes its own
+	// (correct) march to the DLQ, which is the property this test exists to protect.
 	store.SetReleaseBlockClaimErrForTest(nil)
-	for i := 0; i < 8; i++ {
+	store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
+	for i := 0; i < 10; i++ {
 		if _, err := w.ProcessOnce(context.Background()); err != nil {
 			t.Fatalf("post-recovery ProcessOnce %d returned a fatal error: %v", i, err)
 		}
+		// Each pass that ends by claiming and failing the verify leaves its OWN fence
+		// behind, which the next attempt must not release by ownership. Ageing it here
+		// models the passage of time between passes rather than compressing it away.
+		store.BackdateBlockClaimForTest(orgID, "block-1", time.Now().Add(-2*blockDeleteClaimStaleAfter))
 	}
 	if failed, err := store.GetTotalFailedItems(); err != nil {
 		t.Fatalf("GetTotalFailedItems: %v", err)
 	} else if failed == 0 {
 		t.Error("a persistent non-availability verify failure never reached the DLQ once the fence was confirmed off; it must still be visible to a human")
 	}
-	if blk := store.GetBlock(orgID, "block-1"); blk == nil {
-		t.Fatal("canonical block row disappeared")
-	} else if blk.GCState != "" {
-		t.Errorf("fence still up (gc_state=%q) after the release recovered", blk.GCState)
+	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("deleted a block whose liveness was never established: %+v", deletes)
 	}
 }
 
@@ -545,10 +567,7 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	// "a failed release of an actual fence preserves the candidate". Those differ
 	// exactly where it matters: the second is the case where consuming the candidate
 	// strands the block.
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(queuedAt))
-	if err != nil || !applied {
-		t.Fatalf("seed abandoned claim: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
 	// Age the claim past the staleness threshold so the release is one that WOULD
 	// succeed. Done on the row rather than by moving w.clock() forward: a future
 	// worker clock requeues postponed items past DequeueBatch's time.Now() cutoff, so

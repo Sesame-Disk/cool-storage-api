@@ -49,17 +49,11 @@ func TestX2_StaleClaimFromAnotherCandidateIsReleased(t *testing.T) {
 
 	// The abandoned claim belongs to an OLDER candidate whose queue item is gone —
 	// the shape an owner-only release can never clean up.
-	abandonedCandidateAt := time.Now().Add(-6 * time.Hour)
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(abandonedCandidateAt))
-	if err != nil || !applied {
-		t.Fatalf("seed abandoned claim from an earlier candidate: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-abandonedCandidateAt", time.Now())
 
-	// A new candidate for the same block, carrying its own distinct claim id.
+	// A new candidate for the same block. Its attempt gets its own fresh UUID, which is
+	// now true by construction rather than by candidate timestamps happening to differ.
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	if got, want := blockDeleteClaimID(queuedAt), blockDeleteClaimID(abandonedCandidateAt); got == want {
-		t.Fatalf("test is not exercising the cross-candidate case: both candidates derive claim id %q", got)
-	}
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
@@ -101,11 +95,7 @@ func TestX2_FreshClaimFromAnotherCandidateIsLeftAlone(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 
-	otherCandidateAt := time.Now().Add(-6 * time.Hour)
-	applied, err := store.ClaimBlockDelete(orgID, "block-1", blockDeleteClaimID(otherCandidateAt))
-	if err != nil || !applied {
-		t.Fatalf("seed concurrent claim from another candidate: applied=%v err=%v", applied, err)
-	}
+	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-otherCandidateAt", time.Now())
 
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
@@ -157,6 +147,7 @@ func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
 	store.SetClaimBlockDeleteErrForTest(gocql.ErrTimeoutNoResponse)
+	store.SetClaimBlockDeleteSettleErrForTest(gocql.ErrTimeoutNoResponse)
 
 	// More passes than the five-retry budget allows.
 	for i := 0; i < 8; i++ {
@@ -180,6 +171,7 @@ func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 	// Surviving is only half of it: once the cluster is back the item must still be
 	// collectable, or "no loss" would just mean the work leaked in a tidier way.
 	store.SetClaimBlockDeleteErrForTest(nil)
+	store.SetClaimBlockDeleteSettleErrForTest(nil)
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce after recovery returned a fatal error: %v", err)
 	}
@@ -195,7 +187,24 @@ func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 // a malformed statement or an unknown column never resolves on its own, and an item
 // that quietly retries for eternity is an item nobody is ever told about. Those must
 // still spend their retries and land in the DLQ where a human sees them.
-func TestX2_NonAvailabilityErrorStillReachesTheDLQ(t *testing.T) {
+// TestX2_UnsettleableClaimStaysVisibleWithoutReachingTheDLQ replaces
+// TestX2_NonAvailabilityErrorStillReachesTheDLQ for the claim path.
+//
+// The old test required a permanent, item-specific claim error to reach the DLQ, on the
+// reasoning that an error which only ever postpones is invisible. The visibility concern
+// is right; the destination was wrong, and P4a makes that concrete.
+//
+// A schema error like this one breaks the LWT AND the serial settling read that would
+// have resolved it, so the claim's outcome is genuinely unknown — the fence may be
+// standing. The DLQ is where an item goes to be seen once and never processed again, and
+// ItemBlock never returns from it, so parking the item there would make that fence
+// permanent. Postponing keeps the only work item that can still lift it, and the moment
+// the schema is fixed the next pass takes the stale claim over and the block unwedges
+// itself.
+//
+// Visibility is therefore delivered by the metric and the log, not by the DLQ, and this
+// test asserts that rather than assuming it.
+func TestX2_UnsettleableClaimStaysVisibleWithoutReachingTheDLQ(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -209,7 +218,13 @@ func TestX2_NonAvailabilityErrorStillReachesTheDLQ(t *testing.T) {
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
 	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
 
-	store.SetClaimBlockDeleteErrForTest(errors.New("undefined column name gc_claim_id"))
+	// The same schema fault breaks the conditional write and the settling read alike,
+	// which is exactly why the outcome cannot be established.
+	schemaErr := errors.New("undefined column name gc_claim_id")
+	store.SetClaimBlockDeleteErrForTest(schemaErr)
+	store.SetClaimBlockDeleteSettleErrForTest(schemaErr)
+
+	before := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_unsettled"))
 
 	for i := 0; i < 8; i++ {
 		if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -221,8 +236,25 @@ func TestX2_NonAvailabilityErrorStillReachesTheDLQ(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTotalFailedItems: %v", err)
 	}
-	if failed == 0 {
-		t.Fatal("a permanent, item-specific error never reached the DLQ; it would retry silently forever with nobody notified")
+	if failed != 0 {
+		t.Fatalf("%d item(s) reached the DLQ while the claim's outcome was unknown; ItemBlock never returns from there, so any fence the LWT committed would stand forever", failed)
+	}
+	if got := testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues("block_claim_unsettled")) - before; got == 0 {
+		t.Error("an unsettleable claim raised no alertable signal; postponing is only acceptable because it is loud")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 1 {
+		t.Fatalf("candidate rows = %d, want 1: an unsettled claim must keep the item that can still lift its fence", got)
+	}
+
+	// Once the fault is repaired the block unwedges itself, with no human touching the
+	// queue. That is the property the DLQ would have destroyed.
+	store.SetClaimBlockDeleteErrForTest(nil)
+	store.SetClaimBlockDeleteSettleErrForTest(nil)
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("recovery ProcessOnce: %v", err)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("candidate rows = %d after the fault cleared, want the item settled", got)
 	}
 }
 

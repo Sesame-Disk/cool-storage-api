@@ -13,6 +13,7 @@ func TestStore_EnsureBlockGCCandidate_RepairsMissingProjection(t *testing.T) {
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 
+	store.AddBlock(orgID, "block-repair", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "block-repair", "hot", candidateAt)
 	store.DeleteBlockGCCandidateProjectionForTest(orgID, "block-repair", candidateAt)
 
@@ -34,8 +35,8 @@ func TestStore_EnsureBlockGCCandidate_RepairsMissingProjection(t *testing.T) {
 	if !candidates[0].CandidateAt.Equal(candidateAt) {
 		t.Fatalf("projection candidate_at = %v, want %v", candidates[0].CandidateAt, candidateAt)
 	}
-	if candidates[0].StorageClass != "hot" {
-		t.Fatalf("projection storage_class = %q, want %q", candidates[0].StorageClass, "hot")
+	if candidates[0].StorageClass() != "hot" {
+		t.Fatalf("projection storage_class = %q, want %q", candidates[0].StorageClass(), "hot")
 	}
 }
 
@@ -45,6 +46,7 @@ func TestStore_EnsureBlockGCCandidate_PrefersEarlierCandidateAt(t *testing.T) {
 	later := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Millisecond)
 	earlier := later.Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 
+	store.AddBlock(orgID, "block-earlier", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "block-earlier", "hot", later)
 
 	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, "block-earlier", "cold", earlier)
@@ -65,8 +67,8 @@ func TestStore_EnsureBlockGCCandidate_PrefersEarlierCandidateAt(t *testing.T) {
 	if !olderDayCandidates[0].CandidateAt.Equal(earlier) {
 		t.Fatalf("earlier projection candidate_at = %v, want %v", olderDayCandidates[0].CandidateAt, earlier)
 	}
-	if olderDayCandidates[0].StorageClass != "hot" {
-		t.Fatalf("earlier projection storage_class = %q, want %q", olderDayCandidates[0].StorageClass, "hot")
+	if olderDayCandidates[0].StorageClass() != "hot" {
+		t.Fatalf("earlier projection storage_class = %q, want %q", olderDayCandidates[0].StorageClass(), "hot")
 	}
 
 	laterDayCandidates, err := store.ListBlockGCCandidatesByDay(later, db.GCDiscoveryBucket(orgID.String(), "block-earlier"))
