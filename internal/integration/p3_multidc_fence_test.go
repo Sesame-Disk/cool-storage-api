@@ -124,21 +124,31 @@ func p3InstallCanonical(t *testing.T, database *dbpkg.DB, orgID, blockID string,
 // A timeout, a transport failure or any other error would satisfy a bare nil-check
 // while the fence might well be published. Since this leg is what promotes the
 // cross-DC consistency row to GREEN, it has to name the outcome it requires.
+// It reports rather than aborts, deliberately. Both publications carry the same
+// contract, and a mutation run downgrades both at once -- so if the first one
+// aborted the test, a mutation would only ever demonstrate that ClaimBlockDelete is
+// sensitive and StartBlockDeleteOrphan would never be reached. Recording the
+// failure and continuing makes one mutation run exercise both, and the trailing
+// survivor check still runs and reports the fence the downgrade left behind.
 func p3RequireUnavailableAtEachQuorum(t *testing.T, what string, err error) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("P3 REGRESSION: %s succeeded with dc-na down; a fence a dc-na writer cannot see is a fence that does not fence", what)
+		t.Errorf("P3 REGRESSION: %s succeeded with dc-na down; a fence a dc-na writer cannot see is a fence that does not fence", what)
+		return
 	}
 	var unavailable *gocql.RequestErrUnavailable
 	if !errors.As(err, &unavailable) {
 		var timeout *gocql.RequestErrWriteTimeout
 		if errors.As(err, &timeout) {
-			t.Fatalf("P3 REGRESSION: %s returned a write timeout (consistency=%v write_type=%q), which does NOT prove the fence was left unpublished; an LWT that times out may still have been accepted: %v", what, timeout.Consistency, timeout.WriteType, err)
+			t.Errorf("P3 REGRESSION: %s returned a write timeout (consistency=%v write_type=%q), which does NOT prove the fence was left unpublished; an LWT that times out may still have been accepted: %v", what, timeout.Consistency, timeout.WriteType, err)
+			return
 		}
-		t.Fatalf("P3 REGRESSION: %s failed with an error that does not prove the mutation was refused; want Unavailable, got %T: %v", what, err, err)
+		t.Errorf("P3 REGRESSION: %s failed with an error that does not prove the mutation was refused; want Unavailable, got %T: %v", what, err, err)
+		return
 	}
 	if unavailable.Consistency != gocql.EachQuorum {
-		t.Fatalf("P3 REGRESSION: %s was refused at consistency %v, not EACH_QUORUM; the publication is not carrying the level the cross-DC argument depends on (required=%d alive=%d)", what, unavailable.Consistency, unavailable.Required, unavailable.Alive)
+		t.Errorf("P3 REGRESSION: %s was refused at consistency %v, not EACH_QUORUM; the publication is not carrying the level the cross-DC argument depends on (required=%d alive=%d)", what, unavailable.Consistency, unavailable.Required, unavailable.Alive)
+		return
 	}
 	t.Logf("%s refused as required: Unavailable at EACH_QUORUM (required=%d alive=%d)", what, unavailable.Required, unavailable.Alive)
 }
@@ -184,7 +194,7 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 			t.Fatalf("fence read from %s after the refused publications: %v", dc, err)
 		}
 		if fenced {
-			t.Fatalf("P3 REGRESSION: the publications were refused but %s reports an active fence; a refused EACH_QUORUM publication must leave nothing behind", dc)
+			t.Fatalf("P3 REGRESSION: %s holds a fence for a block whose publication could not obtain EACH_QUORUM; a publication that cannot reach every datacenter must leave nothing behind", dc)
 		}
 	}
 
@@ -257,7 +267,27 @@ func TestP3_WriterInAnotherDatacenterObservesTheFence(t *testing.T) {
 		t.Fatalf("P3 REGRESSION: dc-na probe = %v, want BlockedByGC while dc-eu's orphan fence is live", probe.Decision)
 	}
 
-	t.Logf("P3_MULTIDC_HANDOFF_EVIDENCE org=%s block=%s dc-eu ran claim->orphan->finalize; dc-na sees rowless + orphan and refuses to mint", orgID, blockID)
+	// The pre-PUT boundary, on the same state. This is the writer that captured P1
+	// before the lifecycle started and arrives late at its revalidation, and the
+	// state it arrives to is the interesting one: the canonical row is GONE. The
+	// authority read therefore has to separate two rowless observations that look
+	// identical until the orphan is consulted --
+	//
+	//	row absent, no orphan  -> Changed  (start over; a new life may be minted)
+	//	row absent, orphan(P1) -> Blocked  (the previous life is still retiring)
+	//
+	// which is exactly the blocks-first/orphan-last ordering, exercised across
+	// datacenters. Asserting the cause and not only the outcome keeps a future
+	// refactor from satisfying this by returning Blocked for the wrong reason.
+	outcome, authErr := writer.ValidateBlockRepairAuthority(orgID, blockID, location)
+	if outcome != dbpkg.BlockRepairAuthorityBlocked {
+		t.Fatalf("P3 REGRESSION: dc-na pre-PUT repair authority = %v, %v; want Blocked while dc-eu's orphan(P1) is live and the canonical row is gone", outcome, authErr)
+	}
+	if !errors.Is(authErr, dbpkg.ErrBlockRepairBlocked) {
+		t.Fatalf("P3 REGRESSION: dc-na repair authority was Blocked but the cause is %v; want ErrBlockRepairBlocked, so the refusal is the fence and not some other rowless condition", authErr)
+	}
+
+	t.Logf("P3_MULTIDC_HANDOFF_EVIDENCE org=%s block=%s dc-eu ran claim->orphan->finalize; dc-na sees rowless + orphan, refuses to mint, and refuses the pre-PUT repair with ErrBlockRepairBlocked", orgID, blockID)
 }
 
 // p3RequireDCsDown refuses to run the fail-closed leg against a healthy cluster.
