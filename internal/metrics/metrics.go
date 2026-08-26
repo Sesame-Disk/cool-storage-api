@@ -375,7 +375,8 @@ var (
 	// GCBlockDeleteClaimTotal counts block-delete claim attempts by classified outcome.
 	//
 	// The label set is a closed enum — acquired, target_changed, fresh_owner,
-	// stale_owner, missing, invalid, ambiguous, no_candidate, plus release_* — and
+	// stale_owner, missing, invalid, ambiguous, no_candidate,
+	// settle_refused_foreign_owner, plus release_* — and
 	// deliberately carries NO org id, block id, storage key or claim UUID. Those are
 	// unbounded, and a per-tenant or per-object label here would turn one busy org into
 	// a cardinality incident on every scrape.

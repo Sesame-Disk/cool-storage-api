@@ -2337,9 +2337,24 @@ classifies such a row as `invalid`: it mutates nothing, fences nothing, and — 
 — does not consume the candidate. `EnsureBlockGCCandidate` refuses to create a candidate
 for such a row in the first place.
 
-The consequence is that the stub-cleanup branches in `processBlock`
-(`DeleteClaimedBlockStub`) are now unreachable through a candidate, and a metadata-free
-stub row left by some other path is no longer swept by GC.
+The consequence is that the stub-cleanup branches in `processBlock` are unreachable
+through a candidate, and a metadata-free stub row left by some other path is no longer
+swept by GC.
+
+**Those branches have since been REMOVED rather than retained (third P4a pass), because
+"unreachable by truth" turned out not to mean "unreachable".** `GetBlockInfo` is an
+ordinary read while the claim commits at `EACH_QUORUM` in the serial domain, so a
+post-claim read CAN show an empty row — a replica holding only the `gc_*` columns the
+claim itself just wrote. The branches then fired on a stale read, `DeleteClaimedBlockStub`
+correctly refused in the serial domain, and the refusal surfaced as a plain error: retry
+spent, fence still up, and after enough cycles a DLQ entry with `gc_state='deleting'`
+standing. A read that contradicts what the claim already proved is now treated as an
+unreliable observation — hand the fence back, postpone, touch nothing.
+
+`DeleteClaimedBlockStub` itself is retained on `GCStore` and in both stores. It is
+currently unreferenced by the worker, and that is the seam this entry is about: whoever
+takes the follow-up below needs the primitive, and deleting it would hide the gap rather
+than close it.
 
 ### Why This Is Acceptable, And Why It Is Not Silently Fine
 It is acceptable because an *unclaimed* stub is not an upload fence:
@@ -2365,8 +2380,9 @@ currently sweeps one abandoned there.
    or a separate non-destructive sweeper does, keyed on rows with no locator and no claim.
 2. Do NOT solve it by loosening the claim CAS. A destructive primitive that can act on a
    row it cannot name is the defect P4a removed.
-3. Until then, `DeleteClaimedBlockStub` and the `processBlock` branches that call it are
-   retained rather than deleted, so the seam is visible to whoever picks this up.
+3. Until then, `DeleteClaimedBlockStub` is retained (unreferenced by the worker) so the
+   seam is visible to whoever picks this up. Do NOT reinstate the `processBlock` branches:
+   they were driven by a read the claim had already contradicted.
 
 ### Gates
 `TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork` and

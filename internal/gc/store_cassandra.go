@@ -2241,7 +2241,15 @@ func (s *CassandraStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string,
 		// rather than settling — its own candidate is what will lift it.
 		return BlockClaimTooFresh, nil
 	}
-	if row.GCClaimedAt.IsZero() || row.GCClaimedAt.After(staleBefore) {
+	if strings.TrimSpace(row.GCClaimID) == "" || row.GCClaimedAt.IsZero() {
+		// Same shape as the unusable-target case above: a fence whose owner cannot be
+		// named cannot be handed back by an exact CAS, and must not be handed back by a
+		// looser one. Without this the authority below would be incomplete and
+		// ReleaseBlockClaim would reject it as a CALLER error, which reads like a bug in
+		// this function rather than an anomaly in the row.
+		return BlockClaimTooFresh, nil
+	}
+	if row.GCClaimedAt.After(staleBefore) {
 		return BlockClaimTooFresh, nil
 	}
 
@@ -2571,7 +2579,19 @@ func (row blockDeleteClaimRow) classify(attempt BlockDeleteAuthority, staleBefor
 		// Our own claim, already committed by a Paxos round we lost the answer to.
 		return BlockClaimAcquired
 	}
-	if row.GCClaimedAt.IsZero() || row.GCClaimedAt.After(staleBefore) {
+	if strings.TrimSpace(row.GCClaimID) == "" || row.GCClaimedAt.IsZero() {
+		// A fence with no nameable owner. Every recovery route from here is a CAS against
+		// the exact previous authority, and there is no exact authority to name — so a
+		// takeover would be refused forever while the caller kept treating it as a stale
+		// owner it could eventually lift. Classify it as unusable identity instead: that
+		// postpones, preserves the candidate, and says out loud that it will not self-heal.
+		//
+		// This subsumes the old `GCClaimedAt.IsZero()` arm of the freshness test below,
+		// which reported an unnameable owner as merely "too fresh" and so promised a
+		// takeover that could never happen.
+		return BlockClaimInvalid
+	}
+	if row.GCClaimedAt.After(staleBefore) {
 		return BlockClaimFreshOwner
 	}
 	return BlockClaimStaleOwner

@@ -136,6 +136,62 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 	return GCFailureCodeBlockClaimNotYetStale
 }
 
+// blockClaimForeignOwnerError says this attempt reached a settlement step and found its
+// own claim already gone: taken over while it worked, or finalized by whoever took it.
+//
+// IT EXISTS TO STOP A LATE LOSER FROM CONSUMING THE CANDIDATE. The walk has branches
+// that legitimately release the claim and then settle the candidate — "re-referenced
+// after claim" is the important one — and settling is only sound when the release
+// actually released THIS attempt's fence. If the release came back not-owner, another
+// lifecycle holds the fence right now, and the candidate is the only thing that could
+// ever take that fence over if that lifecycle dies. Dropping it there produces exactly
+// the state BlockClaimFreshOwner refuses to produce at the claim: a standing fence with
+// no work item able to lift it.
+//
+// Postponed, never retried: nothing is wrong with the item, it simply lost a race it was
+// never guaranteed to win.
+type blockClaimForeignOwnerError struct {
+	ItemID string
+}
+
+func (e blockClaimForeignOwnerError) Error() string {
+	return fmt.Sprintf("block %s: this attempt's delete claim was already gone at settlement time; another lifecycle owns the fence", e.ItemID)
+}
+
+func (e blockClaimForeignOwnerError) FailureCode() string {
+	return GCFailureCodeBlockClaimForeignOwner
+}
+
+// blockCandidateWithinGraceError says the candidate names an incarnation that has not
+// yet served its own grace period. See GCFailureCodeBlockCandidateWithinGrace.
+type blockCandidateWithinGraceError struct {
+	ItemID string
+}
+
+func (e blockCandidateWithinGraceError) Error() string {
+	return fmt.Sprintf("block %s: the GC candidate is younger than the grace period", e.ItemID)
+}
+
+func (e blockCandidateWithinGraceError) FailureCode() string {
+	return GCFailureCodeBlockCandidateWithinGrace
+}
+
+// blockCanonicalReadUnreliableError says a post-claim canonical read contradicted what
+// the claim CAS proved in the serial domain. See
+// GCFailureCodeBlockCanonicalReadUnreliable.
+type blockCanonicalReadUnreliableError struct {
+	ItemID string
+	Reason string
+}
+
+func (e blockCanonicalReadUnreliableError) Error() string {
+	return fmt.Sprintf("block %s: the post-claim canonical read contradicts the claim's own proof (%s)", e.ItemID, e.Reason)
+}
+
+func (e blockCanonicalReadUnreliableError) FailureCode() string {
+	return GCFailureCodeBlockCanonicalReadUnreliable
+}
+
 // blockClaimReleaseUnconfirmedError says a stale delete claim was found on a live
 // block and could not be handed back. The candidate must survive: it is the only work
 // item that will ever lift that fence.
@@ -289,7 +345,20 @@ func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error
 // consumed, and once a later pass confirms the fence is off, the original error is
 // reached again and spends its retries normally. Deciding queue policy from the
 // original error while the fence is still up is what strands the block.
-func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) error {
+//
+// THE OUTCOME IS RETURNED, NOT SWALLOWED, and that distinction is load-bearing.
+//
+// Not-owner is still not an ERROR — see below — but it is not "released" either, and
+// collapsing the two into a bare nil is what let a late loser consume the candidate out
+// from under the attempt that had taken its claim over. A caller that only needs the
+// fence gone can ignore the outcome; a caller that goes on to SETTLE THE CANDIDATE must
+// require BlockReleaseReleased, because the candidate is the recovery mechanism for
+// whoever owns the fence now.
+//
+// On error the outcome is reported as BlockReleaseNotOwner rather than the zero value:
+// a caller that mistakenly ignores err then still takes the conservative branch and
+// preserves the candidate.
+func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockReleaseOutcome, error) {
 	outcome, relErr := w.store.ReleaseBlockClaim(orgID, blockID, authority)
 	if relErr == nil {
 		// NOT-OWNER IS NOT A FAILURE, and treating it as one would be actively harmful.
@@ -302,7 +371,7 @@ func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority Bl
 		if outcome == BlockReleaseNotOwner {
 			log.Printf("[GC Worker] Block %s: delete claim %s was already gone at release time (taken over, released or finalized elsewhere); nothing to hand back", blockID, authority.ClaimID)
 		}
-		return nil
+		return outcome, nil
 	}
 	if isClusterUnavailableError(relErr) {
 		metrics.GCErrorsTotal.WithLabelValues("cluster_unavailable").Inc()
@@ -312,7 +381,7 @@ func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority Bl
 		metrics.GCErrorsTotal.WithLabelValues("block_claim_release_failed").Inc()
 		log.Printf("[GC Worker] Block %s: releasing the delete claim failed for a non-availability reason; postponing rather than spending the retry that would strand this block behind the fence — this will NOT self-heal and needs a human: %v", blockID, relErr)
 	}
-	return blockClaimReleaseUnconfirmedError{ItemID: blockID, Err: relErr}
+	return BlockReleaseNotOwner, blockClaimReleaseUnconfirmedError{ItemID: blockID, Err: relErr}
 }
 
 // recordDestructiveBlocked marks that a destructive path refused a delete because the
@@ -393,7 +462,15 @@ func shouldPostponeWithoutRetry(err error) bool {
 	case GCFailureCodeLibraryHardDeleteInProgress,
 		GCFailureCodeDestructiveFailClosed,
 		GCFailureCodeBlockClaimNotYetStale,
-		GCFailureCodeBlockClaimReleaseUnconfirmed:
+		GCFailureCodeBlockClaimReleaseUnconfirmed,
+		// GCFailureCodeBlockAuthorityInvalid was documented as postponing from the day it
+		// was introduced and was never listed here, so it retried into the DLQ instead —
+		// the one destination its own contract rules out, because ItemBlock does not come
+		// back from there and the candidate it insists on preserving would be unreachable.
+		GCFailureCodeBlockAuthorityInvalid,
+		GCFailureCodeBlockClaimForeignOwner,
+		GCFailureCodeBlockCandidateWithinGrace,
+		GCFailureCodeBlockCanonicalReadUnreliable:
 		return true
 	default:
 		return false
@@ -586,12 +663,20 @@ var errBlockClaimUnsettled = errors.New("block delete claim outcome could not be
 
 // WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT, AND WHY THE PRE-CHECK ONE IS AGE-BASED
 //
-// processBlock releases a claim in five places, and they deliberately do not use the
+// processBlock releases a claim in several places, and they deliberately do not use the
 // same rule. The pre-check path (before this attempt has claimed anything) releases
 // only a claim old enough to be provably abandoned, because there it would be handing
-// back a claim it never took. The four post-claim paths — failed global verify,
-// re-referenced after claim, malformed canonical metadata, and a topology gate that
-// rejects at the commit point — release THIS attempt's own claim, by exact authority.
+// back a claim it never took. Every post-claim path — failed global verify,
+// re-referenced after claim, an unreliable canonical read-back, a locator that fails
+// validation, and a topology gate that rejects at the commit point — releases THIS
+// attempt's own claim, by exact authority.
+//
+// AND ONE OF THEM MUST ALSO LOOK AT THE ANSWER. Releasing is idempotent-ish for a path
+// that only wants the fence gone, but "re-referenced after claim" goes on to SETTLE THE
+// CANDIDATE, and that is only sound if the release actually released this attempt's
+// fence. A not-owner answer there means another lifecycle holds the fence right now, and
+// the candidate is its only recovery route — so that path requires BlockReleaseReleased
+// and otherwise postpones. See blockClaimForeignOwnerError.
 //
 // That used to be an unconditional release, and it had to be: claimID derived from the
 // candidate timestamp, so it was shared by every attempt on one candidate, and worker A
@@ -1068,7 +1153,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// timestamps agree.
 	if w.gracePeriod > 0 && candidate.CandidateAt.After(w.clock().Add(-w.gracePeriod)) {
 		log.Printf("[GC Worker] Block %s: the GC candidate is younger than the grace period; postponing so the incarnation it names serves its own grace", item.ItemID)
-		return blockClaimNotYetStaleError{ItemID: item.ItemID}
+		return blockCandidateWithinGraceError{ItemID: item.ItemID}
 	}
 
 	// Topology gate: from here the walk can reach a physical delete. The
@@ -1206,9 +1291,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// systematic rather than rare, and every writer of this content would see
 		// BlockDeleteFenceActive until some later attempt happened to clear it.
 		// Failing closed must not mean fencing the block indefinitely.
-		// Unconditional on purpose — see "WHY THE POST-CLAIM RELEASES ARE
-		// UNCONDITIONAL" above; this is the site whose systematic failure mode
-		// decides that trade.
+		// Owner-exact — see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above; this is
+		// the site whose systematic failure mode decides why every post-claim path
+		// releases rather than holding the fence through an outage.
 		//
 		// A failed release RETURNS here rather than warning and falling through to the
 		// classifier below. It used to only log, which meant the queue policy was
@@ -1217,7 +1302,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// gc_state='deleting' left standing. See releaseBlockClaim — the release error
 		// dominates until the fence is confirmed gone, and the verify's own error is
 		// reached again on a later pass.
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			log.Printf("[GC Worker] Block %s: global liveness verify failed (%v) AND the claim could not be handed back; postponing on the release, the verify error will be re-reached once the fence is off", item.ItemID, err)
 			return relErr
 		}
@@ -1257,27 +1342,26 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		if infoErr != nil {
 			return w.failClosedIfUnavailable("failed to load re-referenced block info", item.ItemID, infoErr)
 		}
-		if blockInfo.CreatedAt == nil {
-			if blockInfo.StorageClass != "" {
-				return fmt.Errorf("stub block %s has storage class without creation timestamp", item.ItemID)
-			}
-			// The owned claim fences writers. Remove only the metadata-free stub;
-			// logical SHA-1 mappings are independent of this physical row.
-			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, attempt.ClaimID)
-			if deleteErr != nil {
-				return w.failClosedIfUnavailable("failed to delete re-referenced claimed stub", item.ItemID, deleteErr)
-			}
-			if !deleted {
-				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
-			}
-			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
-				return w.failClosedIfUnavailable("failed to clear block GC candidate after re-referenced stub cleanup", item.ItemID, err)
-			}
-			log.Printf("[GC Worker] Block %s re-referenced after a stub claim; removed the owned stub", item.ItemID)
-			metrics.GCItemsSkippedTotal.Inc()
-			return nil
+		if blockInfo.CreatedAt == nil || blockInfo.StorageClass == "" {
+			// A STUB-SHAPED READ HERE IS A STALE READ, NOT A STUB. The claim CAS named
+			// `IF storage_class = ? AND storage_key = ?` with this attempt's non-empty
+			// locator and committed at EACH_QUORUM in the serial domain, so a successful
+			// claim is proof the row carried that locator. GetBlockInfo is an ordinary
+			// read and can land on a replica holding only the gc_* columns the claim
+			// itself just wrote.
+			//
+			// The old shape tried DeleteClaimedBlockStub anyway. Its CAS runs in the serial
+			// domain and correctly refused — but the refusal came back as a plain error, so
+			// the item spent a retry with the fence still up, re-claimed on the next cycle,
+			// and after enough cycles parked in the DLQ that ItemBlock never leaves, with
+			// gc_state='deleting' standing on a block the EACH_QUORUM verify had just
+			// proved is still referenced.
+			//
+			// So: hand our own fence back, and postpone. Nothing is wrong with the block.
+			return w.releaseAndPostponeUnreliableRead(item, attempt, "re-referenced block reads back with no canonical locator")
 		}
-		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
+		// Owner-exact, and the ONE release in this walk whose ANSWER is load-bearing:
+		// see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above.
 		//
 		// THE most load-bearing release in the walk: the EACH_QUORUM verify just proved
 		// this block is still referenced, so a fence left standing here is standing on
@@ -1286,8 +1370,23 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// and the next pass cannot be relied on to settle it through the safe pre-check
 		// path, because that pre-check is the LOCAL read and may keep answering false
 		// while the reference lives in another datacenter.
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+		if relErr != nil {
 			return relErr
+		}
+		// SETTLING IS ONLY SOUND IF THE RELEASE RELEASED *THIS* ATTEMPT'S FENCE.
+		//
+		// Not-owner here means the claim was taken over while this attempt worked and
+		// somebody else holds the fence right now — the late-loser shape the staleness
+		// window makes ordinary, not exotic. The candidate is unchanged, so its CAS would
+		// happily apply; that is precisely the trap. Consuming it drops the only work item
+		// that could take the new owner's claim over if that owner dies, which is the same
+		// standing-fence-with-no-recovery state BlockClaimFreshOwner refuses to create at
+		// the claim. Reached from the other side, it needs the same answer.
+		if released != BlockReleaseReleased {
+			metrics.GCBlockDeleteClaimTotal.WithLabelValues("settle_refused_foreign_owner").Inc()
+			log.Printf("[GC Worker] Block %s: re-referenced after claim, but this attempt no longer owns the delete claim; preserving the candidate so the current owner's fence stays recoverable", item.ItemID)
+			return blockClaimForeignOwnerError{ItemID: item.ItemID}
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
 			return w.failClosedIfUnavailable("failed to clear block GC candidate after re-reference", item.ItemID, err)
@@ -1322,47 +1421,32 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	storageKey := attempt.Target.StorageKey
 	if observed := (BlockDeleteTarget{StorageClass: blockInfo.StorageClass, StorageKey: blockInfo.StorageKey}); !observed.IsZero() && observed != attempt.Target {
 		metrics.GCErrorsTotal.WithLabelValues("block_incarnation_divergence").Inc()
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			return relErr
 		}
 		return fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, attempt.Target)
 	}
 	if blockInfo.StorageClass == "" {
-		if blockInfo.CreatedAt == nil {
-			deleted, deleteErr := w.store.DeleteClaimedBlockStub(item.OrgID, item.ItemID, attempt.ClaimID)
-			if deleteErr != nil {
-				return w.failClosedIfUnavailable("failed to remove stub block row", item.ItemID, deleteErr)
-			}
-			if !deleted {
-				return fmt.Errorf("claimed stub %s changed before conditional delete", item.ItemID)
-			}
-			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
-				return w.failClosedIfUnavailable("failed to clear block GC candidate after stub cleanup", item.ItemID, err)
-			}
-			log.Printf("[GC Worker] Block %s missing canonical metadata after claim; removed stub row and skipped deletion", item.ItemID)
-			metrics.GCItemsSkippedTotal.Inc()
-			return nil
-		}
-		// Unconditional: see "WHY THE POST-CLAIM RELEASES ARE UNCONDITIONAL" above.
+		// SAME RULE AS THE RE-REFERENCED BRANCH, AND FOR THE SAME REASON. The claim
+		// already proved in the serial domain that this row carries attempt.Target, whose
+		// storage class is non-empty by construction (candidate.Target.IsZero() was
+		// checked before the claim). So an empty class read back here is not a malformed
+		// row and not a stub — it is a replica that has not caught up, and it says nothing
+		// the item can be blamed for.
 		//
-		// The malformed-row error below is deliberately DLQ-bound — a canonical row
-		// with a creation timestamp and no storage class needs a human. But it must not
-		// travel while the fence is unconfirmed, or the human inherits a fenced block
-		// as well as a malformed one. releaseBlockClaim's error dominates; the
-		// malformed-row error is re-reached on the pass that confirms the release.
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-			return relErr
-		}
-		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
+		// This used to split into "stub, delete it" and "malformed, DLQ it". Both were
+		// unreachable by truth and reachable by staleness, and both spent the retry budget
+		// with a fence standing.
+		return w.releaseAndPostponeUnreliableRead(item, attempt, "canonical row reads back with no storage class")
 	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			return relErr
 		}
 		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
 	}
 	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			return relErr
 		}
 		return fmt.Errorf("block %s has empty canonical storage key", item.ItemID)
@@ -1380,14 +1464,14 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if w.storage != nil {
 		resolved, resolveErr := w.storage.GetBlockStoreForOrg(item.OrgID.String(), storageClass)
 		if resolveErr != nil {
-			if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+			if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 				return relErr
 			}
 			return fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, resolveErr)
 		}
 		if validateErr := resolved.ValidatePhysicalLocator(item.ItemID, storageKey); validateErr != nil {
 			metrics.GCErrorsTotal.WithLabelValues("block_storage_key_mismatch").Inc()
-			if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+			if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 				return relErr
 			}
 			return fmt.Errorf("block %s persisted physical locator %q failed validation: %w", item.ItemID, storageKey, validateErr)
@@ -1419,7 +1503,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// Both outcomes postpone, so unlike the sites above this one was never able to
 		// strand the item — it is routed through releaseBlockClaim for the accounting
 		// and the log, not to change the queue policy.
-		if relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
 			return relErr
 		}
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
@@ -1476,6 +1560,26 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_deleted").Inc()
 	log.Printf("[GC Worker] Deleted block %s", item.ItemID)
 	return nil
+}
+
+// releaseAndPostponeUnreliableRead hands this attempt's fence back and postpones,
+// for the case where the post-claim canonical read contradicts what the claim already
+// established in the serial domain.
+//
+// BOTH HALVES MATTER. Releasing is not optional: the walk is abandoning a claim it
+// legitimately holds, and leaving it up turns a lagging replica into a permanent upload
+// refusal on that content. Postponing rather than erroring is not optional either: the
+// observation is about the replica, not the item, so spending the retry budget on it
+// walks the item into a DLQ that ItemBlock never leaves.
+//
+// The candidate is deliberately untouched. Nothing was decided about the block here.
+func (w *Worker) releaseAndPostponeUnreliableRead(item QueueItem, attempt BlockDeleteAuthority, reason string) error {
+	metrics.GCErrorsTotal.WithLabelValues("block_canonical_read_unreliable").Inc()
+	if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		return relErr
+	}
+	log.Printf("[GC Worker] Block %s: %s, which contradicts what the claim CAS proved in the serial domain; handed the fence back and postponing rather than acting on a stale read", item.ItemID, reason)
+	return blockCanonicalReadUnreliableError{ItemID: item.ItemID, Reason: reason}
 }
 
 // settleBlockCandidate consumes the candidate this walk was authorized by, and only

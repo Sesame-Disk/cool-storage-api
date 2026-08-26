@@ -213,6 +213,34 @@ m_grace_ignores_candidate_at() {
   restore
 }
 
+m_late_loser_settles_candidate() {
+  mutate "$WORKER" 's{released != BlockReleaseReleased}{released == BlockReleaseReleased && false}'
+  expect_red 'TestP4A_LateLoserCannotConsumeTheCurrentOwnersCandidate' 'a late loser consumed the candidate while another attempt owned the fence' \
+    'late loser settles the candidate after a not-owner release (a fence with no work item able to take it over, R16 from the other side)'
+  restore
+}
+
+m_unreliable_read_skips_release() {
+  mutate "$WORKER" 's#\.WithLabelValues\("block_canonical_read_unreliable"\)\.Inc\(\)(\s+)if _, relErr := w\.releaseBlockClaim\(item\.OrgID, item\.ItemID, attempt\); relErr != nil \{(\s+)return relErr(\s+)\}#.WithLabelValues("block_canonical_read_unreliable").Inc()#'
+  expect_red 'TestP4A_StalePostClaimReadHandsTheFenceBackAndPostpones' 'fence left standing' \
+    'stale post-claim read postpones WITHOUT handing the fence back (a lagging replica becomes a permanent upload refusal)'
+  restore
+}
+
+m_authority_invalid_retries() {
+  mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockClaimForeignOwner,}{GCFailureCodeBlockClaimForeignOwner,}'
+  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'is documented as postponing but spends the retry budget' \
+    'block_authority_invalid dropped from the postpone list (it retries into a DLQ ItemBlock never leaves, against its own contract)'
+  restore
+}
+
+m_foreign_owner_retries() {
+  mutate "$WORKER" 's{GCFailureCodeBlockClaimForeignOwner,(\s+)GCFailureCodeBlockCandidateWithinGrace,}{GCFailureCodeBlockCandidateWithinGrace,}'
+  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'a late loser must postpone' \
+    'late loser spends the retry budget (parks the item in the DLQ, making the preserved candidate unreachable anyway)'
+  restore
+}
+
 MUTATIONS=(
   m_claim_drops_storage_key
   m_claim_drops_storage_class
@@ -231,6 +259,10 @@ MUTATIONS=(
   m_candidate_loop_unbounded
   m_enqueue_sentinel_is_fatal
   m_grace_ignores_candidate_at
+  m_late_loser_settles_candidate
+  m_unreliable_read_skips_release
+  m_authority_invalid_retries
+  m_foreign_owner_retries
 )
 
 if [ "${1:-}" = "--list" ]; then

@@ -24,6 +24,35 @@ const (
 	// GCFailureCodeBlockAuthorityInvalid marks a candidate whose physical identity is
 	// unusable as destructive authority. Postponed, never retried and never consumed.
 	GCFailureCodeBlockAuthorityInvalid = "block_authority_invalid"
+	// GCFailureCodeBlockClaimForeignOwner marks a walk that reached a settlement step
+	// only to find its own claim already gone — taken over, or finalized elsewhere.
+	//
+	// The item is postponed and the candidate preserved. That is the same rule
+	// BlockClaimFreshOwner follows at the claim, arrived at from the other side: some
+	// other lifecycle owns the fence now, and this candidate is what will lift it if
+	// that lifecycle dies. Consuming it here would leave the fence standing with
+	// nothing able to take it over.
+	GCFailureCodeBlockClaimForeignOwner = "block_claim_foreign_owner"
+	// GCFailureCodeBlockCandidateWithinGrace marks a candidate that is younger than the
+	// grace period, so the incarnation it names has not yet had its own window for
+	// in-flight writers to finish. Postponed, never retried and never consumed.
+	//
+	// It is separate from GCFailureCodeBlockClaimNotYetStale because the two say
+	// different things: one is "someone else holds the fence", the other is "nobody
+	// holds anything, this work is simply not due yet". Collapsing them made every
+	// grace postpone read as claim contention in the metrics.
+	GCFailureCodeBlockCandidateWithinGrace = "block_candidate_within_grace"
+	// GCFailureCodeBlockCanonicalReadUnreliable marks a post-claim canonical read that
+	// contradicts what the claim CAS already proved in the serial domain.
+	//
+	// The claim names `IF storage_class = ? AND storage_key = ?`, so a successful claim
+	// is proof the row carried that exact locator. GetBlockInfo is an ordinary read and
+	// can land on a replica that has only the gc_* columns the claim itself just wrote,
+	// showing an empty row. That observation says nothing about the block and
+	// everything about the replica, so it must not spend a retry — and the fence this
+	// attempt is holding has to come off before postponing, or a lagging replica turns
+	// into a permanent upload refusal.
+	GCFailureCodeBlockCanonicalReadUnreliable = "block_canonical_read_unreliable"
 	// GCFailureCodeDestructiveFailClosed marks a delete refused because the
 	// environment could not authorize it — an unreachable datacenter, or a
 	// replication map that no longer carries the per-DC EACH_QUORUM argument. These

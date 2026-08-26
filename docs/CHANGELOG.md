@@ -131,11 +131,59 @@ and is then recognised by the settling read — was untestable.
   integration `TestMain` OR-chain, so a stack that never came up FAILS instead of
   skipping to a green run). Three legs: exclusive ownership plus exact takeover, the ABA
   case, and retry semantics under the engine's real CAS returns.
-- Mutation: `scripts/p4a-mutation-validation.sh` — seventeen deliberate mutations, each
+- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-one deliberate mutations, each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
-  earned their keep during this pass: one exposed that a mutation which fails to COMPILE
-  proves nothing, and one exposed that the incarnation check lives in two mirrored places
-  (store and mock) with neither protecting the other.
+  earned their keep during the second pass: one exposed that a mutation which fails to
+  COMPILE proves nothing, and one exposed that the incarnation check lives in two mirrored
+  places (store and mock) with neither protecting the other.
+
+**Third review pass — the late loser.** One claim-side hole survived both earlier passes,
+and the exact-`P` work does not catch it because it varies nothing about the candidate.
+
+`releaseBlockClaim` collapsed `BlockReleaseReleased` and `BlockReleaseNotOwner` into a
+bare `nil`. Not-owner genuinely is not an error — an attempt whose claim was taken over
+holds no fence and has nothing to repair — but it is not "released" either, and one
+branch went on to SETTLE THE CANDIDATE after the release: "re-referenced after claim".
+
+So: `A` claims as `D1` and stalls past the staleness threshold; `B` takes `D1` over by
+exact CAS and claims as `D2`; `A` wakes, which the design explicitly allows. `A`'s global
+verify finds the block referenced, `A` releases (not-owner, correctly), and then deleted
+the candidate — whose CAS applied, because the candidate really is unchanged: same block,
+same incarnation, same `candidate_at`. What is left is a fence owned by `D2` with no
+candidate behind it, and nothing can recover from that: an item with no candidate refuses
+to touch `blocks`, the referenced pre-check declines to release a fence it cannot name,
+and the discovery projection went with the candidate. That is the same state
+`BlockClaimFreshOwner` refuses to create at the claim, reached from the other side — so
+R16 was not actually closed until both entrances were.
+
+`releaseBlockClaim` now returns `(BlockReleaseOutcome, error)`; a caller that only needs
+the fence gone ignores the outcome, and the one that settles the candidate requires
+`BlockReleaseReleased` and otherwise postpones with the candidate intact
+(`block_claim_foreign_owner`). `DeleteBlockGCCandidate` is deliberately NOT made
+claim-bound: `BlockClaimTargetChanged` must still be able to settle a stale `P1` candidate
+without holding any claim.
+
+Three smaller fixes landed with it:
+
+- The post-claim stub branches were unreachable by truth and reachable by staleness. The
+  claim CAS names `IF storage_class = ? AND storage_key = ?` and commits at `EACH_QUORUM`
+  in the serial domain, so a successful claim PROVES the locator; `GetBlockInfo` is an
+  ordinary read and can land on a replica holding only the `gc_*` columns the claim itself
+  just wrote. The old code read that as a metadata-free stub, tried
+  `DeleteClaimedBlockStub` (whose own CAS correctly refused, in the serial domain), and
+  surfaced the refusal as a plain error — retry spent, fence still up, re-claimed next
+  cycle, DLQ after enough cycles with `gc_state='deleting'` standing on a block the
+  `EACH_QUORUM` verify had just proved is still referenced. It now hands the fence back
+  and postpones (`block_canonical_read_unreliable`), leaving the candidate untouched.
+- `GCFailureCodeBlockAuthorityInvalid` was documented as postponing from the day it was
+  introduced and was never listed in `shouldPostponeWithoutRetry`, so it retried into the
+  DLQ — the one destination its own contract rules out, since `ItemBlock` does not come
+  back and the candidate it insists on preserving would be unreachable anyway.
+- The grace-period postpone reused `blockClaimNotYetStaleError`, so every "not due yet"
+  read as claim contention in the metrics. It has its own code now
+  (`block_candidate_within_grace`), as does a claim whose owner cannot be named at all —
+  `gc_state='deleting'` with a null `gc_claim_id` is not a takeable stale owner, because
+  every recovery route from it is a CAS against an authority that does not exist.
 
 **Scope, and what is still open.** `StartBlockDeleteOrphan` is deliberately untouched:
 `blocks` and `gc_s3_orphans` are separate Paxos partitions, and binding publication to
