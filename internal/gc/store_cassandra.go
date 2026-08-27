@@ -699,6 +699,40 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 	if err != nil {
 		return err
 	}
+
+	// A REQUEUE MOVES A ROW. IT MUST NEVER CREATE ONE.
+	//
+	// DequeueBatch is a plain SELECT with no lease, so two workers routinely hold the
+	// same queue row at the same time — that is the premise the whole claim protocol
+	// exists to survive. The batch below is DELETE(old) + INSERT(new), and in Cassandra
+	// a DELETE of an absent row is a perfectly valid no-op while the INSERT applies
+	// regardless. So a worker whose copy of the row was already moved by somebody else
+	// did not move a row: it RESURRECTED a stale copy alongside the live one, and after
+	// R26 both rows are durable — same block, same identity_at, different queued_at, so
+	// the primary key keeps them apart and nothing collapses them again.
+	//
+	// The stale attempt is exactly the caller that hits this: a late loser postponing on
+	// blockClaimForeignOwnerError is, by definition, an attempt that fell behind, and the
+	// lifecycle that overtook it has usually requeued the row already.
+	//
+	// So establish the row is still ours to move first. This is the same existence check
+	// FailItem has always done before a DLQ move (and for the same reason), which is why
+	// the retry-capped path was never able to resurrect anything while the postponing one
+	// was. An absent row means another worker already advanced this lifecycle; there is
+	// nothing to move and nothing to report.
+	//
+	// It is an ordinary read, not a CAS, and that is deliberate: the failure mode of
+	// reading a stale absent is that we skip a requeue whose row is in fact still there,
+	// and that row simply keeps its old queued_at and is dequeued again on the next tick.
+	// Nothing is lost, so the linearizable version would buy nothing for its cost.
+	if _, _, _, _, infoErr := s.queueItemPendingInfo(orgID, oldQueuedAt, itemType, itemID, identity); infoErr != nil {
+		if errors.Is(infoErr, gocql.ErrNotFound) {
+			log.Printf("[GC] Skipping requeue for missing queue row org=%s item_type=%s item_id=%s queued_at=%s; another worker already advanced this lifecycle", orgID, itemType, itemID, oldQueuedAt.Format(time.RFC3339Nano))
+			return nil
+		}
+		return fmt.Errorf("load queue row for requeue %s/%s: %w", orgID, itemID, infoErr)
+	}
+
 	now := time.Now().UTC()
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)

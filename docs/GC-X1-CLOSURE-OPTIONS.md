@@ -1653,9 +1653,9 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **40** red-form mutations in
+the observed incarnation — plus **41** red-form mutations in
 `scripts/p4a-mutation-validation.sh`. Every count written elsewhere in this document (17,
-21, 23, 37) is stale; the script prints its own total on a clean run, and that is the
+21, 23, 37, 40) is stale; the script prints its own total on a clean run, and that is the
 figure to cite.
 
 A fourth review pass made every non-authoritative post-claim `GetBlockInfo` outcome
@@ -1681,6 +1681,19 @@ item-specific alert counters (`liveness_verify_failed`, `block_storage_key_misma
 behind the ownership check: they assert that the BLOCK is defective, which a late loser is
 no more entitled to conclude for a metric than for the retry budget, and the owner
 re-observes the durable defect on the next pass.
+
+A seventh pass closed the DURABLE half of "postpone", which is a queue-primitive defect
+rather than a P4a one and predates this whole slice. `RequeueItem`'s batch is
+`DELETE(old)` + `INSERT(new)`; Cassandra applies the INSERT whether or not the DELETE
+addressed anything, and `DequeueBatch` takes no lease, so a worker holding a row another
+worker had already advanced created a SECOND durable row rather than moving one — after
+R26 they differ only in `queued_at`, which is part of the key. Every requeue reached this,
+including `Queue.IncrementRetry` on `main`; what the late-loser rule changed was one
+interleaving, replacing the existence-checked `FailItem` at the retry cap with an
+unconditional requeue. `RequeueItem` now performs the same existence check `FailItem`
+always did and treats an absent row as a no-op. `MockStore` already behaved this way,
+which is precisely why the unit suite could not see it — R19's shape — so the gate is
+`TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` against the real engine.
 
 R14b/P4b, the orphan-publication half, remains open — and note that
 `StartBlockDeleteOrphan`/`FinalizeBlockDelete` failures still return retryable errors

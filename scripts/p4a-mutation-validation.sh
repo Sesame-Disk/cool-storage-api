@@ -372,7 +372,7 @@ m_verify_unwind_ignores_foreign_owner() {
 m_unwind_bypasses_the_wrapper() {
   # ~ delimiters and $1 for the indentation run: the replacement carries unbalanced braces.
   mutate "$WORKER" 's~return w\.releaseClaimThenFailWithRetry\(item, attempt,(\s+)fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {${1}return relErr${1}}${1}return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
-  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'discards the release outcome' \
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'discard the release outcome without postponing' \
     'a sixth post-claim unwind releases inline and discards the outcome (the exact shape of the defect, reachable again by one call site diverging from its siblings)'
   restore
 }
@@ -388,6 +388,20 @@ m_verify_alert_fires_for_a_late_loser() {
   mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {${1}return foreign${2}}~'
   expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
     'the global verify raises liveness_verify_failed before consulting ownership (same conclusion about the item, drawn from a walk this attempt no longer owns)'
+  restore
+}
+
+# A requeue MOVES a row; it must never create one. Cassandra applies the INSERT half of
+# the batch whether or not the DELETE half addressed anything, and DequeueBatch takes no
+# lease, so without the existence check a stale worker resurrects its own copy of a row
+# the live lifecycle already advanced. MockStore cannot show this -- it no-ops when the
+# old row is absent -- which is why the BEHAVIOUR is proven against the engine by
+# TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow, and only the check is gated here.
+m_requeue_can_resurrect_a_stale_row() {
+  # /s so the non-greedy body may span lines; it terminates on the unique error string.
+  mutate "$STORE" 's~if _, _, _, _, infoErr := s\.queueItemPendingInfo\(orgID, oldQueuedAt, itemType, itemID, identity\); infoErr != nil \{.*?return fmt\.Errorf\("load queue row for requeue %s/%s: %w", orgID, itemID, infoErr\)\s+\}~~s'
+  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must establish the old queue row still exists' \
+    'requeue drops its existence check (a stale worker INSERTs a second durable queue row beside the live one; after R26 only queued_at tells them apart)'
   restore
 }
 
@@ -446,6 +460,7 @@ MUTATIONS=(
   m_unwind_bypasses_the_wrapper
   m_owned_alert_fires_for_a_late_loser
   m_verify_alert_fires_for_a_late_loser
+  m_requeue_can_resurrect_a_stale_row
 )
 
 if [ "${1:-}" = "--list" ]; then

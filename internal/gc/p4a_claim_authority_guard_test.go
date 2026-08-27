@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -495,21 +496,25 @@ func p4aHasRawBlocksSelect(fn *ast.FuncDecl) bool {
 }
 
 // TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome is the STRUCTURAL half of the
-// late-loser queue-policy rule. The behavioural half —
-// TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget — proves the five unwinds that
+// late-loser queue-policy rule. The behavioural half --
+// TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget -- proves the five unwinds that
 // exist today are correct; this one is what a sixth has to get past.
 //
 // The defect has exactly one spelling, and that is what makes it guardable. A post-claim
 // unwind that wants to return a retryable error must release the fence first, and Go
-// refuses to compile a `released, relErr :=` whose outcome is never read — so the only
+// refuses to compile a `released, relErr :=` whose outcome is never read -- so the only
 // way to drop the answer is to discard it with `_`. Five sites did precisely that, and
 // each one charged a retry to an item whose claim another lifecycle already owned,
 // walking it into a DLQ ItemBlock never leaves.
 //
-// ONE discard is legitimate, and the guard pins which. The destructive topology gate
-// returns failedClosedError, which postpones on BOTH outcomes, so ownership cannot change
-// its queue policy and there is nothing for it to consult. Every other post-claim unwind
-// must go through releaseClaimThenFailWithRetry, which consults it once on their behalf.
+// A DISCARD IS SOUND ONLY WHERE OWNERSHIP CANNOT CHANGE THE ANSWER -- that is, where the
+// branch postpones whatever the release said. Two do: the destructive topology gate and
+// releaseAndPostponeUnreliableRead. Every other unwind must go through
+// releaseClaimThenFailWithRetry, which consults the outcome once on their behalf.
+//
+// Scanning the whole file rather than processBlock alone is deliberate: a new helper in
+// the shape of releaseAndPostponeUnreliableRead but returning an ordinary error would
+// reopen the hole from outside the one function the first cut of this guard watched.
 func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	source, err := os.ReadFile("worker.go")
 	if err != nil {
@@ -520,48 +525,62 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fn := findGCFunction(file, "processBlock")
-	if fn == nil {
-		t.Fatal("processBlock not found; the release-outcome guard is vacuous")
+
+	// The allowlist checks ITSELF against the classifier: naming a type here that the
+	// queue would in fact retry is the one way this guard could be quietly widened into
+	// permitting the very defect it exists to forbid.
+	postponing := map[string]bool{}
+	for _, sentinel := range []error{
+		failedClosedError{},
+		blockCanonicalReadUnreliableError{},
+		blockClaimForeignOwnerError{},
+		blockClaimNotYetStaleError{},
+		blockCandidateWithinGraceError{},
+		blockClaimReleaseUnconfirmedError{},
+	} {
+		if !shouldPostponeWithoutRetry(sentinel) {
+			t.Fatalf("%T is allowlisted as a postponing unwind but shouldPostponeWithoutRetry says it spends a retry; a discarded release outcome under it would strand the item", sentinel)
+		}
+		name := fmt.Sprintf("%T", sentinel)
+		postponing[name[strings.LastIndex(name, ".")+1:]] = true
 	}
 
-	var discards []*ast.AssignStmt
-	ast.Inspect(fn.Body, func(node ast.Node) bool {
-		assign, ok := node.(*ast.AssignStmt)
-		if !ok || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+	var offenders []string
+	for _, declaration := range file.Decls {
+		fn, ok := declaration.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			assign, ok := node.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+				return true
+			}
+			call, ok := assign.Rhs[0].(*ast.CallExpr)
+			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
+				return true
+			}
+			if blank, ok := assign.Lhs[0].(*ast.Ident); !ok || blank.Name != "_" {
+				return true
+			}
+			if p4aBlockDirectlyReturnsOneOf(p4aTightestBlock(fn, assign.Pos()), postponing) {
+				return true
+			}
+			offenders = append(offenders, fmt.Sprintf("%s (in %s)", fset.Position(assign.Pos()), fn.Name.Name))
 			return true
-		}
-		call, ok := assign.Rhs[0].(*ast.CallExpr)
-		if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
-			return true
-		}
-		if blank, ok := assign.Lhs[0].(*ast.Ident); ok && blank.Name == "_" {
-			discards = append(discards, assign)
-		}
-		return true
-	})
-
-	if len(discards) != 1 {
-		lines := make([]string, 0, len(discards))
-		for _, discard := range discards {
-			lines = append(lines, fset.Position(discard.Pos()).String())
-		}
-		t.Fatalf("processBlock discards the release outcome at %d site(s), want exactly 1 (the topology gate): %s; "+
-			"a post-claim unwind that returns a retryable error must go through releaseClaimThenFailWithRetry; "+
-			"discarding the outcome lets an attempt whose claim was taken over spend the item's retry budget, "+
+		})
+	}
+	if len(offenders) != 0 {
+		t.Errorf("post-claim unwind(s) discard the release outcome without postponing: %s; "+
+			"an unwind that returns a retryable error must go through releaseClaimThenFailWithRetry, "+
+			"because discarding the outcome lets an attempt whose claim was taken over spend the item's retry budget, "+
 			"and at the cap ItemBlock is parked in a DLQ it never leaves with its candidate behind a foreign fence",
-			len(discards), strings.Join(lines, ", "))
+			strings.Join(offenders, "; "))
 	}
 
-	// The one allowed discard must be the branch that postpones on both outcomes.
-	if block := p4aTightestBlock(fn, discards[0].Pos()); !p4aBlockDirectlyReturns(block, "failedClosedError") {
-		t.Errorf("the single discarded release outcome at %s is not the topology gate: a discard is only sound where BOTH outcomes postpone, which is what returning failedClosedError means here",
-			fset.Position(discards[0].Pos()))
-	}
-
-	// And the two consumers must still exist, or the guard above passes over a walk that
+	// And the two consumers must still exist, or the check above passes over a walk that
 	// consults ownership nowhere at all.
-	if !p4aMentions(fn, "refuseRetryForForeignClaimOwner") {
+	if fn := findGCFunction(file, "processBlock"); fn == nil || !p4aMentions(fn, "refuseRetryForForeignClaimOwner") {
 		t.Error("processBlock must consult refuseRetryForForeignClaimOwner directly: the global verify releases before it classifies the error, so it cannot use the wrapper")
 	}
 	wrapper := findGCFunction(file, "releaseClaimThenFailWithRetry")
@@ -570,6 +589,33 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	}
 	if !p4aMentions(wrapper, "refuseRetryForForeignClaimOwner") {
 		t.Error("releaseClaimThenFailWithRetry must consult refuseRetryForForeignClaimOwner; without it every site routed through the wrapper silently regains the defect")
+	}
+}
+
+// TestP4ARequeueNeverCreatesAQueueRow guards the DURABLE half of "postpone".
+//
+// Postponing without spending a retry is implemented as RequeueItem, whose batch is
+// DELETE(old) + INSERT(new). Cassandra treats a DELETE of an absent row as a valid no-op
+// and applies the INSERT anyway, and DequeueBatch takes no lease -- so a worker holding a
+// copy of a row another worker has already advanced would not MOVE a row, it would create
+// a second one, durably distinct after R26 because queued_at is part of the key.
+//
+// The late loser is by definition that worker. This guard keeps the existence check in
+// place; TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow proves the behaviour
+// against the engine, which is where it has to be proven: MockStore.RequeueItem searches
+// for the old row first and no-ops when it is gone, so the unit suite agreed with the
+// code while production carried the defect. That is R19's shape exactly.
+func TestP4ARequeueNeverCreatesAQueueRow(t *testing.T) {
+	file := p4aParseStore(t)
+	fn := findGCFunction(file, "RequeueItem")
+	if fn == nil {
+		t.Fatal("RequeueItem not found; the requeue guard is vacuous")
+	}
+	if !p4aMentions(fn, "queueItemPendingInfo") {
+		t.Error("RequeueItem must establish the old queue row still exists before its batch: a requeue moves a row and must never create one, or a stale worker resurrects its own copy alongside the live lifecycle's")
+	}
+	if !p4aMentions(fn, "ErrNotFound") {
+		t.Error("RequeueItem must treat an absent old row as a no-op rather than an error: another worker already advanced this lifecycle, and there is nothing to move")
 	}
 }
 
@@ -599,10 +645,10 @@ func p4aTightestBlock(fn *ast.FuncDecl, pos token.Pos) *ast.BlockStmt {
 	return tightest
 }
 
-// p4aBlockDirectlyReturns reports whether block returns a composite literal of the named
-// type as one of its OWN statements — not somewhere in a nested branch, which would let
-// any block in the function qualify.
-func p4aBlockDirectlyReturns(block *ast.BlockStmt, typeName string) bool {
+// p4aBlockDirectlyReturnsOneOf reports whether block returns a composite literal of one
+// of the named types as one of its OWN statements -- not somewhere in a nested branch,
+// which would let any block in the function qualify.
+func p4aBlockDirectlyReturnsOneOf(block *ast.BlockStmt, typeNames map[string]bool) bool {
 	if block == nil {
 		return false
 	}
@@ -616,7 +662,7 @@ func p4aBlockDirectlyReturns(block *ast.BlockStmt, typeName string) bool {
 			if !ok {
 				continue
 			}
-			if ident, ok := literal.Type.(*ast.Ident); ok && ident.Name == typeName {
+			if ident, ok := literal.Type.(*ast.Ident); ok && typeNames[ident.Name] {
 				return true
 			}
 		}

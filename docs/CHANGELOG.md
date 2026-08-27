@@ -67,18 +67,61 @@ rejected `ValidatePhysicalLocator`.
   `m_verify_unwind_ignores_foreign_owner` (the one site that cannot use the wrapper),
   `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
   `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
-  item-specific alert counter raised before ownership is consulted). Five in this entry,
-  bringing `scripts/p4a-mutation-validation.sh` to **40** — the script prints its own
-  total on a clean run, and that figure is the one to cite.
+  item-specific alert counter raised before ownership is consulted), and
+  `m_requeue_can_resurrect_a_stale_row` (the requeue drops its existence check). Six in
+  this entry, bringing `scripts/p4a-mutation-validation.sh` to **41** — the script prints
+  its own total on a clean run, and that figure is the one to cite.
+
+**Third pass: the durable half of "postpone".** Two reviewers converged on the queue
+boundary, and they were right that it was the open question -- though not that the defect
+belonged to this branch.
+
+`postponeItem` is `RequeueItem`, whose batch is `DELETE(old row)` + `INSERT(new row)`. In
+Cassandra a `DELETE` of an absent row is a valid no-op and the `INSERT` applies anyway,
+and `DequeueBatch` is a plain `SELECT` with no lease -- so a worker whose copy of the row
+another worker had already advanced did not MOVE a row, it created a second one. After R26
+both are durable: same block, same `identity_at`, different `queued_at`, and `queued_at` is
+part of the primary key, so nothing collapses them again.
+
+Two things about the scope, both verified rather than assumed:
+- It is NOT introduced by the late-loser rule. `Queue.IncrementRetry` calls the same
+  `RequeueItem`, so every ordinary error below the retry cap already reached it on `main`,
+  as did the postpone classes that predate this branch (`BlockClaimFreshOwner`,
+  within-grace, unreliable-read, fail-closed). With no lease on dequeue, two workers
+  requeuing the same row needs no takeover and no stalled walk at all.
+- What this branch DID change is one narrow interleaving: at the retry cap a late loser
+  used to reach `FailItem`, which has always checked the row exists and skipped when it
+  did not. Routing it to `postponeItem` replaced an existence-checked no-op with an
+  unconditional requeue.
+
+The fix belongs at the primitive, not in a new queue-policy class: a not-owner release
+routed away from `postponeItem` would have left the identical hazard reachable from the
+half-dozen other postpone paths, and from every retry. `RequeueItem` now establishes the
+old row still exists before its batch -- the same check `FailItem` has always done, and
+the reason the retry-capped path was never able to resurrect anything. An absent row means
+another worker already advanced this lifecycle: there is nothing to move, and it is a
+no-op rather than an error. The read is ordinary, not a CAS, because the failure mode of a
+stale absent is a skipped requeue whose row keeps its old `queued_at` and is dequeued again
+next tick.
+
+`MockStore.RequeueItem` already searched for the old row and no-opped when it was gone --
+the behaviour we want, and NOT the behaviour Cassandra had. So the whole unit suite agreed
+with the code while production carried the defect. That is R19's shape exactly, and it is
+why the gate is `TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` against the real
+engine, with `TestP4ARequeueNeverCreatesAQueueRow` and
+`m_requeue_can_resurrect_a_stale_row` holding the check itself in place.
 
 **Second pass over this same change.** A review of the first cut found nothing wrong with
 the decision and three things wrong around it, all fixed here:
 - `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome` is a new source guard. The defect
   has exactly one spelling — Go will not compile a `released, relErr :=` whose outcome is
-  never read, so dropping the answer requires `_` — which makes it guardable. The guard
-  allows exactly one discard, the destructive topology gate, and only because that branch
-  returns `failedClosedError` and therefore postpones on both outcomes. A sixth unwind
-  written in the old shape is now a red test rather than a silent regression.
+  never read, so dropping the answer requires `_` — which makes it guardable. A discard is
+  allowed only where ownership cannot change the answer, meaning the branch postpones
+  whatever the release said; the allowlist of postponing error types checks ITSELF against
+  `shouldPostponeWithoutRetry`, so it cannot be widened into permitting the defect. It
+  scans all of `worker.go`, not just `processBlock`: a new helper shaped like
+  `releaseAndPostponeUnreliableRead` but returning an ordinary error would otherwise
+  reopen the hole from outside the one function the first cut watched.
 - The item-specific alert counters (`liveness_verify_failed`, `block_storage_key_mismatch`)
   were raised BEFORE the ownership check. Those counters mean "this block is defective",
   which is a conclusion about the item, and a late loser has no more standing to draw it
@@ -401,7 +444,7 @@ and is then recognised by the settling read — was untestable.
   case, retry semantics under the engine's real CAS returns, and stale-claim release
   bound to the observed physical incarnation.
 - Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations at
-  the time of this entry (forty since 2026-08-27; the newest entry above is
+  the time of this entry (forty-one since 2026-08-27; the newest entry above is
   authoritative for the current count), each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
   earned their keep during the second pass: one exposed that a mutation which fails to
