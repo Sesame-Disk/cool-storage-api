@@ -471,12 +471,11 @@ func TestRetryUploadedBlockMaterializationWithWorkerFastClear(t *testing.T) {
 
 	store := gc.NewMockStore()
 	orgID := uuid.New()
-	libraryID := uuid.New()
 	blockID := fastClearTestBlockID("fast-clear-block")
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", candidateAt)
-	if err := store.EnqueueItem(orgID, candidateAt, gc.ItemBlock, blockID, libraryID, "hot", 0); err != nil {
+	if err := store.EnqueueBlockForTest(orgID, candidateAt, blockID, "hot", 0); err != nil {
 		t.Fatalf("enqueue block: %v", err)
 	}
 

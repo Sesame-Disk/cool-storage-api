@@ -854,10 +854,9 @@ func TestScanner_ScanOrphanedBlocks_SkipsAlreadyQueuedCandidate(t *testing.T) {
 
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-1 * time.Minute)
+	store.AddBlock(orgID, "block-orphan", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "block-orphan", "hot", candidateAt)
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-orphan", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("failed to seed queue item: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, store.AllBlockGCCandidates()[0], 0)
 
 	if err := s.ScanOnce(context.Background()); err != nil {
 		t.Fatalf("ScanOnce failed: %v", err)
@@ -876,10 +875,9 @@ func TestScanner_ScanOrphanedBlocks_SkipsRetriedQueuedCandidate(t *testing.T) {
 
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-1 * time.Minute).UTC().Truncate(time.Millisecond)
+	store.AddBlock(orgID, "block-orphan", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "block-orphan", "hot", candidateAt)
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-orphan", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("failed to seed queue item: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, store.AllBlockGCCandidates()[0], 0)
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -918,7 +916,7 @@ func TestScanner_ScanOrphanedBlocks_EnqueuesFromCandidatesByDay(t *testing.T) {
 
 	// Refcount-decrement paths invoke EnsureBlockGCCandidate when they reach
 	// zero; here we register the candidate row directly to simulate that.
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-zero-ref", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-zero-ref", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 
@@ -959,7 +957,7 @@ func TestScanner_ScanOrphanedBlocks_DiscoversAcrossDistinctBuckets(t *testing.T)
 	for i := 0; i < blockCount; i++ {
 		blockID := fmt.Sprintf("block-%04d", i)
 		store.AddBlock(orgID, blockID, "hot", 0)
-		if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now()); err != nil {
+		if _, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now()); err != nil {
 			t.Fatalf("EnsureBlockGCCandidate failed for %s: %v", blockID, err)
 		}
 	}
@@ -991,7 +989,7 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 
 	// Seed a recent candidate the scanner must pick up on the first pass.
 	store.AddBlock(orgID, "block-recent", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-recent", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-recent", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 
@@ -1011,7 +1009,8 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 	if _, err := store.DequeueBatch(orgID, 10, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("DequeueBatch failed: %v", err)
 	}
-	if err := store.CompleteItem(orgID, store.AllBlockGCCandidates()[0].CandidateAt, ItemBlock, "block-recent"); err != nil {
+	candidate := store.AllBlockGCCandidates()[0]
+	if err := store.CompleteItem(orgID, candidate.CandidateAt, ItemBlock, "block-recent", candidate.ItemIdentity()); err != nil {
 		t.Fatalf("CompleteItem failed: %v", err)
 	}
 
@@ -1639,7 +1638,7 @@ func TestScanner_ScanOrphanedBlocks_EnqueueFailureKeepsCursorUnchanged(t *testin
 	}
 
 	store.AddBlock(orgID, "block-enqueue-fail", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
 	store.enqueueBatchErr = fmt.Errorf("enqueue failed")

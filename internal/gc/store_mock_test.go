@@ -2,6 +2,7 @@ package gc
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -149,8 +150,8 @@ func TestMockStore_SoftDeleteLibrary_MissingLibraryIsIdempotent(t *testing.T) {
 // TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes verifies the raw
 // single-row EnqueueItem path — which cannot carry a block representation — fails
 // closed for the item types that require one, so a caller cannot bypass the
-// EnqueueBatch invariant by writing straight to the store. Non-representation
-// types (e.g. ItemBlock) still enqueue normally.
+// EnqueueBatch invariant by writing straight to the store. Block items follow
+// their separate exact-candidate batch contract.
 func TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes(t *testing.T) {
 	orgID := uuid.New()
 	libID := uuid.New()
@@ -164,10 +165,13 @@ func TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes(t *testing.T) {
 		})
 	}
 
-	t.Run("ItemBlock still allowed", func(t *testing.T) {
+	t.Run("ItemBlock uses exact candidate batch", func(t *testing.T) {
 		store := NewMockStore()
-		if err := store.EnqueueItem(orgID, time.Now().UTC(), ItemBlock, "block-1", libID, "hot", 0); err != nil {
-			t.Fatalf("EnqueueItem(ItemBlock) = %v, want nil", err)
+		queuedAt := time.Now().UTC()
+		store.AddBlock(orgID, "block-1", "hot", 0)
+		ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", queuedAt, 0)
+		if got := store.QueueItems(orgID); len(got) != 1 || got[0].BlockGCCandidateIdentity.Target.IsZero() || got[0].BlockGCCandidateIdentity.CandidateAt.IsZero() {
+			t.Fatalf("exact block queue item = %+v, want one item with its candidate identity", got)
 		}
 	})
 }
@@ -280,4 +284,122 @@ func TestMockStore_ResolveBlockIDs_DualProbeAmbiguousLeavesUnresolvedAndCountsMe
 	if afterAmbiguous-beforeAmbiguous != 1 {
 		t.Fatalf("ambiguous metric delta = %v, want 1", afterAmbiguous-beforeAmbiguous)
 	}
+}
+
+func TestMockStore_FailedItemsUseFullBlockCandidateIdentity(t *testing.T) {
+	orgID := uuid.New()
+	failedAt := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	candidateAt := failedAt.Add(-time.Hour)
+	p1 := BlockGCCandidateIdentity{
+		Target:      BlockDeleteTarget{StorageClass: "hot", StorageKey: "p1"},
+		CandidateAt: candidateAt,
+	}
+	p2 := p1
+	p1Bucket := db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.Target.StorageClass, p1.Target.StorageKey, p1.CandidateAt)
+	foundDistinctBucket := false
+	for i := 0; i < 1000; i++ {
+		p2.Target.StorageKey = fmt.Sprintf("p2-%d", i)
+		if p1Bucket != db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p2.Target.StorageClass, p2.Target.StorageKey, p2.CandidateAt) {
+			foundDistinctBucket = true
+			break
+		}
+	}
+	if !foundDistinctBucket {
+		t.Fatal("could not find distinct expiry buckets for P1 and P2")
+	}
+
+	item := func(candidate BlockGCCandidateIdentity) QueueItem {
+		return QueueItem{
+			OrgID:                    orgID,
+			QueuedAt:                 failedAt,
+			IdentityAt:               candidateAt,
+			ItemType:                 ItemBlock,
+			ItemID:                   "same-block",
+			StorageClass:             "hot",
+			BlockGCCandidateIdentity: candidate,
+		}
+	}
+	seed := func(t *testing.T) *MockStore {
+		t.Helper()
+		store := NewMockStore()
+		if err := store.EnqueueBatch([]QueueItem{item(p2), item(p1)}); err != nil {
+			t.Fatalf("EnqueueBatch: %v", err)
+		}
+		return store
+	}
+	seedFailed := func(t *testing.T) *MockStore {
+		t.Helper()
+		store := seed(t)
+		if err := store.FailItem(item(p2), failedAt, "p2", GCFailureCodeNone); err != nil {
+			t.Fatalf("FailItem(P2): %v", err)
+		}
+		if err := store.FailItem(item(p1), failedAt, "p1", GCFailureCodeNone); err != nil {
+			t.Fatalf("FailItem(P1): %v", err)
+		}
+		return store
+	}
+
+	t.Run("FailItem", func(t *testing.T) {
+		store := seed(t)
+		if err := store.FailItem(item(p1), failedAt, "p1", GCFailureCodeNone); err != nil {
+			t.Fatalf("FailItem(P1): %v", err)
+		}
+		if queued := store.QueueItems(orgID); len(queued) != 1 || queued[0].BlockGCCandidateIdentity != p2 {
+			t.Fatalf("queue after FailItem(P1) = %+v, want only P2", queued)
+		}
+	})
+
+	t.Run("DeleteFailedItem", func(t *testing.T) {
+		store := seedFailed(t)
+		if err := store.DeleteFailedItem(orgID, failedAt, ItemBlock, "same-block", GCItemIdentity{IdentityAt: p1.CandidateAt, BlockCandidate: p1}); err != nil {
+			t.Fatalf("DeleteFailedItem(P1): %v", err)
+		}
+		if failed := store.FailedItems(orgID); len(failed) != 1 || failed[0].BlockGCCandidateIdentity != p2 {
+			t.Fatalf("failed items after DeleteFailedItem(P1) = %+v, want only P2", failed)
+		}
+	})
+
+	t.Run("RequeueFailedItem", func(t *testing.T) {
+		store := seedFailed(t)
+		if err := store.RequeueFailedItem(orgID, failedAt, ItemBlock, "same-block", failedAt.Add(time.Minute), GCItemIdentity{IdentityAt: p1.CandidateAt, BlockCandidate: p1}); err != nil {
+			t.Fatalf("RequeueFailedItem(P1): %v", err)
+		}
+		if failed := store.FailedItems(orgID); len(failed) != 1 || failed[0].BlockGCCandidateIdentity != p2 {
+			t.Fatalf("failed items after RequeueFailedItem(P1) = %+v, want only P2", failed)
+		}
+		if queued := store.QueueItems(orgID); len(queued) != 1 || queued[0].BlockGCCandidateIdentity != p1 {
+			t.Fatalf("queue after RequeueFailedItem(P1) = %+v, want only P1", queued)
+		}
+	})
+
+	t.Run("DeleteExpiredFailedItem", func(t *testing.T) {
+		store := seedFailed(t)
+		expiresAt := failedAt.Add(gcFailedItemRetention)
+		deleted, err := store.DeleteExpiredFailedItem(GCFailedItemExpiryInfo{
+			OrgID:                    orgID,
+			FailedAt:                 failedAt,
+			ExpiresAt:                expiresAt,
+			ItemType:                 ItemBlock,
+			ItemID:                   "same-block",
+			BlockGCCandidateIdentity: p1,
+		}, expiresAt.Add(time.Second))
+		if err != nil || !deleted {
+			t.Fatalf("DeleteExpiredFailedItem(P1) = (%v, %v), want (true, nil)", deleted, err)
+		}
+		if failed := store.FailedItems(orgID); len(failed) != 1 || failed[0].BlockGCCandidateIdentity != p2 {
+			t.Fatalf("failed items after expiry(P1) = %+v, want only P2", failed)
+		}
+	})
+
+	t.Run("expiry bucket", func(t *testing.T) {
+		store := seedFailed(t)
+		bucket := db.GCFailedItemExpiryBucket(orgID.String(), failedAt, string(ItemBlock), "same-block", p1.Target.StorageClass, p1.Target.StorageKey, p1.CandidateAt)
+		expiries, err := store.ListFailedItemExpiriesByDay(failedAt.Add(gcFailedItemRetention), bucket)
+		if err != nil {
+			t.Fatalf("ListFailedItemExpiriesByDay: %v", err)
+		}
+		if len(expiries) != 1 || expiries[0].BlockGCCandidateIdentity != p1 {
+			t.Fatalf("expiry rows for P1 bucket = %+v, want only P1", expiries)
+		}
+	})
 }

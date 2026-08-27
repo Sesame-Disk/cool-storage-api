@@ -443,14 +443,15 @@ func TestGC_BlockDeletion_RemovesObjectFromS3(t *testing.T) {
 	// promoteBlockIfUnreferenced), so a test that enqueues a raw queue row without one
 	// is not exercising a state production can produce.
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, queuedAt); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, queuedAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
 	// Enqueue the block directly with a past timestamp so it clears the grace
 	// period immediately; EnqueueItem also marks the org active so the real
 	// server worker will dequeue it.
-	if err := store.EnqueueItem(orgID, queuedAt, gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
+	if err := enqueueExactBlockCandidateForTest(store, candidate, queuedAt); err != nil {
+		t.Fatalf("enqueue exact block candidate: %v", err)
 	}
 
 	// Drive the real server worker until the canonical row disappears.

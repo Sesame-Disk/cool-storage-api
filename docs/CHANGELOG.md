@@ -8,6 +8,183 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-26 - R26 exact-`P` GC work-item identity (candidate / projection / queue / pending / DLQ)
+
+Makes the exact physical incarnation part of the durable IDENTITY of a GC work item,
+not a payload column riding beside it. P4a bound destructive AUTHORITY to an exact
+`P = (storage_class, storage_key)`; this binds the ROWS. Two lives of one logical block
+now occupy two rows on every surface that carries GC work.
+
+**The defect this closes.** `gc_block_candidates` was keyed `((org_id, block_id))` — one
+logical row per block — so a lifecycle that started on `P1` and finished after `P2` was
+minted had to *decide* which life owned that row. `replaceBlockGCCandidateIncarnation`
+made that decision by rewriting the row from one incarnation to another, and a delayed
+`Ensure(P1)` could therefore destroy the only candidate authorizing `P2`. Not a wrong
+delete — a lost work item, silently, with no fence left behind to notice. The queue,
+pending and DLQ tables had the same shape one layer out: keyed on the logical block, so
+`P1` and `P2` collapsed back into one row immediately after discovery.
+
+CAS could not fix this. `blocks` and `gc_block_candidates` are different surfaces, so an
+extra `SERIAL` read only moves the TOCTOU; the fix is structural.
+
+**What changed**
+- Migration `018` recreates the six GC tables with `P` — and `identity_at` — as
+  clustering columns: `gc_block_candidates`, `gc_block_candidates_by_day`, `gc_queue`,
+  `gc_pending_items`, `gc_failed_items`, `gc_failed_items_by_expiry`. Cassandra cannot
+  add clustering columns by `ALTER`, so these are dropped and recreated. It consolidates
+  everything `003`/`010`/`011` had added (LCS + tombstone settings, `block_representation_id`,
+  `library_guard_mode`, TTLs, clustering order).
+- `replaceBlockGCCandidateIncarnation` is DELETED. The operation it expressed — one
+  incarnation replacing another inside a single row — no longer exists, and with it the
+  ~25 lines of pre-017 legacy handling: a candidate with a NULL `storage_key` cannot exist
+  when the key is part of the primary key. Earliest-wins is now scoped to one `P`.
+- `GCItemIdentity{IdentityAt, BlockCandidate}` is a REQUIRED argument on every store
+  method that addresses a durable row. It replaces variadic `candidate ...` parameters
+  where omitting the identity compiled and silently operated on the `('','')` row. The
+  compiler now rejects that.
+- The DLQ admin selector names `identity_at` for EVERY item type, not just blocks.
+  `identity_at` is a clustering column of `gc_failed_items` for all of them, so the old
+  prefix + `LIMIT 1` read could delete or requeue a different lifecycle than the operator
+  was looking at.
+- `DeleteBlockGCCandidate` retires its discovery row on BOTH CAS outcomes, and reports a
+  failure instead of logging it. Previously a settlement whose canonical half applied and
+  whose projection half failed left a shape with no exit: the scanner re-enumerated the
+  orphaned projection, rebuilt the same work item, the worker correctly no-op'd it, and
+  the next scan produced it again — forever. The worker retires the row on that path too.
+  Deleting it unconditionally is safe ONLY because the projection is now keyed by the full
+  identity: the statement can name `P1`'s row and nothing else.
+- A failed discovery cleanup POSTPONES for every failure reason, not only the ones
+  the availability classifier recognises. It previously routed through
+  `failClosedIfUnavailable`, which postpones an outage but returns a plain error for
+  anything else — so a permanent failure spent a retry, five of them parked the item
+  in a DLQ `ItemBlock` never leaves, and the discovery row it could not retire
+  re-enqueued the identical item once the DLQ row expired. The same loop the fix
+  above closes, running at retention pace instead of scan pace. The classifier now
+  drives the signal, never the queue policy — the rule the stale-claim release beside
+  it already followed.
+- `EnqueueItem` refuses `ItemBlock`. A block work item is legitimate only when a zero-ref
+  DECISION produced a candidate for an exact `P`; the raw single-row path has none to
+  carry, and minting one there let "enqueue" fabricate destructive authority.
+- The DLQ expiry projection has ONE writer surface again. `internal/db` owns both halves
+  of its key — the columns and the bucket hash, now named `GCFailedItemExpiryBucket` — and
+  the duplicate copies in the GC store are gone, along with two block-candidate discovery
+  helpers that had no production caller. Same single-writer rule R22a enforces for orphans.
+
+**The candidate authority read is now in the serial domain.** `GetBlockGCCandidateExact`
+read at the session level while every write to `gc_block_candidates` is an LWT, so an
+ordinary quorum read could miss an accepted-but-not-yet-committed candidate and answer
+"not found" for a row that exists. That answer is what authorizes the self-heal above: it
+retires the discovery row and then completes the queue row and its pending marker — the
+only durable references to that candidate, because discovery walks
+`gc_block_candidates_by_day` and nothing enumerates the canonical table. One stale read
+therefore stranded a LIVE candidate with no path back, and `Ensure` runs only on the
+events that first decide a block is garbage, so nothing rebuilt the projection later. Not
+a wrong delete: a zero-ref block that is never reclaimed, silently. `DeleteBlockGCCandidate`
+already established the same fact soundly — its CAS decides "no longer here" inside Paxos —
+and the read is now held to that standard, pinning `Consistency(gocql.Serial)` itself for
+the same reason `resolveBlockDeleteTarget` does.
+
+**Identity is required, not guessed.** The store's `resolved(fallback)` quietly substituted
+a row's `queued_at` or `failed_at` when a caller named no lifecycle — the same "addresses a
+row prefix while reporting success" shape this slice exists to remove, one layer further
+down. It is now `requireIdentityAt`, which fails closed; a block identity carrying only its
+`candidate_at` is still completed, because that is the same instant by construction rather
+than an unrelated timestamp. The DLQ expiry projection no longer falls back to `failed_at`
+either.
+
+**The DLQ expiry bucket is now a property of the instant, not of who holds it.**
+`gc_failed_items_by_expiry` is the only GC discovery bucket whose input includes
+timestamps — every other one hashes ids and tokens, which survive a round-trip
+unchanged — and it is also the only durable GC surface whose partition key is
+recomputed in Go rather than read back. The write side hashed a value that had never
+been to Cassandra (`FailItem` takes the worker's clock, which is `time.Now` and carries
+nanoseconds) while every delete hashed the same instant after it had come back as a
+TIMESTAMP, holding milliseconds. The two disagreed, so the DELETE named a different
+partition than the INSERT: Cassandra reported success, the row stayed where it was, and
+the sweep that walks every bucket rediscovered it forever — with its canonical DLQ row
+already gone, so the orphan branch ran and recomputed the same unreachable bucket. The
+bucket now hashes the durable form of both timestamps. Reproduced against real Cassandra
+before the fix, in a test that deliberately does not truncate its fixture: every existing
+one did, which is exactly the input that hid this.
+
+Migration `018` itself is pre-production scaffolding: it drops and recreates the six GC
+tables against dev/staging keyspaces that are rebuilt at will, and the whole migration set
+folds into the initial schema for a clean production deploy once X1 closes. No upgrade
+barrier is built for it, deliberately — there is no upgrade path to protect.
+
+**Evidence**
+- Mock: the `A captures P1 / P2 installed / delayed P1 enqueue` race, `same candidate_at
+  distinct P`, the rediscovery-loop self-heal, the earliest-wins stale-item path, and the
+  non-block DLQ selector.
+- Real Cassandra (`SESAMEFS_REQUIRE_R26_EVIDENCE=1`): `TestR26_TwoIncarnationsCoexistAcrossEveryDurableSurface`
+  proves candidate, projection, queue and pending each hold `P1` and `P2` as separate rows
+  and that settling `P1` leaves every `P2` row standing. `TestR26_SameIdentityAtDistinctPRemainIndependent`
+  is the load-bearing half: it pins `candidate_at`, `identity_at` and `queued_at` to ONE
+  instant, so `P` is the only thing Cassandra can use to keep the two lifecycles apart.
+  Three of the four keys carry a timestamp of their own, so a fixture with distinct
+  timestamps would hold two rows whether or not `P` is in the key. A map-backed mock keeps rows apart
+  under any key the Go code invents; only the engine can answer this. Plus the exact-identity
+  discovery retire and the non-block DLQ selector.
+- Source gates: `TestR26MutationsNameTheExactIdentity` (no mutation may address a row
+  prefix), `TestR26SingleRowReadsNameTheExactIdentity`,
+  `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`, and
+  `TestR26AnyIdentityIsNeverPassedToAMutation` — the "any lifecycle" dedup probe is the
+  one value that does not name a row, and it must never reach a write. The mutation guard
+  reads BOTH writer surfaces: the canonical store and internal/db, which owns the DLQ
+  expiry projection's key. `TestR26CandidateAuthorityReadUsesTheSerialDomain` pins the
+  consistency level of the read whose absence retires a lifecycle: in a single-node test
+  cluster an ordinary and a serial read return the same thing, so no behavioural test
+  can tell them apart and the downgrade would stay green everywhere.
+- `TestEveryEvidenceGateIsWiredIntoTestMain` discovers every SESAMEFS_REQUIRE_*_EVIDENCE
+  the integration package uses and requires it in TestMain's chain. The rule was a
+  comment, and the comment did not hold: R26 reached docker-compose and its own tests
+  while the chain kept only P2/P3/P4A, so a standalone R26 evidence run against a dead
+  stack would have exited 0. Masked in the standard run only because P4A is set beside
+  it and P4A *was* wired — the evidence was never false, but the variable did not honour
+  its own contract.
+- SCHEMA gates, because everything above reads Go and the keys live in CQL: dropping
+  `P` from a PRIMARY KEY changes no runtime statement, so every other gate stays green
+  while a freshly migrated keyspace collapses `P1` and `P2` back into one row. They read
+  the EFFECTIVE schema — every migration in version order, last `CREATE TABLE` wins — so
+  they keep working when the set is folded into the initial schema.
+  `TestR26MigrationDeclaresTheExactIdentityKeys` asserts the
+  identity columns as an ORDERED SUFFIX of each key, and
+  `TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey` asserts the matching
+  absence — `candidate_at` must stay a mutable value or every re-decision becomes
+  another row.
+- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **35 mutations**, each
+  removing one invariant and each required to go red with the matching assertion. Twelve
+  are new, including two that edit the MIGRATION itself, one that unpins the candidate
+  authority read's consistency level, and one that hashes the expiry bucket at the
+  caller's precision. Three pieces of existing evidence had
+  quietly stopped proving anything and are repaired here: a P4a mutation stopped applying
+  when the candidate `DELETE` moved `P` from its `IF` into its `WHERE` (aborting the whole
+  run), `TestP4A_ReplacedCandidateServesItsOwnGracePeriod` stopped reaching the grace check
+  at all, and `TestP4ACandidateRetryLoopIsBounded` was inspecting a two-line wrapper.
+
+**Scope.** This closes the block-candidate / work-item half of R26. The `gc_s3_orphans` and
+`gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains
+OPEN, as do P4b/R14b, R15 and the orphan-side R20. `GC_ENABLED=false` continues.
+
+**Deliberately left out, and written down rather than remembered.** One item is deferred with
+an owner: `TECHNICAL-DEBT.md` → *GC work-item identity: creation and durable lookup share one
+constructor* (splitting `QueueItem.Identity()` into a creation form and a durable-lookup form,
+correct today but wide to change). It is cross-referenced from the P4c entry in
+`GC-X1-CLOSURE-OPTIONS.md`.
+
+A second one was filed and then **withdrawn**, which is worth recording because the reasoning
+that produced it is easy to repeat. The claim was that the admin DLQ selector, which parses
+RFC3339Nano, could carry sub-millisecond precision and match no row. It cannot: gocql marshals
+a `time.Time` parameter as `Unix()*1e3 + Nanosecond()/1e6`, so the driver normalizes it on the
+way out and the `WHERE` matches the stored value. The boundary rule is narrower than "sub-ms is
+dangerous" — a value that reaches Cassandra as a PARAMETER is normalized for free, and only a
+value the code turns into a key ITSELF, in Go, needs explicit help. The expiry bucket was the
+second kind, which is why it was a real defect and the selector is not.
+`TestCassandraTimestampBindingNormalizesSubMillisecondParameters` pins the first kind against
+the real engine so the claim is not re-derived from first principles a third time.
+
+---
+
 ## 2026-08-26 - P4a exact-`P`, per-attempt GC claim authority (R14a / R16 / R20 claim path)
 
 Fixes the identity of the destructive claim. A candidate created for one physical

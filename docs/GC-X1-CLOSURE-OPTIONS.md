@@ -264,7 +264,28 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
 - **P4b — claim → orphan publication binding (R14b, R15, R20 orphan path).** OPEN. Carries
   P4a's authority into `StartBlockDeleteOrphan` so a worker that lost ownership cannot
   publish or mutate orphan state.
-- **P4c — orphan and projection lifecycle (R19, R26).** OPEN.
+- **P4c — candidate / work-item identity (R26, block half).** ✅ IMPLEMENTED (migration
+  `018`). `P = (storage_class, storage_key)` is part of the PRIMARY KEY of
+  `gc_block_candidates` and `gc_block_candidates_by_day`, and of `gc_queue`,
+  `gc_pending_items`, `gc_failed_items` and `gc_failed_items_by_expiry` alongside
+  `identity_at`, so two lives of one logical block occupy two rows on every durable
+  surface. `replaceBlockGCCandidateIncarnation` is gone: an incarnation no longer
+  replaces another inside one row, so a delayed `P1` lifecycle cannot destroy `P2`'s
+  candidate, its discoverability or its work item. Settlement retires its own discovery
+  row on both CAS outcomes, which makes an interrupted settlement self-healing instead
+  of an unbounded rediscovery loop.
+- **Deferred out of P4c, neither blocking nor forgotten.** `TECHNICAL-DEBT.md`
+  → *GC work-item identity: creation and durable lookup share one constructor*:
+  `QueueItem.Identity()` still derives `identity_at` from `queued_at`, which is correct at
+  creation and merely untidy afterwards; splitting it into `identityForCreation()` /
+  `durableIdentity()` is a wide mechanical change best done when P4c-orphan revisits the
+  same plumbing.
+- **P4c-orphan — orphan projection lifecycle (R19, R26 orphan half).** OPEN.
+  `gc_s3_orphans` and `gc_s3_orphans_by_day` are still keyed `(org_id, block_id)` /
+  `(…, first_seen_at, org_id, block_id)` with `P` as payload, and `DeleteS3Orphan`
+  resolves a zero `firstSeenAt` from whatever canonical row is current. The rule R26
+  states — fold `P` into the projection's identity — is applied to the candidate
+  projection here and still owed to the orphan one.
 - **P4 — exact-`P` destructive lifecycle (R14, R19, R20, R26).** Tuple-bound GC, orphan,
   candidate and projection lifecycle: claim/finalize CAS naming `P`, and `_by_day`
   identity including it. The orphan's *locator* handoff is not deferred to here — it
@@ -492,6 +513,9 @@ gets the key from the canonical row it already loads, and P1 adds a regular colu
 to one table. Folding `P` into the projection's *identity* (R26) is a different and
 larger change: a key column cannot be added by `ALTER`, so it means a new table and
 a revised identity contract. That belongs in P4, and nothing in P1 requires it.
+Migration `018` has since done exactly that for the CANDIDATE projection
+(`gc_block_candidates_by_day`), by dropping and recreating it; the same treatment of
+`gc_s3_orphans_by_day` remains open under P4c-orphan.
 
 The honest summary is that P1's cost is concentrated in the writer work of step 1
 and in the delete-path plumbing above, not in read amplification. An earlier draft

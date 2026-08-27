@@ -23,12 +23,9 @@ import (
 func p4aSeedBlockCandidate(t *testing.T, store *MockStore, orgID uuid.UUID, blockID string) BlockGCCandidateInfo {
 	t.Helper()
 	store.AddBlock(orgID, blockID, "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().Add(-2*time.Hour)); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
-	}
-	candidate, ok, err := store.GetBlockGCCandidate(orgID, blockID)
-	if err != nil || !ok {
-		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().Add(-2*time.Hour))
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
 	return candidate
 }
@@ -203,12 +200,9 @@ func TestP4A_StaleLifecycleCannotConsumeTheNewIncarnationsCandidate(t *testing.T
 
 	// The incarnation changes and a new candidate is decided for it.
 	store.SetBlockStorageKeyForTest(orgID, "blk-cand-aba", old.Target.StorageKey+".remint")
-	if _, err := store.EnsureBlockGCCandidate(orgID, "blk-cand-aba", "hot", time.Now()); err != nil {
+	fresh, err := store.EnsureBlockGCCandidateExact(orgID, "blk-cand-aba", "hot", time.Now())
+	if err != nil {
 		t.Fatalf("EnsureBlockGCCandidate for the new incarnation: %v", err)
-	}
-	fresh, ok, err := store.GetBlockGCCandidate(orgID, "blk-cand-aba")
-	if err != nil || !ok {
-		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
 	}
 	if fresh.Target == old.Target {
 		t.Fatal("the candidate did not follow the new incarnation")
@@ -221,7 +215,185 @@ func TestP4A_StaleLifecycleCannotConsumeTheNewIncarnationsCandidate(t *testing.T
 		t.Fatalf("stale candidate cleanup must be a safe no-op, got: %v", err)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 1 {
-		t.Fatalf("candidate rows = %d, want 1: a stale lifecycle consumed the live incarnation's work item", got)
+		t.Fatalf("candidate rows = %d, want 1: exact cleanup of P1 must preserve P2", got)
+	}
+}
+
+// TestP4A_DelayedP1EnqueueSettlesOnlyP1AndLeavesP2Claimable models the stale
+// Ensure P1 versus fresh P2 race. A captures P1, then waits before enqueueing;
+// meanwhile P2 becomes canonical and B decides and enqueues it. A's delayed P1
+// item must settle only its own dead incarnation, leaving P2's candidate,
+// discovery projection, queue row, and pending row available for P2's lifecycle.
+func TestP4A_DelayedP1EnqueueSettlesOnlyP1AndLeavesP2Claimable(t *testing.T) {
+	store := NewMockStore()
+	storage := &MockStorageProvider{}
+	queue := NewQueue(store)
+	worker := NewWorker(store, storage, queue, 1, time.Hour, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("blk-delayed-p1")
+	p1At := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	p2At := p1At.Add(time.Second)
+	store.AddBlock(orgID, blockID, "hot", 0)
+
+	// A captures the candidate while P1 is canonical, then stalls before enqueueing it.
+	p1, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", p1At)
+	if err != nil {
+		t.Fatalf("A EnsureBlockGCCandidateExact(P1): %v", err)
+	}
+
+	// P1 is replaced. B observes P2, decides its own candidate, and enqueues it first.
+	store.SetBlockStorageKeyForTest(orgID, blockID, p1.Target.StorageKey+".00000000-0000-0000-0000-000000000002")
+	p2, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", p2At)
+	if err != nil {
+		t.Fatalf("B EnsureBlockGCCandidateExact(P2): %v", err)
+	}
+	if p1.Target == p2.Target {
+		t.Fatal("P2 reused P1's physical candidate identity")
+	}
+	enqueueExactBlockCandidateForTest(t, store, p2, 0)
+
+	// A wakes and enqueues exactly the candidate it captured before the replacement.
+	enqueueExactBlockCandidateForTest(t, store, p1, 0)
+
+	for _, candidate := range []BlockGCCandidateInfo{p1, p2} {
+		if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
+			t.Fatalf("exact candidate %s: ok=%v err=%v", candidate.Target, ok, err)
+		}
+		if exists, err := store.QueueItemExists(orgID, candidate.CandidateAt, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("queue identity for %s: exists=%v err=%v", candidate.Target, exists, err)
+		}
+		if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("pending identity for %s: exists=%v err=%v", candidate.Target, exists, err)
+		}
+	}
+	if queued := store.QueueItems(orgID); len(queued) != 2 {
+		t.Fatalf("queue rows = %d, want 2 exact P1 and P2 identities", len(queued))
+	}
+	bucket := db.GCDiscoveryBucket(orgID.String(), blockID)
+	if projected, err := store.ListBlockGCCandidatesByDay(p1At, bucket); err != nil || len(projected) != 2 {
+		t.Fatalf("coexisting candidate projections: rows=%d err=%v, want 2", len(projected), err)
+	}
+
+	// P1 is older in the queue, so its stale lifecycle reaches TargetChanged first.
+	if processed, err := worker.ProcessOrgOnce(context.Background(), orgID); err != nil || processed != 1 {
+		t.Fatalf("process stale P1: processed=%d err=%v, want 1/nil", processed, err)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, p1.Identity()); err != nil || ok {
+		t.Fatalf("P1 candidate after TargetChanged: ok=%v err=%v, want removed", ok, err)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, p2.Identity()); err != nil || !ok {
+		t.Fatalf("P2 candidate after P1 TargetChanged: ok=%v err=%v, want preserved", ok, err)
+	}
+	if projected, err := store.ListBlockGCCandidatesByDay(p1At, bucket); err != nil || len(projected) != 1 || projected[0].Target != p2.Target {
+		t.Fatalf("projection after P1 TargetChanged: rows=%+v err=%v, want only P2", projected, err)
+	}
+	if queued := store.QueueItems(orgID); len(queued) != 1 || queued[0].BlockGCCandidateIdentity != p2.Identity() {
+		t.Fatalf("queue after P1 TargetChanged = %+v, want only P2", queued)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P1 pending after settlement: exists=%v err=%v, want removed", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
+		t.Fatalf("P2 pending after P1 settlement: exists=%v err=%v, want preserved", exists, err)
+	}
+	if deletes := storage.ScopedBlockDeletes(); len(deletes) != 0 {
+		t.Fatalf("P1 TargetChanged deleted physical data: %+v", deletes)
+	}
+
+	// P2 has served its grace period and reaches its own ordinary claim/delete lifecycle.
+	if processed, err := worker.ProcessOrgOnce(context.Background(), orgID); err != nil || processed != 1 {
+		t.Fatalf("process P2: processed=%d err=%v, want 1/nil", processed, err)
+	}
+	attempts := store.ClaimAttemptsForTest()
+	if len(attempts) != 2 || attempts[0].Target != p1.Target || attempts[1].Target != p2.Target {
+		t.Fatalf("claim targets = %+v, want P1 then P2", attempts)
+	}
+	if store.GetBlock(orgID, blockID) != nil {
+		t.Fatal("P2 canonical row survived its own unreferenced lifecycle")
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("candidates after P2 lifecycle = %d, want 0", got)
+	}
+	if queued := store.QueueItems(orgID); len(queued) != 0 {
+		t.Fatalf("queue after P2 lifecycle = %+v, want empty", queued)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P2 pending after lifecycle: exists=%v err=%v, want removed", exists, err)
+	}
+	if deletes := storage.ScopedBlockDeletes(); len(deletes) != 1 || deletes[0].StorageKey != p2.Target.StorageKey {
+		t.Fatalf("physical deletes = %+v, want only P2 %q", deletes, p2.Target.StorageKey)
+	}
+}
+
+// TestP4A_SameCandidateAtDistinctTargetsKeepIndependentQueueAndPendingIdentity
+// proves the physical queue and pending keys include P. Two candidates with the
+// same logical block and candidate_at differ only by their physical locator; neither
+// may overwrite or complete the other.
+func TestP4A_SameCandidateAtDistinctTargetsKeepIndependentQueueAndPendingIdentity(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("blk-same-candidate-at")
+	candidateAt := time.Date(2020, time.January, 3, 4, 5, 6, 0, time.UTC)
+	store.AddBlock(orgID, blockID, "hot", 0)
+
+	p1, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", candidateAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact(P1): %v", err)
+	}
+	store.SetBlockStorageKeyForTest(orgID, blockID, p1.Target.StorageKey+".00000000-0000-0000-0000-000000000002")
+	p2, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", candidateAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact(P2): %v", err)
+	}
+	if p1.Target == p2.Target || !p1.CandidateAt.Equal(p2.CandidateAt) {
+		t.Fatalf("candidate identities = %+v / %+v, want distinct P at the same candidate_at", p1.Identity(), p2.Identity())
+	}
+
+	for _, candidate := range []BlockGCCandidateInfo{p1, p2} {
+		if err := queue.EnqueueBatch([]QueueItem{{
+			OrgID:                    orgID,
+			QueuedAt:                 candidateAt,
+			IdentityAt:               candidateAt,
+			ItemType:                 ItemBlock,
+			ItemID:                   blockID,
+			LibraryID:                uuid.Nil,
+			StorageClass:             candidate.StorageClass(),
+			BlockGCCandidateIdentity: candidate.Identity(),
+		}}); err != nil {
+			t.Fatalf("EnqueueBatch(%s): %v", candidate.Target, err)
+		}
+	}
+
+	for _, candidate := range []BlockGCCandidateInfo{p1, p2} {
+		if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("queue identity for %s: exists=%v err=%v", candidate.Target, exists, err)
+		}
+		if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, candidate.ItemIdentity()); err != nil || !exists {
+			t.Fatalf("pending identity for %s: exists=%v err=%v", candidate.Target, exists, err)
+		}
+	}
+	if queued := store.QueueItems(orgID); len(queued) != 2 {
+		t.Fatalf("queue rows = %d, want 2 despite identical logical id and candidate_at", len(queued))
+	}
+
+	// Exact completion of P1 must leave the physically distinct P2 row and pending
+	// identity in place; this is the operation a collapsed physical queue key loses.
+	if err := store.CompleteItem(orgID, candidateAt, ItemBlock, blockID, p1.ItemIdentity()); err != nil {
+		t.Fatalf("CompleteItem(P1): %v", err)
+	}
+	if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P1 queue after exact completion: exists=%v err=%v, want removed", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p1.ItemIdentity()); err != nil || exists {
+		t.Fatalf("P1 pending after exact completion: exists=%v err=%v, want removed", exists, err)
+	}
+	if exists, err := store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
+		t.Fatalf("P2 queue after P1 completion: exists=%v err=%v, want preserved", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, p2.ItemIdentity()); err != nil || !exists {
+		t.Fatalf("P2 pending after P1 completion: exists=%v err=%v, want preserved", exists, err)
 	}
 }
 
@@ -237,9 +409,7 @@ func TestP4A_FreshOwnerDoesNotSettleTheCandidate(t *testing.T) {
 	orgID := uuid.New()
 	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-fresh")
 	store.SeedBlockClaimForTest(orgID, "blk-fresh", "another-live-attempt", time.Now())
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, "blk-fresh", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce: %v", err)
@@ -397,9 +567,8 @@ func TestP4A_CandidateWithoutAnExactIncarnationIsNeverDestructiveAndNeverConsume
 	// A candidate row that lost its incarnation. EnsureBlockGCCandidate cannot produce
 	// this, so reaching it means the table was written behind that helper's back.
 	store.SetBlockGCCandidateTargetForTest(orgID, "blk-no-key", BlockDeleteTarget{})
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-no-key", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	candidate := store.AllBlockGCCandidates()[0]
+	store.SeedExactBlockQueueItemForTest(orgID, candidateAt, "blk-no-key", "hot", candidate.Identity(), 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce: %v", err)
@@ -431,9 +600,7 @@ func TestP4A_AmbiguousClaimSettlesBeforeAnyCleanup(t *testing.T) {
 
 	orgID := uuid.New()
 	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-ambiguous")
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, "blk-ambiguous", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 	timeout := errors.New("gocql: no response received from cassandra within timeout period")
 	store.SetClaimBlockDeleteErrForTest(timeout)
 	store.SetClaimBlockDeleteSettleErrForTest(timeout)
@@ -459,12 +626,12 @@ func TestP4A_EnsureBlockGCCandidateRefusesWithoutAnExactIncarnation(t *testing.T
 	store := NewMockStore()
 	orgID := uuid.New()
 
-	if _, err := store.EnsureBlockGCCandidate(orgID, "blk-absent", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(no canonical row) = %v, want ErrBlockCandidateTargetUnavailable", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "blk-absent", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(no canonical row) = %v, want ErrBlockCandidateTargetUnavailable", err)
 	}
 	store.AddStubBlockForTest(orgID, "blk-locatorless")
-	if _, err := store.EnsureBlockGCCandidate(orgID, "blk-locatorless", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(no locator) = %v, want ErrBlockCandidateTargetUnavailable", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "blk-locatorless", "hot", time.Now()); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(no locator) = %v, want ErrBlockCandidateTargetUnavailable", err)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("candidate rows = %d, want 0: a refused capture must leave no destructive authority behind", got)
@@ -492,9 +659,7 @@ func TestP4A_EachWorkerAttemptMintsItsOwnClaimID(t *testing.T) {
 
 	orgID := uuid.New()
 	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-per-attempt")
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, "blk-per-attempt", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 
 	lastGlobal := 0
 	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
@@ -510,11 +675,9 @@ func TestP4A_EachWorkerAttemptMintsItsOwnClaimID(t *testing.T) {
 		}
 		// The re-referenced path settles the candidate; restore it so the second pass
 		// is a genuine second attempt on the same candidate rather than a no-op.
-		if _, ok, _ := store.GetBlockGCCandidate(orgID, "blk-per-attempt"); !ok {
+		if _, ok := store.GetBlockGCCandidateForTest(orgID, "blk-per-attempt"); !ok {
 			store.AddBlockGCCandidate(orgID, "blk-per-attempt", "hot", candidate.CandidateAt)
-			if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, "blk-per-attempt", uuid.Nil, "hot", 0); err != nil {
-				t.Fatalf("re-enqueue for pass %d: %v", i, err)
-			}
+			enqueueExactBlockCandidateForTest(t, store, store.AllBlockGCCandidates()[0], 0)
 		}
 	}
 
@@ -556,9 +719,7 @@ func TestP4A_DestructiveLocatorComesFromTheClaimNotAReadBack(t *testing.T) {
 	orgID := uuid.New()
 	candidate := p4aSeedBlockCandidate(t, store, orgID, testSHA256BlockID("blk-readback"))
 	p1 := candidate.Target
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, testSHA256BlockID("blk-readback"), uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 
 	// The claim succeeds against P1, and only afterwards does the canonical row read
 	// back as a different incarnation — the divergence a ONE-consistency read can show.
@@ -637,23 +798,27 @@ func TestP4A_ReplacedCandidateServesItsOwnGracePeriod(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, grace, false, &Stats{})
 
 	orgID := uuid.New()
-	p4aSeedBlockCandidate(t, store, orgID, testSHA256BlockID("blk-grace"))
-	// An old queue item that has long since cleared the grace period.
-	if err := store.EnqueueItem(orgID, time.Now().Add(-24*time.Hour), ItemBlock, testSHA256BlockID("blk-grace"), uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	blockID := testSHA256BlockID("blk-grace")
+	store.AddBlock(orgID, blockID, "hot", 0)
 
-	// The candidate is re-decided and carries a fresh candidate_at. The incarnation is
-	// deliberately left ALONE: changing it would make the walk abort on locator
-	// validation instead, and the test would pass without ever reaching the grace check.
-	store.AddBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"), "hot", time.Now())
-	fresh, ok, err := store.GetBlockGCCandidate(orgID, testSHA256BlockID("blk-grace"))
-	if err != nil || !ok {
-		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
+	// THE GRACE PERIOD BELONGS TO THE CANDIDATE, NOT TO THE QUEUE ROW, and this is
+	// the state that separates the two: a queue row whose queued_at cleared the
+	// grace window long ago, pointing at a candidate decided moments ago.
+	//
+	// The item carries that candidate's EXACT identity, which is what makes this
+	// test reach the grace check at all. An earlier version re-decided the
+	// candidate with a fresh candidate_at and left the queue item on the old one;
+	// under exact-P identity the worker then settled it as unauthorized and
+	// returned long before the grace comparison, so the gate it meant to pin was
+	// never executed and the mutation harness could not turn it red.
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now())
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
-	if fresh.Target.IsZero() {
-		t.Fatal("the re-decided candidate lost its incarnation; this test must reach the grace check, not a locator refusal")
+	if candidate.Target.IsZero() {
+		t.Fatal("the candidate lost its incarnation; this test must reach the grace check, not a locator refusal")
 	}
+	enqueueExactBlockCandidateAtForTest(t, store, candidate, time.Now().Add(-24*time.Hour), 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Logf("ProcessOnce returned %v (a postponement is the correct outcome)", err)
@@ -661,35 +826,10 @@ func TestP4A_ReplacedCandidateServesItsOwnGracePeriod(t *testing.T) {
 	if deletes := sp.ScopedBlockDeletes(); len(deletes) != 0 {
 		t.Fatalf("deleted a freshly decided incarnation inside its grace period: %+v", deletes)
 	}
-	if blk := store.GetBlock(orgID, testSHA256BlockID("blk-grace")); blk == nil || blk.GCState != "" {
+	if blk := store.GetBlock(orgID, blockID); blk == nil || blk.GCState != "" {
 		t.Fatalf("claimed a freshly decided incarnation inside its grace period (block=%+v)", blk)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 1 {
 		t.Fatalf("candidate rows = %d, want 1: postponing must not consume the work item", got)
-	}
-}
-
-// TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted: a candidate row written before
-// migration 017 has a NULL storage_key. It cannot be repaired by a CAS that names the
-// key — which is what used to spin the retry loop forever, one Paxos round at a time —
-// and it must not be silently adopted as today's incarnation either, because it was
-// authorized for whatever incarnation was live when it was created.
-func TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted(t *testing.T) {
-	store := NewMockStore()
-	orgID := uuid.New()
-	store.AddBlock(orgID, "blk-legacy", "hot", 0)
-	store.AddBlockGCCandidate(orgID, "blk-legacy", "hot", time.Now().Add(-24*time.Hour))
-	store.SetBlockGCCandidateTargetForTest(orgID, "blk-legacy", BlockDeleteTarget{StorageClass: "hot"})
-
-	_, err := store.EnsureBlockGCCandidate(orgID, "blk-legacy", "hot", time.Now())
-	if !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate over a pre-017 row = %v, want ErrBlockCandidateTargetUnavailable", err)
-	}
-	got, ok, _ := store.GetBlockGCCandidate(orgID, "blk-legacy")
-	if !ok {
-		t.Fatal("the pre-017 candidate was consumed; promoting it needs a fresh zero-ref decision, not a delete")
-	}
-	if got.Target.StorageKey != "" {
-		t.Fatalf("the pre-017 candidate was reinterpreted as %s; nothing ever decided that incarnation was garbage", got.Target)
 	}
 }

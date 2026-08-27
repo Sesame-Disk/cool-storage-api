@@ -42,6 +42,7 @@ type QueueItem struct {
 	LibraryID                   uuid.UUID
 	BlockRepresentationID       string
 	StorageClass                string
+	BlockGCCandidateIdentity    BlockGCCandidateIdentity
 	RetryCount                  int
 }
 
@@ -74,7 +75,7 @@ func NewQueue(store GCStore) *Queue {
 
 // Enqueue inserts an item into the gc_queue for later deletion.
 func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
-	if itemTypeRequiresBlockRepresentation(itemType) {
+	if itemTypeRequiresBlockRepresentation(itemType) || itemType == ItemBlock {
 		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
 	}
 	return q.store.EnqueueItem(orgID, time.Now(), itemType, itemID, libraryID, storageClass, 0)
@@ -85,7 +86,7 @@ func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libra
 // cascade children become immediately eligible for processing — they are known
 // to be unreferenced (the parent object is being deleted).
 func (q *Queue) EnqueueCascade(orgID uuid.UUID, parentQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
-	if itemTypeRequiresBlockRepresentation(itemType) {
+	if itemTypeRequiresBlockRepresentation(itemType) || itemType == ItemBlock {
 		return fmt.Errorf("item type %s requires explicit block representation; use EnqueueBatch", itemType)
 	}
 	return q.store.EnqueueItem(orgID, parentQueuedAt, itemType, itemID, libraryID, storageClass, 0)
@@ -107,6 +108,9 @@ func (q *Queue) EnqueueBatch(items []QueueItem) error {
 		if err := validateQueueItemBlockRepresentation(item); err != nil {
 			return err
 		}
+		if err := validateQueueItemBlockCandidateIdentity(item); err != nil {
+			return err
+		}
 	}
 	return q.store.EnqueueBatch(items)
 }
@@ -119,14 +123,20 @@ func (q *Queue) DequeueBatch(orgID uuid.UUID, batchSize int, minAge time.Duratio
 }
 
 // Complete removes a processed item from the gc_queue.
-func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error {
-	return q.store.CompleteItem(orgID, queuedAt, itemType, itemID)
+//
+// Block items must carry their exact candidate identity. Without it, a
+// completion can address no Cassandra row while appearing successful.
+func (q *Queue) Complete(item QueueItem) error {
+	if err := validateQueueItemBlockCandidateIdentity(item); err != nil {
+		return fmt.Errorf("cannot complete queue item: %w", err)
+	}
+	return q.store.CompleteItem(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID, item.Identity())
 }
 
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), item.RequiresLibraryDeletedCheck, item.LibraryGuardMode)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.BlockRepresentationID, item.StorageClass, item.RetryCount+1, item.Identity(), item.RequiresLibraryDeletedCheck, item.LibraryGuardMode)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.

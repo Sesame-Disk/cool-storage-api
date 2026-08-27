@@ -68,17 +68,12 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 		{
 			function: "DeleteBlockGCCandidate",
 			query:    "DELETE FROM gc_block_candidates",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
+			columns:  []string{"candidate_at = ?"},
 		},
 		{
 			function: "advanceBlockGCCandidateAt",
 			query:    "UPDATE gc_block_candidates SET candidate_at",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
-		},
-		{
-			function: "replaceBlockGCCandidateIncarnation",
-			query:    "UPDATE gc_block_candidates SET candidate_at",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "candidate_at = ?"},
+			columns:  []string{"candidate_at = ?"},
 		},
 	} {
 		fn := findGCFunction(file, want.function)
@@ -99,6 +94,22 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 		for _, column := range want.columns {
 			if !strings.Contains(condition, column) {
 				t.Errorf("%s statement %q must condition on %q; without it a lifecycle for one incarnation can act on another (R14). Got IF clause: %s", want.function, want.query, column, condition)
+			}
+		}
+		// gc_block_candidates is keyed by ((org_id, block_id), storage_class,
+		// storage_key), so P lives in the WHERE clause rather than the IF. Both
+		// halves are load-bearing and are asserted separately: the IF pins the
+		// lifecycle instant, the WHERE pins the incarnation. Dropping the WHERE
+		// half restores exactly the R26 defect — a delayed P1 lifecycle addressing
+		// whatever candidate now sits on the logical block.
+		if want.function == "DeleteBlockGCCandidate" || want.function == "advanceBlockGCCandidateAt" {
+			for _, column := range []string{"storage_class = ?", "storage_key = ?"} {
+				if !strings.Contains(statement, column) {
+					t.Errorf("%s statement %q must name %q in its exact key, or a lifecycle for one incarnation addresses another (R26): %s", want.function, want.query, column, statement)
+				}
+			}
+			if strings.Contains(condition, "storage_class = ?") || strings.Contains(condition, "storage_key = ?") {
+				t.Errorf("%s statement %q puts P in the IF clause; P is part of the PRIMARY KEY and belongs in WHERE, where it selects the row rather than merely checking it: %s", want.function, want.query, statement)
 			}
 		}
 	}
@@ -178,10 +189,10 @@ func TestP4ACandidatesCarryTheExactKeyAndNeverDeriveIt(t *testing.T) {
 	file := p4aParseStore(t)
 
 	for _, want := range []struct{ function, query string }{
-		{"EnsureBlockGCCandidate", "INSERT INTO gc_block_candidates"},
+		{"EnsureBlockGCCandidateExact", "INSERT INTO gc_block_candidates"},
 		{"upsertBlockGCCandidateProjection", "INSERT INTO gc_block_candidates_by_day"},
 		{"moveBlockGCCandidateProjection", "INSERT INTO gc_block_candidates_by_day"},
-		{"GetBlockGCCandidate", "FROM gc_block_candidates"},
+		{"GetBlockGCCandidateExact", "FROM gc_block_candidates"},
 		{"ListBlockGCCandidatesByDay", "FROM gc_block_candidates_by_day"},
 	} {
 		fn := findGCFunction(file, want.function)
@@ -309,13 +320,8 @@ func TestP4AStaleClaimReleaseNamesAnIncarnation(t *testing.T) {
 	}
 }
 
-// TestP4ACandidateCaptureUsesTheSerialDomain: the read that decides whether an existing
-// candidate is REPLACED must be linearizable.
-//
-// A lagging read can move a candidate backward — canonical row already at P2, candidate
-// correctly at P2, stale read returns P1, the two differ, replacement fires — and the
-// worker then claims P1, gets TargetChanged, settles the candidate, and leaves P2 with no
-// work item at all.
+// TestP4ACandidateCaptureUsesTheSerialDomain: the read that captures a new candidate
+// must be linearizable.
 func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 	file := p4aParseStore(t)
 	fn := findGCFunction(file, "resolveBlockDeleteTarget")
@@ -323,7 +329,7 @@ func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 		t.Fatal("resolveBlockDeleteTarget not found; candidate capture cannot be verified")
 	}
 	if !gcQueryMethodHas(fn, "FROM blocks", "Consistency", "Serial") {
-		t.Error("resolveBlockDeleteTarget must read at Consistency(gocql.Serial): a lagging read here silently replaces a correct candidate with a dead incarnation and loses the live one's work item")
+		t.Error("resolveBlockDeleteTarget must read at Consistency(gocql.Serial): a lagging read here can create a candidate for a dead incarnation")
 	}
 }
 
@@ -331,25 +337,38 @@ func TestP4ACandidateCaptureUsesTheSerialDomain(t *testing.T) {
 // read moments earlier, so genuine contention converges. An unbounded loop only stays
 // safe while every not-applied outcome is transient, and one is not — a CAS naming a
 // value that can never match spins forever, one Paxos round per iteration, silently.
+// TestP4ACandidateRetryLoopIsBounded inspects EnsureBlockGCCandidateExact, which
+// is where the CAS retry loop actually lives.
+//
+// It used to name EnsureBlockGCCandidate. That was correct until the exact-P
+// split moved the loop into the *Exact variant and left the old name as a
+// two-line wrapper — at which point the guard was inspecting a function with no
+// loop in it at all and would have stayed green through any regression. A source
+// guard that no longer looks at the code it protects is worse than no guard, so
+// this asserts the loop is present as well as bounded.
 func TestP4ACandidateRetryLoopIsBounded(t *testing.T) {
 	file := p4aParseStore(t)
-	fn := findGCFunction(file, "EnsureBlockGCCandidate")
+	fn := findGCFunction(file, "EnsureBlockGCCandidateExact")
 	if fn == nil {
-		t.Fatal("EnsureBlockGCCandidate not found")
+		t.Fatal("EnsureBlockGCCandidateExact not found; the CAS retry loop guard cannot be verified")
 	}
-	var unbounded bool
+	var loops, unbounded int
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		loop, ok := node.(*ast.ForStmt)
 		if !ok {
 			return true
 		}
+		loops++
 		if loop.Cond == nil {
-			unbounded = true
+			unbounded++
 		}
 		return true
 	})
-	if unbounded {
-		t.Error("EnsureBlockGCCandidate's CAS retry loop must be bounded; a non-converging condition otherwise becomes a silent Paxos hot loop")
+	if loops == 0 {
+		t.Fatal("EnsureBlockGCCandidateExact has no retry loop; either the CAS retry moved again and this guard is now vacuous, or the bound was removed with it")
+	}
+	if unbounded > 0 {
+		t.Error("EnsureBlockGCCandidateExact's CAS retry loop must be bounded; a non-converging condition otherwise becomes a silent Paxos hot loop")
 	}
 }
 

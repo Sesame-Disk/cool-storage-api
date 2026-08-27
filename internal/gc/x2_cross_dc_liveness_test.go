@@ -43,7 +43,7 @@ func TestX2_DestructiveVerifyUsesGlobalRead(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("x2-global-read-delete")
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
@@ -77,7 +77,7 @@ func TestX2_UnavailableDatacenterFailsClosed(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	store.AddBlockMapping(orgID, "sha1-abc", "block-1")
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-1", "hot", 0)
 
 	// A datacenter is unreachable: the global read errors instead of answering.
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
@@ -118,7 +118,7 @@ func TestX2_FailedVerifyDoesNotWedgeTheBlock(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// Attempt 1: a datacenter is unreachable, so the verify fails after the claim.
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
@@ -153,7 +153,7 @@ func TestX2_ReferencedBlockReleasesAStaleClaim(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// An earlier attempt claimed the row and its process died before releasing.
 	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
@@ -205,7 +205,7 @@ func TestX2_ReferencedBlockLeavesAFreshClaimAlone(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// Another worker is walking this same candidate right now and holds the claim.
 	store.SeedBlockClaimForTest(orgID, "block-1", "attempt-queuedAt", time.Now())
@@ -294,7 +294,7 @@ func TestX2_StaleClaimReleaseFailureSurvivesTheRetryBudget(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	// A real fence on a real live block: the state the release exists to clear. Aged
@@ -387,7 +387,7 @@ func TestX2_ReReferencedBlockSurvivesAFailedClaimRelease(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// The divergence, held for EVERY pass: local reads blind, global reads see the
 	// reference. The hook is shared by both readers, so it tells them apart by which
@@ -489,7 +489,7 @@ func TestX2_FailedVerifyPlusFailedReleaseDoesNotBurnTheBudget(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// The FRAME the driver actually returns for a poisoned partition, not a plain
 	// error carrying its text — a plain error can never classify as environmental
@@ -557,7 +557,7 @@ func TestX2_StaleClaimReleaseFailureKeepsTheCandidate(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	// There must be a REAL stale claim on the row, not just an injected error. The
@@ -622,7 +622,7 @@ func TestX2_TopologyGateIsArmedWithoutExplicitWiring(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("x2-topology-gate-implicit")
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
@@ -656,7 +656,7 @@ func TestX2_FailClosedDoesNotBurnTheRetryBudget(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("x2-fail-closed-retry-budget")
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 
@@ -703,7 +703,7 @@ func TestX2_UnsupportedTopologyBlocksDelete(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("x2-unsupported-topology")
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
@@ -832,7 +832,7 @@ func TestX2_RemoteReferenceVisibleToVerifyAbortsDelete(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-1", "hot", 0)
 
 	// Local reads see nothing (the write landed in another DC); the global read does.
 	callsSeen := 0

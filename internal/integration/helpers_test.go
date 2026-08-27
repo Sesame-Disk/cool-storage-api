@@ -10,6 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 )
 
 // testClient wraps an HTTP client with a base URL and auth token.
@@ -260,4 +264,21 @@ func containsEntry(entries []interface{}, key string, expected string) bool {
 		}
 	}
 	return false
+}
+
+// enqueueExactBlockCandidateForTest enqueues the block work item for exactly the
+// candidate a zero-ref decision produced. The raw single-row EnqueueItem path no
+// longer accepts ItemBlock: a block item must carry the physical incarnation its
+// candidate authorized, and only EnqueueBatch can express that.
+func enqueueExactBlockCandidateForTest(store *gcpkg.CassandraStore, candidate gcpkg.BlockGCCandidateInfo, queuedAt time.Time) error {
+	return store.EnqueueBatch([]gcpkg.QueueItem{{
+		OrgID:                    candidate.OrgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 gcpkg.ItemBlock,
+		ItemID:                   candidate.BlockID,
+		LibraryID:                uuid.Nil,
+		StorageClass:             candidate.StorageClass(),
+		BlockGCCandidateIdentity: candidate.Identity(),
+	}})
 }

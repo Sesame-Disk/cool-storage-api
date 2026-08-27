@@ -285,18 +285,18 @@ func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testi
 
 	t.Cleanup(func() {
 		_ = store.RemoveOrgFromActiveSet(orgID, time.Now().UTC().Add(time.Hour))
-		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
-			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemLibraryCascade, libraryID.String()), deletedAt, string(gcpkg.ItemLibraryCascade), libraryID.String()).Exec()
-		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
-			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemCommit, commitID), deletedAt, string(gcpkg.ItemCommit), commitID).Exec()
-		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?`,
-			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemFSObject, rootFSID), deletedAt, string(gcpkg.ItemFSObject), rootFSID).Exec()
-		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
-			orgID.String(), gcpkg.PendingItemBucket(orgID, uuid.Nil, gcpkg.ItemLibraryCascade, libraryID.String()), string(gcpkg.ItemLibraryCascade), uuid.Nil.String(), libraryID.String(), deletedAt).Exec()
-		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
-			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemCommit, commitID), string(gcpkg.ItemCommit), libraryID.String(), commitID, deletedAt).Exec()
-		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?`,
-			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemFSObject, rootFSID), string(gcpkg.ItemFSObject), libraryID.String(), rootFSID, deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemLibraryCascade, libraryID.String()), deletedAt, string(gcpkg.ItemLibraryCascade), libraryID.String(), "", "", deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemCommit, commitID), deletedAt, string(gcpkg.ItemCommit), commitID, "", "", deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_queue WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemFSObject, rootFSID), deletedAt, string(gcpkg.ItemFSObject), rootFSID, "", "", deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, uuid.Nil, gcpkg.ItemLibraryCascade, libraryID.String()), string(gcpkg.ItemLibraryCascade), uuid.Nil.String(), libraryID.String(), "", "", deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemCommit, commitID), string(gcpkg.ItemCommit), libraryID.String(), commitID, "", "", deletedAt).Exec()
+		_ = session.Query(`DELETE FROM gc_pending_items WHERE org_id = ? AND bucket = ? AND item_type = ? AND library_id = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?`,
+			orgID.String(), gcpkg.PendingItemBucket(orgID, libraryID, gcpkg.ItemFSObject, rootFSID), string(gcpkg.ItemFSObject), libraryID.String(), rootFSID, "", "", deletedAt).Exec()
 		_ = session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID.String(), commitID).Exec()
 		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID.String(), rootFSID).Exec()
 		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()

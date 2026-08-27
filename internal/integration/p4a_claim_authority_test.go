@@ -57,10 +57,11 @@ func p4aSeedCandidate(t *testing.T, orgID uuid.UUID, blockID string) (gcpkg.Bloc
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
 	target := seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond)); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	candidateAt, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond))
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact readback: %v", err)
 	}
-	candidate, ok, err := store.GetBlockGCCandidate(orgID, blockID)
+	candidate, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidateAt.Identity())
 	if err != nil || !ok {
 		t.Fatalf("GetBlockGCCandidate: ok=%v err=%v", ok, err)
 	}
@@ -157,13 +158,14 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	}
 
 	// The candidate survived every refusal — nothing settled it on a lost race.
-	if _, ok, err := store.GetBlockGCCandidate(orgID, blockID); err != nil || !ok {
+	// Named by its exact identity: with exact-P a logical block can hold several
+	// candidates, so "some candidate exists" would not be the assertion meant here.
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
 		t.Fatalf("P4A REGRESSION: the candidate was consumed by a losing attempt (ok=%v err=%v)", ok, err)
 	}
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, attemptC); err != nil || released != gcpkg.BlockReleaseReleased {
 		t.Fatalf("cleanup release = %s, %v", released, err)
 	}
-	_ = candidate
 
 	gate.observed = true
 	t.Logf("P4A_CLAIM_AUTHORITY_EVIDENCE owners=1 refused_releases=2 refused_finalizes=2 takeovers=1")
@@ -231,10 +233,11 @@ func TestP4A_StaleIncarnationCannotActOnTheLiveOne(t *testing.T) {
 	// incarnation. P2 must get its OWN candidate_at rather than inheriting P1's:
 	// inheriting it would hand the new life an artificially old timestamp and let it
 	// skip the grace period that lets in-flight writers finish.
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond)); err != nil {
+	freshCandidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().UTC().Truncate(time.Millisecond))
+	if err != nil {
 		t.Fatalf("EnsureBlockGCCandidate for P2: %v", err)
 	}
-	fresh, ok, err := store.GetBlockGCCandidate(orgID, blockID)
+	fresh, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, freshCandidate.Identity())
 	if err != nil || !ok {
 		t.Fatalf("GetBlockGCCandidate(P2): ok=%v err=%v", ok, err)
 	}
@@ -251,7 +254,7 @@ func TestP4A_StaleIncarnationCannotActOnTheLiveOne(t *testing.T) {
 	if err := store.DeleteBlockGCCandidate(orgID, blockID, staleCandidate.Identity()); err != nil {
 		t.Fatalf("stale candidate cleanup must be a safe no-op, got: %v", err)
 	}
-	surviving, ok, err := store.GetBlockGCCandidate(orgID, blockID)
+	surviving, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, freshCandidate.Identity())
 	if err != nil || !ok {
 		t.Fatalf("P4A REGRESSION: a stale lifecycle consumed the live incarnation's candidate (ok=%v err=%v)", ok, err)
 	}

@@ -24,7 +24,7 @@ func TestWorker_GracePeriod_BlocksRecentItems(t *testing.T) {
 	store.AddBlock(orgID, "block-fresh", "hot", 0)
 
 	// Enqueue the item NOW — it's within the grace period
-	store.EnqueueItem(orgID, time.Now(), ItemBlock, "block-fresh", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-fresh", "hot", time.Now(), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -55,7 +55,7 @@ func TestWorker_GracePeriod_AllowsOldItems(t *testing.T) {
 	store.AddBlock(orgID, "block-old", "hot", 0)
 
 	// Queued 2 minutes ago — past the grace period
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Minute), ItemBlock, "block-old", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-old", "hot", time.Now().Add(-2*time.Minute), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -366,9 +366,7 @@ func TestWorker_ProcessOrg_PreservesActiveOrgOnConcurrentEnqueue(t *testing.T) {
 	}
 
 	store.AddBlock(orgID, "old-block", "hot", 0)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "old-block", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("enqueue old item: %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, "old-block", "hot", queuedAt, 0)
 
 	hooked := atomic.Bool{}
 	store.removeActiveOrgHook = func(hookOrgID uuid.UUID, activeBefore time.Time) {
@@ -438,9 +436,8 @@ func TestWorker_ProcessOrg_KeepsActiveOrgWhenOnlyGraceBlockedItemsRemain(t *test
 		return base
 	}
 
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "grace-blocked", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("enqueue grace-blocked item: %v", err)
-	}
+	store.AddBlock(orgID, "grace-blocked", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "grace-blocked", "hot", queuedAt, 0)
 
 	processed, err := w.processOrg(context.Background(), orgID)
 	if err != nil {
@@ -505,7 +502,7 @@ func TestWorker_StorageLeak_LWTSkipsLiveBlock(t *testing.T) {
 	// but by the time the worker runs, another file has been uploaded
 	// that references this block — ref_count is now 1.
 	store.AddBlock(orgID, "shared-block", "hot", 1)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "shared-block", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "shared-block", "hot", time.Now().Add(-2*time.Hour), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -544,9 +541,9 @@ func TestWorker_Paginated_ProcessesMultipleOrgs(t *testing.T) {
 	store.AddBlock(orgB, "blk-b", "hot", 0)
 	store.AddBlock(orgC, "blk-c", "hot", 0)
 
-	store.EnqueueItem(orgA, time.Now().Add(-2*time.Hour), ItemBlock, "blk-a", uuid.Nil, "hot", 0)
-	store.EnqueueItem(orgB, time.Now().Add(-2*time.Hour), ItemBlock, "blk-b", uuid.Nil, "hot", 0)
-	store.EnqueueItem(orgC, time.Now().Add(-2*time.Hour), ItemBlock, "blk-c", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgA, "blk-a", "hot", time.Now().Add(-2*time.Hour), 0)
+	ensureAndEnqueueBlockForTest(t, store, orgB, "blk-b", "hot", time.Now().Add(-2*time.Hour), 0)
+	ensureAndEnqueueBlockForTest(t, store, orgC, "blk-c", "hot", time.Now().Add(-2*time.Hour), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -581,7 +578,7 @@ func TestWorker_Paginated_BatchSizeRespected(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		id := "batch-blk-" + string(rune('a'+i))
 		store.AddBlock(orgID, id, "hot", 0)
-		store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, id, uuid.Nil, "hot", 0)
+		ensureAndEnqueueBlockForTest(t, store, orgID, id, "hot", time.Now().Add(-2*time.Hour), 0)
 	}
 
 	ctx := context.Background()
@@ -608,7 +605,8 @@ func TestQueue_IncrementRetry_UpdatesTimestampAndCount(t *testing.T) {
 
 	orgID := uuid.New()
 	originalQueuedAt := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
-	store.EnqueueItem(orgID, originalQueuedAt, ItemBlock, "blk-retry", uuid.Nil, "hot", 2)
+	store.AddBlock(orgID, "blk-retry", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "blk-retry", "hot", originalQueuedAt, 2)
 
 	// Fetch the item
 	items, err := store.DequeueBatch(orgID, 1, time.Now())

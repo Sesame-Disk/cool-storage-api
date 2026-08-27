@@ -67,13 +67,9 @@ func TestQueue_EnqueueAndDequeue(t *testing.T) {
 	q := NewQueue(store)
 
 	orgID := uuid.New()
-	libID := uuid.New()
 
-	// Enqueue an item
-	err := q.Enqueue(orgID, ItemBlock, "block-1", libID, "hot")
-	if err != nil {
-		t.Fatalf("Enqueue failed: %v", err)
-	}
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", time.Now(), 0)
 
 	// DequeueBatch with 0 grace period should return the item
 	items, err := q.DequeueBatch(orgID, 10, 0)
@@ -94,7 +90,7 @@ func TestQueue_EnqueueAndDequeue(t *testing.T) {
 	}
 
 	// Complete the item
-	err = q.Complete(orgID, items[0].QueuedAt, items[0].ItemType, items[0].ItemID)
+	err = q.Complete(items[0])
 	if err != nil {
 		t.Fatalf("Complete failed: %v", err)
 	}
@@ -115,11 +111,9 @@ func TestQueue_DequeueBatch_GracePeriod(t *testing.T) {
 
 	orgID := uuid.New()
 
-	// Enqueue an item (queued at time.Now())
-	err := q.Enqueue(orgID, ItemBlock, "block-1", uuid.Nil, "hot")
-	if err != nil {
-		t.Fatalf("Enqueue failed: %v", err)
-	}
+	// Enqueue an item (queued at time.Now()).
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", time.Now(), 0)
 
 	// DequeueBatch with 1h grace period should return empty (item too new)
 	items, err := q.DequeueBatch(orgID, 10, 1*time.Hour)
@@ -146,10 +140,8 @@ func TestQueue_IncrementRetry(t *testing.T) {
 
 	orgID := uuid.New()
 
-	err := q.Enqueue(orgID, ItemBlock, "block-1", uuid.Nil, "hot")
-	if err != nil {
-		t.Fatalf("Enqueue failed: %v", err)
-	}
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", time.Now(), 0)
 
 	// Get item
 	items, _ := q.DequeueBatch(orgID, 10, 0)
@@ -162,7 +154,7 @@ func TestQueue_IncrementRetry(t *testing.T) {
 	}
 
 	// Increment retry
-	err = q.IncrementRetry(items[0])
+	err := q.IncrementRetry(items[0])
 	if err != nil {
 		t.Fatalf("IncrementRetry failed: %v", err)
 	}
@@ -232,6 +224,163 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 	}
 }
 
+func TestQueue_NonBlockIdentityAtSurvivesRetryAndCompletion(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	identityAt := queuedAt.Add(-time.Hour)
+	item := QueueItem{
+		OrgID:      orgID,
+		QueuedAt:   queuedAt,
+		IdentityAt: identityAt,
+		ItemType:   ItemShareLink,
+		ItemID:     "share-with-stale-queue-time",
+	}
+	if err := queue.EnqueueBatch([]QueueItem{item}); err != nil {
+		t.Fatalf("EnqueueBatch failed: %v", err)
+	}
+
+	items, err := queue.DequeueBatch(orgID, 1, 0)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if !items[0].IdentityAt.Equal(identityAt) {
+		t.Fatalf("dequeued IdentityAt = %v, want %v", items[0].IdentityAt, identityAt)
+	}
+
+	if err := queue.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+	retried := store.QueueItems(orgID)
+	if len(retried) != 1 || !retried[0].IdentityAt.Equal(identityAt) {
+		t.Fatalf("requeued items = %+v, want one item retaining identity_at=%v", retried, identityAt)
+	}
+	if err := queue.Complete(retried[0]); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+	if got := store.QueueLen(); got != 0 {
+		t.Fatalf("queue length after completion = %d, want 0", got)
+	}
+}
+
+func TestQueue_BlockCandidateIdentityIsRequiredAndSurvivesRetryAndDLQ(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID := uuid.New()
+	queuedAt := time.Now().UTC().Add(-time.Hour)
+	store.AddBlock(orgID, "block-exact-identity", "hot", 0)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, "block-exact-identity", "hot", queuedAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
+	}
+
+	incomplete := QueueItem{OrgID: orgID, QueuedAt: queuedAt, ItemType: ItemBlock, ItemID: candidate.BlockID}
+	if err := queue.EnqueueBatch([]QueueItem{incomplete}); err == nil {
+		t.Fatal("block item without exact candidate identity was accepted")
+	}
+
+	item := QueueItem{
+		OrgID:                    orgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidate.CandidateAt,
+		ItemType:                 ItemBlock,
+		ItemID:                   candidate.BlockID,
+		StorageClass:             candidate.StorageClass(),
+		BlockGCCandidateIdentity: candidate.Identity(),
+	}
+	if err := queue.EnqueueBatch([]QueueItem{item}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	dequeued, err := queue.DequeueBatch(orgID, 1, 0)
+	if err != nil || len(dequeued) != 1 {
+		t.Fatalf("DequeueBatch: items=%d err=%v", len(dequeued), err)
+	}
+	if got := dequeued[0]; got.BlockGCCandidateIdentity != candidate.Identity() || !got.IdentityAt.Equal(candidate.CandidateAt) {
+		t.Fatalf("dequeued identity = %+v / %s, want %+v / %s", got.BlockGCCandidateIdentity, got.IdentityAt, candidate.Identity(), candidate.CandidateAt)
+	}
+	if err := queue.IncrementRetry(dequeued[0]); err != nil {
+		t.Fatalf("IncrementRetry: %v", err)
+	}
+	retried := store.QueueItems(orgID)[0]
+	if retried.BlockGCCandidateIdentity != candidate.Identity() || !retried.IdentityAt.Equal(candidate.CandidateAt) {
+		t.Fatalf("retried identity = %+v / %s, want %+v / %s", retried.BlockGCCandidateIdentity, retried.IdentityAt, candidate.Identity(), candidate.CandidateAt)
+	}
+	if err := store.FailItem(retried, time.Now().UTC(), "boom", "test"); err != nil {
+		t.Fatalf("FailItem: %v", err)
+	}
+	failed := store.FailedItems(orgID)
+	if len(failed) != 1 || failed[0].BlockGCCandidateIdentity != candidate.Identity() {
+		t.Fatalf("failed item identity = %+v, want %+v", failed, candidate.Identity())
+	}
+	if err := store.RequeueFailedItem(orgID, failed[0].FailedAt, ItemBlock, candidate.BlockID, time.Now().UTC(), candidate.ItemIdentity()); err != nil {
+		t.Fatalf("RequeueFailedItem: %v", err)
+	}
+	if requeued := store.QueueItems(orgID); len(requeued) != 1 || requeued[0].BlockGCCandidateIdentity != candidate.Identity() || !requeued[0].IdentityAt.Equal(candidate.CandidateAt) {
+		t.Fatalf("requeued identity = %+v, want %+v", requeued, candidate.Identity())
+	}
+}
+
+func TestQueue_CompleteUsesFullBlockCandidateIdentity(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID := uuid.New()
+	queuedAt := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	candidateAt := queuedAt.Add(-time.Hour)
+
+	p1 := QueueItem{
+		OrgID:                    orgID,
+		QueuedAt:                 queuedAt,
+		IdentityAt:               candidateAt,
+		ItemType:                 ItemBlock,
+		ItemID:                   "same-block",
+		StorageClass:             "hot",
+		BlockGCCandidateIdentity: BlockGCCandidateIdentity{Target: BlockDeleteTarget{StorageClass: "hot", StorageKey: "p1"}, CandidateAt: candidateAt},
+	}
+	p2 := p1
+	p2.BlockGCCandidateIdentity.Target.StorageKey = "p2"
+
+	if err := queue.EnqueueBatch([]QueueItem{p1, p2}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	if err := queue.Complete(p1); err != nil {
+		t.Fatalf("Complete(P1): %v", err)
+	}
+
+	remaining := store.QueueItems(orgID)
+	if len(remaining) != 1 || remaining[0].BlockGCCandidateIdentity != p2.BlockGCCandidateIdentity {
+		t.Fatalf("remaining queue items = %+v, want only P2", remaining)
+	}
+}
+
+func TestQueue_CompleteRejectsLegacyBlockItem(t *testing.T) {
+	queue := NewQueue(NewMockStore())
+	err := queue.Complete(QueueItem{ItemType: ItemBlock, ItemID: "legacy-block"})
+	if err == nil || !strings.Contains(err.Error(), "exact block GC candidate identity") {
+		t.Fatalf("Complete(legacy block) error = %v, want exact-identity rejection", err)
+	}
+}
+
+func TestQueue_CompletePreservesNonBlockBehavior(t *testing.T) {
+	store := NewMockStore()
+	queue := NewQueue(store)
+	orgID := uuid.New()
+	if err := queue.Enqueue(orgID, ItemShareLink, "share-link", uuid.Nil, ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	items, err := queue.DequeueBatch(orgID, 1, 0)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch: items=%d err=%v", len(items), err)
+	}
+	if err := queue.Complete(items[0]); err != nil {
+		t.Fatalf("Complete(non-block): %v", err)
+	}
+	if got := store.QueueLen(); got != 0 {
+		t.Fatalf("queue length after non-block completion = %d, want 0", got)
+	}
+}
+
 func TestGCQueueBucket_DeterministicAndDistributedByIdentity(t *testing.T) {
 	orgID := uuid.New()
 	first := gcQueueBucket(orgID, ItemBlock, "block-1")
@@ -295,9 +444,8 @@ func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	org2 := uuid.New()
 
 	// Enqueue items for two orgs
-	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("Enqueue ItemBlock failed: %v", err)
-	}
+	store.AddBlock(org1, "b1", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, org1, "b1", "hot", time.Now(), 0)
 	if err := q.EnqueueBatch([]QueueItem{{
 		OrgID:                 org2,
 		QueuedAt:              time.Now(),
@@ -320,7 +468,7 @@ func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	// Complete all items for org1
 	items, _ := q.DequeueBatch(org1, 10, 0)
 	for _, item := range items {
-		q.Complete(org1, item.QueuedAt, item.ItemType, item.ItemID)
+		q.Complete(item)
 	}
 
 	orgs, _ = q.ListOrgsWithQueuedItems()
@@ -345,12 +493,10 @@ func TestQueue_GetQueueSize(t *testing.T) {
 	}
 
 	// Enqueue 3 items
-	if err := q.Enqueue(orgID, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("Enqueue b1 failed: %v", err)
-	}
-	if err := q.Enqueue(orgID, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("Enqueue b2 failed: %v", err)
-	}
+	store.AddBlock(orgID, "b1", "hot", 0)
+	store.AddBlock(orgID, "b2", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "b1", "hot", time.Now(), 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "b2", "hot", time.Now(), 0)
 	if err := q.EnqueueBatch([]QueueItem{{
 		OrgID:                 orgID,
 		QueuedAt:              time.Now(),
@@ -369,7 +515,7 @@ func TestQueue_GetQueueSize(t *testing.T) {
 
 	// Complete 1 item
 	items, _ := q.DequeueBatch(orgID, 1, 0)
-	q.Complete(orgID, items[0].QueuedAt, items[0].ItemType, items[0].ItemID)
+	q.Complete(items[0])
 
 	size, _ = q.GetQueueSize(orgID)
 	if size != 2 {
@@ -384,12 +530,10 @@ func TestQueue_GetTotalQueueSize(t *testing.T) {
 	org1 := uuid.New()
 	org2 := uuid.New()
 
-	if err := q.Enqueue(org1, ItemBlock, "b1", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("Enqueue org1 b1 failed: %v", err)
-	}
-	if err := q.Enqueue(org1, ItemBlock, "b2", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("Enqueue org1 b2 failed: %v", err)
-	}
+	store.AddBlock(org1, "b1", "hot", 0)
+	store.AddBlock(org1, "b2", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, org1, "b1", "hot", time.Now(), 0)
+	ensureAndEnqueueBlockForTest(t, store, org1, "b2", "hot", time.Now(), 0)
 	if err := q.EnqueueBatch([]QueueItem{{
 		OrgID:                 org2,
 		QueuedAt:              time.Now(),
@@ -417,7 +561,8 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 	orgID := uuid.New()
 	libID := uuid.New()
 
-	q.Enqueue(orgID, ItemBlock, "block-1", uuid.Nil, "hot")
+	store.AddBlock(orgID, "block-1", "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", time.Now(), 0)
 	if err := q.EnqueueBatch([]QueueItem{
 		{
 			OrgID:                 orgID,

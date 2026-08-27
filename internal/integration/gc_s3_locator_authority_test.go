@@ -123,11 +123,12 @@ func TestGC_BlockDeletion_RefusesForeignStorageKey(t *testing.T) {
 	// The candidate captures the (corrupt) foreign locator now on the canonical row,
 	// so the claim can bind to it and the walk reaches the locator validation this test
 	// is about rather than stopping earlier for want of authority.
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, queuedAt); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, storageClass, queuedAt)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidateExact: %v", err)
 	}
-	if err := store.EnqueueItem(orgID, queuedAt, gcpkg.ItemBlock, blockID, uuid.Nil, storageClass, 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
+	if err := enqueueExactBlockCandidateForTest(store, candidate, queuedAt); err != nil {
+		t.Fatalf("enqueue exact block candidate: %v", err)
 	}
 
 	// Drive an in-process worker wired to the real storage manager, so the run is

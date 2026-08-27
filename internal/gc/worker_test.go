@@ -62,7 +62,7 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 	store.AddBlockMapping(orgID, "sha1-abc", blockID)
 
 	// Enqueue the block (in the past so grace period passes)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", time.Now().Add(-2*time.Hour), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -113,7 +113,7 @@ func TestWorker_ProcessBlock_EmptyBlockSHA1LeavesForwardMappingObservable(t *tes
 	// empty blocks.sha1 (the legacy shape this fail-safe guards).
 	store.AddBlockMapping(orgID, "sha1-orphan", blockID)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, blockID, uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", time.Now().Add(-2*time.Hour), 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -140,7 +140,7 @@ func TestWorker_ProcessBlock_RefCountPositive(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 2)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-1", "hot", time.Now().Add(-2*time.Hour), 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -173,12 +173,7 @@ func TestWorker_ProcessBlock_RetryUsesIdentityAtForCandidateCleanup(t *testing.T
 	blockID := testSHA256BlockID("worker-retry-cleanup")
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
-	}
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem failed: %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
 	if err != nil || len(items) != 1 {
@@ -308,7 +303,7 @@ func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *
 	store.AddBlock(orgID, "not-yet-decremented", "hot", 0)
 	store.AddFSObjectReferenceForTest(orgID, "not-yet-decremented", libraryID, "fs-partial")
 	store.AddFSObject(libraryID, "fs-partial", "file", []string{"partial-zero", "not-yet-decremented"})
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "partial-zero", uuid.Nil, "hot", 0)
+	ensureAndEnqueueBlockForTest(t, store, orgID, "partial-zero", "hot", time.Now().Add(-2*time.Hour), 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -337,9 +332,7 @@ func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testi
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, blockID, "cold-tier", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot-tier", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "cold-tier", queuedAt, 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -373,9 +366,7 @@ func TestWorker_ProcessBlock_NonCanonicalStorageClassFailsClosed(t *testing.T) {
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, "blk-padded-class", " hot-tier", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "blk-padded-class", uuid.Nil, " hot-tier", 0); err != nil {
-		t.Fatalf("EnqueueItem() error = %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, "blk-padded-class", " hot-tier", queuedAt, 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v", err)
@@ -409,12 +400,7 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	// from the canonical row — and the row then disappears underneath it. That is the
 	// real shape of this case: a work item carrying an incarnation that is already gone.
 	store.AddBlock(orgID, "block-missing", "hot", 0)
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-missing", "hot", candidateAt); err != nil {
-		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
-	}
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-missing", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem failed: %v", err)
-	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, "block-missing", "hot", candidateAt, 0)
 	store.RemoveBlockForTest(orgID, "block-missing")
 
 	n, err := w.ProcessOnce(context.Background())
@@ -470,8 +456,8 @@ func TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork(t *testing.T) {
 	store.AddBlockMapping(orgID, "sha1-stub", "block-stub")
 
 	// Gate 1: a stub cannot become a candidate.
-	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
-		t.Fatalf("EnsureBlockGCCandidate(stub) = %v, want ErrBlockCandidateTargetUnavailable: a row with no locator must never become destructive work", err)
+	if _, err := store.EnsureBlockGCCandidateExact(orgID, "block-stub", "hot", candidateAt); !errors.Is(err, ErrBlockCandidateTargetUnavailable) {
+		t.Fatalf("EnsureBlockGCCandidateExact(stub) = %v, want ErrBlockCandidateTargetUnavailable: a row with no locator must never become destructive work", err)
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("a stub row produced %d candidate rows, want 0", got)
@@ -479,9 +465,8 @@ func TestWorker_ProcessBlock_StubRowNeverBecomesDestructiveWork(t *testing.T) {
 
 	// Gate 2: even if a work item exists anyway, the claim refuses and preserves it.
 	store.AddBlockGCCandidate(orgID, "block-stub", "hot", candidateAt)
-	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-stub", uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem failed: %v", err)
-	}
+	candidate := store.AllBlockGCCandidates()[0]
+	store.SeedExactBlockQueueItemForTest(orgID, candidateAt, "block-stub", "hot", candidate.Identity(), 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
@@ -521,7 +506,7 @@ func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *test
 	// SHA-1→SHA-256 resolution happens at registration time, not at GC time).
 	store.AddFSObjectReferenceForTest(orgID, "internal-block", libraryID, "fs-mapped")
 	store.AddFSObject(libraryID, "fs-mapped", "file", []string{externalBlockID})
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "internal-block", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "internal-block", "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -548,7 +533,7 @@ func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 	orgID := uuid.New()
 	store.AddBlock(orgID, "block-1", "hot", 0)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-1", "hot", 0)
 
 	ctx := context.Background()
 	n, _ := w.ProcessOnce(ctx)
@@ -1129,7 +1114,7 @@ func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testi
 
 	store.AddBlock(orgID, "blk-rereferenced", "hot", 0)
 	store.AddBlockGCCandidate(orgID, "blk-rereferenced", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-rereferenced", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-rereferenced", "hot", 0)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -1170,7 +1155,7 @@ func TestWorker_ProcessBlock_ReReferencedClaimedStubIsDeleted(t *testing.T) {
 	}
 	store.AddStubBlockForTest(orgID, "blk-stub-rereferenced")
 	store.AddBlockGCCandidate(orgID, "blk-stub-rereferenced", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-rereferenced", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-stub-rereferenced", "hot", 0)
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce() error = %v, want nil", err)
@@ -1196,7 +1181,6 @@ func TestWorker_ProcessBlock_ClaimedStubDeleteLostRaceFailsClosed(t *testing.T) 
 	store := NewMockStore()
 	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
 	orgID := uuid.New()
-	libID := uuid.New()
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	checks := 0
 	store.blockHasReferencesHook = func(uuid.UUID, string, bool) (bool, error) {
@@ -1205,7 +1189,7 @@ func TestWorker_ProcessBlock_ClaimedStubDeleteLostRaceFailsClosed(t *testing.T) 
 	}
 	store.AddStubBlockForTest(orgID, "blk-stub-race")
 	store.AddBlockGCCandidate(orgID, "blk-stub-race", "hot", candidateAt)
-	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-stub-race", libID, "hot", 0)
+	store.EnqueueBlockForTest(orgID, candidateAt, "blk-stub-race", "hot", 0)
 	store.deleteClaimedBlockStubForceFalse = true
 
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -1949,7 +1933,7 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	// Enqueue several items
 	for i := 0; i < 10; i++ {
 		store.AddBlock(orgID, "block-"+string(rune('a'+i)), "hot", 0)
-		store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "block-"+string(rune('a'+i)), uuid.Nil, "hot", 0)
+		store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), "block-"+string(rune('a'+i)), "hot", 0)
 	}
 
 	// Cancel context immediately

@@ -53,9 +53,7 @@ func TestP4A_LateLoserCannotConsumeTheCurrentOwnersCandidate(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("blk-late-loser")
 	candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 
 	// The interposition point is the claim-then-verify window: A holds its claim, and the
 	// EACH_QUORUM verify is the next thing it does. Steal the row there, exactly as a
@@ -169,9 +167,7 @@ func TestP4A_StalePostClaimReadHandsTheFenceBackAndPostpones(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("blk-stale-readback")
 	candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 
 	// A replica that never caught up: the row is there, but only the columns the claim
 	// wrote. It does not heal, so the item meets it on every pass.
@@ -238,9 +234,7 @@ func TestP4A_PostClaimReadErrorHandsTheFenceBackAndPostpones(t *testing.T) {
 			orgID := uuid.New()
 			blockID := testSHA256BlockID("blk-post-claim-read-error-" + tc.name)
 			candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
-			if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-				t.Fatalf("EnqueueItem: %v", err)
-			}
+			enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 			if tc.postClaimRefs {
 				var reads int
 				store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
@@ -287,9 +281,7 @@ func TestP4A_DivergentPostClaimReadHandsTheFenceBackAndPostpones(t *testing.T) {
 	orgID := uuid.New()
 	blockID := testSHA256BlockID("blk-divergent-readback")
 	candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
-	if err := store.EnqueueItem(orgID, candidate.CandidateAt, ItemBlock, blockID, uuid.Nil, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem: %v", err)
-	}
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
 	store.SetGetBlockInfoHookForTest(func(info BlockInfo) BlockInfo {
 		info.StorageKey = candidate.Target.StorageKey + ".stale"
 		return info

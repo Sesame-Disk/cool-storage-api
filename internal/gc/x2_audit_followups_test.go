@@ -55,7 +55,7 @@ func TestX2_StaleClaimFromAnotherCandidateIsReleased(t *testing.T) {
 	// now true by construction rather than by candidate timestamps happening to differ.
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	// Far enough past the abandoned claim that it cannot belong to a live attempt.
@@ -99,7 +99,7 @@ func TestX2_FreshClaimFromAnotherCandidateIsLeftAlone(t *testing.T) {
 
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 	store.AddBlockReferenceForTest(orgID, "block-1", "fs:lib:obj")
 
 	// Clock left at real time: the claim was taken moments ago.
@@ -144,7 +144,7 @@ func TestX2_UnavailableClusterDuringClaimDoesNotBurnRetries(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	store.SetClaimBlockDeleteErrForTest(gocql.ErrTimeoutNoResponse)
 	store.SetClaimBlockDeleteSettleErrForTest(gocql.ErrTimeoutNoResponse)
@@ -216,7 +216,7 @@ func TestX2_UnsettleableClaimStaysVisibleWithoutReachingTheDLQ(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	// The same schema fault breaks the conditional write and the settling read alike,
 	// which is exactly why the outcome cannot be established.
@@ -288,7 +288,7 @@ func TestX2_NonAvailabilityErrorDuringGlobalVerifyStillReachesTheDLQ(t *testing.
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	// The FRAME, not a plain error carrying its text. A plain error can never be
 	// classified as environmental whatever the classifier does, so injecting one would
@@ -445,7 +445,7 @@ func TestX2_BlockedStateSurvivesAPassThatAttemptsNothing(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -517,7 +517,7 @@ func TestX2_DestructiveTimestampsTrackTheLastEvidence(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	store.SetBlockHasReferencesGlobalErrForTest(fakeRequestError{code: gocql.ErrCodeUnavailable, msg: "Cannot achieve consistency level EACH_QUORUM in DC dc-asia"})
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
@@ -572,7 +572,7 @@ func TestX2_LivenessSuccessOnAStillReferencedBlockIsEvidence(t *testing.T) {
 	store.AddBlock(orgID, "block-1", "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, "block-1", "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-1", uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, "block-1", "hot", 0)
 
 	// A reference appears between the cheap pre-check and the authorizing read, so the
 	// walk reaches the global read and that read reports the block alive. Seeding a
@@ -620,7 +620,7 @@ func TestX2_CommitPointRefusalOutranksTheLivenessSuccessInTheSameWalk(t *testing
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	// Passes at the top of the walk, rejects from the commit-point re-check onward: an
 	// ALTER landing after the authorizing read.
@@ -747,7 +747,7 @@ func TestX2_TopologyGateIsRecheckedAtTheCommitPoint(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := now.Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	// The gate passes at the top of the walk and starts rejecting once the
 	// authorizing read is done — an ALTER landing mid-walk.
@@ -863,7 +863,7 @@ func TestX2_OrphanRefusalDoesNotContaminateTheWorkerPass(t *testing.T) {
 	store.AddBlock(orgID, blockID, "hot", 0)
 	queuedAt := time.Now().Add(-2 * time.Hour)
 	store.AddBlockGCCandidate(orgID, blockID, "hot", queuedAt)
-	store.EnqueueItem(orgID, queuedAt, ItemBlock, blockID, uuid.Nil, "hot", 0)
+	store.EnqueueBlockForTest(orgID, queuedAt, blockID, "hot", 0)
 
 	// Orphan recovery refuses a delete from the middle of the worker's pass — the
 	// interleaving that actually happens when the scanner and the worker overlap.
