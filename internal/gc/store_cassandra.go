@@ -713,13 +713,12 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 	now := time.Now().UTC()
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 
-	// The queue move is the only conditional part. The marker writes are prepared first
-	// because Cassandra conditional batches cannot span the queue partition and the marker
-	// partitions; writing them after a successful move could leave that moved row
-	// undiscoverable if the marker batch failed. They are idempotent, so a racer that loses
-	// the queue CAS may refresh a marker without creating another queue row.
+	// A requeue preserves the lifecycle membership represented by gc_pending_items. It must
+	// not recreate that durable dedup row before the queue CAS: another worker may have
+	// completed the old row and deleted its pending marker, after which a losing stale
+	// requeue would otherwise leave pending state with no queue row. The active and dirty
+	// markers are scheduling hints, so refreshing those before the move is harmless.
 	markers := s.db.Session().Batch(gocql.LoggedBatch)
-	addPendingItemBatchQuery(markers, orgID, libraryID, itemType, itemID, identity)
 	markers.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 		VALUES (?, ?, ?)

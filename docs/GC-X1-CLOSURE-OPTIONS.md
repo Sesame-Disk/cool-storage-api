@@ -1653,9 +1653,9 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **41** red-form mutations in
+the observed incarnation — plus **42** red-form mutations in
 `scripts/p4a-mutation-validation.sh`. Every count written elsewhere in this document (17,
-21, 23, 37, 40) is stale; the script prints its own total on a clean run, and that is the
+21, 23, 37, 40, 41) is stale; the script prints its own total on a clean run, and that is the
 figure to cite.
 
 A fourth review pass made every non-authoritative post-claim `GetBlockInfo` outcome
@@ -1696,13 +1696,16 @@ The first repair added a pre-read, but that was still a TOCTOU: two workers coul
 observe the old row and then both insert a new one. The move now uses a two-statement
 conditional batch on the single `gc_queue` partition: `DELETE(old) IF EXISTS` plus
 `INSERT(new)`, executed through the driver's batch-CAS API with the global `SERIAL`
-phase. A losing CAS returns `applied=false` and is a no-op. `gc_pending_items`,
-`gc_active_orgs` and `gc_dirty_orgs` are written in an idempotent logged batch first,
-because Cassandra conditional batches cannot span those partitions and writing the
-markers after the move could make that moved row undiscoverable if the marker write
-failed. `MockStore` already behaved this way, which is precisely why the unit suite could
-not see it — R19's shape. The real-engine gates are
-`TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` and
+phase. A losing CAS returns `applied=false` and is a no-op. `gc_active_orgs` and
+`gc_dirty_orgs` are written in an idempotent logged batch first because Cassandra
+conditional batches cannot span those partitions and writing scheduling hints after the
+move could make that moved row undiscoverable if the hint write failed. The durable
+`gc_pending_items` membership is not written by `RequeueItem`: a stale
+requeue that loses after `CompleteItem` removed the lifecycle must not recreate a permanent
+dedup marker with no queue row. `MockStore` already behaved this way, which is precisely why
+the unit suite could not see the original queue defect — R19's shape. The real-engine gates are
+`TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow`,
+`TestP4A_StaleRequeueCannotResurrectCompletedPendingMarker`, and
 `TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce`; the source gate requires the
 conditional move rather than merely a `queueItemPendingInfo` pre-read.
 

@@ -664,6 +664,9 @@ func TestP4ARequeueNeverCreatesAQueueRow(t *testing.T) {
 	if !p4aMentions(fn, "applied") {
 		t.Error("RequeueItem must branch on whether the move applied: a batch that did not apply means another worker already advanced this lifecycle, which is a no-op and not an error")
 	}
+	if p4aMentions(fn, "addPendingItemBatchQuery") {
+		t.Error("RequeueItem must not recreate gc_pending_items: a stale requeue can lose its queue CAS after CompleteItem deleted the lifecycle, leaving a permanent pending marker with no queue row")
+	}
 }
 
 // p4aCallsWorkerMethod reports whether call is `<receiver>.<name>(...)`.

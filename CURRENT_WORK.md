@@ -1,6 +1,6 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-08-26
+**Last Updated**: 2026-08-27
 **Session**: X1/P4a exact-`P`, per-attempt claim authority — R14a and R16 GREEN, R20 partial (claim path only); R14b claim->orphan binding, strict A+ non-overlap and R18/R27 remain open
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
@@ -54,7 +54,7 @@ production blocker, and no status document should say that it is.
 this file and every earlier mutation count (17, 21, 23, 37, 40 — all stale).
 `internal/integration/p4a_claim_authority_test.go` has four real-Cassandra legs: exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **41** mutations
+the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **42** mutations
 end-to-end, and the script prints its own total on a clean run — cite that, not a number
 copied from prose.
 
@@ -91,9 +91,11 @@ question, and it is deliberately not patched here. `GC_ENABLED=false` remains re
 The seventh P4a review also closed the durable half of postpone. Cassandra `RequeueItem`
 now moves the old queue row with `DELETE(old) IF EXISTS` plus `INSERT(new)` in a conditional
 batch on the `gc_queue` partition, using global `SERIAL` consistency and treating
-`applied=false` as a no-op. The marker writes remain in an idempotent logged batch before
-the conditional move because those tables are outside the queue partition. Real-Cassandra
-coverage includes both the sequential stale-row case and concurrent racers, while
+`applied=false` as a no-op. Only the `gc_active_orgs` and `gc_dirty_orgs` scheduling hints
+are refreshed in the idempotent logged batch before the conditional move; `gc_pending_items`
+is deliberately not recreated by `RequeueItem`, so a stale loser cannot leave a
+permanent dedup marker after `CompleteItem`. Real-Cassandra coverage includes the sequential
+stale-row case, concurrent racers, and stale requeue after completion, while
 `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)

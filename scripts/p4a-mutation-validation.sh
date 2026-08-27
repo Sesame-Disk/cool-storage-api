@@ -406,6 +406,13 @@ m_requeue_move_is_unconditional() {
   restore
 }
 
+m_requeue_recreates_pending_marker() {
+  mutate "$STORE" 's~(markers := s\.db\.Session\(\)\.Batch\(gocql\.LoggedBatch\))~$1\n\taddPendingItemBatchQuery(markers, orgID, libraryID, itemType, itemID, identity)~'
+  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must not recreate gc_pending_items' \
+    'requeue recreates pending membership before its CAS (a stale loser can leave a permanent dedup marker after CompleteItem removed the lifecycle)'
+  restore
+}
+
 m_candidate_authority_read_is_ordinary() {
   mutate "$STORE" 's{Consistency\(gocql\.Serial\)\.(\s+)Scan\(&candidateAt\)}{Scan(&candidateAt)}'
   expect_red 'TestR26CandidateAuthorityReadUsesTheSerialDomain' 'must read at Consistency(gocql.Serial)' \
@@ -462,6 +469,7 @@ MUTATIONS=(
   m_owned_alert_fires_for_a_late_loser
   m_verify_alert_fires_for_a_late_loser
   m_requeue_move_is_unconditional
+  m_requeue_recreates_pending_marker
 )
 
 if [ "${1:-}" = "--list" ]; then

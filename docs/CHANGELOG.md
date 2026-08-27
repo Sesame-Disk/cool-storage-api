@@ -68,9 +68,10 @@ rejected `ValidatePhysicalLocator`.
   `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
   `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
   item-specific alert counter raised before ownership is consulted), and
-  `m_requeue_move_is_unconditional` (the requeue drops the conditional move). Six in
-  this entry, bringing `scripts/p4a-mutation-validation.sh` to **41** — the script prints
-  its own total on a clean run, and that figure is the one to cite.
+  `m_requeue_move_is_unconditional` (the requeue drops the conditional move), and
+  `m_requeue_recreates_pending_marker` (the requeue recreates durable pending state before
+  its CAS). Seven in this entry, bringing `scripts/p4a-mutation-validation.sh` to **42** —
+  the script prints its own total on a clean run, and that figure is the one to cite.
 
 **Third pass: the durable half of "postpone".** Two reviewers converged on the queue
 boundary, and they were right that it was the open question -- though not that the defect
@@ -103,6 +104,14 @@ test part of a two-statement conditional batch on the single `gc_queue` partitio
 `DELETE(old) IF EXISTS` plus `INSERT(new)`, through the batch-CAS API with global `SERIAL`
 consistency. An absent row produces `applied=false`, meaning another worker already
 advanced this lifecycle; there is nothing to move, and the operation is a no-op.
+
+The marker phase has one narrower rule: `gc_active_orgs` and `gc_dirty_orgs` remain safe
+scheduling hints and may be refreshed before the move, but `gc_pending_items` is durable
+deduplication state and is not written by `RequeueItem`. Otherwise a stale worker could lose
+the queue move after `CompleteItem` removed the lifecycle and leave a permanent pending marker
+with no queue row. `TestP4A_StaleRequeueCannotResurrectCompletedPendingMarker` covers that
+real-Cassandra boundary, `TestP4ARequeueNeverCreatesAQueueRow` guards the source shape, and
+`m_requeue_recreates_pending_marker` keeps the mutation gate red if the ordering regresses.
 
 `MockStore.RequeueItem` already searched for the old row and no-opped when it was gone --
 the behaviour we want, and NOT the behaviour Cassandra had. So the whole unit suite agreed

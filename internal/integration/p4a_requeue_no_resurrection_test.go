@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/google/uuid"
 )
@@ -213,6 +214,82 @@ func TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce(t *testing.T) {
 				t.Fatalf("round %d: surviving row is at %s, which is none of the racers' targets", round, after[0].QueuedAt.Format(time.RFC3339Nano))
 			}
 		}()
+	}
+
+	gate.observed = true
+}
+
+// TestP4A_StaleRequeueCannotResurrectCompletedPendingMarker covers the other race
+// boundary: CompleteItem removes both the queue row and its pending membership, then a
+// worker with a stale copy of that row attempts to postpone it. A losing queue CAS must
+// not recreate gc_pending_items, because that table has no TTL and non-block dedup probes
+// intentionally ask about any lifecycle of the item.
+func TestP4A_StaleRequeueCannotResurrectCompletedPendingMarker(t *testing.T) {
+	requireCassandra(t)
+	gate := p4aRequireEvidence(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID, libraryID := uuid.New(), uuid.New()
+	itemID := fmt.Sprintf("p4a-completed-requeue-%d", time.Now().UnixNano())
+	queuedAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+
+	t.Cleanup(func() {
+		_ = database.Session().Query(`
+			DELETE FROM gc_queue WHERE org_id = ? AND bucket = ?
+		`, orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemCommit, itemID)).Exec()
+		deleteGCPendingItemsByIdentity(t, orgID, libraryID, gcpkg.ItemCommit, itemID)
+	})
+
+	q := gcpkg.QueueItem{
+		OrgID:                 orgID,
+		QueuedAt:              queuedAt,
+		IdentityAt:            queuedAt,
+		ItemType:              gcpkg.ItemCommit,
+		ItemID:                itemID,
+		LibraryID:             libraryID,
+		BlockRepresentationID: dbpkg.PlainBlockRepresentationID,
+		StorageClass:          "hot",
+	}
+	if err := store.EnqueueBatch([]gcpkg.QueueItem{q}); err != nil {
+		t.Fatalf("enqueue Q0: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 10, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("dequeue Q0: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("dequeued rows = %d, want exactly Q0", len(items))
+	}
+	q0 := items[0]
+	identity := q0.Identity()
+	if exists, err := store.PendingItemExists(orgID, libraryID, gcpkg.ItemCommit, itemID, gcpkg.AnyGCItemIdentity()); err != nil || !exists {
+		t.Fatalf("pending marker before completion: exists=%v err=%v, want true", exists, err)
+	}
+
+	// B completes the lifecycle and removes both Q0 and its pending membership.
+	if err := store.CompleteItem(orgID, q0.QueuedAt, q0.ItemType, q0.ItemID, identity); err != nil {
+		t.Fatalf("complete Q0: %v", err)
+	}
+	if exists, err := store.QueueItemExists(orgID, q0.QueuedAt, q0.ItemType, q0.ItemID, identity); err != nil || exists {
+		t.Fatalf("queue after completion: exists=%v err=%v, want false", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, libraryID, gcpkg.ItemCommit, itemID, gcpkg.AnyGCItemIdentity()); err != nil || exists {
+		t.Fatalf("pending marker after completion: exists=%v err=%v, want false", exists, err)
+	}
+
+	// A retains the stale Q0 copy. Its CAS loses, and must not recreate the pending marker.
+	if err := store.RequeueItem(orgID, q0.QueuedAt, q0.QueuedAt.Add(time.Minute), q0.ItemType, q0.ItemID,
+		q0.LibraryID, q0.BlockRepresentationID, q0.StorageClass, q0.RetryCount, identity,
+		q0.RequiresLibraryDeletedCheck, q0.LibraryGuardMode); err != nil {
+		t.Fatalf("stale requeue after completion: %v", err)
+	}
+	if exists, err := store.QueueItemExists(orgID, q0.QueuedAt.Add(time.Minute), q0.ItemType, q0.ItemID, identity); err != nil || exists {
+		t.Fatalf("queue after losing stale requeue: exists=%v err=%v, want false", exists, err)
+	}
+	if exists, err := store.PendingItemExists(orgID, libraryID, gcpkg.ItemCommit, itemID, gcpkg.AnyGCItemIdentity()); err != nil || exists {
+		t.Fatalf("pending marker after losing stale requeue: exists=%v err=%v, want false", exists, err)
 	}
 
 	gate.observed = true
