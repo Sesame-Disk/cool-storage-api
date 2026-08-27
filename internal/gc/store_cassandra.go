@@ -438,6 +438,13 @@ func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, it
 // not offer — so the only correct answers are "the exact incarnation you named" or a
 // refusal. Nothing in the tree asks the other question today; this makes sure that if
 // something starts to, it fails loudly instead of being told no.
+//
+// IT REQUIRES P AND DELIBERATELY NOT identity_at, because those two omissions are not
+// the same question. identity_at is the LAST clustering column, so P present with no
+// identity_at is a legitimate partition prefix — "is this exact incarnation pending
+// under any lifecycle" — which the key answers truthfully. P absent is not a wider
+// question, it is an unanswerable one. Refusing the prefix too would forbid a query
+// the schema supports, for no caller that exists.
 func requireBlockPendingProbeIdentity(itemType ItemType, itemID string, identity GCItemIdentity) error {
 	if itemType != ItemBlock || !identity.Target().IsZero() {
 		return nil

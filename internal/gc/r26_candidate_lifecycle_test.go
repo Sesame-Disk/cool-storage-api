@@ -417,12 +417,16 @@ func TestR26_AnyIdentityPendingProbeIsRefusedForBlocks(t *testing.T) {
 			"\"not pending\", which is indistinguishable from a real negative and never becomes true")
 	}
 
-	// The exact-incarnation probe is unaffected, and still answers.
+	// The exact-incarnation probe is unaffected, and still answers. ONE instant, not two
+	// calls to time.Now: for a block identity_at and candidate_at are the same instant by
+	// construction, and a fixture that quietly breaks that models a state the rest of the
+	// package refuses.
+	at := time.Now().UTC()
 	identity := GCItemIdentity{
-		IdentityAt: time.Now().UTC(),
+		IdentityAt: at,
 		BlockCandidate: BlockGCCandidateIdentity{
 			Target:      BlockDeleteTarget{StorageClass: "hot", StorageKey: "blocks/org/" + blockID},
-			CandidateAt: time.Now().UTC(),
+			CandidateAt: at,
 		},
 	}
 	if _, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, identity); err != nil {
