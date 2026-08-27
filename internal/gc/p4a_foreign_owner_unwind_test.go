@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // foreignOwnerUnwindCase is one post-claim failure point that unwinds by handing the
@@ -25,6 +27,21 @@ type foreignOwnerUnwindCase struct {
 	// verifyErr, when set, is what the GLOBAL reference verify answers. It is the only
 	// failure point that fires before the destructive phase is entered at all.
 	verifyErr error
+	// ownedErrorMetric is the GCErrorsTotal reason this failure point raises, or "" when
+	// it raises none. It is asserted from BOTH sides for the same reason the retry budget
+	// is: these counters are the item-specific alert — "this block is defective" — and a
+	// late loser is in no position to draw that conclusion either. The owner must still
+	// raise it, or the fix would have silenced a real defect instead of a race.
+	ownedErrorMetric string
+}
+
+// gcErrorCount reads one GCErrorsTotal reason. The counters are process-global, so every
+// assertion here is a DELTA around one driven walk.
+func gcErrorCount(reason string) float64 {
+	if reason == "" {
+		return 0
+	}
+	return testutil.ToFloat64(metrics.GCErrorsTotal.WithLabelValues(reason))
 }
 
 func foreignOwnerUnwindCases() []foreignOwnerUnwindCase {
@@ -54,7 +71,8 @@ func foreignOwnerUnwindCases() []foreignOwnerUnwindCase {
 				t.Helper()
 				return p4aSeedBlockCandidate(t, store, orgID, blockID)
 			},
-			verifyErr: errors.New("read failure: too many tombstones in block_references"),
+			verifyErr:        errors.New("read failure: too many tombstones in block_references"),
+			ownedErrorMetric: "liveness_verify_failed",
 		},
 		{
 			name: "non-canonical-storage-class",
@@ -82,6 +100,7 @@ func foreignOwnerUnwindCases() []foreignOwnerUnwindCase {
 				// class, and refused by the org-scoped store that owns the naming rules.
 				return MockCanonicalStorageKey(uuid.New().String(), blockID)
 			}),
+			ownedErrorMetric: "block_storage_key_mismatch",
 		},
 	}
 }
@@ -93,6 +112,11 @@ type foreignOwnerUnwindResult struct {
 	orgID    uuid.UUID
 	blockID  string
 	takeover BlockDeleteAuthority
+	// itemErrorsRaised is the delta on this case's own GCErrorsTotal reason, and
+	// refusalsRecorded the delta on the claim counter that says a late loser was turned
+	// away.
+	itemErrorsRaised float64
+	refusalsRecorded float64
 }
 
 // runForeignOwnerUnwind drives one failure point to completion.
@@ -134,13 +158,24 @@ func runForeignOwnerUnwind(t *testing.T, tc foreignOwnerUnwindCase, retryCount i
 		return false, nil
 	})
 
+	itemErrorsBefore := gcErrorCount(tc.ownedErrorMetric)
+	refusalsBefore := testutil.ToFloat64(metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner"))
+
 	if _, err := w.ProcessOnce(context.Background()); err != nil {
 		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
 	}
 	if calls < 2 {
 		t.Fatalf("the walk never reached the global verify (BlockHasReferences calls = %d); this case is not exercising a POST-claim unwind", calls)
 	}
-	return foreignOwnerUnwindResult{store: store, provider: sp, orgID: orgID, blockID: blockID, takeover: takeover}
+	return foreignOwnerUnwindResult{
+		store:            store,
+		provider:         sp,
+		orgID:            orgID,
+		blockID:          blockID,
+		takeover:         takeover,
+		itemErrorsRaised: gcErrorCount(tc.ownedErrorMetric) - itemErrorsBefore,
+		refusalsRecorded: testutil.ToFloat64(metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner")) - refusalsBefore,
+	}
 }
 
 // TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget is the queue-policy half of the
@@ -206,6 +241,17 @@ func TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget(t *testing.T) {
 					if deletes := got.provider.ScopedBlockDeletes(); len(deletes) != 0 {
 						t.Errorf("physical deletes = %d, want 0: %+v", len(deletes), deletes)
 					}
+
+					// 5. The refusal is observable, and it did NOT masquerade as an
+					// item defect. Raising the item-specific counter for a lost race
+					// would page someone about a healthy block, and the owner raises it
+					// on the next pass anyway.
+					if got.refusalsRecorded != 1 {
+						t.Errorf("retry_refused_foreign_owner delta = %v, want 1: the refusal must be visible to an operator", got.refusalsRecorded)
+					}
+					if tc.ownedErrorMetric != "" && got.itemErrorsRaised != 0 {
+						t.Errorf("GCErrorsTotal{%s} delta = %v, want 0: a late loser concluded the ITEM was defective from a walk it no longer owned", tc.ownedErrorMetric, got.itemErrorsRaised)
+					}
 				})
 			}
 		})
@@ -242,6 +288,14 @@ func TestP4A_OwnedUnwindStillSpendsTheRetryBudget(t *testing.T) {
 					t.Fatal("canonical row disappeared")
 				} else if blk.GCState != "" {
 					t.Errorf("fence still up (gc_state=%q) after an owned unwind handed the claim back", blk.GCState)
+				}
+				// And the alert an operator acts on must still fire. Gating these
+				// counters on ownership is only safe while the owner still raises them.
+				if tc.ownedErrorMetric != "" && got.itemErrorsRaised != 1 {
+					t.Errorf("GCErrorsTotal{%s} delta = %v, want 1: gating the counter on ownership silenced a real defect", tc.ownedErrorMetric, got.itemErrorsRaised)
+				}
+				if got.refusalsRecorded != 0 {
+					t.Errorf("retry_refused_foreign_owner delta = %v, want 0: nothing was refused, this attempt owned its fence", got.refusalsRecorded)
 				}
 			})
 			t.Run(retryCountLabel(5), func(t *testing.T) {

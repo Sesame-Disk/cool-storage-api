@@ -366,6 +366,31 @@ m_verify_unwind_ignores_foreign_owner() {
   restore
 }
 
+# The three above prove the DECISION is right. These three prove it cannot be bypassed:
+# one reintroduces the inline release/error shape the wrapper exists to absorb, and two
+# put an item-specific alert counter back in front of the ownership check.
+m_unwind_bypasses_the_wrapper() {
+  # ~ delimiters and $1 for the indentation run: the replacement carries unbalanced braces.
+  mutate "$WORKER" 's~return w\.releaseClaimThenFailWithRetry\(item, attempt,(\s+)fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {${1}return relErr${1}}${1}return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'discards the release outcome' \
+    'a sixth post-claim unwind releases inline and discards the outcome (the exact shape of the defect, reachable again by one call site diverging from its siblings)'
+  restore
+}
+
+m_owned_alert_fires_for_a_late_loser() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, outcome, originalErr\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)for _, record := range onOwnedFailure \{(\s+)record\(\)(\s+)\}~for _, record := range onOwnedFailure {${4}record()${5}}${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, outcome, originalErr); foreign != nil {${1}return foreign${2}}~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
+    'the wrapper raises its item-specific counter before consulting ownership (a lost race pages someone about a healthy block)'
+  restore
+}
+
+m_verify_alert_fires_for_a_late_loser() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {${1}return foreign${2}}~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
+    'the global verify raises liveness_verify_failed before consulting ownership (same conclusion about the item, drawn from a walk this attempt no longer owns)'
+  restore
+}
+
 m_candidate_authority_read_is_ordinary() {
   mutate "$STORE" 's{Consistency\(gocql\.Serial\)\.(\s+)Scan\(&candidateAt\)}{Scan(&candidateAt)}'
   expect_red 'TestR26CandidateAuthorityReadUsesTheSerialDomain' 'must read at Consistency(gocql.Serial)' \
@@ -418,6 +443,9 @@ MUTATIONS=(
   m_foreign_owner_retries
   m_unwind_ignores_foreign_owner
   m_verify_unwind_ignores_foreign_owner
+  m_unwind_bypasses_the_wrapper
+  m_owned_alert_fires_for_a_late_loser
+  m_verify_alert_fires_for_a_late_loser
 )
 
 if [ "${1:-}" = "--list" ]; then

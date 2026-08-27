@@ -493,3 +493,133 @@ func p4aHasRawBlocksSelect(fn *ast.FuncDecl) bool {
 	})
 	return found
 }
+
+// TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome is the STRUCTURAL half of the
+// late-loser queue-policy rule. The behavioural half —
+// TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget — proves the five unwinds that
+// exist today are correct; this one is what a sixth has to get past.
+//
+// The defect has exactly one spelling, and that is what makes it guardable. A post-claim
+// unwind that wants to return a retryable error must release the fence first, and Go
+// refuses to compile a `released, relErr :=` whose outcome is never read — so the only
+// way to drop the answer is to discard it with `_`. Five sites did precisely that, and
+// each one charged a retry to an item whose claim another lifecycle already owned,
+// walking it into a DLQ ItemBlock never leaves.
+//
+// ONE discard is legitimate, and the guard pins which. The destructive topology gate
+// returns failedClosedError, which postpones on BOTH outcomes, so ownership cannot change
+// its queue policy and there is nothing for it to consult. Every other post-claim unwind
+// must go through releaseClaimThenFailWithRetry, which consults it once on their behalf.
+func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
+	source, err := os.ReadFile("worker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "worker.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := findGCFunction(file, "processBlock")
+	if fn == nil {
+		t.Fatal("processBlock not found; the release-outcome guard is vacuous")
+	}
+
+	var discards []*ast.AssignStmt
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
+			return true
+		}
+		if blank, ok := assign.Lhs[0].(*ast.Ident); ok && blank.Name == "_" {
+			discards = append(discards, assign)
+		}
+		return true
+	})
+
+	if len(discards) != 1 {
+		lines := make([]string, 0, len(discards))
+		for _, discard := range discards {
+			lines = append(lines, fset.Position(discard.Pos()).String())
+		}
+		t.Fatalf("processBlock discards the release outcome at %d site(s), want exactly 1 (the topology gate): %s; "+
+			"a post-claim unwind that returns a retryable error must go through releaseClaimThenFailWithRetry; "+
+			"discarding the outcome lets an attempt whose claim was taken over spend the item's retry budget, "+
+			"and at the cap ItemBlock is parked in a DLQ it never leaves with its candidate behind a foreign fence",
+			len(discards), strings.Join(lines, ", "))
+	}
+
+	// The one allowed discard must be the branch that postpones on both outcomes.
+	if block := p4aTightestBlock(fn, discards[0].Pos()); !p4aBlockDirectlyReturns(block, "failedClosedError") {
+		t.Errorf("the single discarded release outcome at %s is not the topology gate: a discard is only sound where BOTH outcomes postpone, which is what returning failedClosedError means here",
+			fset.Position(discards[0].Pos()))
+	}
+
+	// And the two consumers must still exist, or the guard above passes over a walk that
+	// consults ownership nowhere at all.
+	if !p4aMentions(fn, "refuseRetryForForeignClaimOwner") {
+		t.Error("processBlock must consult refuseRetryForForeignClaimOwner directly: the global verify releases before it classifies the error, so it cannot use the wrapper")
+	}
+	wrapper := findGCFunction(file, "releaseClaimThenFailWithRetry")
+	if wrapper == nil {
+		t.Fatal("releaseClaimThenFailWithRetry not found; the four authorization-phase unwinds have nowhere to route their release")
+	}
+	if !p4aMentions(wrapper, "refuseRetryForForeignClaimOwner") {
+		t.Error("releaseClaimThenFailWithRetry must consult refuseRetryForForeignClaimOwner; without it every site routed through the wrapper silently regains the defect")
+	}
+}
+
+// p4aCallsWorkerMethod reports whether call is `<receiver>.<name>(...)`.
+func p4aCallsWorkerMethod(call *ast.CallExpr, name string) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	_, ok = selector.X.(*ast.Ident)
+	return ok && selector.Sel.Name == name
+}
+
+// p4aTightestBlock returns the innermost block statement of fn containing pos.
+func p4aTightestBlock(fn *ast.FuncDecl, pos token.Pos) *ast.BlockStmt {
+	var tightest *ast.BlockStmt
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		block, ok := node.(*ast.BlockStmt)
+		if !ok || pos < block.Pos() || pos > block.End() {
+			return true
+		}
+		if tightest == nil || block.Pos() > tightest.Pos() {
+			tightest = block
+		}
+		return true
+	})
+	return tightest
+}
+
+// p4aBlockDirectlyReturns reports whether block returns a composite literal of the named
+// type as one of its OWN statements — not somewhere in a nested branch, which would let
+// any block in the function qualify.
+func p4aBlockDirectlyReturns(block *ast.BlockStmt, typeName string) bool {
+	if block == nil {
+		return false
+	}
+	for _, statement := range block.List {
+		ret, ok := statement.(*ast.ReturnStmt)
+		if !ok {
+			continue
+		}
+		for _, result := range ret.Results {
+			literal, ok := result.(*ast.CompositeLit)
+			if !ok {
+				continue
+			}
+			if ident, ok := literal.Type.(*ast.Ident); ok && ident.Name == typeName {
+				return true
+			}
+		}
+	}
+	return false
+}

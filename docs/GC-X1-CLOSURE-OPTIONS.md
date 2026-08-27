@@ -1653,10 +1653,10 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **37** red-form mutations in
+the observed incarnation — plus **40** red-form mutations in
 `scripts/p4a-mutation-validation.sh`. Every count written elsewhere in this document (17,
-21, 23) is stale; the script prints its own total on a clean run, and that is the figure
-to cite.
+21, 23, 37) is stale; the script prints its own total on a clean run, and that is the
+figure to cite.
 
 A fourth review pass made every non-authoritative post-claim `GetBlockInfo` outcome
 (stub-shaped, error, or divergent locator) release the exact claim and postpone with the
@@ -1670,7 +1670,17 @@ advanced to `today-1`, leaving the preserved candidate undiscoverable behind a l
 foreign fence. A not-owner release now postpones instead, while an owner still spends its
 retries so permanent item defects keep reaching the DLQ. Gated by
 `TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget`,
-`TestP4A_OwnedUnwindStillSpendsTheRetryBudget` and two mutations.
+`TestP4A_OwnedUnwindStillSpendsTheRetryBudget` and five mutations.
+
+A sixth pass hardened that rule rather than changing it. The defect has exactly one
+spelling — Go refuses to compile a `released, relErr :=` whose outcome is never read, so
+dropping the answer requires `_` — and `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome`
+now allows exactly one such discard: the destructive topology gate, which returns
+`failedClosedError` and therefore postpones on both outcomes. The same pass moved the
+item-specific alert counters (`liveness_verify_failed`, `block_storage_key_mismatch`)
+behind the ownership check: they assert that the BLOCK is defective, which a late loser is
+no more entitled to conclude for a metric than for the retry budget, and the owner
+re-observes the durable defect on the next pass.
 
 R14b/P4b, the orphan-publication half, remains open — and note that
 `StartBlockDeleteOrphan`/`FinalizeBlockDelete` failures still return retryable errors

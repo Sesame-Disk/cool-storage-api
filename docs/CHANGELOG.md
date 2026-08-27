@@ -36,7 +36,7 @@ with nothing left in the system able to lift it.
 It does not take a long run of lost races. An item already at the cap for unrelated
 reasons needs ONE.
 
-**The five sites**, all in `processBlockItem` after the claim: the global reference
+**The five sites**, all in `processBlock` after the claim: the global reference
 verify's non-availability branch (the realistic one — a `ReadFailure` from a
 tombstone-heavy `block_references` partition is exactly what that branch was built to
 escalate, and a late loser reaches it as easily as the owner does), a non-canonical
@@ -63,9 +63,31 @@ rejected `ValidatePhysicalLocator`.
 - `TestP4A_OwnedUnwindStillSpendsTheRetryBudget` — the same five points WITHOUT a
   takeover: retry spent, DLQ reached at the cap, fence off. This is what keeps the fix
   from trading a stranded fence for an item that retries forever in silence.
-- Mutation: `m_unwind_ignores_foreign_owner` (the shared decision) and
+- Mutation: `m_unwind_ignores_foreign_owner` (the shared decision),
   `m_verify_unwind_ignores_foreign_owner` (the one site that cannot use the wrapper),
-  bringing `scripts/p4a-mutation-validation.sh` to twenty-five.
+  `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
+  `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
+  item-specific alert counter raised before ownership is consulted). Five in this entry,
+  bringing `scripts/p4a-mutation-validation.sh` to **40** — the script prints its own
+  total on a clean run, and that figure is the one to cite.
+
+**Second pass over this same change.** A review of the first cut found nothing wrong with
+the decision and three things wrong around it, all fixed here:
+- `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome` is a new source guard. The defect
+  has exactly one spelling — Go will not compile a `released, relErr :=` whose outcome is
+  never read, so dropping the answer requires `_` — which makes it guardable. The guard
+  allows exactly one discard, the destructive topology gate, and only because that branch
+  returns `failedClosedError` and therefore postpones on both outcomes. A sixth unwind
+  written in the old shape is now a red test rather than a silent regression.
+- The item-specific alert counters (`liveness_verify_failed`, `block_storage_key_mismatch`)
+  were raised BEFORE the ownership check. Those counters mean "this block is defective",
+  which is a conclusion about the item, and a late loser has no more standing to draw it
+  for a metric than for the retry budget — it would page someone about a healthy block.
+  They now fire only on the owned path; the defect is durable, so the attempt that does
+  own the fence re-observes it and raises the counter on the next pass. Asserted from both
+  sides of the table test via `testutil.ToFloat64`.
+- `blockClaimForeignOwnerError`'s message still said "at settlement time" although the
+  error now also covers unwinds that settle nothing.
 
 **Still open, deliberately.** `StartBlockDeleteOrphan` and `FinalizeBlockDelete` failures
 retain the fence and return retryable errors without consulting ownership, so a late
@@ -379,7 +401,7 @@ and is then recognised by the settling read — was untestable.
   case, retry semantics under the engine's real CAS returns, and stale-claim release
   bound to the observed physical incarnation.
 - Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations at
-  the time of this entry (twenty-five since 2026-08-27; the newest entry above is
+  the time of this entry (forty since 2026-08-27; the newest entry above is
   authoritative for the current count), each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
   earned their keep during the second pass: one exposed that a mutation which fails to
