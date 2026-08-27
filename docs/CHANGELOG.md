@@ -8,6 +8,74 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4a: a late loser must not spend the work item's retry budget either
+
+Closes the second half of the late-loser contract. The first half — landed with P4a —
+stopped an attempt whose claim had been taken over from CONSUMING the current owner's
+candidate. This one stops it from consuming the current owner's only way BACK to that
+candidate.
+
+**The defect.** Five post-claim unwinds released the fence and then returned an ordinary
+error, discarding the release outcome:
+
+```go
+if _, relErr := w.releaseBlockClaim(...); relErr != nil { return relErr }
+return fmt.Errorf("...")            // retryable → retry_count++ → DLQ at the cap
+```
+
+`BlockReleaseNotOwner` and `BlockReleaseReleased` were indistinguishable there, so an
+attempt taken over mid-walk charged a retry to the item for a race it never owned. That
+is not a lost delete and not a wrong delete — it is a lost WORK ITEM: `ItemBlock` never
+leaves the DLQ (`isAutoRecoverableFailedItem` rescues only commit/fs_object items with
+`library_hard_delete_in_progress`), and Phase 1 of the scanner advances its day cursor to
+`today-1` on every clean pass, so the surviving candidate's discovery row is never read
+again. Candidate present, work item unreachable, foreign fence standing — and if that
+owner later dies, `BlockDeleteFenceActive` refuses every future upload of that content
+with nothing left in the system able to lift it.
+
+It does not take a long run of lost races. An item already at the cap for unrelated
+reasons needs ONE.
+
+**The five sites**, all in `processBlockItem` after the claim: the global reference
+verify's non-availability branch (the realistic one — a `ReadFailure` from a
+tombstone-heavy `block_references` partition is exactly what that branch was built to
+escalate, and a late loser reaches it as easily as the owner does), a non-canonical
+`storage_class`, an empty/untrimmed `storage_key`, a failed `GetBlockStoreForOrg`, and a
+rejected `ValidatePhysicalLocator`.
+
+**What changed**
+- `refuseRetryForForeignClaimOwner` turns a not-owner release into
+  `blockClaimForeignOwnerError` — already in `shouldPostponeWithoutRetry`, so it
+  postpones with no retry spent and no DLQ entry.
+- `releaseClaimThenFailWithRetry` wraps release + decision for the four authorization-phase
+  sites. The verify site captures the outcome directly, because its release must happen
+  before the availability classification that picks the branch.
+- **Not a blanket postpone.** A permanent item defect must still reach the DLQ where a
+  human sees it; what a not-owner release removes is this attempt's STANDING to conclude
+  anything about the item from a walk it no longer owns. The next pass re-claims fresh,
+  and an owner reaching the same error spends its retries normally.
+
+**Evidence**
+- `TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget` — table-driven over all five
+  failure points with a takeover interposed at the claim/verify window, run on both sides
+  of the retry cap: candidate present, current owner's claim untouched, queue item live,
+  `retry_count` unchanged, DLQ empty, zero physical deletes.
+- `TestP4A_OwnedUnwindStillSpendsTheRetryBudget` — the same five points WITHOUT a
+  takeover: retry spent, DLQ reached at the cap, fence off. This is what keeps the fix
+  from trading a stranded fence for an item that retries forever in silence.
+- Mutation: `m_unwind_ignores_foreign_owner` (the shared decision) and
+  `m_verify_unwind_ignores_foreign_owner` (the one site that cannot use the wrapper),
+  bringing `scripts/p4a-mutation-validation.sh` to twenty-five.
+
+**Still open, deliberately.** `StartBlockDeleteOrphan` and `FinalizeBlockDelete` failures
+retain the fence and return retryable errors without consulting ownership, so a late
+loser reaching THEM can still spend budget. That is the orphan-publication half — R14b /
+P4b, recorded OPEN — and it is not patched here: a late loser that gets that far has
+already published an orphan row for a block another lifecycle owns, which is the A+
+non-overlap question P4b exists to answer, not a queue-policy one.
+
+`GC_ENABLED=false` remains required on every replica in every DC.
+
 ## 2026-08-26 - R26 exact-`P` GC work-item identity (candidate / projection / queue / pending / DLQ)
 
 Makes the exact physical incarnation part of the durable IDENTITY of a GC work item,
@@ -310,7 +378,9 @@ and is then recognised by the settling read — was untestable.
   skipping to a green run). Four legs: exclusive ownership plus exact takeover, the ABA
   case, retry semantics under the engine's real CAS returns, and stale-claim release
   bound to the observed physical incarnation.
-- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations, each
+- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations at
+  the time of this entry (twenty-five since 2026-08-27; the newest entry above is
+  authoritative for the current count), each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
   earned their keep during the second pass: one exposed that a mutation which fails to
   COMPILE proves nothing, and one exposed that the incarnation check lives in two mirrored

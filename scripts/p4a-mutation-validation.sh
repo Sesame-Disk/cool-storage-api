@@ -205,7 +205,11 @@ m_stale_discovery_failure_burns_a_retry() {
 }
 
 m_enqueue_item_mints_block_candidate() {
-  mutate "$STORE" 's{\tif itemType == ItemBlock \{\n\t\treturn fmt\.Errorf\("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType\)\n\t\}\n}{}'
+  # Whitespace runs, not literal newlines: this pattern used \n\t\t and silently matched
+  # NOTHING against a CRLF working tree, so the mutation never applied and the run aborted
+  # before it could prove anything. Exactly the portability rule stated at the top of this
+  # file, which this one entry did not follow.
+  mutate "$STORE" 's{if itemType == ItemBlock \{\s+return fmt\.Errorf\("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType\)\s+\}}{}'
   expect_red 'TestEnqueueItemRefusesBlockItems' 'reached the database' \
     'raw enqueue accepts ItemBlock again (enqueue fabricates destructive authority with no zero-ref decision)'
   restore
@@ -344,6 +348,24 @@ m_foreign_owner_retries() {
   restore
 }
 
+# The candidate is preserved by the settlement rule, but a candidate is only a recovery
+# mechanism while a work item can still carry it back. These two cover the OTHER exit:
+# the post-claim unwinds that spend the retry budget on their way out.
+m_unwind_ignores_foreign_owner() {
+  mutate "$WORKER" 's{if outcome == BlockReleaseReleased \{(\s+)return nil(\s+)\}}{if true {$1return nil$2}}'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'a late loser spent the item' \
+    'retryable post-claim unwind ignores not-owner (a taken-over attempt charges the retry that DLQs an item ItemBlock never leaves)'
+  restore
+}
+
+m_verify_unwind_ignores_foreign_owner() {
+  # ~ delimiters: the replacement carries an unbalanced { and perl would try to balance it.
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{~if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); false \&\& foreign != nil \{~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'a late loser spent the item' \
+    'global verify unwind drops the release outcome (the one site that cannot use the wrapper, and the one a real ReadFailure reaches)'
+  restore
+}
+
 m_candidate_authority_read_is_ordinary() {
   mutate "$STORE" 's{Consistency\(gocql\.Serial\)\.(\s+)Scan\(&candidateAt\)}{Scan(&candidateAt)}'
   expect_red 'TestR26CandidateAuthorityReadUsesTheSerialDomain' 'must read at Consistency(gocql.Serial)' \
@@ -394,6 +416,8 @@ MUTATIONS=(
   m_divergent_read_retries
   m_authority_invalid_retries
   m_foreign_owner_retries
+  m_unwind_ignores_foreign_owner
+  m_verify_unwind_ignores_foreign_owner
 )
 
 if [ "${1:-}" = "--list" ]; then

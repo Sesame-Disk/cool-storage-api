@@ -384,6 +384,63 @@ func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority Bl
 	return BlockReleaseNotOwner, blockClaimReleaseUnconfirmedError{ItemID: blockID, Err: relErr}
 }
 
+// refuseRetryForForeignClaimOwner is the release outcome's SECOND consumer, and it exists
+// for the same reason as the first.
+//
+// The settlement rule — a late loser must not consume the current owner's candidate — is
+// only half of what "the candidate survives" has to mean. A candidate row is a recovery
+// mechanism only while some work item can still carry it back, and every post-claim
+// unwind that returns an ORDINARY error spends the item's retry budget on the way out.
+// Five of them did that without ever looking at whether the fence they just handed back
+// was still theirs.
+//
+// So the same race the settlement rule catches produced the same stranded state one
+// branch over. An attempt taken over mid-walk unwinds, releases nothing (it owns
+// nothing), and charges a retry to the item. At the cap the item goes to the DLQ, which
+// ItemBlock never leaves — isAutoRecoverableFailedItem rescues only commit/fs_object
+// items — and the scanner's day cursor has already advanced past the candidate's
+// discovery row. Candidate present, work item unreachable, foreign fence standing: if
+// that owner then dies, BlockDeleteFenceActive refuses every future upload of the
+// content, and nothing in the system can lift it.
+//
+// AUTHORITY, NOT ERROR CLASS, is what this decides. A not-owner release says another
+// lifecycle owns the fence right now, so this attempt is in no position to conclude
+// anything about the ITEM from a walk it no longer owns — exactly the reasoning
+// BlockClaimFreshOwner applies at the claim. It says nothing about whether the original
+// error is real: the next pass re-claims fresh, and an attempt that owns its fence
+// reaches the same error and spends its retries normally. That is why this is not a
+// blanket postpone. A non-canonical storage class or a locator its own store refuses is
+// permanent and item-specific, and it MUST still reach the DLQ where a human sees it —
+// see TestP4A_OwnedUnwindStillSpendsTheRetryBudget, which pins that half.
+//
+// Returns nil when this attempt really did release its own fence, so the caller's
+// original error stands.
+func (w *Worker) refuseRetryForForeignClaimOwner(itemID string, outcome BlockReleaseOutcome, originalErr error) error {
+	if outcome == BlockReleaseReleased {
+		return nil
+	}
+	metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner").Inc()
+	log.Printf("[GC Worker] Block %s: unwinding on %v, but this attempt no longer owns the delete claim; postponing instead of spending the retry that would strand the current owner's fence behind an undiscoverable candidate", itemID, originalErr)
+	return blockClaimForeignOwnerError{ItemID: itemID}
+}
+
+// releaseClaimThenFailWithRetry hands this attempt's fence back on a post-claim path that
+// is about to return a RETRYABLE error, and applies the rule above.
+//
+// Every such unwind goes through here rather than releasing inline, so the not-owner
+// answer cannot be dropped again by one call site diverging from its four siblings. The
+// release error still dominates the original one — see releaseBlockClaim.
+func (w *Worker) releaseClaimThenFailWithRetry(item QueueItem, attempt BlockDeleteAuthority, originalErr error) error {
+	outcome, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+	if relErr != nil {
+		return relErr
+	}
+	if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, outcome, originalErr); foreign != nil {
+		return foreign
+	}
+	return originalErr
+}
+
 // recordDestructiveBlocked marks that a destructive path refused a delete because the
 // environment could not authorize it.
 //
@@ -1323,7 +1380,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// gc_state='deleting' left standing. See releaseBlockClaim — the release error
 		// dominates until the fence is confirmed gone, and the verify's own error is
 		// reached again on a later pass.
-		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		// The outcome is captured, not discarded: the retryable branch below must know
+		// whether the fence it just handed back was still this attempt's. See
+		// refuseRetryForForeignClaimOwner. The release has to happen HERE rather than
+		// inside each branch, because both branches abandon the claim.
+		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+		if relErr != nil {
 			log.Printf("[GC Worker] Block %s: global liveness verify failed (%v) AND the claim could not be handed back; postponing on the release, the verify error will be re-reached once the fence is off", item.ItemID, err)
 			return relErr
 		}
@@ -1343,6 +1405,14 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// forward and clears the alert while this item stays stuck.
 		if !isClusterUnavailableError(err) {
 			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
+			// ...but only an attempt that still owned the fence may charge that retry to
+			// the item. This is the site where the shape actually bites in practice: a
+			// ReadFailure from a tombstone-heavy block_references partition is exactly
+			// the item-specific error this branch was built to escalate, and it is just
+			// as reachable by a late loser as by the current owner.
+			if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
+				return foreign
+			}
 			log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
 			return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 		}
@@ -1458,16 +1528,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return w.releaseAndPostponeUnreliableRead(item, attempt, "canonical row reads back with no storage class")
 	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
-		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-			return relErr
-		}
-		return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)
+		return w.releaseClaimThenFailWithRetry(item, attempt,
+			fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass))
 	}
 	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-			return relErr
-		}
-		return fmt.Errorf("block %s has empty canonical storage key", item.ItemID)
+		return w.releaseClaimThenFailWithRetry(item, attempt,
+			fmt.Errorf("block %s has empty canonical storage key", item.ItemID))
 	}
 	// Resolve the destination store HERE, in the authorization phase, rather than
 	// after the row is gone. Two reasons, and the second is the one that matters:
@@ -1482,17 +1548,13 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if w.storage != nil {
 		resolved, resolveErr := w.storage.GetBlockStoreForOrg(item.OrgID.String(), storageClass)
 		if resolveErr != nil {
-			if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-				return relErr
-			}
-			return fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, resolveErr)
+			return w.releaseClaimThenFailWithRetry(item, attempt,
+				fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, resolveErr))
 		}
 		if validateErr := resolved.ValidatePhysicalLocator(item.ItemID, storageKey); validateErr != nil {
 			metrics.GCErrorsTotal.WithLabelValues("block_storage_key_mismatch").Inc()
-			if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
-				return relErr
-			}
-			return fmt.Errorf("block %s persisted physical locator %q failed validation: %w", item.ItemID, storageKey, validateErr)
+			return w.releaseClaimThenFailWithRetry(item, attempt,
+				fmt.Errorf("block %s persisted physical locator %q failed validation: %w", item.ItemID, storageKey, validateErr))
 		}
 		blockStore = resolved
 	}
