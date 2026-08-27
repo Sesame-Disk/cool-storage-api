@@ -551,22 +551,40 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 		if !ok || fn.Body == nil {
 			continue
 		}
+
+		// Every call, then the ones that BIND the outcome -- rather than the discarding
+		// spellings, which is what the first cut of this guard enumerated. It claimed the
+		// defect had exactly one spelling because Go will not compile an unread
+		// `released, relErr :=`. That is true of that form and only that form: a bare
+		// `w.releaseBlockClaim(...)` statement, or `_, _ = w.releaseBlockClaim(...)`,
+		// discards everything and compiles fine. Inverting the test -- offender unless
+		// PROVEN consulted -- makes the guard independent of how many ways Go offers to
+		// throw a value away.
+		consulted := map[token.Pos]bool{}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			assign, ok := node.(*ast.AssignStmt)
-			if !ok || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+			if !ok || len(assign.Lhs) == 0 || len(assign.Rhs) != 1 {
 				return true
 			}
 			call, ok := assign.Rhs[0].(*ast.CallExpr)
 			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
 				return true
 			}
-			if blank, ok := assign.Lhs[0].(*ast.Ident); !ok || blank.Name != "_" {
+			if bound, ok := assign.Lhs[0].(*ast.Ident); ok && bound.Name != "_" {
+				consulted[call.Pos()] = true
+			}
+			return true
+		})
+
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") || consulted[call.Pos()] {
 				return true
 			}
-			if p4aBlockDirectlyReturnsOneOf(p4aTightestBlock(fn, assign.Pos()), postponing) {
+			if p4aBlockPostponesUnconditionally(p4aTightestBlock(fn, call.Pos()), postponing) {
 				return true
 			}
-			offenders = append(offenders, fmt.Sprintf("%s (in %s)", fset.Position(assign.Pos()), fn.Name.Name))
+			offenders = append(offenders, fmt.Sprintf("%s (in %s)", fset.Position(call.Pos()), fn.Name.Name))
 			return true
 		})
 	}
@@ -594,28 +612,57 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 
 // TestP4ARequeueNeverCreatesAQueueRow guards the DURABLE half of "postpone".
 //
-// Postponing without spending a retry is implemented as RequeueItem, whose batch is
+// Postponing without spending a retry is implemented as RequeueItem, whose move is
 // DELETE(old) + INSERT(new). Cassandra treats a DELETE of an absent row as a valid no-op
 // and applies the INSERT anyway, and DequeueBatch takes no lease -- so a worker holding a
-// copy of a row another worker has already advanced would not MOVE a row, it would create
-// a second one, durably distinct after R26 because queued_at is part of the key.
+// row another worker has already advanced would not MOVE a row, it would create a second
+// one, durably distinct after R26 because queued_at is part of the key.
 //
-// The late loser is by definition that worker. This guard keeps the existence check in
-// place; TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow proves the behaviour
-// against the engine, which is where it has to be proven: MockStore.RequeueItem searches
-// for the old row first and no-ops when it is gone, so the unit suite agreed with the
-// code while production carried the defect. That is R19's shape exactly.
+// THE CONDITION HAS TO BE PART OF THE MUTATION. A SELECT before the batch answers "the
+// row existed when I looked", and the dangerous direction is not a stale absent but a
+// present that stops being true between the read and the commit -- so a linearizable read
+// would move the window rather than remove it. This guard therefore requires the
+// conditional form, not the presence of a pre-read: an IF on the delete, a batch CAS
+// terminal, and an `applied` the code actually branches on.
+//
+// TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow proves the behaviour against
+// the engine, which is where it has to be proven: MockStore.RequeueItem searches for the
+// old row first and no-ops when it is gone, so the unit suite agreed with the code while
+// production carried the defect. That is R19's shape exactly.
 func TestP4ARequeueNeverCreatesAQueueRow(t *testing.T) {
 	file := p4aParseStore(t)
 	fn := findGCFunction(file, "RequeueItem")
 	if fn == nil {
 		t.Fatal("RequeueItem not found; the requeue guard is vacuous")
 	}
-	if !p4aMentions(fn, "queueItemPendingInfo") {
-		t.Error("RequeueItem must establish the old queue row still exists before its batch: a requeue moves a row and must never create one, or a stale worker resurrects its own copy alongside the live lifecycle's")
+
+	var deleteCQL string
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		text, err := strconv.Unquote(literal.Value)
+		if err != nil || !strings.Contains(text, "DELETE FROM gc_queue") {
+			return true
+		}
+		deleteCQL = text
+		return true
+	})
+	if deleteCQL == "" {
+		t.Fatal("RequeueItem no longer deletes the old gc_queue row; the requeue guard is vacuous")
 	}
-	if !p4aMentions(fn, "ErrNotFound") {
-		t.Error("RequeueItem must treat an absent old row as a no-op rather than an error: another worker already advanced this lifecycle, and there is nothing to move")
+	if !strings.Contains(deleteCQL, "IF EXISTS") {
+		t.Error("RequeueItem must make the old row's existence a CONDITION of the move (IF EXISTS), not something it checked beforehand: a read followed by an unconditional DELETE+INSERT still lets two workers that both observed the row create two durable rows, and no consistency level on the read closes that")
+	}
+	if !p4aMentions(fn, "MapExecCAS") {
+		t.Error("RequeueItem must execute its move as a conditional batch: without a CAS terminal the IF is never evaluated as one operation")
+	}
+	if !p4aMentions(fn, "SerialConsistency") || !p4aMentions(fn, "Serial") {
+		t.Error("RequeueItem's conditional move must serialize globally: workers requeueing one row can live in different datacenters, and LOCAL_SERIAL would not order them against each other")
+	}
+	if !p4aMentions(fn, "applied") {
+		t.Error("RequeueItem must branch on whether the move applied: a batch that did not apply means another worker already advanced this lifecycle, which is a no-op and not an error")
 	}
 }
 
@@ -645,27 +692,44 @@ func p4aTightestBlock(fn *ast.FuncDecl, pos token.Pos) *ast.BlockStmt {
 	return tightest
 }
 
-// p4aBlockDirectlyReturnsOneOf reports whether block returns a composite literal of one
-// of the named types as one of its OWN statements -- not somewhere in a nested branch,
-// which would let any block in the function qualify.
-func p4aBlockDirectlyReturnsOneOf(block *ast.BlockStmt, typeNames map[string]bool) bool {
+// p4aBlockPostponesUnconditionally reports whether EVERY exit this block takes for
+// itself postpones, which is the only condition under which a discarded release outcome
+// is sound: ownership cannot change an answer the branch was going to give anyway.
+//
+// Both halves matter. Requiring a postponing return catches a branch that decides nothing
+// about the fence; forbidding a `fmt.Errorf` return in the same block catches the shape
+// an earlier version of this guard would have waved through --
+//
+//	_, err := w.releaseBlockClaim(...)
+//	if something {
+//		return failedClosedError{}
+//	}
+//	return fmt.Errorf("retryable")
+//
+// -- where a postponing return exists but is not the exit that matters. Only the block's
+// OWN statements are read; a return nested in a deeper branch belongs to that branch.
+func p4aBlockPostponesUnconditionally(block *ast.BlockStmt, typeNames map[string]bool) bool {
 	if block == nil {
 		return false
 	}
+	postpones := false
 	for _, statement := range block.List {
 		ret, ok := statement.(*ast.ReturnStmt)
 		if !ok {
 			continue
 		}
 		for _, result := range ret.Results {
-			literal, ok := result.(*ast.CompositeLit)
-			if !ok {
-				continue
-			}
-			if ident, ok := literal.Type.(*ast.Ident); ok && typeNames[ident.Name] {
-				return true
+			switch typed := result.(type) {
+			case *ast.CompositeLit:
+				if ident, ok := typed.Type.(*ast.Ident); ok && typeNames[ident.Name] {
+					postpones = true
+				}
+			case *ast.CallExpr:
+				if selector, ok := typed.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "Errorf" {
+					return false
+				}
 			}
 		}
 	}
-	return false
+	return postpones
 }

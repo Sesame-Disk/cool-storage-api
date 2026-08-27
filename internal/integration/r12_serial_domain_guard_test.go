@@ -232,8 +232,9 @@ var r12BatchCASTerminals = map[string]bool{
 	// The deprecated-but-functional Session-level forms of the same operation.
 	// v2 keeps them working and delegates to the Batch methods above, so leaving
 	// them out would make the rule depend on which spelling a caller picked
-	// rather than on what the call does. SesameFS uses MapExecuteBatchCAS today,
-	// which is precisely why the omission mattered.
+	// rather than on what the call does. Production uses Batch.MapExecCAS today,
+	// while the deprecated forms remain covered so a future refactor cannot
+	// silently reintroduce them without the scanner understanding their semantics.
 	"ExecuteBatchCAS":    true,
 	"MapExecuteBatchCAS": true,
 }
@@ -244,6 +245,10 @@ var r12BatchCASTerminals = map[string]bool{
 // stands on its own.
 var r12AllowedBatchCAS = map[string]r12UnresolvedAllowance{
 	"relocateLockRowCASFn": {count: 1, reason: "locked_files row relocation; both batch.Query statements are inline literals on locked_files, so the general Query rule classifies them and would discover an R12 target with no CAS terminal"},
+	// The old row's existence has to be a CONDITION of the move, not something read
+	// beforehand: a pre-read answers "it existed when I looked", and two workers that both
+	// looked would each insert a durable queue row. R26 keeps those two apart forever.
+	"(*CassandraStore).RequeueItem": {count: 1, reason: "gc_queue row move; every batch.Query statement is an inline literal on gc_queue, so the general Query rule classifies them and would discover an R12 target with no CAS terminal"},
 }
 
 // r12AllowedBatchCASShape pins what each allowlisted conditional batch is
@@ -259,7 +264,8 @@ var r12AllowedBatchCASShape = map[string]struct {
 	statements int
 	tables     map[string]bool
 }{
-	"relocateLockRowCASFn": {statements: 2, tables: map[string]bool{"locked_files": true}},
+	"relocateLockRowCASFn":          {statements: 2, tables: map[string]bool{"locked_files": true}},
+	"(*CassandraStore).RequeueItem": {statements: 4, tables: map[string]bool{"gc_queue": true, "gc_active_orgs": true, "gc_dirty_orgs": true}},
 }
 
 type r12SerialPin struct {

@@ -88,6 +88,14 @@ retryable errors without consulting ownership, so a late loser reaching them can
 spend budget — that is the orphan-publication half (R14b/P4b), not a queue-policy
 question, and it is deliberately not patched here. `GC_ENABLED=false` remains required.
 
+The seventh P4a review also closed the durable half of postpone. Cassandra `RequeueItem`
+now moves the old queue row with `DELETE(old) IF EXISTS` plus `INSERT(new)` in a conditional
+batch on the `gc_queue` partition, using global `SERIAL` consistency and treating
+`applied=false` as a no-op. The marker writes remain in an idempotent logged batch before
+the conditional move because those tables are outside the queue partition. Real-Cassandra
+coverage includes both the sequential stale-row case and concurrent racers, while
+`GC_ENABLED=false` remains required.
+
 ### Inter-session Update (2026-05-21)
 
 - PR61 focus is desktop sync conflict hardening and closeout, not audit-log expansion.

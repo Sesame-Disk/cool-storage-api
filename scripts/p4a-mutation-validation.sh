@@ -393,15 +393,16 @@ m_verify_alert_fires_for_a_late_loser() {
 
 # A requeue MOVES a row; it must never create one. Cassandra applies the INSERT half of
 # the batch whether or not the DELETE half addressed anything, and DequeueBatch takes no
-# lease, so without the existence check a stale worker resurrects its own copy of a row
-# the live lifecycle already advanced. MockStore cannot show this -- it no-ops when the
-# old row is absent -- which is why the BEHAVIOUR is proven against the engine by
-# TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow, and only the check is gated here.
-m_requeue_can_resurrect_a_stale_row() {
-  # /s so the non-greedy body may span lines; it terminates on the unique error string.
-  mutate "$STORE" 's~if _, _, _, _, infoErr := s\.queueItemPendingInfo\(orgID, oldQueuedAt, itemType, itemID, identity\); infoErr != nil \{.*?return fmt\.Errorf\("load queue row for requeue %s/%s: %w", orgID, itemID, infoErr\)\s+\}~~s'
-  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must establish the old queue row still exists' \
-    'requeue drops its existence check (a stale worker INSERTs a second durable queue row beside the live one; after R26 only queued_at tells them apart)'
+# lease, so unless the old row's existence is a CONDITION of the move, two workers that
+# both observed the row create two durable rows -- after R26 only queued_at tells them
+# apart. A pre-read cannot supply that condition at any consistency level, which is why
+# the mutation removes the IF rather than the read. MockStore cannot show the behaviour --
+# it no-ops when the old row is absent -- so the engine half is
+# TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow.
+m_requeue_move_is_unconditional() {
+  mutate "$STORE" 's~(DELETE FROM gc_queue\s+WHERE org_id = \? AND bucket = \? AND queued_at = \? AND item_type = \? AND item_id = \? AND candidate_storage_class = \? AND candidate_storage_key = \? AND identity_at = \?)\s+IF EXISTS~${1}~'
+  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must make the old row' \
+    'the requeue move drops its IF EXISTS (two workers that both observed the row each INSERT a durable queue row beside the other)'
   restore
 }
 
@@ -460,7 +461,7 @@ MUTATIONS=(
   m_unwind_bypasses_the_wrapper
   m_owned_alert_fires_for_a_late_loser
   m_verify_alert_fires_for_a_late_loser
-  m_requeue_can_resurrect_a_stale_row
+  m_requeue_move_is_unconditional
 )
 
 if [ "${1:-}" = "--list" ]; then

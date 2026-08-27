@@ -700,65 +700,62 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 		return err
 	}
 
-	// A REQUEUE MOVES A ROW. IT MUST NEVER CREATE ONE.
+	// A requeue must move one old row, never create a second row. DequeueBatch is a plain
+	// SELECT with no lease, so concurrent workers can hold the same row. A read before
+	// this operation cannot close that race: both workers can observe the old row and then
+	// each run DELETE(old) plus INSERT(new), where Cassandra treats a delete of an absent
+	// row as a no-op while applying the insert.
 	//
-	// DequeueBatch is a plain SELECT with no lease, so two workers routinely hold the
-	// same queue row at the same time — that is the premise the whole claim protocol
-	// exists to survive. The batch below is DELETE(old) + INSERT(new), and in Cassandra
-	// a DELETE of an absent row is a perfectly valid no-op while the INSERT applies
-	// regardless. So a worker whose copy of the row was already moved by somebody else
-	// did not move a row: it RESURRECTED a stale copy alongside the live one, and after
-	// R26 both rows are durable — same block, same identity_at, different queued_at, so
-	// the primary key keeps them apart and nothing collapses them again.
-	//
-	// The stale attempt is exactly the caller that hits this: a late loser postponing on
-	// blockClaimForeignOwnerError is, by definition, an attempt that fell behind, and the
-	// lifecycle that overtook it has usually requeued the row already.
-	//
-	// So establish the row is still ours to move first. This is the same existence check
-	// FailItem has always done before a DLQ move (and for the same reason), which is why
-	// the retry-capped path was never able to resurrect anything while the postponing one
-	// was. An absent row means another worker already advanced this lifecycle; there is
-	// nothing to move and nothing to report.
-	//
-	// It is an ordinary read, not a CAS, and that is deliberate: the failure mode of
-	// reading a stale absent is that we skip a requeue whose row is in fact still there,
-	// and that row simply keeps its old queued_at and is dequeued again on the next tick.
-	// Nothing is lost, so the linearizable version would buy nothing for its cost.
-	if _, _, _, _, infoErr := s.queueItemPendingInfo(orgID, oldQueuedAt, itemType, itemID, identity); infoErr != nil {
-		if errors.Is(infoErr, gocql.ErrNotFound) {
-			log.Printf("[GC] Skipping requeue for missing queue row org=%s item_type=%s item_id=%s queued_at=%s; another worker already advanced this lifecycle", orgID, itemType, itemID, oldQueuedAt.Format(time.RFC3339Nano))
-			return nil
-		}
-		return fmt.Errorf("load queue row for requeue %s/%s: %w", orgID, itemID, infoErr)
-	}
-
+	// The old row's existence is therefore a condition of the move. The old and new queue
+	// rows use the same (org_id, bucket) partition because only queued_at changes, so the
+	// two queue statements can be one Paxos decision. A losing conditional move is a
+	// harmless no-op because another worker already advanced this lifecycle.
 	now := time.Now().UTC()
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
 
-	// Delete old item
-	batch.Query(`
-		DELETE FROM gc_queue
-		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
-
-	// Insert new item at the end of the queue
-	batch.Query(`
-		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, identity.IdentityAt, guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, identity.Target().StorageClass, identity.Target().StorageKey, newRetryCount)
-	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, identity)
-	batch.Query(`
+	// The queue move is the only conditional part. The marker writes are prepared first
+	// because Cassandra conditional batches cannot span the queue partition and the marker
+	// partitions; writing them after a successful move could leave that moved row
+	// undiscoverable if the marker batch failed. They are idempotent, so a racer that loses
+	// the queue CAS may refresh a marker without creating another queue row.
+	markers := s.db.Session().Batch(gocql.LoggedBatch)
+	addPendingItemBatchQuery(markers, orgID, libraryID, itemType, itemID, identity)
+	markers.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
-	batch.Query(`
+	markers.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), now)
+	if err := markers.Exec(); err != nil {
+		return fmt.Errorf("record queue requeue markers for %s/%s: %w", orgID, itemID, err)
+	}
 
-	return batch.Exec()
+	move := s.db.Session().Batch(gocql.LoggedBatch)
+	move.Query(`
+		DELETE FROM gc_queue
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+		IF EXISTS
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
+	move.Query(`
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, identity.IdentityAt, guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, identity.Target().StorageClass, identity.Target().StorageKey, newRetryCount)
+
+	applied, iter, err := move.SerialConsistency(gocql.Serial).MapExecCAS(map[string]interface{}{})
+	if iter != nil {
+		if closeErr := iter.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("move queue item %s/%s: %w", orgID, itemID, err)
+	}
+	if !applied {
+		log.Printf("[GC] Skipping requeue for missing queue row org=%s item_type=%s item_id=%s queued_at=%s; another worker already advanced this lifecycle", orgID, itemType, itemID, oldQueuedAt.Format(time.RFC3339Nano))
+	}
+	return nil
 }
 
 func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error {

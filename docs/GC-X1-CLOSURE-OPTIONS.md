@@ -1690,10 +1690,21 @@ worker had already advanced created a SECOND durable row rather than moving one 
 R26 they differ only in `queued_at`, which is part of the key. Every requeue reached this,
 including `Queue.IncrementRetry` on `main`; what the late-loser rule changed was one
 interleaving, replacing the existence-checked `FailItem` at the retry cap with an
-unconditional requeue. `RequeueItem` now performs the same existence check `FailItem`
-always did and treats an absent row as a no-op. `MockStore` already behaved this way,
-which is precisely why the unit suite could not see it — R19's shape — so the gate is
-`TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` against the real engine.
+unconditional requeue.
+
+The first repair added a pre-read, but that was still a TOCTOU: two workers could both
+observe the old row and then both insert a new one. The move now uses a two-statement
+conditional batch on the single `gc_queue` partition: `DELETE(old) IF EXISTS` plus
+`INSERT(new)`, executed through the driver's batch-CAS API with the global `SERIAL`
+phase. A losing CAS returns `applied=false` and is a no-op. `gc_pending_items`,
+`gc_active_orgs` and `gc_dirty_orgs` are written in an idempotent logged batch first,
+because Cassandra conditional batches cannot span those partitions and writing the
+markers after the move could make that moved row undiscoverable if the marker write
+failed. `MockStore` already behaved this way, which is precisely why the unit suite could
+not see it — R19's shape. The real-engine gates are
+`TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` and
+`TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce`; the source gate requires the
+conditional move rather than merely a `queueItemPendingInfo` pre-read.
 
 R14b/P4b, the orphan-publication half, remains open — and note that
 `StartBlockDeleteOrphan`/`FinalizeBlockDelete` failures still return retryable errors

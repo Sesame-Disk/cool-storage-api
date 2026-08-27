@@ -4,6 +4,7 @@ package integration
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,7 +39,11 @@ func p4aBlockQueueRows(t *testing.T, store *gcpkg.CassandraStore, orgID uuid.UUI
 // one. DequeueBatch is a plain SELECT with no lease, so two workers holding the same row
 // is not an exotic interleaving; it is the premise the claim protocol exists to survive.
 //
-// MockStore cannot show this. Its RequeueItem searches for the old row first and no-ops
+// This leg covers the SEQUENTIAL case: the row is already gone when the second worker
+// arrives. TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce covers the case a pre-read
+// could never have closed, where both workers observe the row and then both mutate.
+//
+// MockStore cannot show either. Its RequeueItem searches for the old row first and no-ops
 // when it is absent, which is the behaviour we WANT and not the behaviour Cassandra had —
 // so the entire unit suite agreed with the code while production could double the row.
 // That is the exact shape of R19, and it is why this gate lives here.
@@ -111,6 +116,103 @@ func TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow(t *testing.T) {
 	}
 	if moved[0].RetryCount != q0.RetryCount+1 {
 		t.Fatalf("retry_count = %d, want %d: the existence check must not swallow the payload update", moved[0].RetryCount, q0.RetryCount+1)
+	}
+
+	gate.observed = true
+}
+
+// TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce is the leg that a read-before-batch
+// implementation cannot pass, and the reason the move is a conditional batch rather than
+// a SELECT followed by an unconditional one.
+//
+// The sequential leg above only proves that a row already absent on entry is not
+// recreated. A pre-read passes that just as well. What it cannot pass is this:
+//
+//	A: observes Q0 -> exists
+//	B: observes Q0 -> exists
+//	B: DELETE Q0 + INSERT Q1   (applies)
+//	A: DELETE Q0 (no-op) + INSERT Q2   (applies anyway)
+//
+// Raising the read to SERIAL does not help. A linearizable read still only says the row
+// existed at that instant; it does not stop the other worker from moving it immediately
+// afterwards. The existence of the old row has to be a condition OF the mutation.
+//
+// With the conditional batch, Paxos serializes the racers on the gc_queue partition and
+// exactly one move applies — so this assertion holds no matter how the goroutines
+// interleave, which is what makes the test non-flaky rather than merely lucky. Several
+// rounds are run because a race test that never actually overlaps proves nothing about
+// the window even when it passes.
+func TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce(t *testing.T) {
+	requireCassandra(t)
+	gate := p4aRequireEvidence(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+
+	const racers = 4
+	for round := 0; round < 5; round++ {
+		blockID := fmt.Sprintf("p4a-requeue-race-%d-%d", time.Now().UnixNano(), round)
+		func() {
+			defer cleanupGCBlockRowsForTest(t, orgID, blockID)
+
+			seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
+			candidate, err := store.EnsureBlockGCCandidateExact(orgID, blockID, "hot", time.Now().UTC().Add(-2*time.Hour).Truncate(time.Millisecond))
+			if err != nil {
+				t.Fatalf("round %d: EnsureBlockGCCandidateExact: %v", round, err)
+			}
+			if err := enqueueExactBlockCandidateForTest(store, candidate, candidate.CandidateAt); err != nil {
+				t.Fatalf("round %d: enqueue candidate: %v", round, err)
+			}
+			rows := p4aBlockQueueRows(t, store, orgID, blockID)
+			if len(rows) != 1 {
+				t.Fatalf("round %d: queue rows after enqueue = %d, want 1", round, len(rows))
+			}
+			q0 := rows[0]
+
+			// Every racer holds the same Q0, which is what DequeueBatch hands out: it is a
+			// plain SELECT and takes no lease.
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			errs := make([]error, racers)
+			targets := make([]time.Time, racers)
+			for i := 0; i < racers; i++ {
+				targets[i] = time.Now().UTC().Add(time.Duration(i+1) * time.Second).Truncate(time.Millisecond)
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					errs[i] = store.RequeueItem(orgID, q0.QueuedAt, targets[i], q0.ItemType, q0.ItemID,
+						q0.LibraryID, q0.BlockRepresentationID, q0.StorageClass, q0.RetryCount,
+						q0.Identity(), q0.RequiresLibraryDeletedCheck, q0.LibraryGuardMode)
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+
+			for i, err := range errs {
+				if err != nil {
+					t.Fatalf("round %d: racer %d: losing a conditional move is a no-op, not an error: %v", round, i, err)
+				}
+			}
+
+			after := p4aBlockQueueRows(t, store, orgID, blockID)
+			if len(after) != 1 {
+				t.Fatalf("round %d: live queue rows = %d, want 1: workers that all observed Q0 each created a durable row; after R26 they differ only in queued_at and nothing collapses them again: %+v", round, len(after), after)
+			}
+			if after[0].QueuedAt.Equal(q0.QueuedAt) {
+				t.Fatalf("round %d: Q0 is still the live row; no move applied at all", round)
+			}
+			var matched bool
+			for _, target := range targets {
+				if after[0].QueuedAt.Equal(target) {
+					matched = true
+				}
+			}
+			if !matched {
+				t.Fatalf("round %d: surviving row is at %s, which is none of the racers' targets", round, after[0].QueuedAt.Format(time.RFC3339Nano))
+			}
+		}()
 	}
 
 	gate.observed = true

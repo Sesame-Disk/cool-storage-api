@@ -68,7 +68,7 @@ rejected `ValidatePhysicalLocator`.
   `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
   `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
   item-specific alert counter raised before ownership is consulted), and
-  `m_requeue_can_resurrect_a_stale_row` (the requeue drops its existence check). Six in
+  `m_requeue_move_is_unconditional` (the requeue drops the conditional move). Six in
   this entry, bringing `scripts/p4a-mutation-validation.sh` to **41** — the script prints
   its own total on a clean run, and that figure is the one to cite.
 
@@ -96,20 +96,21 @@ Two things about the scope, both verified rather than assumed:
 
 The fix belongs at the primitive, not in a new queue-policy class: a not-owner release
 routed away from `postponeItem` would have left the identical hazard reachable from the
-half-dozen other postpone paths, and from every retry. `RequeueItem` now establishes the
-old row still exists before its batch -- the same check `FailItem` has always done, and
-the reason the retry-capped path was never able to resurrect anything. An absent row means
-another worker already advanced this lifecycle: there is nothing to move, and it is a
-no-op rather than an error. The read is ordinary, not a CAS, because the failure mode of a
-stale absent is a skipped requeue whose row keeps its old `queued_at` and is dequeued again
-next tick.
+half-dozen other postpone paths, and from every retry. The first repair established that
+the old row existed before its batch, but that read was still TOCTOU: two workers could
+both observe the row and then both insert a new one. `RequeueItem` now makes the existence
+test part of a two-statement conditional batch on the single `gc_queue` partition,
+`DELETE(old) IF EXISTS` plus `INSERT(new)`, through the batch-CAS API with global `SERIAL`
+consistency. An absent row produces `applied=false`, meaning another worker already
+advanced this lifecycle; there is nothing to move, and the operation is a no-op.
 
 `MockStore.RequeueItem` already searched for the old row and no-opped when it was gone --
 the behaviour we want, and NOT the behaviour Cassandra had. So the whole unit suite agreed
 with the code while production carried the defect. That is R19's shape exactly, and it is
 why the gate is `TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` against the real
-engine, with `TestP4ARequeueNeverCreatesAQueueRow` and
-`m_requeue_can_resurrect_a_stale_row` holding the check itself in place.
+engine, with `TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce`,
+`TestP4ARequeueNeverCreatesAQueueRow` and `m_requeue_move_is_unconditional` holding the
+conditional move in place.
 
 **Second pass over this same change.** A review of the first cut found nothing wrong with
 the decision and three things wrong around it, all fixed here:

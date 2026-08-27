@@ -127,7 +127,7 @@ var relocateLockRowCASFn = func(session *gocql.Session, repoUUID gocql.UUID, old
 		`DELETE FROM locked_files WHERE repo_id = ? AND path = ? IF locked_by = ?`,
 		repoUUID, oldPath, userUUID,
 	)
-	applied, iter, err := session.MapExecuteBatchCAS(batch, map[string]interface{}{})
+	applied, iter, err := batch.MapExecCAS(map[string]interface{}{})
 	if iter != nil {
 		_ = iter.Close()
 	}
