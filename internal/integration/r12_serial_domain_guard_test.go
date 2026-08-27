@@ -232,8 +232,9 @@ var r12BatchCASTerminals = map[string]bool{
 	// The deprecated-but-functional Session-level forms of the same operation.
 	// v2 keeps them working and delegates to the Batch methods above, so leaving
 	// them out would make the rule depend on which spelling a caller picked
-	// rather than on what the call does. SesameFS uses MapExecuteBatchCAS today,
-	// which is precisely why the omission mattered.
+	// rather than on what the call does. Production uses Batch.MapExecCAS today,
+	// while the deprecated forms remain covered so a future refactor cannot
+	// silently reintroduce them without the scanner understanding their semantics.
 	"ExecuteBatchCAS":    true,
 	"MapExecuteBatchCAS": true,
 }

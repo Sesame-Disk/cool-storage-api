@@ -8,6 +8,257 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4a: the postponing unwinds obey the authority rule too
+
+The previous entry established the rule and applied it to five of eight post-claim exits.
+Three were left out on a reason that had just stopped being true.
+
+**What was missed.** The five fixed exits return a RETRYABLE error, so losing the claim
+there cost the item its retry budget — a visible, expensive failure. The other three
+return a POSTPONING error, and the standing justification for ignoring the release outcome
+on them was "both outcomes postpone, so ownership cannot change the queue policy". That
+was accurate while postponing meant leaving the item alone. It stopped being accurate the
+moment a lost claim came to mean NO DURABLE QUEUE MUTATION, because postponing is
+`postponeItem`, `postponeItem` is `RequeueItem`, and `RequeueItem` is a durable mutation —
+a `DELETE(old)` + `INSERT(new)` batch that inserts whether or not the delete addressed
+anything (E6). A stale attempt handed it a copy of the queue row it had been holding since
+before it lost the claim.
+
+The three:
+
+| Exit | What it did |
+|---|---|
+| global liveness verify, **availability** half | bound the outcome, consulted it only in the non-availability branch |
+| `releaseAndPostponeUnreliableRead` | discarded the outcome |
+| destructive topology gate at the commit point | discarded the outcome |
+
+The availability half is the one that matters operationally: an unreachable datacenter
+sends every in-flight block down exactly the branch that skipped the check, all at once.
+
+**What changed.** All three now bind the release outcome and route it through
+`refuseRetryForForeignClaimOwner`, so a not-owner answer produces
+`blockClaimForeignOwnerError` and `processOrg` leaves the queue alone. There are now zero
+sites in `worker.go` that discard a `BlockReleaseOutcome`.
+
+**Observation and policy are separated, deliberately.** The environmental signals still
+fire for a late loser — `liveness_verify_unavailable` plus `recordDestructiveBlocked`, and
+`block_canonical_read_unreliable` — because an outage or a lagging replica is real whoever
+holds the claim, and suppressing them would hide a datacenter that is genuinely
+unreachable. What a late loser lacks is standing to decide the ITEM's fate: which error to
+return, whether a retry is spent, whether the row moves. The item-specific counters
+(`liveness_verify_failed`, `block_storage_key_mismatch`) stay owner-only for the same
+reason they were moved there in the first place.
+
+**The guard got simpler by getting stricter.** `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome`
+used to allow a discard wherever the branch postponed anyway, and that exemption pointed at
+exactly the two paths above — the worst thing a guard can do is bless the defect it was
+written to catch. It also could not see the third shape, because the verify BOUND the
+outcome and consulted it in one branch of two, which any name-based check reads as
+"consulted". The allowlist is gone. The rule is now: no caller of `releaseBlockClaim` may
+discard its outcome, and every function that releases must name the authority decision.
+
+**Evidence.** `TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched` drives all
+three with a takeover interposed at the claim/verify window and requires
+`Complete=Requeue=Fail=0` plus a queue row identical to the one the walk found.
+`TestP4A_OwnedPostponingUnwindStillRequeues` is the half that keeps this from becoming a
+different bug: an attempt that still owns its fence must go on postponing, requeue
+included, or the item blocks the head of the queue for as long as the condition lasts.
+Verified red against the pre-fix worker: all three reported `Requeue=1`. Four mutations:
+`m_unreliable_read_discards_foreign_owner`, `m_topology_gate_discards_foreign_owner` and
+`m_availability_verify_skips_foreign_owner` restore one discard each, and
+`m_bound_outcome_never_reaches_authority` binds the outcome and merely logs it — the shape
+a per-function guard cannot see, because the other release sites consult theirs. The
+script now runs **44** mutations, all red.
+
+**What this does NOT close.** E6 is untouched: `DequeueBatch` still takes no lease and
+`Requeue`/`Complete`/`Fail` are still ordinary batches, so two ordinary workers can still
+duplicate a `queued_at`. What is now true is narrower and worth stating exactly: *an
+attempt that discovers post-claim that it no longer owns the claim performs no durable
+queue mutation.* `BlockClaimFreshOwner` deliberately still postpones through the generic
+path — it never held the claim, so it is not a stale walk in the sense this rule is
+about, and backing off by moving the row is what keeps the queue moving. That is a
+statement about the WALK, not about the row: `DequeueBatch` takes no lease, so a
+fresh-owner rejection's copy of the row can be stale like any other. Which is E6, and E6
+is not what this rule closes.
+
+## 2026-08-27 - P4a review: queue lifecycle arbitration remains open
+
+The queue-primitive hardening from the draft below is withdrawn from this branch. It mixed
+global `RequeueItem` arbitration into the late-loser fix while `CompleteItem` and `FailItem`
+still use ordinary batches, so it could not establish one authority for the whole
+`Requeue`/`Complete`/`Fail` lifecycle.
+
+The mergeable scope is now explicit:
+
+- A `blockClaimForeignOwnerError` is classified at the `processOrg` boundary before generic
+  error, retry, postpone or DLQ handling.
+- The stale worker performs no `CompleteItem`, `RequeueItem`, `FailItem` or retry mutation.
+  It performs no durable queue mutation: the row it is holding, the candidate, the
+  identity and the claim are left exactly as it found them. That is a statement about what
+  the stale attempt does, not about the state — the authoritative lifecycle may well have
+  moved the row and taken the claim already, which is the case
+  `TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow` covers.
+- The five post-claim ownership/unwind fixes and their owned-vs-foreign behavior remain in
+  P4a. Permanent defects still spend retries when the attempt owns the claim.
+- `RequeueItem` is back to the ordinary logged `DELETE(old)` + `INSERT(new)` batch used by
+  the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
+  a partial LWT.
+- The requeue-specific real-Cassandra tests, source guard and mutations were removed from
+  this PR. The active P4a mutation script now contains **44** mutations; the script output
+  is authoritative.
+
+The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ
+and cross-partition pending state. Its race matrix includes `Requeue` vs `Requeue`,
+`Requeue` vs `Complete`, `Requeue` vs `Fail`, `Complete` vs `Fail`, and ambiguous outcomes.
+Until that design is implemented and proven, `GC_ENABLED=false` remains required.
+
+## 2026-08-27 - P4a: a late loser must not spend the work item's retry budget either (historical draft)
+
+> The queue-primitive sections in this historical entry describe an implementation that was
+> later withdrawn from the mergeable branch. The current queue status is recorded above.
+
+Closes the second half of the late-loser contract. The first half — landed with P4a —
+stopped an attempt whose claim had been taken over from CONSUMING the current owner's
+candidate. This one stops it from consuming the current owner's only way BACK to that
+candidate.
+
+**The defect.** Five post-claim unwinds released the fence and then returned an ordinary
+error, discarding the release outcome:
+
+```go
+if _, relErr := w.releaseBlockClaim(...); relErr != nil { return relErr }
+return fmt.Errorf("...")            // retryable → retry_count++ → DLQ at the cap
+```
+
+`BlockReleaseNotOwner` and `BlockReleaseReleased` were indistinguishable there, so an
+attempt taken over mid-walk charged a retry to the item for a race it never owned. That
+is not a lost delete and not a wrong delete — it is a lost WORK ITEM: `ItemBlock` never
+leaves the DLQ (`isAutoRecoverableFailedItem` rescues only commit/fs_object items with
+`library_hard_delete_in_progress`), and Phase 1 of the scanner advances its day cursor to
+`today-1` on every clean pass, so the surviving candidate's discovery row is never read
+again. Candidate present, work item unreachable, foreign fence standing — and if that
+owner later dies, `BlockDeleteFenceActive` refuses every future upload of that content
+with nothing left in the system able to lift it.
+
+It does not take a long run of lost races. An item already at the cap for unrelated
+reasons needs ONE.
+
+**The five sites**, all in `processBlock` after the claim: the global reference
+verify's non-availability branch (the realistic one — a `ReadFailure` from a
+tombstone-heavy `block_references` partition is exactly what that branch was built to
+escalate, and a late loser reaches it as easily as the owner does), a non-canonical
+`storage_class`, an empty/untrimmed `storage_key`, a failed `GetBlockStoreForOrg`, and a
+rejected `ValidatePhysicalLocator`.
+
+**What changed**
+- `refuseRetryForForeignClaimOwner` turns a not-owner release into
+  `blockClaimForeignOwnerError` — already in `shouldPostponeWithoutRetry`, so it
+  postpones with no retry spent and no DLQ entry.
+- `releaseClaimThenFailWithRetry` wraps release + decision for the four authorization-phase
+  sites. The verify site captures the outcome directly, because its release must happen
+  before the availability classification that picks the branch.
+- **Not a blanket postpone.** A permanent item defect must still reach the DLQ where a
+  human sees it; what a not-owner release removes is this attempt's STANDING to conclude
+  anything about the item from a walk it no longer owns. The next pass re-claims fresh,
+  and an owner reaching the same error spends its retries normally.
+
+**Evidence**
+- `TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget` — table-driven over all five
+  failure points with a takeover interposed at the claim/verify window, run on both sides
+  of the retry cap: candidate present, current owner's claim untouched, queue item live,
+  `retry_count` unchanged, DLQ empty, zero physical deletes.
+- `TestP4A_OwnedUnwindStillSpendsTheRetryBudget` — the same five points WITHOUT a
+  takeover: retry spent, DLQ reached at the cap, fence off. This is what keeps the fix
+  from trading a stranded fence for an item that retries forever in silence.
+- Mutation: `m_unwind_ignores_foreign_owner` (the shared decision),
+  `m_verify_unwind_ignores_foreign_owner` (the one site that cannot use the wrapper),
+  `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
+  `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
+  item-specific alert counter raised before ownership is consulted). The two
+  requeue-specific mutations this entry also listed, `m_requeue_move_is_unconditional`
+  and `m_requeue_recreates_pending_marker`, were withdrawn with the queue-primitive
+  draft and no longer exist -- nor do the four real-Cassandra and source gates named
+  further down this entry. For the current total, run the script: it prints its own,
+  and no count written in prose here is authoritative.
+
+**Third pass: the durable half of "postpone".** Two reviewers converged on the queue
+boundary, and they were right that it was the open question -- though not that the defect
+belonged to this branch.
+
+`postponeItem` is `RequeueItem`, whose batch is `DELETE(old row)` + `INSERT(new row)`. In
+Cassandra a `DELETE` of an absent row is a valid no-op and the `INSERT` applies anyway,
+and `DequeueBatch` is a plain `SELECT` with no lease -- so a worker whose copy of the row
+another worker had already advanced did not MOVE a row, it created a second one. After R26
+both are durable: same block, same `identity_at`, different `queued_at`, and `queued_at` is
+part of the primary key, so nothing collapses them again.
+
+Two things about the scope, both verified rather than assumed:
+- It is NOT introduced by the late-loser rule. `Queue.IncrementRetry` calls the same
+  `RequeueItem`, so every ordinary error below the retry cap already reached it on `main`,
+  as did the postpone classes that predate this branch (`BlockClaimFreshOwner`,
+  within-grace, unreliable-read, fail-closed). With no lease on dequeue, two workers
+  requeuing the same row needs no takeover and no stalled walk at all.
+- What this branch DID change is one narrow interleaving: at the retry cap a late loser
+  used to reach `FailItem`, which has always checked the row exists and skipped when it
+  did not. Routing it to `postponeItem` replaced an existence-checked no-op with an
+  unconditional requeue.
+
+The fix belongs at the primitive, not in a new queue-policy class: a not-owner release
+routed away from `postponeItem` would have left the identical hazard reachable from the
+half-dozen other postpone paths, and from every retry. The first repair established that
+the old row existed before its batch, but that read was still TOCTOU: two workers could
+both observe the row and then both insert a new one. `RequeueItem` now makes the existence
+test part of a two-statement conditional batch on the single `gc_queue` partition,
+`DELETE(old) IF EXISTS` plus `INSERT(new)`, through the batch-CAS API with global `SERIAL`
+consistency. An absent row produces `applied=false`, meaning another worker already
+advanced this lifecycle; there is nothing to move, and the operation is a no-op.
+
+The marker phase has one narrower rule: `gc_active_orgs` and `gc_dirty_orgs` remain safe
+scheduling hints and may be refreshed before the move, but `gc_pending_items` is durable
+deduplication state and is not written by `RequeueItem`. Otherwise a stale worker could lose
+the queue move after `CompleteItem` removed the lifecycle and leave a permanent pending marker
+with no queue row. `TestP4A_StaleRequeueCannotResurrectCompletedPendingMarker` covers that
+real-Cassandra boundary, `TestP4ARequeueNeverCreatesAQueueRow` guards the source shape, and
+`m_requeue_recreates_pending_marker` keeps the mutation gate red if the ordering regresses.
+
+`MockStore.RequeueItem` already searched for the old row and no-opped when it was gone --
+the behaviour we want, and NOT the behaviour Cassandra had. So the whole unit suite agreed
+with the code while production carried the defect. That is R19's shape exactly, and it is
+why the gate is `TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow` against the real
+engine, with `TestP4A_ConcurrentRequeueOfOneRowAppliesExactlyOnce`,
+`TestP4ARequeueNeverCreatesAQueueRow` and `m_requeue_move_is_unconditional` holding the
+conditional move in place.
+
+**Second pass over this same change.** A review of the first cut found nothing wrong with
+the decision and three things wrong around it, all fixed here:
+- `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome` is a new source guard. The defect
+  has exactly one spelling — Go will not compile a `released, relErr :=` whose outcome is
+  never read, so dropping the answer requires `_` — which makes it guardable. A discard is
+  allowed only where ownership cannot change the answer, meaning the branch postpones
+  whatever the release said; the allowlist of postponing error types checks ITSELF against
+  `shouldPostponeWithoutRetry`, so it cannot be widened into permitting the defect. It
+  scans all of `worker.go`, not just `processBlock`: a new helper shaped like
+  `releaseAndPostponeUnreliableRead` but returning an ordinary error would otherwise
+  reopen the hole from outside the one function the first cut watched.
+- The item-specific alert counters (`liveness_verify_failed`, `block_storage_key_mismatch`)
+  were raised BEFORE the ownership check. Those counters mean "this block is defective",
+  which is a conclusion about the item, and a late loser has no more standing to draw it
+  for a metric than for the retry budget — it would page someone about a healthy block.
+  They now fire only on the owned path; the defect is durable, so the attempt that does
+  own the fence re-observes it and raises the counter on the next pass. Asserted from both
+  sides of the table test via `testutil.ToFloat64`.
+- `blockClaimForeignOwnerError`'s message still said "at settlement time" although the
+  error now also covers unwinds that settle nothing.
+
+**Still open, deliberately.** `StartBlockDeleteOrphan` and `FinalizeBlockDelete` failures
+retain the fence and return retryable errors without consulting ownership, so a late
+loser reaching THEM can still spend budget. That is the orphan-publication half — R14b /
+P4b, recorded OPEN — and it is not patched here: a late loser that gets that far has
+already published an orphan row for a block another lifecycle owns, which is the A+
+non-overlap question P4b exists to answer, not a queue-policy one.
+
+`GC_ENABLED=false` remains required on every replica in every DC.
+
 ## 2026-08-26 - R26 exact-`P` GC work-item identity (candidate / projection / queue / pending / DLQ)
 
 Makes the exact physical incarnation part of the durable IDENTITY of a GC work item,
@@ -310,7 +561,9 @@ and is then recognised by the settling read — was untestable.
   skipping to a green run). Four legs: exclusive ownership plus exact takeover, the ABA
   case, retry semantics under the engine's real CAS returns, and stale-claim release
   bound to the observed physical incarnation.
-- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations, each
+- Mutation: `scripts/p4a-mutation-validation.sh` — twenty-three deliberate mutations at
+  the time of this entry (forty-one since 2026-08-27; the newest entry above is
+  authoritative for the current count), each
   required to go red WITH a P4a assertion rather than for an unrelated reason. Two of them
   earned their keep during the second pass: one exposed that a mutation which fails to
   COMPILE proves nothing, and one exposed that the incarnation check lives in two mirrored

@@ -24,10 +24,10 @@ const (
 	// GCFailureCodeBlockAuthorityInvalid marks a candidate whose physical identity is
 	// unusable as destructive authority. Postponed, never retried and never consumed.
 	GCFailureCodeBlockAuthorityInvalid = "block_authority_invalid"
-	// GCFailureCodeBlockClaimForeignOwner marks a walk that reached a settlement step
-	// only to find its own claim already gone — taken over, or finalized elsewhere.
+	// GCFailureCodeBlockClaimForeignOwner marks a walk that reached a post-claim decision
+	// point only to find its own claim already gone — taken over, or finalized elsewhere.
 	//
-	// The item is postponed and the candidate preserved. That is the same rule
+	// The worker leaves the item and candidate untouched. That is the same rule
 	// BlockClaimFreshOwner follows at the claim, arrived at from the other side: some
 	// other lifecycle owns the fence now, and this candidate is what will lift it if
 	// that lifecycle dies. Consuming it here would leave the fence standing with

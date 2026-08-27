@@ -205,7 +205,11 @@ m_stale_discovery_failure_burns_a_retry() {
 }
 
 m_enqueue_item_mints_block_candidate() {
-  mutate "$STORE" 's{\tif itemType == ItemBlock \{\n\t\treturn fmt\.Errorf\("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType\)\n\t\}\n}{}'
+  # Whitespace runs, not literal newlines: this pattern used \n\t\t and silently matched
+  # NOTHING against a CRLF working tree, so the mutation never applied and the run aborted
+  # before it could prove anything. Exactly the portability rule stated at the top of this
+  # file, which this one entry did not follow.
+  mutate "$STORE" 's{if itemType == ItemBlock \{\s+return fmt\.Errorf\("item type %s requires an exact block GC candidate identity; use EnqueueBatch", itemType\)\s+\}}{}'
   expect_red 'TestEnqueueItemRefusesBlockItems' 'reached the database' \
     'raw enqueue accepts ItemBlock again (enqueue fabricates destructive authority with no zero-ref decision)'
   restore
@@ -310,7 +314,11 @@ m_late_loser_settles_candidate() {
 }
 
 m_unreliable_read_skips_release() {
-  mutate "$WORKER" 's#\.WithLabelValues\("block_canonical_read_unreliable"\)\.Inc\(\)(\s+)if _, relErr := w\.releaseBlockClaim\(item\.OrgID, item\.ItemID, attempt\); relErr != nil \{(\s+)return relErr(\s+)\}#.WithLabelValues("block_canonical_read_unreliable").Inc()#'
+  # The helper now BINDS the release outcome, because it must consult ownership before it
+  # may postpone -- postponing is RequeueItem, a durable queue mutation a late loser may
+  # not make. Release and authority check are therefore removed together here; the
+  # foreign-owner half has its own mutation below.
+  mutate "$WORKER" 's#\.WithLabelValues\("block_canonical_read_unreliable"\)\.Inc\(\)\s+released, relErr := w\.releaseBlockClaim\(item\.OrgID, item\.ItemID, attempt\).*?if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, errors\.New\(reason\)\); foreign != nil \{\s+return foreign\s+\}#.WithLabelValues("block_canonical_read_unreliable").Inc()#s'
   expect_red 'TestP4A_StalePostClaimReadHandsTheFenceBackAndPostpones' 'fence left standing' \
     'stale post-claim read postpones WITHOUT handing the fence back (a lagging replica becomes a permanent upload refusal)'
   restore
@@ -331,16 +339,100 @@ m_divergent_read_retries() {
 }
 
 m_authority_invalid_retries() {
-  mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockClaimForeignOwner,}{GCFailureCodeBlockClaimForeignOwner,}'
-  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'is documented as postponing but spends the retry budget' \
+  mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockCandidateWithinGrace,}{GCFailureCodeBlockCandidateWithinGrace,}'
+  expect_red 'TestP4A_LateLoserLeavesQueueUntouched' 'is documented as postponing but spends the retry budget' \
     'block_authority_invalid dropped from the postpone list (it retries into a DLQ ItemBlock never leaves, against its own contract)'
   restore
 }
 
-m_foreign_owner_retries() {
-  mutate "$WORKER" 's{GCFailureCodeBlockClaimForeignOwner,(\s+)GCFailureCodeBlockCandidateWithinGrace,}{GCFailureCodeBlockCandidateWithinGrace,}'
-  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'a late loser must postpone' \
-    'late loser spends the retry budget (parks the item in the DLQ, making the preserved candidate unreachable anyway)'
+m_foreign_owner_enters_queue_lifecycle() {
+  mutate "$WORKER" 's~if shouldLeaveQueueUntouched\(err\) \{~if false \{~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'queue mutations = Complete:' \
+    'late loser enters the generic queue lifecycle path instead of leaving its stale row untouched'
+  restore
+}
+
+# The candidate is preserved by the settlement rule, but a candidate is only a recovery
+# mechanism while a work item can still carry it back. These two cover the OTHER exit:
+# the post-claim unwinds that spend the retry budget on their way out.
+m_unwind_ignores_foreign_owner() {
+  mutate "$WORKER" 's{if outcome == BlockReleaseReleased \{(\s+)return nil(\s+)\}}{if true {$1return nil$2}}'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'a late loser spent the item' \
+    'retryable post-claim unwind ignores not-owner (a taken-over attempt charges the retry that DLQs an item ItemBlock never leaves)'
+  restore
+}
+
+m_verify_unwind_ignores_foreign_owner() {
+  # ~ delimiters: the replacement carries an unbalanced { and perl would try to balance it.
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{~if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); false \&\& foreign != nil \{~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'a late loser spent the item' \
+    'global verify unwind drops the release outcome (the one site that cannot use the wrapper, and the one a real ReadFailure reaches)'
+  restore
+}
+
+# The three above prove the DECISION is right. These three prove it cannot be bypassed:
+# one reintroduces the inline release/error shape the wrapper exists to absorb, and two
+# put an item-specific alert counter back in front of the ownership check.
+m_unwind_bypasses_the_wrapper() {
+  # ~ delimiters and $1 for the indentation run: the replacement carries unbalanced braces.
+  mutate "$WORKER" 's~return w\.releaseClaimThenFailWithRetry\(item, attempt,(\s+)fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {${1}return relErr${1}}${1}return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'release outcome discarded at' \
+    'a sixth post-claim unwind releases inline and discards the outcome (the exact shape of the defect, reachable again by one call site diverging from its siblings)'
+  restore
+}
+
+m_owned_alert_fires_for_a_late_loser() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, outcome, originalErr\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)for _, record := range onOwnedFailure \{(\s+)record\(\)(\s+)\}~for _, record := range onOwnedFailure {${4}record()${5}}${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, outcome, originalErr); foreign != nil {${1}return foreign${2}}~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
+    'the wrapper raises its item-specific counter before consulting ownership (a lost race pages someone about a healthy block)'
+  restore
+}
+
+m_verify_alert_fires_for_a_late_loser() {
+  # The ownership check now sits ABOVE the availability split, so the item-specific
+  # counter is several statements below it rather than immediately after. This hoists the
+  # counter back above the check: a lost race then pages someone about a healthy block.
+  mutate "$WORKER" 's~(if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\})(.*?)(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}${1}${2}~s'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
+    'the global verify raises liveness_verify_failed before consulting ownership (same conclusion about the item, drawn from a walk this attempt no longer owns)'
+  restore
+}
+
+# The five RETRYABLE unwinds are covered above. These three cover the POSTPONING ones,
+# which were left alone while "both outcomes postpone" still meant ownership could not
+# change the answer. It stopped meaning that when a lost claim started meaning no durable
+# queue mutation at all: postponing is postponeItem, which is RequeueItem. Each mutation
+# restores one of the three original discards.
+m_unreliable_read_discards_foreign_owner() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, errors\.New\(reason\)\); foreign != nil \{\s+return foreign\s+\}~_ = released~'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the unreliable-read helper drops the release outcome (a stale attempt requeues the row it has been holding since before the takeover)'
+  restore
+}
+
+m_topology_gate_discards_foreign_owner() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}(\s+)return failedClosedError\{Reason: "destructive topology gate rejected block at the commit point"~_ = released${1}return failedClosedError{Reason: "destructive topology gate rejected block at the commit point"~s'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the commit-point topology gate drops the release outcome (its old justification was that both outcomes postpone, which a durable requeue makes false)'
+  restore
+}
+
+m_availability_verify_skips_foreign_owner() {
+  mutate "$WORKER" 's~(unavailable := isClusterUnavailableError\(err\).*?if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); )foreign != nil~${1}!unavailable && foreign != nil~s'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the global verify consults ownership only on the non-availability branch (an unreachable datacenter sends every in-flight block down the half that skipped the check)'
+  restore
+}
+
+# Go's unused-variable rule already refuses `released, relErr :=` whose outcome is never
+# read at all, so the guard's per-identifier half only earns its keep against an outcome
+# that IS read -- just not by an authority decision. This logs it instead of consulting it,
+# which compiles, and which the previous per-FUNCTION form of the guard would have waved
+# through because processBlock consults the decision at its other release sites.
+m_bound_outcome_never_reaches_authority() {
+  mutate "$WORKER" 's~(unavailable := isClusterUnavailableError\(err\).*?)if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}~${1}log.Printf("[GC Worker] Block %s: release outcome %v", item.ItemID, released)~s'
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'never brings THAT binding to an authority decision' \
+    'a release outcome is bound and read but never reaches an authority decision (the shape a per-function guard cannot see, because its siblings consult theirs)'
   restore
 }
 
@@ -393,7 +485,16 @@ MUTATIONS=(
   m_post_claim_read_error_skips_release
   m_divergent_read_retries
   m_authority_invalid_retries
-  m_foreign_owner_retries
+  m_foreign_owner_enters_queue_lifecycle
+  m_unreliable_read_discards_foreign_owner
+  m_topology_gate_discards_foreign_owner
+  m_availability_verify_skips_foreign_owner
+  m_bound_outcome_never_reaches_authority
+  m_unwind_ignores_foreign_owner
+  m_verify_unwind_ignores_foreign_owner
+  m_unwind_bypasses_the_wrapper
+  m_owned_alert_fires_for_a_late_loser
+  m_verify_alert_fires_for_a_late_loser
 )
 
 if [ "${1:-}" = "--list" ]; then

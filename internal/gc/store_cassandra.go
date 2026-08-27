@@ -692,9 +692,6 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 // RequeueItem moves a failed item to the back of the queue to prevent head-of-line blocking.
 // It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
 func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
-	// A requeue keeps the lifecycle it was already serving: same identity_at, same
-	// P. Only queued_at moves, so the item goes to the back of the queue without
-	// becoming a different work item.
 	identity, err := identity.requireIdentityAt("queue requeue", itemID)
 	if err != nil {
 		return err
@@ -703,13 +700,11 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 
-	// Delete old item
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
 	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
 
-	// Insert new item at the end of the queue
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
