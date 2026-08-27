@@ -61,9 +61,45 @@ The Cassandra 5.0.9 CQL reference documents the relevant conditional-write seman
 [CQL data manipulation](https://cassandra.apache.org/doc/5.0.9/cassandra/developing/cql/dml.html).
 
 The P4a late-loser path does not enter this generic protocol: a foreign-owner result is
-handled at the worker boundary with no queue mutation. A future queue design must choose
-one authority across `Requeue`, `Complete`, `Fail`, DLQ and `gc_pending_items`; adding an
-LWT only to `RequeueItem` would leave the lifecycle partially ordered.
+handled at the worker boundary with no queue mutation. That now covers every post-claim
+exit, the postponing ones included — postponing is `RequeueItem`, so an exit that
+postponed without consulting ownership was still a stale worker mutating the queue.
+
+A future queue design must choose one authority across `Requeue`, `Complete`, `Fail`, DLQ
+and `gc_pending_items`; adding an LWT only to `RequeueItem` would leave the lifecycle
+partially ordered.
+### What the queue-primitive detour cost, and what it taught
+
+Recorded because the withdrawal was the right call and the reasoning should not have to be
+rediscovered.
+
+An earlier revision of this branch made `RequeueItem` a conditional batch
+(`DELETE(old) IF EXISTS` + `INSERT(new)`, batch CAS, global `SERIAL`). It worked, and it
+was measured against real Cassandra: without it a stale sequential requeue left **2**
+durable rows, and four concurrent workers that all observed the same row left **4** —
+same block, same `identity_at`, differing only in `queued_at`, which R26 makes part of the
+key. It was withdrawn anyway, for a reason that outranks the measurement: `CompleteItem`
+and `FailItem` remained ordinary batches, so the lifecycle would have been PARTIALLY
+ordered. `Requeue` vs `Requeue` was closed while `Requeue` vs `Complete` stayed open — a
+requeue could apply, a concurrent completion could no-op against the row it had already
+moved, and the "completed" item would live on under a new `queued_at`. A half-ordered
+protocol is harder to reason about than an unordered one, because it invites the
+assumption that the whole lifecycle is safe.
+
+Three things to carry forward:
+
+1. **The fix belonged at the authority layer, not the primitive.** The late loser does not
+   need `RequeueItem` to be atomic; it needs to not call it. That is what shipped, and it
+   holds regardless of how the queue protocol is eventually arbitrated.
+2. **Do not add an LWT to one queue transition.** The follow-up must choose one authority
+   across `Requeue`, `Complete`, `Fail`, DLQ and `gc_pending_items`, with the full race
+   matrix, or leave all of them ordinary. E6 records this.
+3. **`MockStore` was accidentally right and Cassandra was wrong.** `MockStore.RequeueItem`
+   looks up the old row and no-ops when it is gone; Cassandra inserts regardless. The
+   entire unit suite therefore agreed with the code while production carried the defect —
+   R19's shape, for the second time. Any future work on this boundary needs real-Cassandra
+   evidence, not mock evidence.
+
 
 ---
 

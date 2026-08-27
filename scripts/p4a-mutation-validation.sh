@@ -314,7 +314,11 @@ m_late_loser_settles_candidate() {
 }
 
 m_unreliable_read_skips_release() {
-  mutate "$WORKER" 's#\.WithLabelValues\("block_canonical_read_unreliable"\)\.Inc\(\)(\s+)if _, relErr := w\.releaseBlockClaim\(item\.OrgID, item\.ItemID, attempt\); relErr != nil \{(\s+)return relErr(\s+)\}#.WithLabelValues("block_canonical_read_unreliable").Inc()#'
+  # The helper now BINDS the release outcome, because it must consult ownership before it
+  # may postpone -- postponing is RequeueItem, a durable queue mutation a late loser may
+  # not make. Release and authority check are therefore removed together here; the
+  # foreign-owner half has its own mutation below.
+  mutate "$WORKER" 's#\.WithLabelValues\("block_canonical_read_unreliable"\)\.Inc\(\)\s+released, relErr := w\.releaseBlockClaim\(item\.OrgID, item\.ItemID, attempt\).*?if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, errors\.New\(reason\)\); foreign != nil \{\s+return foreign\s+\}#.WithLabelValues("block_canonical_read_unreliable").Inc()#s'
   expect_red 'TestP4A_StalePostClaimReadHandsTheFenceBackAndPostpones' 'fence left standing' \
     'stale post-claim read postpones WITHOUT handing the fence back (a lagging replica becomes a permanent upload refusal)'
   restore
@@ -372,7 +376,7 @@ m_verify_unwind_ignores_foreign_owner() {
 m_unwind_bypasses_the_wrapper() {
   # ~ delimiters and $1 for the indentation run: the replacement carries unbalanced braces.
   mutate "$WORKER" 's~return w\.releaseClaimThenFailWithRetry\(item, attempt,(\s+)fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {${1}return relErr${1}}${1}return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
-  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'discard the release outcome without postponing' \
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'release outcome discarded at' \
     'a sixth post-claim unwind releases inline and discards the outcome (the exact shape of the defect, reachable again by one call site diverging from its siblings)'
   restore
 }
@@ -385,9 +389,38 @@ m_owned_alert_fires_for_a_late_loser() {
 }
 
 m_verify_alert_fires_for_a_late_loser() {
-  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {${1}return foreign${2}}~'
+  # The ownership check now sits ABOVE the availability split, so the item-specific
+  # counter is several statements below it rather than immediately after. This hoists the
+  # counter back above the check: a lost race then pages someone about a healthy block.
+  mutate "$WORKER" 's~(if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\})(.*?)(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}${1}${2}~s'
   expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
     'the global verify raises liveness_verify_failed before consulting ownership (same conclusion about the item, drawn from a walk this attempt no longer owns)'
+  restore
+}
+
+# The five RETRYABLE unwinds are covered above. These three cover the POSTPONING ones,
+# which were left alone while "both outcomes postpone" still meant ownership could not
+# change the answer. It stopped meaning that when a lost claim started meaning no durable
+# queue mutation at all: postponing is postponeItem, which is RequeueItem. Each mutation
+# restores one of the three original discards.
+m_unreliable_read_discards_foreign_owner() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, errors\.New\(reason\)\); foreign != nil \{\s+return foreign\s+\}~_ = released~'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the unreliable-read helper drops the release outcome (a stale attempt requeues the row it has been holding since before the takeover)'
+  restore
+}
+
+m_topology_gate_discards_foreign_owner() {
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}(\s+)return failedClosedError\{Reason: "destructive topology gate rejected block at the commit point"~_ = released${1}return failedClosedError{Reason: "destructive topology gate rejected block at the commit point"~s'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the commit-point topology gate drops the release outcome (its old justification was that both outcomes postpone, which a durable requeue makes false)'
+  restore
+}
+
+m_availability_verify_skips_foreign_owner() {
+  mutate "$WORKER" 's~(unavailable := isClusterUnavailableError\(err\).*?if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); )foreign != nil~${1}!unavailable && foreign != nil~s'
+  expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
+    'the global verify consults ownership only on the non-availability branch (an unreachable datacenter sends every in-flight block down the half that skipped the check)'
   restore
 }
 
@@ -441,6 +474,9 @@ MUTATIONS=(
   m_divergent_read_retries
   m_authority_invalid_retries
   m_foreign_owner_enters_queue_lifecycle
+  m_unreliable_read_discards_foreign_owner
+  m_topology_gate_discards_foreign_owner
+  m_availability_verify_skips_foreign_owner
   m_unwind_ignores_foreign_owner
   m_verify_unwind_ignores_foreign_owner
   m_unwind_bypasses_the_wrapper

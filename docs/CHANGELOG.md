@@ -8,6 +8,74 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4a: the postponing unwinds obey the authority rule too
+
+The previous entry established the rule and applied it to five of eight post-claim exits.
+Three were left out on a reason that had just stopped being true.
+
+**What was missed.** The five fixed exits return a RETRYABLE error, so losing the claim
+there cost the item its retry budget — a visible, expensive failure. The other three
+return a POSTPONING error, and the standing justification for ignoring the release outcome
+on them was "both outcomes postpone, so ownership cannot change the queue policy". That
+was accurate while postponing meant leaving the item alone. It stopped being accurate the
+moment a lost claim came to mean NO DURABLE QUEUE MUTATION, because postponing is
+`postponeItem`, `postponeItem` is `RequeueItem`, and `RequeueItem` is a durable mutation —
+a `DELETE(old)` + `INSERT(new)` batch that inserts whether or not the delete addressed
+anything (E6). A stale attempt handed it a copy of the queue row it had been holding since
+before it lost the claim.
+
+The three:
+
+| Exit | What it did |
+|---|---|
+| global liveness verify, **availability** half | bound the outcome, consulted it only in the non-availability branch |
+| `releaseAndPostponeUnreliableRead` | discarded the outcome |
+| destructive topology gate at the commit point | discarded the outcome |
+
+The availability half is the one that matters operationally: an unreachable datacenter
+sends every in-flight block down exactly the branch that skipped the check, all at once.
+
+**What changed.** All three now bind the release outcome and route it through
+`refuseRetryForForeignClaimOwner`, so a not-owner answer produces
+`blockClaimForeignOwnerError` and `processOrg` leaves the queue alone. There are now zero
+sites in `worker.go` that discard a `BlockReleaseOutcome`.
+
+**Observation and policy are separated, deliberately.** The environmental signals still
+fire for a late loser — `liveness_verify_unavailable` plus `recordDestructiveBlocked`, and
+`block_canonical_read_unreliable` — because an outage or a lagging replica is real whoever
+holds the claim, and suppressing them would hide a datacenter that is genuinely
+unreachable. What a late loser lacks is standing to decide the ITEM's fate: which error to
+return, whether a retry is spent, whether the row moves. The item-specific counters
+(`liveness_verify_failed`, `block_storage_key_mismatch`) stay owner-only for the same
+reason they were moved there in the first place.
+
+**The guard got simpler by getting stricter.** `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome`
+used to allow a discard wherever the branch postponed anyway, and that exemption pointed at
+exactly the two paths above — the worst thing a guard can do is bless the defect it was
+written to catch. It also could not see the third shape, because the verify BOUND the
+outcome and consulted it in one branch of two, which any name-based check reads as
+"consulted". The allowlist is gone. The rule is now: no caller of `releaseBlockClaim` may
+discard its outcome, and every function that releases must name the authority decision.
+
+**Evidence.** `TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched` drives all
+three with a takeover interposed at the claim/verify window and requires
+`Complete=Requeue=Fail=0` plus a queue row identical to the one the walk found.
+`TestP4A_OwnedPostponingUnwindStillRequeues` is the half that keeps this from becoming a
+different bug: an attempt that still owns its fence must go on postponing, requeue
+included, or the item blocks the head of the queue for as long as the condition lasts.
+Verified red against the pre-fix worker: all three reported `Requeue=1`. Three mutations
+(`m_unreliable_read_discards_foreign_owner`, `m_topology_gate_discards_foreign_owner`,
+`m_availability_verify_skips_foreign_owner`) restore one discard each; the script now runs
+**43** mutations, all red.
+
+**What this does NOT close.** E6 is untouched: `DequeueBatch` still takes no lease and
+`Requeue`/`Complete`/`Fail` are still ordinary batches, so two ordinary workers can still
+duplicate a `queued_at`. What is now true is narrower and worth stating exactly: *an
+attempt that discovers post-claim that it no longer owns the claim performs no durable
+queue mutation.* `BlockClaimFreshOwner` deliberately still postpones through the generic
+path — it never held the claim, so its copy of the row is fresh, and backing off is what
+keeps the queue moving.
+
 ## 2026-08-27 - P4a review: queue lifecycle arbitration remains open
 
 The queue-primitive hardening from the draft below is withdrawn from this branch. It mixed
@@ -20,15 +88,18 @@ The mergeable scope is now explicit:
 - A `blockClaimForeignOwnerError` is classified at the `processOrg` boundary before generic
   error, retry, postpone or DLQ handling.
 - The stale worker performs no `CompleteItem`, `RequeueItem`, `FailItem` or retry mutation.
-  Its exact queue row, candidate, identity and claim remain untouched; the current owner
-  carries the candidate forward.
+  It performs no durable queue mutation: the row it is holding, the candidate, the
+  identity and the claim are left exactly as it found them. That is a statement about what
+  the stale attempt does, not about the state — the authoritative lifecycle may well have
+  moved the row and taken the claim already, which is the case
+  `TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow` covers.
 - The five post-claim ownership/unwind fixes and their owned-vs-foreign behavior remain in
   P4a. Permanent defects still spend retries when the attempt owns the claim.
 - `RequeueItem` is back to the ordinary logged `DELETE(old)` + `INSERT(new)` batch used by
   the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
   a partial LWT.
 - The requeue-specific real-Cassandra tests, source guard and mutations were removed from
-  this PR. The active P4a mutation script now contains **40** mutations; the script output
+  this PR. The active P4a mutation script now contains **43** mutations; the script output
   is authoritative.
 
 The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ
@@ -98,11 +169,12 @@ rejected `ValidatePhysicalLocator`.
   `m_verify_unwind_ignores_foreign_owner` (the one site that cannot use the wrapper),
   `m_unwind_bypasses_the_wrapper` (a sixth unwind written in the old inline shape), and
   `m_owned_alert_fires_for_a_late_loser` / `m_verify_alert_fires_for_a_late_loser` (an
-  item-specific alert counter raised before ownership is consulted), and
-  `m_requeue_move_is_unconditional` (the requeue drops the conditional move), and
-  `m_requeue_recreates_pending_marker` (the requeue recreates durable pending state before
-  its CAS). Seven in this entry, bringing `scripts/p4a-mutation-validation.sh` to **42** —
-  the script prints its own total on a clean run, and that figure is the one to cite.
+  item-specific alert counter raised before ownership is consulted). The two
+  requeue-specific mutations this entry also listed, `m_requeue_move_is_unconditional`
+  and `m_requeue_recreates_pending_marker`, were withdrawn with the queue-primitive
+  draft and no longer exist -- nor do the four real-Cassandra and source gates named
+  further down this entry. For the current total, run the script: it prints its own,
+  and no count written in prose here is authoritative.
 
 **Third pass: the durable half of "postpone".** Two reviewers converged on the queue
 boundary, and they were right that it was the open question -- though not that the defect

@@ -1425,40 +1425,47 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// The delete is abandoned either way — an error here never authorizes
 		// destruction. What is decided below is only the QUEUE policy, and the same
 		// classifier rule applies here as at every other statement in the walk:
-		// postpone what the environment caused, spend retries on what it did not.
+		// postpone what the environment caused, spend retries on what it did not — and,
+		// before either, hand the decision away entirely if this attempt no longer owns
+		// the fence it just gave back.
+		// WHAT THE ENVIRONMENT DID IS RECORDED FIRST; WHAT HAPPENS TO THE ITEM IS DECIDED
+		// AFTER, AND ONLY BY AN ATTEMPT THAT STILL OWNS ITS FENCE.
 		//
-		// This branch is easy to get wrong in the safe-looking direction. Treating
-		// every failure here as environmental keeps the fail-closed guarantee intact,
-		// which is why it survived a while — but it makes an item-specific, permanent
-		// error postpone for eternity: no retry spent, no DLQ entry, nobody told. A
-		// ReadFailure from a tombstone-heavy block_references partition is exactly
-		// that shape, and it would be invisible, because the blocked/liveness pair is
-		// per PATH: any other block's successful verify moves the recovery half
-		// forward and clears the alert while this item stays stuck.
-		if !isClusterUnavailableError(err) {
-			// ...but only an attempt that still owned the fence may charge that retry to
-			// the item. This is the site where the shape actually bites in practice: a
-			// ReadFailure from a tombstone-heavy block_references partition is exactly
-			// the item-specific error this branch was built to escalate, and it is just
-			// as reachable by a late loser as by the current owner.
-			//
-			// The counter is raised AFTER that check, not before. liveness_verify_failed
-			// is the item-specific half of the blocked/liveness pair — the thing that
-			// tells a human this block is defective — and a late loser is drawing no
-			// conclusion about the item here. The verify error is durable, so the attempt
-			// that owns the fence reaches it on the next pass and raises it then.
-			if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
-				return foreign
-			}
-			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
-			log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
-			return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
+		// An outage is real whoever holds the claim, so the availability signal is raised
+		// before authority is consulted — suppressing it for a late loser would hide a
+		// datacenter that is genuinely unreachable. Everything below that line is a
+		// statement about the ITEM: which error to return, whether a retry is spent, and
+		// whether the queue row moves. Those a late loser has no standing to make.
+		unavailable := isClusterUnavailableError(err)
+		if unavailable {
+			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
+			w.recordDestructiveBlocked(destructivePathBlock)
 		}
 
-		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-		w.recordDestructiveBlocked(destructivePathBlock)
-		log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
-		return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
+		// The ownership check sits ABOVE the availability split, not inside one half of
+		// it. It used to guard only the non-availability branch, which left the other
+		// branch returning a postponing error — and postponing is RequeueItem, so a stale
+		// attempt still mutated the queue row it had been holding since before it lost
+		// the claim. Both halves abandon the walk; both must answer to the same authority.
+		if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
+			return foreign
+		}
+
+		if unavailable {
+			log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
+			return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
+		}
+
+		// This branch is easy to get wrong in the safe-looking direction. Treating every
+		// failure here as environmental keeps the fail-closed guarantee intact, but it
+		// makes an item-specific, permanent error postpone for eternity: no retry spent,
+		// no DLQ entry, nobody told. A ReadFailure from a tombstone-heavy
+		// block_references partition is exactly that shape. liveness_verify_failed is the
+		// item-specific half of the blocked/liveness pair, which is why it is raised here
+		// rather than beside the availability counter above.
+		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
+		log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
+		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 	}
 	// The read returned, which is this path's only proof that the environment can still
 	// authorize a delete. Recorded here, BEFORE looking at what it found: a still
@@ -1617,11 +1624,18 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// nothing here, and holding it under a systematic rejection would fence this
 		// content for as long as the topology stays wrong.
 		//
-		// Both outcomes postpone, so unlike the sites above this one was never able to
-		// strand the item — it is routed through releaseBlockClaim for the accounting
-		// and the log, not to change the queue policy.
-		if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+		// The outcome is consulted, and the reason it has to be is the one this whole
+		// slice turned on. "Both outcomes postpone, so ownership cannot change the queue
+		// policy" was true while postponing meant leaving the item alone. It stopped
+		// being true when a lost claim started meaning NO durable queue mutation at all:
+		// postponing is RequeueItem, and a stale attempt reaching this gate has been
+		// holding its copy of the queue row since before it lost the claim.
+		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+		if relErr != nil {
 			return relErr
+		}
+		if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
+			return foreign
 		}
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
 	}
@@ -1691,9 +1705,21 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 //
 // The candidate is deliberately untouched. Nothing was decided about the block here.
 func (w *Worker) releaseAndPostponeUnreliableRead(item QueueItem, attempt BlockDeleteAuthority, reason string) error {
+	// The unreliable read is an observation about a REPLICA, so it is counted whoever
+	// owns the fence — the same rule the availability half of the global verify follows.
 	metrics.GCErrorsTotal.WithLabelValues("block_canonical_read_unreliable").Inc()
-	if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {
+	released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+	if relErr != nil {
 		return relErr
+	}
+	// But postponing is RequeueItem, and that is a durable queue mutation this attempt
+	// may no longer make. Every caller of this helper is post-claim by construction: it
+	// exists because the claim already committed and an ordinary read then failed to
+	// confirm what the serial domain had proved. A stale attempt is therefore exactly
+	// who arrives here, carrying a copy of the queue row it has held since before the
+	// takeover.
+	if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, errors.New(reason)); foreign != nil {
+		return foreign
 	}
 	log.Printf("[GC Worker] Block %s: %s after the claim CAS proved its target in the serial domain; handed the fence back and postponing rather than acting without a reliable read", item.ItemID, reason)
 	return blockCanonicalReadUnreliableError{ItemID: item.ItemID, Reason: reason}

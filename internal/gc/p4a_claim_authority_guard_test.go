@@ -496,25 +496,28 @@ func p4aHasRawBlocksSelect(fn *ast.FuncDecl) bool {
 }
 
 // TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome is the STRUCTURAL half of the
-// late-loser queue-policy rule. The behavioural half --
-// TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget -- proves the five unwinds that
-// exist today are correct; this one is what a sixth has to get past.
+// late-loser rule, and the rule it now enforces is the simplest one available:
 //
-// The defect has exactly one spelling, and that is what makes it guardable. A post-claim
-// unwind that wants to return a retryable error must release the fence first, and Go
-// refuses to compile a `released, relErr :=` whose outcome is never read -- so the only
-// way to drop the answer is to discard it with `_`. Five sites did precisely that, and
-// each one charged a retry to an item whose claim another lifecycle already owned,
-// walking it into a DLQ ItemBlock never leaves.
+//	NO CALLER OF releaseBlockClaim MAY DISCARD ITS OUTCOME. NOT ONE.
 //
-// A DISCARD IS SOUND ONLY WHERE OWNERSHIP CANNOT CHANGE THE ANSWER -- that is, where the
-// branch postpones whatever the release said. Two do: the destructive topology gate and
-// releaseAndPostponeUnreliableRead. Every other unwind must go through
-// releaseClaimThenFailWithRetry, which consults the outcome once on their behalf.
+// The first cut of this guard allowed a discard wherever the branch was going to postpone
+// anyway, on the reasoning that ownership could not change an answer already fixed. That
+// reasoning was retired by the change that made a lost claim mean NO DURABLE QUEUE
+// MUTATION, because postponing is RequeueItem — a mutation. The exemption then pointed at
+// exactly the two paths that still needed fixing (the unreliable-read helper and the
+// destructive topology gate), which is the worst thing a guard can do: bless the defect
+// it was written to catch.
 //
-// Scanning the whole file rather than processBlock alone is deliberate: a new helper in
-// the shape of releaseAndPostponeUnreliableRead but returning an ordinary error would
-// reopen the hole from outside the one function the first cut of this guard watched.
+// It also could not see a third shape. The global verify BOUND the outcome and consulted
+// it in only one of two branches, so a name-based "was it bound?" test called it
+// consulted. Requiring the outcome to reach the authority decision on every path is not
+// expressible as an allowlist, so the allowlist is gone: zero discards, and every release
+// site routed through refuseRetryForForeignClaimOwner.
+//
+// The defect has more than one spelling, which is why this counts CALLS rather than
+// assignment forms. Go will not compile an unread `released, relErr :=`, but a bare
+// `w.releaseBlockClaim(...)` statement and `_, _ = w.releaseBlockClaim(...)` both discard
+// everything and compile fine.
 func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	source, err := os.ReadFile("worker.go")
 	if err != nil {
@@ -526,40 +529,15 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The allowlist checks ITSELF against the classifier: naming a type here that the
-	// queue would in fact retry is the one way this guard could be quietly widened into
-	// permitting the very defect it exists to forbid.
-	postponing := map[string]bool{}
-	for _, sentinel := range []error{
-		failedClosedError{},
-		blockCanonicalReadUnreliableError{},
-		blockClaimNotYetStaleError{},
-		blockCandidateWithinGraceError{},
-		blockClaimReleaseUnconfirmedError{},
-	} {
-		if !shouldPostponeWithoutRetry(sentinel) {
-			t.Fatalf("%T is allowlisted as a postponing unwind but shouldPostponeWithoutRetry says it spends a retry; a discarded release outcome under it would strand the item", sentinel)
-		}
-		name := fmt.Sprintf("%T", sentinel)
-		postponing[name[strings.LastIndex(name, ".")+1:]] = true
-	}
-
-	var offenders []string
+	var discards []string
+	var sites int
 	for _, declaration := range file.Decls {
 		fn, ok := declaration.(*ast.FuncDecl)
-		if !ok || fn.Body == nil {
+		if !ok || fn.Body == nil || fn.Name.Name == "releaseBlockClaim" {
 			continue
 		}
 
-		// Every call, then the ones that BIND the outcome -- rather than the discarding
-		// spellings, which is what the first cut of this guard enumerated. It claimed the
-		// defect had exactly one spelling because Go will not compile an unread
-		// `released, relErr :=`. That is true of that form and only that form: a bare
-		// `w.releaseBlockClaim(...)` statement, or `_, _ = w.releaseBlockClaim(...)`,
-		// discards everything and compiles fine. Inverting the test -- offender unless
-		// PROVEN consulted -- makes the guard independent of how many ways Go offers to
-		// throw a value away.
-		consulted := map[token.Pos]bool{}
+		bound := map[token.Pos]bool{}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			assign, ok := node.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) == 0 || len(assign.Rhs) != 1 {
@@ -569,106 +547,55 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
 				return true
 			}
-			if bound, ok := assign.Lhs[0].(*ast.Ident); ok && bound.Name != "_" {
-				consulted[call.Pos()] = true
+			if outcome, ok := assign.Lhs[0].(*ast.Ident); ok && outcome.Name != "_" {
+				bound[call.Pos()] = true
 			}
 			return true
 		})
 
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
-			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") || consulted[call.Pos()] {
+			if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
 				return true
 			}
-			if p4aBlockPostponesUnconditionally(p4aTightestBlock(fn, call.Pos()), postponing) {
-				return true
+			sites++
+			if !bound[call.Pos()] {
+				discards = append(discards, fmt.Sprintf("%s (in %s)", fset.Position(call.Pos()), fn.Name.Name))
 			}
-			offenders = append(offenders, fmt.Sprintf("%s (in %s)", fset.Position(call.Pos()), fn.Name.Name))
 			return true
 		})
 	}
-	if len(offenders) != 0 {
-		t.Errorf("post-claim unwind(s) discard the release outcome without postponing: %s; "+
-			"an unwind that returns a retryable error must go through releaseClaimThenFailWithRetry, "+
-			"because discarding the outcome lets an attempt whose claim was taken over spend the item's retry budget, "+
-			"and at the cap ItemBlock is parked in a DLQ it never leaves with its candidate behind a foreign fence",
-			strings.Join(offenders, "; "))
+
+	if sites == 0 {
+		t.Fatal("no releaseBlockClaim call sites found in worker.go; the release-outcome guard is vacuous")
+	}
+	if len(discards) != 0 {
+		t.Errorf("release outcome discarded at %s; every post-claim release must bind the outcome and route it through refuseRetryForForeignClaimOwner, "+
+			"because a not-owner answer means this attempt may make NO durable queue mutation — and postponing is RequeueItem, not a no-op",
+			strings.Join(discards, "; "))
 	}
 
-	// And the two consumers must still exist, or the check above passes over a walk that
-	// consults ownership nowhere at all.
-	if fn := findGCFunction(file, "processBlock"); fn == nil || !p4aMentions(fn, "refuseRetryForForeignClaimOwner") {
-		t.Error("processBlock must consult refuseRetryForForeignClaimOwner directly: the global verify releases before it classifies the error, so it cannot use the wrapper")
-	}
-	wrapper := findGCFunction(file, "releaseClaimThenFailWithRetry")
-	if wrapper == nil {
-		t.Fatal("releaseClaimThenFailWithRetry not found; the four authorization-phase unwinds have nowhere to route their release")
-	}
-	if !p4aMentions(wrapper, "refuseRetryForForeignClaimOwner") {
-		t.Error("releaseClaimThenFailWithRetry must consult refuseRetryForForeignClaimOwner; without it every site routed through the wrapper silently regains the defect")
-	}
-}
-
-// TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle is the source-side gate for the
-// queue half of P4a. A foreign-owner result is a handled stale attempt, not a postponable
-// item failure, so processOrg must classify it before the generic retry/postpone/DLQ path.
-func TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle(t *testing.T) {
-	source, err := os.ReadFile("worker.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := parser.ParseFile(token.NewFileSet(), "worker.go", source, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	processOrg := findGCFunction(file, "processOrg")
-	if processOrg == nil {
-		t.Fatal("processOrg not found; the foreign-owner queue boundary is not guarded")
-	}
-	var leavePos, postponePos token.Pos
-	ast.Inspect(processOrg.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
+	// Binding is necessary but not sufficient: the global verify used to bind the outcome
+	// and consult it in one branch only. Every function that releases must also name the
+	// authority decision, so a bound-but-ignored outcome cannot pass.
+	for _, declaration := range file.Decls {
+		fn, ok := declaration.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name == "releaseBlockClaim" {
+			continue
 		}
-		name, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		switch name.Name {
-		case "shouldLeaveQueueUntouched":
-			if leavePos == token.NoPos {
-				leavePos = call.Pos()
+		releases := false
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok && p4aCallsWorkerMethod(call, "releaseBlockClaim") {
+				releases = true
 			}
-		case "shouldPostponeWithoutRetry":
-			if postponePos == token.NoPos {
-				postponePos = call.Pos()
-			}
+			return true
+		})
+		if !releases {
+			continue
 		}
-		return true
-	})
-	if leavePos == token.NoPos || postponePos == token.NoPos {
-		t.Fatalf("processOrg must call both queue classifiers: leave=%v postpone=%v", leavePos, postponePos)
-	}
-	if leavePos >= postponePos {
-		t.Fatalf("processOrg must classify foreign-owner before generic postpone: leave=%v postpone=%v", leavePos, postponePos)
-	}
-
-	classifier := findGCFunction(file, "shouldPostponeWithoutRetry")
-	if classifier == nil {
-		t.Fatal("shouldPostponeWithoutRetry not found")
-	}
-	foreignInPostpone := false
-	ast.Inspect(classifier.Body, func(node ast.Node) bool {
-		ident, ok := node.(*ast.Ident)
-		if ok && ident.Name == "GCFailureCodeBlockClaimForeignOwner" {
-			foreignInPostpone = true
+		if !p4aMentions(fn, "refuseRetryForForeignClaimOwner") && !p4aMentions(fn, "BlockReleaseReleased") {
+			t.Errorf("%s releases a claim without consulting the outcome's authority: it must call refuseRetryForForeignClaimOwner, or compare against BlockReleaseReleased itself the way the re-referenced settlement does", fn.Name.Name)
 		}
-		return true
-	})
-	if foreignInPostpone {
-		t.Fatal("blockClaimForeignOwner must not be a generic postpone classifier")
 	}
 }
 
@@ -698,44 +625,3 @@ func p4aTightestBlock(fn *ast.FuncDecl, pos token.Pos) *ast.BlockStmt {
 	return tightest
 }
 
-// p4aBlockPostponesUnconditionally reports whether EVERY exit this block takes for
-// itself postpones, which is the only condition under which a discarded release outcome
-// is sound: ownership cannot change an answer the branch was going to give anyway.
-//
-// Both halves matter. Requiring a postponing return catches a branch that decides nothing
-// about the fence; forbidding a `fmt.Errorf` return in the same block catches the shape
-// an earlier version of this guard would have waved through --
-//
-//	_, err := w.releaseBlockClaim(...)
-//	if something {
-//		return failedClosedError{}
-//	}
-//	return fmt.Errorf("retryable")
-//
-// -- where a postponing return exists but is not the exit that matters. Only the block's
-// OWN statements are read; a return nested in a deeper branch belongs to that branch.
-func p4aBlockPostponesUnconditionally(block *ast.BlockStmt, typeNames map[string]bool) bool {
-	if block == nil {
-		return false
-	}
-	postpones := false
-	for _, statement := range block.List {
-		ret, ok := statement.(*ast.ReturnStmt)
-		if !ok {
-			continue
-		}
-		for _, result := range ret.Results {
-			switch typed := result.(type) {
-			case *ast.CompositeLit:
-				if ident, ok := typed.Type.(*ast.Ident); ok && typeNames[ident.Name] {
-					postpones = true
-				}
-			case *ast.CallExpr:
-				if selector, ok := typed.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "Errorf" {
-					return false
-				}
-			}
-		}
-	}
-	return postpones
-}

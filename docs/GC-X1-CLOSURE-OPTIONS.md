@@ -1653,7 +1653,7 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **40** active red-form mutations in
+the observed incarnation — plus **43** active red-form mutations in
 `scripts/p4a-mutation-validation.sh`. Older counts are historical; the script prints its own
 total on a clean run, and that is the figure to cite.
 
