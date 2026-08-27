@@ -170,9 +170,9 @@ the review of this slice and are deferred with an owner:
 `ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` (the admin DLQ selector parses timestamps at
 nanosecond precision while Cassandra stores milliseconds, so an over-precise selector matches
 nothing — and delete calls that success while requeue calls it a 500; not reachable from the
-UI, which round-trips values it read back), and `TECHNICAL-DEBT.md` §25 (splitting
-`QueueItem.Identity()` into a creation form and a durable-lookup form, correct today but
-wide to change). Both are cross-referenced from the P4c entry in `GC-X1-CLOSURE-OPTIONS.md`.
+UI, which round-trips values it read back), and `TECHNICAL-DEBT.md` → *GC work-item identity:
+creation and durable lookup share one constructor* (splitting `QueueItem.Identity()` into a
+creation form and a durable-lookup form, correct today but wide to change). Both are cross-referenced from the P4c entry in `GC-X1-CLOSURE-OPTIONS.md`.
 
 ---
 

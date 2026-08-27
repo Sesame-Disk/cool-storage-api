@@ -2482,3 +2482,6 @@ half (`P4c-orphan`) is the likely moment, since it revisits the same identity pl
 `ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` is the other item deferred out of the same
 review round, and is a latent defect rather than debt: see `KNOWN_ISSUES.md`.
 
+(This file carries three overlapping `## 21..25` series from earlier consolidations, so
+cite this entry by its title rather than by its number.)
+

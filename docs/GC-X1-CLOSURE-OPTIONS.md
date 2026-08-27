@@ -279,7 +279,8 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   (`KNOWN_ISSUES.md`): the admin DLQ selector parses timestamps at nanosecond precision
   while Cassandra stores milliseconds, so an over-precise selector matches no row — and the
   delete path reports that as success while the requeue path reports it as a 500. Not
-  reachable from the UI, which round-trips values it read back. And `TECHNICAL-DEBT.md` §25:
+  reachable from the UI, which round-trips values it read back. And `TECHNICAL-DEBT.md`
+  → *GC work-item identity: creation and durable lookup share one constructor*:
   `QueueItem.Identity()` still derives `identity_at` from `queued_at`, which is correct at
   creation and merely untidy afterwards; splitting it into `identityForCreation()` /
   `durableIdentity()` is a wide mechanical change best done when P4c-orphan revisits the
