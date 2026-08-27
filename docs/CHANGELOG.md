@@ -165,6 +165,15 @@ barrier is built for it, deliberately — there is no upgrade path to protect.
 `gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains
 OPEN, as do P4b/R14b, R15 and the orphan-side R20. `GC_ENABLED=false` continues.
 
+**Deliberately left out, and written down rather than remembered.** Two items came out of
+the review of this slice and are deferred with an owner:
+`ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` (the admin DLQ selector parses timestamps at
+nanosecond precision while Cassandra stores milliseconds, so an over-precise selector matches
+nothing — and delete calls that success while requeue calls it a 500; not reachable from the
+UI, which round-trips values it read back), and `TECHNICAL-DEBT.md` §25 (splitting
+`QueueItem.Identity()` into a creation form and a durable-lookup form, correct today but
+wide to change). Both are cross-referenced from the P4c entry in `GC-X1-CLOSURE-OPTIONS.md`.
+
 ---
 
 ## 2026-08-26 - P4a exact-`P`, per-attempt GC claim authority (R14a / R16 / R20 claim path)

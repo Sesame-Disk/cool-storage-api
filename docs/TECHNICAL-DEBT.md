@@ -2433,3 +2433,52 @@ the upgrade.
 `TestP4A_PreMigrationCandidateIsRefusedNotReinterpreted` pins both halves: the row is
 refused, and it is neither consumed nor silently adopted as today's incarnation.
 `TestP4ACandidateRetryLoopIsBounded` pins that the refusal cannot become a hot loop again.
+
+---
+
+## 25. GC work-item identity: creation and durable lookup share one constructor (LOW, deferred from R26)
+
+### Status
+Open, deliberately deferred from the R26 exact-`P` identity slice (PR #190). No known
+defect: this is API shape, not behaviour.
+
+### The shape
+R26 made `identity_at` part of the primary key of every durable GC table and made the
+identity a required argument, with `requireIdentityAt` refusing at the mutation boundary a
+value that names no lifecycle. But `QueueItem.Identity()` and `GCFailedItemInfo.Identity()`
+still run their `identity_at` through `effectiveIdentityAt`, which falls back to `queued_at`.
+
+So a hand-built `QueueItem{QueuedAt: T}` with no `IdentityAt` becomes `IdentityAt: T`
+*before* it ever reaches `requireIdentityAt`, and the guard cannot see that the value was
+supplied rather than stored.
+
+### Why it is not a defect today
+The fallback has a real job: `EnqueueBatch` calls `item.Identity()`, and for a non-block
+item `identity_at = queued_at` at creation is the **definition** of the new lifecycle, not a
+guess about an existing one. After that the value is durable and every consumer reads it
+back — `identity_at` is a clustering column, so it cannot come back null. For blocks the
+fallback cannot produce a usable identity at all:
+`validateQueueItemBlockCandidateIdentity` requires `IdentityAt == candidate.CandidateAt` and
+refuses a zero candidate identity, so an item that arrived that way is rejected rather than
+processed under an invented identity.
+
+### The cleanup, when something makes it worth doing
+Split the one constructor in two, so the type system carries the distinction the prose
+currently carries:
+
+- `identityForCreation()` — may derive `identity_at` from `queued_at`; used by the enqueue
+  paths, which are defining a lifecycle.
+- `durableIdentity()` — requires the value to have come from a row; used by everything that
+  looks one up.
+
+### Why not now
+`Identity()` is called from every producer and consumer path, so the split is a wide
+mechanical change with zero behavioural difference. It was left out of PR #190 to keep that
+PR reviewable. Do it when the next change touches those call sites anyway — the R26 orphan
+half (`P4c-orphan`) is the likely moment, since it revisits the same identity plumbing for
+`gc_s3_orphans`.
+
+### Related
+`ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` is the other item deferred out of the same
+review round, and is a latent defect rather than debt: see `KNOWN_ISSUES.md`.
+

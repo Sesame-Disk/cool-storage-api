@@ -4343,6 +4343,49 @@ queue items behind indefinitely.
 
 ---
 
+### ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01: A sub-millisecond admin DLQ selector matches nothing, and delete reports success
+
+**Status**: 🟡 Open (found 2026-08-26) — not reachable from the admin UI today
+**Severity**: Low — no data-safety impact; an operator action can silently do nothing
+**Affected**: `parseGCFailedItemSelector` (`internal/api`), `DeleteFailedItemContext` / `RequeueFailedItemContext` (`internal/gc`)
+
+#### Problem
+
+The admin DLQ selector parses `failed_at`, `identity_at` and `candidate_at` with
+`time.RFC3339Nano`, so it accepts sub-millisecond precision. A Cassandra `TIMESTAMP`
+holds milliseconds, so every one of those values is stored truncated, and a selector
+carrying a sub-millisecond remainder matches **no row**.
+
+The two admin paths then disagree about what that means:
+
+- `DeleteFailedItemContext` maps `gocql.ErrNotFound` to `nil`, so the API answers success
+  having deleted nothing. That mapping is a deliberate idempotency contract — deleting an
+  already-deleted item is not an error — but it makes "your selector was too precise"
+  indistinguishable from "it was already gone".
+- `RequeueFailedItemContext` wraps the same miss as an error, so the caller gets a 500.
+
+Not reachable through the product: the list endpoint serializes values that were read back
+from Cassandra, so they are already millisecond-precision by the time the UI sees them, and
+the UI sends back exactly what it was given. It needs a hand-built call, a script, or a
+future producer that mints a timestamp locally.
+
+#### Why it is worth an id anyway
+
+This is the same precision class as the defect fixed in PR #190, where it **was** reachable:
+`GCFailedItemExpiryBucket` hashed timestamps that had never been to Cassandra, so the
+expiry projection's partition key changed across the round-trip and the row outlived its own
+deletion. That one had a producer (`FailItem` takes the worker's clock, which is `time.Now`);
+this one is waiting for a producer.
+
+#### Fix direction
+
+Normalize the parsed timestamps to Cassandra's precision inside `parseGCFailedItemSelector`
+— one choke point, mirroring what `GCFailedItemExpiryBucket` now does before hashing — and
+decide deliberately whether a no-match delete should stay idempotent success or become a
+404. Whatever is chosen, both admin paths should report a miss the same way.
+
+---
+
 ### ISSUE-GC-DISCOVERY-CURSOR-OBS-01: Discovery Cursor Lag Is Not Observable Enough
 
 **Status**: Pending
