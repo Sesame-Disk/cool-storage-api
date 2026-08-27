@@ -51,12 +51,12 @@ production blocker, and no status document should say that it is.
 8. **Current X1/P4a key:** this branch binds the destructive claim to the exact physical incarnation and to a per-attempt owner. Migration `017` puts `storage_key` on `gc_block_candidates` and its `_by_day` projection; `EnsureBlockGCCandidate` captures it from the canonical row and refuses to write a candidate it cannot name a `P` for. The claim CAS is `IF storage_class = ? AND storage_key = ? AND gc_state = null AND gc_claim_id = null AND gc_claimed_at = null`, `claimID` is a fresh UUID per ATTEMPT (`blockDeleteClaimID` is deleted and its absence is gated), and release, stale takeover, finalize and candidate cleanup all condition on the exact tuple. `ClaimBlockDelete` returns a classified outcome, so a non-applied CAS is no longer read as completion. Evidence is green on real Cassandra under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` (four legs: exclusive ownership with exact takeover, the ABA case, retry semantics, and stale-claim release bound to the observed incarnation), with deliberate mutations red via `scripts/p4a-mutation-validation.sh` (see the count below). **Recorded as R14a GREEN / R14b OPEN, R16 GREEN, R20 PARTIAL — the claim path settles in the serial domain, the orphan path does not.** `StartBlockDeleteOrphan` is deliberately untouched and remains the residual that keeps strict A+ non-overlap open; that is P4b. Technical debt #21 and #22 are closed; #23 (GC no longer sweeps metadata-free stubs) and #24 (pre-017 candidate rows need a fresh zero-ref decision, not a backfill) are opened as follow-ups, #24 being a PRE-ACTIVATION requirement rather than a merge blocker. A second review pass found and fixed four defects in the first cut: the stale takeover re-read the row instead of CASing against the authority it observed (so a P1 worker could drop P2 fence); the same hole existed at the owner-agnostic pre-check call site, reachable with no clock skew; the orphan publication and the S3 delete took their locator from an ordinary post-claim re-read rather than from the claim; and ErrBlockCandidateTargetUnavailable was fatal at all three enqueue sites, which was self-poisoning on the fs_object path. The deliberate mutations are red — the script reports its own current total, and the evidence update below is authoritative for it; two of them earned their keep by exposing a non-compiling mutation and a store/mock mirror with neither copy protecting the other. One behavioural narrowing to be aware of: GC no longer deletes metadata-free stub rows, because it has no exact authority over a row with no locator — an unclaimed stub is not an upload fence, and the only producer of a `deleting` metadata-free stub was the old claim CAS. The writer path does claim metadata-free rows, under `gc_state='repairing_stub'`, and cleans up its own; those are not a delete fence and were never GC's to touch. A third review pass closed the last claim-side hole: `releaseBlockClaim` collapsed `BlockReleaseNotOwner` into a bare `nil`, so a late loser — an attempt whose claim was taken over while it worked — walked through the "re-referenced after claim" unwind and consumed the CURRENT owner's candidate. Nothing about the candidate changes in that race (same block, same `P`, same `candidate_at`), so the exact-`P` CAS cannot refuse it; the wrapper now returns the outcome and settlement requires `BlockReleaseReleased`. R16 is GREEN only with both entrances closed — `BlockClaimFreshOwner` at the claim and this one at the release. Landed with it: the post-claim stub branches (driven by an ordinary read the claim had already contradicted in the serial domain, and DLQ-bound with the fence up) are gone in favour of hand-back-and-postpone; `GCFailureCodeBlockAuthorityInvalid` was documented as postponing but was never in `shouldPostponeWithoutRetry`; and the grace postpone and an unnameable claim owner got their own codes. Keep `GC_ENABLED=false` on every replica in every DC.
 
 **P4a evidence update (2026-08-27):** This supersedes every earlier P4a status wording in
-this file and every earlier mutation count (17, 21, 23, 37, 40 — all stale).
+this file and every earlier mutation count. The script output is authoritative.
 `internal/integration/p4a_claim_authority_test.go` has four real-Cassandra legs: exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **42** mutations
-end-to-end, and the script prints its own total on a clean run — cite that, not a number
-copied from prose.
+the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **40** active mutations
+end-to-end after the queue-primitive draft was withdrawn, and the script prints its own total
+on a clean run — cite that, not a number copied from prose.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
 locators: each now releases the exact claim, preserves the candidate, and postpones
@@ -70,12 +70,15 @@ empty/untrimmed `storage_key`, a failed `GetBlockStoreForOrg`, a rejected
 looking at whether the fence was still theirs. A late loser therefore spent the item's
 retry budget, and at the cap `ItemBlock` reached a DLQ it never leaves, past a scanner day
 cursor already advanced to `today-1`: candidate present, work item unreachable, foreign
-fence standing. An item already near the cap needed ONE lost race. All five now postpone
-on `BlockReleaseNotOwner` (`refuseRetryForForeignClaimOwner` /
-`releaseClaimThenFailWithRetry`), while an attempt that still owns its claim spends
-retries exactly as before, so a permanent item defect still reaches the DLQ where a human
-sees it. Gated by `TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget` and
-`TestP4A_OwnedUnwindStillSpendsTheRetryBudget`, plus two new mutations.
+fence standing. An item already near the cap needed ONE lost race. All five now return a
+classified foreign-owner result on `BlockReleaseNotOwner` (`refuseRetryForForeignClaimOwner`
+/ `releaseClaimThenFailWithRetry`), and `processOrg` leaves the stale queue row untouched,
+while an attempt that still owns its claim spends retries exactly as before, so a permanent
+item defect still reaches the DLQ where a human sees it. Gated by
+`TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget`,
+`TestP4A_OwnedUnwindStillSpendsTheRetryBudget`,
+`TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow` and
+`TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle`, plus two new mutations.
 
 The same pass found the mutation gate itself half-open: `m_enqueue_item_mints_block_candidate`
 matched literal `\n\t\t` against a CRLF working tree, so it silently applied NOTHING and
@@ -88,15 +91,20 @@ retryable errors without consulting ownership, so a late loser reaching them can
 spend budget — that is the orphan-publication half (R14b/P4b), not a queue-policy
 question, and it is deliberately not patched here. `GC_ENABLED=false` remains required.
 
-The seventh P4a review also closed the durable half of postpone. Cassandra `RequeueItem`
-now moves the old queue row with `DELETE(old) IF EXISTS` plus `INSERT(new)` in a conditional
-batch on the `gc_queue` partition, using global `SERIAL` consistency and treating
-`applied=false` as a no-op. Only the `gc_active_orgs` and `gc_dirty_orgs` scheduling hints
-are refreshed in the idempotent logged batch before the conditional move; `gc_pending_items`
-is deliberately not recreated by `RequeueItem`, so a stale loser cannot leave a
-permanent dedup marker after `CompleteItem`. Real-Cassandra coverage includes the sequential
-stale-row case, concurrent racers, and stale requeue after completion, while
-`GC_ENABLED=false` remains required.
+**Queue lifecycle review update (2026-08-27):** The attempted generic LWT hardening of
+`RequeueItem` is withdrawn from this branch. `CompleteItem`, `FailItem` and `RequeueItem`
+must not be presented as one atomic lifecycle: the first two use ordinary batches and a
+partial CAS on requeue would create a false guarantee. `RequeueItem` is restored to the
+ordinary logged `DELETE(old)` + `INSERT(new)` path; its concurrent race is a documented
+follow-up, not a P4a closure claim.
+
+The mergeable late-loser rule is narrower. `blockClaimForeignOwnerError` is handled by
+`processOrg` before generic logging, retry, postpone or DLQ handling. The stale worker calls
+none of `CompleteItem`, `RequeueItem`, `FailItem` or retry mutation, and its queue identity,
+candidate and retry count remain unchanged. The five P4a ownership/unwind fixes remain
+active, including the owned path's normal retry/DLQ behavior. `GC_ENABLED=false` remains
+required while the follow-up chooses one authority for `Requeue`/`Complete`/`Fail`, DLQ and
+pending state.
 
 ### Inter-session Update (2026-05-21)
 

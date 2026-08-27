@@ -335,16 +335,16 @@ m_divergent_read_retries() {
 }
 
 m_authority_invalid_retries() {
-  mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockClaimForeignOwner,}{GCFailureCodeBlockClaimForeignOwner,}'
-  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'is documented as postponing but spends the retry budget' \
+  mutate "$WORKER" 's{GCFailureCodeBlockAuthorityInvalid,(\s+)GCFailureCodeBlockCandidateWithinGrace,}{GCFailureCodeBlockCandidateWithinGrace,}'
+  expect_red 'TestP4A_LateLoserLeavesQueueUntouched' 'is documented as postponing but spends the retry budget' \
     'block_authority_invalid dropped from the postpone list (it retries into a DLQ ItemBlock never leaves, against its own contract)'
   restore
 }
 
-m_foreign_owner_retries() {
-  mutate "$WORKER" 's{GCFailureCodeBlockClaimForeignOwner,(\s+)GCFailureCodeBlockCandidateWithinGrace,}{GCFailureCodeBlockCandidateWithinGrace,}'
-  expect_red 'TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget' 'a late loser must postpone' \
-    'late loser spends the retry budget (parks the item in the DLQ, making the preserved candidate unreachable anyway)'
+m_foreign_owner_enters_queue_lifecycle() {
+  mutate "$WORKER" 's~if shouldLeaveQueueUntouched\(err\) \{~if false \{~'
+  expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'queue mutations = Complete:' \
+    'late loser enters the generic queue lifecycle path instead of leaving its stale row untouched'
   restore
 }
 
@@ -388,28 +388,6 @@ m_verify_alert_fires_for_a_late_loser() {
   mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{(\s+)return foreign(\s+)\}(\s+)metrics\.GCErrorsTotal\.WithLabelValues\("liveness_verify_failed"\)\.Inc\(\)~metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()${3}if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {${1}return foreign${2}}~'
   expect_red 'TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget' 'concluded the ITEM was defective' \
     'the global verify raises liveness_verify_failed before consulting ownership (same conclusion about the item, drawn from a walk this attempt no longer owns)'
-  restore
-}
-
-# A requeue MOVES a row; it must never create one. Cassandra applies the INSERT half of
-# the batch whether or not the DELETE half addressed anything, and DequeueBatch takes no
-# lease, so unless the old row's existence is a CONDITION of the move, two workers that
-# both observed the row create two durable rows -- after R26 only queued_at tells them
-# apart. A pre-read cannot supply that condition at any consistency level, which is why
-# the mutation removes the IF rather than the read. MockStore cannot show the behaviour --
-# it no-ops when the old row is absent -- so the engine half is
-# TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow.
-m_requeue_move_is_unconditional() {
-  mutate "$STORE" 's~(DELETE FROM gc_queue\s+WHERE org_id = \? AND bucket = \? AND queued_at = \? AND item_type = \? AND item_id = \? AND candidate_storage_class = \? AND candidate_storage_key = \? AND identity_at = \?)\s+IF EXISTS~${1}~'
-  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must make the old row' \
-    'the requeue move drops its IF EXISTS (two workers that both observed the row each INSERT a durable queue row beside the other)'
-  restore
-}
-
-m_requeue_recreates_pending_marker() {
-  mutate "$STORE" 's~(markers := s\.db\.Session\(\)\.Batch\(gocql\.LoggedBatch\))~$1\n\taddPendingItemBatchQuery(markers, orgID, libraryID, itemType, itemID, identity)~'
-  expect_red 'TestP4ARequeueNeverCreatesAQueueRow' 'must not recreate gc_pending_items' \
-    'requeue recreates pending membership before its CAS (a stale loser can leave a permanent dedup marker after CompleteItem removed the lifecycle)'
   restore
 }
 
@@ -462,14 +440,12 @@ MUTATIONS=(
   m_post_claim_read_error_skips_release
   m_divergent_read_retries
   m_authority_invalid_retries
-  m_foreign_owner_retries
+  m_foreign_owner_enters_queue_lifecycle
   m_unwind_ignores_foreign_owner
   m_verify_unwind_ignores_foreign_owner
   m_unwind_bypasses_the_wrapper
   m_owned_alert_fires_for_a_late_loser
   m_verify_alert_fires_for_a_late_loser
-  m_requeue_move_is_unconditional
-  m_requeue_recreates_pending_marker
 )
 
 if [ "${1:-}" = "--list" ]; then

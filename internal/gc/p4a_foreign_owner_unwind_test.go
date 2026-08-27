@@ -17,7 +17,7 @@ import (
 // the cap, parks in the DLQ.
 //
 // Each case is run twice: once with a takeover interposed between the claim and the
-// failure point (the late loser, which must postpone), and once without (the attempt
+// failure point (the late loser, which must leave the queue untouched), and once without (the attempt
 // still owns its claim, and the error must spend the budget exactly as before).
 type foreignOwnerUnwindCase struct {
 	name string
@@ -117,6 +117,10 @@ type foreignOwnerUnwindResult struct {
 	// away.
 	itemErrorsRaised float64
 	refusalsRecorded float64
+	originalItem     QueueItem
+	completeCalls    int64
+	requeueCalls     int64
+	failCalls        int64
 }
 
 // runForeignOwnerUnwind drives one failure point to completion.
@@ -131,6 +135,10 @@ func runForeignOwnerUnwind(t *testing.T, tc foreignOwnerUnwindCase, retryCount i
 	blockID := testSHA256BlockID("blk-foreign-owner-" + tc.name)
 	candidate := tc.seed(t, store, sp, orgID, blockID)
 	enqueueExactBlockCandidateForTest(t, store, candidate, retryCount)
+	queued := store.QueueItems(orgID)
+	if len(queued) != 1 {
+		t.Fatalf("queue items after enqueue = %d, want 1", len(queued))
+	}
 
 	// The interposition point is the claim-then-verify window, the same one
 	// TestP4A_LateLoserCannotConsumeTheCurrentOwnersCandidate uses: this attempt holds
@@ -175,6 +183,10 @@ func runForeignOwnerUnwind(t *testing.T, tc foreignOwnerUnwindCase, retryCount i
 		takeover:         takeover,
 		itemErrorsRaised: gcErrorCount(tc.ownedErrorMetric) - itemErrorsBefore,
 		refusalsRecorded: testutil.ToFloat64(metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner")) - refusalsBefore,
+		originalItem:     queued[0],
+		completeCalls:    store.QueueCompleteCallsForTest(),
+		requeueCalls:     store.QueueRequeueCallsForTest(),
+		failCalls:        store.QueueFailCallsForTest(),
 	}
 }
 
@@ -192,10 +204,11 @@ func runForeignOwnerUnwind(t *testing.T, tc foreignOwnerUnwindCase, retryCount i
 // fence the current owner holds. If that owner then dies, the fence is stranded and
 // BlockDeleteFenceActive refuses every future upload of that content.
 //
-// A not-owner release means another lifecycle owns the fence RIGHT NOW. This attempt has
-// no authority to conclude anything about the item from a walk it no longer owns, so the
-// only sound answer is the one BlockClaimFreshOwner gives at the claim: postpone, leave
-// the candidate and its work item alone, and let whoever owns the fence finish.
+// A not-owner release means this attempt no longer owns the fence. It has no authority to
+// conclude anything about the item from a walk it no longer owns, so the
+// only sound answer is the one BlockClaimFreshOwner gives at the claim: yield without
+// queue mutation, leave the candidate and its work item alone, and let whoever owns the
+// fence finish.
 func TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget(t *testing.T) {
 	for _, tc := range foreignOwnerUnwindCases() {
 		tc := tc
@@ -232,6 +245,12 @@ func TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget(t *testing.T) {
 					}
 					if items[0].RetryCount != retryCount {
 						t.Errorf("retry_count = %d, want %d: a late loser spent the item's budget on another lifecycle's walk", items[0].RetryCount, retryCount)
+					}
+					if items[0].QueuedAt != got.originalItem.QueuedAt || items[0].IdentityAt != got.originalItem.IdentityAt || items[0].BlockGCCandidateIdentity != got.originalItem.BlockGCCandidateIdentity {
+						t.Errorf("late loser changed queue identity: got queued_at=%s identity_at=%s candidate=%+v, want queued_at=%s identity_at=%s candidate=%+v", items[0].QueuedAt, items[0].IdentityAt, items[0].BlockGCCandidateIdentity, got.originalItem.QueuedAt, got.originalItem.IdentityAt, got.originalItem.BlockGCCandidateIdentity)
+					}
+					if got.completeCalls != 0 || got.requeueCalls != 0 || got.failCalls != 0 {
+						t.Errorf("queue mutations = Complete:%d RequeueItem:%d FailItem:%d, want all zero: foreign-owner handling must leave the stale row untouched", got.completeCalls, got.requeueCalls, got.failCalls)
 					}
 					if failed := got.store.FailedItems(got.orgID); len(failed) != 0 {
 						t.Errorf("DLQ entries = %d, want 0: ItemBlock never leaves the DLQ, so the surviving candidate would be undiscoverable: %+v", len(failed), failed)

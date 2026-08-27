@@ -103,7 +103,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. Drift/manual-ops edge case; not reproduced on the current live path. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
-| **GC Worker/Scanner Robustness (E1/E2/E4/E5)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
+| **GC Worker/Scanner Robustness (E1/E2/E4/E5/E6)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, queue lifecycle arbitration, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
 | **No Reconcile/Backfill for Existing Orphans** | ⏸ Deferred (greenfield prod) | Brownfield clusters with pre-fix residue may need a read-only reconcile pass. **Not required** for the planned empty prod deploy. See ISSUE-GC-RECONCILE-BACKFILL-01 below. |
 | **Block `gc_pending_items` Rows Leak (library-scope mismatch)** | 🟢 Fixed (2026-07-13) | Confirmed live-path leak: `ItemBlock` enqueued with the real `library_id` while the pending key is library-scoped and dedup checks use `uuid.Nil`. Fixed by standardizing block enqueue on `uuid.Nil` + store backstop. Pre-existing orphans on brownfield clusters only. See ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01 below. |
 | **Forward SHA-1 Mappings Retained After Physical GC** | 🟡 Confirmed retention debt (Low) | R11a intentionally keeps `block_id_mappings` after physical block deletion. Rows are idempotent per `(org, representation, SHA-1)` rather than per delete churn, but they have no TTL or logical-death reaper and can resolve to a 404 until rematerialization. No live bytes or references are deleted. See ISSUE-GC-LOGICAL-MAPPING-RETENTION-01 below. |
@@ -5158,7 +5158,7 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 ---
 
-### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4/E5)
+### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4/E5/E6)
 
 **Status**: 🟡 Confirmed, low-severity (2026-07-10)
 **Severity**: Low / Low-Med — engine fragility and observability; former E3 is High P6
@@ -5185,6 +5185,17 @@ P6 issue above.
   `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`. `block_claim_release_unconfirmed` is the
   only one that postpones on non-environmental errors, and it carries a dedicated
   `gc_errors_total{type="stale_claim_release_failed"}` counter for exactly that reason.
+- **E6 — queue lifecycle arbitration is not global.** `DequeueBatch` is a plain `SELECT`
+  without a lease, so multiple workers may hold the same `gc_queue` row. `RequeueItem`
+  uses an ordinary logged `DELETE(old)` + `INSERT(new)` batch, while `CompleteItem` and
+  `FailItem` use their own ordinary batches. If a stale worker reaches a generic requeue
+  after another lifecycle has advanced the row, Cassandra can apply the insert even when
+  the delete addressed nothing; `queued_at` is part of the key, so a duplicate lifecycle
+  remains durable. The same authority gap covers `Requeue` vs `Complete`, `Requeue` vs
+  `Fail`, `Complete` vs `Fail`, DLQ and pending-marker state. This is a queue-protocol
+  follow-up, not closed by the P4a late-loser fix: a `block_claim_foreign_owner` result now
+  exits at `processOrg` without calling `CompleteItem`, `RequeueItem`, `FailItem` or retry
+  mutation, but ordinary retry/postpone paths still need one lifecycle authority.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
   without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.
@@ -5215,6 +5226,8 @@ P6 issue above.
 - 10A: `atomic.Bool` plus an explicit decision on hard-cutover semantics.
 - 10B: consistently surface remaining scanner errors; P5/P6 own their specific paths.
 - 10C: meter/bound repeated postpones without premature DLQ.
+- 10C also needs an explicit lifecycle authority for `Requeue`/`Complete`/`Fail`; do not
+  add a partial LWT to `RequeueItem` while the other queue transitions remain ordinary.
 - 10D: audit/reconcile pending rows against queue + retained DLQ; no standalone TTL unless
   lifetimes are coordinated.
 - 10E: decide E5 explicitly — accept leader-lease exclusion as design because operations are

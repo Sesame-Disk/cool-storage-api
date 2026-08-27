@@ -692,69 +692,34 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 // RequeueItem moves a failed item to the back of the queue to prevent head-of-line blocking.
 // It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
 func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
-	// A requeue keeps the lifecycle it was already serving: same identity_at, same
-	// P. Only queued_at moves, so the item goes to the back of the queue without
-	// becoming a different work item.
 	identity, err := identity.requireIdentityAt("queue requeue", itemID)
 	if err != nil {
 		return err
 	}
-
-	// A requeue must move one old row, never create a second row. DequeueBatch is a plain
-	// SELECT with no lease, so concurrent workers can hold the same row. A read before
-	// this operation cannot close that race: both workers can observe the old row and then
-	// each run DELETE(old) plus INSERT(new), where Cassandra treats a delete of an absent
-	// row as a no-op while applying the insert.
-	//
-	// The old row's existence is therefore a condition of the move. The old and new queue
-	// rows use the same (org_id, bucket) partition because only queued_at changes, so the
-	// two queue statements can be one Paxos decision. A losing conditional move is a
-	// harmless no-op because another worker already advanced this lifecycle.
 	now := time.Now().UTC()
 	guardMode := effectiveLibraryGuardMode(libraryGuardMode, requiresLibraryDeletedCheck)
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
 
-	// A requeue preserves the lifecycle membership represented by gc_pending_items. It must
-	// not recreate that durable dedup row before the queue CAS: another worker may have
-	// completed the old row and deleted its pending marker, after which a losing stale
-	// requeue would otherwise leave pending state with no queue row. The active and dirty
-	// markers are scheduling hints, so refreshing those before the move is harmless.
-	markers := s.db.Session().Batch(gocql.LoggedBatch)
-	markers.Query(`
-		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
-		VALUES (?, ?, ?)
-	`, gcOrgBucket(orgID), orgID.String(), now)
-	markers.Query(`
-		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
-		VALUES (?, ?, ?)
-	`, gcOrgBucket(orgID), orgID.String(), now)
-	if err := markers.Exec(); err != nil {
-		return fmt.Errorf("record queue requeue markers for %s/%s: %w", orgID, itemID, err)
-	}
-
-	move := s.db.Session().Batch(gocql.LoggedBatch)
-	move.Query(`
+	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
-		IF EXISTS
 	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt)
-	move.Query(`
+
+	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, library_guard_mode, item_type, item_id, library_id, block_representation_id, storage_class, candidate_storage_class, candidate_storage_key, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, identity.IdentityAt, guardMode != LibraryGuardNone, string(guardMode), string(itemType), itemID, libraryID.String(), strings.TrimSpace(blockRepresentationID), storageClass, identity.Target().StorageClass, identity.Target().StorageKey, newRetryCount)
+	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, identity)
+	batch.Query(`
+		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
+		VALUES (?, ?, ?)
+	`, gcOrgBucket(orgID), orgID.String(), now)
+	batch.Query(`
+		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
+		VALUES (?, ?, ?)
+	`, gcOrgBucket(orgID), orgID.String(), now)
 
-	applied, iter, err := move.SerialConsistency(gocql.Serial).MapExecCAS(map[string]interface{}{})
-	if iter != nil {
-		if closeErr := iter.Close(); err == nil {
-			err = closeErr
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("move queue item %s/%s: %w", orgID, itemID, err)
-	}
-	if !applied {
-		log.Printf("[GC] Skipping requeue for missing queue row org=%s item_type=%s item_id=%s queued_at=%s; another worker already advanced this lifecycle", orgID, itemType, itemID, oldQueuedAt.Format(time.RFC3339Nano))
-	}
-	return nil
+	return batch.Exec()
 }
 
 func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error {

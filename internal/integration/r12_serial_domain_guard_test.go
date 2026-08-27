@@ -245,10 +245,6 @@ var r12BatchCASTerminals = map[string]bool{
 // stands on its own.
 var r12AllowedBatchCAS = map[string]r12UnresolvedAllowance{
 	"relocateLockRowCASFn": {count: 1, reason: "locked_files row relocation; both batch.Query statements are inline literals on locked_files, so the general Query rule classifies them and would discover an R12 target with no CAS terminal"},
-	// The old row's existence has to be a CONDITION of the move, not something read
-	// beforehand: a pre-read answers "it existed when I looked", and two workers that both
-	// looked would each insert a durable queue row. R26 keeps those two apart forever.
-	"(*CassandraStore).RequeueItem": {count: 1, reason: "gc_queue row move; every batch.Query statement is an inline literal on gc_queue, so the general Query rule classifies them and would discover an R12 target with no CAS terminal"},
 }
 
 // r12AllowedBatchCASShape pins what each allowlisted conditional batch is
@@ -264,8 +260,7 @@ var r12AllowedBatchCASShape = map[string]struct {
 	statements int
 	tables     map[string]bool
 }{
-	"relocateLockRowCASFn":          {statements: 2, tables: map[string]bool{"locked_files": true}},
-	"(*CassandraStore).RequeueItem": {statements: 4, tables: map[string]bool{"gc_queue": true, "gc_active_orgs": true, "gc_dirty_orgs": true}},
+	"relocateLockRowCASFn": {statements: 2, tables: map[string]bool{"locked_files": true}},
 }
 
 type r12SerialPin struct {

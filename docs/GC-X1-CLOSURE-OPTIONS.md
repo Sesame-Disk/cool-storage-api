@@ -1653,10 +1653,9 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **42** red-form mutations in
-`scripts/p4a-mutation-validation.sh`. Every count written elsewhere in this document (17,
-21, 23, 37, 40, 41) is stale; the script prints its own total on a clean run, and that is the
-figure to cite.
+the observed incarnation — plus **40** active red-form mutations in
+`scripts/p4a-mutation-validation.sh`. Older counts are historical; the script prints its own
+total on a clean run, and that is the figure to cite.
 
 A fourth review pass made every non-authoritative post-claim `GetBlockInfo` outcome
 (stub-shaped, error, or divergent locator) release the exact claim and postpone with the
@@ -1667,10 +1666,13 @@ unwinds released the fence and returned an ordinary error while discarding the r
 outcome, so an attempt whose claim had been taken over spent the item's retry budget; at
 the cap that parks `ItemBlock` in a DLQ it never leaves, past a Phase 1 day cursor already
 advanced to `today-1`, leaving the preserved candidate undiscoverable behind a live
-foreign fence. A not-owner release now postpones instead, while an owner still spends its
+foreign fence. A not-owner release now returns a classified foreign-owner result, and the
+worker boundary leaves that stale queue row untouched, while an owner still spends its
 retries so permanent item defects keep reaching the DLQ. Gated by
 `TestP4A_ForeignOwnerUnwindDoesNotSpendTheRetryBudget`,
-`TestP4A_OwnedUnwindStillSpendsTheRetryBudget` and five mutations.
+`TestP4A_OwnedUnwindStillSpendsTheRetryBudget`,
+`TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow`,
+`TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle` and five mutations.
 
 A sixth pass hardened that rule rather than changing it. The defect has exactly one
 spelling — Go refuses to compile a `released, relErr :=` whose outcome is never read, so
@@ -1682,8 +1684,9 @@ behind the ownership check: they assert that the BLOCK is defective, which a lat
 no more entitled to conclude for a metric than for the retry budget, and the owner
 re-observes the durable defect on the next pass.
 
-A seventh pass closed the DURABLE half of "postpone", which is a queue-primitive defect
-rather than a P4a one and predates this whole slice. `RequeueItem`'s batch is
+**Historical draft, withdrawn from this branch:** A seventh pass attempted to close the
+DURABLE half of "postpone", which is a queue-primitive defect rather than a P4a one and
+predates this whole slice. `RequeueItem`'s batch is
 `DELETE(old)` + `INSERT(new)`; Cassandra applies the INSERT whether or not the DELETE
 addressed anything, and `DequeueBatch` takes no lease, so a worker holding a row another
 worker had already advanced created a SECOND durable row rather than moving one — after
@@ -1712,6 +1715,12 @@ conditional move rather than merely a `queueItemPendingInfo` pre-read.
 R14b/P4b, the orphan-publication half, remains open — and note that
 `StartBlockDeleteOrphan`/`FinalizeBlockDelete` failures still return retryable errors
 without consulting ownership. That is P4b's question, not this row's.
+
+The current branch deliberately does not claim the queue primitive as closed. The
+foreign-owner result is handled before generic queue policy and performs no `Complete`,
+`Requeue`, `Fail` or retry mutation. `RequeueItem` remains the ordinary logged
+`DELETE(old)` + `INSERT(new)` path, so one lifecycle authority for `Requeue`/`Complete`/`Fail`,
+DLQ and pending state is a follow-up required before destructive GC activation.
 
 | # | Sequence | Required outcome |
 |---|---|---|

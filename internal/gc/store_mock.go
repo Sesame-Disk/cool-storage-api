@@ -212,6 +212,11 @@ type MockStore struct {
 	// LoggedBatch case (Cassandra timeout / unavailable) where the batch
 	// committed at the cluster but the client observed a failure.
 	requeueItemErrAfterMutate error
+	// Queue mutation counters let worker tests prove that a stale late loser does not
+	// accidentally enter a queue lifecycle path.
+	queueCompleteCalls atomic.Int64
+	queueRequeueCalls  atomic.Int64
+	queueFailCalls     atomic.Int64
 	// ensureBlockGCCandidateErrAfterMutate, when non-nil, forces
 	// EnsureBlockGCCandidate to preserve the canonical/discovery rows and then
 	// return this error. Models degraded projection-repair outcomes where the
@@ -1505,6 +1510,10 @@ func (m *MockStore) QueueItems(orgID uuid.UUID) []QueueItem {
 	return append([]QueueItem{}, m.queue[orgID]...)
 }
 
+func (m *MockStore) QueueCompleteCallsForTest() int64 { return m.queueCompleteCalls.Load() }
+func (m *MockStore) QueueRequeueCallsForTest() int64  { return m.queueRequeueCalls.Load() }
+func (m *MockStore) QueueFailCallsForTest() int64     { return m.queueFailCalls.Load() }
+
 func (m *MockStore) IsOrgActive(orgID uuid.UUID) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1665,6 +1674,7 @@ func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Tim
 }
 
 func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
+	m.queueCompleteCalls.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	identity, err := identity.requireIdentityAt("queue completion", itemID)
@@ -1685,6 +1695,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 }
 
 func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
+	m.queueRequeueCalls.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	identity, err := identity.requireIdentityAt("queue requeue", itemID)
@@ -1725,6 +1736,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 }
 
 func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error {
+	m.queueFailCalls.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

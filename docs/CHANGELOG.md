@@ -8,7 +8,38 @@ Session-by-session development history for SesameFS.
 
 ---
 
-## 2026-08-27 - P4a: a late loser must not spend the work item's retry budget either
+## 2026-08-27 - P4a review: queue lifecycle arbitration remains open
+
+The queue-primitive hardening from the draft below is withdrawn from this branch. It mixed
+global `RequeueItem` arbitration into the late-loser fix while `CompleteItem` and `FailItem`
+still use ordinary batches, so it could not establish one authority for the whole
+`Requeue`/`Complete`/`Fail` lifecycle.
+
+The mergeable scope is now explicit:
+
+- A `blockClaimForeignOwnerError` is classified at the `processOrg` boundary before generic
+  error, retry, postpone or DLQ handling.
+- The stale worker performs no `CompleteItem`, `RequeueItem`, `FailItem` or retry mutation.
+  Its exact queue row, candidate, identity and claim remain untouched; the current owner
+  carries the candidate forward.
+- The five post-claim ownership/unwind fixes and their owned-vs-foreign behavior remain in
+  P4a. Permanent defects still spend retries when the attempt owns the claim.
+- `RequeueItem` is back to the ordinary logged `DELETE(old)` + `INSERT(new)` batch used by
+  the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
+  a partial LWT.
+- The requeue-specific real-Cassandra tests, source guard and mutations were removed from
+  this PR. The active P4a mutation script now contains **40** mutations; the script output
+  is authoritative.
+
+The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ
+and cross-partition pending state. Its race matrix includes `Requeue` vs `Requeue`,
+`Requeue` vs `Complete`, `Requeue` vs `Fail`, `Complete` vs `Fail`, and ambiguous outcomes.
+Until that design is implemented and proven, `GC_ENABLED=false` remains required.
+
+## 2026-08-27 - P4a: a late loser must not spend the work item's retry budget either (historical draft)
+
+> The queue-primitive sections in this historical entry describe an implementation that was
+> later withdrawn from the mergeable branch. The current queue status is recorded above.
 
 Closes the second half of the late-loser contract. The first half — landed with P4a —
 stopped an attempt whose claim had been taken over from CONSUMING the current owner's

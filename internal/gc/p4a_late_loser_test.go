@@ -3,6 +3,7 @@ package gc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -121,15 +122,21 @@ func TestP4A_LateLoserCannotConsumeTheCurrentOwnersCandidate(t *testing.T) {
 	}
 }
 
-// TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget pins the queue policy half.
+// TestP4A_LateLoserLeavesQueueUntouched pins the queue policy half.
 //
 // Losing a race the attempt was never guaranteed to win says nothing about the item, so
 // it must not walk toward the DLQ — a destination ItemBlock never returns from, which
 // would make the candidate this branch just went out of its way to preserve unreachable
 // anyway.
-func TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget(t *testing.T) {
-	if !shouldPostponeWithoutRetry(blockClaimForeignOwnerError{ItemID: "b"}) {
-		t.Fatal("a late loser must postpone: spending the retry budget parks the item in a DLQ that ItemBlock never leaves, stranding the fence it refused to disturb")
+func TestP4A_LateLoserLeavesQueueUntouched(t *testing.T) {
+	foreignOwner := blockClaimForeignOwnerError{ItemID: "b"}
+	for _, err := range []error{foreignOwner, fmt.Errorf("wrapped foreign owner: %w", foreignOwner)} {
+		if shouldPostponeWithoutRetry(err) {
+			t.Fatal("a late loser must not enter the generic postpone path: RequeueItem is a queue lifecycle decision")
+		}
+		if !shouldLeaveQueueUntouched(err) {
+			t.Fatalf("%T must be classified at the worker boundary as queue-untouched", err)
+		}
 	}
 	// The sibling codes this pass also settled. Each was documented as postponing and
 	// GCFailureCodeBlockAuthorityInvalid in particular was not actually listed, so it
@@ -142,6 +149,89 @@ func TestP4A_LateLoserPostponesInsteadOfSpendingTheRetryBudget(t *testing.T) {
 		if !shouldPostponeWithoutRetry(err) {
 			t.Errorf("%T is documented as postponing but spends the retry budget", err)
 		}
+	}
+}
+
+// TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow covers the stronger form of
+// the rule: the authoritative worker may advance Q0 to Q1 before A discovers that its
+// claim is gone, and A must not create another queue lifecycle from its stale Q0 copy.
+func TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, &Stats{})
+
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("blk-late-loser-advanced-queue")
+	candidate := p4aSeedBlockCandidate(t, store, orgID, blockID)
+	enqueueExactBlockCandidateForTest(t, store, candidate, 0)
+	queued := store.QueueItems(orgID)
+	if len(queued) != 1 {
+		t.Fatalf("queue items after enqueue = %d, want 1", len(queued))
+	}
+	original := queued[0]
+
+	var calls int
+	var takeoverAuthority BlockDeleteAuthority
+	var advancedQueuedAt time.Time
+	var queueRequeueCallsAfterAdvance int64
+	store.SetBlockHasReferencesHookForTest(func(_ uuid.UUID, _ string, _ bool) (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, nil
+		}
+		if takeoverAuthority.IsZero() {
+			blk := store.GetBlock(orgID, blockID)
+			if blk == nil || blk.GCState != db.BlockGCStateDeleting {
+				t.Errorf("expected attempt A to be holding the claim at verify time, got %+v", blk)
+			}
+
+			// B owns the durable lifecycle now: it advances A's stale Q0 and takes
+			// the current claim before A receives the not-owner result.
+			advancedQueuedAt = original.QueuedAt.Add(time.Second)
+			if err := store.RequeueItem(
+				original.OrgID,
+				original.QueuedAt,
+				advancedQueuedAt,
+				original.ItemType,
+				original.ItemID,
+				original.LibraryID,
+				original.BlockRepresentationID,
+				original.StorageClass,
+				original.RetryCount+1,
+				original.Identity(),
+				original.RequiresLibraryDeletedCheck,
+				original.LibraryGuardMode,
+			); err != nil {
+				t.Fatalf("authoritative Q0 -> Q1 requeue: %v", err)
+			}
+			queueRequeueCallsAfterAdvance = store.QueueRequeueCallsForTest()
+			takeoverAuthority = store.SeedBlockClaimForTest(orgID, blockID, "attempt-B-D2", time.Now())
+		}
+		return true, nil
+	})
+
+	completeBefore := store.QueueCompleteCallsForTest()
+	failBefore := store.QueueFailCallsForTest()
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce returned a fatal error: %v", err)
+	}
+	if calls < 2 || takeoverAuthority.IsZero() {
+		t.Fatalf("the walk did not reach the interposed takeover: references calls=%d authority=%+v", calls, takeoverAuthority)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("live queue items = %d, want 1", len(items))
+	}
+	if items[0].QueuedAt != advancedQueuedAt || items[0].RetryCount != original.RetryCount+1 || items[0].IdentityAt != original.IdentityAt || items[0].BlockGCCandidateIdentity != original.BlockGCCandidateIdentity {
+		t.Fatalf("authoritative Q1 was changed: got %+v, want queued_at=%s retry_count=%d identity_at=%s candidate=%+v", items[0], advancedQueuedAt, original.RetryCount+1, original.IdentityAt, original.BlockGCCandidateIdentity)
+	}
+	if store.QueueRequeueCallsForTest() != queueRequeueCallsAfterAdvance || store.QueueCompleteCallsForTest()-completeBefore != 0 || store.QueueFailCallsForTest()-failBefore != 0 {
+		t.Fatalf("stale attempt mutated the queue after B's move: Requeue=%d Complete=%d Fail=%d", store.QueueRequeueCallsForTest()-queueRequeueCallsAfterAdvance, store.QueueCompleteCallsForTest()-completeBefore, store.QueueFailCallsForTest()-failBefore)
+	}
+	if blk := store.GetBlock(orgID, blockID); blk == nil || blk.GCClaimID != takeoverAuthority.ClaimID {
+		t.Fatalf("authoritative claim was disturbed: got %+v, want claim %s", blk, takeoverAuthority.ClaimID)
 	}
 }
 

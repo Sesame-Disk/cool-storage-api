@@ -533,7 +533,6 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	for _, sentinel := range []error{
 		failedClosedError{},
 		blockCanonicalReadUnreliableError{},
-		blockClaimForeignOwnerError{},
 		blockClaimNotYetStaleError{},
 		blockCandidateWithinGraceError{},
 		blockClaimReleaseUnconfirmedError{},
@@ -610,62 +609,66 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 	}
 }
 
-// TestP4ARequeueNeverCreatesAQueueRow guards the DURABLE half of "postpone".
-//
-// Postponing without spending a retry is implemented as RequeueItem, whose move is
-// DELETE(old) + INSERT(new). Cassandra treats a DELETE of an absent row as a valid no-op
-// and applies the INSERT anyway, and DequeueBatch takes no lease -- so a worker holding a
-// row another worker has already advanced would not MOVE a row, it would create a second
-// one, durably distinct after R26 because queued_at is part of the key.
-//
-// THE CONDITION HAS TO BE PART OF THE MUTATION. A SELECT before the batch answers "the
-// row existed when I looked", and the dangerous direction is not a stale absent but a
-// present that stops being true between the read and the commit -- so a linearizable read
-// would move the window rather than remove it. This guard therefore requires the
-// conditional form, not the presence of a pre-read: an IF on the delete, a batch CAS
-// terminal, and an `applied` the code actually branches on.
-//
-// TestP4A_RequeueNeverResurrectsAnAlreadyAdvancedQueueRow proves the behaviour against
-// the engine, which is where it has to be proven: MockStore.RequeueItem searches for the
-// old row first and no-ops when it is gone, so the unit suite agreed with the code while
-// production carried the defect. That is R19's shape exactly.
-func TestP4ARequeueNeverCreatesAQueueRow(t *testing.T) {
-	file := p4aParseStore(t)
-	fn := findGCFunction(file, "RequeueItem")
-	if fn == nil {
-		t.Fatal("RequeueItem not found; the requeue guard is vacuous")
+// TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle is the source-side gate for the
+// queue half of P4a. A foreign-owner result is a handled stale attempt, not a postponable
+// item failure, so processOrg must classify it before the generic retry/postpone/DLQ path.
+func TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle(t *testing.T) {
+	source, err := os.ReadFile("worker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "worker.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	var deleteCQL string
-	ast.Inspect(fn.Body, func(node ast.Node) bool {
-		literal, ok := node.(*ast.BasicLit)
-		if !ok || literal.Kind != token.STRING {
+	processOrg := findGCFunction(file, "processOrg")
+	if processOrg == nil {
+		t.Fatal("processOrg not found; the foreign-owner queue boundary is not guarded")
+	}
+	var leavePos, postponePos token.Pos
+	ast.Inspect(processOrg.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
 			return true
 		}
-		text, err := strconv.Unquote(literal.Value)
-		if err != nil || !strings.Contains(text, "DELETE FROM gc_queue") {
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok {
 			return true
 		}
-		deleteCQL = text
+		switch name.Name {
+		case "shouldLeaveQueueUntouched":
+			if leavePos == token.NoPos {
+				leavePos = call.Pos()
+			}
+		case "shouldPostponeWithoutRetry":
+			if postponePos == token.NoPos {
+				postponePos = call.Pos()
+			}
+		}
 		return true
 	})
-	if deleteCQL == "" {
-		t.Fatal("RequeueItem no longer deletes the old gc_queue row; the requeue guard is vacuous")
+	if leavePos == token.NoPos || postponePos == token.NoPos {
+		t.Fatalf("processOrg must call both queue classifiers: leave=%v postpone=%v", leavePos, postponePos)
 	}
-	if !strings.Contains(deleteCQL, "IF EXISTS") {
-		t.Error("RequeueItem must make the old row's existence a CONDITION of the move (IF EXISTS), not something it checked beforehand: a read followed by an unconditional DELETE+INSERT still lets two workers that both observed the row create two durable rows, and no consistency level on the read closes that")
+	if leavePos >= postponePos {
+		t.Fatalf("processOrg must classify foreign-owner before generic postpone: leave=%v postpone=%v", leavePos, postponePos)
 	}
-	if !p4aMentions(fn, "MapExecCAS") {
-		t.Error("RequeueItem must execute its move as a conditional batch: without a CAS terminal the IF is never evaluated as one operation")
+
+	classifier := findGCFunction(file, "shouldPostponeWithoutRetry")
+	if classifier == nil {
+		t.Fatal("shouldPostponeWithoutRetry not found")
 	}
-	if !p4aMentions(fn, "SerialConsistency") || !p4aMentions(fn, "Serial") {
-		t.Error("RequeueItem's conditional move must serialize globally: workers requeueing one row can live in different datacenters, and LOCAL_SERIAL would not order them against each other")
-	}
-	if !p4aMentions(fn, "applied") {
-		t.Error("RequeueItem must branch on whether the move applied: a batch that did not apply means another worker already advanced this lifecycle, which is a no-op and not an error")
-	}
-	if p4aMentions(fn, "addPendingItemBatchQuery") {
-		t.Error("RequeueItem must not recreate gc_pending_items: a stale requeue can lose its queue CAS after CompleteItem deleted the lifecycle, leaving a permanent pending marker with no queue row")
+	foreignInPostpone := false
+	ast.Inspect(classifier.Body, func(node ast.Node) bool {
+		ident, ok := node.(*ast.Ident)
+		if ok && ident.Name == "GCFailureCodeBlockClaimForeignOwner" {
+			foreignInPostpone = true
+		}
+		return true
+	})
+	if foreignInPostpone {
+		t.Fatal("blockClaimForeignOwner must not be a generic postpone classifier")
 	}
 }
 

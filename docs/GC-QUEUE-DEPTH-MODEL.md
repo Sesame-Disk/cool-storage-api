@@ -48,6 +48,23 @@ GC depth tracking went through three designs:
   on recalc when depth > 0, and a defensive `GetOldestQueuedAt` (LIMIT 1) probe
   prevents a stale snapshot from draining an org with live rows.
 
+### Queue lifecycle arbitration follow-up (2026-08-27)
+
+`DequeueBatch` is deliberately a read and does not lease a row. Multiple workers can
+therefore hold the same queue item. `RequeueItem` currently uses the ordinary logged
+`DELETE(old)` + `INSERT(new)` batch, while `CompleteItem` and `FailItem` use separate
+ordinary batches. A stale requeue can consequently insert a new `queued_at` row after
+another lifecycle advanced or removed the old row. This is a known queue-protocol race,
+not a guarantee supplied by the depth markers.
+
+The Cassandra 5.0.9 CQL reference documents the relevant conditional-write semantics:
+[CQL data manipulation](https://cassandra.apache.org/doc/5.0.9/cassandra/developing/cql/dml.html).
+
+The P4a late-loser path does not enter this generic protocol: a foreign-owner result is
+handled at the worker boundary with no queue mutation. A future queue design must choose
+one authority across `Requeue`, `Complete`, `Fail`, DLQ and `gc_pending_items`; adding an
+LWT only to `RequeueItem` would leave the lifecycle partially ordered.
+
 ---
 
 ## Hardening applied in this branch

@@ -144,11 +144,9 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 // THE WORK ITEM THAT CARRIES IT. The walk has branches
 // that legitimately release the claim and then settle the candidate — "re-referenced
 // after claim" is the important one — and settling is only sound when the release
-// actually released THIS attempt's fence. If the release came back not-owner, another
-// lifecycle holds the fence right now, and the candidate is the only thing that could
-// ever take that fence over if that lifecycle dies. Dropping it there produces exactly
-// the state BlockClaimFreshOwner refuses to produce at the claim: a standing fence with
-// no work item able to lift it.
+// actually released THIS attempt's fence. If the release came back not-owner, this
+// attempt has no authority to settle the candidate. Preserving it is the only safe choice
+// because it can be needed to recover a fence if another lifecycle left one standing.
 //
 // The same reasoning reaches one branch over. A post-claim unwind that returns an
 // ORDINARY error spends the item's retry budget, and at the cap the item is parked in a
@@ -156,14 +154,14 @@ func (e blockClaimNotYetStaleError) FailureCode() string {
 // with nothing able to carry it back. Both exits are this error's job; see
 // refuseRetryForForeignClaimOwner.
 //
-// Postponed, never retried: nothing is wrong with the item, it simply lost a race it was
-// never guaranteed to win.
+// The worker boundary handles this without retrying or mutating the queue: nothing is wrong
+// with the item, it simply lost a race it was never guaranteed to win.
 type blockClaimForeignOwnerError struct {
 	ItemID string
 }
 
 func (e blockClaimForeignOwnerError) Error() string {
-	return fmt.Sprintf("block %s: this attempt's delete claim was already gone when it reached a post-claim decision point; another lifecycle owns the fence", e.ItemID)
+	return fmt.Sprintf("block %s: this attempt no longer owns the delete claim at a post-claim decision point", e.ItemID)
 }
 
 func (e blockClaimForeignOwnerError) FailureCode() string {
@@ -395,8 +393,9 @@ func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority Bl
 // refuseRetryForForeignClaimOwner is the release outcome's SECOND consumer, and it exists
 // for the same reason as the first.
 //
-// The settlement rule — a late loser must not consume the current owner's candidate — is
-// only half of what "the candidate survives" has to mean. A candidate row is a recovery
+// The settlement rule — a late loser must not consume the candidate for the authoritative
+// lifecycle — is only half of what "the candidate survives" has to mean. A candidate row is
+// a recovery
 // mechanism only while some work item can still carry it back, and every post-claim
 // unwind that returns an ORDINARY error spends the item's retry budget on the way out.
 // Five of them did that without ever looking at whether the fence they just handed back
@@ -407,13 +406,13 @@ func (w *Worker) releaseBlockClaim(orgID uuid.UUID, blockID string, authority Bl
 // nothing), and charges a retry to the item. At the cap the item goes to the DLQ, which
 // ItemBlock never leaves — isAutoRecoverableFailedItem rescues only commit/fs_object
 // items — and the scanner's day cursor has already advanced past the candidate's
-// discovery row. Candidate present, work item unreachable, foreign fence standing: if
-// that owner then dies, BlockDeleteFenceActive refuses every future upload of the
-// content, and nothing in the system can lift it.
+// discovery row. Candidate present, work item unreachable, and a lifecycle state that
+// may still carry a foreign fence: if that owner then dies, BlockDeleteFenceActive refuses
+// every future upload of the content, and nothing in the system can lift it.
 //
-// AUTHORITY, NOT ERROR CLASS, is what this decides. A not-owner release says another
-// lifecycle owns the fence right now, so this attempt is in no position to conclude
-// anything about the ITEM from a walk it no longer owns — exactly the reasoning
+// AUTHORITY, NOT ERROR CLASS, is what this decides. A not-owner release says this attempt
+// no longer owns the fence, so it is in no position to conclude anything about the ITEM
+// from a walk it no longer owns — exactly the reasoning
 // BlockClaimFreshOwner applies at the claim. It says nothing about whether the original
 // error is real: the next pass re-claims fresh, and an attempt that owns its fence
 // reaches the same error and spends its retries normally. That is why this is not a
@@ -428,7 +427,7 @@ func (w *Worker) refuseRetryForForeignClaimOwner(itemID string, outcome BlockRel
 		return nil
 	}
 	metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner").Inc()
-	log.Printf("[GC Worker] Block %s: unwinding on %v, but this attempt no longer owns the delete claim; postponing instead of spending the retry that would strand the current owner's fence behind an undiscoverable candidate", itemID, originalErr)
+	log.Printf("[GC Worker] Block %s: unwinding on %v, but this attempt no longer owns the delete claim; leaving the queue untouched instead of spending the retry that would strand the authoritative lifecycle's fence behind an undiscoverable candidate", itemID, originalErr)
 	return blockClaimForeignOwnerError{ItemID: itemID}
 }
 
@@ -544,13 +543,19 @@ func shouldPostponeWithoutRetry(err error) bool {
 		// the one destination its own contract rules out, because ItemBlock does not come
 		// back from there and the candidate it insists on preserving would be unreachable.
 		GCFailureCodeBlockAuthorityInvalid,
-		GCFailureCodeBlockClaimForeignOwner,
 		GCFailureCodeBlockCandidateWithinGrace,
 		GCFailureCodeBlockCanonicalReadUnreliable:
 		return true
 	default:
 		return false
 	}
+}
+
+// shouldLeaveQueueUntouched identifies a late loser after its claim has been taken over.
+// It is intentionally separate from shouldPostponeWithoutRetry: postponing calls
+// RequeueItem, while a stale worker must not participate in any queue lifecycle decision.
+func shouldLeaveQueueUntouched(err error) bool {
+	return failureCodeForError(err) == GCFailureCodeBlockClaimForeignOwner
 }
 
 func isBlockNotFound(err error) bool {
@@ -748,9 +753,9 @@ var errBlockClaimUnsettled = errors.New("block delete claim outcome could not be
 // AND ONE OF THEM MUST ALSO LOOK AT THE ANSWER. Releasing is idempotent-ish for a path
 // that only wants the fence gone, but "re-referenced after claim" goes on to SETTLE THE
 // CANDIDATE, and that is only sound if the release actually released this attempt's
-// fence. A not-owner answer there means another lifecycle holds the fence right now, and
-// the candidate is its only recovery route — so that path requires BlockReleaseReleased
-// and otherwise postpones. See blockClaimForeignOwnerError.
+// fence. A not-owner answer there means this attempt no longer owns the fence, and it has
+// no authority to settle the candidate — so that path requires BlockReleaseReleased
+// and otherwise yields a classified foreign-owner result. See blockClaimForeignOwnerError.
 //
 // That used to be an unconditional release, and it had to be: claimID derived from the
 // candidate timestamp, so it was shared by every attempt on one candidate, and worker A
@@ -928,6 +933,14 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		}
 
 		if err := w.processItem(ctx, item); err != nil {
+			// A foreign-owner result is not an item failure and must not be routed through
+			// any queue lifecycle operation. The owner of the current claim will carry the
+			// candidate forward; the stale worker leaves its exact queue row untouched.
+			if shouldLeaveQueueUntouched(err) {
+				log.Printf("[GC Worker] Leaving item %s/%s untouched: this attempt no longer owns the block claim", item.OrgID, item.ItemID)
+				continue
+			}
+
 			log.Printf("[GC Worker] Failed to process item %s/%s (type=%s): %v",
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
@@ -1492,16 +1505,15 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		}
 		// SETTLING IS ONLY SOUND IF THE RELEASE RELEASED *THIS* ATTEMPT'S FENCE.
 		//
-		// Not-owner here means the claim was taken over while this attempt worked and
-		// somebody else holds the fence right now — the late-loser shape the staleness
-		// window makes ordinary, not exotic. The candidate is unchanged, so its CAS would
+		// Not-owner here means this attempt no longer owns the fence — the late-loser shape the
+		// staleness window makes ordinary, not exotic. The candidate is unchanged, so its CAS would
 		// happily apply; that is precisely the trap. Consuming it drops the only work item
 		// that could take the new owner's claim over if that owner dies, which is the same
 		// standing-fence-with-no-recovery state BlockClaimFreshOwner refuses to create at
 		// the claim. Reached from the other side, it needs the same answer.
 		if released != BlockReleaseReleased {
 			metrics.GCBlockDeleteClaimTotal.WithLabelValues("settle_refused_foreign_owner").Inc()
-			log.Printf("[GC Worker] Block %s: re-referenced after claim, but this attempt no longer owns the delete claim; preserving the candidate so the current owner's fence stays recoverable", item.ItemID)
+			log.Printf("[GC Worker] Block %s: re-referenced after claim, but this attempt no longer owns the delete claim; preserving the candidate for the authoritative lifecycle or a later recovery pass", item.ItemID)
 			return blockClaimForeignOwnerError{ItemID: item.ItemID}
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
