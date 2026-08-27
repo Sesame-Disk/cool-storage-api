@@ -447,17 +447,48 @@ func (m *Migrator) preflightDestructive(mf MigrationFile) error {
 		// NumRows, not Scan: the probe deliberately binds no columns, because it
 		// must work for any schema, and Scan with no destinations is a driver error
 		// rather than an empty result.
-		iter := m.session.Query(fmt.Sprintf(`SELECT * FROM %s LIMIT 1`, table)).Iter()
+		//
+		// EACH_QUORUM, NEVER THE SESSION DEFAULT. The session normally runs
+		// LOCAL_QUORUM, and a local quorum is exactly the wrong instrument here: it
+		// can answer "empty" while another datacenter holds rows that simply have
+		// not been read locally, and the migration would then drop live work on the
+		// strength of a local view. EACH_QUORUM obtains a quorum in EVERY
+		// datacenter, so it intersects the quorum that acknowledged a write in
+		// whichever DC accepted it — the same per-DC intersection argument the
+		// destructive GC path rests on (see ValidateDestructiveGCTopology).
+		//
+		// It is deliberately NOT conditional on the replication class. Under a
+		// strategy that gives EACH_QUORUM no per-DC meaning the engine either
+		// resolves it to an ordinary quorum — still strictly stronger than
+		// LOCAL_QUORUM, and sound where there is no second DC to miss — or rejects
+		// it, and a rejection lands in the refusal below. Both outcomes are
+		// fail-closed, so the probe does not have to depend on which one an engine
+		// picks.
+		iter := m.session.Query(fmt.Sprintf(`SELECT * FROM %s LIMIT 1`, table)).
+			Consistency(gocql.EachQuorum).
+			Iter()
 		occupied := iter.NumRows() > 0
 		err := iter.Close()
 		if err != nil {
 			if missingTableError(err) {
 				continue
 			}
+			// A scan that cannot complete is NOT evidence of emptiness, so it
+			// refuses like any other unverified table. Name the tombstone case
+			// explicitly: these are high-churn tables, a drained one can still hold
+			// hundreds of thousands of tombstones, and an operator who reads only
+			// "could not be established" has no way to tell a dead datacenter from
+			// a table that is empty but heavily deleted. TRUNCATE resolves both.
+			hint := ""
+			if tombstoneScanError(err) {
+				hint = " The scan aborted on tombstones, which means this table was used and drained rather " +
+					"than being unreachable: it may well be logically empty. That is still not proof, so it is " +
+					"refused. TRUNCATE the GC tables to clear both rows and tombstones before starting the server."
+			}
 			return fmt.Errorf(
 				"migrator: %s drops %s, and whether that table is empty could not be established: %w — "+
-					"refusing to run a destructive migration on an unverified table",
-				mf.label(), table, err)
+					"refusing to run a destructive migration on an unverified table%s",
+				mf.label(), table, err, hint)
 		}
 		if occupied {
 			return fmt.Errorf(
@@ -490,4 +521,15 @@ func PreflightDestructiveForTest(session *gocql.Session, migrationCQL string) er
 		Content:    migrationCQL,
 		Statements: parseCQLStatements(migrationCQL),
 	})
+}
+
+// tombstoneScanError reports whether a read aborted because it walked too many
+// tombstones. The driver surfaces this as a plain read failure, so the wording is
+// what distinguishes it.
+func tombstoneScanError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "tombstone")
 }

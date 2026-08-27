@@ -42,6 +42,7 @@ STORE=internal/gc/store_cassandra.go
 WORKER=internal/gc/worker.go
 MOCK=internal/gc/store_mock.go
 MIGRATION=internal/db/migrations/018_gc_exact_p_candidate_identity.cql
+MIGRATOR=internal/db/migrator.go
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -184,6 +185,12 @@ m_queue_complete_drops_p() {
 # see: dropping P from a key changes no runtime CQL, so every source guard and
 # every mutation above stays green while a freshly migrated keyspace collapses P1
 # and P2 back into one row. These two prove the schema guard is load-bearing.
+m_preflight_probe_reads_locally() {
+  mutate "$MIGRATOR" 's{Consistency\(gocql\.EachQuorum\)\.(\s+)Iter\(\)}{Iter()}'
+  expect_red 'TestPreflightProbeReadsAtEachQuorum' 'does not pin Consistency'     'destructive preflight probes at the session default (a local quorum calls a table empty while another DC holds its rows, and the migration drops them)'
+  restore
+}
+
 m_migration_queue_key_drops_p() {
   mutate "$MIGRATION" 's{PRIMARY KEY \(\(org_id, bucket\), queued_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at\)}{PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id, identity_at)}'
   expect_red 'TestR26MigrationDeclaresTheExactIdentityKeys' 'must END with'     'migration drops P from the gc_queue key (two lives of one block share a queue row again)'
@@ -356,6 +363,7 @@ MUTATIONS=(
   m_dlq_selector_drops_identity_at
   m_queue_complete_drops_p
   m_enqueue_item_mints_block_candidate
+  m_preflight_probe_reads_locally
   m_migration_queue_key_drops_p
   m_migration_candidate_key_adds_candidate_at
   m_stale_discovery_failure_burns_a_retry

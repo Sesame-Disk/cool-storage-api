@@ -197,3 +197,41 @@ func functionBodyForTest(source, signature string) (string, bool) {
 	}
 	return rest[:end], true
 }
+
+// TestPreflightProbeReadsAtEachQuorum pins the consistency level of the emptiness
+// probe, which is the one property of this barrier that behaves correctly in a
+// single-datacenter test and silently wrongly in production.
+//
+// The session runs LOCAL_QUORUM. A local quorum can answer "this table is empty"
+// while another datacenter holds rows that simply have not been read locally — and
+// the migration would then drop live queue, pending and DLQ state on the strength
+// of a local view. EACH_QUORUM obtains a quorum in EVERY datacenter, so it
+// intersects the quorum that acknowledged the write in whichever DC accepted it.
+//
+// Every test in this repo runs against one datacenter, where EACH_QUORUM and
+// LOCAL_QUORUM name the same quorum. So no behavioural test — here or in the
+// integration suite — can tell the two apart, and a downgrade would stay green
+// everywhere while removing the entire cross-DC guarantee. That is what makes a
+// source assertion the right instrument rather than a lazy one.
+func TestPreflightProbeReadsAtEachQuorum(t *testing.T) {
+	source := migratorSourceForTest(t)
+	body, ok := functionBodyForTest(source, "func (m *Migrator) preflightDestructive(mf MigrationFile) error {")
+	if !ok {
+		t.Fatal("preflightDestructive not found; the probe's consistency level cannot be verified")
+	}
+	if !strings.Contains(body, "SELECT * FROM %s LIMIT 1") {
+		t.Fatal("preflightDestructive no longer issues the emptiness probe; this guard is now vacuous")
+	}
+	if !strings.Contains(body, "Consistency(gocql.EachQuorum)") {
+		t.Error("PREFLIGHT REGRESSION: the emptiness probe does not pin Consistency(gocql.EachQuorum).\n" +
+			"Falling back to the session default (LOCAL_QUORUM) lets the probe call a table empty while " +
+			"another datacenter still holds rows, and the migration then drops them. Every test here runs " +
+			"single-DC, so nothing else can catch this.")
+	}
+	for _, weaker := range []string{"gocql.LocalQuorum", "gocql.LocalOne", "gocql.One", "gocql.Any"} {
+		if strings.Contains(body, weaker) {
+			t.Errorf("PREFLIGHT REGRESSION: the emptiness probe uses %s; a destructive migration may not "+
+				"be authorized by a read weaker than EACH_QUORUM", weaker)
+		}
+	}
+}

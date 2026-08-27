@@ -73,7 +73,12 @@ extra `SERIAL` read only moves the TOCTOU; the fix is structural.
 **Migration 018 is destructive, and the contract is now ENFORCED.** It drops the tables it
 recreates, which is correct only for this release's contract: a clean keyspace, migrated
 before any node produces GC work. `Migrator.preflightDestructive` refuses any
-table-dropping migration whose targets still hold rows, so running this against a keyspace
+table-dropping migration whose targets still hold rows. The emptiness probe reads at
+EACH_QUORUM, never the session default: a LOCAL_QUORUM read can call a table empty
+while another datacenter holds rows, and the migration would then drop live work on
+the strength of a local view. A scan that cannot complete — including one that aborts
+on tombstones, which these high-churn tables accumulate even when logically empty — is
+not evidence of emptiness either, so it refuses and says which case it hit, so running this against a keyspace
 with existing GC work fails at startup with the table named rather than erasing queue,
 pending and DLQ state — including the non-block item types unrelated to this change. The
 check is generic, so the next destructive migration inherits the barrier.
