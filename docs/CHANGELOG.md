@@ -92,6 +92,21 @@ down. It is now `requireIdentityAt`, which fails closed; a block identity carryi
 than an unrelated timestamp. The DLQ expiry projection no longer falls back to `failed_at`
 either.
 
+**The DLQ expiry bucket is now a property of the instant, not of who holds it.**
+`gc_failed_items_by_expiry` is the only GC discovery bucket whose input includes
+timestamps — every other one hashes ids and tokens, which survive a round-trip
+unchanged — and it is also the only durable GC surface whose partition key is
+recomputed in Go rather than read back. The write side hashed a value that had never
+been to Cassandra (`FailItem` takes the worker's clock, which is `time.Now` and carries
+nanoseconds) while every delete hashed the same instant after it had come back as a
+TIMESTAMP, holding milliseconds. The two disagreed, so the DELETE named a different
+partition than the INSERT: Cassandra reported success, the row stayed where it was, and
+the sweep that walks every bucket rediscovered it forever — with its canonical DLQ row
+already gone, so the orphan branch ran and recomputed the same unreachable bucket. The
+bucket now hashes the durable form of both timestamps. Reproduced against real Cassandra
+before the fix, in a test that deliberately does not truncate its fixture: every existing
+one did, which is exactly the input that hid this.
+
 Migration `018` itself is pre-production scaffolding: it drops and recreates the six GC
 tables against dev/staging keyspaces that are rebuilt at will, and the whole migration set
 folds into the initial schema for a clean production deploy once X1 closes. No upgrade
@@ -137,7 +152,7 @@ barrier is built for it, deliberately — there is no upgrade path to protect.
   `TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey` asserts the matching
   absence — `candidate_at` must stay a mutable value or every re-decision becomes
   another row.
-- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **34 mutations**, each
+- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **35 mutations**, each
   removing one invariant and each required to go red with the matching assertion. Eleven
   are new, including two that edit the MIGRATION itself and one that unpins the candidate
   authority read's consistency level. Three pieces of existing evidence had

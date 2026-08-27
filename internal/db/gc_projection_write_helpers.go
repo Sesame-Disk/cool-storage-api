@@ -141,16 +141,40 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 // TestR22aDiscoveryWriterSurface fails if a second writer or helper caller
 // reappears.
 
+// cassandraTimestamp collapses an instant to the precision a Cassandra TIMESTAMP
+// actually stores: milliseconds since the epoch, in UTC.
+//
+// It exists for hashing. A value bound to a timestamp COLUMN needs no help — the
+// engine truncates it on the way in and every later comparison sees the truncated
+// value — but a value hashed in Go does, because the hash is computed from the
+// caller's representation and nothing normalizes it.
+func cassandraTimestamp(ts time.Time) time.Time {
+	return time.UnixMilli(ts.UnixMilli()).UTC()
+}
+
 // GCFailedItemExpiryBucket is the ONE definition of the expiry projection's
 // bucket. Both halves of the key — the columns and this hash — must be derived
 // identically by every writer, so the formula is named and exported rather than
 // re-spelled at each call site.
+//
+// IT HASHES THE DURABLE FORM OF EACH TIMESTAMP, NOT THE CALLER'S. This is the only
+// GC discovery bucket whose input includes timestamps; every other one hashes ids
+// and tokens, which survive a round-trip unchanged. Here the write side hashes a
+// value that has never been to Cassandra — FailItem takes the worker's clock, which
+// is time.Now and carries nanoseconds — while every delete hashes the same instant
+// after it has come back as a TIMESTAMP, holding milliseconds. Hashing the raw
+// values made those two disagree, so the DELETE named a different partition than
+// the INSERT: Cassandra reported success, the row stayed where it was, and the
+// sweep that walks every bucket rediscovered it forever. Its canonical DLQ row was
+// gone by then, so the orphan branch ran and recomputed the same unreachable
+// bucket. Normalizing first makes the bucket a property of the instant rather than
+// of who is holding it.
 func GCFailedItemExpiryBucket(orgID string, failedAt time.Time, itemType, itemID, candidateStorageClass, candidateStorageKey string, identityAt time.Time) int {
 	return GCDiscoveryBucket(
 		orgID, itemType, itemID,
-		failedAt.UTC().Format(time.RFC3339Nano),
+		cassandraTimestamp(failedAt).Format(time.RFC3339Nano),
 		candidateStorageClass, candidateStorageKey,
-		identityAt.UTC().Format(time.RFC3339Nano),
+		cassandraTimestamp(identityAt).Format(time.RFC3339Nano),
 	)
 }
 

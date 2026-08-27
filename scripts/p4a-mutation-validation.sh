@@ -41,6 +41,7 @@ cd "$(dirname "$0")/.."
 STORE=internal/gc/store_cassandra.go
 WORKER=internal/gc/worker.go
 MOCK=internal/gc/store_mock.go
+PROJECTIONS=internal/db/gc_projection_write_helpers.go
 MIGRATION=internal/db/migrations/018_gc_exact_p_candidate_identity.cql
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -350,6 +351,13 @@ m_candidate_authority_read_is_ordinary() {
   restore
 }
 
+m_expiry_bucket_hashes_raw_timestamps() {
+  mutate "$PROJECTIONS" 's{cassandraTimestamp\((failedAt|identityAt)\)\.Format}{$1.UTC().Format}g'
+  expect_red 'TestGCFailedItemExpiryBucketIsStableAcrossCassandraPrecision' 'once Cassandra has truncated it' \
+    'expiry bucket hashed at the caller precision (the INSERT lands in one partition and every DELETE names another, so the expiry row outlives its own deletion)'
+  restore
+}
+
 MUTATIONS=(
   m_claim_drops_storage_key
   m_claim_drops_storage_class
@@ -369,6 +377,7 @@ MUTATIONS=(
   m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
   m_candidate_authority_read_is_ordinary
+  m_expiry_bucket_hashes_raw_timestamps
   m_candidate_drops_storage_key
   m_claim_id_from_candidate_at
   m_fresh_owner_completes_candidate
