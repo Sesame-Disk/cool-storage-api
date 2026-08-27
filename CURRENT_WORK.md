@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-27
-**Session**: X1/P4a exact-`P`, per-attempt claim authority — R14a and R16 GREEN, R20 partial (claim path only); R14b claim->orphan binding, strict A+ non-overlap and R18/R27 remain open
+**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 publication is implemented with unit/mutation coverage, while full R14b claim->orphan binding, strict A+ non-overlap and R18/R27 remain open
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -85,11 +85,12 @@ matched literal `\n\t\t` against a CRLF working tree, so it silently applied NOT
 aborted the run before the remaining mutations were reached. Fixed to whitespace runs, per
 the rule the script's own header states.
 
-P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. **Explicitly still open:**
-`StartBlockDeleteOrphan` and `FinalizeBlockDelete` failures keep the fence and return
-retryable errors without consulting ownership, so a late loser reaching them can still
-spend budget — that is the orphan-publication half (R14b/P4b), not a queue-policy
-question, and it is deliberately not patched here. `GC_ENABLED=false` remains required.
+P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. P4b-1 now classifies
+`StartBlockDeleteOrphan` outcomes, settles uncertain publication in the serial domain and
+keeps ambiguous, invalid and projection-unconfirmed states fail-closed. **Explicitly still
+open:** claim authority is not yet carried into orphan publication, and `FinalizeBlockDelete`
+remains outside that binding. Those are the orphan-publication follow-ups (R14b/P4b), not a
+queue-policy question. `GC_ENABLED=false` remains required.
 
 **Queue lifecycle review update (2026-08-27):** The attempted generic LWT hardening of
 `RequeueItem` is withdrawn from this branch. `CompleteItem`, `FailItem` and `RequeueItem`
@@ -105,6 +106,17 @@ candidate and retry count remain unchanged. The five P4a ownership/unwind fixes 
 active, including the owned path's normal retry/DLQ behavior. `GC_ENABLED=false` remains
 required while the follow-up chooses one authority for `Requeue`/`Complete`/`Fail`, DLQ and
 pending state.
+
+**P4b-1 update (2026-08-27):** `StartBlockDeleteOrphan` now publishes the canonical row
+with a write-once `EachQuorum + Serial` LWT and no driver retry/speculation. Its result is
+classified as `Created`, `SameTarget`, `DifferentTarget`, `NotPublished`, `Ambiguous`,
+`Invalid` or `ProjectionUnconfirmed`; same-target resumes use the stored `first_seen_at`
+and repair the identity-only discovery projection. The worker only releases/postpones a
+confirmed conflict or absent settled row; uncertain, malformed or unconfirmed projection
+states retain claim, candidate and queue lifecycle. Unit coverage and four deliberate
+mutations are green/red as required, and real-Cassandra evidence is gated by
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. This is P4b-1 only: the remaining R14b work must carry
+the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)
 

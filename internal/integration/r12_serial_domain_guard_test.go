@@ -170,7 +170,6 @@ var r12ExpectedSerialOperations = map[string]string{
 	"(*CassandraStore).advanceBlockGCCandidateAt|gc_block_candidates|UPDATE":   "candidate grace advance",
 	"(*CassandraStore).DeleteBlockGCCandidate|gc_block_candidates|DELETE":      "tuple-bound candidate cleanup",
 	"(*CassandraStore).StartBlockDeleteOrphan|gc_s3_orphans|INSERT":            "orphan creation",
-	"(*CassandraStore).StartBlockDeleteOrphan|gc_s3_orphans|UPDATE":            "orphan lifecycle reset",
 	"(*CassandraStore).MarkS3OrphanMappingCleanupPending|gc_s3_orphans|UPDATE": "orphan mapping phase",
 	"(*CassandraStore).UpdateS3OrphanAttempt|gc_s3_orphans|UPDATE":             "orphan attempt update",
 	"(*CassandraStore).ClaimBlockDelete|blocks|UPDATE":                         "GC claim",

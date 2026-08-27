@@ -225,6 +225,27 @@ func (e blockClaimReleaseUnconfirmedError) FailureCode() string {
 	return GCFailureCodeBlockClaimReleaseUnconfirmed
 }
 
+// blockOrphanPublicationError is returned for publication outcomes whose queue
+// policy is not the generic retry path. In particular, an unsettled publication
+// may already have created the recovery fence, so neither the claim nor the
+// candidate may be released or consumed by this attempt.
+type blockOrphanPublicationError struct {
+	ItemID string
+	Code   string
+	Err    error
+}
+
+func (e blockOrphanPublicationError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("block %s: orphan publication outcome is %s", e.ItemID, e.Code)
+	}
+	return fmt.Sprintf("block %s: orphan publication outcome is %s: %v", e.ItemID, e.Code, e.Err)
+}
+
+func (e blockOrphanPublicationError) Unwrap() error { return e.Err }
+
+func (e blockOrphanPublicationError) FailureCode() string { return e.Code }
+
 // isClusterUnavailableError reports whether an error means "the cluster could not
 // serve this right now" rather than anything about the item.
 //
@@ -558,7 +579,9 @@ func shouldPostponeWithoutRetry(err error) bool {
 		// back from there and the candidate it insists on preserving would be unreachable.
 		GCFailureCodeBlockAuthorityInvalid,
 		GCFailureCodeBlockCandidateWithinGrace,
-		GCFailureCodeBlockCanonicalReadUnreliable:
+		GCFailureCodeBlockCanonicalReadUnreliable,
+		GCFailureCodeBlockOrphanConflict,
+		GCFailureCodeBlockOrphanNotPublished:
 		return true
 	default:
 		return false
@@ -569,7 +592,15 @@ func shouldPostponeWithoutRetry(err error) bool {
 // It is intentionally separate from shouldPostponeWithoutRetry: postponing calls
 // RequeueItem, while a stale worker must not participate in any queue lifecycle decision.
 func shouldLeaveQueueUntouched(err error) bool {
-	return failureCodeForError(err) == GCFailureCodeBlockClaimForeignOwner
+	switch failureCodeForError(err) {
+	case GCFailureCodeBlockClaimForeignOwner,
+		GCFailureCodeBlockOrphanUnsettled,
+		GCFailureCodeBlockOrphanProjectionUnconfirmed,
+		GCFailureCodeBlockAuthorityInvalid:
+		return true
+	default:
+		return false
+	}
 }
 
 func isBlockNotFound(err error) bool {
@@ -1654,9 +1685,30 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
 	}
 
-	orphanFirstSeenAt, err := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, storageKey, blockInfo.Sha1, w.clock().UTC())
-	if err != nil {
-		return w.failClosedIfUnavailable("failed to record pending S3 delete", item.ItemID, err)
+	publication := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, storageKey, blockInfo.Sha1, w.clock().UTC())
+	var orphanFirstSeenAt time.Time
+	switch publication.Outcome {
+	case StartBlockDeleteOrphanCreated, StartBlockDeleteOrphanSameTarget:
+		// SameTarget carries the canonical lifecycle's token. The store only returns
+		// these outcomes after the identity-only discovery projection was acknowledged.
+		if publication.FirstSeenAt.IsZero() {
+			return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: errors.New("orphan publication returned no first_seen_at")}
+		}
+		orphanFirstSeenAt = publication.FirstSeenAt
+	case StartBlockDeleteOrphanDifferentTarget:
+		return w.releaseOrphanClaimAndPostpone(item, attempt, GCFailureCodeBlockOrphanConflict, publication.Cause)
+	case StartBlockDeleteOrphanNotPublished:
+		return w.releaseOrphanClaimAndPostpone(item, attempt, GCFailureCodeBlockOrphanNotPublished, publication.Cause)
+	case StartBlockDeleteOrphanAmbiguous:
+		w.recordDestructiveBlocked(destructivePathOrphan)
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: publication.Cause}
+	case StartBlockDeleteOrphanProjectionUnconfirmed:
+		w.recordDestructiveBlocked(destructivePathOrphan)
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanProjectionUnconfirmed, Err: publication.Cause}
+	case StartBlockDeleteOrphanInvalid:
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockAuthorityInvalid, Err: publication.Cause}
+	default:
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: fmt.Errorf("unhandled orphan publication outcome %s", publication.Outcome)}
 	}
 
 	// 4. Now remove the claimed DB row. If this fails, the row stays claimed and
@@ -1737,6 +1789,25 @@ func (w *Worker) releaseAndPostponeUnreliableRead(item QueueItem, attempt BlockD
 	}
 	log.Printf("[GC Worker] Block %s: %s after the claim CAS proved its target in the serial domain; handed the fence back and postponing rather than acting without a reliable read", item.ItemID, reason)
 	return blockCanonicalReadUnreliableError{ItemID: item.ItemID, Reason: reason}
+}
+
+// releaseOrphanClaimAndPostpone releases this attempt's claim only when the
+// exact authority still owns it. A confirmed orphan conflict or absent settled
+// publication is not a retryable item failure; it is a safe unwind. If the
+// release says NotOwner, preserve the queue exactly as required for a late loser.
+func (w *Worker) releaseOrphanClaimAndPostpone(item QueueItem, attempt BlockDeleteAuthority, code string, cause error) error {
+	if cause == nil {
+		cause = errors.New(code)
+	}
+	original := blockOrphanPublicationError{ItemID: item.ItemID, Code: code, Err: cause}
+	released, err := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+	if err != nil {
+		return err
+	}
+	if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, original); foreign != nil {
+		return foreign
+	}
+	return original
 }
 
 // settleBlockCandidate consumes the candidate this walk was authorized by, and only

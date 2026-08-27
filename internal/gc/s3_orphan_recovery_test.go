@@ -193,7 +193,8 @@ func TestWorker_RecoverS3Orphans_NonCanonicalStorageClassFailsClosed(t *testing.
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-padded-class", " hot ", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-padded-class", "hot", "", "earlier failure", time.Now())
+	store.SetS3OrphanStorageClassForTest(orgID, "orph-padded-class", " hot ")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -609,7 +610,8 @@ func TestWorker_RecoverS3Orphans_EmptyStorageClassFailsClosed(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-empty-class", "", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-empty-class", "hot", "", "earlier failure", time.Now())
+	store.SetS3OrphanStorageClassForTest(orgID, "orph-empty-class", "")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -728,7 +730,7 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	}
 }
 
-func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *testing.T) {
+func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -748,8 +750,9 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if err != nil || claim.Outcome != BlockClaimAcquired {
 		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC()); err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC())
+	if result.Outcome != StartBlockDeleteOrphanSameTarget {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v", result.Outcome, result.Cause)
 	}
 	if err := store.FinalizeBlockDelete(orgID, blockID, authority); err != nil {
 		t.Fatalf("FinalizeBlockDelete: %v", err)
@@ -769,8 +772,8 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
-		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
+	if len(deleted) != 0 {
+		t.Fatalf("same-target resume must preserve the completed S3 phase, got deletes %v", deleted)
 	}
 }
 

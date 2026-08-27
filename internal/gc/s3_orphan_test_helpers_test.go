@@ -13,10 +13,11 @@ import (
 func seedS3Orphan(t *testing.T, store GCStore, orgID uuid.UUID, blockID, storageClass, externalSHA1, errMsg string, firstSeenAt time.Time) time.Time {
 	t.Helper()
 	firstSeenAt = firstSeenAt.UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, MockCanonicalStorageKey(orgID.String(), blockID), externalSHA1, firstSeenAt)
-	if err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, MockCanonicalStorageKey(orgID.String(), blockID), externalSHA1, firstSeenAt)
+	if result.Outcome != StartBlockDeleteOrphanCreated && result.Outcome != StartBlockDeleteOrphanSameTarget {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v", result.Outcome, result.Cause)
 	}
+	effectiveFirstSeenAt := result.FirstSeenAt
 	if errMsg != "" {
 		if err := store.UpdateS3OrphanAttempt(orgID, blockID, effectiveFirstSeenAt, errMsg, firstSeenAt); err != nil {
 			t.Fatalf("UpdateS3OrphanAttempt: %v", err)

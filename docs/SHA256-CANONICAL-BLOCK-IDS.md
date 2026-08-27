@@ -454,14 +454,13 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       orphan row. Pinned by
       `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock` and
       `TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists`.
-   - **Stale-phase reset on a new delete.** A NEW block delete writes its recovery row via
-     `StartBlockDeleteOrphan`, which always resets the phase to `pending_s3` (and `retry_count`,
-     `last_error`) — even if a stale row from an older delete of the same `block_id` was left at
-     `pending_mapping_cleanup`. Otherwise recovery would inherit the stale phase and SKIP the
-     physical S3 delete for the new lifecycle, leaking the new object. `first_seen_at` is preserved
-     so the discovery projection stays a single in-place row; the reset is fail-closed (`IF EXISTS`).
-     Pinned by `TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup` and
-     `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
+   - **Write-once orphan publication.** A block delete writes its recovery row via
+      `StartBlockDeleteOrphan` with `INSERT ... IF NOT EXISTS`. A same-target retry preserves
+      the canonical row's `first_seen_at` and recovery state while repairing its discovery
+      projection; a different target is reported as a conflict without overwriting the older
+      lifecycle. An uncertain result is settled in the serial domain, and an unsettled result
+      remains fail-closed. Pinned by the P4b publication unit and real-Cassandra evidence
+      tests.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** The canonical block lookup hits a
 full partition key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone

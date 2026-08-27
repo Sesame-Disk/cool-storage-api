@@ -81,6 +81,21 @@ const (
 	// out of a comparison — a counter that has never fired is simply absent, and
 	// `increase(...) > 0` reads absence as "did not happen", which is true.
 	GCFailureCodeBlockClaimReleaseUnconfirmed = "block_claim_release_unconfirmed"
+	// GCFailureCodeBlockOrphanConflict marks a confirmed competing orphan lifecycle.
+	// The current attempt may release its own claim and postpone without spending a
+	// retry, but it must not consume its candidate.
+	GCFailureCodeBlockOrphanConflict = "block_orphan_conflict"
+	// GCFailureCodeBlockOrphanNotPublished marks a serially settled absent orphan.
+	// The claim can be released, but no finalize or queue completion is allowed.
+	GCFailureCodeBlockOrphanNotPublished = "block_orphan_not_published"
+	// GCFailureCodeBlockOrphanUnsettled marks a publication whose canonical outcome
+	// could not be established. The claim and candidate stay in place and the queue
+	// row must remain untouched.
+	GCFailureCodeBlockOrphanUnsettled = "block_orphan_unsettled"
+	// GCFailureCodeBlockOrphanProjectionUnconfirmed marks a durable canonical orphan
+	// whose discovery projection was not acknowledged. The worker must not finalize
+	// the block while recovery discovery is unconfirmed.
+	GCFailureCodeBlockOrphanProjectionUnconfirmed = "block_orphan_projection_unconfirmed"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -280,11 +295,10 @@ type GCStore interface {
 	BlockReferenceExists(orgID uuid.UUID, blockID, referrer string) (bool, error)
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
-	// StartBlockDeleteOrphan records the durable recovery row for a NEW block
-	// deletion. It always resets recovery state to pending_s3 so a stale
-	// pending_mapping_cleanup row from an older delete cannot make recovery skip
-	// the physical object delete for this new lifecycle.
-	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error)
+	// StartBlockDeleteOrphan records the durable recovery row for a block deletion
+	// without overwriting an existing lifecycle. Callers must branch on the returned
+	// outcome rather than treating every non-created result as completion.
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult
 	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
 	// destructive recovery path. It supplies recovery state and the physical
 	// backend selector; it is not a Paxos settlement read and does not authorize
@@ -759,6 +773,65 @@ type S3OrphanInfo struct {
 	LastAttemptAt time.Time
 	RetryCount    int
 	LastError     string
+}
+
+// StartBlockDeleteOrphanOutcome classifies the result of the single-use orphan
+// publication. Outcome, not Cause, is the authority contract for the worker.
+type StartBlockDeleteOrphanOutcome int
+
+const (
+	// StartBlockDeleteOrphanAmbiguous means neither the LWT nor its serial
+	// settlement established whether the orphan was published.
+	StartBlockDeleteOrphanAmbiguous StartBlockDeleteOrphanOutcome = iota
+	// StartBlockDeleteOrphanCreated means the proposed physical identity was
+	// inserted and its discovery projection was acknowledged.
+	StartBlockDeleteOrphanCreated
+	// StartBlockDeleteOrphanSameTarget means an existing orphan carries the exact
+	// proposed physical identity. Its lifecycle state was not changed.
+	StartBlockDeleteOrphanSameTarget
+	// StartBlockDeleteOrphanDifferentTarget means an existing orphan carries a
+	// different physical identity. The existing lifecycle was not changed.
+	StartBlockDeleteOrphanDifferentTarget
+	// StartBlockDeleteOrphanNotPublished means serial settlement found no row.
+	StartBlockDeleteOrphanNotPublished
+	// StartBlockDeleteOrphanInvalid means the proposed input is invalid.
+	StartBlockDeleteOrphanInvalid
+	// StartBlockDeleteOrphanProjectionUnconfirmed means the canonical orphan is
+	// known, but its discovery projection was not durably acknowledged.
+	StartBlockDeleteOrphanProjectionUnconfirmed
+)
+
+func (o StartBlockDeleteOrphanOutcome) String() string {
+	switch o {
+	case StartBlockDeleteOrphanAmbiguous:
+		return "ambiguous"
+	case StartBlockDeleteOrphanCreated:
+		return "created"
+	case StartBlockDeleteOrphanSameTarget:
+		return "same_target"
+	case StartBlockDeleteOrphanDifferentTarget:
+		return "different_target"
+	case StartBlockDeleteOrphanNotPublished:
+		return "not_published"
+	case StartBlockDeleteOrphanInvalid:
+		return "invalid"
+	case StartBlockDeleteOrphanProjectionUnconfirmed:
+		return "projection_unconfirmed"
+	default:
+		return "unknown"
+	}
+}
+
+// StartBlockDeleteOrphanResult is the complete publication result. FirstSeenAt
+// is always the canonical lifecycle token when a row was found; it must be used
+// for projection repair instead of the proposed timestamp. Cause is diagnostic
+// only and never grants permission to finalize or delete.
+type StartBlockDeleteOrphanResult struct {
+	Outcome        StartBlockDeleteOrphanOutcome
+	FirstSeenAt    time.Time
+	ExistingTarget BlockDeleteTarget
+	Submitted      bool
+	Cause          error
 }
 
 const (

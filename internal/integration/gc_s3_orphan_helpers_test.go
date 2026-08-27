@@ -20,10 +20,11 @@ func seedS3Orphan(t *testing.T, store gcpkg.GCStore, orgID uuid.UUID, blockID, s
 func seedS3OrphanWithStorageKey(t *testing.T, store gcpkg.GCStore, orgID uuid.UUID, blockID, storageKey, storageClass, externalSHA1, errMsg string, firstSeenAt time.Time) time.Time {
 	t.Helper()
 	firstSeenAt = firstSeenAt.UTC().Truncate(time.Millisecond)
-	effectiveFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, storageKey, externalSHA1, firstSeenAt)
-	if err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, storageClass, storageKey, externalSHA1, firstSeenAt)
+	if result.Outcome != gcpkg.StartBlockDeleteOrphanCreated && result.Outcome != gcpkg.StartBlockDeleteOrphanSameTarget {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v", result.Outcome, result.Cause)
 	}
+	effectiveFirstSeenAt := result.FirstSeenAt
 	if errMsg != "" {
 		if err := store.UpdateS3OrphanAttempt(orgID, blockID, effectiveFirstSeenAt, errMsg, firstSeenAt); err != nil {
 			t.Fatalf("UpdateS3OrphanAttempt: %v", err)

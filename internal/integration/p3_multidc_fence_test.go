@@ -188,8 +188,11 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 
 	// The orphan: the fence that gates a rowless mint, so a publication invisible to
 	// dc-na is what lets a second physical life be born while the first retires.
-	_, orphanErr := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC())
-	p3RequireUnavailableAtEachQuorum(t, "StartBlockDeleteOrphan", orphanErr)
+	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC())
+	if orphanResult.Outcome != gcpkg.StartBlockDeleteOrphanNotPublished {
+		t.Errorf("P3 REGRESSION: StartBlockDeleteOrphan outcome=%s, want not_published after serial settlement confirms absence (cause=%v)", orphanResult.Outcome, orphanResult.Cause)
+	}
+	p3RequireUnavailableAtEachQuorum(t, "StartBlockDeleteOrphan", orphanResult.Cause)
 
 	// Refused is not the same as "left no trace". Check both datacenters that WERE
 	// reachable, because those are the ones a partially applied publication would
@@ -252,8 +255,9 @@ func TestP3_WriterInAnotherDatacenterObservesTheFence(t *testing.T) {
 	if err != nil || outcome2Res.Outcome != gcpkg.BlockClaimAcquired {
 		t.Fatalf("claim P1 from dc-eu = %s, %v; want acquired", outcome2Res.Outcome, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC()); err != nil {
-		t.Fatalf("publish orphan fence from dc-eu: %v", err)
+	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC())
+	if orphanResult.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
+		t.Fatalf("publish orphan fence from dc-eu: outcome=%s cause=%v", orphanResult.Outcome, orphanResult.Cause)
 	}
 	if err := store.FinalizeBlockDelete(orgUUID, blockID, authority); err != nil {
 		t.Fatalf("finalize P1 from dc-eu: %v", err)

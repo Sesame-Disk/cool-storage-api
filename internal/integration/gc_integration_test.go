@@ -2318,7 +2318,7 @@ func TestGC_StartBlockDeleteOrphan_RepairsDiscoveryRowWhenCanonicalExists(t *tes
 		t.Fatal("expected S3 orphan projection row to be deleted before repair")
 	}
 
-	repairedFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "cold", "", "", time.Now().UTC())
+	repairedFirstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "", "", time.Now().UTC())
 	if !repairedFirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("repaired first_seen_at = %v, want original %v", repairedFirstSeenAt, firstSeenAt)
 	}
@@ -2352,7 +2352,7 @@ func TestGC_DeleteS3Orphan_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
 	}
 }
 
-func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
+func TestGC_StartBlockDeleteOrphan_DifferentTargetPreservesCurrentLifecycleState(t *testing.T) {
 	requireCassandra(t)
 
 	database := shareProjectionDBForTest(t)
@@ -2361,9 +2361,8 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	blockID := fmt.Sprintf("orph-reset-%d", time.Now().UnixNano())
 	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	// Seed a locator from a previous lifecycle so the reset below has something
-	// to overwrite. Without a differing value the storage_key assertion would
-	// pass whether or not the UPDATE carries the column at all.
+	// Seed a locator from a previous lifecycle so the new publication has a
+	// competing identity to classify. The existing row must remain untouched.
 	staleStorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-stale")
 	effectiveFirstSeenAt := seedS3OrphanWithStorageKey(t, store, orgID, blockID, staleStorageKey, "cold", "sha1-old", "seed", firstSeenAt)
 	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
@@ -2379,12 +2378,12 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	})
 
 	wantStorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)
-	resetFirstSeenAt, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", wantStorageKey, "sha1-new", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", wantStorageKey, "sha1-new", time.Now().UTC())
+	if result.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v, want different_target", result.Outcome, result.Cause)
 	}
-	if !resetFirstSeenAt.Equal(firstSeenAt) {
-		t.Fatalf("reset first_seen_at = %v, want original %v", resetFirstSeenAt, firstSeenAt)
+	if !result.FirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("existing first_seen_at = %v, want original %v", result.FirstSeenAt, firstSeenAt)
 	}
 
 	var storageClass, storageKey, externalSHA1, recoveryPhase string
@@ -2396,19 +2395,17 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	`, orgID.String(), blockID).Scan(&storageClass, &storageKey, &externalSHA1, &recoveryPhase, &storedFirstSeenAt); err != nil {
 		t.Fatalf("read gc_s3_orphans: %v", err)
 	}
-	// The locator is what recovery hands to S3, so a reset that left the previous
-	// lifecycle's key in place would aim the next delete at a stale object.
-	if storageKey != wantStorageKey {
-		t.Fatalf("gc_s3_orphans.storage_key = %q, want %q (stale was %q)", storageKey, wantStorageKey, staleStorageKey)
+	if storageKey != staleStorageKey {
+		t.Fatalf("gc_s3_orphans.storage_key = %q, want unchanged stale key %q", storageKey, staleStorageKey)
 	}
-	if storageClass != "hot" {
-		t.Fatalf("gc_s3_orphans.storage_class = %q, want %q", storageClass, "hot")
+	if storageClass != "cold" {
+		t.Fatalf("gc_s3_orphans.storage_class = %q, want unchanged %q", storageClass, "cold")
 	}
-	if externalSHA1 != "sha1-new" {
-		t.Fatalf("gc_s3_orphans.external_sha1 = %q, want %q", externalSHA1, "sha1-new")
+	if externalSHA1 != "sha1-old" {
+		t.Fatalf("gc_s3_orphans.external_sha1 = %q, want unchanged %q", externalSHA1, "sha1-old")
 	}
-	if recoveryPhase != gcpkg.S3OrphanPhasePendingS3 {
-		t.Fatalf("gc_s3_orphans.recovery_phase = %q, want %q", recoveryPhase, gcpkg.S3OrphanPhasePendingS3)
+	if recoveryPhase != gcpkg.S3OrphanPhasePendingMappingCleanup {
+		t.Fatalf("gc_s3_orphans.recovery_phase = %q, want unchanged %q", recoveryPhase, gcpkg.S3OrphanPhasePendingMappingCleanup)
 	}
 	if !storedFirstSeenAt.UTC().Equal(firstSeenAt.UTC()) {
 		t.Fatalf("gc_s3_orphans.first_seen_at = %v, want %v", storedFirstSeenAt.UTC(), firstSeenAt.UTC())
@@ -2418,8 +2415,8 @@ func TestGC_StartBlockDeleteOrphan_ResetsCurrentLifecycleState(t *testing.T) {
 	// recovery_phase columns were dropped by migration 014 (R22b); selecting them
 	// here would now be rejected by Cassandra, and the property they used to assert
 	// — that the projection mirrors canonical payload — is deliberately gone. What
-	// must still hold is that the lifecycle reset republished the discovery row
-	// under the preserved first_seen_at.
+	// must still hold is that the competing publication leaves the existing
+	// discovery row under the preserved first_seen_at.
 	var projFirstSeenAt time.Time
 	if err := database.Session().Query(`
 		SELECT first_seen_at

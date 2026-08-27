@@ -8,6 +8,26 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4b-1: write-once orphan publication and classified outcomes
+
+Implemented the P4b-1 publication boundary without claiming full P4b/R14b closure.
+
+- `StartBlockDeleteOrphan` now uses a single-use `INSERT ... IF NOT EXISTS` at
+  `EachQuorum`/`Serial`, disables driver retries and speculative execution, and settles
+  uncertain results through a SERIAL canonical read.
+- Existing rows are classified by exact `(storage_class, storage_key)` identity. A
+  same-target result reuses the stored `first_seen_at` and repairs the identity-only
+  discovery projection; a different target is never overwritten.
+- The worker releases and postpones only confirmed conflict/not-published outcomes;
+  ambiguous, invalid and projection-unconfirmed results retain the destructive state
+  without queue lifecycle mutation.
+- Added unit coverage, real-Cassandra evidence, an R22a guard adjustment for the
+  projection wrapper, and `scripts/p4b-mutation-validation.sh` with four load-bearing
+  mutations.
+
+Full claim-to-orphan authority binding remains open under R14b/P4b. `GC_ENABLED=false`
+remains required.
+
 ## 2026-08-27 - P4a: the postponing unwinds obey the authority rule too
 
 The previous entry established the rule and applied it to five of eight post-claim exits.
