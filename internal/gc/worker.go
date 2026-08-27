@@ -356,10 +356,17 @@ func (w *Worker) failClosedIfUnavailable(reason, itemID string, err error) error
 //
 // Not-owner is still not an ERROR — see below — but it is not "released" either, and
 // collapsing the two into a bare nil is what let a late loser consume the candidate out
-// from under the attempt that had taken its claim over. A caller that only needs the
-// fence gone can ignore the outcome; a caller that goes on to SETTLE THE CANDIDATE must
-// require BlockReleaseReleased, because the candidate is the recovery mechanism for
-// whoever owns the fence now.
+// from under the attempt that had taken its claim over.
+//
+// NO CALLER MAY IGNORE IT. This comment used to say that a caller which only needs the
+// fence gone could, and that was true while the only thing at stake was the candidate.
+// It stopped being true when a lost claim came to mean no durable QUEUE mutation either:
+// the branches that "only need the fence gone" are the ones that go on to postpone, and
+// postponing is RequeueItem. Every caller now either hands the outcome to
+// refuseRetryForForeignClaimOwner or compares it against BlockReleaseReleased itself, as
+// the re-referenced settlement does — and
+// TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome fails the build if a new one does
+// neither.
 //
 // On error the outcome is reported as BlockReleaseNotOwner rather than the zero value:
 // a caller that mistakenly ignores err then still takes the conservative branch and
@@ -426,6 +433,13 @@ func (w *Worker) refuseRetryForForeignClaimOwner(itemID string, outcome BlockRel
 	if outcome == BlockReleaseReleased {
 		return nil
 	}
+	// The label predates the rule outgrowing it. It counted refused RETRIES when the five
+	// retryable unwinds were the only callers; it now also covers three exits that were
+	// going to postpone, where what is refused is the requeue rather than a retry. What it
+	// has always meant is "a late loser was turned away here", and renaming it would break
+	// whatever an operator has already built on it for a gain that is purely cosmetic
+	// while GC_ENABLED=false. Left as is, deliberately, and recorded so the next reader
+	// does not have to work out whether the name or the call sites are the mistake.
 	metrics.GCBlockDeleteClaimTotal.WithLabelValues("retry_refused_foreign_owner").Inc()
 	log.Printf("[GC Worker] Block %s: unwinding on %v, but this attempt no longer owns the delete claim; leaving the queue untouched instead of spending the retry that would strand the authoritative lifecycle's fence behind an undiscoverable candidate", itemID, originalErr)
 	return blockClaimForeignOwnerError{ItemID: itemID}

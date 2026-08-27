@@ -5196,6 +5196,24 @@ P6 issue above.
   follow-up, not closed by the P4a late-loser fix: a `block_claim_foreign_owner` result now
   exits at `processOrg` without calling `CompleteItem`, `RequeueItem`, `FailItem` or retry
   mutation, but ordinary retry/postpone paths still need one lifecycle authority.
+
+  One interleaving belongs explicitly in that race matrix, because it shows why the
+  follow-up cannot be "put a CAS on `RequeueItem`". P4a binds the QUEUE decision to the
+  CLAIM outcome, and those are observed at different instants:
+
+  ```
+  A releases its claim   -> Released      (A genuinely still owned it here)
+                            [window]
+  B claims               -> D2            (A is now stale, and does not know)
+  A returns to processOrg -> Requeue, or FailItem at the retry cap
+  ```
+
+  A passed the ownership check honestly and then mutated the queue as a stale worker. At
+  the cap that parks an `ItemBlock` in a DLQ it never leaves while B holds a live fence —
+  the same stranded shape P4a closes from the other side. Closing it needs the queue
+  lifecycle to carry its own authority (a lease, or a lifecycle token that makes a stale
+  mutation impossible), not a conditional write on one transition. Measured evidence for
+  the duplicate-row half is recorded in `docs/GC-QUEUE-DEPTH-MODEL.md`.
 - **E2 — `dryRun` data race vs cutover semantics.** `dryRun` is read/written concurrently
   without synchronization. `atomic.Bool` fixes the Go race and visibility, but does not stop work
   already past its check; hard cutover requires drain/serialization or destructive-step rechecks.

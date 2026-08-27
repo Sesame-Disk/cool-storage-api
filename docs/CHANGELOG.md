@@ -63,18 +63,23 @@ three with a takeover interposed at the claim/verify window and requires
 `TestP4A_OwnedPostponingUnwindStillRequeues` is the half that keeps this from becoming a
 different bug: an attempt that still owns its fence must go on postponing, requeue
 included, or the item blocks the head of the queue for as long as the condition lasts.
-Verified red against the pre-fix worker: all three reported `Requeue=1`. Three mutations
-(`m_unreliable_read_discards_foreign_owner`, `m_topology_gate_discards_foreign_owner`,
-`m_availability_verify_skips_foreign_owner`) restore one discard each; the script now runs
-**43** mutations, all red.
+Verified red against the pre-fix worker: all three reported `Requeue=1`. Four mutations:
+`m_unreliable_read_discards_foreign_owner`, `m_topology_gate_discards_foreign_owner` and
+`m_availability_verify_skips_foreign_owner` restore one discard each, and
+`m_bound_outcome_never_reaches_authority` binds the outcome and merely logs it — the shape
+a per-function guard cannot see, because the other release sites consult theirs. The
+script now runs **44** mutations, all red.
 
 **What this does NOT close.** E6 is untouched: `DequeueBatch` still takes no lease and
 `Requeue`/`Complete`/`Fail` are still ordinary batches, so two ordinary workers can still
 duplicate a `queued_at`. What is now true is narrower and worth stating exactly: *an
 attempt that discovers post-claim that it no longer owns the claim performs no durable
 queue mutation.* `BlockClaimFreshOwner` deliberately still postpones through the generic
-path — it never held the claim, so its copy of the row is fresh, and backing off is what
-keeps the queue moving.
+path — it never held the claim, so it is not a stale walk in the sense this rule is
+about, and backing off by moving the row is what keeps the queue moving. That is a
+statement about the WALK, not about the row: `DequeueBatch` takes no lease, so a
+fresh-owner rejection's copy of the row can be stale like any other. Which is E6, and E6
+is not what this rule closes.
 
 ## 2026-08-27 - P4a review: queue lifecycle arbitration remains open
 
@@ -99,7 +104,7 @@ The mergeable scope is now explicit:
   the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
   a partial LWT.
 - The requeue-specific real-Cassandra tests, source guard and mutations were removed from
-  this PR. The active P4a mutation script now contains **43** mutations; the script output
+  this PR. The active P4a mutation script now contains **44** mutations; the script output
   is authoritative.
 
 The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ

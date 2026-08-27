@@ -575,38 +575,103 @@ func TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome(t *testing.T) {
 			strings.Join(discards, "; "))
 	}
 
-	// Binding is necessary but not sufficient: the global verify used to bind the outcome
-	// and consult it in one branch only. Every function that releases must also name the
-	// authority decision, so a bound-but-ignored outcome cannot pass.
+	// BINDING IS NECESSARY BUT NOT SUFFICIENT, AND THE CHECK IS PER OUTCOME, NOT PER
+	// FUNCTION. The global verify is the reason: it bound the outcome and consulted it in
+	// one branch of two, which any "does this function mention the decision?" test reads
+	// as consulted. processBlock releases in several places, so function-level membership
+	// would let a new release ride on a sibling's check.
+	//
+	// Each bound outcome IDENTIFIER must therefore reach an authority decision itself:
+	// passed to refuseRetryForForeignClaimOwner, or compared against BlockReleaseReleased
+	// the way the re-referenced settlement does its own comparison.
 	for _, declaration := range file.Decls {
 		fn, ok := declaration.(*ast.FuncDecl)
 		if !ok || fn.Body == nil || fn.Name.Name == "releaseBlockClaim" {
 			continue
 		}
-		releases := false
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			if call, ok := node.(*ast.CallExpr); ok && p4aCallsWorkerMethod(call, "releaseBlockClaim") {
-				releases = true
+		for _, binding := range p4aBoundReleaseOutcomes(fn) {
+			if p4aOutcomeReachesAuthority(binding) {
+				continue
 			}
-			return true
-		})
-		if !releases {
-			continue
-		}
-		if !p4aMentions(fn, "refuseRetryForForeignClaimOwner") && !p4aMentions(fn, "BlockReleaseReleased") {
-			t.Errorf("%s releases a claim without consulting the outcome's authority: it must call refuseRetryForForeignClaimOwner, or compare against BlockReleaseReleased itself the way the re-referenced settlement does", fn.Name.Name)
+			t.Errorf("%s binds a release outcome as %q at %s but never brings THAT binding to an authority decision: it must be passed to refuseRetryForForeignClaimOwner, or compared against BlockReleaseReleased, within the branch that bound it",
+				fn.Name.Name, binding.name, fset.Position(binding.pos))
 		}
 	}
 }
 
-// p4aCallsWorkerMethod reports whether call is `<receiver>.<name>(...)`.
-func p4aCallsWorkerMethod(call *ast.CallExpr, name string) bool {
-	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
+// p4aReleaseBinding is one `outcome, err := w.releaseBlockClaim(...)` and the branch that
+// owns it.
+//
+// The SCOPE is the load-bearing part. An earlier version of this check searched the whole
+// function for any authority call naming the same identifier, and processBlock binds two
+// separate releases to the same name `released` — so the topology gate's check satisfied
+// the global verify's binding and the guard collapsed back into the per-function form it
+// was written to replace. A binding is now answered only from inside the block that
+// created it.
+type p4aReleaseBinding struct {
+	name  string
+	pos   token.Pos
+	scope *ast.BlockStmt
+}
+
+func p4aBoundReleaseOutcomes(fn *ast.FuncDecl) []p4aReleaseBinding {
+	var bindings []p4aReleaseBinding
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) == 0 || len(assign.Rhs) != 1 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !p4aCallsWorkerMethod(call, "releaseBlockClaim") {
+			return true
+		}
+		bound, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || bound.Name == "_" {
+			return true
+		}
+		bindings = append(bindings, p4aReleaseBinding{
+			name:  bound.Name,
+			pos:   assign.Pos(),
+			scope: p4aTightestBlock(fn, assign.Pos()),
+		})
+		return true
+	})
+	return bindings
+}
+
+// p4aOutcomeReachesAuthority reports whether this binding is handed to
+// refuseRetryForForeignClaimOwner or compared against BlockReleaseReleased, within the
+// branch that bound it.
+func p4aOutcomeReachesAuthority(binding p4aReleaseBinding) bool {
+	if binding.scope == nil {
 		return false
 	}
-	_, ok = selector.X.(*ast.Ident)
-	return ok && selector.Sel.Name == name
+	found := false
+	ast.Inspect(binding.scope, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			selector, ok := typed.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "refuseRetryForForeignClaimOwner" {
+				return true
+			}
+			for _, argument := range typed.Args {
+				if ident, ok := argument.(*ast.Ident); ok && ident.Name == binding.name {
+					found = true
+				}
+			}
+		case *ast.BinaryExpr:
+			left, leftOK := typed.X.(*ast.Ident)
+			right, rightOK := typed.Y.(*ast.Ident)
+			if leftOK && rightOK && left.Name == binding.name && right.Name == "BlockReleaseReleased" {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // p4aTightestBlock returns the innermost block statement of fn containing pos.
@@ -624,4 +689,78 @@ func p4aTightestBlock(fn *ast.FuncDecl, pos token.Pos) *ast.BlockStmt {
 	})
 	return tightest
 }
+
+// TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle is the source-side gate for the
+// queue half of P4a. A foreign-owner result is a handled stale attempt, not a postponable
+// item failure, so processOrg must classify it before the generic retry/postpone/DLQ path.
+func TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle(t *testing.T) {
+	source, err := os.ReadFile("worker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "worker.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	processOrg := findGCFunction(file, "processOrg")
+	if processOrg == nil {
+		t.Fatal("processOrg not found; the foreign-owner queue boundary is not guarded")
+	}
+	var leavePos, postponePos token.Pos
+	ast.Inspect(processOrg.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		switch name.Name {
+		case "shouldLeaveQueueUntouched":
+			if leavePos == token.NoPos {
+				leavePos = call.Pos()
+			}
+		case "shouldPostponeWithoutRetry":
+			if postponePos == token.NoPos {
+				postponePos = call.Pos()
+			}
+		}
+		return true
+	})
+	if leavePos == token.NoPos || postponePos == token.NoPos {
+		t.Fatalf("processOrg must call both queue classifiers: leave=%v postpone=%v", leavePos, postponePos)
+	}
+	if leavePos >= postponePos {
+		t.Fatalf("processOrg must classify foreign-owner before generic postpone: leave=%v postpone=%v", leavePos, postponePos)
+	}
+
+	classifier := findGCFunction(file, "shouldPostponeWithoutRetry")
+	if classifier == nil {
+		t.Fatal("shouldPostponeWithoutRetry not found")
+	}
+	foreignInPostpone := false
+	ast.Inspect(classifier.Body, func(node ast.Node) bool {
+		ident, ok := node.(*ast.Ident)
+		if ok && ident.Name == "GCFailureCodeBlockClaimForeignOwner" {
+			foreignInPostpone = true
+		}
+		return true
+	})
+	if foreignInPostpone {
+		t.Fatal("blockClaimForeignOwner must not be a generic postpone classifier")
+	}
+}
+
+// p4aCallsWorkerMethod reports whether call is `<receiver>.<name>(...)`.
+func p4aCallsWorkerMethod(call *ast.CallExpr, name string) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	_, ok = selector.X.(*ast.Ident)
+	return ok && selector.Sel.Name == name
+}
+
 

@@ -54,7 +54,7 @@ production blocker, and no status document should say that it is.
 this file and every earlier mutation count. The script output is authoritative.
 `internal/integration/p4a_claim_authority_test.go` has four real-Cassandra legs: exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **43** active mutations
+the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **44** active mutations
 end-to-end after the queue-primitive draft was withdrawn, and the script prints its own total
 on a clean run — cite that, not a number copied from prose.
 

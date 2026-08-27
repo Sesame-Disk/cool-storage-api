@@ -424,6 +424,18 @@ m_availability_verify_skips_foreign_owner() {
   restore
 }
 
+# Go's unused-variable rule already refuses `released, relErr :=` whose outcome is never
+# read at all, so the guard's per-identifier half only earns its keep against an outcome
+# that IS read -- just not by an authority decision. This logs it instead of consulting it,
+# which compiles, and which the previous per-FUNCTION form of the guard would have waved
+# through because processBlock consults the decision at its other release sites.
+m_bound_outcome_never_reaches_authority() {
+  mutate "$WORKER" 's~(unavailable := isClusterUnavailableError\(err\).*?)if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}~${1}log.Printf("[GC Worker] Block %s: release outcome %v", item.ItemID, released)~s'
+  expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'never brings THAT binding to an authority decision' \
+    'a release outcome is bound and read but never reaches an authority decision (the shape a per-function guard cannot see, because its siblings consult theirs)'
+  restore
+}
+
 m_candidate_authority_read_is_ordinary() {
   mutate "$STORE" 's{Consistency\(gocql\.Serial\)\.(\s+)Scan\(&candidateAt\)}{Scan(&candidateAt)}'
   expect_red 'TestR26CandidateAuthorityReadUsesTheSerialDomain' 'must read at Consistency(gocql.Serial)' \
@@ -477,6 +489,7 @@ MUTATIONS=(
   m_unreliable_read_discards_foreign_owner
   m_topology_gate_discards_foreign_owner
   m_availability_verify_skips_foreign_owner
+  m_bound_outcome_never_reaches_authority
   m_unwind_ignores_foreign_owner
   m_verify_unwind_ignores_foreign_owner
   m_unwind_bypasses_the_wrapper

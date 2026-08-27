@@ -1653,7 +1653,7 @@ The P3 evidence table near the end of this document is the current status source
 **P4a evidence update (2026-08-27):** The R14a row below is GREEN only for the
 claim-side lifecycle. Its current evidence is four real-Cassandra legs — exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation — plus **43** active red-form mutations in
+the observed incarnation — plus **44** active red-form mutations in
 `scripts/p4a-mutation-validation.sh`. Older counts are historical; the script prints its own
 total on a clean run, and that is the figure to cite.
 
@@ -1674,15 +1674,43 @@ retries so permanent item defects keep reaching the DLQ. Gated by
 `TestP4A_LateLoserDoesNotTouchAnAlreadyAdvancedQueueRow`,
 `TestP4AForeignOwnerQueuePolicyPrecedesGenericLifecycle` and five mutations.
 
-A sixth pass hardened that rule rather than changing it. The defect has exactly one
-spelling — Go refuses to compile a `released, relErr :=` whose outcome is never read, so
-dropping the answer requires `_` — and `TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome`
-now allows exactly one such discard: the destructive topology gate, which returns
-`failedClosedError` and therefore postpones on both outcomes. The same pass moved the
+A sixth pass hardened that rule rather than changing it, and an eighth **superseded the
+guard it describes: there are now ZERO permitted release-outcome discards.** The text that
+follows is kept for the reasoning, not for the rule. At the time it allowed exactly one
+discard — the destructive topology gate, which returned `failedClosedError` and therefore
+postponed on both outcomes — and it claimed the defect had exactly one spelling because Go
+refuses to compile a `released, relErr :=` whose outcome is never read. Both claims were
+wrong in the same direction: a bare `w.releaseBlockClaim(...)` statement discards
+everything and compiles, and "both outcomes postpone" stopped being an exemption once
+postponing meant `RequeueItem`. See the eighth-pass entry below. The sixth pass also moved the
 item-specific alert counters (`liveness_verify_failed`, `block_storage_key_mismatch`)
 behind the ownership check: they assert that the BLOCK is defective, which a late loser is
 no more entitled to conclude for a metric than for the retry budget, and the owner
 re-observes the durable defect on the next pass.
+
+**Eighth pass — the rule reaches every post-claim exit, and the guard stops making
+exceptions.** The fifth pass applied "a lost claim decides nothing" to the five exits that
+return a RETRYABLE error. Three exits that return a POSTPONING error kept their old
+exemption: both outcomes postpone, so ownership was held not to matter. That reasoning had
+already been invalidated by the change that made a lost claim mean no durable QUEUE
+mutation, because postponing is `postponeItem`, which is `RequeueItem`. The three — the
+global verify's AVAILABILITY half (which bound the outcome but consulted it only in the
+other branch), `releaseAndPostponeUnreliableRead`, and the destructive topology gate at the
+commit point — now bind the outcome and route it through `refuseRetryForForeignClaimOwner`.
+Zero sites in `worker.go` discard a `BlockReleaseOutcome`.
+
+Environmental observation stays separate from item policy: a late loser still raises
+`liveness_verify_unavailable`, `recordDestructiveBlocked` and
+`block_canonical_read_unreliable`, because an outage or a lagging replica is real whoever
+holds the claim. What it may not do is decide the item's error, retry or queue fate.
+
+The guard was rewritten twice over and is now two rules with no allowlist: no caller of
+`releaseBlockClaim` may discard the outcome, and every bound outcome must itself reach an
+authority decision — checked per identifier, not per function, because `processBlock`
+releases in several places and function-level membership let one site ride on a sibling's
+check. Gated by `TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched` (foreign:
+`Complete=Requeue=Fail=0`), its mirror `TestP4A_OwnedPostponingUnwindStillRequeues` (owner:
+`Requeue=1`, so the fix cannot become permanent head-of-line blocking), and four mutations.
 
 **Historical draft, withdrawn from this branch:** A seventh pass attempted to close the
 DURABLE half of "postpone", which is a queue-primitive defect rather than a P4a one and
