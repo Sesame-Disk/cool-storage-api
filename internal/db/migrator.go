@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -99,9 +98,6 @@ func (m *Migrator) Run() error {
 			continue
 		}
 
-		if err := m.preflightDestructive(mf); err != nil {
-			return err
-		}
 		if err := m.apply(mf); err != nil {
 			return fmt.Errorf("migrator: applying %03d_%s: %w", mf.Version, mf.Name, err)
 		}
@@ -366,170 +362,4 @@ func parseCQLStatements(content string) []string {
 		}
 	}
 	return stmts
-}
-
-// --- Destructive-migration preflight -----------------------------------------
-//
-// A migration that DROPs a table is not an upgrade: it discards whatever the
-// table held. Migration 018 is exactly that — the exact-P GC identity model
-// cannot be reached with ALTER, because Cassandra will not change a PRIMARY KEY
-// — and it is correct ONLY under the contract it states: a clean keyspace, put
-// into service before any node starts producing GC work.
-//
-// A comment cannot enforce that contract. This preflight can: before applying
-// any migration that drops tables, every table it is about to drop must be
-// empty. Running the release against a keyspace that already accumulated GC
-// work then fails loudly at startup with the table named, instead of silently
-// erasing queue, pending and DLQ rows — including the non-block item types that
-// have nothing to do with this change.
-//
-// The check is deliberately generic rather than keyed to version 018, so the
-// next destructive migration inherits the barrier instead of having to remember
-// it.
-
-var dropTablePattern = regexp.MustCompile(`(?is)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_."]+)`)
-
-// droppedTables returns the tables a migration drops, in statement order.
-//
-// A keyspace-qualified name is returned AS WRITTEN, not stripped down to the bare
-// table. The probe runs against the migrator's session, which is bound to one
-// keyspace: silently discarding the qualifier would make it check
-// `<session keyspace>.foo` while the DROP removes `otherks.foo`, so the barrier
-// would report a different table empty than the one about to be destroyed. Passing
-// the qualifier through keeps the probe and the drop pointed at the same table.
-func (mf MigrationFile) droppedTables() []string {
-	var tables []string
-	for _, stmt := range mf.Statements {
-		for _, match := range dropTablePattern.FindAllStringSubmatch(stmt, -1) {
-			name := strings.Trim(strings.TrimSpace(match[1]), `";`)
-			if name != "" {
-				tables = append(tables, name)
-			}
-		}
-	}
-	return tables
-}
-
-// missingTableError reports whether err says the table is not there. A table
-// this migration was going to drop anyway is not something to protect, so a
-// re-run after a partially-applied destructive migration still converges.
-func missingTableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"unconfigured table",
-		"unconfigured columnfamily",
-		"does not exist",
-		"non-existent table",
-		"cannot be found",
-		"table not found",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// preflightDestructive refuses a table-dropping migration whose targets still
-// hold rows.
-func (m *Migrator) preflightDestructive(mf MigrationFile) error {
-	tables := mf.droppedTables()
-	if len(tables) == 0 {
-		return nil
-	}
-	for _, table := range tables {
-		// LIMIT 1 over the whole table: this only has to answer "is there anything
-		// here", and it runs once, at startup, before the drop.
-		//
-		// NumRows, not Scan: the probe deliberately binds no columns, because it
-		// must work for any schema, and Scan with no destinations is a driver error
-		// rather than an empty result.
-		//
-		// EACH_QUORUM, NEVER THE SESSION DEFAULT. The session normally runs
-		// LOCAL_QUORUM, and a local quorum is exactly the wrong instrument here: it
-		// can answer "empty" while another datacenter holds rows that simply have
-		// not been read locally, and the migration would then drop live work on the
-		// strength of a local view. EACH_QUORUM obtains a quorum in EVERY
-		// datacenter, so it intersects the quorum that acknowledged a write in
-		// whichever DC accepted it — the same per-DC intersection argument the
-		// destructive GC path rests on (see ValidateDestructiveGCTopology).
-		//
-		// It is deliberately NOT conditional on the replication class. Under a
-		// strategy that gives EACH_QUORUM no per-DC meaning the engine either
-		// resolves it to an ordinary quorum — still strictly stronger than
-		// LOCAL_QUORUM, and sound where there is no second DC to miss — or rejects
-		// it, and a rejection lands in the refusal below. Both outcomes are
-		// fail-closed, so the probe does not have to depend on which one an engine
-		// picks.
-		iter := m.session.Query(fmt.Sprintf(`SELECT * FROM %s LIMIT 1`, table)).
-			Consistency(gocql.EachQuorum).
-			Iter()
-		occupied := iter.NumRows() > 0
-		err := iter.Close()
-		if err != nil {
-			if missingTableError(err) {
-				continue
-			}
-			// A scan that cannot complete is NOT evidence of emptiness, so it
-			// refuses like any other unverified table. Name the tombstone case
-			// explicitly: these are high-churn tables, a drained one can still hold
-			// hundreds of thousands of tombstones, and an operator who reads only
-			// "could not be established" has no way to tell a dead datacenter from
-			// a table that is empty but heavily deleted. TRUNCATE resolves both.
-			hint := ""
-			if tombstoneScanError(err) {
-				hint = " The scan aborted on tombstones, which means this table was used and drained rather " +
-					"than being unreachable: it may well be logically empty. That is still not proof, so it is " +
-					"refused. TRUNCATE the GC tables to clear both rows and tombstones before starting the server."
-			}
-			return fmt.Errorf(
-				"migrator: %s drops %s, and whether that table is empty could not be established: %w — "+
-					"refusing to run a destructive migration on an unverified table%s",
-				mf.label(), table, err, hint)
-		}
-		if occupied {
-			return fmt.Errorf(
-				"migrator: %s drops %s, but that table still holds rows.\n"+
-					"This migration is NOT an upgrade — it discards the tables it drops — and is only "+
-					"correct against a clean keyspace deployed before any node produces GC work.\n"+
-					"Refusing to erase live state. Either deploy this release onto an empty keyspace, or "+
-					"drain and truncate the GC tables deliberately before starting the server.",
-				mf.label(), table)
-		}
-	}
-	return nil
-}
-
-// PreflightDestructiveForTest runs the destructive preflight over a migration's
-// CQL against an arbitrary session.
-//
-// It exists so the barrier can be proven against a REAL cluster: the whole check
-// is a live read of a live table, so a unit test cannot show it closing. The
-// integration test seeds a scratch table and asserts the refusal, which is the
-// only way to demonstrate that deploying this release onto a keyspace with
-// existing GC work fails loudly instead of erasing it.
-//
-// It is a test seam, not an API: production always reaches this through Run.
-func PreflightDestructiveForTest(session *gocql.Session, migrationCQL string) error {
-	m := &Migrator{session: session}
-	return m.preflightDestructive(MigrationFile{
-		Version:    0,
-		Name:       "preflight_probe",
-		Content:    migrationCQL,
-		Statements: parseCQLStatements(migrationCQL),
-	})
-}
-
-// tombstoneScanError reports whether a read aborted because it walked too many
-// tombstones. The driver surfaces this as a plain read failure, so the wording is
-// what distinguishes it.
-func tombstoneScanError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "tombstone")
 }

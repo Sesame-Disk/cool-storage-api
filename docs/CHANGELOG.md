@@ -70,18 +70,32 @@ extra `SERIAL` read only moves the TOCTOU; the fix is structural.
   the duplicate copies in the GC store are gone, along with two block-candidate discovery
   helpers that had no production caller. Same single-writer rule R22a enforces for orphans.
 
-**Migration 018 is destructive, and the contract is now ENFORCED.** It drops the tables it
-recreates, which is correct only for this release's contract: a clean keyspace, migrated
-before any node produces GC work. `Migrator.preflightDestructive` refuses any
-table-dropping migration whose targets still hold rows. The emptiness probe reads at
-EACH_QUORUM, never the session default: a LOCAL_QUORUM read can call a table empty
-while another datacenter holds rows, and the migration would then drop live work on
-the strength of a local view. A scan that cannot complete — including one that aborts
-on tombstones, which these high-churn tables accumulate even when logically empty — is
-not evidence of emptiness either, so it refuses and says which case it hit, so running this against a keyspace
-with existing GC work fails at startup with the table named rather than erasing queue,
-pending and DLQ state — including the non-block item types unrelated to this change. The
-check is generic, so the next destructive migration inherits the barrier.
+**The candidate authority read is now in the serial domain.** `GetBlockGCCandidateExact`
+read at the session level while every write to `gc_block_candidates` is an LWT, so an
+ordinary quorum read could miss an accepted-but-not-yet-committed candidate and answer
+"not found" for a row that exists. That answer is what authorizes the self-heal above: it
+retires the discovery row and then completes the queue row and its pending marker — the
+only durable references to that candidate, because discovery walks
+`gc_block_candidates_by_day` and nothing enumerates the canonical table. One stale read
+therefore stranded a LIVE candidate with no path back, and `Ensure` runs only on the
+events that first decide a block is garbage, so nothing rebuilt the projection later. Not
+a wrong delete: a zero-ref block that is never reclaimed, silently. `DeleteBlockGCCandidate`
+already established the same fact soundly — its CAS decides "no longer here" inside Paxos —
+and the read is now held to that standard, pinning `Consistency(gocql.Serial)` itself for
+the same reason `resolveBlockDeleteTarget` does.
+
+**Identity is required, not guessed.** The store's `resolved(fallback)` quietly substituted
+a row's `queued_at` or `failed_at` when a caller named no lifecycle — the same "addresses a
+row prefix while reporting success" shape this slice exists to remove, one layer further
+down. It is now `requireIdentityAt`, which fails closed; a block identity carrying only its
+`candidate_at` is still completed, because that is the same instant by construction rather
+than an unrelated timestamp. The DLQ expiry projection no longer falls back to `failed_at`
+either.
+
+Migration `018` itself is pre-production scaffolding: it drops and recreates the six GC
+tables against dev/staging keyspaces that are rebuilt at will, and the whole migration set
+folds into the initial schema for a clean production deploy once X1 closes. No upgrade
+barrier is built for it, deliberately — there is no upgrade path to protect.
 
 **Evidence**
 - Mock: the `A captures P1 / P2 installed / delayed P1 enqueue` race, `same candidate_at
@@ -95,15 +109,17 @@ check is generic, so the next destructive migration inherits the barrier.
   Three of the four keys carry a timestamp of their own, so a fixture with distinct
   timestamps would hold two rows whether or not `P` is in the key. A map-backed mock keeps rows apart
   under any key the Go code invents; only the engine can answer this. Plus the exact-identity
-  discovery retire, the non-block DLQ selector, and the destructive preflight closing on a
-  table that holds a row.
+  discovery retire and the non-block DLQ selector.
 - Source gates: `TestR26MutationsNameTheExactIdentity` (no mutation may address a row
   prefix), `TestR26SingleRowReadsNameTheExactIdentity`,
   `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`, and
-  `TestR26AnyIdentityIsNeverPassedToAMutation` — the "any lifecycle" dedup probe is
-  the one value that resolves its row from a fallback, and it must never reach a write.
-  The mutation guard reads BOTH writer surfaces: the canonical store and internal/db,
-  which owns the DLQ expiry projection's key.
+  `TestR26AnyIdentityIsNeverPassedToAMutation` — the "any lifecycle" dedup probe is the
+  one value that does not name a row, and it must never reach a write. The mutation guard
+  reads BOTH writer surfaces: the canonical store and internal/db, which owns the DLQ
+  expiry projection's key. `TestR26CandidateAuthorityReadUsesTheSerialDomain` pins the
+  consistency level of the read whose absence retires a lifecycle: in a single-node test
+  cluster an ordinary and a serial read return the same thing, so no behavioural test
+  can tell them apart and the downgrade would stay green everywhere.
 - `TestEveryEvidenceGateIsWiredIntoTestMain` discovers every SESAMEFS_REQUIRE_*_EVIDENCE
   the integration package uses and requires it in TestMain's chain. The rule was a
   comment, and the comment did not hold: R26 reached docker-compose and its own tests
@@ -112,17 +128,19 @@ check is generic, so the next destructive migration inherits the barrier.
   it and P4A *was* wired — the evidence was never false, but the variable did not honour
   its own contract.
 - SCHEMA gates, because everything above reads Go and the keys live in CQL: dropping
-  `P` from a PRIMARY KEY in migration `018` changes no runtime statement, so every
-  other gate stays green while a freshly migrated keyspace collapses `P1` and `P2`
-  back into one row. `TestR26MigrationDeclaresTheExactIdentityKeys` asserts the
+  `P` from a PRIMARY KEY changes no runtime statement, so every other gate stays green
+  while a freshly migrated keyspace collapses `P1` and `P2` back into one row. They read
+  the EFFECTIVE schema — every migration in version order, last `CREATE TABLE` wins — so
+  they keep working when the set is folded into the initial schema.
+  `TestR26MigrationDeclaresTheExactIdentityKeys` asserts the
   identity columns as an ORDERED SUFFIX of each key, and
   `TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey` asserts the matching
   absence — `candidate_at` must stay a mutable value or every re-decision becomes
   another row.
 - `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **34 mutations**, each
   removing one invariant and each required to go red with the matching assertion. Eleven
-  are new, including two that edit the MIGRATION itself and one that unpins the
-  destructive preflight's consistency level. Three pieces of existing evidence had
+  are new, including two that edit the MIGRATION itself and one that unpins the candidate
+  authority read's consistency level. Three pieces of existing evidence had
   quietly stopped proving anything and are repaired here: a P4a mutation stopped applying
   when the candidate `DELETE` moved `P` from its `IF` into its `WHERE` (aborting the whole
   run), `TestP4A_ReplacedCandidateServesItsOwnGracePeriod` stopped reaching the grace check

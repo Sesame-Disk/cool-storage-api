@@ -558,18 +558,34 @@ func AnyGCItemIdentity() GCItemIdentity { return GCItemIdentity{} }
 // items.
 func (i GCItemIdentity) Target() BlockDeleteTarget { return i.BlockCandidate.Target }
 
-// resolved fills in an identity_at that the caller left implicit. Queue rows
-// written before an explicit identity existed stored queued_at in the column, so
-// a lifecycle that carries no identity_at of its own still addresses its row.
-func (i GCItemIdentity) resolved(fallback time.Time) GCItemIdentity {
-	if i.IdentityAt.IsZero() {
-		if !i.BlockCandidate.CandidateAt.IsZero() {
-			i.IdentityAt = i.BlockCandidate.CandidateAt
-		} else {
-			i.IdentityAt = fallback
-		}
+// requireIdentityAt returns the identity with identity_at guaranteed present, or an
+// error.
+//
+// It used to be a `resolved(fallback)` that quietly substituted the row's queued_at
+// or failed_at when the caller named no lifecycle. That is the exact shape this slice
+// exists to remove, one layer lower down: a mutation whose row is GUESSED rather than
+// named can address a different lifecycle's row, or none at all while reporting
+// success. Since migration 018 every durable GC row is written with an explicit
+// identity_at, so a zero one is a programming error, not old data to be tolerated —
+// and a hard failure at the store boundary is worth more than a mutation that silently
+// went somewhere else.
+//
+// A block identity that carries only its candidate_at is completed rather than
+// refused: identity_at and candidate_at are the same instant by construction
+// (validateQueueItemBlockCandidateIdentity enforces it), so this derives the value
+// from the identity itself instead of from an unrelated timestamp.
+func (i GCItemIdentity) requireIdentityAt(operation, itemID string) (GCItemIdentity, error) {
+	if !i.IdentityAt.IsZero() {
+		return i, nil
 	}
-	return i
+	if !i.BlockCandidate.CandidateAt.IsZero() {
+		i.IdentityAt = i.BlockCandidate.CandidateAt
+		return i, nil
+	}
+	return GCItemIdentity{}, fmt.Errorf(
+		"gc: %s for item %s requires an explicit identity_at: it is part of the primary key of every "+
+			"durable GC table, so without it this operation would address a row prefix instead of the "+
+			"lifecycle the caller observed", operation, itemID)
 }
 
 // ItemIdentity is the durable work-item identity this candidate authorizes.
@@ -697,6 +713,11 @@ func (f GCFailedItemInfo) Identity() GCItemIdentity {
 	}
 }
 
+// effectiveFailedItemExpiryIdentity reads the lifecycle out of an expiry projection
+// row. It deliberately does NOT fall back to failed_at: identity_at is a clustering
+// column of gc_failed_items_by_expiry, so guessing it would point the DLQ expiry
+// sweep at a row the operator never saw. A zero value is returned as zero and refused
+// by requireIdentityAt at the mutation boundary, where the failure can be reported.
 func effectiveFailedItemExpiryIdentity(expiry GCFailedItemExpiryInfo) time.Time {
 	if !expiry.IdentityAt.IsZero() {
 		return expiry.IdentityAt.UTC()
@@ -704,7 +725,7 @@ func effectiveFailedItemExpiryIdentity(expiry GCFailedItemExpiryInfo) time.Time 
 	if !expiry.BlockGCCandidateIdentity.CandidateAt.IsZero() {
 		return expiry.BlockGCCandidateIdentity.CandidateAt.UTC()
 	}
-	return expiry.FailedAt.UTC()
+	return time.Time{}
 }
 
 // GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.

@@ -333,3 +333,65 @@ func TestR26_NonBlockDLQOperationsNameTheirIdentityAt(t *testing.T) {
 		t.Fatalf("the delete hit the wrong lifecycle: survivor identity_at = %v, want %v", failed[0].IdentityAt, second)
 	}
 }
+
+// TestR26_MutationsRefuseAnIdentityThatNamesNoLifecycle pins the fail-closed half of
+// the identity contract.
+//
+// The store used to accept an identity with no identity_at and quietly substitute the
+// row's queued_at or failed_at. That is the same defect one layer down: the mutation
+// still ran, against a row nobody named. Every durable GC row has carried an explicit
+// identity_at since the exact-P schema, so a zero one is a bug in the caller and the
+// store must say so rather than pick a row.
+//
+// AnyGCItemIdentity is the one identity that legitimately names no lifecycle, and it
+// belongs to PendingItemExists alone — so it is exactly what this feeds in.
+func TestR26_MutationsRefuseAnIdentityThatNamesNoLifecycle(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	queuedAt := failedAt.Add(-time.Hour)
+	itemID := uuid.New().String()
+
+	store.AddFailedItemForTest(GCFailedItemInfo{
+		OrgID:      orgID,
+		FailedAt:   failedAt,
+		QueuedAt:   queuedAt,
+		IdentityAt: queuedAt,
+		ItemType:   ItemCommit,
+		ItemID:     itemID,
+		LibraryID:  uuid.New(),
+	})
+
+	mutations := map[string]func() error{
+		"CompleteItem": func() error {
+			return store.CompleteItem(orgID, queuedAt, ItemCommit, itemID, AnyGCItemIdentity())
+		},
+		"RequeueItem": func() error {
+			return store.RequeueItem(orgID, queuedAt, time.Now().UTC(), ItemCommit, itemID, uuid.Nil, "", "", 1, AnyGCItemIdentity(), false, LibraryGuardNone)
+		},
+		"DeleteFailedItem": func() error {
+			return store.DeleteFailedItem(orgID, failedAt, ItemCommit, itemID, AnyGCItemIdentity())
+		},
+		"RequeueFailedItem": func() error {
+			return store.RequeueFailedItem(orgID, failedAt, ItemCommit, itemID, time.Now().UTC(), AnyGCItemIdentity())
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			if err := mutate(); err == nil {
+				t.Fatal("a mutation with no identity_at must be refused: guessing the row from queued_at or " +
+					"failed_at is how a lifecycle nobody named gets mutated while the call reports success")
+			}
+		})
+	}
+
+	// The refusals must not have touched anything on the way out.
+	if failed := store.FailedItems(orgID); len(failed) != 1 {
+		t.Fatalf("failed items after four refused mutations = %d, want 1 untouched", len(failed))
+	}
+
+	// ...and the dedup probe, which legitimately asks "under ANY lifecycle", still works.
+	if _, err := store.PendingItemExists(orgID, uuid.Nil, ItemCommit, itemID, AnyGCItemIdentity()); err != nil {
+		t.Fatalf("PendingItemExists must still accept the any-lifecycle probe: %v", err)
+	}
+}

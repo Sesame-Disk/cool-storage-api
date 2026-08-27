@@ -367,3 +367,37 @@ func r26IsAnyIdentityCall(expr ast.Expr) bool {
 	}
 	return false
 }
+
+// TestR26CandidateAuthorityReadUsesTheSerialDomain pins the read whose ABSENCE
+// authorizes retiring a whole lifecycle.
+//
+// GetBlockGCCandidateExact answering "not found" is what sends processBlock down the
+// self-heal path: it deletes the discovery row and then completes the queue row and
+// its pending marker. Those are the only durable references to the candidate — the
+// scanner walks gc_block_candidates_by_day and nothing enumerates the canonical
+// table — so if that answer can be produced by a lagging replica rather than by the
+// candidate really being gone, one stale read strands a live candidate forever and
+// the block behind it is never reclaimed. Every write to gc_block_candidates is an
+// LWT, so an ordinary quorum read can miss an accepted-but-not-yet-committed row.
+//
+// Like the two P4a serial-domain guards, this is decidable only from source: in a
+// single-node test cluster an ordinary read and a serial read return the same thing,
+// so no behavioural test — mock or real — can tell them apart, and the downgrade
+// would stay green everywhere while removing the guarantee.
+//
+// Note this is Consistency(gocql.Serial) on a plain SELECT, not SerialConsistency,
+// which configures conditional mutations and is ignored for SELECTs.
+func TestR26CandidateAuthorityReadUsesTheSerialDomain(t *testing.T) {
+	file := p4aParseStore(t)
+
+	fn := findGCFunction(file, "GetBlockGCCandidateExact")
+	if fn == nil {
+		t.Fatal("GetBlockGCCandidateExact not found; the candidate authority read cannot be verified")
+	}
+	if !gcQueryMethodHas(fn, "FROM gc_block_candidates", "Consistency", "Serial") {
+		t.Error("GetBlockGCCandidateExact must read at Consistency(gocql.Serial): its \"not found\" answer " +
+			"deletes the discovery row and completes the queue and pending rows, so an ordinary read that " +
+			"misses an LWT-written candidate strands it with no durable reference left to rediscover it")
+	}
+}
+

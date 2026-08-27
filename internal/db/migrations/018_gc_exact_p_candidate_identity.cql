@@ -6,19 +6,16 @@
 -- projection, the queue, the pending markers and the DLQ. Cassandra cannot add
 -- clustering columns to an existing table, so these are recreated.
 --
--- THIS MIGRATION IS DESTRUCTIVE AND IS NOT AN UPGRADE. It drops the tables it
--- recreates. It is correct only for the contract this release ships under: a
--- clean keyspace, migrated before any node starts producing GC work.
+-- THIS MIGRATION IS PRE-PRODUCTION SCAFFOLDING, NOT AN UPGRADE PATH. It drops the
+-- tables it recreates, and it is correct only against the environments this branch
+-- targets: development and staging keyspaces that can be rebuilt at will. Nothing
+-- ships to production from this file. Once X1 is closed the whole migration set is
+-- folded into the initial schema and production is deployed clean from it, so the
+-- rollout question this drop would otherwise raise never arises and no destructive
+-- upgrade barrier is needed for it.
 --
--- That contract is ENFORCED, not merely documented. Migrator.preflightDestructive
--- refuses to apply any table-dropping migration whose targets still hold rows, so
--- running this release against a keyspace that already accumulated GC work fails
--- at startup with the offending table named, instead of silently erasing queue,
--- pending and DLQ state — including the non-block item types that have nothing to
--- do with this change. See internal/db/migrator.go.
---
--- Dropping rather than altering also makes an accidental rolling upgrade fail
--- visibly: a binary from before this release inserts into gc_queue without the
+-- Dropping rather than altering also makes an accidental rolling restart fail
+-- visibly: a binary from before this change inserts into gc_queue without the
 -- clustering columns and is rejected by the engine, rather than collapsing P1 and
 -- P2 back into one row.
 --

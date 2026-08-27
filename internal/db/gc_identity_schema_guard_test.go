@@ -1,14 +1,20 @@
 package db
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-// R26 schema guard: the shipped migration must actually declare the PRIMARY KEYs
-// the runtime depends on.
+// R26 schema guard: the migration set must actually declare the PRIMARY KEYs the
+// runtime depends on.
+//
+// It reads the EFFECTIVE schema — every migration in version order, last CREATE
+// TABLE for a given table wins — rather than one named file. Which migration
+// declares these keys is an accident of history: 018 does today, and the whole set
+// is folded into the initial schema once X1 closes. The property being pinned is
+// the same either way, so the guard must not have to be rewritten when the file
+// moves.
 //
 // This closes the last blind spot in the R26 evidence chain. The other gates all
 // look at Go: the source guards read the CQL literals in store_cassandra.go, the
@@ -31,7 +37,6 @@ import (
 // P columns would still "contain" all three while changing which prefixes are
 // queryable, and every read in the store is written against this order.
 func TestR26MigrationDeclaresTheExactIdentityKeys(t *testing.T) {
-	const migration = "018_gc_exact_p_candidate_identity"
 
 	// The identity columns each table's key must END with, in order.
 	wantKeySuffix := map[string][]string{
@@ -43,19 +48,24 @@ func TestR26MigrationDeclaresTheExactIdentityKeys(t *testing.T) {
 		"gc_failed_items_by_expiry":  {"candidate_storage_class", "candidate_storage_key", "identity_at"},
 	}
 
-	keys := primaryKeysInMigration(t, migration)
+	tracked := map[string]bool{}
+	for table := range wantKeySuffix {
+		tracked[table] = true
+	}
+
+	keys := effectivePrimaryKeys(t, tracked)
 	if len(keys) == 0 {
-		t.Fatalf("no CREATE TABLE statements found in %s; this guard is vacuous", migration)
+		t.Fatal("no CREATE TABLE statements found in the migration set; this guard is vacuous")
 	}
 
 	for table, want := range wantKeySuffix {
 		key, ok := keys[table]
 		if !ok {
-			t.Errorf("%s does not create %s; the runtime expects it to carry the exact-P identity key", migration, table)
+			t.Errorf("the migration set does not create %s; the runtime expects it to carry the exact-P identity key", table)
 			continue
 		}
 		if len(key) < len(want) {
-			t.Errorf("R26 REGRESSION: %s.%s PRIMARY KEY is %v, too short to end with %v", migration, table, key, want)
+			t.Errorf("R26 REGRESSION: %s PRIMARY KEY is %v, too short to end with %v", table, key, want)
 			continue
 		}
 		got := key[len(key)-len(want):]
@@ -63,12 +73,12 @@ func TestR26MigrationDeclaresTheExactIdentityKeys(t *testing.T) {
 			if got[i] == want[i] {
 				continue
 			}
-			t.Errorf("R26 REGRESSION: %s.%s PRIMARY KEY = %v.\n"+
+			t.Errorf("R26 REGRESSION: %s PRIMARY KEY = %v.\n"+
 				"It must END with %v, in that order. Without those columns two lives of one logical block "+
 				"collapse into a single row and a delayed lifecycle for a dead incarnation addresses a live "+
-				"one's work — the defect this migration exists to remove. Nothing in the Go code changes when "+
+				"one's work — the defect the exact-P identity exists to remove. Nothing in the Go code changes when "+
 				"this key does, so no other gate can catch it.",
-				migration, table, key, want)
+				table, key, want)
 			break
 		}
 	}
@@ -84,10 +94,10 @@ func TestR26MigrationDeclaresTheExactIdentityKeys(t *testing.T) {
 // turn every re-decision into a new row, so a block would accumulate one candidate
 // per observation and settling one would leave the others behind.
 func TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey(t *testing.T) {
-	keys := primaryKeysInMigration(t, "018_gc_exact_p_candidate_identity")
+	keys := effectivePrimaryKeys(t, map[string]bool{"gc_block_candidates": true})
 	key, ok := keys["gc_block_candidates"]
 	if !ok {
-		t.Fatal("018 does not create gc_block_candidates; this guard is vacuous")
+		t.Fatal("the migration set does not create gc_block_candidates; this guard is vacuous")
 	}
 	for _, column := range key {
 		if column == "candidate_at" {
@@ -102,42 +112,58 @@ func TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey(t *testing.T) {
 var (
 	createTablePattern = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.]+)\s*\((.*)`)
 	primaryKeyPattern  = regexp.MustCompile(`(?is)PRIMARY\s+KEY\s*\((.*?)\)\s*\)`)
+	dropTableStatement = regexp.MustCompile(`(?is)^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z0-9_."]+)`)
 )
 
-// primaryKeysInMigration returns table -> ordered primary key columns, with the
-// partition-key parentheses flattened away: ((a, b), c) reads as [a b c].
-func primaryKeysInMigration(t *testing.T, name string) map[string][]string {
+// effectivePrimaryKeys returns table -> ordered primary key columns, for the tracked
+// tables only, as the schema
+// the migration set actually leaves behind: migrations are walked in version order,
+// a CREATE TABLE records (and replaces) a table's key, and a DROP TABLE removes it
+// again. That is what a freshly migrated keyspace ends up with, whether the keys are
+// declared by a late migration or by a consolidated initial schema.
+//
+// The partition-key parentheses are flattened away: ((a, b), c) reads as [a b c].
+func effectivePrimaryKeys(t *testing.T, tracked map[string]bool) map[string][]string {
 	t.Helper()
 	m := &Migrator{}
 	files, err := m.loadFiles()
 	if err != nil {
 		t.Fatalf("loadFiles: %v", err)
 	}
+	keys := map[string][]string{}
 	for _, mf := range files {
-		if mf.Name != strings.TrimPrefix(name, fmt.Sprintf("%03d_", mf.Version)) && mf.label() != name {
-			continue
-		}
-		keys := map[string][]string{}
 		for _, stmt := range mf.Statements {
+			if drop := dropTableStatement.FindStringSubmatch(stmt); drop != nil {
+				delete(keys, bareTableName(drop[1]))
+				continue
+			}
+
 			create := createTablePattern.FindStringSubmatch(stmt)
 			if create == nil {
 				continue
 			}
-			table := strings.ToLower(create[1])
-			if idx := strings.LastIndex(table, "."); idx >= 0 {
-				table = table[idx+1:]
+			table := bareTableName(create[1])
+			if !tracked[table] {
+				continue
 			}
 			pk := primaryKeyPattern.FindStringSubmatch(create[2])
 			if pk == nil {
-				t.Errorf("CREATE TABLE %s in %s has no parseable PRIMARY KEY; the guard cannot verify it", table, name)
+				t.Errorf("CREATE TABLE %s in %s has no parseable PRIMARY KEY; the guard cannot verify it", table, mf.label())
 				continue
 			}
 			keys[table] = splitKeyColumns(pk[1])
 		}
-		return keys
 	}
-	t.Fatalf("migration %s not found", name)
-	return nil
+	return keys
+}
+
+// bareTableName strips a keyspace qualifier and normalises case.
+func bareTableName(raw string) string {
+	table := strings.ToLower(strings.Trim(strings.TrimSpace(raw), `";`))
+	if idx := strings.LastIndex(table, "."); idx >= 0 {
+		table = table[idx+1:]
+	}
+	return table
 }
 
 func splitKeyColumns(raw string) []string {

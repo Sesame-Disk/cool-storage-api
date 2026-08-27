@@ -1602,7 +1602,10 @@ func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	identity = identity.resolved(queuedAt)
+	identity, err := identity.requireIdentityAt("queue item existence check", itemID)
+	if err != nil {
+		return false, err
+	}
 	for _, item := range m.queue[orgID] {
 		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
 			return true, nil
@@ -1661,7 +1664,10 @@ func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Tim
 func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, identity GCItemIdentity) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	identity = identity.resolved(queuedAt)
+	identity, err := identity.requireIdentityAt("queue completion", itemID)
+	if err != nil {
+		return err
+	}
 
 	items := m.queue[orgID]
 	for i, item := range items {
@@ -1678,7 +1684,10 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, blockRepresentationID, storageClass string, newRetryCount int, identity GCItemIdentity, requiresLibraryDeletedCheck bool, libraryGuardMode LibraryGuardMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	identity = identity.resolved(oldQueuedAt)
+	identity, err := identity.requireIdentityAt("queue requeue", itemID)
+	if err != nil {
+		return err
+	}
 
 	if m.requeueItemErr != nil {
 		return m.requeueItemErr
@@ -1896,7 +1905,10 @@ func (m *MockStore) DeleteFailedItemContext(ctx context.Context, orgID uuid.UUID
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	identity = identity.resolved(failedAt)
+	identity, err := identity.requireIdentityAt("DLQ delete", itemID)
+	if err != nil {
+		return err
+	}
 	items := m.failedItems[orgID]
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
@@ -1948,7 +1960,10 @@ func (m *MockStore) RequeueFailedItemContext(ctx context.Context, orgID uuid.UUI
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	identity = identity.resolved(failedAt)
+	identity, err := identity.requireIdentityAt("DLQ requeue", itemID)
+	if err != nil {
+		return err
+	}
 	items := m.failedItems[orgID]
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID && sameGCItemIdentity(item.Identity(), identity) {
