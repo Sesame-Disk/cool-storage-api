@@ -876,8 +876,14 @@ func gcQueueItemExistsSince(t *testing.T, orgID string, itemType string, itemID 
 	return false
 }
 
+// gcFailedItemExpiryBucketForTest DELEGATES rather than re-spelling the formula. A
+// second copy of a partition key is how a test starts agreeing with itself instead
+// of with production: this one was a faithful copy of the pre-normalization version,
+// correct only because its call sites pass values already read back from Cassandra,
+// and a future caller handing it a raw time.Now() would have computed a bucket the
+// store never writes to.
 func gcFailedItemExpiryBucketForTest(orgID string, itemType string, itemID string, failedAt time.Time, candidateStorageClass, candidateStorageKey string, identityAt time.Time) int {
-	return db.GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano), candidateStorageClass, candidateStorageKey, identityAt.UTC().Format(time.RFC3339Nano))
+	return db.GCFailedItemExpiryBucket(orgID, failedAt, itemType, itemID, candidateStorageClass, candidateStorageKey, identityAt)
 }
 
 func deleteGCQueueItemsByIdentity(t *testing.T, orgID string, itemType string, itemID string) {

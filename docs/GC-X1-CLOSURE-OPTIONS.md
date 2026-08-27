@@ -274,12 +274,7 @@ A workable split, one property per PR as the R11/R22/R23 slices were:
   candidate, its discoverability or its work item. Settlement retires its own discovery
   row on both CAS outcomes, which makes an interrupted settlement self-healing instead
   of an unbounded rediscovery loop.
-- **Deferred out of P4c, neither blocking nor forgotten.** Two items came out of the P4c
-  review and were left for later on purpose. `ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01`
-  (`KNOWN_ISSUES.md`): the admin DLQ selector parses timestamps at nanosecond precision
-  while Cassandra stores milliseconds, so an over-precise selector matches no row — and the
-  delete path reports that as success while the requeue path reports it as a 500. Not
-  reachable from the UI, which round-trips values it read back. And `TECHNICAL-DEBT.md`
+- **Deferred out of P4c, neither blocking nor forgotten.** `TECHNICAL-DEBT.md`
   → *GC work-item identity: creation and durable lookup share one constructor*:
   `QueueItem.Identity()` still derives `identity_at` from `queued_at`, which is correct at
   creation and merely untidy afterwards; splitting it into `identityForCreation()` /

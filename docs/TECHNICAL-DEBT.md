@@ -2479,8 +2479,10 @@ half (`P4c-orphan`) is the likely moment, since it revisits the same identity pl
 `gc_s3_orphans`.
 
 ### Related
-`ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` is the other item deferred out of the same
-review round, and is a latent defect rather than debt: see `KNOWN_ISSUES.md`.
+A second item from the same review round — an admin DLQ selector said to break on
+sub-millisecond timestamps — was filed and withdrawn: gocql normalizes a `time.Time`
+parameter to milliseconds when it binds it, so the selector matches. See the R26 entry in
+`CHANGELOG.md` and `TestCassandraTimestampBindingNormalizesSubMillisecondParameters`.
 
 (This file carries three overlapping `## 21..25` series from earlier consolidations, so
 cite this entry by its title rather than by its number.)

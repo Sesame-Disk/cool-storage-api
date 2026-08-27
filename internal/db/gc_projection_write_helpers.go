@@ -144,10 +144,16 @@ func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID,
 // cassandraTimestamp collapses an instant to the precision a Cassandra TIMESTAMP
 // actually stores: milliseconds since the epoch, in UTC.
 //
-// It exists for hashing. A value bound to a timestamp COLUMN needs no help — the
-// engine truncates it on the way in and every later comparison sees the truncated
-// value — but a value hashed in Go does, because the hash is computed from the
-// caller's representation and nothing normalizes it.
+// IT EXISTS FOR HASHING, AND ONLY FOR HASHING. A value that reaches Cassandra as a
+// query PARAMETER needs no help: gocql marshals a time.Time as
+// `Unix()*1e3 + Nanosecond()/1e6`, so the driver normalizes it on the way out and a
+// caller holding nanoseconds still addresses the row stored under the truncated
+// value. Do not add normalization to WHERE clauses on the strength of this helper —
+// TestCassandraTimestampBindingNormalizesSubMillisecondParameters pins that they do
+// not need it, against the real engine.
+//
+// What does need help is a value the code turns into a KEY ITSELF, in Go, which never
+// meets the driver at all. That is the bucket below.
 func cassandraTimestamp(ts time.Time) time.Time {
 	return time.UnixMilli(ts.UnixMilli()).UTC()
 }

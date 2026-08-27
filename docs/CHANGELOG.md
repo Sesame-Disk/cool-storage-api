@@ -153,9 +153,10 @@ barrier is built for it, deliberately — there is no upgrade path to protect.
   absence — `candidate_at` must stay a mutable value or every re-decision becomes
   another row.
 - `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **35 mutations**, each
-  removing one invariant and each required to go red with the matching assertion. Eleven
-  are new, including two that edit the MIGRATION itself and one that unpins the candidate
-  authority read's consistency level. Three pieces of existing evidence had
+  removing one invariant and each required to go red with the matching assertion. Twelve
+  are new, including two that edit the MIGRATION itself, one that unpins the candidate
+  authority read's consistency level, and one that hashes the expiry bucket at the
+  caller's precision. Three pieces of existing evidence had
   quietly stopped proving anything and are repaired here: a P4a mutation stopped applying
   when the candidate `DELETE` moved `P` from its `IF` into its `WHERE` (aborting the whole
   run), `TestP4A_ReplacedCandidateServesItsOwnGracePeriod` stopped reaching the grace check
@@ -165,14 +166,22 @@ barrier is built for it, deliberately — there is no upgrade path to protect.
 `gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains
 OPEN, as do P4b/R14b, R15 and the orphan-side R20. `GC_ENABLED=false` continues.
 
-**Deliberately left out, and written down rather than remembered.** Two items came out of
-the review of this slice and are deferred with an owner:
-`ISSUE-GC-DLQ-SELECTOR-TIMESTAMP-PRECISION-01` (the admin DLQ selector parses timestamps at
-nanosecond precision while Cassandra stores milliseconds, so an over-precise selector matches
-nothing — and delete calls that success while requeue calls it a 500; not reachable from the
-UI, which round-trips values it read back), and `TECHNICAL-DEBT.md` → *GC work-item identity:
-creation and durable lookup share one constructor* (splitting `QueueItem.Identity()` into a
-creation form and a durable-lookup form, correct today but wide to change). Both are cross-referenced from the P4c entry in `GC-X1-CLOSURE-OPTIONS.md`.
+**Deliberately left out, and written down rather than remembered.** One item is deferred with
+an owner: `TECHNICAL-DEBT.md` → *GC work-item identity: creation and durable lookup share one
+constructor* (splitting `QueueItem.Identity()` into a creation form and a durable-lookup form,
+correct today but wide to change). It is cross-referenced from the P4c entry in
+`GC-X1-CLOSURE-OPTIONS.md`.
+
+A second one was filed and then **withdrawn**, which is worth recording because the reasoning
+that produced it is easy to repeat. The claim was that the admin DLQ selector, which parses
+RFC3339Nano, could carry sub-millisecond precision and match no row. It cannot: gocql marshals
+a `time.Time` parameter as `Unix()*1e3 + Nanosecond()/1e6`, so the driver normalizes it on the
+way out and the `WHERE` matches the stored value. The boundary rule is narrower than "sub-ms is
+dangerous" — a value that reaches Cassandra as a PARAMETER is normalized for free, and only a
+value the code turns into a key ITSELF, in Go, needs explicit help. The expiry bucket was the
+second kind, which is why it was a real defect and the selector is not.
+`TestCassandraTimestampBindingNormalizesSubMillisecondParameters` pins the first kind against
+the real engine so the claim is not re-derived from first principles a third time.
 
 ---
 
