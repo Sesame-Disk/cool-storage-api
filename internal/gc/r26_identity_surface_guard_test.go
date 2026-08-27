@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,6 +38,18 @@ import (
 //	gc_failed_items             ((org_id), failed_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
 //	gc_failed_items_by_expiry   ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
 const r26StoreSource = "store_cassandra.go"
+
+// r26MutationSources are every file that writes an R26 table.
+//
+// The canonical store is not the only one: gc_failed_items_by_expiry is written
+// through internal/db, which owns that projection's key so the columns and the
+// bucket hash cannot drift apart. A guard that read only store_cassandra.go would
+// leave the half of the key that lives one package over unprotected — correct today,
+// but nothing would say so if it stopped being correct.
+var r26MutationSources = []string{
+	r26StoreSource,
+	filepath.Join("..", "db", "gc_projection_write_helpers.go"),
+}
 
 // r26IdentityColumns lists the columns that make a row addressable, per table.
 var r26IdentityColumns = map[string][]string{
@@ -203,22 +216,29 @@ func r26ParseStore(t *testing.T) *ast.File {
 
 func r26Statements(t *testing.T) []string {
 	t.Helper()
-	file := r26ParseStore(t)
 	var statements []string
-	ast.Inspect(file, func(node ast.Node) bool {
-		literal, ok := node.(*ast.BasicLit)
-		if !ok || literal.Kind != token.STRING {
-			return true
+	for _, source := range r26MutationSources {
+		file, err := parser.ParseFile(token.NewFileSet(), source, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source, err)
 		}
-		text, err := strconv.Unquote(literal.Value)
-		if err != nil || !strings.Contains(text, "gc_") {
+		found := 0
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			text, err := strconv.Unquote(literal.Value)
+			if err != nil || !strings.Contains(text, "gc_") {
+				return true
+			}
+			statements = append(statements, text)
+			found++
 			return true
+		})
+		if found == 0 {
+			t.Fatalf("no CQL literals found in %s; this guard no longer covers that writer", source)
 		}
-		statements = append(statements, text)
-		return true
-	})
-	if len(statements) == 0 {
-		t.Fatal("no CQL literals found in " + r26StoreSource + "; this guard is vacuous")
 	}
 	return statements
 }

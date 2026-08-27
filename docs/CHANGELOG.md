@@ -102,6 +102,15 @@ check is generic, so the next destructive migration inherits the barrier.
   `TestR26CandidateSettlementAlwaysRetiresItsDiscoveryRow`, and
   `TestR26AnyIdentityIsNeverPassedToAMutation` — the "any lifecycle" dedup probe is
   the one value that resolves its row from a fallback, and it must never reach a write.
+  The mutation guard reads BOTH writer surfaces: the canonical store and internal/db,
+  which owns the DLQ expiry projection's key.
+- `TestEveryEvidenceGateIsWiredIntoTestMain` discovers every SESAMEFS_REQUIRE_*_EVIDENCE
+  the integration package uses and requires it in TestMain's chain. The rule was a
+  comment, and the comment did not hold: R26 reached docker-compose and its own tests
+  while the chain kept only P2/P3/P4A, so a standalone R26 evidence run against a dead
+  stack would have exited 0. Masked in the standard run only because P4A is set beside
+  it and P4A *was* wired — the evidence was never false, but the variable did not honour
+  its own contract.
 - SCHEMA gates, because everything above reads Go and the keys live in CQL: dropping
   `P` from a PRIMARY KEY in migration `018` changes no runtime statement, so every
   other gate stays green while a freshly migrated keyspace collapses `P1` and `P2`
@@ -110,12 +119,14 @@ check is generic, so the next destructive migration inherits the barrier.
   `TestR26MigrationKeepsCandidateAtOutOfTheCandidateKey` asserts the matching
   absence — `candidate_at` must stay a mutable value or every re-decision becomes
   another row.
-- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: 30 mutations, each removing
-  one invariant and each required to go red with the matching assertion. Seven are new;
-  one existing P4a mutation had silently stopped applying when the candidate `DELETE`
-  moved `P` from its `IF` into its `WHERE`, and `TestP4A_ReplacedCandidateServesItsOwnGracePeriod`
-  had stopped reaching the grace check at all — both are repaired here. 33 in total,
-  including two that edit the MIGRATION itself.
+- `scripts/p4a-mutation-validation.sh` covers P4a **and** R26: **34 mutations**, each
+  removing one invariant and each required to go red with the matching assertion. Eleven
+  are new, including two that edit the MIGRATION itself and one that unpins the
+  destructive preflight's consistency level. Three pieces of existing evidence had
+  quietly stopped proving anything and are repaired here: a P4a mutation stopped applying
+  when the candidate `DELETE` moved `P` from its `IF` into its `WHERE` (aborting the whole
+  run), `TestP4A_ReplacedCandidateServesItsOwnGracePeriod` stopped reaching the grace check
+  at all, and `TestP4ACandidateRetryLoopIsBounded` was inspecting a two-line wrapper.
 
 **Scope.** This closes the block-candidate / work-item half of R26. The `gc_s3_orphans` and
 `gc_s3_orphans_by_day` half — `DeleteS3Orphan`'s projection clear — is untouched and remains

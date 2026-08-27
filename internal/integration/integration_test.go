@@ -43,9 +43,14 @@ func TestMain(m *testing.M) {
 	// Every evidence gate must be listed here. A gate that is not in this chain still
 	// fails a SKIP inside its own test, but it cannot stop TestMain from exiting 0 when
 	// the stack never came up at all — the run would print "ok" having executed nothing.
+	// TestEveryEvidenceGateIsWiredIntoTestMain enforces the rule above, because a
+	// comment could not: R26 was added to docker-compose and missed here, and the
+	// omission was invisible in the standard run only because P4A happens to be set
+	// alongside it.
 	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_P3_EVIDENCE") == "1" ||
-		os.Getenv("SESAMEFS_REQUIRE_P4A_EVIDENCE") == "1"
+		os.Getenv("SESAMEFS_REQUIRE_P4A_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_R26_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
 		baseURL = "http://localhost:3000"
