@@ -1615,6 +1615,9 @@ func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemTyp
 }
 
 func (m *MockStore) PendingItemExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
+	if err := requireBlockPendingProbeIdentity(itemType, itemID, identity); err != nil {
+		return false, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	libraryID = pendingItemLibraryID(itemType, libraryID)

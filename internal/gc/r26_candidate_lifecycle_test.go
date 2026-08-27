@@ -395,3 +395,37 @@ func TestR26_MutationsRefuseAnIdentityThatNamesNoLifecycle(t *testing.T) {
 		t.Fatalf("PendingItemExists must still accept the any-lifecycle probe: %v", err)
 	}
 }
+
+// TestR26_AnyIdentityPendingProbeIsRefusedForBlocks closes the one place where
+// AnyGCItemIdentity would be answered instead of refused.
+//
+// "Any lifecycle" is a real question for a non-block item: P is empty in the row and
+// empty in the predicate, so dropping identity_at widens the probe to every lifecycle.
+// For a block it is not answerable at all — P is part of the pending key and a block
+// row always carries a real one — so the probe would match nothing and return the
+// plausible, permanent, wrong answer "not pending" for every incarnation at once.
+//
+// The query shape cannot express "any P", so a refusal is the only honest outcome.
+// Nothing asks this today; this is what keeps a future caller from being told no.
+func TestR26_AnyIdentityPendingProbeIsRefusedForBlocks(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	blockID := uuid.New().String()
+
+	if _, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, AnyGCItemIdentity()); err == nil {
+		t.Fatal("a block pending probe with no incarnation must be refused: it can only ever answer " +
+			"\"not pending\", which is indistinguishable from a real negative and never becomes true")
+	}
+
+	// The exact-incarnation probe is unaffected, and still answers.
+	identity := GCItemIdentity{
+		IdentityAt: time.Now().UTC(),
+		BlockCandidate: BlockGCCandidateIdentity{
+			Target:      BlockDeleteTarget{StorageClass: "hot", StorageKey: "blocks/org/" + blockID},
+			CandidateAt: time.Now().UTC(),
+		},
+	}
+	if _, err := store.PendingItemExists(orgID, uuid.Nil, ItemBlock, blockID, identity); err != nil {
+		t.Fatalf("an exact block pending probe must still be answered: %v", err)
+	}
+}

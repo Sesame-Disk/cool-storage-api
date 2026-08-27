@@ -423,7 +423,35 @@ func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, it
 	return true, nil
 }
 
+// requireBlockPendingProbeIdentity refuses a block dedup probe that names no
+// incarnation.
+//
+// AnyGCItemIdentity means "under ANY lifecycle", and for a non-block item that is
+// exactly what the query does: P is empty in the row and empty in the predicate, so
+// omitting identity_at widens it to every lifecycle of that item. For a BLOCK it
+// would quietly mean something else. P is part of the pending row's key and a block
+// row always carries a real one, so a probe with an empty P matches nothing and the
+// honest-looking answer "not pending" would be returned forever, for every
+// incarnation, while the caller believed it had asked about all of them.
+//
+// The query shape cannot express "any P" — that is a partition prefix this key does
+// not offer — so the only correct answers are "the exact incarnation you named" or a
+// refusal. Nothing in the tree asks the other question today; this makes sure that if
+// something starts to, it fails loudly instead of being told no.
+func requireBlockPendingProbeIdentity(itemType ItemType, itemID string, identity GCItemIdentity) error {
+	if itemType != ItemBlock || !identity.Target().IsZero() {
+		return nil
+	}
+	return fmt.Errorf(
+		"gc: pending probe for block %s must name the exact incarnation it is asking about: "+
+			"P is part of the pending row's key, so a probe with no storage class/key can only "+
+			"ever answer \"not pending\"", itemID)
+}
+
 func (s *CassandraStore) PendingItemExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identity GCItemIdentity) (bool, error) {
+	if err := requireBlockPendingProbeIdentity(itemType, itemID, identity); err != nil {
+		return false, err
+	}
 	// Read under the same coerced key the write/delete helpers use, so a block dedup
 	// probe always inspects the canonical uuid.Nil partition regardless of the caller.
 	libraryID = pendingItemLibraryID(itemType, libraryID)
