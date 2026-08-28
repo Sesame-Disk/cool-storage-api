@@ -1923,12 +1923,13 @@ func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID strin
 // discovery projection is deliberately not consulted here: recovery uses this
 // row for phase, external SHA-1 characterization, and backend selection. The
 // SameTarget publication path uses the same read to confirm that writers in
-// every DC can observe the fence before FinalizeBlockDelete is allowed.
-// EACH_QUORUM provides the same cross-DC visibility contract as the destructive
-// liveness read, but this ordinary SELECT is not a Paxos settlement and does
-// not authorize a physical delete by itself. Confirmation relies on Cassandra's
-// default blocking read repair: an EACH_QUORUM read that finds replica
-// divergence repairs the replicas it contacted before returning.
+// every DC can observe the fence before FinalizeBlockDelete is allowed, and
+// that recovery_phase is still pending_s3. EACH_QUORUM provides the same
+// cross-DC visibility contract as the destructive liveness read, but this
+// ordinary SELECT is not a Paxos settlement and does not authorize a physical
+// delete by itself. Confirmation relies on Cassandra's default blocking read
+// repair: an EACH_QUORUM read that finds replica divergence repairs the
+// replicas it contacted before returning. It does not refresh the row TTL.
 func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3OrphanInfo, bool, error) {
 	var info S3OrphanInfo
 	var firstSeenAt time.Time
@@ -2141,6 +2142,11 @@ func classifyCanonicalOrphanVisibility(info S3OrphanInfo, found bool, readErr er
 	if !stored.Equal(expected) {
 		visible.Outcome = StartBlockDeleteOrphanInvalid
 		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan visible first_seen_at %v does not match settled token %v", stored, expected))
+		return visible
+	}
+	if strings.TrimSpace(info.RecoveryPhase) != S3OrphanPhasePendingS3 {
+		visible.Outcome = StartBlockDeleteOrphanLifecycleAdvanced
+		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", strings.TrimSpace(info.RecoveryPhase)))
 	}
 	return visible
 }
@@ -2194,6 +2200,15 @@ func (s *CassandraStore) settleS3OrphanState(orgID uuid.UUID, blockID string) (s
 		return s3OrphanCASRow{}, true, parseErr
 	}
 	return parsed, true, nil
+}
+
+// ClassifySettledS3OrphanForTest runs the SERIAL settlement read used after an
+// uncertain StartBlockDeleteOrphan LWT and classifies that row. It does not
+// confirm EACH_QUORUM visibility or repair the projection. Production
+// publication must go through StartBlockDeleteOrphan.
+func (s *CassandraStore) ClassifySettledS3OrphanForTest(orgID uuid.UUID, blockID string, proposed BlockDeleteTarget) StartBlockDeleteOrphanResult {
+	row, found, err := s.settleS3OrphanState(orgID, blockID)
+	return resultFromSettledS3Orphan(row, found, err, proposed, nil)
 }
 
 func (s *CassandraStore) ensureS3OrphanProjectionResult(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {

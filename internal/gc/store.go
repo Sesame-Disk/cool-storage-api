@@ -96,6 +96,12 @@ const (
 	// whose discovery projection was not acknowledged. The worker must not finalize
 	// the block while recovery discovery is unconfirmed.
 	GCFailureCodeBlockOrphanProjectionUnconfirmed = "block_orphan_projection_unconfirmed"
+	// GCFailureCodeBlockOrphanLifecycleAdvanced marks a same-P orphan whose recovery
+	// phase has already left pending_s3. Recovery treats pending_mapping_cleanup as
+	// "S3 already succeeded" and does not consult BlockExists, so authorizing
+	// FinalizeBlockDelete from that row would drop the blocks fence while recovery
+	// can still clear the orphan. The claim, candidate and queue stay untouched.
+	GCFailureCodeBlockOrphanLifecycleAdvanced = "block_orphan_lifecycle_advanced"
 	// GCFailureCodeBlockOrphanInvalid marks a publication whose proposed identity, or
 	// the identity already stored on the canonical row, cannot be used. It is
 	// deliberately NOT GCFailureCodeBlockAuthorityInvalid: that code postpones, and
@@ -798,8 +804,10 @@ const (
 	// inserted at EACH_QUORUM and its discovery projection was acknowledged.
 	StartBlockDeleteOrphanCreated
 	// StartBlockDeleteOrphanSameTarget means an existing orphan carries the exact
-	// proposed physical identity, that row is visible at EACH_QUORUM, and the
-	// discovery projection was acknowledged. Its lifecycle state was not changed.
+	// proposed physical identity, that row is visible at EACH_QUORUM, still in
+	// pending_s3, and the discovery projection was acknowledged. Its lifecycle
+	// state was not changed. Confirmation proves visibility now; it does not
+	// renew the row's remaining TTL (R27/R28).
 	StartBlockDeleteOrphanSameTarget
 	// StartBlockDeleteOrphanDifferentTarget means an existing orphan carries a
 	// different physical identity. The existing lifecycle was not changed.
@@ -811,6 +819,10 @@ const (
 	// StartBlockDeleteOrphanProjectionUnconfirmed means the canonical orphan is
 	// known, but its discovery projection was not durably acknowledged.
 	StartBlockDeleteOrphanProjectionUnconfirmed
+	// StartBlockDeleteOrphanLifecycleAdvanced means the existing row matches the
+	// proposed physical identity but is no longer in pending_s3, so it cannot
+	// authorize a new physical delete. The existing lifecycle was not changed.
+	StartBlockDeleteOrphanLifecycleAdvanced
 )
 
 func (o StartBlockDeleteOrphanOutcome) String() string {
@@ -829,6 +841,8 @@ func (o StartBlockDeleteOrphanOutcome) String() string {
 		return "invalid"
 	case StartBlockDeleteOrphanProjectionUnconfirmed:
 		return "projection_unconfirmed"
+	case StartBlockDeleteOrphanLifecycleAdvanced:
+		return "lifecycle_advanced"
 	default:
 		return "unknown"
 	}

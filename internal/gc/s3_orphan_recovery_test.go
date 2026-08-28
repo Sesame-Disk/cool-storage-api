@@ -730,23 +730,15 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	}
 }
 
-// TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase pins the side of the
-// write-once trade that is easy to mistake for a defect, so read the sign carefully.
-//
-// The previous entry point rewound an existing row to pending_s3 on every publish. That
-// is what this test's ancestor asserted, and it is exactly the shape P4b-1 removed: a
-// rewind aims a second physical delete at a key a NEW incarnation may already have
-// re-created, which is live-content loss. Write-once refuses to rewind, and the price is
-// visible right here — a block re-uploaded while its old row sat at
-// pending_mapping_cleanup, then condemned again, resolves to the same P, so recovery
-// inherits the completed phase and performs NO delete. The object leaks.
-//
-// Leak over loss is the accepted trade, and only until the orphan row carries the
-// incarnation that separates "resume" from "new lifecycle at the same P" — R14b. If that
-// binding lands, this expectation changes with it. The processBlock form of the same
-// leak — inline S3 retries exhausted after inheriting this phase — is
-// TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete.
-func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
+// TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan
+// pins the write-once / phase split. Publication no longer rewinds pending_s3, and it
+// also must not treat pending_mapping_cleanup as permission to FinalizeBlockDelete:
+// recovery on that phase does not consult BlockExists, so dropping the blocks row
+// first would open a live-content window. Recovery may still clear the completed-phase
+// row without a physical delete; the claimed block stays until a later Created
+// publication can start a new pending_s3 fence. R14b is what binds that later
+// publication to the current claim.
+func TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -767,11 +759,8 @@ func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
 		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
 	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC())
-	if result.Outcome != StartBlockDeleteOrphanSameTarget {
-		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v", result.Outcome, result.Cause)
-	}
-	if err := store.FinalizeBlockDelete(orgID, blockID, authority); err != nil {
-		t.Fatalf("FinalizeBlockDelete: %v", err)
+	if result.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v, want lifecycle_advanced", result.Outcome, result.Cause)
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -784,12 +773,15 @@ func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
+	if store.GetBlock(orgID, blockID) == nil {
+		t.Fatal("lifecycle-advanced publication must not have finalized the claimed block")
+	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-new") {
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
 	if len(deleted) != 0 {
-		t.Fatalf("same-target resume must preserve the completed S3 phase, got deletes %v", deleted)
+		t.Fatalf("completed-phase recovery must not delete S3, got deletes %v", deleted)
 	}
 }
 

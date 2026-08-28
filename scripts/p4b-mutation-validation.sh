@@ -112,6 +112,20 @@ m_projection_publish_downgrades_to_local_quorum() {
   restore
 }
 
+m_same_target_ignores_recovery_phase() {
+  mutate "$STORE" 's{if strings\.TrimSpace\(info\.RecoveryPhase\) != S3OrphanPhasePendingS3}{if false && strings.TrimSpace(info.RecoveryPhase) != S3OrphanPhasePendingS3}'
+  expect_red 'TestP4B_CanonicalVisibilityClassification' 'pending_mapping_cleanup must not authorize finalize' \
+    'SameTarget authorizes finalize for a lifecycle that already declared S3 complete'
+  restore
+}
+
+m_same_target_compares_only_storage_key() {
+  mutate "$STORE" 's{if row\.Target == proposed}{if row.Target.StorageKey == proposed.StorageKey}'
+  expect_red 'TestP4B_SettledOrphanClassification' 'want different_target' \
+    'exact-P classification compares only storage_key and treats a different class as same-target'
+  restore
+}
+
 MUTATIONS=(
   m_lwt_loses_write_once
   m_settlement_read_is_ordinary
@@ -121,6 +135,8 @@ MUTATIONS=(
   m_empty_nonapplied_means_not_published
   m_same_target_skips_canonical_each_quorum_confirmation
   m_projection_publish_downgrades_to_local_quorum
+  m_same_target_ignores_recovery_phase
+  m_same_target_compares_only_storage_key
 )
 
 if [ "${1:-}" = "--list" ]; then

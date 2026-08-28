@@ -8,6 +8,22 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4b-1 follow-up: SameTarget requires pending_s3, not only identity
+
+Closed the remaining P4b-1 publication hole without opening R14b.
+
+- `SameTarget` now requires `recovery_phase = pending_s3` after the canonical
+  `EACH_QUORUM` read. A visible same-P row at `pending_mapping_cleanup` is
+  `LifecycleAdvanced`: no `FinalizeBlockDelete`, claim/candidate/queue untouched.
+  Recovery on that phase still does not consult `BlockExists`.
+- R22a's lexical allowlist matches the Created vs SameTarget split
+  (`StartBlockDeleteOrphan` 1, `confirmSameTargetOrphanResult` 1).
+- Real-Cassandra evidence covers SERIAL settlement classification, the advanced-phase
+  refusal, and effective `read_repair=BLOCKING`. Two further mutations pin the phase
+  gate and exact-P comparison.
+
+R14b claim→orphan binding remains OPEN. `GC_ENABLED=false` remains required.
+
 ## 2026-08-27 - P4b-1 follow-up: SERIAL settlement is not EACH_QUORUM visibility
 
 Closed two publication-classification holes without opening R14b.

@@ -603,6 +603,7 @@ func shouldLeaveQueueUntouched(err error) bool {
 	case GCFailureCodeBlockClaimForeignOwner,
 		GCFailureCodeBlockOrphanUnsettled,
 		GCFailureCodeBlockOrphanProjectionUnconfirmed,
+		GCFailureCodeBlockOrphanLifecycleAdvanced,
 		GCFailureCodeBlockOrphanInvalid:
 		return true
 	default:
@@ -1703,7 +1704,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	case StartBlockDeleteOrphanCreated, StartBlockDeleteOrphanSameTarget:
 		// Created already proved canonical EACH_QUORUM on the LWT. SameTarget carries
 		// the stored lifecycle token and is returned only after canonical EACH_QUORUM
-		// visibility and the identity-only discovery projection were acknowledged.
+		// visibility, a still-pending_s3 phase, and the identity-only discovery
+		// projection were acknowledged.
 		if publication.FirstSeenAt.IsZero() {
 			return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: errors.New("orphan publication returned no first_seen_at")}
 		}
@@ -1721,6 +1723,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	case StartBlockDeleteOrphanProjectionUnconfirmed:
 		w.recordDestructiveBlocked(destructivePathBlock)
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanProjectionUnconfirmed, Err: publication.Cause}
+	case StartBlockDeleteOrphanLifecycleAdvanced:
+		w.recordDestructiveBlocked(destructivePathBlock)
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanLifecycleAdvanced, Err: publication.Cause}
 	case StartBlockDeleteOrphanInvalid:
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanInvalid, Err: publication.Cause}
 	default:

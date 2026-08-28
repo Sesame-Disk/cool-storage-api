@@ -150,7 +150,7 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     the write-once trade recorded under the S3 orphan recovery section below.
   - **Tests** pin the current finalization and write-once behavior:
     `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock`
-    and `TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase`.
+    and `TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan`.
 - `R11a` — physical GC no longer deletes the logical forward mapping. The mapping belongs
   to the SHA-1 -> SHA-256 relationship rather than to a physical block incarnation. The
   historical `pending_mapping_cleanup` phase remains for restart compatibility, but now
@@ -468,19 +468,15 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       existing row to `pending_s3`, because a stale row left at `pending_mapping_cleanup` makes
       recovery SKIP the physical delete. Preserving the existing lifecycle brings that case
       back: a block re-uploaded while its old row still sits at `pending_mapping_cleanup`, then
-      condemned again, resolves to the SAME `(storage_class, storage_key)`, so publication is a
-      same-target resume and the phase is not rewound. The inline delete in `processBlock`
-      still removes the object on the success path, so a leak remains if that delete never
-      completes: a crash between publication and the delete, **or** the inline delete
-      exhausting its retries while the inherited phase stays `pending_mapping_cleanup`.
-      Recovery then treats the row as "S3 already succeeded" and clears it without a
-      physical delete. The cost is a LEAKED object, not a lost one. The reset traded that
-      leak for the opposite risk: rewinding a lifecycle that had already deleted the object
-      aims a second physical delete at a key a new incarnation may have re-created, which
-      is live-content loss. Leak over loss is the accepted trade until the orphan row
-      carries the incarnation that would tell the two apart — R14b. Pinned by
-      `TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase` and
-      `TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete`.
+      condemned again, resolves to the SAME `(storage_class, storage_key)`. Publication now
+      classifies that as `LifecycleAdvanced` and does not authorize `FinalizeBlockDelete`,
+      because recovery on that phase does not consult `BlockExists`. Recovery may still
+      clear the completed-phase row without a physical delete. For this stale-phase
+      ambiguity, write-once stays leak-biased rather than aiming a second delete at a key
+      a new incarnation may have re-created. Full loss-freedom still requires the
+      incarnation binding — R14b. Pinned by
+      `TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan`
+      and `TestP4B_WorkerLifecycleAdvancedDoesNotFinalize`.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** The canonical block lookup hits a
 full partition key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone

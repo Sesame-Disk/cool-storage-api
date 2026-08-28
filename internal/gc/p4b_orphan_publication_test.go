@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,14 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	if strings.Contains(classifier, "StartBlockDeleteOrphanNotPublished") {
 		t.Fatal("classifyNonAppliedOrphanCAS must not emit NotPublished; empty CAS is not proof of absence")
 	}
+
+	visibility := formattedGCFunction(t, file, "classifyCanonicalOrphanVisibility")
+	if !strings.Contains(visibility, "S3OrphanPhasePendingS3") {
+		t.Fatal("SameTarget confirmation must require pending_s3 before authorizing finalize")
+	}
+	if !strings.Contains(visibility, "StartBlockDeleteOrphanLifecycleAdvanced") {
+		t.Fatal("a visible same-P row past pending_s3 must be classified as lifecycle_advanced, not SameTarget")
+	}
 }
 
 func TestP4B_OrphanProjectionPinsEachQuorum(t *testing.T) {
@@ -124,6 +133,27 @@ func TestP4B_CanonicalOrphanSchemaDoesNotDisableBlockingReadRepair(t *testing.T)
 	table := strings.ToLower(rest[:end])
 	if strings.Contains(table, "read_repair") && strings.Contains(table, "none") {
 		t.Fatal("gc_s3_orphans must not set read_repair='NONE'; SameTarget confirmation relies on blocking read repair at EACH_QUORUM")
+	}
+
+	entries, err := os.ReadDir(filepath.Join("..", "db", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".cql") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "db", "migrations", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(body))
+		if !strings.Contains(lower, "read_repair") || !strings.Contains(lower, "none") {
+			continue
+		}
+		if strings.Contains(lower, "alter table gc_s3_orphans ") || strings.Contains(lower, "alter table gc_s3_orphans\n") || strings.Contains(lower, "alter table gc_s3_orphans\t") {
+			t.Fatalf("%s disables blocking read repair on gc_s3_orphans; SameTarget confirmation relies on BLOCKING", entry.Name())
+		}
 	}
 }
 
@@ -211,27 +241,30 @@ func TestP4B_CanonicalVisibilityClassification(t *testing.T) {
 	}
 
 	visible := classifyCanonicalOrphanVisibility(S3OrphanInfo{
-		StorageClass: proposed.StorageClass,
-		StorageKey:   proposed.StorageKey,
-		FirstSeenAt:  token,
+		StorageClass:  proposed.StorageClass,
+		StorageKey:    proposed.StorageKey,
+		FirstSeenAt:   token,
+		RecoveryPhase: S3OrphanPhasePendingS3,
 	}, true, nil, proposed, token, prior)
 	if visible.Outcome != StartBlockDeleteOrphanSameTarget {
 		t.Fatalf("matching EACH_QUORUM row = %s, want same_target", visible.Outcome)
 	}
 
 	other := classifyCanonicalOrphanVisibility(S3OrphanInfo{
-		StorageClass: "cold",
-		StorageKey:   proposed.StorageKey,
-		FirstSeenAt:  token,
+		StorageClass:  "cold",
+		StorageKey:    proposed.StorageKey,
+		FirstSeenAt:   token,
+		RecoveryPhase: S3OrphanPhasePendingS3,
 	}, true, nil, proposed, token, prior)
 	if other.Outcome != StartBlockDeleteOrphanDifferentTarget {
 		t.Fatalf("visible different target = %s, want different_target", other.Outcome)
 	}
 
 	mismatchedToken := classifyCanonicalOrphanVisibility(S3OrphanInfo{
-		StorageClass: proposed.StorageClass,
-		StorageKey:   proposed.StorageKey,
-		FirstSeenAt:  token.Add(time.Second),
+		StorageClass:  proposed.StorageClass,
+		StorageKey:    proposed.StorageKey,
+		FirstSeenAt:   token.Add(time.Second),
+		RecoveryPhase: S3OrphanPhasePendingS3,
 	}, true, nil, proposed, token, prior)
 	if mismatchedToken.Outcome != StartBlockDeleteOrphanInvalid {
 		t.Fatalf("EACH_QUORUM first_seen_at mismatch = %s, want invalid", mismatchedToken.Outcome)
@@ -244,6 +277,25 @@ func TestP4B_CanonicalVisibilityClassification(t *testing.T) {
 	}, true, nil, proposed, token, prior)
 	if incomplete.Outcome != StartBlockDeleteOrphanInvalid {
 		t.Fatalf("EACH_QUORUM incomplete identity = %s, want invalid", incomplete.Outcome)
+	}
+
+	advanced := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass:  proposed.StorageClass,
+		StorageKey:    proposed.StorageKey,
+		FirstSeenAt:   token,
+		RecoveryPhase: S3OrphanPhasePendingMappingCleanup,
+	}, true, nil, proposed, token, prior)
+	if advanced.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("pending_mapping_cleanup must not authorize finalize: got %s", advanced.Outcome)
+	}
+
+	emptyPhase := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass: proposed.StorageClass,
+		StorageKey:   proposed.StorageKey,
+		FirstSeenAt:  token,
+	}, true, nil, proposed, token, prior)
+	if emptyPhase.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("empty recovery_phase must not authorize finalize: got %s", emptyPhase.Outcome)
 	}
 }
 
@@ -360,6 +412,15 @@ func TestP4B_WorkerAmbiguousAndInvalidLeaveQueueUntouched(t *testing.T) {
 			configure: func(store *MockStore, orgID uuid.UUID, blockID string, candidateAt time.Time) {
 				seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-existing", "existing failure", candidateAt)
 				store.SetS3OrphanStorageKeyForTest(orgID, blockID, " ")
+			},
+		},
+		{
+			name: "advanced recovery phase",
+			configure: func(store *MockStore, orgID uuid.UUID, blockID string, candidateAt time.Time) {
+				firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-existing", "", candidateAt)
+				if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-existing", firstSeenAt.Add(time.Minute)); err != nil {
+					t.Fatalf("advance orphan phase: %v", err)
+				}
 			},
 		},
 	}
@@ -503,6 +564,15 @@ func TestP4B_WorkerPublicationRefusalRecordsBlockPathNotOrphan(t *testing.T) {
 				store.SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest()
 			},
 		},
+		{
+			name: "lifecycle advanced",
+			configure: func(store *MockStore, orgID uuid.UUID, blockID string, candidateAt time.Time) {
+				firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-existing", "", candidateAt)
+				if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-existing", firstSeenAt.Add(time.Minute)); err != nil {
+					t.Fatalf("advance orphan phase: %v", err)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -535,44 +605,45 @@ func TestP4B_WorkerPublicationRefusalRecordsBlockPathNotOrphan(t *testing.T) {
 	}
 }
 
-func TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete(t *testing.T) {
-	defer shortRetries(t)()
-
+func TestP4B_WorkerLifecycleAdvancedDoesNotFinalize(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
-	sp.FailAlways(errors.New("s3 down"))
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 	orgID := uuid.New()
-	blockID := testSHA256BlockID("p4b-stale-phase-inline-fail")
+	blockID := testSHA256BlockID("p4b-lifecycle-advanced")
 	store.AddBlock(orgID, blockID, "hot", 0)
 	store.AddBlockMapping(orgID, "sha1-new", blockID)
 	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
 	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
 		t.Fatalf("advance stale orphan phase: %v", err)
 	}
-	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", time.Now().UTC().Add(-2*time.Hour), 0)
+	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	candidate := ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
 
 	n, err := w.ProcessOnce(context.Background())
-	if err != nil || n != 1 {
-		t.Fatalf("ProcessOnce() = (%d, %v), want queue completion after recording the failed inline delete", n, err)
+	if err != nil || n != 0 {
+		t.Fatalf("ProcessOnce() = (%d, %v), want fail-closed refusal", n, err)
 	}
-	if store.GetBlock(orgID, blockID) != nil {
-		t.Fatal("canonical block must be finalized before the inline S3 failure is recorded")
+	block := store.GetBlock(orgID, blockID)
+	if block == nil || block.GCState != "deleting" || block.GCClaimID == "" {
+		t.Fatalf("pending_mapping_cleanup must not authorize finalize: block=%+v", block)
 	}
-	orphans := store.AllS3Orphans()
-	if len(orphans) != 1 || orphans[0].RecoveryPhase != S3OrphanPhasePendingMappingCleanup || orphans[0].LastError == "" {
-		t.Fatalf("inherited pending_mapping_cleanup must survive the inline S3 failure: %+v", orphans)
+	if store.QueueCompleteCallsForTest() != 0 || store.QueueRequeueCallsForTest() != 0 || store.QueueFailCallsForTest() != 0 {
+		t.Fatalf("queue lifecycle calls = complete:%d requeue:%d fail:%d, want all zero", store.QueueCompleteCallsForTest(), store.QueueRequeueCallsForTest(), store.QueueFailCallsForTest())
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
+		t.Fatalf("candidate was consumed after lifecycle-advanced refusal: ok=%v err=%v", ok, err)
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
-		t.Fatalf("inline S3 delete succeeded unexpectedly: %v", got)
+		t.Fatalf("lifecycle-advanced publication must not delete S3: %v", got)
 	}
 
 	recovered, recErr := w.RecoverS3Orphans(context.Background(), 100)
 	if recErr != nil || recovered != 1 {
-		t.Fatalf("RecoverS3Orphans() = (%d, %v), want 1 finalized without a physical delete", recovered, recErr)
+		t.Fatalf("RecoverS3Orphans() = (%d, %v), want 1 post-S3 finalization without a physical delete", recovered, recErr)
 	}
-	if store.S3OrphanCount() != 0 {
-		t.Fatalf("recovery cleared no orphan row, got %d", store.S3OrphanCount())
+	if store.GetBlock(orgID, blockID) == nil {
+		t.Fatal("recovery of pending_mapping_cleanup must not remove the still-claimed block")
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Fatalf("recovery must skip the physical delete for pending_mapping_cleanup, got %v", got)

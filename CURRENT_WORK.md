@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-27
-**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 now settles empty CAS via SERIAL, confirms canonical EACH_QUORUM before SameTarget, and keeps R14b claim->orphan binding OPEN
+**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 SameTarget requires pending_s3 and canonical EACH_QUORUM; R14b claim->orphan binding stays OPEN
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -110,22 +110,21 @@ pending state.
 **P4b-1 update (2026-08-27):** `StartBlockDeleteOrphan` now publishes the canonical row
 with a write-once `EachQuorum + Serial` LWT and no driver retry/speculation. Its result is
 classified as `Created`, `SameTarget`, `DifferentTarget`, `NotPublished`, `Ambiguous`,
-`Invalid` or `ProjectionUnconfirmed`; same-target resumes use the stored `first_seen_at`
-and repair the identity-only discovery projection. The worker only releases/postpones a
-confirmed conflict or absent settled row; uncertain, malformed or unconfirmed projection
-states retain claim, candidate and queue lifecycle. Publication-invalid has its own
+`Invalid`, `ProjectionUnconfirmed` or `LifecycleAdvanced`; same-target resumes use the stored `first_seen_at`
+and repair the identity-only discovery projection only while the row is still `pending_s3`.
+The worker only releases/postpones a
+confirmed conflict or absent settled row; uncertain, malformed, unconfirmed projection
+or advanced-phase states retain claim, candidate and queue lifecycle. Publication-invalid has its own
 failure code: the untouched check runs before the postpone check, so reusing
 `block_authority_invalid` would have silently taken the candidate-authority error off the
-postpone path P4a had just put it on. Unit coverage and eight deliberate
+postpone path P4a had just put it on. Unit coverage and ten deliberate
 mutations are green/red as required, and real-Cassandra evidence is gated by
-`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. Write-once also drops the stale-phase reset, which
-trades an object LEAK for the live-content LOSS the reset risked. The leak is not
-only a crash between publication and the inline S3 delete: a `SameTarget` resume
-that inherits `pending_mapping_cleanup` and then fails that inline delete after
-retries still completes the queue item, and recovery skips the physical delete.
-Recorded on the R14b row rather than treated as closed. `SameTarget` now also
-confirms canonical `EACH_QUORUM` visibility before finalize, and `NotPublished`
-requires SERIAL-confirmed absence. This is P4b-1 only: the remaining R14b work must carry
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. Write-once also drops the stale-phase reset.
+A same-P row already at `pending_mapping_cleanup` no longer authorizes finalize; recovery
+may still clear that completed-phase row without a physical delete. For that stale-phase
+ambiguity itself the trade stays leak-biased until R14b binds incarnation. `SameTarget`
+confirms canonical `EACH_QUORUM` visibility before finalize, does not renew TTL, and
+`NotPublished` requires SERIAL-confirmed absence. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)
