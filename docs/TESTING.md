@@ -942,9 +942,10 @@ docker exec dc3run sh -c 'cp /tmp/sc.bak internal/gc/store_cassandra.go'
 
 ### P4b orphan publication evidence
 
-The P4b unit contract covers the write-once LWT, SERIAL settlement, stored
-`first_seen_at`, target conflicts and projection uncertainty. The mutation script
-proves those guards are load-bearing:
+The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical
+`EACH_QUORUM` visibility before `SameTarget` success, stored `first_seen_at`,
+target conflicts and projection uncertainty. The mutation script proves those
+guards are load-bearing:
 
 ```bash
 docker compose run --rm --build gotest bash scripts/p4b-mutation-validation.sh

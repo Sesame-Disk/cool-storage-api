@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-27
-**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 publication is implemented with unit/mutation coverage, while full R14b claim->orphan binding, strict A+ non-overlap and R18/R27 remain open
+**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 now settles empty CAS via SERIAL, confirms canonical EACH_QUORUM before SameTarget, and keeps R14b claim->orphan binding OPEN
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -116,11 +116,16 @@ confirmed conflict or absent settled row; uncertain, malformed or unconfirmed pr
 states retain claim, candidate and queue lifecycle. Publication-invalid has its own
 failure code: the untouched check runs before the postpone check, so reusing
 `block_authority_invalid` would have silently taken the candidate-authority error off the
-postpone path P4a had just put it on. Unit coverage and five deliberate
+postpone path P4a had just put it on. Unit coverage and eight deliberate
 mutations are green/red as required, and real-Cassandra evidence is gated by
 `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. Write-once also drops the stale-phase reset, which
-trades a bounded object LEAK for the live-content LOSS the reset risked; recorded on the
-R14b row rather than treated as closed. This is P4b-1 only: the remaining R14b work must carry
+trades an object LEAK for the live-content LOSS the reset risked. The leak is not
+only a crash between publication and the inline S3 delete: a `SameTarget` resume
+that inherits `pending_mapping_cleanup` and then fails that inline delete after
+retries still completes the queue item, and recovery skips the physical delete.
+Recorded on the R14b row rather than treated as closed. `SameTarget` now also
+confirms canonical `EACH_QUORUM` visibility before finalize, and `NotPublished`
+requires SERIAL-confirmed absence. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)

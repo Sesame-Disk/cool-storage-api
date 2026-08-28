@@ -469,13 +469,18 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       recovery SKIP the physical delete. Preserving the existing lifecycle brings that case
       back: a block re-uploaded while its old row still sits at `pending_mapping_cleanup`, then
       condemned again, resolves to the SAME `(storage_class, storage_key)`, so publication is a
-      same-target resume and the phase is not rewound. The inline delete in `processBlock` still
-      removes the object, so the window is a crash between publication and that delete — and its
-      cost is a LEAKED object, not a lost one. The reset traded that leak for the opposite risk:
-      rewinding a lifecycle that had already deleted the object aims a second physical delete at
-      a key a new incarnation may have re-created, which is live-content loss. Leak over loss is
-      the accepted trade until the orphan row carries the incarnation that would tell the two
-      apart — R14b. Pinned by `TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase`.
+      same-target resume and the phase is not rewound. The inline delete in `processBlock`
+      still removes the object on the success path, so a leak remains if that delete never
+      completes: a crash between publication and the delete, **or** the inline delete
+      exhausting its retries while the inherited phase stays `pending_mapping_cleanup`.
+      Recovery then treats the row as "S3 already succeeded" and clears it without a
+      physical delete. The cost is a LEAKED object, not a lost one. The reset traded that
+      leak for the opposite risk: rewinding a lifecycle that had already deleted the object
+      aims a second physical delete at a key a new incarnation may have re-created, which
+      is live-content loss. Leak over loss is the accepted trade until the orphan row
+      carries the incarnation that would tell the two apart — R14b. Pinned by
+      `TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase` and
+      `TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete`.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** The canonical block lookup hits a
 full partition key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone

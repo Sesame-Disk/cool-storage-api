@@ -8,6 +8,27 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4b-1 follow-up: SERIAL settlement is not EACH_QUORUM visibility
+
+Closed two publication-classification holes without opening R14b.
+
+- `SameTarget` no longer authorizes `FinalizeBlockDelete` from a SERIAL observation
+  or a non-applied CAS row alone. The canonical `gc_s3_orphans` identity must be
+  visible at `EACH_QUORUM` before the discovery projection is repaired. `Created`
+  still relies on the LWT's own `EACH_QUORUM` commit.
+- An empty non-applied CAS map is settled in the SERIAL domain. `NotPublished`
+  is emitted only when that settlement confirms absence, which is the contract the
+  worker uses to release a claim.
+- The accepted same-P leak is documented as crash **or** inline S3 delete exhausting
+  retries after inheriting `pending_mapping_cleanup`, and is pinned through
+  `processBlock` as well as recovery. Publication refusals record the `block`
+  destructive path, not `orphan`.
+- Source, classification and worker tests plus three additional P4b mutations
+  (`empty non-applied`, `SameTarget` skipping canonical confirmation, projection
+  `EACH_QUORUM`) hold the new contract.
+
+R14b claim→orphan binding remains OPEN. `GC_ENABLED=false` remains required.
+
 ## 2026-08-27 - P4b-1: write-once orphan publication and classified outcomes
 
 Implemented the P4b-1 publication boundary without claiming full P4b/R14b closure.

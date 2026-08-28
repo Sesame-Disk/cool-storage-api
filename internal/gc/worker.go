@@ -1701,8 +1701,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	var orphanFirstSeenAt time.Time
 	switch publication.Outcome {
 	case StartBlockDeleteOrphanCreated, StartBlockDeleteOrphanSameTarget:
-		// SameTarget carries the canonical lifecycle's token. The store only returns
-		// these outcomes after the identity-only discovery projection was acknowledged.
+		// Created already proved canonical EACH_QUORUM on the LWT. SameTarget carries
+		// the stored lifecycle token and is returned only after canonical EACH_QUORUM
+		// visibility and the identity-only discovery projection were acknowledged.
 		if publication.FirstSeenAt.IsZero() {
 			return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: errors.New("orphan publication returned no first_seen_at")}
 		}

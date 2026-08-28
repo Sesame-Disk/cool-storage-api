@@ -790,14 +790,16 @@ type S3OrphanInfo struct {
 type StartBlockDeleteOrphanOutcome int
 
 const (
-	// StartBlockDeleteOrphanAmbiguous means neither the LWT nor its serial
-	// settlement established whether the orphan was published.
+	// StartBlockDeleteOrphanAmbiguous means the worker must not finalize: the LWT
+	// was uncertain and serial settlement, or canonical EACH_QUORUM visibility,
+	// could not be established.
 	StartBlockDeleteOrphanAmbiguous StartBlockDeleteOrphanOutcome = iota
 	// StartBlockDeleteOrphanCreated means the proposed physical identity was
-	// inserted and its discovery projection was acknowledged.
+	// inserted at EACH_QUORUM and its discovery projection was acknowledged.
 	StartBlockDeleteOrphanCreated
 	// StartBlockDeleteOrphanSameTarget means an existing orphan carries the exact
-	// proposed physical identity. Its lifecycle state was not changed.
+	// proposed physical identity, that row is visible at EACH_QUORUM, and the
+	// discovery projection was acknowledged. Its lifecycle state was not changed.
 	StartBlockDeleteOrphanSameTarget
 	// StartBlockDeleteOrphanDifferentTarget means an existing orphan carries a
 	// different physical identity. The existing lifecycle was not changed.

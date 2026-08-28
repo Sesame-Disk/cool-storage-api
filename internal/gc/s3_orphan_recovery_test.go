@@ -743,7 +743,9 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 //
 // Leak over loss is the accepted trade, and only until the orphan row carries the
 // incarnation that separates "resume" from "new lifecycle at the same P" — R14b. If that
-// binding lands, this expectation changes with it.
+// binding lands, this expectation changes with it. The processBlock form of the same
+// leak — inline S3 retries exhausted after inheriting this phase — is
+// TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete.
 func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}

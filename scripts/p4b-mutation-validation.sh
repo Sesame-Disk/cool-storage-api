@@ -91,12 +91,36 @@ m_publication_invalid_reuses_the_candidate_code() {
   restore
 }
 
+m_empty_nonapplied_means_not_published() {
+  mutate "$STORE" 's{StartBlockDeleteOrphanResult\{Outcome: StartBlockDeleteOrphanAmbiguous\},\s+NeedsSettlement: true}{StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanNotPublished}}'
+  expect_red 'TestP4B_EmptyNonAppliedCASRequiresSerialSettlement' 'empty non-applied CAS is not proof of absence' \
+    'empty non-applied CAS is classified as NotPublished without SERIAL settlement'
+  restore
+}
+
+m_same_target_skips_canonical_each_quorum_confirmation() {
+  mutate "$STORE" 's{info, found, err := s\.GetS3OrphanGlobal\(orgID, blockID\)\s+confirmed := classifyCanonicalOrphanVisibility\(info, found, err, proposed, result\.FirstSeenAt, result\)\s+if confirmed\.Outcome != StartBlockDeleteOrphanSameTarget \{\s+return confirmed\s+\}\s+return s\.ensureS3OrphanProjectionResult\(orgID, blockID, confirmed\)}{return s.ensureS3OrphanProjectionResult(orgID, blockID, result)}'
+  expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'SameTarget confirmation must read the canonical row at EACH_QUORUM through GetS3OrphanGlobal' \
+    'SameTarget authorizes finalize without confirming canonical EACH_QUORUM visibility'
+  restore
+}
+
+m_projection_publish_downgrades_to_local_quorum() {
+  mutate "$STORE" 's{(func \(s \*CassandraStore\) upsertS3OrphanProjection.*?Consistency\()gocql\.EachQuorum}{$1gocql.LocalQuorum}s'
+  expect_red 'TestP4B_OrphanProjectionPinsEachQuorum' 'upsertS3OrphanProjection must pin discovery publication to gocql.EachQuorum' \
+    'orphan discovery projection is published below EACH_QUORUM'
+  restore
+}
+
 MUTATIONS=(
   m_lwt_loses_write_once
   m_settlement_read_is_ordinary
   m_same_target_uses_proposed_timestamp
   m_projection_uncertainty_finalizes
   m_publication_invalid_reuses_the_candidate_code
+  m_empty_nonapplied_means_not_published
+  m_same_target_skips_canonical_each_quorum_confirmation
+  m_projection_publish_downgrades_to_local_quorum
 )
 
 if [ "${1:-}" = "--list" ]; then

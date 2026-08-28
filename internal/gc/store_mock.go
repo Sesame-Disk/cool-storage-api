@@ -160,46 +160,47 @@ type MockStore struct {
 	deleteLibraryStorageCounterErr error
 	// libraryDestructiveCalls records HardDeleteLibrary / DeleteLibraryStorageCounter
 	// in call order so tests can assert the hard delete precedes the counter cleanup.
-	libraryDestructiveCalls                []string
-	deleteLibraryStorageCounterFor         map[uuid.UUID]int
-	deleteGroupFullErr                     error
-	reconcileStorageCountersHook           func()
-	acquireOrgHardDeleteLockHook           func(orgID uuid.UUID)
-	beginOrgPurgeHook                      func(orgID uuid.UUID)
-	getBlockRefCountErr                    error
-	blockExistsErr                         error
-	blockExistsCalls                       int
-	libraryExistsErr                       error
-	canonicalLibraryExistsErr              error
-	forceRenewLibraryLockNotOwned          bool
-	groupExistsErr                         error
-	groupExistsCalls                       atomic.Int64
-	findOrgForLibraryErr                   error
-	blockHasReferencesHook                 func(orgID uuid.UUID, blockID string, current bool) (bool, error)
-	blockHasReferencesErr                  error
-	blockHasReferencesGlobalErr            error
-	blockHasReferencesLocalCalls           int
-	blockHasReferencesGlobalCalls          int
-	releaseStaleBlockClaimErr              error
-	getBlockGCCandidateErr                 error
-	deleteBlockGCCandidateDiscoveryErr     error
-	claimBlockDeleteSettleErr              error
-	getBlockInfoHook                       func(BlockInfo) BlockInfo
-	getBlockInfoErr                        error
-	claimAttempts                          []BlockDeleteAuthority
-	releaseBlockClaimErr                   error
-	claimBlockDeleteErr                    error
-	validateDestructiveTopologyErr         error
-	blockReferenceExistsErr                error
-	ensureBlockGCCandidateErr              error
-	deleteProvisionalProjectionErr         error
-	getS3OrphanGlobalErr                   error
-	getS3OrphanGlobalCalls                 int
-	getS3OrphanGlobalHook                  func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
-	deleteS3OrphanErrOnce                  error
-	markS3OrphanErrOnce                    error
-	startBlockDeleteOrphanAmbiguousOnce    bool
-	startBlockDeleteOrphanNotPublishedOnce bool
+	libraryDestructiveCalls                        []string
+	deleteLibraryStorageCounterFor                 map[uuid.UUID]int
+	deleteGroupFullErr                             error
+	reconcileStorageCountersHook                   func()
+	acquireOrgHardDeleteLockHook                   func(orgID uuid.UUID)
+	beginOrgPurgeHook                              func(orgID uuid.UUID)
+	getBlockRefCountErr                            error
+	blockExistsErr                                 error
+	blockExistsCalls                               int
+	libraryExistsErr                               error
+	canonicalLibraryExistsErr                      error
+	forceRenewLibraryLockNotOwned                  bool
+	groupExistsErr                                 error
+	groupExistsCalls                               atomic.Int64
+	findOrgForLibraryErr                           error
+	blockHasReferencesHook                         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
+	blockHasReferencesErr                          error
+	blockHasReferencesGlobalErr                    error
+	blockHasReferencesLocalCalls                   int
+	blockHasReferencesGlobalCalls                  int
+	releaseStaleBlockClaimErr                      error
+	getBlockGCCandidateErr                         error
+	deleteBlockGCCandidateDiscoveryErr             error
+	claimBlockDeleteSettleErr                      error
+	getBlockInfoHook                               func(BlockInfo) BlockInfo
+	getBlockInfoErr                                error
+	claimAttempts                                  []BlockDeleteAuthority
+	releaseBlockClaimErr                           error
+	claimBlockDeleteErr                            error
+	validateDestructiveTopologyErr                 error
+	blockReferenceExistsErr                        error
+	ensureBlockGCCandidateErr                      error
+	deleteProvisionalProjectionErr                 error
+	getS3OrphanGlobalErr                           error
+	getS3OrphanGlobalCalls                         int
+	getS3OrphanGlobalHook                          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
+	deleteS3OrphanErrOnce                          error
+	markS3OrphanErrOnce                            error
+	startBlockDeleteOrphanAmbiguousOnce            bool
+	startBlockDeleteOrphanNotPublishedOnce         bool
+	startBlockDeleteOrphanCanonicalUnconfirmedOnce bool
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook                        func(orgID uuid.UUID, size int)
@@ -4387,7 +4388,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 			return result
 		}
 		result.Outcome = StartBlockDeleteOrphanSameTarget
-		return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+		return m.confirmSameTargetOrphanResultLocked(orgID, blockID, result)
 	}
 	orphan := &S3OrphanInfo{
 		OrgID:         orgID,
@@ -4402,6 +4403,16 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 	m.s3Orphans[key] = orphan
 	result.Outcome = StartBlockDeleteOrphanCreated
 	result.FirstSeenAt = orphan.FirstSeenAt
+	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+}
+
+func (m *MockStore) confirmSameTargetOrphanResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	if m.startBlockDeleteOrphanCanonicalUnconfirmedOnce {
+		m.startBlockDeleteOrphanCanonicalUnconfirmedOnce = false
+		result.Outcome = StartBlockDeleteOrphanAmbiguous
+		result.Cause = errors.New("test: canonical EACH_QUORUM visibility unconfirmed")
+		return result
+	}
 	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
 }
 
@@ -4564,6 +4575,16 @@ func (m *MockStore) SetStartBlockDeleteOrphanAmbiguousOnceForTest() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.startBlockDeleteOrphanAmbiguousOnce = true
+}
+
+// SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest makes the next
+// same-target publication fail closed before projection repair, matching a
+// SERIAL/CAS observation whose canonical EACH_QUORUM read did not confirm
+// writer-visible fence dissemination.
+func (m *MockStore) SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startBlockDeleteOrphanCanonicalUnconfirmedOnce = true
 }
 
 // SetReleaseBlockClaimHookForTest runs once immediately before a mock release

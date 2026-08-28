@@ -99,6 +99,10 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 		t.Fatalf("same-target retry = outcome:%s first_seen_at:%v cause:%v, want same_target at %v", sameTarget.Outcome, sameTarget.FirstSeenAt, sameTarget.Cause, firstSeenAt)
 	}
 	assertCanonical("same-target retry")
+	visible, found, err := store.GetS3OrphanGlobal(orgID, blockID)
+	if err != nil || !found || visible.StorageClass != "hot" || visible.StorageKey != storageKey || !visible.FirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("same-target must confirm canonical EACH_QUORUM visibility: found=%v err=%v info=%+v", found, err, visible)
+	}
 
 	differentTarget := store.StartBlockDeleteOrphan(orgID, blockID, "cold", storageKey, "sha1-third", firstSeenAt.Add(2*time.Hour))
 	if differentTarget.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
@@ -115,5 +119,5 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 	}
 
 	gate.observed = true
-	t.Logf("P4B_ORPHAN_PUBLICATION_EVIDENCE created=1 same_target=1 different_target=1 projection=1 first_seen_at_preserved=1")
+	t.Logf("P4B_ORPHAN_PUBLICATION_EVIDENCE created=1 same_target=1 different_target=1 projection=1 first_seen_at_preserved=1 canonical_each_quorum=1")
 }

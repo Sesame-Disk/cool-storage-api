@@ -3,6 +3,8 @@ package gc
 import (
 	"bytes"
 	"context"
+	"errors"
+	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -15,23 +17,8 @@ import (
 )
 
 func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
-	source, err := os.ReadFile("store_cassandra.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := parser.ParseFile(token.NewFileSet(), "store_cassandra.go", source, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	function := findGCFunction(file, "StartBlockDeleteOrphan")
-	if function == nil {
-		t.Fatal("StartBlockDeleteOrphan not found")
-	}
-	var formatted bytes.Buffer
-	if err := format.Node(&formatted, token.NewFileSet(), function); err != nil {
-		t.Fatalf("format StartBlockDeleteOrphan: %v", err)
-	}
-	text := formatted.String()
+	file := parseGCStoreFile(t)
+	text := formattedGCFunction(t, file, "StartBlockDeleteOrphan")
 
 	if !strings.Contains(text, "INSERT INTO gc_s3_orphans") {
 		t.Fatal("StartBlockDeleteOrphan must publish the canonical orphan row")
@@ -51,8 +38,17 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	if !strings.Contains(text, "Idempotent(false)") || !strings.Contains(text, "NumRetries: 0") || !strings.Contains(text, "NonSpeculativeExecution") {
 		t.Fatal("StartBlockDeleteOrphan must not hide an uncertain LWT behind driver retries")
 	}
-	if got := strings.Count(text, "ensureS3OrphanProjectionResult"); got != 3 {
-		t.Fatalf("StartBlockDeleteOrphan projection wrapper calls = %d, want 3 guarded return paths", got)
+	if strings.Contains(text, "StartBlockDeleteOrphanNotPublished") {
+		t.Fatal("StartBlockDeleteOrphan must not emit NotPublished; only SERIAL settlement may")
+	}
+	if got := strings.Count(text, "settleStartBlockDeleteOrphan"); got != 2 {
+		t.Fatalf("StartBlockDeleteOrphan settlement helper calls = %d, want 2 (LWT error and empty non-applied CAS)", got)
+	}
+	if got := strings.Count(text, "confirmSameTargetOrphanResult"); got != 1 {
+		t.Fatalf("StartBlockDeleteOrphan same-target confirmation calls = %d, want 1 for the non-applied CAS path", got)
+	}
+	if got := strings.Count(text, "ensureS3OrphanProjectionResult"); got != 1 {
+		t.Fatalf("StartBlockDeleteOrphan projection wrapper calls = %d, want 1 Created path; SameTarget must confirm canonical visibility first", got)
 	}
 
 	settlement := findGCFunction(file, "settleS3OrphanState")
@@ -62,6 +58,219 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	if !gcQueryMethodHas(settlement, "SELECT storage_class, storage_key, first_seen_at", "Consistency", "Serial") {
 		t.Fatal("settleS3OrphanState must read the canonical row at Consistency(gocql.Serial)")
 	}
+
+	settleHelper := formattedGCFunction(t, file, "settleStartBlockDeleteOrphan")
+	if !strings.Contains(settleHelper, "confirmSameTargetOrphanResult") {
+		t.Fatal("settled SameTarget must confirm canonical EACH_QUORUM visibility before projection")
+	}
+	if strings.Contains(settleHelper, "ensureS3OrphanProjectionResult") {
+		t.Fatal("settlement must not skip canonical visibility confirmation by publishing the projection directly")
+	}
+
+	confirm := formattedGCFunction(t, file, "confirmSameTargetOrphanResult")
+	if !strings.Contains(confirm, "GetS3OrphanGlobal") {
+		t.Fatal("SameTarget confirmation must read the canonical row at EACH_QUORUM through GetS3OrphanGlobal")
+	}
+	if !strings.Contains(confirm, "classifyCanonicalOrphanVisibility") {
+		t.Fatal("SameTarget confirmation must classify the EACH_QUORUM row before authorizing finalize")
+	}
+	if !strings.Contains(confirm, "ensureS3OrphanProjectionResult") {
+		t.Fatal("SameTarget confirmation must repair the discovery projection only after canonical visibility")
+	}
+
+	global := findGCFunction(file, "GetS3OrphanGlobal")
+	if global == nil {
+		t.Fatal("GetS3OrphanGlobal not found")
+	}
+	if !gcQueryMethodHas(global, "FROM gc_s3_orphans", "Consistency", "EachQuorum") {
+		t.Fatal("GetS3OrphanGlobal must pin canonical visibility reads to EachQuorum")
+	}
+
+	classifier := formattedGCFunction(t, file, "classifyNonAppliedOrphanCAS")
+	if !strings.Contains(classifier, "NeedsSettlement: true") {
+		t.Fatal("empty non-applied CAS must require SERIAL settlement")
+	}
+	if strings.Contains(classifier, "StartBlockDeleteOrphanNotPublished") {
+		t.Fatal("classifyNonAppliedOrphanCAS must not emit NotPublished; empty CAS is not proof of absence")
+	}
+}
+
+func TestP4B_OrphanProjectionPinsEachQuorum(t *testing.T) {
+	file := parseGCStoreFile(t)
+	projection := findGCFunction(file, "upsertS3OrphanProjection")
+	if projection == nil {
+		t.Fatal("upsertS3OrphanProjection not found")
+	}
+	if !gcQueryMethodHas(projection, "INSERT INTO gc_s3_orphans_by_day", "Consistency", "EachQuorum") {
+		t.Fatal("upsertS3OrphanProjection must pin discovery publication to gocql.EachQuorum")
+	}
+}
+
+func TestP4B_CanonicalOrphanSchemaDoesNotDisableBlockingReadRepair(t *testing.T) {
+	source, err := os.ReadFile("../db/migrations/001_initial_schema.cql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "CREATE TABLE IF NOT EXISTS gc_s3_orphans (")
+	if start < 0 {
+		t.Fatal("gc_s3_orphans table definition not found")
+	}
+	rest := text[start:]
+	end := strings.Index(rest, "CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day")
+	if end < 0 {
+		t.Fatal("could not bound the gc_s3_orphans table definition")
+	}
+	table := strings.ToLower(rest[:end])
+	if strings.Contains(table, "read_repair") && strings.Contains(table, "none") {
+		t.Fatal("gc_s3_orphans must not set read_repair='NONE'; SameTarget confirmation relies on blocking read repair at EACH_QUORUM")
+	}
+}
+
+func TestP4B_EmptyNonAppliedCASRequiresSerialSettlement(t *testing.T) {
+	proposed := BlockDeleteTarget{StorageClass: "hot", StorageKey: MockCanonicalStorageKey(uuid.NewString(), "p4b-empty-cas")}
+	got := classifyNonAppliedOrphanCAS(map[string]interface{}{}, proposed)
+	if !got.NeedsSettlement {
+		t.Error("empty non-applied CAS must be settled in the SERIAL domain")
+	}
+	if got.Result.Outcome == StartBlockDeleteOrphanNotPublished {
+		t.Error("empty non-applied CAS is not proof of absence")
+	}
+	if t.Failed() {
+		return
+	}
+
+	same := classifyNonAppliedOrphanCAS(map[string]interface{}{
+		"storage_class": "hot",
+		"storage_key":   proposed.StorageKey,
+		"first_seen_at": time.Unix(1, 0).UTC(),
+	}, proposed)
+	if same.NeedsSettlement || same.Result.Outcome != StartBlockDeleteOrphanSameTarget {
+		t.Fatalf("usable same-target CAS = settlement:%v outcome:%s, want same_target without settlement", same.NeedsSettlement, same.Result.Outcome)
+	}
+
+	different := classifyNonAppliedOrphanCAS(map[string]interface{}{
+		"storage_class": "cold",
+		"storage_key":   proposed.StorageKey,
+		"first_seen_at": time.Unix(1, 0).UTC(),
+	}, proposed)
+	if different.NeedsSettlement || different.Result.Outcome != StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("usable different-target CAS = settlement:%v outcome:%s, want different_target", different.NeedsSettlement, different.Result.Outcome)
+	}
+}
+
+func TestP4B_SettledOrphanClassification(t *testing.T) {
+	proposed := BlockDeleteTarget{StorageClass: "hot", StorageKey: "blocks/org/aa/bb/key"}
+	row := s3OrphanCASRow{Target: proposed, FirstSeenAt: time.Unix(2, 0).UTC()}
+
+	absent := resultFromSettledS3Orphan(s3OrphanCASRow{}, false, nil, proposed, errors.New("lwt timeout"))
+	if absent.Outcome != StartBlockDeleteOrphanNotPublished {
+		t.Fatalf("SERIAL absence = %s, want not_published", absent.Outcome)
+	}
+
+	same := resultFromSettledS3Orphan(row, true, nil, proposed, errors.New("lwt timeout"))
+	if same.Outcome != StartBlockDeleteOrphanSameTarget || !same.FirstSeenAt.Equal(row.FirstSeenAt) {
+		t.Fatalf("SERIAL same-target = %+v, want same_target at stored token", same)
+	}
+
+	different := resultFromSettledS3Orphan(s3OrphanCASRow{
+		Target:      BlockDeleteTarget{StorageClass: "cold", StorageKey: proposed.StorageKey},
+		FirstSeenAt: row.FirstSeenAt,
+	}, true, nil, proposed, nil)
+	if different.Outcome != StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("SERIAL different-target = %s, want different_target", different.Outcome)
+	}
+
+	unreadable := resultFromSettledS3Orphan(s3OrphanCASRow{}, false, errors.New("serial unavailable"), proposed, errors.New("lwt timeout"))
+	if unreadable.Outcome != StartBlockDeleteOrphanAmbiguous {
+		t.Fatalf("unreadable settlement = %s, want ambiguous", unreadable.Outcome)
+	}
+
+	malformed := resultFromSettledS3Orphan(s3OrphanCASRow{}, true, errors.New("incomplete identity"), proposed, nil)
+	if malformed.Outcome != StartBlockDeleteOrphanInvalid {
+		t.Fatalf("malformed settlement = %s, want invalid", malformed.Outcome)
+	}
+}
+
+func TestP4B_CanonicalVisibilityClassification(t *testing.T) {
+	proposed := BlockDeleteTarget{StorageClass: "hot", StorageKey: "blocks/org/aa/bb/key"}
+	token := time.Unix(3, 0).UTC()
+	prior := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanSameTarget, FirstSeenAt: token, ExistingTarget: proposed, Submitted: true}
+
+	missing := classifyCanonicalOrphanVisibility(S3OrphanInfo{}, false, nil, proposed, token, prior)
+	if missing.Outcome != StartBlockDeleteOrphanAmbiguous {
+		t.Fatalf("EACH_QUORUM miss after SERIAL hit = %s, want ambiguous not not_published", missing.Outcome)
+	}
+	if missing.Outcome == StartBlockDeleteOrphanNotPublished {
+		t.Fatal("EACH_QUORUM miss must not release the claim as NotPublished")
+	}
+
+	readErr := classifyCanonicalOrphanVisibility(S3OrphanInfo{}, false, errors.New("dc-na unavailable"), proposed, token, prior)
+	if readErr.Outcome != StartBlockDeleteOrphanAmbiguous {
+		t.Fatalf("EACH_QUORUM error = %s, want ambiguous", readErr.Outcome)
+	}
+
+	visible := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass: proposed.StorageClass,
+		StorageKey:   proposed.StorageKey,
+		FirstSeenAt:  token,
+	}, true, nil, proposed, token, prior)
+	if visible.Outcome != StartBlockDeleteOrphanSameTarget {
+		t.Fatalf("matching EACH_QUORUM row = %s, want same_target", visible.Outcome)
+	}
+
+	other := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass: "cold",
+		StorageKey:   proposed.StorageKey,
+		FirstSeenAt:  token,
+	}, true, nil, proposed, token, prior)
+	if other.Outcome != StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("visible different target = %s, want different_target", other.Outcome)
+	}
+
+	mismatchedToken := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass: proposed.StorageClass,
+		StorageKey:   proposed.StorageKey,
+		FirstSeenAt:  token.Add(time.Second),
+	}, true, nil, proposed, token, prior)
+	if mismatchedToken.Outcome != StartBlockDeleteOrphanInvalid {
+		t.Fatalf("EACH_QUORUM first_seen_at mismatch = %s, want invalid", mismatchedToken.Outcome)
+	}
+
+	incomplete := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass: proposed.StorageClass,
+		StorageKey:   "",
+		FirstSeenAt:  token,
+	}, true, nil, proposed, token, prior)
+	if incomplete.Outcome != StartBlockDeleteOrphanInvalid {
+		t.Fatalf("EACH_QUORUM incomplete identity = %s, want invalid", incomplete.Outcome)
+	}
+}
+
+func parseGCStoreFile(t *testing.T) *ast.File {
+	t.Helper()
+	source, err := os.ReadFile("store_cassandra.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "store_cassandra.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+func formattedGCFunction(t *testing.T, file *ast.File, name string) string {
+	t.Helper()
+	function := findGCFunction(file, name)
+	if function == nil {
+		t.Fatalf("%s not found", name)
+	}
+	var formatted bytes.Buffer
+	if err := format.Node(&formatted, token.NewFileSet(), function); err != nil {
+		t.Fatalf("format %s: %v", name, err)
+	}
+	return formatted.String()
 }
 
 func TestP4B_WorkerDifferentTargetReleasesClaimWithoutRetry(t *testing.T) {
@@ -241,5 +450,131 @@ func TestP4B_WorkerOrphanRefusalNotOwnerLeavesQueueUntouched(t *testing.T) {
 				t.Fatalf("candidate was consumed after not-owner release: ok=%v err=%v", ok, err)
 			}
 		})
+	}
+}
+
+func TestP4B_WorkerCanonicalVisibilityUnconfirmedLeavesQueueUntouched(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, &MockStorageProvider{}, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("p4b-canonical-unconfirmed")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	candidate := ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+	seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-existing", "", candidateAt)
+	store.SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest()
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil || n != 0 {
+		t.Fatalf("ProcessOnce() = (%d, %v), want fail-closed refusal", n, err)
+	}
+	block := store.GetBlock(orgID, blockID)
+	if block == nil || block.GCState != "deleting" || block.GCClaimID == "" {
+		t.Fatalf("canonical visibility uncertainty must retain the claim: block=%+v", block)
+	}
+	if store.QueueCompleteCallsForTest() != 0 || store.QueueRequeueCallsForTest() != 0 || store.QueueFailCallsForTest() != 0 {
+		t.Fatalf("queue lifecycle calls = complete:%d requeue:%d fail:%d, want all zero", store.QueueCompleteCallsForTest(), store.QueueRequeueCallsForTest(), store.QueueFailCallsForTest())
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
+		t.Fatalf("candidate was consumed after canonical visibility uncertainty: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestP4B_WorkerPublicationRefusalRecordsBlockPathNotOrphan(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*MockStore, uuid.UUID, string, time.Time)
+	}{
+		{
+			name: "ambiguous publication",
+			configure: func(store *MockStore, _ uuid.UUID, _ string, _ time.Time) {
+				store.SetStartBlockDeleteOrphanAmbiguousOnceForTest()
+			},
+		},
+		{
+			name: "projection unconfirmed",
+			configure: func(store *MockStore, _ uuid.UUID, _ string, _ time.Time) {
+				store.SetStartBlockDeleteOrphanProjectionErrOnceForTest(context.DeadlineExceeded)
+			},
+		},
+		{
+			name: "canonical visibility unconfirmed",
+			configure: func(store *MockStore, orgID uuid.UUID, blockID string, candidateAt time.Time) {
+				seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-existing", "", candidateAt)
+				store.SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest()
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			w := NewWorker(store, &MockStorageProvider{}, NewQueue(store), 100, 0, false, &Stats{})
+			w.clock = advancingClock(time.Now())
+			resetDestructivePairForTest(destructivePathBlock, destructivePathOrphan)
+
+			orgID := uuid.New()
+			blockID := testSHA256BlockID("p4b-path-" + tc.name)
+			store.AddBlock(orgID, blockID, "hot", 0)
+			candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+			ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+			tc.configure(store, orgID, blockID, candidateAt)
+
+			if n, err := w.ProcessOnce(context.Background()); err != nil || n != 0 {
+				t.Fatalf("ProcessOnce() = (%d, %v), want publication refusal", n, err)
+			}
+
+			blocked, livenessSuccess := destructivePairForTest(t, destructivePathBlock)
+			if blocked <= livenessSuccess {
+				t.Fatalf("block path last_blocked=%v last_liveness_success=%v, want blocked later: publication refusals belong to the worker path whose liveness this walk published", blocked, livenessSuccess)
+			}
+			orphanBlocked, orphanSuccess := destructivePairForTest(t, destructivePathOrphan)
+			if orphanBlocked != 0 || orphanSuccess != 0 {
+				t.Fatalf("orphan path moved to blocked=%v success=%v; a processBlock publication refusal must not speak for recovery", orphanBlocked, orphanSuccess)
+			}
+		})
+	}
+}
+
+func TestP4B_SameTargetStalePhaseInlineDeleteFailureLeaksWithoutRecoveryDelete(t *testing.T) {
+	defer shortRetries(t)()
+
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	sp.FailAlways(errors.New("s3 down"))
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("p4b-stale-phase-inline-fail")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockMapping(orgID, "sha1-new", blockID)
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-old", "prev", time.Now().Add(-time.Hour))
+	if err := store.MarkS3OrphanMappingCleanupPending(orgID, blockID, "sha1-old", firstSeenAt.Add(5*time.Minute)); err != nil {
+		t.Fatalf("advance stale orphan phase: %v", err)
+	}
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", time.Now().UTC().Add(-2*time.Hour), 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("ProcessOnce() = (%d, %v), want queue completion after recording the failed inline delete", n, err)
+	}
+	if store.GetBlock(orgID, blockID) != nil {
+		t.Fatal("canonical block must be finalized before the inline S3 failure is recorded")
+	}
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 || orphans[0].RecoveryPhase != S3OrphanPhasePendingMappingCleanup || orphans[0].LastError == "" {
+		t.Fatalf("inherited pending_mapping_cleanup must survive the inline S3 failure: %+v", orphans)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("inline S3 delete succeeded unexpectedly: %v", got)
+	}
+
+	recovered, recErr := w.RecoverS3Orphans(context.Background(), 100)
+	if recErr != nil || recovered != 1 {
+		t.Fatalf("RecoverS3Orphans() = (%d, %v), want 1 finalized without a physical delete", recovered, recErr)
+	}
+	if store.S3OrphanCount() != 0 {
+		t.Fatalf("recovery cleared no orphan row, got %d", store.S3OrphanCount())
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("recovery must skip the physical delete for pending_mapping_cleanup, got %v", got)
 	}
 }
