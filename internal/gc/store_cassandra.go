@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -1913,15 +1914,22 @@ func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID strin
 	return s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id)
 		VALUES (?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Exec()
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).
+		Consistency(gocql.EachQuorum).
+		Exec()
 }
 
 // GetS3OrphanGlobal reads the canonical recovery row at EACH_QUORUM. The
 // discovery projection is deliberately not consulted here: recovery uses this
-// row for phase, external SHA-1 characterization, and backend selection. EACH_QUORUM provides
-// the same cross-DC visibility contract as the destructive liveness read, but
-// this ordinary SELECT is not a Paxos settlement and does not authorize a
-// physical delete by itself.
+// row for phase, external SHA-1 characterization, and backend selection. The
+// SameTarget publication path uses the same read to confirm that writers in
+// every DC can observe the fence before FinalizeBlockDelete is allowed, and
+// that recovery_phase is still pending_s3. EACH_QUORUM provides the same
+// cross-DC visibility contract as the destructive liveness read, but this
+// ordinary SELECT is not a Paxos settlement and does not authorize a physical
+// delete by itself. Confirmation relies on Cassandra's default blocking read
+// repair: an EACH_QUORUM read that finds replica divergence repairs the
+// replicas it contacted before returning. It does not refresh the row TTL.
 func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3OrphanInfo, bool, error) {
 	var info S3OrphanInfo
 	var firstSeenAt time.Time
@@ -1949,61 +1957,257 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 	info.OrgID = orgID
 	info.BlockID = blockID
 	info.ExternalSHA1 = strings.TrimSpace(info.ExternalSHA1)
-	info.RecoveryPhase = strings.TrimSpace(info.RecoveryPhase)
 	info.FirstSeenAt = firstSeenAt.UTC()
 	return info, true, nil
 }
 
-// StartBlockDeleteOrphan records the durable recovery row for a NEW block
-// delete lifecycle. It always resets the phase to pending_s3, even when a
-// stale row from an older delete already exists for the same block_id.
-func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
-	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+// StartBlockDeleteOrphan records the durable recovery row for a block delete
+// lifecycle without overwriting an existing lifecycle. The canonical insert is
+// single-use: an uncertain result is settled in the SERIAL domain rather than
+// repeating the mutation, and the existing row's first_seen_at is always reused.
+//
+// SERIAL settlement and canonical EACH_QUORUM visibility are different facts.
+// SERIAL answers which value Paxos chose. Writer fence reads are LOCAL_QUORUM, so
+// SameTarget may not authorize FinalizeBlockDelete until gc_s3_orphans itself is
+// visible at EACH_QUORUM. A successful Created LWT already proved that commit.
+func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult {
+	result := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous}
+	if !config.IsCanonicalStorageClassName(storageClass) {
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s with non-canonical storage class %q", orgID, blockID, storageClass)
+		return result
 	}
+	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+		return result
+	}
+	now = now.UTC()
 	externalSHA1 = strings.TrimSpace(externalSHA1)
 	existing := map[string]interface{}{}
+	proposed := BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey}
+	// This is a single-use LWT. Driver retries and speculative execution would
+	// hide the first uncertain result instead of sending it through settlement.
+	result.Submitted = true
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, storage_key, external_sha1, recovery_phase, first_seen_at, last_attempt_at, retry_count, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
 	`, orgID.String(), blockID, storageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, now, 0, "").
 		Consistency(gocql.EachQuorum).
 		SerialConsistency(gocql.Serial).
+		Idempotent(false).
+		RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0}).
+		SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{}).
 		MapScanCAS(existing)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to record block delete orphan: %w", err)
+		return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, err)
 	}
-	effectiveFirstSeenAt := now.UTC()
-	effectiveStorageClass := storageClass
-	if !applied {
-		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
-		if err != nil {
-			return time.Time{}, err
-		}
-		if effectiveFirstSeenAt.IsZero() {
-			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
-		}
-		updateState := map[string]interface{}{}
-		updated, err := s.db.Session().Query(`
-			UPDATE gc_s3_orphans
-			SET storage_class = ?, storage_key = ?, external_sha1 = ?, recovery_phase = ?, last_attempt_at = ?, retry_count = ?, last_error = ?
-			WHERE org_id = ? AND block_id = ?
-			IF EXISTS
-		`, effectiveStorageClass, storageKey, externalSHA1, S3OrphanPhasePendingS3, now, 0, "", orgID.String(), blockID).
-			Consistency(gocql.EachQuorum).
-			SerialConsistency(gocql.Serial).
-			MapScanCAS(updateState)
-		if err != nil {
-			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: %w", orgID, blockID, err)
-		}
-		if !updated {
-			return effectiveFirstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
+	if applied {
+		result.Outcome = StartBlockDeleteOrphanCreated
+		result.FirstSeenAt = now
+		return s.ensureS3OrphanProjectionResult(orgID, blockID, result)
+	}
+
+	classified := classifyNonAppliedOrphanCAS(existing, proposed)
+	if classified.NeedsSettlement {
+		return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, nil)
+	}
+	classified.Result.Submitted = true
+	if classified.Result.Outcome == StartBlockDeleteOrphanInvalid && classified.Result.Cause != nil {
+		classified.Result.Cause = fmt.Errorf("classify existing S3 orphan for org=%s block=%s: %w", orgID, blockID, classified.Result.Cause)
+	}
+	if classified.Result.Outcome == StartBlockDeleteOrphanSameTarget {
+		return s.confirmSameTargetOrphanResult(orgID, blockID, proposed, classified.Result)
+	}
+	return classified.Result
+}
+
+type s3OrphanCASRow struct {
+	Target      BlockDeleteTarget
+	FirstSeenAt time.Time
+}
+
+func parseS3OrphanCAS(row map[string]interface{}) (s3OrphanCASRow, error) {
+	storageClass, err := casStringValue(row, "storage_class")
+	if err != nil {
+		return s3OrphanCASRow{}, err
+	}
+	storageKey, err := casStringValue(row, "storage_key")
+	if err != nil {
+		return s3OrphanCASRow{}, err
+	}
+	firstSeenAt, err := casTimeValue(row, "first_seen_at")
+	if err != nil {
+		return s3OrphanCASRow{}, err
+	}
+	if !config.IsCanonicalStorageClassName(storageClass) || storageKey == "" || strings.TrimSpace(storageKey) != storageKey || firstSeenAt.IsZero() {
+		return s3OrphanCASRow{}, fmt.Errorf("existing orphan has incomplete identity or first_seen_at")
+	}
+	return s3OrphanCASRow{
+		Target:      BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey},
+		FirstSeenAt: firstSeenAt.UTC(),
+	}, nil
+}
+
+func classifyS3OrphanRow(row s3OrphanCASRow, proposed BlockDeleteTarget) StartBlockDeleteOrphanResult {
+	result := StartBlockDeleteOrphanResult{FirstSeenAt: row.FirstSeenAt, ExistingTarget: row.Target}
+	if row.Target == proposed {
+		result.Outcome = StartBlockDeleteOrphanSameTarget
+	} else {
+		result.Outcome = StartBlockDeleteOrphanDifferentTarget
+	}
+	return result
+}
+
+type orphanCASClassification struct {
+	Result          StartBlockDeleteOrphanResult
+	NeedsSettlement bool
+}
+
+// classifyNonAppliedOrphanCAS decides what a completed INSERT IF NOT EXISTS that
+// did not apply means. An empty previous-values map is not absence: MapScanCAS can
+// return applied=false without a usable row, and that shape must be settled in the
+// SERIAL domain. NotPublished is never produced here.
+func classifyNonAppliedOrphanCAS(existing map[string]interface{}, proposed BlockDeleteTarget) orphanCASClassification {
+	if len(existing) == 0 {
+		return orphanCASClassification{
+			Result:          StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous},
+			NeedsSettlement: true,
 		}
 	}
-	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveFirstSeenAt); err != nil {
-		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+	row, parseErr := parseS3OrphanCAS(existing)
+	if parseErr != nil {
+		return orphanCASClassification{
+			Result: StartBlockDeleteOrphanResult{
+				Outcome: StartBlockDeleteOrphanInvalid,
+				Cause:   parseErr,
+			},
+		}
 	}
-	return effectiveFirstSeenAt, nil
+	return orphanCASClassification{Result: classifyS3OrphanRow(row, proposed)}
+}
+
+func resultFromSettledS3Orphan(row s3OrphanCASRow, found bool, settleErr error, proposed BlockDeleteTarget, cause error) StartBlockDeleteOrphanResult {
+	result := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous, Submitted: true, Cause: cause}
+	if settleErr != nil {
+		if found {
+			result.Outcome = StartBlockDeleteOrphanInvalid
+		}
+		result.Cause = errors.Join(cause, fmt.Errorf("settle S3 orphan publication: %w", settleErr))
+		return result
+	}
+	if !found {
+		result.Outcome = StartBlockDeleteOrphanNotPublished
+		return result
+	}
+	settled := classifyS3OrphanRow(row, proposed)
+	settled.Submitted = true
+	settled.Cause = cause
+	return settled
+}
+
+func classifyCanonicalOrphanVisibility(info S3OrphanInfo, found bool, readErr error, proposed BlockDeleteTarget, expectedFirstSeenAt time.Time, prior StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	result := prior
+	if readErr != nil {
+		result.Outcome = StartBlockDeleteOrphanAmbiguous
+		result.Cause = errors.Join(prior.Cause, fmt.Errorf("confirm canonical S3 orphan visibility at EACH_QUORUM: %w", readErr))
+		return result
+	}
+	if !found {
+		// SERIAL or CAS observed a row; regular EACH_QUORUM did not. That is not
+		// permission to release the claim. Absence here is unconfirmed visibility.
+		result.Outcome = StartBlockDeleteOrphanAmbiguous
+		result.Cause = errors.Join(prior.Cause, errors.New("canonical S3 orphan is not visible at EACH_QUORUM"))
+		return result
+	}
+	if !config.IsCanonicalStorageClassName(info.StorageClass) || info.StorageKey == "" || strings.TrimSpace(info.StorageKey) != info.StorageKey || info.FirstSeenAt.IsZero() {
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.ExistingTarget = BlockDeleteTarget{StorageClass: info.StorageClass, StorageKey: info.StorageKey}
+		result.FirstSeenAt = info.FirstSeenAt.UTC()
+		result.Cause = errors.Join(prior.Cause, errors.New("canonical S3 orphan visible at EACH_QUORUM has incomplete identity or first_seen_at"))
+		return result
+	}
+	visible := classifyS3OrphanRow(s3OrphanCASRow{
+		Target:      BlockDeleteTarget{StorageClass: info.StorageClass, StorageKey: info.StorageKey},
+		FirstSeenAt: info.FirstSeenAt.UTC(),
+	}, proposed)
+	visible.Submitted = prior.Submitted
+	visible.Cause = prior.Cause
+	if visible.Outcome != StartBlockDeleteOrphanSameTarget {
+		return visible
+	}
+	stored := info.FirstSeenAt.UTC().Truncate(time.Millisecond)
+	expected := expectedFirstSeenAt.UTC().Truncate(time.Millisecond)
+	if !stored.Equal(expected) {
+		visible.Outcome = StartBlockDeleteOrphanInvalid
+		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan visible first_seen_at %v does not match settled token %v", stored, expected))
+		return visible
+	}
+	if info.RecoveryPhase != S3OrphanPhasePendingS3 {
+		visible.Outcome = StartBlockDeleteOrphanLifecycleAdvanced
+		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", info.RecoveryPhase))
+	}
+	return visible
+}
+
+func (s *CassandraStore) settleStartBlockDeleteOrphan(orgID uuid.UUID, blockID string, proposed BlockDeleteTarget, cause error) StartBlockDeleteOrphanResult {
+	row, found, settleErr := s.settleS3OrphanState(orgID, blockID)
+	settled := resultFromSettledS3Orphan(row, found, settleErr, proposed, cause)
+	if settled.Outcome == StartBlockDeleteOrphanSameTarget {
+		return s.confirmSameTargetOrphanResult(orgID, blockID, proposed, settled)
+	}
+	return settled
+}
+
+func (s *CassandraStore) confirmSameTargetOrphanResult(orgID uuid.UUID, blockID string, proposed BlockDeleteTarget, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	info, found, err := s.GetS3OrphanGlobal(orgID, blockID)
+	confirmed := classifyCanonicalOrphanVisibility(info, found, err, proposed, result.FirstSeenAt, result)
+	if confirmed.Outcome != StartBlockDeleteOrphanSameTarget {
+		return confirmed
+	}
+	return s.ensureS3OrphanProjectionResult(orgID, blockID, confirmed)
+}
+
+func (s *CassandraStore) settleS3OrphanState(orgID uuid.UUID, blockID string) (s3OrphanCASRow, bool, error) {
+	var storageClass, storageKey *string
+	var firstSeenAt *time.Time
+	// Keep this SELECT aligned with TestP4B_SerialSettlementClassifiesRealCassandra.
+	err := s.db.Session().Query(`
+		SELECT storage_class, storage_key, first_seen_at
+		FROM gc_s3_orphans
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).
+		Consistency(gocql.Serial).
+		Scan(&storageClass, &storageKey, &firstSeenAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return s3OrphanCASRow{}, false, nil
+		}
+		return s3OrphanCASRow{}, false, err
+	}
+	row := map[string]interface{}{}
+	if storageClass != nil {
+		row["storage_class"] = *storageClass
+	}
+	if storageKey != nil {
+		row["storage_key"] = *storageKey
+	}
+	if firstSeenAt != nil {
+		row["first_seen_at"] = *firstSeenAt
+	}
+	parsed, parseErr := parseS3OrphanCAS(row)
+	if parseErr != nil {
+		return s3OrphanCASRow{}, true, parseErr
+	}
+	return parsed, true, nil
+}
+
+func (s *CassandraStore) ensureS3OrphanProjectionResult(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	if err := s.upsertS3OrphanProjection(orgID, blockID, result.FirstSeenAt); err != nil {
+		result.Outcome = StartBlockDeleteOrphanProjectionUnconfirmed
+		result.Cause = fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+	}
+	return result
 }
 
 func (s *CassandraStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
@@ -2644,6 +2848,77 @@ func (s *CassandraStore) settleBlockDeleteClaimState(orgID uuid.UUID, blockID st
 	return row, true, nil
 }
 
+func (s *CassandraStore) confirmSettledBlockClaimVisibility(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error) {
+	// SERIAL settlement answered which claim Paxos chose. Writer fence reads are
+	// LOCAL_QUORUM, so Acquired after an uncertain LWT still needs the canonical
+	// row visible at EACH_QUORUM — the same split SameTarget uses for orphans.
+	// That EACH_QUORUM read is a dissemination barrier only while `blocks` uses
+	// blocking read repair: otherwise the coordinator can return D1 while a stale
+	// RF-1 replica in another DC still serves gc_state=null to writers.
+	row, found, err := s.readBlockDeleteClaimEachQuorum(orgID, blockID)
+	classified := classifySettledBlockClaimVisibility(row, found, err, attempt)
+	if classified.Outcome != BlockClaimAcquired {
+		cause := err
+		if cause == nil && !found {
+			cause = errors.New("settled block claim is not visible at EACH_QUORUM")
+		} else if cause == nil {
+			cause = fmt.Errorf("settled block claim is not the exact authority at EACH_QUORUM")
+		}
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", cause)
+	}
+	return classified, nil
+}
+
+func (s *CassandraStore) readBlockDeleteClaimEachQuorum(orgID uuid.UUID, blockID string) (blockDeleteClaimRow, bool, error) {
+	var row blockDeleteClaimRow
+	var storageClass, storageKey, gcState, gcClaimID *string
+	var gcClaimedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at
+		FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).
+		Consistency(gocql.EachQuorum).
+		Scan(&storageClass, &storageKey, &gcState, &gcClaimID, &gcClaimedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return blockDeleteClaimRow{}, false, nil
+		}
+		return blockDeleteClaimRow{}, false, err
+	}
+	if storageClass != nil {
+		row.Target.StorageClass = *storageClass
+	}
+	if storageKey != nil {
+		row.Target.StorageKey = *storageKey
+	}
+	if gcState != nil {
+		row.GCState = *gcState
+	}
+	if gcClaimID != nil {
+		row.GCClaimID = *gcClaimID
+	}
+	if gcClaimedAt != nil {
+		row.GCClaimedAt = *gcClaimedAt
+	}
+	return row, true, nil
+}
+
+func classifySettledBlockClaimVisibility(row blockDeleteClaimRow, found bool, readErr error, attempt BlockDeleteAuthority) BlockClaimResult {
+	if readErr != nil || !found {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	got := row.result(attempt, attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter))
+	if got.Outcome != BlockClaimAcquired {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	stored := row.GCClaimedAt.UTC().Truncate(time.Millisecond)
+	expected := attempt.ClaimedAt.UTC().Truncate(time.Millisecond)
+	if !stored.Equal(expected) {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	return got
+}
+
 // blockDeleteClaimRow is the claim-relevant projection of a `blocks` row, however it
 // was observed — from a CAS result's current values or from a serial settling read.
 type blockDeleteClaimRow struct {
@@ -2689,7 +2964,10 @@ func (row blockDeleteClaimRow) classify(attempt BlockDeleteAuthority, staleBefor
 		return BlockClaimFreshOwner
 	}
 	if row.GCClaimID == attempt.ClaimID {
-		// Our own claim, already committed by a Paxos round we lost the answer to.
+		// Our own claim in the serial domain. Callers that observed this after an
+		// uncertain LWT must still confirm EACH_QUORUM visibility before treating
+		// it as BlockClaimAcquired; classify itself does not know the observation
+		// origin.
 		return BlockClaimAcquired
 	}
 	if strings.TrimSpace(row.GCClaimID) == "" || row.GCClaimedAt.IsZero() {
@@ -2737,6 +3015,11 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		// The LWT's outcome is unknown: it may have committed. Settle in the serial
 		// domain rather than guessing, and if that cannot be established either, stay
 		// ambiguous — the caller then retains claim and candidate and stops (R20).
+		//
+		// SERIAL ownership is not EACH_QUORUM visibility. Paxos can accept on a
+		// majority while the EACH_QUORUM learn fails (a down DC). Treat our own
+		// settled claim as Acquired only after the canonical row is visible at
+		// EACH_QUORUM, the same split SameTarget uses for orphans.
 		row, found, settleErr := s.settleBlockDeleteClaimState(orgID, blockID)
 		if settleErr != nil {
 			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, err, settleErr)
@@ -2744,7 +3027,11 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		if !found {
 			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 		}
-		return row.result(attempt, staleBefore), nil
+		settled := row.result(attempt, staleBefore)
+		if settled.Outcome == BlockClaimAcquired {
+			return s.confirmSettledBlockClaimVisibility(orgID, blockID, attempt)
+		}
+		return settled, nil
 	}
 	if applied {
 		return BlockClaimResult{Outcome: BlockClaimAcquired, Owner: attempt}, nil

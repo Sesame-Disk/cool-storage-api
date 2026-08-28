@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-08-27
-**Session**: X1/P4a exact-`P`, per-attempt claim authority — R14a and R16 GREEN, R20 partial (claim path only); R14b claim->orphan binding, strict A+ non-overlap and R18/R27 remain open
+**Last Updated**: 2026-08-28
+**Session**: X1/P4b-1 write-once orphan publication — P4a now confirms settled own claims at EACH_QUORUM; R14a and R16 remain GREEN; P4b-1 SameTarget requires pending_s3 and canonical EACH_QUORUM; R14b claim->orphan binding stays OPEN
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -54,9 +54,17 @@ production blocker, and no status document should say that it is.
 this file and every earlier mutation count. The script output is authoritative.
 `internal/integration/p4a_claim_authority_test.go` has four real-Cassandra legs: exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **44** active mutations
-end-to-end after the queue-primitive draft was withdrawn, and the script prints its own total
-on a clean run — cite that, not a number copied from prose.
+the observed incarnation. `scripts/p4a-mutation-validation.sh` prints its own total on a
+clean run — cite that, not a number copied from prose.
+
+**P4a claim visibility (2026-08-28):** After an uncertain LWT, SERIAL seeing our own
+`claimID` is not `BlockClaimAcquired`. Production confirms the canonical `blocks` row at
+`EACH_QUORUM` (exact P, `deleting`, claim id, `claimed_at`) before granting destructive
+authority — the same split P4b-1 uses for orphan `SameTarget`. Direct `applied=true`
+stays Acquired. That confirmation read requires effective `blocks.read_repair=BLOCKING`
+(empty is not the default); source/schema and `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` pin it.
+Mutations `m_settled_own_claim_skips_each_quorum` and
+`m_blocks_disables_blocking_read_repair` hold those gates.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
 locators: each now releases the exact claim, preserves the candidate, and postpones
@@ -85,11 +93,12 @@ matched literal `\n\t\t` against a CRLF working tree, so it silently applied NOT
 aborted the run before the remaining mutations were reached. Fixed to whitespace runs, per
 the rule the script's own header states.
 
-P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. **Explicitly still open:**
-`StartBlockDeleteOrphan` and `FinalizeBlockDelete` failures keep the fence and return
-retryable errors without consulting ownership, so a late loser reaching them can still
-spend budget — that is the orphan-publication half (R14b/P4b), not a queue-policy
-question, and it is deliberately not patched here. `GC_ENABLED=false` remains required.
+P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. P4b-1 now classifies
+`StartBlockDeleteOrphan` outcomes, settles uncertain publication in the serial domain and
+keeps ambiguous, invalid and projection-unconfirmed states fail-closed. **Explicitly still
+open:** claim authority is not yet carried into orphan publication, and `FinalizeBlockDelete`
+remains outside that binding. Those are the orphan-publication follow-ups (R14b/P4b), not a
+queue-policy question. `GC_ENABLED=false` remains required.
 
 **Queue lifecycle review update (2026-08-27):** The attempted generic LWT hardening of
 `RequeueItem` is withdrawn from this branch. `CompleteItem`, `FailItem` and `RequeueItem`
@@ -105,6 +114,31 @@ candidate and retry count remain unchanged. The five P4a ownership/unwind fixes 
 active, including the owned path's normal retry/DLQ behavior. `GC_ENABLED=false` remains
 required while the follow-up chooses one authority for `Requeue`/`Complete`/`Fail`, DLQ and
 pending state.
+
+**P4b-1 update (2026-08-27):** `StartBlockDeleteOrphan` now publishes the canonical row
+with a write-once `EachQuorum + Serial` LWT and no driver retry/speculation. Its result is
+classified as `Created`, `SameTarget`, `DifferentTarget`, `NotPublished`, `Ambiguous`,
+`Invalid`, `ProjectionUnconfirmed` or `LifecycleAdvanced`; same-target resumes use the stored `first_seen_at`
+and repair the identity-only discovery projection only while the row is still `pending_s3`.
+The worker only releases/postpones a
+confirmed conflict or absent settled row; uncertain, malformed, unconfirmed projection
+or advanced-phase states retain claim, candidate and queue lifecycle. Publication-invalid has its own
+failure code: the untouched check runs before the postpone check, so reusing
+`block_authority_invalid` would have silently taken the candidate-authority error off the
+postpone path P4a had just put it on. Unit coverage and ten deliberate
+mutations are green/red as required, and real-Cassandra evidence is gated by
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. Write-once also drops the stale-phase reset.
+A same-P row already at `pending_mapping_cleanup` no longer authorizes finalize; recovery
+may still clear that completed-phase row without a physical delete. For that stale-phase
+ambiguity itself the trade stays leak-biased until R14b binds incarnation. `SameTarget`
+confirms canonical `EACH_QUORUM` visibility before finalize and does not renew TTL
+(R28: crash-retry still authorizes Finalize because `Created` already inserted the
+fence; remaining TTL is not a lease). `NotPublished` requires SERIAL-confirmed absence.
+With a datacenter down, P3 accepts `BlockClaimAmbiguous` (err may be nil after
+SERIAL settlement of an unowned row, or after SERIAL sees our claim without
+`EACH_QUORUM` confirmation) and orphan `NotPublished` or `Ambiguous`; never claim
+`Acquired` or orphan `Created`/`SameTarget`. This is P4b-1 only: the remaining R14b work must carry
+the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)
 

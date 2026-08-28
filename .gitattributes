@@ -8,3 +8,7 @@
 # Observed repeatedly, and only clearable with a destructive `docker compose
 # down -v`. Pinning the checkout encoding removes the class outright.
 *.cql text eol=lf
+
+# This tracker is edited across Windows and Linux. Git treats CR as trailing
+# whitespace, so a CRLF blob makes `git diff --check` fail on every added line.
+docs/SHA256-CANONICAL-BLOCK-IDS.md text eol=lf

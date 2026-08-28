@@ -898,12 +898,14 @@ Each of these exists because the obvious version of the test proves nothing.
 |---|---|
 | `P3_EXPECT_DC_DOWN=1` | leg 1 passing against a healthy cluster, where the publications would simply succeed |
 | leg 2 skips when `P3_EXPECT_DC_DOWN` is set | running the handoff leg against a cluster with a DC missing |
-| `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted |
-| post-refusal fence read from dc-eu **and** dc-asia | "the call failed" being mistaken for "nothing was published" |
+| `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof on the orphan `NotPublished` path. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted there |
+| claim `BlockClaimAmbiguous` (not `claimErr != nil`) | P4a SERIAL settlement returning `Ambiguous` with `err=nil` after EACH_QUORUM fails, **or** SERIAL seeing our claim without a renewed EACH_QUORUM visibility proof. The worker fail-closes on Outcome; treating nil error as success is a false P3 regression. SERIAL ownership is not `Acquired` |
+| post-refusal fence read from dc-eu **and** dc-asia | treating "the LWT errored" as "nothing exists". Required only when orphan publication is `NotPublished` (SERIAL-confirmed absence). `Ambiguous` may leave a partial row on survivors and must still not authorize `FinalizeBlockDelete` |
 | `BlockExists` check after finalize in leg 2 | measuring an orphan read instead of the rowless-mint gate |
 | fresh org/block id per run | a previous run's rows deciding this run's assertions |
 | script requires the `--- PASS:` line | a skipped package reporting success |
 | `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` | the P4a claim-authority legs skipping their way to exit 0 against a stack that never came up. It is pinned in `docker-compose.yaml` **and** listed in the integration `TestMain` OR-chain — a gate missing from that chain still fails its own skip, but cannot stop `TestMain` from exiting 0 when nothing ran at all |
+| `SESAMEFS_REQUIRE_P4B_EVIDENCE=1` | the P4b orphan-publication legs skipping their real-Cassandra write-once, SERIAL, lifecycle-advanced and read-repair assertions. It is pinned in `docker-compose.yaml` and listed in the integration `TestMain` OR-chain |
 | `p4aRequireEvidence`'s `gate.observed` check | a leg that runs, passes, and asserts nothing: the test must reach its evidence log line, not merely avoid failing |
 | `mutate()` in `scripts/p4a-mutation-validation.sh` compares the file after patching | a mutation whose pattern matched nothing being reported as "the guard held". Line endings and indentation differ between the working tree and the container's COPY, which is exactly how the X2 script caught an inert mutation |
 | `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at. A mutation that fails to COMPILE trips this too, which is how the takeover mutation was caught proving nothing |
@@ -938,6 +940,26 @@ docker exec dc3run sh -c 'cp internal/gc/store_cassandra.go /tmp/sc.bak &&
 # ... re-run leg 1, expect FAIL ...
 docker exec dc3run sh -c 'cp /tmp/sc.bak internal/gc/store_cassandra.go'
 ```
+
+### P4b orphan publication evidence
+
+The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical
+`EACH_QUORUM` visibility and `pending_s3` before `SameTarget` success, stored
+`first_seen_at`, target conflicts, advanced-phase refusal and projection uncertainty.
+The mutation script proves those guards are load-bearing:
+
+```bash
+docker compose run --rm --build gotest bash scripts/p4b-mutation-validation.sh
+```
+
+The real-Cassandra legs are `TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra`,
+`TestP4B_SerialSettlementClassifiesRealCassandra`,
+`TestP4B_LifecycleAdvancedAtRealCassandra`, and
+`TestP4B_CanonicalOrphanReadRepairIsBlocking`.
+The standard integration containers run them with `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`.
+P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
+`TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,
+because settled own-claim confirmation is an `EACH_QUORUM` read of that table.
 
 ### What these legs do NOT cover
 

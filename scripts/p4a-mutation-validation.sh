@@ -43,6 +43,7 @@ WORKER=internal/gc/worker.go
 MOCK=internal/gc/store_mock.go
 PROJECTIONS=internal/db/gc_projection_write_helpers.go
 MIGRATION=internal/db/migrations/018_gc_exact_p_candidate_identity.cql
+SCHEMA001=internal/db/migrations/001_initial_schema.cql
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -219,6 +220,20 @@ m_settlement_read_is_ordinary() {
   mutate "$STORE" 's{Consistency\(gocql\.Serial\)\.(\s+)Scan\(&storageClass, &storageKey, &gcState}{Scan(&storageClass, &storageKey, &gcState}'
   expect_red 'TestP4ASettlementReadsUseTheSerialDomain' 'Consistency(gocql.Serial)' \
     'settling read downgraded to ordinary consistency (a false absent consumes the candidate, R20)'
+  restore
+}
+
+m_settled_own_claim_skips_each_quorum() {
+  mutate "$STORE" 's{if settled\.Outcome == BlockClaimAcquired \{\s+return s\.confirmSettledBlockClaimVisibility\(orgID, blockID, attempt\)\s+\}\s+return settled, nil}{return settled, nil}'
+  expect_red 'TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum' 'SERIAL own claim must confirm EACH_QUORUM' \
+    'SERIAL-settled own claim treated as Acquired without EACH_QUORUM visibility (Paxos accepted, learn failed)'
+  restore
+}
+
+m_blocks_disables_blocking_read_repair() {
+  mutate "$SCHEMA001" 's{PRIMARY KEY \(\(org_id, block_id\)\)\s+\);\s+-- Row-per-reference liveness model}{PRIMARY KEY ((org_id, block_id))\n) WITH read_repair = NONE;\n\n-- Row-per-reference liveness model}'
+  expect_red 'TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair' 'blocking read repair at EACH_QUORUM' \
+    'blocks created with read_repair=NONE (EACH_QUORUM confirmation can return D1 while a writer DC still serves gc_state=null)'
   restore
 }
 
@@ -468,6 +483,8 @@ MUTATIONS=(
   m_migration_candidate_key_adds_candidate_at
   m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
+  m_settled_own_claim_skips_each_quorum
+  m_blocks_disables_blocking_read_repair
   m_candidate_authority_read_is_ordinary
   m_expiry_bucket_hashes_raw_timestamps
   m_candidate_drops_storage_key

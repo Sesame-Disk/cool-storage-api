@@ -24,7 +24,7 @@ func TestP3FencePublishersPinEachQuorumAndSerial(t *testing.T) {
 		queries  []string
 	}{
 		{function: "ClaimBlockDelete", queries: []string{"UPDATE blocks SET gc_state"}},
-		{function: "StartBlockDeleteOrphan", queries: []string{"INSERT INTO gc_s3_orphans", "UPDATE gc_s3_orphans"}},
+		{function: "StartBlockDeleteOrphan", queries: []string{"INSERT INTO gc_s3_orphans"}},
 	} {
 		fn := findGCFunction(file, want.function)
 		if fn == nil {

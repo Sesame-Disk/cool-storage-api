@@ -40,11 +40,11 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	deletePattern := regexp.MustCompile(`(?i)\bDELETE\s+FROM\s+gc_s3_orphans_by_day\b`)
 
 	// The canonical store owns both halves. upsertS3OrphanProjection is reached
-	// only from StartBlockDeleteOrphan and MarkS3OrphanMappingCleanupPending,
-	// both of which establish canonical state before publishing the projection;
-	// the cross-table sequence is not atomic, so concurrent lifecycle races remain
-	// fail-closed in recovery. DeleteS3Orphan removes the canonical row and then
-	// its projection.
+	// only from ensureS3OrphanProjectionResult and
+	// MarkS3OrphanMappingCleanupPending, both of which establish canonical state
+	// before publishing the projection; the cross-table sequence is not atomic,
+	// so concurrent lifecycle races remain fail-closed in recovery. DeleteS3Orphan
+	// removes the canonical row and then its projection.
 	allowedInsert := "upsertS3OrphanProjection"
 	allowedDelete := "DeleteS3Orphan"
 	// Counts, not set membership. Each authorized caller publishes the projection
@@ -52,8 +52,18 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	// count would accept two publications from one caller and none from the other,
 	// which is precisely the case where a lifecycle transition stops publishing.
 	allowedProjectionCallsites := map[string]int{
-		"(*CassandraStore).StartBlockDeleteOrphan":            1,
+		"(*CassandraStore).ensureS3OrphanProjectionResult":    1,
 		"(*CassandraStore).MarkS3OrphanMappingCleanupPending": 1,
+	}
+	// Direct lexical calls, not transitive ones. Created publishes from
+	// StartBlockDeleteOrphan; SameTarget only publishes after
+	// confirmSameTargetOrphanResult has acknowledged canonical EACH_QUORUM
+	// visibility. Counting three wrappers on StartBlockDeleteOrphan would
+	// reject that split and miss an unauthorized helper that published
+	// without confirming the canonical row.
+	allowedProjectionWrapperCallsites := map[string]int{
+		"(*CassandraStore).StartBlockDeleteOrphan":        1,
+		"(*CassandraStore).confirmSameTargetOrphanResult": 1,
 	}
 
 	// Identifiers removed by R22a, kept by name so a revert is caught even if the
@@ -67,6 +77,7 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 	insertWriters := []string{}
 	deleteWriters := []string{}
 	projectionCallsites := map[string]int{}
+	projectionWrapperCallsites := map[string]int{}
 	functionName := func(fn *ast.FuncDecl) string {
 		if fn.Recv == nil || len(fn.Recv.List) == 0 {
 			return fn.Name.Name
@@ -81,12 +92,12 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 		}
 		return fn.Name.Name
 	}
-	recordProjectionCallsites := func(node ast.Node, caller string) {
+	recordCallsites := func(node ast.Node, caller, target string, callsites map[string]int) {
 		ast.Inspect(node, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if ok {
-				if function, identOK := call.Fun.(*ast.Ident); identOK && function.Name == allowedInsert {
-					projectionCallsites[caller]++
+				if function, identOK := call.Fun.(*ast.Ident); identOK && function.Name == target {
+					callsites[caller]++
 				}
 			}
 			return true
@@ -96,8 +107,8 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 		// selector call twice.
 		ast.Inspect(node, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
-			if ok && selector.Sel.Name == allowedInsert {
-				projectionCallsites[caller]++
+			if ok && selector.Sel.Name == target {
+				callsites[caller]++
 			}
 			return true
 		})
@@ -146,7 +157,8 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 					}
 				}
 				if filepath.Base(path) != "store_mock.go" {
-					recordProjectionCallsites(declaration, "<package>")
+					recordCallsites(declaration, "<package>", allowedInsert, projectionCallsites)
+					recordCallsites(declaration, "<package>", "ensureS3OrphanProjectionResult", projectionWrapperCallsites)
 				}
 				continue
 			}
@@ -154,7 +166,8 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 			// compiled Go but is not a production caller of the Cassandra helper;
 			// do not let the mirror weaken the exact Cassandra callsite contract.
 			if filepath.Base(path) != "store_mock.go" {
-				recordProjectionCallsites(fn.Body, functionName(fn))
+				recordCallsites(fn.Body, functionName(fn), allowedInsert, projectionCallsites)
+				recordCallsites(fn.Body, functionName(fn), "ensureS3OrphanProjectionResult", projectionWrapperCallsites)
 			}
 			for _, query := range stringLiteralsIn(fn) {
 				if insertPattern.MatchString(query) {
@@ -204,6 +217,21 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 		if _, present := projectionCallsites[caller]; !present {
 			t.Errorf("%s no longer calls %s (want %d): its canonical state would exist with no discovery row, invisible to the day scan until the canonical TTL",
 				caller, allowedInsert, want)
+		}
+	}
+	for caller, count := range projectionWrapperCallsites {
+		want, authorized := allowedProjectionWrapperCallsites[caller]
+		if !authorized {
+			t.Errorf("%s: ensureS3OrphanProjectionResult callsite is not an authorized canonical-first lifecycle caller", caller)
+			continue
+		}
+		if count != want {
+			t.Errorf("%s calls ensureS3OrphanProjectionResult %d times, want %d", caller, count, want)
+		}
+	}
+	for caller, want := range allowedProjectionWrapperCallsites {
+		if _, present := projectionWrapperCallsites[caller]; !present {
+			t.Errorf("%s no longer calls ensureS3OrphanProjectionResult (want %d): its canonical state would exist with no discovery row", caller, want)
 		}
 	}
 }

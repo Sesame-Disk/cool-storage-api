@@ -193,7 +193,8 @@ func TestWorker_RecoverS3Orphans_NonCanonicalStorageClassFailsClosed(t *testing.
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-padded-class", " hot ", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-padded-class", "hot", "", "earlier failure", time.Now())
+	store.SetS3OrphanStorageClassForTest(orgID, "orph-padded-class", " hot ")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -609,7 +610,8 @@ func TestWorker_RecoverS3Orphans_EmptyStorageClassFailsClosed(t *testing.T) {
 	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
 
 	orgID := uuid.New()
-	seedS3Orphan(t, store, orgID, "orph-empty-class", "", "", "earlier failure", time.Now())
+	seedS3Orphan(t, store, orgID, "orph-empty-class", "hot", "", "earlier failure", time.Now())
+	store.SetS3OrphanStorageClassForTest(orgID, "orph-empty-class", "")
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
 	if err == nil {
@@ -728,7 +730,15 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	}
 }
 
-func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *testing.T) {
+// TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan
+// pins the write-once / phase split. Publication no longer rewinds pending_s3, and it
+// also must not treat pending_mapping_cleanup as permission to FinalizeBlockDelete:
+// recovery on that phase does not consult BlockExists, so dropping the blocks row
+// first would open a live-content window. Recovery may still clear the completed-phase
+// row without a physical delete; the claimed block stays until a later Created
+// publication can start a new pending_s3 fence. R14b is what binds that later
+// publication to the current claim.
+func TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
 	stats := &Stats{}
@@ -748,11 +758,9 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if err != nil || claim.Outcome != BlockClaimAcquired {
 		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC()); err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
-	}
-	if err := store.FinalizeBlockDelete(orgID, blockID, authority); err != nil {
-		t.Fatalf("FinalizeBlockDelete: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC())
+	if result.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v, want lifecycle_advanced", result.Outcome, result.Cause)
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -765,12 +773,15 @@ func TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3(t *t
 	if store.S3OrphanCount() != 0 {
 		t.Fatalf("orphan should be cleared, got %d", store.S3OrphanCount())
 	}
+	if store.GetBlock(orgID, blockID) == nil {
+		t.Fatal("lifecycle-advanced publication must not have finalized the claimed block")
+	}
 	if !store.ForwardBlockMappingExists(orgID, "sha1-new") {
 		t.Fatal("forward mapping should survive recovered S3 delete")
 	}
 	deleted := sp.DeletedBlocks()
-	if len(deleted) != 1 || deleted[0] != MockCanonicalStorageKey(orgID.String(), blockID) {
-		t.Fatalf("expected one S3 delete for blk-redelete, got %v", deleted)
+	if len(deleted) != 0 {
+		t.Fatalf("completed-phase recovery must not delete S3, got deletes %v", deleted)
 	}
 }
 

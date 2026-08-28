@@ -619,6 +619,97 @@ func TestP4A_AmbiguousClaimSettlesBeforeAnyCleanup(t *testing.T) {
 	}
 }
 
+// TestP4A_ClassifySettledBlockClaimVisibility pins the helper that turns an EACH_QUORUM
+// observation of a SERIAL-settled own claim into Acquired or Ambiguous. SERIAL already
+// answered ownership; this read only authorizes destructive continuation.
+func TestP4A_ClassifySettledBlockClaimVisibility(t *testing.T) {
+	attempt := BlockDeleteAuthority{
+		Target:    BlockDeleteTarget{StorageClass: "hot", StorageKey: "blocks/org/aa/bb/key"},
+		ClaimID:   "d1",
+		ClaimedAt: time.Unix(10, 0).UTC(),
+	}
+	row := blockDeleteClaimRow{
+		Target:      attempt.Target,
+		GCState:     db.BlockGCStateDeleting,
+		GCClaimID:   attempt.ClaimID,
+		GCClaimedAt: attempt.ClaimedAt,
+	}
+
+	visible := classifySettledBlockClaimVisibility(row, true, nil, attempt)
+	if visible.Outcome != BlockClaimAcquired {
+		t.Fatalf("exact EACH_QUORUM confirmation = %s, want acquired", visible.Outcome)
+	}
+
+	unavail := classifySettledBlockClaimVisibility(blockDeleteClaimRow{}, false, errors.New("Cannot achieve consistency level EACH_QUORUM in DC dc-na"), attempt)
+	if unavail.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("EACH_QUORUM unavailable = %s, want ambiguous", unavail.Outcome)
+	}
+
+	missing := classifySettledBlockClaimVisibility(blockDeleteClaimRow{}, false, nil, attempt)
+	if missing.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("EACH_QUORUM miss after SERIAL hit = %s, want ambiguous not missing", missing.Outcome)
+	}
+
+	other := row
+	other.GCClaimID = "d2"
+	if got := classifySettledBlockClaimVisibility(other, true, nil, attempt); got.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("EACH_QUORUM different claim = %s, want ambiguous", got.Outcome)
+	}
+
+	wrongP := row
+	wrongP.Target.StorageKey = "other-key"
+	if got := classifySettledBlockClaimVisibility(wrongP, true, nil, attempt); got.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("EACH_QUORUM different P = %s, want ambiguous", got.Outcome)
+	}
+
+	wrongTime := row
+	wrongTime.GCClaimedAt = attempt.ClaimedAt.Add(time.Second)
+	if got := classifySettledBlockClaimVisibility(wrongTime, true, nil, attempt); got.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("EACH_QUORUM claimed_at mismatch = %s, want ambiguous", got.Outcome)
+	}
+}
+
+// TestP4A_SettledOwnClaimIsAmbiguousWhenEachQuorumIsUnavailable is the mock half of the
+// same contract: LWT error + SERIAL seeing our D1 is not Acquired if the regular
+// visibility read cannot complete.
+func TestP4A_SettledOwnClaimIsAmbiguousWhenEachQuorumIsUnavailable(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-eq-unavail")
+	attempt := p4aAttempt(candidate, time.Now().UTC())
+	store.SeedBlockClaimForTest(orgID, "blk-eq-unavail", attempt.ClaimID, attempt.ClaimedAt)
+	store.SetClaimBlockDeleteErrForTest(errors.New("gocql: no response received from cassandra within timeout period"))
+	store.SetClaimBlockDeleteEachQuorumErrForTest(errors.New("Cannot achieve consistency level EACH_QUORUM in DC dc-na"))
+
+	claim, err := store.ClaimBlockDelete(orgID, "blk-eq-unavail", attempt)
+	if claim.Outcome == BlockClaimAcquired {
+		t.Fatal("SERIAL own claim after LWT error must not be Acquired when EACH_QUORUM is unavailable")
+	}
+	if claim.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("claim = %s, want ambiguous", claim.Outcome)
+	}
+	if err == nil {
+		t.Fatal("EACH_QUORUM confirmation failure must surface as an error")
+	}
+}
+
+func TestP4A_SettledOwnClaimIsAcquiredWhenEachQuorumConfirms(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-eq-confirm")
+	attempt := p4aAttempt(candidate, time.Now().UTC())
+	store.SeedBlockClaimForTest(orgID, "blk-eq-confirm", attempt.ClaimID, attempt.ClaimedAt)
+	store.SetClaimBlockDeleteErrForTest(errors.New("gocql: no response received from cassandra within timeout period"))
+
+	claim, err := store.ClaimBlockDelete(orgID, "blk-eq-confirm", attempt)
+	if err != nil {
+		t.Fatalf("visible settled own claim: %v", err)
+	}
+	if claim.Outcome != BlockClaimAcquired {
+		t.Fatalf("SERIAL own claim + EACH_QUORUM confirmation = %s, want acquired", claim.Outcome)
+	}
+}
+
 // TestP4A_EnsureBlockGCCandidateRefusesWithoutAnExactIncarnation is the source-side gate:
 // a candidate that cannot name P is never written at all, so no later code path has to
 // remember to check for one.

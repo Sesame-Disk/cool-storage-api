@@ -138,16 +138,19 @@ this evolves), [CHUNKING-ANALYSIS.md](./CHUNKING-ANALYSIS.md).
     survives physical GC under R11a). See the safety + performance section below.
 - `PR8` — **merged to `main`**: GC recovery hardening for the former forward-only
   mapping-cleanup model. The mapping-cleanup portion below is historical and superseded
-  by R11a; the durable physical-orphan recovery and stale-phase reset remain active.
+  by R11a, and the stale-phase reset described here was removed by P4b-1's write-once
+  publication; the durable physical-orphan recovery remains active.
   - **Historical mapping-cleanup design (superseded by R11a):** Migration
     `007_gc_s3_orphan_mapping_recovery.cql` added `external_sha1` and `recovery_phase`
     so recovery could clean the forward SHA-1 mapping after the canonical `blocks` row
     was gone.
-  - **Active stale-phase reset on new delete** ensures a fresh block lifecycle cannot
-    inherit an old `pending_mapping_cleanup` phase and skip the physical S3 delete.
-  - **Tests** pin the current finalization and reset behavior:
+  - **Stale-phase reset on new delete (REMOVED by P4b-1)** used to stop a fresh block
+    lifecycle from inheriting an old `pending_mapping_cleanup` phase and skipping the
+    physical S3 delete. Write-once publication no longer rewinds an existing row; see
+    the write-once trade recorded under the S3 orphan recovery section below.
+  - **Tests** pin the current finalization and write-once behavior:
     `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock`
-    and `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
+    and `TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan`.
 - `R11a` — physical GC no longer deletes the logical forward mapping. The mapping belongs
   to the SHA-1 -> SHA-256 relationship rather than to a physical block incarnation. The
   historical `pending_mapping_cleanup` phase remains for restart compatibility, but now
@@ -454,14 +457,28 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       orphan row. Pinned by
       `TestWorker_RecoverS3Orphans_PendingMappingCleanupFinalizesWithResurrectedBlock` and
       `TestWorker_RecoverS3Orphans_PendingMappingCleanupDoesNotReadBlockExists`.
-   - **Stale-phase reset on a new delete.** A NEW block delete writes its recovery row via
-     `StartBlockDeleteOrphan`, which always resets the phase to `pending_s3` (and `retry_count`,
-     `last_error`) — even if a stale row from an older delete of the same `block_id` was left at
-     `pending_mapping_cleanup`. Otherwise recovery would inherit the stale phase and SKIP the
-     physical S3 delete for the new lifecycle, leaking the new object. `first_seen_at` is preserved
-     so the discovery projection stays a single in-place row; the reset is fail-closed (`IF EXISTS`).
-     Pinned by `TestStore_StartBlockDeleteOrphan_ResetsStalePendingMappingCleanup` and
-     `TestWorker_RecoverS3Orphans_NewDeleteResetsStalePhaseAndStillDeletesS3`.
+   - **Write-once orphan publication.** A block delete writes its recovery row via
+      `StartBlockDeleteOrphan` with `INSERT ... IF NOT EXISTS`. A same-target retry preserves
+      the canonical row's `first_seen_at` and recovery state while repairing its discovery
+      projection; a different target is reported as a conflict without overwriting the older
+      lifecycle. An uncertain result is settled in the serial domain, and an unsettled result
+      remains fail-closed. Same-target confirmation proves visibility now and does not renew
+      the remaining TTL (R28); crash-retry still authorizes `FinalizeBlockDelete` because
+      `Created` already inserted the fence. Pinned by the P4b publication unit and real-Cassandra evidence
+      tests.
+    - **What write-once gave up, deliberately.** The previous entry point always reset an
+      existing row to `pending_s3`, because a stale row left at `pending_mapping_cleanup` makes
+      recovery SKIP the physical delete. Preserving the existing lifecycle brings that case
+      back: a block re-uploaded while its old row still sits at `pending_mapping_cleanup`, then
+      condemned again, resolves to the SAME `(storage_class, storage_key)`. Publication now
+      classifies that as `LifecycleAdvanced` and does not authorize `FinalizeBlockDelete`,
+      because recovery on that phase does not consult `BlockExists`. Recovery may still
+      clear the completed-phase row without a physical delete. For this stale-phase
+      ambiguity, write-once stays leak-biased rather than aiming a second delete at a key
+      a new incarnation may have re-created. Full loss-freedom still requires the
+      incarnation binding — R14b. Pinned by
+      `TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClearsOrphan`
+      and `TestP4B_WorkerLifecycleAdvancedDoesNotFinalize`.
 
 **No tombstone / hot-partition risk (Cassandra access pattern).** The canonical block lookup hits a
 full partition key, so there is no `ALLOW FILTERING`, no clustering-row scan, and no tombstone

@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -168,6 +169,9 @@ func TestP4ASettlementReadsUseTheSerialDomain(t *testing.T) {
 	if !gcQueryMethodHas(fn, "FROM blocks", "Consistency", "Serial") {
 		t.Error("settleBlockDeleteClaimState must read at Consistency(gocql.Serial): an ordinary read that misses a committed claim strands the block behind a fence nothing can lift (R20)")
 	}
+	if strings.Contains(formattedGCFunction(t, file, "settleBlockDeleteClaimState"), "EachQuorum") {
+		t.Error("settleBlockDeleteClaimState must stay in the serial domain; EACH_QUORUM confirmation of a settled own claim is a separate read")
+	}
 
 	// ReleaseStaleBlockClaim's observing read decides whether a candidate may be
 	// consumed, so it must go through the settling read rather than its own SELECT.
@@ -177,6 +181,90 @@ func TestP4ASettlementReadsUseTheSerialDomain(t *testing.T) {
 	}
 	if p4aHasRawBlocksSelect(stale) {
 		t.Error("ReleaseStaleBlockClaim must not issue its own SELECT on blocks; its zero authorizes consuming the candidate, so it has to settle in the serial domain (ISSUE-GC-STALE-CLAIM-READ-CONSISTENCY-01)")
+	}
+}
+
+// TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum is the claim-side twin of
+// SameTarget's canonical confirmation. Paxos can accept a proposal on a majority while
+// the EACH_QUORUM learn fails (a down DC). A SERIAL settling read may then observe or
+// complete that proposal. That is ownership in the Paxos domain, not writer-visible
+// fence publication. BlockClaimAcquired after an uncertain LWT is allowed only once
+// the canonical row matches at EACH_QUORUM.
+func TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum(t *testing.T) {
+	file := p4aParseStore(t)
+
+	claim := formattedGCFunction(t, file, "ClaimBlockDelete")
+	if !strings.Contains(claim, "if settled.Outcome == BlockClaimAcquired") ||
+		!strings.Contains(claim, "return s.confirmSettledBlockClaimVisibility") {
+		t.Fatal("LWT error + SERIAL own claim must confirm EACH_QUORUM visibility before Acquired")
+	}
+
+	confirm := formattedGCFunction(t, file, "confirmSettledBlockClaimVisibility")
+	if !strings.Contains(confirm, "readBlockDeleteClaimEachQuorum") {
+		t.Fatal("settled-claim confirmation must re-read blocks at EACH_QUORUM")
+	}
+	if !strings.Contains(confirm, "classifySettledBlockClaimVisibility") {
+		t.Fatal("settled-claim confirmation must classify the EACH_QUORUM row before Acquired")
+	}
+	if !strings.Contains(confirm, "BlockClaimAmbiguous") {
+		t.Fatal("EACH_QUORUM miss or mismatch after SERIAL own claim must be Ambiguous, not Acquired")
+	}
+
+	read := findGCFunction(file, "readBlockDeleteClaimEachQuorum")
+	if read == nil {
+		t.Fatal("readBlockDeleteClaimEachQuorum not found")
+	}
+	if !gcQueryMethodHas(read, "FROM blocks", "Consistency", "EachQuorum") {
+		t.Fatal("readBlockDeleteClaimEachQuorum must pin regular visibility to gocql.EachQuorum")
+	}
+	if gcQueryMethodHas(read, "FROM blocks", "Consistency", "Serial") {
+		t.Fatal("readBlockDeleteClaimEachQuorum must not be a second SERIAL read; SERIAL already settled ownership")
+	}
+}
+
+// TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair pins the schema
+// premise that confirmSettledBlockClaimVisibility depends on. An EACH_QUORUM read
+// of `blocks` can return the reconciled D1 while a stale RF-1 replica still serves
+// gc_state=null to a LOCAL_QUORUM writer unless read repair is BLOCKING.
+func TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "db", "migrations", "001_initial_schema.cql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "CREATE TABLE IF NOT EXISTS blocks (")
+	if start < 0 {
+		t.Fatal("blocks table definition not found")
+	}
+	rest := text[start:]
+	end := strings.Index(rest, "CREATE TABLE IF NOT EXISTS block_references")
+	if end < 0 {
+		t.Fatal("could not bound the blocks table definition")
+	}
+	table := strings.ToLower(rest[:end])
+	if strings.Contains(table, "read_repair") && strings.Contains(table, "none") {
+		t.Fatal("blocks must not set read_repair='NONE'; settled own-claim confirmation relies on blocking read repair at EACH_QUORUM")
+	}
+
+	entries, err := os.ReadDir(filepath.Join("..", "db", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".cql") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "db", "migrations", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(body))
+		if !strings.Contains(lower, "read_repair") || !strings.Contains(lower, "none") {
+			continue
+		}
+		if strings.Contains(lower, "alter table blocks ") || strings.Contains(lower, "alter table blocks\n") || strings.Contains(lower, "alter table blocks\t") {
+			t.Fatalf("%s disables blocking read repair on blocks; settled own-claim confirmation relies on BLOCKING", entry.Name())
+		}
 	}
 }
 
@@ -762,5 +850,3 @@ func p4aCallsWorkerMethod(call *ast.CallExpr, name string) bool {
 	_, ok = selector.X.(*ast.Ident)
 	return ok && selector.Sel.Name == name
 }
-
-

@@ -198,8 +198,9 @@ func TestWorker_RecoverS3Orphans_RefusesStorageKeyFromAnotherOrg(t *testing.T) {
 	orgID := uuid.New()
 	victimOrgID := uuid.New()
 	blockID := testSHA256BlockID("orphan-foreign-key")
-	if _, err := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(victimOrgID.String(), blockID), "", time.Now().UTC()); err != nil {
-		t.Fatalf("StartBlockDeleteOrphan: %v", err)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(victimOrgID.String(), blockID), "", time.Now().UTC())
+	if result.Outcome != StartBlockDeleteOrphanCreated {
+		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v", result.Outcome, result.Cause)
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
@@ -260,8 +261,9 @@ func TestStartBlockDeleteOrphanRequiresStorageKey(t *testing.T) {
 	orgID := uuid.New()
 
 	for _, storageKey := range []string{"", "   ", "canonical-key ", " canonical-key"} {
-		if _, err := store.StartBlockDeleteOrphan(orgID, "blk-no-key", "hot", storageKey, "", time.Now().UTC()); err == nil {
-			t.Fatalf("StartBlockDeleteOrphan(%q) error = nil, want invalid storage key error", storageKey)
+		result := store.StartBlockDeleteOrphan(orgID, "blk-no-key", "hot", storageKey, "", time.Now().UTC())
+		if result.Outcome != StartBlockDeleteOrphanInvalid {
+			t.Fatalf("StartBlockDeleteOrphan(%q) outcome = %s, want invalid", storageKey, result.Outcome)
 		}
 	}
 	if store.S3OrphanCount() != 0 {

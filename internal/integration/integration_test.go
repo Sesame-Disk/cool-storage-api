@@ -50,6 +50,7 @@ func TestMain(m *testing.M) {
 	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_P3_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_P4A_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_P4B_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R26_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {

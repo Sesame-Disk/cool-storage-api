@@ -149,6 +149,14 @@ func TestP4A_LateLoserLeavesQueueUntouched(t *testing.T) {
 		if !shouldPostponeWithoutRetry(err) {
 			t.Errorf("%T is documented as postponing but spends the retry budget", err)
 		}
+		// And the postpone must still be REACHABLE. processOrg checks
+		// shouldLeaveQueueUntouched first, so a code that appears in both lists never
+		// postpones no matter what shouldPostponeWithoutRetry says about it — which is
+		// exactly how P4b-1 nearly moved block_authority_invalid off this contract by
+		// reusing its code for an unrelated publication outcome.
+		if shouldLeaveQueueUntouched(err) {
+			t.Errorf("%T is classified as queue-untouched as well, so its documented postpone is unreachable", err)
+		}
 	}
 }
 

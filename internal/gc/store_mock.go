@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -159,50 +160,55 @@ type MockStore struct {
 	deleteLibraryStorageCounterErr error
 	// libraryDestructiveCalls records HardDeleteLibrary / DeleteLibraryStorageCounter
 	// in call order so tests can assert the hard delete precedes the counter cleanup.
-	libraryDestructiveCalls            []string
-	deleteLibraryStorageCounterFor     map[uuid.UUID]int
-	deleteGroupFullErr                 error
-	reconcileStorageCountersHook       func()
-	acquireOrgHardDeleteLockHook       func(orgID uuid.UUID)
-	beginOrgPurgeHook                  func(orgID uuid.UUID)
-	getBlockRefCountErr                error
-	blockExistsErr                     error
-	blockExistsCalls                   int
-	libraryExistsErr                   error
-	canonicalLibraryExistsErr          error
-	forceRenewLibraryLockNotOwned      bool
-	groupExistsErr                     error
-	groupExistsCalls                   atomic.Int64
-	findOrgForLibraryErr               error
-	blockHasReferencesHook             func(orgID uuid.UUID, blockID string, current bool) (bool, error)
-	blockHasReferencesErr              error
-	blockHasReferencesGlobalErr        error
-	blockHasReferencesLocalCalls       int
-	blockHasReferencesGlobalCalls      int
-	releaseStaleBlockClaimErr          error
-	getBlockGCCandidateErr             error
-	deleteBlockGCCandidateDiscoveryErr error
-	claimBlockDeleteSettleErr          error
-	getBlockInfoHook                   func(BlockInfo) BlockInfo
-	getBlockInfoErr                    error
-	claimAttempts                      []BlockDeleteAuthority
-	releaseBlockClaimErr               error
-	claimBlockDeleteErr                error
-	validateDestructiveTopologyErr     error
-	blockReferenceExistsErr            error
-	ensureBlockGCCandidateErr          error
-	deleteProvisionalProjectionErr     error
-	getS3OrphanGlobalErr               error
-	getS3OrphanGlobalCalls             int
-	getS3OrphanGlobalHook              func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
-	deleteS3OrphanErrOnce              error
-	markS3OrphanErrOnce                error
+	libraryDestructiveCalls                        []string
+	deleteLibraryStorageCounterFor                 map[uuid.UUID]int
+	deleteGroupFullErr                             error
+	reconcileStorageCountersHook                   func()
+	acquireOrgHardDeleteLockHook                   func(orgID uuid.UUID)
+	beginOrgPurgeHook                              func(orgID uuid.UUID)
+	getBlockRefCountErr                            error
+	blockExistsErr                                 error
+	blockExistsCalls                               int
+	libraryExistsErr                               error
+	canonicalLibraryExistsErr                      error
+	forceRenewLibraryLockNotOwned                  bool
+	groupExistsErr                                 error
+	groupExistsCalls                               atomic.Int64
+	findOrgForLibraryErr                           error
+	blockHasReferencesHook                         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
+	blockHasReferencesErr                          error
+	blockHasReferencesGlobalErr                    error
+	blockHasReferencesLocalCalls                   int
+	blockHasReferencesGlobalCalls                  int
+	releaseStaleBlockClaimErr                      error
+	getBlockGCCandidateErr                         error
+	deleteBlockGCCandidateDiscoveryErr             error
+	claimBlockDeleteSettleErr                      error
+	claimBlockDeleteEachQuorumErr                  error
+	getBlockInfoHook                               func(BlockInfo) BlockInfo
+	getBlockInfoErr                                error
+	claimAttempts                                  []BlockDeleteAuthority
+	releaseBlockClaimErr                           error
+	claimBlockDeleteErr                            error
+	validateDestructiveTopologyErr                 error
+	blockReferenceExistsErr                        error
+	ensureBlockGCCandidateErr                      error
+	deleteProvisionalProjectionErr                 error
+	getS3OrphanGlobalErr                           error
+	getS3OrphanGlobalCalls                         int
+	getS3OrphanGlobalHook                          func(orgID uuid.UUID, blockID string, call int, info S3OrphanInfo) (S3OrphanInfo, error)
+	deleteS3OrphanErrOnce                          error
+	markS3OrphanErrOnce                            error
+	startBlockDeleteOrphanAmbiguousOnce            bool
+	startBlockDeleteOrphanNotPublishedOnce         bool
+	startBlockDeleteOrphanCanonicalUnconfirmedOnce bool
 
 	// optional test hooks for reproducing concurrency windows deterministically.
-	getQueueSizeHook                func(orgID uuid.UUID, size int)
-	removeActiveOrgHook             func(orgID uuid.UUID, activeBefore time.Time)
-	recalculateStatsHook            func(orgID uuid.UUID)
-	startBlockDeleteOrphanResetRace bool
+	getQueueSizeHook                        func(orgID uuid.UUID, size int)
+	removeActiveOrgHook                     func(orgID uuid.UUID, activeBefore time.Time)
+	recalculateStatsHook                    func(orgID uuid.UUID)
+	startBlockDeleteOrphanProjectionErrOnce error
+	releaseBlockClaimHook                   func()
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
 	// where the LoggedBatch never applied.
@@ -905,9 +911,16 @@ func (m *MockStore) DeleteS3OrphanCanonicalForTest(orgID uuid.UUID, blockID stri
 }
 
 // SetGetS3OrphanGlobalErrForTest makes the canonical EACH_QUORUM read fail.
-// SetS3OrphanStorageKeyForTest rewrites a canonical orphan's locator after the
-// lifecycle entry point has refused to create it without one, so a test can model
-// a row that lost or never had a usable key.
+// The storage setters rewrite a canonical orphan after the lifecycle entry point
+// has validated it, so recovery tests can model malformed legacy rows.
+func (m *MockStore) SetS3OrphanStorageClassForTest(orgID uuid.UUID, blockID, storageClass string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if orphan, ok := m.s3Orphans[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		orphan.StorageClass = storageClass
+	}
+}
+
 func (m *MockStore) SetS3OrphanStorageKeyForTest(orgID uuid.UUID, blockID, storageKey string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2594,6 +2607,15 @@ func (m *MockStore) SetClaimBlockDeleteSettleErrForTest(err error) {
 	m.claimBlockDeleteSettleErr = err
 }
 
+// SetClaimBlockDeleteEachQuorumErrForTest models SERIAL settlement seeing our claim
+// while the canonical EACH_QUORUM visibility read cannot complete. Production then
+// returns Ambiguous, not Acquired.
+func (m *MockStore) SetClaimBlockDeleteEachQuorumErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimBlockDeleteEachQuorumErr = err
+}
+
 // SetGetBlockGCCandidateErrForTest injects a failure into the candidate authority read.
 func (m *MockStore) SetGetBlockGCCandidateErrForTest(err error) {
 	m.mu.Lock()
@@ -2743,7 +2765,9 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 		// only a settlement that ALSO fails leaves the outcome unknown. Reporting every
 		// injected error as ambiguous made the mock unable to express the case that
 		// matters most — an LWT that timed out after committing, which the settling read
-		// then recognises as our own claim.
+		// then recognises as our own claim. SERIAL ownership is still not EACH_QUORUM
+		// visibility: claimBlockDeleteEachQuorumErr models a learn that never became
+		// visible in every DC.
 		if m.claimBlockDeleteSettleErr != nil {
 			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, m.claimBlockDeleteErr, m.claimBlockDeleteSettleErr)
 		}
@@ -2759,7 +2783,11 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 		if b.GCClaimedAt != nil {
 			settled.GCClaimedAt = *b.GCClaimedAt
 		}
-		return settled.result(attempt, staleBefore), nil
+		result := settled.result(attempt, staleBefore)
+		if result.Outcome == BlockClaimAcquired && m.claimBlockDeleteEachQuorumErr != nil {
+			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", m.claimBlockDeleteEachQuorumErr)
+		}
+		return result, nil
 	}
 	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if !ok {
@@ -2800,6 +2828,13 @@ func (m *MockStore) SetReleaseBlockClaimErrForTest(err error) {
 }
 
 func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockReleaseOutcome, error) {
+	m.mu.Lock()
+	hook := m.releaseBlockClaimHook
+	m.releaseBlockClaimHook = nil
+	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.releaseBlockClaimLocked(orgID, blockID, authority)
@@ -4326,43 +4361,92 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 	return info, true, nil
 }
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) (time.Time, error) {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult {
+	result := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous}
+	if !config.IsCanonicalStorageClassName(storageClass) {
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s with non-canonical storage class %q", orgID, blockID, storageClass)
+		return result
+	}
 	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		return time.Time{}, fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s without storage key", orgID, blockID)
+		return result
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	result.Submitted = true
+	now = now.UTC()
+	externalSHA1 = strings.TrimSpace(externalSHA1)
+	if m.startBlockDeleteOrphanNotPublishedOnce {
+		m.startBlockDeleteOrphanNotPublishedOnce = false
+		result.Outcome = StartBlockDeleteOrphanNotPublished
+		result.Cause = errors.New("test: serial settlement confirmed orphan publication absent")
+		return result
+	}
+	if m.startBlockDeleteOrphanAmbiguousOnce {
+		m.startBlockDeleteOrphanAmbiguousOnce = false
+		result.Outcome = StartBlockDeleteOrphanAmbiguous
+		result.Cause = errors.New("test: serial settlement could not establish orphan publication")
+		return result
+	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
-		if m.startBlockDeleteOrphanResetRace {
-			firstSeenAt := existing.FirstSeenAt
-			delete(m.s3Orphans, key)
-			delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
-			return firstSeenAt, fmt.Errorf("reset S3 orphan recovery state for org=%s block=%s: row disappeared before update", orgID, blockID)
+		result.FirstSeenAt = existing.FirstSeenAt
+		result.ExistingTarget = BlockDeleteTarget{StorageClass: existing.StorageClass, StorageKey: existing.StorageKey}
+		if !config.IsCanonicalStorageClassName(existing.StorageClass) || existing.StorageKey == "" || strings.TrimSpace(existing.StorageKey) != existing.StorageKey || existing.FirstSeenAt.IsZero() {
+			result.Outcome = StartBlockDeleteOrphanInvalid
+			result.Cause = fmt.Errorf("existing S3 orphan for org=%s block=%s has incomplete identity or first_seen_at", orgID, blockID)
+			return result
 		}
-		existing.StorageClass = storageClass
-		existing.StorageKey = storageKey
-		existing.ExternalSHA1 = strings.TrimSpace(externalSHA1)
-		existing.RecoveryPhase = S3OrphanPhasePendingS3
-		existing.LastAttemptAt = now
-		existing.RetryCount = 0
-		existing.LastError = ""
-		m.upsertS3OrphanProjection(existing.OrgID, existing.BlockID, existing.FirstSeenAt)
-		return existing.FirstSeenAt, nil
+		if result.ExistingTarget != (BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey}) {
+			result.Outcome = StartBlockDeleteOrphanDifferentTarget
+			return result
+		}
+		result.Outcome = StartBlockDeleteOrphanSameTarget
+		return m.confirmSameTargetOrphanResultLocked(orgID, blockID, result)
 	}
 	orphan := &S3OrphanInfo{
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
 		StorageKey:    storageKey,
-		ExternalSHA1:  strings.TrimSpace(externalSHA1),
+		ExternalSHA1:  externalSHA1,
 		RecoveryPhase: S3OrphanPhasePendingS3,
-		FirstSeenAt:   now.UTC(),
+		FirstSeenAt:   now,
 		LastAttemptAt: now,
 	}
 	m.s3Orphans[key] = orphan
-	m.upsertS3OrphanProjection(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
-	return orphan.FirstSeenAt, nil
+	result.Outcome = StartBlockDeleteOrphanCreated
+	result.FirstSeenAt = orphan.FirstSeenAt
+	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+}
+
+func (m *MockStore) confirmSameTargetOrphanResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	if m.startBlockDeleteOrphanCanonicalUnconfirmedOnce {
+		m.startBlockDeleteOrphanCanonicalUnconfirmedOnce = false
+		result.Outcome = StartBlockDeleteOrphanAmbiguous
+		result.Cause = errors.New("test: canonical EACH_QUORUM visibility unconfirmed")
+		return result
+	}
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if existing, ok := m.s3Orphans[key]; ok && existing.RecoveryPhase != S3OrphanPhasePendingS3 {
+		result.Outcome = StartBlockDeleteOrphanLifecycleAdvanced
+		result.Cause = fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", existing.RecoveryPhase)
+		return result
+	}
+	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+}
+
+func (m *MockStore) ensureS3OrphanProjectionResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	if m.startBlockDeleteOrphanProjectionErrOnce != nil {
+		result.Outcome = StartBlockDeleteOrphanProjectionUnconfirmed
+		result.Cause = m.startBlockDeleteOrphanProjectionErrOnce
+		m.startBlockDeleteOrphanProjectionErrOnce = nil
+		return result
+	}
+	m.upsertS3OrphanProjection(orgID, blockID, result.FirstSeenAt)
+	return result
 }
 
 func (m *MockStore) MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error {
@@ -4490,12 +4574,47 @@ func (m *MockStore) AllS3Orphans() []S3OrphanInfo {
 	return out
 }
 
-// SetStartBlockDeleteOrphanResetRaceForTest makes the mock model the canonical
-// row disappearing after the CAS read and before the conditional reset update.
-func (m *MockStore) SetStartBlockDeleteOrphanResetRaceForTest(enabled bool) {
+// SetStartBlockDeleteOrphanProjectionErrOnceForTest makes publication retain the
+// canonical row while reporting that discovery projection durability was not
+// confirmed.
+func (m *MockStore) SetStartBlockDeleteOrphanProjectionErrOnceForTest(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.startBlockDeleteOrphanResetRace = enabled
+	m.startBlockDeleteOrphanProjectionErrOnce = err
+}
+
+// SetStartBlockDeleteOrphanNotPublishedOnceForTest makes the next publication
+// report that serial settlement confirmed the orphan row was absent.
+func (m *MockStore) SetStartBlockDeleteOrphanNotPublishedOnceForTest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startBlockDeleteOrphanNotPublishedOnce = true
+}
+
+// SetStartBlockDeleteOrphanAmbiguousOnceForTest makes the next publication
+// report that serial settlement could not establish its outcome.
+func (m *MockStore) SetStartBlockDeleteOrphanAmbiguousOnceForTest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startBlockDeleteOrphanAmbiguousOnce = true
+}
+
+// SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest makes the next
+// same-target publication fail closed before projection repair, matching a
+// SERIAL/CAS observation whose canonical EACH_QUORUM read did not confirm
+// writer-visible fence dissemination.
+func (m *MockStore) SetStartBlockDeleteOrphanCanonicalUnconfirmedOnceForTest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startBlockDeleteOrphanCanonicalUnconfirmedOnce = true
+}
+
+// SetReleaseBlockClaimHookForTest runs once immediately before a mock release
+// evaluates ownership, allowing tests to interpose a competing claim.
+func (m *MockStore) SetReleaseBlockClaimHookForTest(hook func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseBlockClaimHook = hook
 }
 
 // AllBlockGCCandidates is a test helper returning every candidate row across

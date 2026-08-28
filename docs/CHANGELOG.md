@@ -8,6 +8,125 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4a follow-up: gate blocks read_repair=BLOCKING
+
+`confirmSettledBlockClaimVisibility` uses an `EACH_QUORUM` read of `blocks` as
+the dissemination barrier for writer `LOCAL_QUORUM` fence reads. That is only
+sound while effective `read_repair` is `BLOCKING` (empty is not accepted as the
+default). Source/schema and real-Cassandra P4a evidence now pin `blocks` the
+same way P4b-1 already pins `gc_s3_orphans`. Production claim protocol is
+unchanged.
+
+## 2026-08-28 - P4a follow-up: SERIAL own claim is not EACH_QUORUM Acquired
+
+`ClaimBlockDelete` no longer treats a SERIAL-settled own `claimID` as
+`BlockClaimAcquired` after an uncertain LWT. Paxos can accept on a majority while
+the `EACH_QUORUM` learn fails; SERIAL may then observe that proposal. Acquired
+after an LWT error requires a canonical `blocks` read at `EACH_QUORUM` matching
+exact P, `gc_state=deleting`, claim id and `claimed_at`. Direct `applied=true`
+is unchanged. This is the same split P4b-1 already uses for orphan `SameTarget`.
+
+## 2026-08-28 - P4b-1 follow-up: SameTarget requires the exact pending_s3 token
+
+`recovery_phase` is compared without TrimSpace, matching the strict identity
+fields. A padded `" pending_s3 "` is `LifecycleAdvanced` and does not authorize
+finalize. `GetS3OrphanGlobal` no longer trims the phase before that check.
+
+## 2026-08-28 - P4b-1 follow-up: P3 claim fail-closed is Ambiguous, not err!=nil
+
+The DC-down P3 leg inspected only `ClaimBlockDelete`'s error. After P4a settlement,
+SERIAL can observe the still-unowned row and return `BlockClaimAmbiguous` with
+`err=nil`; the worker already fail-closes on that Outcome, but the test treated nil
+as success. The claim half now requires `Ambiguous` and forbids `Acquired`. The
+orphan half is unchanged (`NotPublished` or `Ambiguous`).
+
+## 2026-08-27 - P4b-1 follow-up: P3 fail-closed is not-published or ambiguous
+
+Aligned the multi-DC evidence with SERIAL settlement and tightened the production API.
+
+- With a datacenter down, `StartBlockDeleteOrphan` may return `NotPublished` or
+  `Ambiguous`. `Created`/`SameTarget` remain forbidden because they authorize
+  `FinalizeBlockDelete`. Survivor "no fence" is required only after SERIAL-confirmed
+  absence; a partial row on live DCs is fail-closed, not a successful condemnation.
+- `ClassifySettledS3OrphanForTest` is gone from the production store API. Real
+  SERIAL evidence uses the same SELECT as settlement; classification stays in
+  package `gc` unit tests.
+- Effective `read_repair` evidence no longer treats an empty schema value as BLOCKING.
+- `SameTarget` still authorizes crash-retry Finalize. Unrejuvenated TTL is R28;
+  refusing SameTarget Finalize would stall the retry that write-once exists for.
+  `GC_ENABLED=false` remains required until R14b.
+
+## 2026-08-27 - P4b-1 follow-up: SameTarget requires pending_s3, not only identity
+
+Closed the remaining P4b-1 publication hole without opening R14b.
+
+- `SameTarget` now requires `recovery_phase = pending_s3` after the canonical
+  `EACH_QUORUM` read. A visible same-P row at `pending_mapping_cleanup` is
+  `LifecycleAdvanced`: no `FinalizeBlockDelete`, claim/candidate/queue untouched.
+  Recovery on that phase still does not consult `BlockExists`.
+- R22a's lexical allowlist matches the Created vs SameTarget split
+  (`StartBlockDeleteOrphan` 1, `confirmSameTargetOrphanResult` 1).
+- Real-Cassandra evidence covers SERIAL settlement classification, the advanced-phase
+  refusal, and effective `read_repair=BLOCKING`. Two further mutations pin the phase
+  gate and exact-P comparison.
+
+R14b claim→orphan binding remains OPEN. `GC_ENABLED=false` remains required.
+
+## 2026-08-27 - P4b-1 follow-up: SERIAL settlement is not EACH_QUORUM visibility
+
+Closed two publication-classification holes without opening R14b.
+
+- `SameTarget` no longer authorizes `FinalizeBlockDelete` from a SERIAL observation
+  or a non-applied CAS row alone. The canonical `gc_s3_orphans` identity must be
+  visible at `EACH_QUORUM` before the discovery projection is repaired. `Created`
+  still relies on the LWT's own `EACH_QUORUM` commit.
+- An empty non-applied CAS map is settled in the SERIAL domain. `NotPublished`
+  is emitted only when that settlement confirms absence, which is the contract the
+  worker uses to release a claim.
+- The accepted same-P leak is documented as crash **or** inline S3 delete exhausting
+  retries after inheriting `pending_mapping_cleanup`, and is pinned through
+  `processBlock` as well as recovery. Publication refusals record the `block`
+  destructive path, not `orphan`.
+- Source, classification and worker tests plus three additional P4b mutations
+  (`empty non-applied`, `SameTarget` skipping canonical confirmation, projection
+  `EACH_QUORUM`) hold the new contract.
+
+R14b claim→orphan binding remains OPEN. `GC_ENABLED=false` remains required.
+
+## 2026-08-27 - P4b-1: write-once orphan publication and classified outcomes
+
+Implemented the P4b-1 publication boundary without claiming full P4b/R14b closure.
+
+- `StartBlockDeleteOrphan` now uses a single-use `INSERT ... IF NOT EXISTS` at
+  `EachQuorum`/`Serial`, disables driver retries and speculative execution, and settles
+  uncertain results through a SERIAL canonical read.
+- Existing rows are classified by exact `(storage_class, storage_key)` identity. A
+  same-target result reuses the stored `first_seen_at` and repairs the identity-only
+  discovery projection; a different target is never overwritten.
+- The worker releases and postpones only confirmed conflict/not-published outcomes;
+  ambiguous, invalid and projection-unconfirmed results retain the destructive state
+  without queue lifecycle mutation.
+- Publication refusals carry their own failure code (`block_orphan_invalid`) instead of
+  reusing `block_authority_invalid`. The untouched check runs before the postpone check,
+  so sharing the code would have moved the candidate-authority error off its documented
+  postpone path without any test noticing. The P4a contract test now asserts the two
+  classifications stay disjoint, and a fifth mutation holds it there.
+- The two publication fail-closed refusals record the `block` destructive path, the one
+  whose liveness success this walk publishes — not `orphan`, which belongs to the
+  recovery scanner the blocked/liveness alert compares separately.
+- Added unit coverage, real-Cassandra evidence, an R22a guard adjustment for the
+  projection wrapper, and `scripts/p4b-mutation-validation.sh` with five load-bearing
+  mutations.
+
+Write-once gives up the old stale-phase reset, and that is a deliberate trade: a
+same-target resume can inherit a `pending_mapping_cleanup` phase and leak an object,
+where the reset it replaced could aim a second physical delete at a re-created key and
+lose live content. Leak over loss, until the orphan row carries an incarnation — see the
+R14b row in `docs/GC-X1-CLOSURE-OPTIONS.md`.
+
+Full claim-to-orphan authority binding remains open under R14b/P4b. `GC_ENABLED=false`
+remains required.
+
 ## 2026-08-27 - P4a: the postponing unwinds obey the authority rule too
 
 The previous entry established the rule and applied it to five of eight post-claim exits.
