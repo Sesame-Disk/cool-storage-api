@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -218,6 +219,52 @@ func TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum(t *testing.T) {
 	}
 	if gcQueryMethodHas(read, "FROM blocks", "Consistency", "Serial") {
 		t.Fatal("readBlockDeleteClaimEachQuorum must not be a second SERIAL read; SERIAL already settled ownership")
+	}
+}
+
+// TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair pins the schema
+// premise that confirmSettledBlockClaimVisibility depends on. An EACH_QUORUM read
+// of `blocks` can return the reconciled D1 while a stale RF-1 replica still serves
+// gc_state=null to a LOCAL_QUORUM writer unless read repair is BLOCKING.
+func TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "db", "migrations", "001_initial_schema.cql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "CREATE TABLE IF NOT EXISTS blocks (")
+	if start < 0 {
+		t.Fatal("blocks table definition not found")
+	}
+	rest := text[start:]
+	end := strings.Index(rest, "CREATE TABLE IF NOT EXISTS block_references")
+	if end < 0 {
+		t.Fatal("could not bound the blocks table definition")
+	}
+	table := strings.ToLower(rest[:end])
+	if strings.Contains(table, "read_repair") && strings.Contains(table, "none") {
+		t.Fatal("blocks must not set read_repair='NONE'; settled own-claim confirmation relies on blocking read repair at EACH_QUORUM")
+	}
+
+	entries, err := os.ReadDir(filepath.Join("..", "db", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".cql") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "db", "migrations", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(body))
+		if !strings.Contains(lower, "read_repair") || !strings.Contains(lower, "none") {
+			continue
+		}
+		if strings.Contains(lower, "alter table blocks ") || strings.Contains(lower, "alter table blocks\n") || strings.Contains(lower, "alter table blocks\t") {
+			t.Fatalf("%s disables blocking read repair on blocks; settled own-claim confirmation relies on BLOCKING", entry.Name())
+		}
 	}
 }
 

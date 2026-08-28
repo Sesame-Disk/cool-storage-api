@@ -61,7 +61,10 @@ clean run — cite that, not a number copied from prose.
 `claimID` is not `BlockClaimAcquired`. Production confirms the canonical `blocks` row at
 `EACH_QUORUM` (exact P, `deleting`, claim id, `claimed_at`) before granting destructive
 authority — the same split P4b-1 uses for orphan `SameTarget`. Direct `applied=true`
-stays Acquired. A new mutation (`m_settled_own_claim_skips_each_quorum`) holds that gate.
+stays Acquired. That confirmation read requires effective `blocks.read_repair=BLOCKING`
+(empty is not the default); source/schema and `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` pin it.
+Mutations `m_settled_own_claim_skips_each_quorum` and
+`m_blocks_disables_blocking_read_repair` hold those gates.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
 locators: each now releases the exact claim, preserves the candidate, and postpones

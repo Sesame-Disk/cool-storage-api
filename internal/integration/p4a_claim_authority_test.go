@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -388,4 +389,25 @@ func TestP4A_StaleClaimReleaseIsBoundToTheIncarnation(t *testing.T) {
 
 	gate.observed = true
 	t.Logf("P4A_PRECHECK_EVIDENCE refused_cross_incarnation=1 released_own_incarnation=1")
+}
+
+func TestP4A_CanonicalBlockReadRepairIsBlocking(t *testing.T) {
+	requireCassandra(t)
+	gate := p4aRequireEvidence(t)
+
+	keyspace := envOrDefault("CASSANDRA_KEYSPACE", "sesamefs")
+	var readRepair string
+	if err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT read_repair
+		FROM system_schema.tables
+		WHERE keyspace_name = ? AND table_name = ?
+	`, keyspace, "blocks").Scan(&readRepair); err != nil {
+		t.Fatalf("read effective read_repair for blocks: %v", err)
+	}
+	if strings.ToUpper(strings.TrimSpace(readRepair)) != "BLOCKING" {
+		t.Fatalf("blocks effective read_repair = %q, want BLOCKING; empty is not treated as the default. Settled own-claim confirmation relies on blocking read repair at EACH_QUORUM", readRepair)
+	}
+
+	gate.observed = true
+	t.Logf("P4A_READ_REPAIR_EVIDENCE blocking=1 value=%q", readRepair)
 }

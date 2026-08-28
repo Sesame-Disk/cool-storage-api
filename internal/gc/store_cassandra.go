@@ -2852,6 +2852,9 @@ func (s *CassandraStore) confirmSettledBlockClaimVisibility(orgID uuid.UUID, blo
 	// SERIAL settlement answered which claim Paxos chose. Writer fence reads are
 	// LOCAL_QUORUM, so Acquired after an uncertain LWT still needs the canonical
 	// row visible at EACH_QUORUM — the same split SameTarget uses for orphans.
+	// That EACH_QUORUM read is a dissemination barrier only while `blocks` uses
+	// blocking read repair: otherwise the coordinator can return D1 while a stale
+	// RF-1 replica in another DC still serves gc_state=null to writers.
 	row, found, err := s.readBlockDeleteClaimEachQuorum(orgID, blockID)
 	classified := classifySettledBlockClaimVisibility(row, found, err, attempt)
 	if classified.Outcome != BlockClaimAcquired {

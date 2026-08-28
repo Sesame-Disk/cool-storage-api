@@ -957,6 +957,9 @@ The real-Cassandra legs are `TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra
 `TestP4B_LifecycleAdvancedAtRealCassandra`, and
 `TestP4B_CanonicalOrphanReadRepairIsBlocking`.
 The standard integration containers run them with `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`.
+P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
+`TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,
+because settled own-claim confirmation is an `EACH_QUORUM` read of that table.
 
 ### What these legs do NOT cover
 

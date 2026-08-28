@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4a follow-up: gate blocks read_repair=BLOCKING
+
+`confirmSettledBlockClaimVisibility` uses an `EACH_QUORUM` read of `blocks` as
+the dissemination barrier for writer `LOCAL_QUORUM` fence reads. That is only
+sound while effective `read_repair` is `BLOCKING` (empty is not accepted as the
+default). Source/schema and real-Cassandra P4a evidence now pin `blocks` the
+same way P4b-1 already pins `gc_s3_orphans`. Production claim protocol is
+unchanged.
+
 ## 2026-08-28 - P4a follow-up: SERIAL own claim is not EACH_QUORUM Acquired
 
 `ClaimBlockDelete` no longer treats a SERIAL-settled own `claimID` as
