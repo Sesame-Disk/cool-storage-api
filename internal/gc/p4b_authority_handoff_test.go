@@ -41,6 +41,12 @@ func TestP4B_CommitBlockDeleteOrphanHandoffSourceContract(t *testing.T) {
 	if !strings.Contains(text, "Idempotent(false)") || !strings.Contains(text, "NumRetries: 0") || !strings.Contains(text, "NonSpeculativeExecution") {
 		t.Fatal("CommitBlockDeleteOrphanHandoff must not hide an uncertain LWT behind driver retries")
 	}
+	if !strings.Contains(text, "len(existing) == 0") || !strings.Contains(text, "settleBlockDeleteHandoff") {
+		t.Fatal("empty non-applied handoff CAS must SERIAL-settle, never classify as Invalid from the empty map")
+	}
+	if !strings.Contains(text, "maybeConfirmAlreadyCommittedHandoffEachQuorum") {
+		t.Fatal("CAS-map AlreadyCommitted must confirm EACH_QUORUM visibility before success")
+	}
 }
 
 func TestP4B_ReleaseAndClaimRefuseCommittedHandoff(t *testing.T) {
@@ -106,21 +112,32 @@ func TestProcessBlockCommittedHandoffIsNotReleasedOnPreClaimRefsBranch(t *testin
 	blockID := testSHA256BlockID("p4b-h10-refs")
 	store.AddBlock(orgID, blockID, "hot", 0)
 	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
-	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+	candidate := ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+	original := store.QueueItems(orgID)[0]
 	stored := store.SeedBlockClaimForTest(orgID, blockID, "stored-d1", candidateAt)
 	store.SeedBlockHandoffForTest(orgID, blockID)
 	store.AddBlockReferenceForTest(orgID, blockID, "still-referenced")
 
 	n, err := w.ProcessOnce(context.Background())
-	if err != nil || n != 1 {
-		t.Fatalf("ProcessOnce() = (%d, %v), want resume and complete under stored D", n, err)
+	if err != nil || n != 0 {
+		t.Fatalf("ProcessOnce() = (%d, %v), want committed-pending contradiction (no release, no delete)", n, err)
 	}
-	if store.GetBlock(orgID, blockID) != nil {
-		t.Fatal("CommittedOwner resume must finish the stored delete, not postpone as stale")
+	block := store.GetBlock(orgID, blockID)
+	if block == nil || block.GCState != "deleting" || block.GCClaimID != "stored-d1" || !orphanHandoffCommitted(block.GCOrphanHandoff) {
+		t.Fatalf("CommittedOwner refs contradiction released or finalized the stored authority: %+v", block)
 	}
-	orphans := store.AllS3Orphans()
-	if len(orphans) != 0 {
-		t.Fatalf("completed resume left orphan state: %+v", orphans)
+	if store.QueueCompleteCallsForTest() != 0 || store.QueueRequeueCallsForTest() != 0 || store.QueueFailCallsForTest() != 0 {
+		t.Fatalf("queue lifecycle calls = complete:%d requeue:%d fail:%d, want all zero", store.QueueCompleteCallsForTest(), store.QueueRequeueCallsForTest(), store.QueueFailCallsForTest())
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].RetryCount != original.RetryCount || !items[0].QueuedAt.Equal(original.QueuedAt) {
+		t.Fatalf("queue after H10 contradiction = %+v, want original %+v", items, original)
+	}
+	if _, ok, err := store.GetBlockGCCandidateExact(orgID, blockID, candidate.Identity()); err != nil || !ok {
+		t.Fatalf("candidate was consumed after H10 contradiction: ok=%v err=%v", ok, err)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("physical deletes = %v, want none while references remain", got)
 	}
 	if stored.ClaimID != "stored-d1" {
 		t.Fatal("test fixture lost the stored claim id")
@@ -193,5 +210,8 @@ func TestProcessBlockCommittedOwnerDoesNotMintANewClaim(t *testing.T) {
 	}
 	if got := sp.DeletedBlocks(); len(got) != 1 {
 		t.Fatalf("physical deletes = %v, want the stored incarnation", got)
+	}
+	if store.BlockDeleteLifecyclePhaseForTest(orgID, blockID, "stored-d1") != BlockDeleteLifecyclePhaseTerminal {
+		t.Fatal("successful delete must CAS the lifecycle tombstone to terminal before clearing the orphan")
 	}
 }

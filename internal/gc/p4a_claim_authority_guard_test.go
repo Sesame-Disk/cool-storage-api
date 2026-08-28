@@ -73,6 +73,11 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_state = ?", "gc_claim_id = ?", "gc_claimed_at = ?", "gc_orphan_handoff = null"},
 		},
 		{
+			function: "TerminateBlockDeleteLifecycle",
+			query:    "UPDATE gc_block_delete_lifecycles SET phase",
+			columns:  []string{"phase = ?", "storage_class = ?", "storage_key = ?", "claimed_at = ?"},
+		},
+		{
 			function: "DeleteBlockGCCandidate",
 			query:    "DELETE FROM gc_block_candidates",
 			columns:  []string{"candidate_at = ?"},
@@ -202,6 +207,9 @@ func TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum(t *testing.T) {
 	if !strings.Contains(claim, "if settled.Outcome == BlockClaimAcquired") ||
 		!strings.Contains(claim, "return s.confirmSettledBlockClaimVisibility") {
 		t.Fatal("LWT error + SERIAL own claim must confirm EACH_QUORUM visibility before Acquired")
+	}
+	if strings.Count(claim, "maybeConfirmCommittedOwnerEachQuorum") != 2 {
+		t.Fatal("LWT-error settlement and CAS-map CommittedOwner must both confirm EACH_QUORUM visibility")
 	}
 
 	confirm := formattedGCFunction(t, file, "confirmSettledBlockClaimVisibility")

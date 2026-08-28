@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4b-2 audit closures: EACH_QUORUM committed authority, refs contradiction, D tombstone
+
+Closed the confirmed P4b-2 / R14b audit holes without redesigning the handoff.
+`AlreadyCommitted` and `CommittedOwner` now confirm canonical `EACH_QUORUM`
+visibility (empty handoff CAS maps SERIAL-settle). `CommittedOwner` re-checks
+`BlockHasReferencesGlobal` as a contradiction detector; R3 stays OPEN. Migration
+`020` adds never-deleted `gc_block_delete_lifecycles` so a terminal D cannot
+republish an orphan or authorize S3 after finalize. Production clears
+`gc_s3_orphans` only after `published → terminal`. `CommittedBlockDeleteAuthority`
+is opaque; Cassandra still validates. R12 allowlist is the count source (10
+conditional `blocks` statements). X1 stays OPEN. `GC_ENABLED=false`.
+
 ## 2026-08-28 - P4b-2 / R14b: bind orphan handoff and finalize to exact delete authority
 
 `CommitBlockDeleteOrphanHandoff` is the irreversible `blocks` marker

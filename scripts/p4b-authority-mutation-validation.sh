@@ -33,13 +33,19 @@ fail() { red "FAILED: $*"; restore; exit 1; }
 trap restore EXIT INT TERM
 
 mutate() {
-  local f="$1" expr="$2"
-  cp "$f" "$f.p4b2bak"
-  BACKUPS+=("$f")
+  local f="$1" expr="$2" before
+  if [ ! -f "$f.p4b2bak" ]; then
+    cp "$f" "$f.p4b2bak"
+    BACKUPS+=("$f")
+  fi
+  before="$(mktemp)"
+  cp "$f" "$before"
   perl -0pi -e "$expr" "$f"
-  if cmp -s "$f" "$f.p4b2bak"; then
+  if cmp -s "$f" "$before"; then
+    rm -f "$before"
     fail "mutation did not apply to $f"
   fi
+  rm -f "$before"
 }
 
 expect_red() {
@@ -153,6 +159,57 @@ m_worker_releases_after_handoff() {
   restore
 }
 
+m_already_committed_skips_each_quorum() {
+  mutate "$STORE" 's#return s\.maybeConfirmAlreadyCommittedHandoffEachQuorum\(orgID, blockID, authority, classifyBlockDeleteHandoffRow\(row, authority\)\)#classified := classifyBlockDeleteHandoffRow(row, authority)\n\treturn classified, classified.Cause#'
+  mutate "$STORE" 's#return s\.confirmAlreadyCommittedHandoffEachQuorum\(orgID, blockID, authority\)#return classified, nil#g'
+  mutate "$MOCK" 's{if m\.claimBlockDeleteEachQuorumErr != nil \|\| confirmed\.Outcome != BlockDeleteHandoffAlreadyCommitted}{if false && (m.claimBlockDeleteEachQuorumErr != nil || confirmed.Outcome != BlockDeleteHandoffAlreadyCommitted)}'
+  expect_red 'TestP4B_AlreadyCommittedHandoffFailsClosedWhenEachQuorumUnconfirmed' 'must not be treated as durable authority' \
+    'AlreadyCommitted skips EACH_QUORUM confirmation'
+  restore
+}
+
+m_committed_owner_skips_each_quorum() {
+  mutate "$STORE" 's#return s\.maybeConfirmCommittedOwnerEachQuorum\(orgID, blockID, attempt, settled\)#return settled, nil#'
+  mutate "$STORE" 's#return s\.maybeConfirmCommittedOwnerEachQuorum\(orgID, blockID, attempt, row\.result\(attempt, staleBefore\)\)#return row.result(attempt, staleBefore), nil#'
+  mutate "$MOCK" 's#func \(m \*MockStore\) confirmMockCommittedOwner\(row blockDeleteClaimRow, attempt BlockDeleteAuthority, result BlockClaimResult\) \(BlockClaimResult, error\) \{\s+if result.Outcome != BlockClaimCommittedOwner#func (m *MockStore) confirmMockCommittedOwner(row blockDeleteClaimRow, attempt BlockDeleteAuthority, result BlockClaimResult) (BlockClaimResult, error) {\n\treturn result, nil\n\tif result.Outcome != BlockClaimCommittedOwner#'
+  expect_red 'TestP4B_CommittedOwnerFailsClosedWhenEachQuorumUnconfirmed' 'must not be success' \
+    'CommittedOwner skips EACH_QUORUM confirmation'
+  restore
+}
+
+m_committed_owner_skips_refs() {
+  mutate "$WORKER" 's#if alreadyCommitted \{\s+hasRefs, err = w\.store\.BlockHasReferencesGlobal#if false {\n\t\thasRefs, err = w.store.BlockHasReferencesGlobal#'
+  expect_red 'TestProcessBlockCommittedHandoffIsNotReleasedOnPreClaimRefsBranch' 'want committed-pending contradiction' \
+    'CommittedOwner no longer treats global refs as a contradiction'
+  restore
+}
+
+m_orphan_skips_lifecycle() {
+  mutate "$STORE" 's#lifecycle := s\.insertBlockDeleteLifecycle\(orgID, blockID, proposed\)\s+if lifecycle\.Outcome == StartBlockDeleteOrphanLifecycleAdvanced \{\s+return lifecycle\s+\}\s+if lifecycle\.Outcome != StartBlockDeleteOrphanCreated && lifecycle\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+return lifecycle\s+\}\s+##'
+  mutate "$MOCK" 's#lifecycle := m\.insertMockBlockDeleteLifecycleLocked\(orgID, blockID, proposed\)\s+if lifecycle\.Outcome == StartBlockDeleteOrphanLifecycleAdvanced \{\s+return lifecycle\s+\}\s+if lifecycle\.Outcome != StartBlockDeleteOrphanCreated && lifecycle\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+return lifecycle\s+\}\s+##'
+  expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'must insert the durable D tombstone' \
+    'StartBlockDeleteOrphan no longer inserts the lifecycle tombstone'
+  expect_red 'TestP4B_WorkerAlreadyFinalizedWithTerminalLifecycleDoesNotDeleteS3' 'must not authorize physical delete' \
+    'mock StartBlockDeleteOrphan no longer consults the lifecycle tombstone'
+  restore
+}
+
+m_clear_orphan_skips_terminal() {
+  mutate "$WORKER" 's#terminated, err := w\.store\.TerminateBlockDeleteLifecycle.*?return w\.store\.DeleteS3Orphan#return w.store.DeleteS3Orphan#s'
+  expect_red 'TestProcessBlockCommittedOwnerDoesNotMintANewClaim' 'must CAS the lifecycle tombstone to terminal' \
+    'DeleteS3Orphan runs without a published→terminal CAS'
+  restore
+}
+
+m_terminal_lifecycle_is_same_authority() {
+  mutate "$STORE" 's#case BlockDeleteLifecyclePhaseTerminal:\s+result\.Outcome = StartBlockDeleteOrphanLifecycleAdvanced\s+result\.Cause = errors\.New\("block-delete lifecycle is terminal; D is no longer destructive authority"\)#case BlockDeleteLifecyclePhaseTerminal:\n\t\tresult.Outcome = StartBlockDeleteOrphanSameAuthority#'
+  mutate "$STORE" 's#if lifeFound && life\.Phase == BlockDeleteLifecyclePhaseTerminal#if false && lifeFound && life.Phase == BlockDeleteLifecyclePhaseTerminal#'
+  mutate "$MOCK" 's#if life != nil && life\.Phase == BlockDeleteLifecyclePhaseTerminal#if false && life != nil && life.Phase == BlockDeleteLifecyclePhaseTerminal#'
+  expect_red 'TestP4B_AlreadyFinalizedDoesNotAuthorizeWhenLifecycleTerminal' 'want already_complete' \
+    'phase=terminal is treated as SameAuthority / AlreadyFinalized that authorizes S3'
+  restore
+}
+
 MUTATIONS=(
   m_handoff_drops_storage_class
   m_handoff_drops_storage_key
@@ -167,6 +224,12 @@ MUTATIONS=(
   m_handoff_local_serial
   m_claim_omits_handoff_predicate
   m_worker_releases_after_handoff
+  m_already_committed_skips_each_quorum
+  m_committed_owner_skips_each_quorum
+  m_committed_owner_skips_refs
+  m_orphan_skips_lifecycle
+  m_clear_orphan_skips_terminal
+  m_terminal_lifecycle_is_same_authority
 )
 
 if [ "${1:-}" = "--list" ]; then

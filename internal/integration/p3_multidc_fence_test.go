@@ -201,9 +201,20 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 		t.Errorf("P3 REGRESSION: ClaimBlockDelete outcome=%s err=%v; with a datacenter down the claim must be ambiguous, never acquired", claim.Outcome, claimErr)
 	}
 
+	handoff, handoffErr := store.CommitBlockDeleteOrphanHandoff(orgUUID, blockID, attempt)
+	switch handoff.Outcome {
+	case gcpkg.BlockDeleteHandoffAmbiguous, gcpkg.BlockDeleteHandoffInvalid, gcpkg.BlockDeleteHandoffNotOwner:
+		// EACH_QUORUM learn cannot finish, or SERIAL settlement observed an uncommitted
+		// row. Neither is permission to publish.
+	case gcpkg.BlockDeleteHandoffCommitted, gcpkg.BlockDeleteHandoffAlreadyCommitted:
+		t.Errorf("P3 REGRESSION: CommitBlockDeleteOrphanHandoff outcome=%s err=%v; with a datacenter down the handoff must not be committed/already_committed", handoff.Outcome, handoffErr)
+	default:
+		t.Errorf("P3 REGRESSION: CommitBlockDeleteOrphanHandoff outcome=%s err=%v; with a datacenter down the handoff must fail closed", handoff.Outcome, handoffErr)
+	}
+
 	// The orphan: the fence that gates a rowless mint, so a publication invisible to
 	// dc-na is what lets a second physical life be born while the first retires.
-	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, gcpkg.CommittedBlockDeleteAuthority{BlockDeleteAuthority: attempt}, "", time.Now().UTC())
+	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(attempt), "", time.Now().UTC())
 	switch orphanResult.Outcome {
 	case gcpkg.StartBlockDeleteOrphanNotPublished:
 		p3RequireUnavailableAtEachQuorum(t, "StartBlockDeleteOrphan", orphanResult.Cause)
@@ -216,7 +227,7 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 		t.Errorf("P3 REGRESSION: StartBlockDeleteOrphan outcome=%s cause=%v; with a datacenter down publication must be not_published or ambiguous, never Created/SameAuthority (those authorize FinalizeBlockDelete)", orphanResult.Outcome, orphanResult.Cause)
 	}
 
-	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s claim=%s orphan=%s (must not authorize finalize)", orgID, blockID, claim.Outcome, orphanResult.Outcome)
+	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s claim=%s handoff=%s orphan=%s (must not authorize finalize)", orgID, blockID, claim.Outcome, handoff.Outcome, orphanResult.Outcome)
 }
 
 func p3RequireNoFenceOnSurvivors(t *testing.T, orgID, blockID string, endpoints map[string]string) {
@@ -282,7 +293,7 @@ func TestP3_WriterInAnotherDatacenterObservesTheFence(t *testing.T) {
 	if err != nil || (handoff.Outcome != gcpkg.BlockDeleteHandoffCommitted && handoff.Outcome != gcpkg.BlockDeleteHandoffAlreadyCommitted) {
 		t.Fatalf("commit orphan handoff from dc-eu = %s, %v; want committed", handoff.Outcome, err)
 	}
-	committed := gcpkg.CommittedBlockDeleteAuthority{BlockDeleteAuthority: authority}
+	committed := gcpkg.CommittedBlockDeleteAuthorityForTest(authority)
 	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, committed, "", time.Now().UTC())
 	if orphanResult.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
 		t.Fatalf("publish orphan fence from dc-eu: outcome=%s cause=%v", orphanResult.Outcome, orphanResult.Cause)

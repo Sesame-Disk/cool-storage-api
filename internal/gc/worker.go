@@ -1438,7 +1438,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	case BlockClaimCommittedOwner:
 		alreadyCommitted = true
 		deleteAuthority = claim.Owner
-		log.Printf("[GC Worker] Block %s: resuming committed delete authority %s; no new claim, no takeover, no refs re-authorization", item.ItemID, deleteAuthority.ClaimID)
+		log.Printf("[GC Worker] Block %s: resuming committed delete authority %s; no new claim, no takeover; refs are a contradiction detector", item.ItemID, deleteAuthority.ClaimID)
 	case BlockClaimTargetChanged:
 		// The row is a different physical incarnation than this candidate authorized.
 		// This candidate's life is over and its work is irrelevant; the incarnation
@@ -1759,6 +1759,18 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return failedClosedError{Reason: "destructive topology gate rejected block before orphan-handoff commit", ItemID: item.ItemID, Err: err}
 	}
 
+	if alreadyCommitted {
+		hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
+		if err != nil {
+			log.Printf("[GC Worker] Block %s: committed-owner refs contradiction read failed; leaving the queue untouched: %v", item.ItemID, err)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: err}
+		}
+		if hasRefs {
+			log.Printf("[GC Worker] Block %s: committed-owner refs contradiction; leaving the stored authority standing and not deleting", item.ItemID)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: errors.New("committed delete authority observed references after handoff")}
+		}
+	}
+
 	if !alreadyCommitted {
 		handoff, handoffErr := w.store.CommitBlockDeleteOrphanHandoff(item.OrgID, item.ItemID, deleteAuthority)
 		metrics.GCBlockDeleteHandoffTotal.WithLabelValues(handoff.Outcome.String()).Inc()
@@ -1766,7 +1778,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		case BlockDeleteHandoffCommitted, BlockDeleteHandoffAlreadyCommitted:
 			alreadyCommitted = true
 			if !handoff.Authority.IsZero() {
-				deleteAuthority = handoff.Authority.BlockDeleteAuthority
+				deleteAuthority = handoff.Authority.Authority()
 			}
 		case BlockDeleteHandoffNotOwner, BlockDeleteHandoffTargetChanged:
 			log.Printf("[GC Worker] Block %s: orphan-handoff commit lost the claim (%s); preserving the candidate", item.ItemID, handoff.Outcome)
@@ -1867,7 +1879,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// 5. Finalize the recovery row after the physical delete. The forward mapping
 	// is logical metadata and intentionally survives this physical GC lifecycle.
 	if clearRecoveryRow {
-		if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
+		if err := w.terminateThenDeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt, committedBlockDeleteAuthority(deleteAuthority)); err != nil {
 			log.Printf("[GC Worker] WARNING: block %s physical cleanup succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
@@ -1880,6 +1892,24 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_deleted").Inc()
 	log.Printf("[GC Worker] Deleted block %s", item.ItemID)
 	return nil
+}
+
+func (w *Worker) terminateThenDeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time, authority CommittedBlockDeleteAuthority) error {
+	if authority.IsZero() {
+		return fmt.Errorf("refusing to clear S3 orphan %s without a committed lifecycle authority", blockID)
+	}
+	terminated, err := w.store.TerminateBlockDeleteLifecycle(orgID, blockID, authority)
+	if !terminated.ok() {
+		cause := err
+		if cause == nil {
+			cause = terminated.Cause
+		}
+		if cause == nil {
+			cause = fmt.Errorf("lifecycle terminate outcome %s", terminated.Outcome)
+		}
+		return cause
+	}
+	return w.store.DeleteS3Orphan(orgID, blockID, firstSeenAt)
 }
 
 // releaseAndPostponeUnreliableRead hands this attempt's fence back and postpones when a
@@ -2190,7 +2220,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 						}
 						continue
 					}
-					if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
+					if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: failed to finalize post-S3 orphan row %s: %v", canonicalCommit.BlockID, err)
 						if phaseErr == nil {
 							phaseErr = fmt.Errorf("finalize post-S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)
@@ -2373,7 +2403,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
+				if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", canonicalCommit.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("clear S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)

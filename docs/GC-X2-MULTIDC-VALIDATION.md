@@ -678,8 +678,9 @@ succeed and leave the third DC blind.
 ### The legs
 
 ```
---p3                 leg 1  dc-na stopped: ClaimBlockDelete and StartBlockDeleteOrphan
-                            must BOTH refuse to publish
+--p3                 leg 1  dc-na stopped: ClaimBlockDelete, CommitBlockDeleteOrphanHandoff,
+                            and StartBlockDeleteOrphan must all refuse to publish
+                            (handoff must not be Committed / AlreadyCommitted)
                      leg 2  all DCs up: dc-eu runs the real lifecycle
                             (claim -> orphan -> finalize); dc-na then sees no
                             canonical row and a live orphan, and must refuse to
@@ -697,16 +698,17 @@ Observed on the fixture, with dc-na stopped:
 Cannot achieve consistency level EACH_QUORUM in DC dc-na
 ```
 
-for both the claim and the orphan — and under either mutation, `applied=true`
+for the claim, the orphan handoff, and the orphan — and under either mutation, `applied=true`
 instead.
 
 Leg 1 does not accept that as `err != nil`. A lightweight transaction that times
 out (`WriteType: CAS`) may still have been accepted, so "it errored" is not proof
-that nothing was published. Both halves settle in SERIAL after the EACH_QUORUM
-learn fails. The claim must be `BlockClaimAmbiguous` — never `Acquired` — and
+that nothing was published. Claim, handoff, and orphan settle in SERIAL after the
+EACH_QUORUM learn fails. The claim must be `BlockClaimAmbiguous` — never `Acquired` — and
 SERIAL may return that outcome with `err=nil` after observing the still-unowned
 row. SERIAL seeing our own `claimID` is still not `Acquired` until the canonical
-row is confirmed at `EACH_QUORUM`. The orphan must be `NotPublished` or `Ambiguous` — never `Created` or
+row is confirmed at `EACH_QUORUM`. The handoff must be `Ambiguous`, `Invalid`, or `NotOwner` — never `Committed` or
+`AlreadyCommitted`. The orphan must be `NotPublished` or `Ambiguous` — never `Created` or
 `SameTarget`. When SERIAL confirms orphan absence, the leg then reads the fence
 back from dc-eu and dc-asia and requires both to report no fence. `Ambiguous` may
 leave a partial row on the survivors; that is fail-closed, not a successful

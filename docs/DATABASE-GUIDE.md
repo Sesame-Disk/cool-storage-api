@@ -538,6 +538,12 @@ enumerate orphaned blocks.
 | `gc_orphan_handoff` | BOOLEAN | Null until the orphan-handoff commit; `true` afterwards. Never written `false` |
 | `last_accessed` | TIMESTAMP | For cold storage tiering |
 
+`gc_orphan_handoff` dies with the `blocks` row at finalize. The never-deleted
+companion is `gc_block_delete_lifecycles` (migration `020`, not folded into
+`001_initial_schema.cql`): PK `((org_id, block_id), claim_id)`, phases
+`published` | `terminal`. Same `claim_id` cannot republish the orphan or
+authorize S3 after `terminal`. Do not DELETE those rows.
+
 > `blocks` no longer carries a mutable `ref_count`. Block liveness lives in
 > `block_references` (one row per `(block, referrer)`); a block is alive iff a
 > reference row exists. See ARCHITECTURE.md "Block Liveness — Row-Per-Reference Model".
@@ -1295,17 +1301,21 @@ Set appropriate consistency levels per operation:
 | GC candidate lifecycle (`INSERT IF NOT EXISTS`, conditional grace advance and cleanup) | `SERIAL` (explicit statement pin) | Preserves the candidate timestamp under concurrent enqueue. Since migration `018` the candidate is keyed by `((org_id, block_id), storage_class, storage_key)`, so each of these addresses ONE physical incarnation: there is no longer any "replace one incarnation with another" operation, and a delayed lifecycle for a dead incarnation cannot reach a live one's row |
 | GC candidate authority read (`GetBlockGCCandidateExact`) | `SERIAL` (explicit statement pin, `Consistency` not `SerialConsistency`) | A plain SELECT, pinned because its ABSENCE is destructive authority: "no candidate for this exact identity" retires the discovery row and then the queue and pending rows, which are the only durable references to it. Every write to `gc_block_candidates` is an LWT, so an ordinary quorum read can miss an accepted-but-uncommitted row and strand a live candidate |
 | GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (explicit statement pin) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
+| GC block-delete lifecycle tombstone (`gc_block_delete_lifecycles` INSERT / published→terminal UPDATE) | `SERIAL` (explicit statement pin) | Survives `DELETE` of `blocks` and clear of `gc_s3_orphans` so a stale D cannot replay physical delete |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
 
 The rows marked **explicit statement pin** do not derive their level from
 `serial_consistency` at all. The four CONDITIONAL ones have called `SerialConsistency(gocql.Serial)` themselves since P0/R12 (2026-08-23), so the level holds even where a
 deployment sets the session to `LOCAL_SERIAL`. That inventory — 10 conditional
-`blocks` statements (P4b-2 added `CommitBlockDeleteOrphanHandoff`), 4 canonical
-`gc_s3_orphans` and 3 `gc_block_candidates`
-(create, grace advance, tuple-bound cleanup) — is pinned by the untagged source
+`blocks` statements (P4b-2 added `CommitBlockDeleteOrphanHandoff`; the count
+source is `r12ExpectedSerialOperations`), 4 canonical
+`gc_s3_orphans`, 3 `gc_block_candidates`
+(create, grace advance, tuple-bound cleanup), and 2 `gc_block_delete_lifecycles`
+(write-once INSERT, published→terminal UPDATE) — is pinned by the untagged source
 gate `TestR12SerialDomainGuard`
-(`internal/integration/`).
+(`internal/integration/`). Do not treat a prose “11” as the inventory; the
+allowlist is authoritative.
 
 The gate keys discovery on **the CQL, not on the Go method that executes it**.
 That direction matters: Cassandra makes a statement a lightweight transaction

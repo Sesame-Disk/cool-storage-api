@@ -160,30 +160,33 @@ func r24NodeText(t *testing.T, node ast.Node) string {
 // adjacent hardening, but is kept distinct in the labels below so the design
 // documents do not accidentally claim that candidate ordering closes X1.
 var r12ExpectedSerialOperations = map[string]string{
-	"installBlockMetadataLWTFn|blocks|INSERT":                                  "single-use metadata install",
-	"claimReleasedBlockStubForRepairFn|blocks|UPDATE":                          "released-stub repair claim",
-	"deleteRepairClaimedBlockStubFn|blocks|DELETE":                             "released-stub repair cleanup",
-	"deleteClaimedBlockStubFn|blocks|DELETE":                                   "GC stub cleanup",
-	"backfillCurrentBlockRepresentationIDFn|blocks|UPDATE":                     "tuple-bound representation identity repair",
-	"backfillCurrentBlockSHA1Fn|blocks|UPDATE":                                 "tuple-bound SHA-1 identity repair",
-	"(*CassandraStore).EnsureBlockGCCandidateExact|gc_block_candidates|INSERT": "candidate creation",
-	"(*CassandraStore).advanceBlockGCCandidateAt|gc_block_candidates|UPDATE":   "candidate grace advance",
-	"(*CassandraStore).DeleteBlockGCCandidate|gc_block_candidates|DELETE":      "tuple-bound candidate cleanup",
-	"(*CassandraStore).StartBlockDeleteOrphan|gc_s3_orphans|INSERT":            "orphan creation",
-	"(*CassandraStore).MarkS3OrphanMappingCleanupPending|gc_s3_orphans|UPDATE": "orphan mapping phase",
-	"(*CassandraStore).UpdateS3OrphanAttempt|gc_s3_orphans|UPDATE":             "orphan attempt update",
-	"(*CassandraStore).ClaimBlockDelete|blocks|UPDATE":                         "GC claim",
-	"(*CassandraStore).ReleaseBlockClaim|blocks|UPDATE":                        "GC claim release",
-	"(*CassandraStore).CommitBlockDeleteOrphanHandoff|blocks|UPDATE":           "GC orphan-handoff commit",
-	"(*CassandraStore).FinalizeBlockDelete|blocks|DELETE":                      "GC finalize",
+	"installBlockMetadataLWTFn|blocks|INSERT":                                           "single-use metadata install",
+	"claimReleasedBlockStubForRepairFn|blocks|UPDATE":                                   "released-stub repair claim",
+	"deleteRepairClaimedBlockStubFn|blocks|DELETE":                                      "released-stub repair cleanup",
+	"deleteClaimedBlockStubFn|blocks|DELETE":                                            "GC stub cleanup",
+	"backfillCurrentBlockRepresentationIDFn|blocks|UPDATE":                              "tuple-bound representation identity repair",
+	"backfillCurrentBlockSHA1Fn|blocks|UPDATE":                                          "tuple-bound SHA-1 identity repair",
+	"(*CassandraStore).EnsureBlockGCCandidateExact|gc_block_candidates|INSERT":          "candidate creation",
+	"(*CassandraStore).advanceBlockGCCandidateAt|gc_block_candidates|UPDATE":            "candidate grace advance",
+	"(*CassandraStore).DeleteBlockGCCandidate|gc_block_candidates|DELETE":               "tuple-bound candidate cleanup",
+	"(*CassandraStore).StartBlockDeleteOrphan|gc_s3_orphans|INSERT":                     "orphan creation",
+	"(*CassandraStore).MarkS3OrphanMappingCleanupPending|gc_s3_orphans|UPDATE":          "orphan mapping phase",
+	"(*CassandraStore).UpdateS3OrphanAttempt|gc_s3_orphans|UPDATE":                      "orphan attempt update",
+	"(*CassandraStore).insertBlockDeleteLifecycle|gc_block_delete_lifecycles|INSERT":    "block-delete lifecycle tombstone",
+	"(*CassandraStore).TerminateBlockDeleteLifecycle|gc_block_delete_lifecycles|UPDATE": "block-delete lifecycle terminal",
+	"(*CassandraStore).ClaimBlockDelete|blocks|UPDATE":                                  "GC claim",
+	"(*CassandraStore).ReleaseBlockClaim|blocks|UPDATE":                                 "GC claim release",
+	"(*CassandraStore).CommitBlockDeleteOrphanHandoff|blocks|UPDATE":                    "GC orphan-handoff commit",
+	"(*CassandraStore).FinalizeBlockDelete|blocks|DELETE":                               "GC finalize",
 }
 
 // r12TargetTables is the R12 target set. Discovery resolves a statement's table
 // reference to one of these names; every other relation is out of scope.
 var r12TargetTables = map[string]bool{
-	"blocks":              true,
-	"gc_block_candidates": true,
-	"gc_s3_orphans":       true,
+	"blocks":                     true,
+	"gc_block_candidates":        true,
+	"gc_s3_orphans":              true,
+	"gc_block_delete_lifecycles": true,
 }
 
 // r12IdentifierPattern matches one component of a CQL table reference: either a
@@ -281,7 +284,7 @@ type r12DiscoveredOperation struct {
 // fail-closed on unresolvable CQL: without this allowlist a statement that moved
 // its CQL into a variable or fmt.Sprintf would stop being discovered instead of
 // failing the gate. Every entry must name a call site that provably cannot
-// address blocks, gc_block_candidates or gc_s3_orphans.
+// address blocks, gc_block_candidates, gc_s3_orphans or gc_block_delete_lifecycles.
 //
 // The rule deliberately applies to every Query call site, not only those ending
 // in a CAS method. Cassandra decides that a statement is a lightweight
@@ -391,7 +394,7 @@ func TestR12SerialDomainGuard(t *testing.T) {
 		allowance, allowed := r12AllowedUnresolvedCAS[symbol]
 		if !allowed {
 			t.Errorf(
-				"conditional CAS with non-literal CQL at %s (%s): R12 discovery cannot prove it does not target blocks, gc_block_candidates or gc_s3_orphans; keep the CQL inline or add an explicit allowlist entry",
+				"conditional CAS with non-literal CQL at %s (%s): R12 discovery cannot prove it does not target blocks, gc_block_candidates, gc_s3_orphans or gc_block_delete_lifecycles; keep the CQL inline or add an explicit allowlist entry",
 				symbol,
 				r12FormatPositions(positions),
 			)

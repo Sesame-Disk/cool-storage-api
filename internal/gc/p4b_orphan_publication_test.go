@@ -21,6 +21,12 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	file := parseGCStoreFile(t)
 	text := formattedGCFunction(t, file, "StartBlockDeleteOrphan")
 
+	if !strings.Contains(text, "insertBlockDeleteLifecycle") {
+		t.Fatal("StartBlockDeleteOrphan must insert the durable D tombstone before the orphan row")
+	}
+	if strings.Index(text, "insertBlockDeleteLifecycle") > strings.Index(text, "INSERT INTO gc_s3_orphans") {
+		t.Fatal("lifecycle INSERT must run before gc_s3_orphans INSERT")
+	}
 	if !strings.Contains(text, "INSERT INTO gc_s3_orphans") {
 		t.Fatal("StartBlockDeleteOrphan must publish the canonical orphan row")
 	}

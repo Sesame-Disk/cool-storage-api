@@ -112,7 +112,7 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, attemptB); err != nil || released != gcpkg.BlockReleaseNotOwner {
 		t.Fatalf("P4A REGRESSION: B release = %s, %v; the loser dropped the winner's fence", released, err)
 	}
-	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthority{BlockDeleteAuthority: attemptB}); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(attemptB)); err == nil {
 		t.Fatal("P4A REGRESSION: B finalized a delete it never owned; the canonical row would vanish under A")
 	}
 	if exists, err := store.BlockExists(orgID, blockID); err != nil || !exists {
@@ -151,7 +151,7 @@ func TestP4A_ClaimOwnershipIsExclusiveAndTakeoverIsExact(t *testing.T) {
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, attemptA); err != nil || released != gcpkg.BlockReleaseNotOwner {
 		t.Fatalf("P4A REGRESSION: A release after takeover = %s, %v; A dropped C's fence", released, err)
 	}
-	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthority{BlockDeleteAuthority: attemptA}); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(attemptA)); err == nil {
 		t.Fatal("P4A REGRESSION: A finalized after being taken over; C's delete would lose its canonical row mid-flight")
 	}
 	if exists, err := store.BlockExists(orgID, blockID); err != nil || !exists {
@@ -223,7 +223,7 @@ func TestP4A_StaleIncarnationCannotActOnTheLiveOne(t *testing.T) {
 	if released, err := store.ReleaseBlockClaim(orgID, blockID, stale); err != nil || released != gcpkg.BlockReleaseNotOwner {
 		t.Fatalf("P4A REGRESSION: stale release = %s, %v; want not_owner", released, err)
 	}
-	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthority{BlockDeleteAuthority: stale}); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(stale)); err == nil {
 		t.Fatal("P4A REGRESSION: a dead incarnation's authority finalized the delete of the live one")
 	}
 	if exists, err := store.BlockExists(orgID, blockID); err != nil || !exists {

@@ -155,18 +155,23 @@ exact P4a claim authority. `GC_ENABLED=false` remains required.
 
 **P4b-2 update (2026-08-28):** R14b is GREEN. Migration `019` adds `blocks.gc_orphan_handoff`
 (null until commit, never written false) and `gc_s3_orphans.gc_claim_id` / `gc_claimed_at`.
-`CommitBlockDeleteOrphanHandoff` is the single irreversible commit (EACH_QUORUM + SERIAL,
-exact `(P,D)`, handoff still null). After it: no release, takeover, Complete, Requeue, Fail,
-or retry++. `ClaimBlockDelete` classifies `CommittedOwner` and resumes stored D; release and
-stale takeover refuse `handoff=true`. Orphan publication persists D and classifies
-`SameAuthority` vs `DifferentAuthority` (legacy unbound rows fail closed). Finalize requires
-`gc_orphan_handoff = true` plus exact `(P,D)`. Worker: topology/locator stay the last
-preconditions before commit on `Acquired`; `CommittedOwner` revalidates store/locator/topology
-and never re-authorizes refs. Pre-check `hasRefs` with a committed handoff falls through to
-resume (H10). Evidence: unit H9/H10 plus `scripts/p4b-authority-mutation-validation.sh`;
-real Cassandra `internal/integration/p4b_claim_orphan_authority_test.go` under
-`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. P4b-1's write-once script stays `scripts/p4b-mutation-validation.sh`.
-Do not fold 019 into `001_initial_schema.cql`. X1 stays OPEN.
+Migration `020` adds `gc_block_delete_lifecycles` (PK `((org_id, block_id), claim_id)`,
+phases `published`/`terminal`, never DELETE). Do not fold 019 or 020 into
+`001_initial_schema.cql`. `CommitBlockDeleteOrphanHandoff` is the irreversible commit
+(EACH_QUORUM + SERIAL, exact `(P,D)`). `AlreadyCommitted` and `CommittedOwner` require
+canonical `EACH_QUORUM` visibility; an empty non-applied handoff CAS SERIAL-settles.
+After commit: no release, takeover, Complete, Requeue, Fail, or retry++. `CommittedOwner`
+revalidates locator/store/topology, then treats `BlockHasReferencesGlobal` as a
+contradiction detector (error or refs>0 → `committed_pending`; R3 stays OPEN). Orphan
+publication INSERTs the lifecycle tombstone first; terminal D cannot recreate the orphan
+or authorize S3. Finalize `AlreadyFinalized` does not authorize S3 when the tombstone is
+terminal. Production `DeleteS3Orphan` runs only after `published → terminal`. Evidence:
+unit + `scripts/p4b-authority-mutation-validation.sh`; real Cassandra
+`internal/integration/p4b_claim_orphan_authority_test.go` under
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. 3-DC P3 fail-closed: with dc-na down,
+`CommitBlockDeleteOrphanHandoff` from dc-eu is Ambiguous, not
+Committed/AlreadyCommitted. P4b-1's write-once script stays
+`scripts/p4b-mutation-validation.sh`. X1 stays OPEN. `GC_ENABLED=false`.
 
 ### Inter-session Update (2026-05-21)
 
