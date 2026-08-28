@@ -30,7 +30,7 @@ func p4bRequireEvidence(t *testing.T) *p4bEvidenceGate {
 		if t.Skipped() {
 			t.Errorf("%s=1 requires real Cassandra P4b evidence, but the test skipped", p4bRequireEvidenceEnv)
 		} else if !t.Failed() && !gate.observed {
-			t.Errorf("%s=1 completed without orphan-publication evidence", p4bRequireEvidenceEnv)
+			t.Errorf("%s=1 completed without P4b evidence", p4bRequireEvidenceEnv)
 		}
 	})
 	return gate
@@ -58,7 +58,7 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 		}
 	})
 
-	created := store.StartBlockDeleteOrphan(orgID, blockID, "hot", storageKey, "sha1-first", firstSeenAt)
+	created := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "hot", storageKey), "sha1-first", firstSeenAt)
 	if created.Outcome != gcpkg.StartBlockDeleteOrphanCreated || !created.FirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("first publication = outcome:%s first_seen_at:%v cause:%v, want created at %v", created.Outcome, created.FirstSeenAt, created.Cause, firstSeenAt)
 	}
@@ -96,8 +96,8 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 		t.Fatalf("discovery projection still present before repair: %+v", discovery)
 	}
 
-	sameTarget := store.StartBlockDeleteOrphan(orgID, blockID, "hot", storageKey, "sha1-second", firstSeenAt.Add(time.Hour))
-	if sameTarget.Outcome != gcpkg.StartBlockDeleteOrphanSameTarget || !sameTarget.FirstSeenAt.Equal(firstSeenAt) {
+	sameTarget := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "hot", storageKey), "sha1-second", firstSeenAt.Add(time.Hour))
+	if sameTarget.Outcome != gcpkg.StartBlockDeleteOrphanSameAuthority || !sameTarget.FirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("same-target retry = outcome:%s first_seen_at:%v cause:%v, want same_target at %v", sameTarget.Outcome, sameTarget.FirstSeenAt, sameTarget.Cause, firstSeenAt)
 	}
 	assertCanonical("same-target retry")
@@ -106,7 +106,7 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 		t.Fatalf("same-target must confirm canonical EACH_QUORUM visibility: found=%v err=%v info=%+v", found, err, visible)
 	}
 
-	differentTarget := store.StartBlockDeleteOrphan(orgID, blockID, "cold", storageKey, "sha1-third", firstSeenAt.Add(2*time.Hour))
+	differentTarget := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "cold", storageKey), "sha1-third", firstSeenAt.Add(2*time.Hour))
 	if differentTarget.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
 		t.Fatalf("different-target retry = outcome:%s existing=%+v cause:%v, want different_target", differentTarget.Outcome, differentTarget.ExistingTarget, differentTarget.Cause)
 	}
@@ -150,7 +150,7 @@ func TestP4B_SerialSettlementClassifiesRealCassandra(t *testing.T) {
 		t.Fatal("SERIAL absence must not find a canonical orphan")
 	}
 
-	created := store.StartBlockDeleteOrphan(orgID, presentID, "hot", storageKey, "sha1-serial", firstSeenAt)
+	created := store.StartBlockDeleteOrphan(orgID, presentID, testCommittedOrphanAuthority(presentID, "hot", storageKey), "sha1-serial", firstSeenAt)
 	if created.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
 		t.Fatalf("seed publication = %s cause=%v, want created", created.Outcome, created.Cause)
 	}
@@ -184,7 +184,7 @@ func TestP4B_LifecycleAdvancedAtRealCassandra(t *testing.T) {
 		}
 	})
 
-	created := store.StartBlockDeleteOrphan(orgID, blockID, "hot", storageKey, "sha1-phase", firstSeenAt)
+	created := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "hot", storageKey), "sha1-phase", firstSeenAt)
 	if created.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
 		t.Fatalf("seed publication = %s cause=%v, want created", created.Outcome, created.Cause)
 	}
@@ -192,7 +192,7 @@ func TestP4B_LifecycleAdvancedAtRealCassandra(t *testing.T) {
 		t.Fatalf("advance recovery phase: %v", err)
 	}
 
-	advanced := store.StartBlockDeleteOrphan(orgID, blockID, "hot", storageKey, "sha1-new", firstSeenAt.Add(time.Hour))
+	advanced := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "hot", storageKey), "sha1-new", firstSeenAt.Add(time.Hour))
 	if advanced.Outcome != gcpkg.StartBlockDeleteOrphanLifecycleAdvanced || !advanced.FirstSeenAt.Equal(firstSeenAt) {
 		t.Fatalf("advanced-phase retry = outcome:%s first_seen_at:%v cause:%v, want lifecycle_advanced at %v", advanced.Outcome, advanced.FirstSeenAt, advanced.Cause, firstSeenAt)
 	}

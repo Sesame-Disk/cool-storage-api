@@ -257,6 +257,7 @@ type mockBlock struct {
 	GCState             string
 	GCClaimID           string
 	GCClaimedAt         *time.Time
+	GCOrphanHandoff     *bool
 	RepresentationID    string
 	Sha1                string
 }
@@ -2337,6 +2338,9 @@ func (m *MockStore) ReleaseStaleBlockClaim(orgID uuid.UUID, blockID string, expe
 		// A fence on a different incarnation than the caller is authorized for.
 		return BlockClaimTooFresh, nil
 	}
+	if orphanHandoffCommitted(b.GCOrphanHandoff) {
+		return BlockClaimCommittedHandoff, nil
+	}
 	if b.GCClaimedAt == nil || b.GCClaimedAt.After(staleBefore) {
 		return BlockClaimTooFresh, nil
 	}
@@ -2776,9 +2780,10 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 		}
 		settled := blockDeleteClaimRow{
-			Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
-			GCState:   b.GCState,
-			GCClaimID: b.GCClaimID,
+			Target:          BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+			GCState:         b.GCState,
+			GCClaimID:       b.GCClaimID,
+			GCOrphanHandoff: b.GCOrphanHandoff,
 		}
 		if b.GCClaimedAt != nil {
 			settled.GCClaimedAt = *b.GCClaimedAt
@@ -2804,9 +2809,10 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 		return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 	}
 	row := blockDeleteClaimRow{
-		Target:    BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
-		GCState:   b.GCState,
-		GCClaimID: b.GCClaimID,
+		Target:          BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+		GCState:         b.GCState,
+		GCClaimID:       b.GCClaimID,
+		GCOrphanHandoff: b.GCOrphanHandoff,
 	}
 	if b.GCClaimedAt != nil {
 		row.GCClaimedAt = *b.GCClaimedAt
@@ -2870,6 +2876,9 @@ func (m *MockStore) releaseBlockClaimLocked(orgID uuid.UUID, blockID string, aut
 	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != authority.Target {
 		return BlockReleaseNotOwner, nil
 	}
+	if orphanHandoffCommitted(b.GCOrphanHandoff) {
+		return BlockReleaseNotOwner, nil
+	}
 	b.GCState = ""
 	b.GCClaimID = ""
 	b.GCClaimedAt = nil
@@ -2892,26 +2901,103 @@ func (m *MockStore) DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID str
 	return true, nil
 }
 
-func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) error {
+func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) (BlockDeleteFinalizeResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if authority.IsZero() {
-		return fmt.Errorf("block %s: refusing to finalize without a complete delete authority", blockID)
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteInvalid,
+			Cause:   fmt.Errorf("block %s: refusing to finalize without a complete delete authority", blockID),
+		}, fmt.Errorf("block %s: refusing to finalize without a complete delete authority", blockID)
 	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
-	if !ok || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != authority.ClaimID {
-		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+	if !ok {
+		if existing, found := m.s3Orphans[key]; found && existing.Authority.sameAuthority(authority.BlockDeleteAuthority) {
+			return BlockDeleteFinalizeResult{Outcome: BlockDeleteAlreadyFinalized}, nil
+		}
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   fmt.Errorf("block delete finalize not applied for %s", blockID),
+		}, fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
+	if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != authority.ClaimID {
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   fmt.Errorf("block delete finalize not applied for %s", blockID),
+		}, fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	if b.GCClaimedAt == nil || !b.GCClaimedAt.Equal(authority.ClaimedAt) {
-		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   fmt.Errorf("block delete finalize not applied for %s", blockID),
+		}, fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	if (BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey}) != authority.Target {
-		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   fmt.Errorf("block delete finalize not applied for %s", blockID),
+		}, fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
+	if !orphanHandoffCommitted(b.GCOrphanHandoff) {
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   fmt.Errorf("block delete finalize not applied for %s", blockID),
+		}, fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	delete(m.blocks, key)
-	return nil
+	return BlockDeleteFinalizeResult{Outcome: BlockDeleteFinalized}, nil
+}
+
+func (m *MockStore) CommitBlockDeleteOrphanHandoff(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockDeleteHandoffResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if authority.IsZero() {
+		return BlockDeleteHandoffResult{
+			Outcome: BlockDeleteHandoffInvalid,
+			Cause:   fmt.Errorf("block %s: refusing to commit orphan handoff without a complete delete authority", blockID),
+		}, fmt.Errorf("block %s: refusing to commit orphan handoff without a complete delete authority", blockID)
+	}
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return BlockDeleteHandoffResult{
+			Outcome: BlockDeleteHandoffInvalid,
+			Cause:   fmt.Errorf("block %s: orphan handoff found no canonical row", blockID),
+		}, fmt.Errorf("block %s: orphan handoff found no canonical row", blockID)
+	}
+	row := blockDeleteClaimRow{
+		Target:          BlockDeleteTarget{StorageClass: b.StorageClass, StorageKey: b.StorageKey},
+		GCState:         b.GCState,
+		GCClaimID:       b.GCClaimID,
+		GCOrphanHandoff: b.GCOrphanHandoff,
+	}
+	if b.GCClaimedAt != nil {
+		row.GCClaimedAt = *b.GCClaimedAt
+	}
+	classified := classifyBlockDeleteHandoffRow(row, authority)
+	if classified.Outcome == BlockDeleteHandoffAlreadyCommitted || classified.Outcome == BlockDeleteHandoffNotOwner || classified.Outcome == BlockDeleteHandoffTargetChanged || classified.Outcome == BlockDeleteHandoffInvalid {
+		return classified, classified.Cause
+	}
+	handoff := true
+	b.GCOrphanHandoff = &handoff
+	return BlockDeleteHandoffResult{
+		Outcome:   BlockDeleteHandoffCommitted,
+		Authority: committedBlockDeleteAuthority(authority),
+	}, nil
+}
+
+// SeedBlockHandoffForTest marks an existing delete claim as having crossed the
+// irreversible orphan-handoff commit point.
+func (m *MockStore) SeedBlockHandoffForTest(orgID uuid.UUID, blockID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if !ok {
+		return
+	}
+	handoff := true
+	b.GCOrphanHandoff = &handoff
 }
 
 func (m *MockStore) GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error) {
@@ -4371,8 +4457,15 @@ func (m *MockStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3Orphan
 	return info, true, nil
 }
 
-func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult {
+func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult {
 	result := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous}
+	if authority.IsZero() {
+		result.Outcome = StartBlockDeleteOrphanInvalid
+		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s without a complete committed delete authority", orgID, blockID)
+		return result
+	}
+	storageClass := authority.Target.StorageClass
+	storageKey := authority.Target.StorageKey
 	if !config.IsCanonicalStorageClassName(storageClass) {
 		result.Outcome = StartBlockDeleteOrphanInvalid
 		result.Cause = fmt.Errorf("cannot record S3 orphan for org=%s block=%s with non-canonical storage class %q", orgID, blockID, storageClass)
@@ -4402,19 +4495,20 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.s3Orphans[key]; ok {
-		result.FirstSeenAt = existing.FirstSeenAt
-		result.ExistingTarget = BlockDeleteTarget{StorageClass: existing.StorageClass, StorageKey: existing.StorageKey}
-		if !config.IsCanonicalStorageClassName(existing.StorageClass) || existing.StorageKey == "" || strings.TrimSpace(existing.StorageKey) != existing.StorageKey || existing.FirstSeenAt.IsZero() {
-			result.Outcome = StartBlockDeleteOrphanInvalid
-			result.Cause = fmt.Errorf("existing S3 orphan for org=%s block=%s has incomplete identity or first_seen_at", orgID, blockID)
-			return result
+		row := s3OrphanCASRow{
+			Target:      BlockDeleteTarget{StorageClass: existing.StorageClass, StorageKey: existing.StorageKey},
+			Authority:   existing.Authority,
+			FirstSeenAt: existing.FirstSeenAt,
 		}
-		if result.ExistingTarget != (BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey}) {
-			result.Outcome = StartBlockDeleteOrphanDifferentTarget
-			return result
+		classified := classifyS3OrphanRow(row, authority.BlockDeleteAuthority)
+		classified.Submitted = true
+		if classified.Outcome == StartBlockDeleteOrphanInvalid {
+			return classified
 		}
-		result.Outcome = StartBlockDeleteOrphanSameTarget
-		return m.confirmSameTargetOrphanResultLocked(orgID, blockID, result)
+		if classified.Outcome == StartBlockDeleteOrphanSameAuthority {
+			return m.confirmSameAuthorityOrphanResultLocked(orgID, blockID, classified)
+		}
+		return classified
 	}
 	orphan := &S3OrphanInfo{
 		OrgID:         orgID,
@@ -4425,14 +4519,16 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClas
 		RecoveryPhase: S3OrphanPhasePendingS3,
 		FirstSeenAt:   now,
 		LastAttemptAt: now,
+		Authority:     authority.BlockDeleteAuthority,
 	}
 	m.s3Orphans[key] = orphan
 	result.Outcome = StartBlockDeleteOrphanCreated
 	result.FirstSeenAt = orphan.FirstSeenAt
+	result.ExistingAuthority = authority.BlockDeleteAuthority
 	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
 }
 
-func (m *MockStore) confirmSameTargetOrphanResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+func (m *MockStore) confirmSameAuthorityOrphanResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
 	if m.startBlockDeleteOrphanCanonicalUnconfirmedOnce {
 		m.startBlockDeleteOrphanCanonicalUnconfirmedOnce = false
 		result.Outcome = StartBlockDeleteOrphanAmbiguous

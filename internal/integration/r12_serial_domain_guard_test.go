@@ -174,6 +174,7 @@ var r12ExpectedSerialOperations = map[string]string{
 	"(*CassandraStore).UpdateS3OrphanAttempt|gc_s3_orphans|UPDATE":             "orphan attempt update",
 	"(*CassandraStore).ClaimBlockDelete|blocks|UPDATE":                         "GC claim",
 	"(*CassandraStore).ReleaseBlockClaim|blocks|UPDATE":                        "GC claim release",
+	"(*CassandraStore).CommitBlockDeleteOrphanHandoff|blocks|UPDATE":           "GC orphan-handoff commit",
 	"(*CassandraStore).FinalizeBlockDelete|blocks|DELETE":                      "GC finalize",
 }
 

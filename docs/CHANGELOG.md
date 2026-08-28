@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4b-2 / R14b: bind orphan handoff and finalize to exact delete authority
+
+`CommitBlockDeleteOrphanHandoff` is the irreversible `blocks` marker
+(`gc_orphan_handoff`, never written false) that binds claim → orphan → finalize
+to exact `(P, D)`. Resume is `CommittedOwner` of the stored claim; release and
+stale takeover refuse a committed handoff. Orphan publication persists D and
+classifies `SameAuthority` vs `DifferentAuthority`. Finalize requires
+`handoff=true`. Post-commit failures leave the queue untouched. Migration `019`
+is ALTER-only and is not folded into `001_initial_schema.cql`. X1 stays OPEN.
+`GC_ENABLED=false` remains required.
+
 ## 2026-08-28 - P4a evidence precision follow-up
 
 The claim execution-policy mutation is now three independent source-contract

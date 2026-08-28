@@ -133,10 +133,15 @@ func TestWorker_ProcessBlock_UsesExistingOrphanFirstSeenAtForCleanup(t *testing.
 	blockID := testSHA256BlockID("existing-orphan-cleanup")
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddBlock(orgID, blockID, "hot", 0)
-	seedS3Orphan(t, store, orgID, blockID, "hot", "", "previous failure", firstSeenAt)
-	if err := store.EnqueueBlockForTest(orgID, time.Now().Add(-2*time.Hour), blockID, "hot", 0); err != nil {
-		t.Fatalf("EnqueueItem failed: %v", err)
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+	stored := store.SeedBlockClaimForTest(orgID, blockID, "stored-d1", candidateAt)
+	store.SeedBlockHandoffForTest(orgID, blockID)
+	published := store.StartBlockDeleteOrphan(orgID, blockID, committedBlockDeleteAuthority(stored), "", firstSeenAt)
+	if published.Outcome != StartBlockDeleteOrphanCreated && published.Outcome != StartBlockDeleteOrphanSameAuthority {
+		t.Fatalf("seed existing orphan: outcome=%s cause=%v", published.Outcome, published.Cause)
 	}
+	firstSeenAt = published.FirstSeenAt
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -758,7 +763,7 @@ func TestWorker_RecoverS3Orphans_LifecycleAdvancedLeavesBlockUntilRecoveryClears
 	if err != nil || claim.Outcome != BlockClaimAcquired {
 		t.Fatalf("claim block delete: claim.Outcome=%s err=%v", claim.Outcome, err)
 	}
-	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID), "sha1-new", time.Now().UTC())
+	result := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthorityForOrg(orgID, blockID, "hot"), "sha1-new", time.Now().UTC())
 	if result.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
 		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v, want lifecycle_advanced", result.Outcome, result.Cause)
 	}

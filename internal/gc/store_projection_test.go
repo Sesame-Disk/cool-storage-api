@@ -135,8 +135,8 @@ func TestStore_StartBlockDeleteOrphan_SameTargetUsesStoredFirstSeenAndRepairsPro
 	store.DeleteS3OrphanProjectionForTest(orgID, "orph-repair", firstSeenAt)
 
 	proposedFirstSeenAt := firstSeenAt.Add(24 * time.Hour)
-	result := store.StartBlockDeleteOrphan(orgID, "orph-repair", "hot", MockCanonicalStorageKey(orgID.String(), "orph-repair"), "sha1-new", proposedFirstSeenAt)
-	if result.Outcome != StartBlockDeleteOrphanSameTarget {
+	result := store.StartBlockDeleteOrphan(orgID, "orph-repair", testCommittedOrphanAuthorityForOrg(orgID, "orph-repair", "hot"), "sha1-new", proposedFirstSeenAt)
+	if result.Outcome != StartBlockDeleteOrphanSameAuthority {
 		t.Fatalf("StartBlockDeleteOrphan outcome = %s, want same_target (cause=%v)", result.Outcome, result.Cause)
 	}
 	if !result.FirstSeenAt.Equal(firstSeenAt) {
@@ -171,7 +171,7 @@ func TestStore_StartBlockDeleteOrphan_DifferentTargetDoesNotOverwrite(t *testing
 	firstSeenAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	seedS3Orphan(t, store, orgID, "orph-conflict", "hot", "sha1-old", "prev", firstSeenAt)
-	result := store.StartBlockDeleteOrphan(orgID, "orph-conflict", "cold", MockCanonicalStorageKey(orgID.String(), "orph-conflict"), "sha1-new", time.Now().UTC())
+	result := store.StartBlockDeleteOrphan(orgID, "orph-conflict", testCommittedOrphanAuthority("orph-conflict", "cold", MockCanonicalStorageKey(orgID.String(), "orph-conflict")), "sha1-new", time.Now().UTC())
 	if result.Outcome != StartBlockDeleteOrphanDifferentTarget {
 		t.Fatalf("StartBlockDeleteOrphan outcome = %s, want different_target (cause=%v)", result.Outcome, result.Cause)
 	}
@@ -199,7 +199,7 @@ func TestStore_StartBlockDeleteOrphan_MalformedExistingIsInvalid(t *testing.T) {
 
 	seedS3Orphan(t, store, orgID, "orph-malformed", "hot", "sha1-old", "prev", firstSeenAt)
 	store.SetS3OrphanStorageKeyForTest(orgID, "orph-malformed", " ")
-	result := store.StartBlockDeleteOrphan(orgID, "orph-malformed", "hot", MockCanonicalStorageKey(orgID.String(), "orph-malformed"), "sha1-new", time.Now().UTC())
+	result := store.StartBlockDeleteOrphan(orgID, "orph-malformed", testCommittedOrphanAuthorityForOrg(orgID, "orph-malformed", "hot"), "sha1-new", time.Now().UTC())
 	if result.Outcome != StartBlockDeleteOrphanInvalid {
 		t.Fatalf("StartBlockDeleteOrphan outcome = %s, want invalid", result.Outcome)
 	}

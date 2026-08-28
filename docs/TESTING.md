@@ -958,7 +958,7 @@ docker compose --profile test run --rm --build gotest bash scripts/p4a-mutation-
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical
-`EACH_QUORUM` visibility and `pending_s3` before `SameTarget` success, stored
+`EACH_QUORUM` visibility and `pending_s3` before `SameAuthority` success, stored
 `first_seen_at`, target conflicts, advanced-phase refusal and projection uncertainty.
 The mutation script proves those guards are load-bearing:
 
@@ -966,10 +966,18 @@ The mutation script proves those guards are load-bearing:
 docker compose run --rm --build gotest bash scripts/p4b-mutation-validation.sh
 ```
 
+P4b-2 / R14b adds the irreversible orphan-handoff commit and exact `(P, D)` binding.
+Its sibling mutation script must stay red when those predicates are removed:
+
+```bash
+docker compose run --rm --build gotest bash scripts/p4b-authority-mutation-validation.sh
+```
+
 The real-Cassandra legs are `TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra`,
 `TestP4B_SerialSettlementClassifiesRealCassandra`,
-`TestP4B_LifecycleAdvancedAtRealCassandra`, and
-`TestP4B_CanonicalOrphanReadRepairIsBlocking`.
+`TestP4B_LifecycleAdvancedAtRealCassandra`,
+`TestP4B_CanonicalOrphanReadRepairIsBlocking`, and
+`TestP4B_ClaimOrphanAuthorityIsBoundAtRealCassandra`.
 The standard integration containers run them with `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`.
 P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
 `TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,

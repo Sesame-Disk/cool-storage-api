@@ -533,7 +533,9 @@ enumerate orphaned blocks.
 | `storage_class` | TEXT | Where stored (`hot-s3-usa`) |
 | `storage_key` | TEXT | S3 object key |
 | `gc_state` | TEXT | `'deleting'` while the GC worker holds a delete claim (else null) |
+| `gc_claim_id` | TEXT | Per-attempt owner of the delete claim |
 | `gc_claimed_at` | TIMESTAMP | When the GC claim was taken |
+| `gc_orphan_handoff` | BOOLEAN | Null until the orphan-handoff commit; `true` afterwards. Never written `false` |
 | `last_accessed` | TIMESTAMP | For cold storage tiering |
 
 > `blocks` no longer carries a mutable `ref_count`. Block liveness lives in
@@ -1298,8 +1300,9 @@ Set appropriate consistency levels per operation:
 
 The rows marked **explicit statement pin** do not derive their level from
 `serial_consistency` at all. The four CONDITIONAL ones have called `SerialConsistency(gocql.Serial)` themselves since P0/R12 (2026-08-23), so the level holds even where a
-deployment sets the session to `LOCAL_SERIAL`. That inventory — 11 conditional
-`blocks` statements, 4 canonical `gc_s3_orphans` and 3 `gc_block_candidates`
+deployment sets the session to `LOCAL_SERIAL`. That inventory — 10 conditional
+`blocks` statements (P4b-2 added `CommitBlockDeleteOrphanHandoff`), 4 canonical
+`gc_s3_orphans` and 3 `gc_block_candidates`
 (create, grace advance, tuple-bound cleanup) — is pinned by the untagged source
 gate `TestR12SerialDomainGuard`
 (`internal/integration/`).

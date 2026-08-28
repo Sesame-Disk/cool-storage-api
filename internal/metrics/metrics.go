@@ -397,6 +397,26 @@ var (
 		[]string{"result"},
 	)
 
+	// GCBlockDeleteHandoffTotal counts orphan-handoff commits by classified outcome.
+	// Closed enum only — no claim id, storage key, or block id labels.
+	GCBlockDeleteHandoffTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_block_delete_handoff_total",
+			Help: "Total block-delete orphan-handoff commits by outcome. committed and already_committed are success; not_owner and ambiguous mean the walk must not publish or finalize.",
+		},
+		[]string{"result"},
+	)
+
+	// GCBlockDeleteOrphanPublicationTotal counts StartBlockDeleteOrphan outcomes.
+	// Closed enum including different_authority — no claim id, storage key, or block id.
+	GCBlockDeleteOrphanPublicationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_block_delete_orphan_publication_total",
+			Help: "Total block-delete orphan publications by outcome. different_authority is a competing claim identity on the same physical incarnation, never an idempotent resume.",
+		},
+		[]string{"result"},
+	)
+
 	// LibraryDeleteRepresentationResolutionFailures counts library delete
 	// operations that could not resolve a canonical block representation before
 	// writing the GC marker. A non-zero rate signals a delete path or migration
@@ -1204,6 +1224,8 @@ func Register() {
 		GCAuditEventsTotal,
 		GCBlockDeleteClaimTotal,
 		GCBlockDeleteTakeoverTotal,
+		GCBlockDeleteHandoffTotal,
+		GCBlockDeleteOrphanPublicationTotal,
 		LibraryDeleteRepresentationResolutionFailures,
 		ChunkUploadTempOrphansCleaned,
 		ChunkUploadFinalizationAttemptsTotal,
