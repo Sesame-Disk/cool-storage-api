@@ -898,7 +898,8 @@ Each of these exists because the obvious version of the test proves nothing.
 |---|---|
 | `P3_EXPECT_DC_DOWN=1` | leg 1 passing against a healthy cluster, where the publications would simply succeed |
 | leg 2 skips when `P3_EXPECT_DC_DOWN` is set | running the handoff leg against a cluster with a DC missing |
-| `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted |
+| `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof on the orphan `NotPublished` path. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted there |
+| claim `BlockClaimAmbiguous` (not `claimErr != nil`) | P4a SERIAL settlement returning `Ambiguous` with `err=nil` after EACH_QUORUM fails. The worker fail-closes on Outcome; treating nil error as success is a false P3 regression |
 | post-refusal fence read from dc-eu **and** dc-asia | treating "the LWT errored" as "nothing exists". Required only when orphan publication is `NotPublished` (SERIAL-confirmed absence). `Ambiguous` may leave a partial row on survivors and must still not authorize `FinalizeBlockDelete` |
 | `BlockExists` check after finalize in leg 2 | measuring an orphan read instead of the rowless-mint gate |
 | fresh org/block id per run | a previous run's rows deciding this run's assertions |

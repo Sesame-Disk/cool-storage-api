@@ -8,6 +8,14 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4b-1 follow-up: P3 claim fail-closed is Ambiguous, not err!=nil
+
+The DC-down P3 leg inspected only `ClaimBlockDelete`'s error. After P4a settlement,
+SERIAL can observe the still-unowned row and return `BlockClaimAmbiguous` with
+`err=nil`; the worker already fail-closes on that Outcome, but the test treated nil
+as success. The claim half now requires `Ambiguous` and forbids `Acquired`. The
+orphan half is unchanged (`NotPublished` or `Ambiguous`).
+
 ## 2026-08-27 - P4b-1 follow-up: P3 fail-closed is not-published or ambiguous
 
 Aligned the multi-DC evidence with SERIAL settlement and tightened the production API.

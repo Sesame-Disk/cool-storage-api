@@ -47,10 +47,10 @@ import (
 //
 //	you cannot reach a state where GC has authorized FinalizeBlockDelete but a
 //	writer in another datacenter cannot see the fence. Publication either
-//	obtains EACH_QUORUM in every DC (Created/SameTarget) or it fails closed.
-//	SERIAL settlement may complete a Paxos proposal on the live DCs; that is
-//	Ambiguous, not permission to finalize, and a partial row on survivors is
-//	not a P3 regression.
+//	obtains EACH_QUORUM in every DC (claim Acquired, orphan Created/SameTarget)
+//	or it fails closed. SERIAL settlement may complete a Paxos proposal on the
+//	live DCs, or observe the still-unowned claim row; both are Ambiguous, not
+//	permission to continue, and a partial row on survivors is not a P3 regression.
 //
 // So the green leg asserts the failure, and the mutations assert that the weaker
 // levels reach exactly the state the fence exists to prevent.
@@ -127,12 +127,8 @@ func p3InstallCanonical(t *testing.T, database *dbpkg.DB, orgID, blockID string,
 // A timeout, a transport failure or any other error would satisfy a bare nil-check
 // while the fence might well be published. Since this leg is what promotes the
 // cross-DC consistency row to GREEN, it has to name the outcome it requires.
-// It reports rather than aborts, deliberately. Both publications carry the same
-// contract, and a mutation run downgrades both at once -- so if the first one
-// aborted the test, a mutation would only ever demonstrate that ClaimBlockDelete is
-// sensitive and StartBlockDeleteOrphan would never be reached. Recording the
-// failure and continuing makes one mutation run exercise both, and the trailing
-// survivor check still runs and reports the fence the downgrade left behind.
+// It reports rather than aborts, deliberately. The claim and orphan publications
+// both continue after a recorded failure so one mutation run exercises both.
 func p3RequireUnavailableAtEachQuorum(t *testing.T, what string, err error) {
 	t.Helper()
 	if err == nil {
@@ -158,12 +154,16 @@ func p3RequireUnavailableAtEachQuorum(t *testing.T, what string, err error) {
 
 // TestP3_FencePublicationFailsClosedWhenADatacenterIsDown is the green leg. With
 // dc-na stopped, GC must not obtain a fence it would be unable to show writers in
-// that DC. ClaimBlockDelete still proves the coordinator refused the mutation
-// (Unavailable at EACH_QUORUM). StartBlockDeleteOrphan additionally settles in
-// SERIAL, so the live DCs may have accepted a Paxos proposal whose EACH_QUORUM
-// learn could not finish. That must come back Ambiguous or NotPublished — never
-// Created or SameTarget, which are the only outcomes that authorize
-// FinalizeBlockDelete.
+// that DC. Both publishers settle an uncertain LWT in SERIAL, so the live DCs may
+// have accepted a Paxos proposal whose EACH_QUORUM learn could not finish.
+//
+// ClaimBlockDelete must come back BlockClaimAmbiguous — never Acquired, which is
+// the only claim outcome that lets the worker continue. SERIAL can observe the
+// still-unowned row after Unavailable and return that outcome with err=nil; the
+// worker fail-closes on Outcome, not on the error.
+//
+// StartBlockDeleteOrphan must come back Ambiguous or NotPublished — never
+// Created or SameTarget, which authorize FinalizeBlockDelete.
 //
 // "No fence on survivors" is therefore conditional: it is required when SERIAL
 // confirmed absence (NotPublished). It is not required on Ambiguous, because a
@@ -189,8 +189,16 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 		ClaimID:   "p3-multidc-" + uuid.NewString(),
 		ClaimedAt: time.Now().UTC(),
 	}
-	_, claimErr := store.ClaimBlockDelete(orgUUID, blockID, attempt)
-	p3RequireUnavailableAtEachQuorum(t, "ClaimBlockDelete", claimErr)
+	claim, claimErr := store.ClaimBlockDelete(orgUUID, blockID, attempt)
+	switch claim.Outcome {
+	case gcpkg.BlockClaimAmbiguous:
+		// SERIAL settlement after EACH_QUORUM failure. err may be nil: the settling
+		// read can see the still-unowned row and classify that as Ambiguous.
+	case gcpkg.BlockClaimAcquired:
+		t.Errorf("P3 REGRESSION: ClaimBlockDelete acquired with dc-na down; a claim a dc-na writer cannot see is a fence that does not fence (err=%v)", claimErr)
+	default:
+		t.Errorf("P3 REGRESSION: ClaimBlockDelete outcome=%s err=%v; with a datacenter down the claim must be ambiguous, never acquired", claim.Outcome, claimErr)
+	}
 
 	// The orphan: the fence that gates a rowless mint, so a publication invisible to
 	// dc-na is what lets a second physical life be born while the first retires.
@@ -207,7 +215,7 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 		t.Errorf("P3 REGRESSION: StartBlockDeleteOrphan outcome=%s cause=%v; with a datacenter down publication must be not_published or ambiguous, never Created/SameTarget (those authorize FinalizeBlockDelete)", orphanResult.Outcome, orphanResult.Cause)
 	}
 
-	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s claim refused as Unavailable at EACH_QUORUM; orphan outcome=%s (must not authorize finalize)", orgID, blockID, orphanResult.Outcome)
+	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s claim=%s orphan=%s (must not authorize finalize)", orgID, blockID, claim.Outcome, orphanResult.Outcome)
 }
 
 func p3RequireNoFenceOnSurvivors(t *testing.T, orgID, blockID string, endpoints map[string]string) {

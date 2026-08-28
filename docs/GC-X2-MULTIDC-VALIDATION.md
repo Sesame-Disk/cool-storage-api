@@ -702,14 +702,14 @@ instead.
 
 Leg 1 does not accept that as `err != nil`. A lightweight transaction that times
 out (`WriteType: CAS`) may still have been accepted, so "it errored" is not proof
-that nothing was published. The claim half requires the error to be specifically
-`Unavailable` **naming EACH_QUORUM**. The orphan half settles in SERIAL after that
-failure, so the legal outcomes are `NotPublished` or `Ambiguous` — never
-`Created` or `SameTarget`, which authorize `FinalizeBlockDelete`. When SERIAL
-confirms absence, the leg then reads the fence back from dc-eu and dc-asia and
-requires both to report no fence. `Ambiguous` may leave a partial canonical row
-on the survivors; that is fail-closed, not a successful condemnation. Anything
-else fails the leg.
+that nothing was published. Both halves settle in SERIAL after the EACH_QUORUM
+learn fails. The claim must be `BlockClaimAmbiguous` — never `Acquired` — and
+SERIAL may return that outcome with `err=nil` after observing the still-unowned
+row. The orphan must be `NotPublished` or `Ambiguous` — never `Created` or
+`SameTarget`. When SERIAL confirms orphan absence, the leg then reads the fence
+back from dc-eu and dc-asia and requires both to report no fence. `Ambiguous` may
+leave a partial row on the survivors; that is fail-closed, not a successful
+condemnation. Anything else fails the leg.
 
 ### Why three datacenters, again
 
