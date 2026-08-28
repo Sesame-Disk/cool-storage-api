@@ -77,9 +77,17 @@ m_same_target_uses_proposed_timestamp() {
 }
 
 m_projection_uncertainty_finalizes() {
-  mutate "$WORKER" 's{case StartBlockDeleteOrphanProjectionUnconfirmed:\s+w\.recordDestructiveBlocked\(destructivePathOrphan\)\s+return blockOrphanPublicationError\{ItemID: item\.ItemID, Code: GCFailureCodeBlockOrphanProjectionUnconfirmed, Err: publication\.Cause\}}{case StartBlockDeleteOrphanProjectionUnconfirmed:\n\t\torphanFirstSeenAt = publication.FirstSeenAt}'
+  mutate "$WORKER" 's{case StartBlockDeleteOrphanProjectionUnconfirmed:\s+w\.recordDestructiveBlocked\(destructivePathBlock\)\s+return blockOrphanPublicationError\{ItemID: item\.ItemID, Code: GCFailureCodeBlockOrphanProjectionUnconfirmed, Err: publication\.Cause\}}{case StartBlockDeleteOrphanProjectionUnconfirmed:\n\t\torphanFirstSeenAt = publication.FirstSeenAt}'
   expect_red 'TestP4B_WorkerProjectionUnconfirmedLeavesClaimAndQueueUntouched' 'want untouched publication refusal' \
     'projection uncertainty is incorrectly allowed to finalize the destructive lifecycle'
+  restore
+}
+
+m_publication_invalid_reuses_the_candidate_code() {
+  mutate "$WORKER" 's{GCFailureCodeBlockOrphanInvalid:}{GCFailureCodeBlockOrphanInvalid,
+		GCFailureCodeBlockAuthorityInvalid:}'
+  expect_red 'TestP4A_LateLoserLeavesQueueUntouched' 'its documented postpone is unreachable' \
+    'publication-invalid shares block_authority_invalid, which silently moves the candidate code off its documented postpone path'
   restore
 }
 
@@ -88,6 +96,7 @@ MUTATIONS=(
   m_settlement_read_is_ordinary
   m_same_target_uses_proposed_timestamp
   m_projection_uncertainty_finalizes
+  m_publication_invalid_reuses_the_candidate_code
 )
 
 if [ "${1:-}" = "--list" ]; then

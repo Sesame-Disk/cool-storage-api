@@ -21,9 +21,23 @@ Implemented the P4b-1 publication boundary without claiming full P4b/R14b closur
 - The worker releases and postpones only confirmed conflict/not-published outcomes;
   ambiguous, invalid and projection-unconfirmed results retain the destructive state
   without queue lifecycle mutation.
+- Publication refusals carry their own failure code (`block_orphan_invalid`) instead of
+  reusing `block_authority_invalid`. The untouched check runs before the postpone check,
+  so sharing the code would have moved the candidate-authority error off its documented
+  postpone path without any test noticing. The P4a contract test now asserts the two
+  classifications stay disjoint, and a fifth mutation holds it there.
+- The two publication fail-closed refusals record the `block` destructive path, the one
+  whose liveness success this walk publishes — not `orphan`, which belongs to the
+  recovery scanner the blocked/liveness alert compares separately.
 - Added unit coverage, real-Cassandra evidence, an R22a guard adjustment for the
-  projection wrapper, and `scripts/p4b-mutation-validation.sh` with four load-bearing
+  projection wrapper, and `scripts/p4b-mutation-validation.sh` with five load-bearing
   mutations.
+
+Write-once gives up the old stale-phase reset, and that is a deliberate trade: a
+same-target resume can inherit a `pending_mapping_cleanup` phase and leak an object,
+where the reset it replaced could aim a second physical delete at a re-created key and
+lose live content. Leak over loss, until the orphan row carries an incarnation — see the
+R14b row in `docs/GC-X1-CLOSURE-OPTIONS.md`.
 
 Full claim-to-orphan authority binding remains open under R14b/P4b. `GC_ENABLED=false`
 remains required.

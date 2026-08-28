@@ -588,15 +588,22 @@ func shouldPostponeWithoutRetry(err error) bool {
 	}
 }
 
-// shouldLeaveQueueUntouched identifies a late loser after its claim has been taken over.
-// It is intentionally separate from shouldPostponeWithoutRetry: postponing calls
-// RequeueItem, while a stale worker must not participate in any queue lifecycle decision.
+// shouldLeaveQueueUntouched identifies the refusals that may make no queue lifecycle
+// decision at all: a late loser whose claim was taken over, and a post-claim orphan
+// publication whose outcome is not established. It is intentionally separate from
+// shouldPostponeWithoutRetry — postponing calls RequeueItem, and neither a stale worker
+// nor an attempt that may already have published a recovery fence may run it.
+//
+// This check runs BEFORE shouldPostponeWithoutRetry at the worker boundary, so a code
+// listed here can never also postpone. Every code here must therefore be one that no
+// other error type produces; that is why publication-invalid has its own code rather
+// than reusing GCFailureCodeBlockAuthorityInvalid.
 func shouldLeaveQueueUntouched(err error) bool {
 	switch failureCodeForError(err) {
 	case GCFailureCodeBlockClaimForeignOwner,
 		GCFailureCodeBlockOrphanUnsettled,
 		GCFailureCodeBlockOrphanProjectionUnconfirmed,
-		GCFailureCodeBlockAuthorityInvalid:
+		GCFailureCodeBlockOrphanInvalid:
 		return true
 	default:
 		return false
@@ -982,7 +989,12 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 			// any queue lifecycle operation. The owner of the current claim will carry the
 			// candidate forward; the stale worker leaves its exact queue row untouched.
 			if shouldLeaveQueueUntouched(err) {
-				log.Printf("[GC Worker] Leaving item %s/%s untouched: this attempt no longer owns the block claim", item.OrgID, item.ItemID)
+				// Name the code: this branch no longer means "taken over" only. An
+				// unsettled orphan publication lands here too, and reporting it as a
+				// lost claim would send an operator looking for a race that did not
+				// happen.
+				log.Printf("[GC Worker] Leaving item %s/%s untouched (%s): this attempt may make no queue lifecycle decision: %v",
+					item.OrgID, item.ItemID, failureCodeForError(err), err)
 				continue
 			}
 
@@ -1700,13 +1712,16 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	case StartBlockDeleteOrphanNotPublished:
 		return w.releaseOrphanClaimAndPostpone(item, attempt, GCFailureCodeBlockOrphanNotPublished, publication.Cause)
 	case StartBlockDeleteOrphanAmbiguous:
-		w.recordDestructiveBlocked(destructivePathOrphan)
+		// The BLOCK path is the one being blocked here, not the orphan recovery scanner:
+		// this walk records its liveness success under destructivePathBlock, and the
+		// blocked/liveness pair is compared per path.
+		w.recordDestructiveBlocked(destructivePathBlock)
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: publication.Cause}
 	case StartBlockDeleteOrphanProjectionUnconfirmed:
-		w.recordDestructiveBlocked(destructivePathOrphan)
+		w.recordDestructiveBlocked(destructivePathBlock)
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanProjectionUnconfirmed, Err: publication.Cause}
 	case StartBlockDeleteOrphanInvalid:
-		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockAuthorityInvalid, Err: publication.Cause}
+		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanInvalid, Err: publication.Cause}
 	default:
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: fmt.Errorf("unhandled orphan publication outcome %s", publication.Outcome)}
 	}

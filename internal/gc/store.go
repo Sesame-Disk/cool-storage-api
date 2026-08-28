@@ -96,6 +96,16 @@ const (
 	// whose discovery projection was not acknowledged. The worker must not finalize
 	// the block while recovery discovery is unconfirmed.
 	GCFailureCodeBlockOrphanProjectionUnconfirmed = "block_orphan_projection_unconfirmed"
+	// GCFailureCodeBlockOrphanInvalid marks a publication whose proposed identity, or
+	// the identity already stored on the canonical row, cannot be used. It is
+	// deliberately NOT GCFailureCodeBlockAuthorityInvalid: that code postpones, and
+	// the two live on opposite sides of the claim. An unusable candidate identity is
+	// observed BEFORE anything destructive happened, so requeueing it is safe; an
+	// unusable publication is observed AFTER the claim committed and may already sit
+	// next to a canonical orphan row, so this attempt must make no queue lifecycle
+	// decision at all. Collapsing them would silently move the candidate code off its
+	// documented postpone path, because the untouched check runs first.
+	GCFailureCodeBlockOrphanInvalid = "block_orphan_invalid"
 )
 
 // GCStore abstracts all database operations used by the GC system.

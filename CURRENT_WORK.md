@@ -113,9 +113,14 @@ classified as `Created`, `SameTarget`, `DifferentTarget`, `NotPublished`, `Ambig
 `Invalid` or `ProjectionUnconfirmed`; same-target resumes use the stored `first_seen_at`
 and repair the identity-only discovery projection. The worker only releases/postpones a
 confirmed conflict or absent settled row; uncertain, malformed or unconfirmed projection
-states retain claim, candidate and queue lifecycle. Unit coverage and four deliberate
+states retain claim, candidate and queue lifecycle. Publication-invalid has its own
+failure code: the untouched check runs before the postpone check, so reusing
+`block_authority_invalid` would have silently taken the candidate-authority error off the
+postpone path P4a had just put it on. Unit coverage and five deliberate
 mutations are green/red as required, and real-Cassandra evidence is gated by
-`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. This is P4b-1 only: the remaining R14b work must carry
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. Write-once also drops the stale-phase reset, which
+trades a bounded object LEAK for the live-content LOSS the reset risked; recorded on the
+R14b row rather than treated as closed. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)

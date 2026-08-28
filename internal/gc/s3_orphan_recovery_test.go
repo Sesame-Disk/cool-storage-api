@@ -730,6 +730,20 @@ func TestWorker_RecoverS3Orphans_CompletesPendingMappingCleanupWithoutS3(t *test
 	}
 }
 
+// TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase pins the side of the
+// write-once trade that is easy to mistake for a defect, so read the sign carefully.
+//
+// The previous entry point rewound an existing row to pending_s3 on every publish. That
+// is what this test's ancestor asserted, and it is exactly the shape P4b-1 removed: a
+// rewind aims a second physical delete at a key a NEW incarnation may already have
+// re-created, which is live-content loss. Write-once refuses to rewind, and the price is
+// visible right here — a block re-uploaded while its old row sat at
+// pending_mapping_cleanup, then condemned again, resolves to the same P, so recovery
+// inherits the completed phase and performs NO delete. The object leaks.
+//
+// Leak over loss is the accepted trade, and only until the orphan row carries the
+// incarnation that separates "resume" from "new lifecycle at the same P" — R14b. If that
+// binding lands, this expectation changes with it.
 func TestWorker_RecoverS3Orphans_SameTargetPreservesStalePhase(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
