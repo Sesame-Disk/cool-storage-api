@@ -944,9 +944,12 @@ docker exec dc3run sh -c 'cp /tmp/sc.bak internal/gc/store_cassandra.go'
 
 ### P4a and P4b mutation evidence
 
-The P4a mutation script covers the exact claim authority, serial settlement, settled-claim
-`EACH_QUORUM` confirmation, the explicit no-retry/no-speculation LWT policy and the
-`blocks.read_repair=BLOCKING` premise. Run it in Docker:
+The P4a/R26 mutation script covers the exact claim authority, serial settlement,
+settled-claim `EACH_QUORUM` confirmation, the explicit no-retry/no-speculation LWT
+policy, the `blocks.read_repair=BLOCKING` premise and the cross-surface exact identity
+keys. The three claim-policy mutations independently pin the source contract; they do
+not claim that removing one makes the current driver defaults retry or speculate. Run
+it in Docker:
 
 ```bash
 docker compose --profile test run --rm --build gotest bash scripts/p4a-mutation-validation.sh

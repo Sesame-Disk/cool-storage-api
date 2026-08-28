@@ -8,6 +8,14 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4a evidence precision follow-up
+
+The claim execution-policy mutation is now three independent source-contract
+mutations for `Idempotent(false)`, zero retries and disabled speculative execution.
+The evidence is described as contract pinning rather than as proof that removing one
+setting makes the current driver defaults unsafe. The combined P4a/R26 matrix now
+contains 50 mutations.
+
 ## 2026-08-28 - P4a audit hardening follow-up
 
 The mock's uncertain-claim path now runs the same exact visibility classifier as
@@ -233,8 +241,8 @@ The mergeable scope is now explicit:
   the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
   a partial LWT.
 - The requeue-specific real-Cassandra tests, source guard and mutations were removed from
-  this PR. The active P4a mutation script now contains **44** mutations; the script output
-  is authoritative.
+  this PR. At that historical point, the P4a mutation script contained **44** mutations;
+  the current count is maintained by the script output.
 
 The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ
 and cross-partition pending state. Its race matrix includes `Requeue` vs `Requeue`,

@@ -65,7 +65,9 @@ stays Acquired. That confirmation read requires effective `blocks.read_repair=BL
 (empty is not the default); source/schema and `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` pin it.
 Mutations `m_settled_own_claim_skips_each_quorum`,
 `m_settled_claim_visibility_downgrades_to_local_quorum`,
-`m_claim_retries_uncertain_lwt` and
+`m_claim_loses_explicit_non_idempotent_pin`,
+`m_claim_loses_zero_retry_policy`,
+`m_claim_loses_non_speculative_policy` and
 `m_blocks_disables_blocking_read_repair` hold those gates. The mock follows the same
 exact classifier, including `claimed_at`, and the initial claim LWT explicitly disables
 driver retries and speculative execution.
@@ -74,7 +76,7 @@ driver retries and speculative execution.
 `internal/gc/store_cassandra.go`, `internal/gc/p4a_claim_ownership_test.go`,
 `internal/gc/p4a_claim_authority_guard_test.go`,
 `scripts/p4a-mutation-validation.sh`, `docs/TESTING.md`, `docs/CHANGELOG.md` and
-`CURRENT_WORK.md`. Docker validation passed the full 48-mutation P4a matrix and the
+`CURRENT_WORK.md`. Docker validation passed the full 50-mutation P4a/R26 matrix and the
 full short Go suite.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
