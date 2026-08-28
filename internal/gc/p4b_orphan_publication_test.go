@@ -85,12 +85,12 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 		t.Fatal("SERIAL-only classification must not be an exported CassandraStore method")
 	}
 
-	global := findGCFunction(file, "GetS3OrphanGlobal")
-	if global == nil {
-		t.Fatal("GetS3OrphanGlobal not found")
-	}
-	if !gcQueryMethodHas(global, "FROM gc_s3_orphans", "Consistency", "EachQuorum") {
+	global := formattedGCFunction(t, file, "GetS3OrphanGlobal")
+	if !gcQueryMethodHas(findGCFunction(file, "GetS3OrphanGlobal"), "FROM gc_s3_orphans", "Consistency", "EachQuorum") {
 		t.Fatal("GetS3OrphanGlobal must pin canonical visibility reads to EachQuorum")
+	}
+	if strings.Contains(global, "RecoveryPhase = strings.TrimSpace") {
+		t.Fatal("GetS3OrphanGlobal must not trim recovery_phase before SameTarget classification")
 	}
 
 	classifier := formattedGCFunction(t, file, "classifyNonAppliedOrphanCAS")
@@ -102,8 +102,11 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	}
 
 	visibility := formattedGCFunction(t, file, "classifyCanonicalOrphanVisibility")
-	if !strings.Contains(visibility, "S3OrphanPhasePendingS3") {
-		t.Fatal("SameTarget confirmation must require pending_s3 before authorizing finalize")
+	if strings.Contains(visibility, "TrimSpace(info.RecoveryPhase)") {
+		t.Fatal("SameTarget must compare recovery_phase exactly; trimming would accept a padded pending_s3 as authorization")
+	}
+	if !strings.Contains(visibility, "info.RecoveryPhase != S3OrphanPhasePendingS3") {
+		t.Fatal("SameTarget confirmation must require the exact pending_s3 token before authorizing finalize")
 	}
 	if !strings.Contains(visibility, "StartBlockDeleteOrphanLifecycleAdvanced") {
 		t.Fatal("a visible same-P row past pending_s3 must be classified as lifecycle_advanced, not SameTarget")
@@ -302,6 +305,16 @@ func TestP4B_CanonicalVisibilityClassification(t *testing.T) {
 	}, true, nil, proposed, token, prior)
 	if emptyPhase.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
 		t.Fatalf("empty recovery_phase must not authorize finalize: got %s", emptyPhase.Outcome)
+	}
+
+	paddedPhase := classifyCanonicalOrphanVisibility(S3OrphanInfo{
+		StorageClass:  proposed.StorageClass,
+		StorageKey:    proposed.StorageKey,
+		FirstSeenAt:   token,
+		RecoveryPhase: " " + S3OrphanPhasePendingS3 + " ",
+	}, true, nil, proposed, token, prior)
+	if paddedPhase.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("padded recovery_phase must not authorize finalize: got %s", paddedPhase.Outcome)
 	}
 }
 

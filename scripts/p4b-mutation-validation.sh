@@ -113,7 +113,7 @@ m_projection_publish_downgrades_to_local_quorum() {
 }
 
 m_same_target_ignores_recovery_phase() {
-  mutate "$STORE" 's{if strings\.TrimSpace\(info\.RecoveryPhase\) != S3OrphanPhasePendingS3}{if false && strings.TrimSpace(info.RecoveryPhase) != S3OrphanPhasePendingS3}'
+  mutate "$STORE" 's{if info\.RecoveryPhase != S3OrphanPhasePendingS3}{if false && info.RecoveryPhase != S3OrphanPhasePendingS3}'
   expect_red 'TestP4B_CanonicalVisibilityClassification' 'pending_mapping_cleanup must not authorize finalize' \
     'SameTarget authorizes finalize for a lifecycle that already declared S3 complete'
   restore

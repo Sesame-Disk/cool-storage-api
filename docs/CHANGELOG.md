@@ -8,6 +8,12 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4b-1 follow-up: SameTarget requires the exact pending_s3 token
+
+`recovery_phase` is compared without TrimSpace, matching the strict identity
+fields. A padded `" pending_s3 "` is `LifecycleAdvanced` and does not authorize
+finalize. `GetS3OrphanGlobal` no longer trims the phase before that check.
+
 ## 2026-08-28 - P4b-1 follow-up: P3 claim fail-closed is Ambiguous, not err!=nil
 
 The DC-down P3 leg inspected only `ClaimBlockDelete`'s error. After P4a settlement,

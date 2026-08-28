@@ -4414,9 +4414,9 @@ func (m *MockStore) confirmSameTargetOrphanResultLocked(orgID uuid.UUID, blockID
 		return result
 	}
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	if existing, ok := m.s3Orphans[key]; ok && strings.TrimSpace(existing.RecoveryPhase) != S3OrphanPhasePendingS3 {
+	if existing, ok := m.s3Orphans[key]; ok && existing.RecoveryPhase != S3OrphanPhasePendingS3 {
 		result.Outcome = StartBlockDeleteOrphanLifecycleAdvanced
-		result.Cause = fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", strings.TrimSpace(existing.RecoveryPhase))
+		result.Cause = fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", existing.RecoveryPhase)
 		return result
 	}
 	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)

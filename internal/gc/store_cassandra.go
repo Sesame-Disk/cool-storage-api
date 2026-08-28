@@ -1957,7 +1957,6 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 	info.OrgID = orgID
 	info.BlockID = blockID
 	info.ExternalSHA1 = strings.TrimSpace(info.ExternalSHA1)
-	info.RecoveryPhase = strings.TrimSpace(info.RecoveryPhase)
 	info.FirstSeenAt = firstSeenAt.UTC()
 	return info, true, nil
 }
@@ -2144,9 +2143,9 @@ func classifyCanonicalOrphanVisibility(info S3OrphanInfo, found bool, readErr er
 		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan visible first_seen_at %v does not match settled token %v", stored, expected))
 		return visible
 	}
-	if strings.TrimSpace(info.RecoveryPhase) != S3OrphanPhasePendingS3 {
+	if info.RecoveryPhase != S3OrphanPhasePendingS3 {
 		visible.Outcome = StartBlockDeleteOrphanLifecycleAdvanced
-		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", strings.TrimSpace(info.RecoveryPhase)))
+		visible.Cause = errors.Join(prior.Cause, fmt.Errorf("canonical S3 orphan recovery phase %q does not authorize a new physical delete", info.RecoveryPhase))
 	}
 	return visible
 }
