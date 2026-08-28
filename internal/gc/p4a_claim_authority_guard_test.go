@@ -222,6 +222,23 @@ func TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum(t *testing.T) {
 	}
 }
 
+// TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate keeps the initial LWT's uncertain
+// result visible to the settlement path. A driver retry or speculative execution could
+// hide which invocation's outcome is being settled, defeating the explicit protocol.
+func TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate(t *testing.T) {
+	file := p4aParseStore(t)
+	claim := formattedGCFunction(t, file, "ClaimBlockDelete")
+	for _, required := range []string{
+		"Idempotent(false)",
+		"RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0})",
+		"SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{})",
+	} {
+		if !strings.Contains(claim, required) {
+			t.Errorf("ClaimBlockDelete must explicitly pin %s so uncertain LWTs reach settlement", required)
+		}
+	}
+}
+
 // TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair pins the schema
 // premise that confirmSettledBlockClaimVisibility depends on. An EACH_QUORUM read
 // of `blocks` can return the reconciled D1 while a stale RF-1 replica still serves

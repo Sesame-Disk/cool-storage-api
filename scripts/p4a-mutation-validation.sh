@@ -230,6 +230,34 @@ m_settled_own_claim_skips_each_quorum() {
   restore
 }
 
+m_settled_claim_visibility_downgrades_to_local_quorum() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) readBlockDeleteClaimEachQuorum.*?Consistency\(gocql\.)EachQuorum(\))~${1}LocalQuorum$2~s'
+  expect_red 'TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum' 'must pin regular visibility to gocql.EachQuorum' \
+    'settled-claim visibility downgraded to LOCAL_QUORUM (a writer in another DC can still miss the fence)'
+  restore
+}
+
+m_claim_loses_explicit_non_idempotent_pin() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) ClaimBlockDelete.*?SerialConsistency\(gocql\.Serial\)\.\s*)Idempotent\(false\)\.\s*~${1}~s'
+  expect_red 'TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate' 'must explicitly pin Idempotent(false)' \
+    'claim LWT loses the explicit non-idempotent contract pin (the protocol must not rely on session defaults)'
+  restore
+}
+
+m_claim_loses_zero_retry_policy() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) ClaimBlockDelete.*?SerialConsistency\(gocql\.Serial\)\.\s*Idempotent\(false\)\.\s*)RetryPolicy\(&gocql\.SimpleRetryPolicy\{NumRetries: 0\}\)\.\s*~${1}~s'
+  expect_red 'TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate' 'must explicitly pin RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0})' \
+    'claim LWT loses the explicit zero-retry policy (the single-use contract must not rely on session defaults)'
+  restore
+}
+
+m_claim_loses_non_speculative_policy() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) ClaimBlockDelete.*?SerialConsistency\(gocql\.Serial\)\.\s*Idempotent\(false\)\.\s*RetryPolicy\(&gocql\.SimpleRetryPolicy\{NumRetries: 0\}\)\.\s*)SetSpeculativeExecutionPolicy\(&gocql\.NonSpeculativeExecution\{\}\)\.\s*~${1}~s'
+  expect_red 'TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate' 'must explicitly pin SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{})' \
+    'claim LWT loses the explicit non-speculative policy (the single-use contract must not rely on session defaults)'
+  restore
+}
+
 m_blocks_disables_blocking_read_repair() {
   mutate "$SCHEMA001" 's{PRIMARY KEY \(\(org_id, block_id\)\)\s+\);\s+-- Row-per-reference liveness model}{PRIMARY KEY ((org_id, block_id))\n) WITH read_repair = NONE;\n\n-- Row-per-reference liveness model}'
   expect_red 'TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair' 'blocking read repair at EACH_QUORUM' \
@@ -484,6 +512,10 @@ MUTATIONS=(
   m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
   m_settled_own_claim_skips_each_quorum
+  m_settled_claim_visibility_downgrades_to_local_quorum
+  m_claim_loses_explicit_non_idempotent_pin
+  m_claim_loses_zero_retry_policy
+  m_claim_loses_non_speculative_policy
   m_blocks_disables_blocking_read_repair
   m_candidate_authority_read_is_ordinary
   m_expiry_bucket_hashes_raw_timestamps
@@ -536,5 +568,5 @@ done
 
 restore
 printf '\n'
-green "All ${#MUTATIONS[@]} P4a mutation(s) produced the expected red."
-printf 'Each removed invariant was detected by a P4a assertion, not by an unrelated failure.\n'
+green "All ${#MUTATIONS[@]} P4a/R26 mutation(s) produced the expected red."
+printf 'Each removed invariant was detected by its expected P4a/R26 assertion, not by an unrelated failure.\n'

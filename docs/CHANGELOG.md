@@ -8,14 +8,32 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4a evidence precision follow-up
+
+The claim execution-policy mutation is now three independent source-contract
+mutations for `Idempotent(false)`, zero retries and disabled speculative execution.
+The evidence is described as contract pinning rather than as proof that removing one
+setting makes the current driver defaults unsafe. The combined P4a/R26 matrix now
+contains 50 mutations.
+
+## 2026-08-28 - P4a audit hardening follow-up
+
+The mock's uncertain-claim path now runs the same exact visibility classifier as
+production, including `claimed_at`, so tests cannot accept a state production would
+classify as ambiguous. The claim LWT also explicitly disables driver retries and
+speculative execution, and mutation evidence covers both that contract and the
+settled-claim `EACH_QUORUM` read. `GC_ENABLED=false` remains required.
+
 ## 2026-08-28 - P4a follow-up: gate blocks read_repair=BLOCKING
 
 `confirmSettledBlockClaimVisibility` uses an `EACH_QUORUM` read of `blocks` as
 the dissemination barrier for writer `LOCAL_QUORUM` fence reads. That is only
 sound while effective `read_repair` is `BLOCKING` (empty is not accepted as the
 default). Source/schema and real-Cassandra P4a evidence now pin `blocks` the
-same way P4b-1 already pins `gc_s3_orphans`. Production claim protocol is
-unchanged.
+same way P4b-1 already pins `gc_s3_orphans`. The initial LWT's consistency and
+ownership contract is unchanged; its no-retry/no-speculative execution policy is
+now explicit. Post-error settlement authorization is hardened with canonical
+`EACH_QUORUM` confirmation.
 
 ## 2026-08-28 - P4a follow-up: SERIAL own claim is not EACH_QUORUM Acquired
 
@@ -223,8 +241,8 @@ The mergeable scope is now explicit:
   the pre-draft queue path. Its concurrent lifecycle race is documented, not hidden behind
   a partial LWT.
 - The requeue-specific real-Cassandra tests, source guard and mutations were removed from
-  this PR. The active P4a mutation script now contains **44** mutations; the script output
-  is authoritative.
+  this PR. At that historical point, the P4a mutation script contained **44** mutations;
+  the current count is maintained by the script output.
 
 The follow-up must choose one lifecycle authority for `Requeue`, `Complete`, `Fail`, DLQ
 and cross-partition pending state. Its race matrix includes `Requeue` vs `Requeue`,

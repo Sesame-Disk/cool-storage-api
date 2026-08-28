@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-28
-**Session**: X1/P4b-1 write-once orphan publication — P4a now confirms settled own claims at EACH_QUORUM; R14a and R16 remain GREEN; P4b-1 SameTarget requires pending_s3 and canonical EACH_QUORUM; R14b claim->orphan binding stays OPEN
+**Session**: X1/P4a audit hardening — settled-claim mock parity, explicit no-retry LWT policy and load-bearing EACH_QUORUM mutation evidence; R14a and R16 remain GREEN; R14b claim->orphan binding stays OPEN
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -63,8 +63,21 @@ clean run — cite that, not a number copied from prose.
 authority — the same split P4b-1 uses for orphan `SameTarget`. Direct `applied=true`
 stays Acquired. That confirmation read requires effective `blocks.read_repair=BLOCKING`
 (empty is not the default); source/schema and `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` pin it.
-Mutations `m_settled_own_claim_skips_each_quorum` and
-`m_blocks_disables_blocking_read_repair` hold those gates.
+Mutations `m_settled_own_claim_skips_each_quorum`,
+`m_settled_claim_visibility_downgrades_to_local_quorum`,
+`m_claim_loses_explicit_non_idempotent_pin`,
+`m_claim_loses_zero_retry_policy`,
+`m_claim_loses_non_speculative_policy` and
+`m_blocks_disables_blocking_read_repair` hold those gates. The mock follows the same
+exact classifier, including `claimed_at`, and the initial claim LWT explicitly disables
+driver retries and speculative execution.
+
+**Audit hardening files (2026-08-28):** `internal/gc/store_mock.go`,
+`internal/gc/store_cassandra.go`, `internal/gc/p4a_claim_ownership_test.go`,
+`internal/gc/p4a_claim_authority_guard_test.go`,
+`scripts/p4a-mutation-validation.sh`, `docs/TESTING.md`, `docs/CHANGELOG.md` and
+`CURRENT_WORK.md`. Docker validation passed the full 50-mutation P4a/R26 matrix and the
+full short Go suite.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
 locators: each now releases the exact claim, preserves the candidate, and postpones
@@ -135,8 +148,9 @@ confirms canonical `EACH_QUORUM` visibility before finalize and does not renew T
 (R28: crash-retry still authorizes Finalize because `Created` already inserted the
 fence; remaining TTL is not a lease). `NotPublished` requires SERIAL-confirmed absence.
 With a datacenter down, P3 accepts `BlockClaimAmbiguous` (err may be nil after
-SERIAL settlement of an unowned row, or after SERIAL sees our claim without
-`EACH_QUORUM` confirmation) and orphan `NotPublished` or `Ambiguous`; never claim
+SERIAL settlement of an unowned row; when SERIAL sees our claim but
+`EACH_QUORUM` confirmation is unavailable, the outcome is Ambiguous with a non-nil
+error) and orphan `NotPublished` or `Ambiguous`; never claim
 `Acquired` or orphan `Created`/`SameTarget`. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
