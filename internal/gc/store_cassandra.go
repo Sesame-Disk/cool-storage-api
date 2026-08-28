@@ -2172,6 +2172,7 @@ func (s *CassandraStore) confirmSameTargetOrphanResult(orgID uuid.UUID, blockID 
 func (s *CassandraStore) settleS3OrphanState(orgID uuid.UUID, blockID string) (s3OrphanCASRow, bool, error) {
 	var storageClass, storageKey *string
 	var firstSeenAt *time.Time
+	// Keep this SELECT aligned with TestP4B_SerialSettlementClassifiesRealCassandra.
 	err := s.db.Session().Query(`
 		SELECT storage_class, storage_key, first_seen_at
 		FROM gc_s3_orphans
@@ -2200,15 +2201,6 @@ func (s *CassandraStore) settleS3OrphanState(orgID uuid.UUID, blockID string) (s
 		return s3OrphanCASRow{}, true, parseErr
 	}
 	return parsed, true, nil
-}
-
-// ClassifySettledS3OrphanForTest runs the SERIAL settlement read used after an
-// uncertain StartBlockDeleteOrphan LWT and classifies that row. It does not
-// confirm EACH_QUORUM visibility or repair the projection. Production
-// publication must go through StartBlockDeleteOrphan.
-func (s *CassandraStore) ClassifySettledS3OrphanForTest(orgID uuid.UUID, blockID string, proposed BlockDeleteTarget) StartBlockDeleteOrphanResult {
-	row, found, err := s.settleS3OrphanState(orgID, blockID)
-	return resultFromSettledS3Orphan(row, found, err, proposed, nil)
 }
 
 func (s *CassandraStore) ensureS3OrphanProjectionResult(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {

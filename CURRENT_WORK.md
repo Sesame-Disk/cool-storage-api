@@ -123,8 +123,11 @@ mutations are green/red as required, and real-Cassandra evidence is gated by
 A same-P row already at `pending_mapping_cleanup` no longer authorizes finalize; recovery
 may still clear that completed-phase row without a physical delete. For that stale-phase
 ambiguity itself the trade stays leak-biased until R14b binds incarnation. `SameTarget`
-confirms canonical `EACH_QUORUM` visibility before finalize, does not renew TTL, and
-`NotPublished` requires SERIAL-confirmed absence. This is P4b-1 only: the remaining R14b work must carry
+confirms canonical `EACH_QUORUM` visibility before finalize and does not renew TTL
+(R28: crash-retry still authorizes Finalize because `Created` already inserted the
+fence; remaining TTL is not a lease). `NotPublished` requires SERIAL-confirmed absence.
+With a datacenter down, P3 accepts `NotPublished` or `Ambiguous` and never
+`Created`/`SameTarget`. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 
 ### Inter-session Update (2026-05-21)

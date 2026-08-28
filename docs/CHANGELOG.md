@@ -8,6 +8,22 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-27 - P4b-1 follow-up: P3 fail-closed is not-published or ambiguous
+
+Aligned the multi-DC evidence with SERIAL settlement and tightened the production API.
+
+- With a datacenter down, `StartBlockDeleteOrphan` may return `NotPublished` or
+  `Ambiguous`. `Created`/`SameTarget` remain forbidden because they authorize
+  `FinalizeBlockDelete`. Survivor "no fence" is required only after SERIAL-confirmed
+  absence; a partial row on live DCs is fail-closed, not a successful condemnation.
+- `ClassifySettledS3OrphanForTest` is gone from the production store API. Real
+  SERIAL evidence uses the same SELECT as settlement; classification stays in
+  package `gc` unit tests.
+- Effective `read_repair` evidence no longer treats an empty schema value as BLOCKING.
+- `SameTarget` still authorizes crash-retry Finalize. Unrejuvenated TTL is R28;
+  refusing SameTarget Finalize would stall the retry that write-once exists for.
+  `GC_ENABLED=false` remains required until R14b.
+
 ## 2026-08-27 - P4b-1 follow-up: SameTarget requires pending_s3, not only identity
 
 Closed the remaining P4b-1 publication hole without opening R14b.

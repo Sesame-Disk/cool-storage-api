@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -123,6 +124,10 @@ func TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra(t *testing.T) {
 	t.Logf("P4B_ORPHAN_PUBLICATION_EVIDENCE created=1 same_target=1 different_target=1 projection=1 first_seen_at_preserved=1 canonical_each_quorum=1")
 }
 
+// TestP4B_SerialSettlementClassifiesRealCassandra proves the SERIAL SELECT used
+// after an uncertain LWT against real Cassandra. Row classification lives in
+// package gc unit tests; this leg must not call an exported SERIAL-only helper
+// that skips EACH_QUORUM confirmation.
 func TestP4B_SerialSettlementClassifiesRealCassandra(t *testing.T) {
 	requireCassandra(t)
 	gate := p4bRequireEvidence(t)
@@ -141,9 +146,8 @@ func TestP4B_SerialSettlementClassifiesRealCassandra(t *testing.T) {
 		}
 	})
 
-	absent := store.ClassifySettledS3OrphanForTest(orgID, absentID, proposed)
-	if absent.Outcome != gcpkg.StartBlockDeleteOrphanNotPublished {
-		t.Fatalf("SERIAL absence = %s cause=%v, want not_published", absent.Outcome, absent.Cause)
+	if found := scanCanonicalOrphanSERIAL(t, database, orgID, absentID); found {
+		t.Fatal("SERIAL absence must not find a canonical orphan")
 	}
 
 	created := store.StartBlockDeleteOrphan(orgID, presentID, "hot", storageKey, "sha1-serial", firstSeenAt)
@@ -151,18 +155,17 @@ func TestP4B_SerialSettlementClassifiesRealCassandra(t *testing.T) {
 		t.Fatalf("seed publication = %s cause=%v, want created", created.Outcome, created.Cause)
 	}
 
-	same := store.ClassifySettledS3OrphanForTest(orgID, presentID, proposed)
-	if same.Outcome != gcpkg.StartBlockDeleteOrphanSameTarget || !same.FirstSeenAt.Equal(firstSeenAt) {
-		t.Fatalf("SERIAL same-target = outcome:%s first_seen_at:%v, want same_target at %v", same.Outcome, same.FirstSeenAt, firstSeenAt)
+	class, key, storedFirstSeenAt, found := mustScanCanonicalOrphanSERIAL(t, database, orgID, presentID)
+	if !found || class != proposed.StorageClass || key != proposed.StorageKey || !storedFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("SERIAL same-target row = found:%v class:%q key:%q first_seen_at:%v, want hot/%s at %v", found, class, key, storedFirstSeenAt, proposed.StorageKey, firstSeenAt)
 	}
-
-	different := store.ClassifySettledS3OrphanForTest(orgID, presentID, gcpkg.BlockDeleteTarget{StorageClass: "cold", StorageKey: storageKey})
-	if different.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
-		t.Fatalf("SERIAL different-target = %s, want different_target", different.Outcome)
+	other := gcpkg.BlockDeleteTarget{StorageClass: "cold", StorageKey: storageKey}
+	if class == other.StorageClass && key == other.StorageKey {
+		t.Fatal("SERIAL row matched a different-class proposal; exact P is (storage_class, storage_key)")
 	}
 
 	gate.observed = true
-	t.Logf("P4B_SERIAL_SETTLEMENT_EVIDENCE absent=1 same_target=1 different_target=1")
+	t.Logf("P4B_SERIAL_SETTLEMENT_EVIDENCE absent=1 same_identity=1 different_class_mismatch=1")
 }
 
 func TestP4B_LifecycleAdvancedAtRealCassandra(t *testing.T) {
@@ -221,12 +224,57 @@ func TestP4B_CanonicalOrphanReadRepairIsBlocking(t *testing.T) {
 	`, keyspace, "gc_s3_orphans").Scan(&readRepair); err != nil {
 		t.Fatalf("read effective read_repair for gc_s3_orphans: %v", err)
 	}
-	switch strings.ToUpper(strings.TrimSpace(readRepair)) {
-	case "", "BLOCKING":
-	default:
-		t.Fatalf("gc_s3_orphans effective read_repair = %q, want BLOCKING (default or explicit); SameTarget confirmation relies on blocking read repair at EACH_QUORUM", readRepair)
+	if strings.ToUpper(strings.TrimSpace(readRepair)) != "BLOCKING" {
+		t.Fatalf("gc_s3_orphans effective read_repair = %q, want BLOCKING; empty is not treated as the default. SameTarget confirmation relies on blocking read repair at EACH_QUORUM", readRepair)
 	}
 
 	gate.observed = true
 	t.Logf("P4B_READ_REPAIR_EVIDENCE blocking=1 value=%q", readRepair)
+}
+
+// scanCanonicalOrphanSERIAL issues the same SERIAL SELECT as settleS3OrphanState.
+func scanCanonicalOrphanSERIAL(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string) bool {
+	t.Helper()
+	_, _, _, found := readCanonicalOrphanSERIAL(t, database, orgID, blockID)
+	return found
+}
+
+func mustScanCanonicalOrphanSERIAL(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string) (string, string, time.Time, bool) {
+	t.Helper()
+	class, key, firstSeenAt, found := readCanonicalOrphanSERIAL(t, database, orgID, blockID)
+	if !found {
+		t.Fatal("SERIAL settlement read found no canonical orphan")
+	}
+	return class, key, firstSeenAt, found
+}
+
+func readCanonicalOrphanSERIAL(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string) (string, string, time.Time, bool) {
+	t.Helper()
+	var storageClass, storageKey *string
+	var firstSeenAt *time.Time
+	err := database.Session().Query(`
+		SELECT storage_class, storage_key, first_seen_at
+		FROM gc_s3_orphans
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).
+		Consistency(gocql.Serial).
+		Scan(&storageClass, &storageKey, &firstSeenAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return "", "", time.Time{}, false
+	}
+	if err != nil {
+		t.Fatalf("SERIAL settlement read: %v", err)
+	}
+	class, key := "", ""
+	if storageClass != nil {
+		class = *storageClass
+	}
+	if storageKey != nil {
+		key = *storageKey
+	}
+	seen := time.Time{}
+	if firstSeenAt != nil {
+		seen = firstSeenAt.UTC()
+	}
+	return class, key, seen, true
 }

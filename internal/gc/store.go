@@ -814,7 +814,9 @@ const (
 	StartBlockDeleteOrphanDifferentTarget
 	// StartBlockDeleteOrphanNotPublished means serial settlement found no row.
 	StartBlockDeleteOrphanNotPublished
-	// StartBlockDeleteOrphanInvalid means the proposed input is invalid.
+	// StartBlockDeleteOrphanInvalid means the proposed input is invalid, or the
+	// visible canonical row is malformed or its stored first_seen_at does not
+	// match the settled token. The worker must not finalize.
 	StartBlockDeleteOrphanInvalid
 	// StartBlockDeleteOrphanProjectionUnconfirmed means the canonical orphan is
 	// known, but its discovery projection was not durably acknowledged.

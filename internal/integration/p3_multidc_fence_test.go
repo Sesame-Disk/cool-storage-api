@@ -45,9 +45,12 @@ import (
 // because with a datacenter down an EACH_QUORUM publication does not succeed at
 // all. That is not an obstacle -- it IS the property:
 //
-//	you cannot reach a state where the fence exists but a writer in another
-//	datacenter cannot see it, because the publication either obtains a quorum
-//	in every DC or it fails and nothing is condemned.
+//	you cannot reach a state where GC has authorized FinalizeBlockDelete but a
+//	writer in another datacenter cannot see the fence. Publication either
+//	obtains EACH_QUORUM in every DC (Created/SameTarget) or it fails closed.
+//	SERIAL settlement may complete a Paxos proposal on the live DCs; that is
+//	Ambiguous, not permission to finalize, and a partial row on survivors is
+//	not a P3 regression.
 //
 // So the green leg asserts the failure, and the mutations assert that the weaker
 // levels reach exactly the state the fence exists to prevent.
@@ -154,15 +157,18 @@ func p3RequireUnavailableAtEachQuorum(t *testing.T, what string, err error) {
 }
 
 // TestP3_FencePublicationFailsClosedWhenADatacenterIsDown is the green leg. With
-// dc-na stopped, neither half of the fence may be published: an EACH_QUORUM commit
-// cannot obtain a quorum in a datacenter that is not there, so GC cannot condemn an
-// incarnation it would be unable to fence for writers in that DC.
+// dc-na stopped, GC must not obtain a fence it would be unable to show writers in
+// that DC. ClaimBlockDelete still proves the coordinator refused the mutation
+// (Unavailable at EACH_QUORUM). StartBlockDeleteOrphan additionally settles in
+// SERIAL, so the live DCs may have accepted a Paxos proposal whose EACH_QUORUM
+// learn could not finish. That must come back Ambiguous or NotPublished — never
+// Created or SameTarget, which are the only outcomes that authorize
+// FinalizeBlockDelete.
 //
-// It asserts three things, not one: the error is specifically Unavailable, the
-// level it names is EACH_QUORUM, and no fence actually landed in either surviving
-// datacenter. The third is what turns "the call failed" into "nothing was
-// published", and it is checked through the production reader from both DCs that
-// were up and could therefore have accepted a partial write.
+// "No fence on survivors" is therefore conditional: it is required when SERIAL
+// confirmed absence (NotPublished). It is not required on Ambiguous, because a
+// partial canonical row on dc-eu/dc-asia is fail-closed, not a successful
+// condemnation.
 //
 // The script downgrades the publishers and re-runs this leg to show it goes red.
 func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
@@ -189,26 +195,34 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 	// The orphan: the fence that gates a rowless mint, so a publication invisible to
 	// dc-na is what lets a second physical life be born while the first retires.
 	orphanResult := store.StartBlockDeleteOrphan(orgUUID, blockID, location.StorageClass, location.StorageKey, "", time.Now().UTC())
-	if orphanResult.Outcome != gcpkg.StartBlockDeleteOrphanNotPublished {
-		t.Errorf("P3 REGRESSION: StartBlockDeleteOrphan outcome=%s, want not_published after serial settlement confirms absence (cause=%v)", orphanResult.Outcome, orphanResult.Cause)
+	switch orphanResult.Outcome {
+	case gcpkg.StartBlockDeleteOrphanNotPublished:
+		p3RequireUnavailableAtEachQuorum(t, "StartBlockDeleteOrphan", orphanResult.Cause)
+		p3RequireNoFenceOnSurvivors(t, orgID, blockID, endpoints)
+	case gcpkg.StartBlockDeleteOrphanAmbiguous:
+		if orphanResult.Cause == nil {
+			t.Errorf("P3 REGRESSION: Ambiguous StartBlockDeleteOrphan with dc-na down must carry the consistency failure")
+		}
+	default:
+		t.Errorf("P3 REGRESSION: StartBlockDeleteOrphan outcome=%s cause=%v; with a datacenter down publication must be not_published or ambiguous, never Created/SameTarget (those authorize FinalizeBlockDelete)", orphanResult.Outcome, orphanResult.Cause)
 	}
-	p3RequireUnavailableAtEachQuorum(t, "StartBlockDeleteOrphan", orphanResult.Cause)
 
-	// Refused is not the same as "left no trace". Check both datacenters that WERE
-	// reachable, because those are the ones a partially applied publication would
-	// have landed on.
+	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s claim refused as Unavailable at EACH_QUORUM; orphan outcome=%s (must not authorize finalize)", orgID, blockID, orphanResult.Outcome)
+}
+
+func p3RequireNoFenceOnSurvivors(t *testing.T, orgID, blockID string, endpoints map[string]string) {
+	t.Helper()
 	for _, dc := range []string{"dc-eu", "dc-asia"} {
 		survivor := x2ConnectToDC(t, dc, endpoints)
 		fenced, err := survivor.BlockDeleteFenceActive(orgID, blockID)
 		if err != nil {
-			t.Fatalf("fence read from %s after the refused publications: %v", dc, err)
+			t.Errorf("fence read from %s after SERIAL-confirmed absence: %v", dc, err)
+			continue
 		}
 		if fenced {
-			t.Fatalf("P3 REGRESSION: %s holds a fence for a block whose publication could not obtain EACH_QUORUM; a publication that cannot reach every datacenter must leave nothing behind", dc)
+			t.Errorf("P3 REGRESSION: %s holds a fence after StartBlockDeleteOrphan returned not_published; SERIAL-confirmed absence must leave no writer-visible fence on the live DCs", dc)
 		}
 	}
-
-	t.Logf("P3_MULTIDC_FAILCLOSED_EVIDENCE org=%s block=%s both publications refused as Unavailable at EACH_QUORUM, and neither dc-eu nor dc-asia holds a fence", orgID, blockID)
 }
 
 // TestP3_WriterInAnotherDatacenterObservesTheFence runs the REAL destructive

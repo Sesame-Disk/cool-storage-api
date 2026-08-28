@@ -462,7 +462,9 @@ uses it to find a block's SHA-1 alias(es) when deleting the block by SHA-256.
       the canonical row's `first_seen_at` and recovery state while repairing its discovery
       projection; a different target is reported as a conflict without overwriting the older
       lifecycle. An uncertain result is settled in the serial domain, and an unsettled result
-      remains fail-closed. Pinned by the P4b publication unit and real-Cassandra evidence
+      remains fail-closed. Same-target confirmation proves visibility now and does not renew
+      the remaining TTL (R28); crash-retry still authorizes `FinalizeBlockDelete` because
+      `Created` already inserted the fence. Pinned by the P4b publication unit and real-Cassandra evidence
       tests.
     - **What write-once gave up, deliberately.** The previous entry point always reset an
       existing row to `pending_s3`, because a stale row left at `pending_mapping_cleanup` makes

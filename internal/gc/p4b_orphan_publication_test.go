@@ -78,6 +78,12 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	if !strings.Contains(confirm, "ensureS3OrphanProjectionResult") {
 		t.Fatal("SameTarget confirmation must repair the discovery projection only after canonical visibility")
 	}
+	if !strings.Contains(confirm, "confirmed.Outcome != StartBlockDeleteOrphanSameTarget") {
+		t.Fatal("LifecycleAdvanced and other non-SameTarget outcomes must return before projection repair")
+	}
+	if findGCFunction(file, "ClassifySettledS3OrphanForTest") != nil {
+		t.Fatal("SERIAL-only classification must not be an exported CassandraStore method")
+	}
 
 	global := findGCFunction(file, "GetS3OrphanGlobal")
 	if global == nil {
