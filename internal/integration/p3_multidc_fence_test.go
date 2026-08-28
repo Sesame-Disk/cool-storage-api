@@ -192,8 +192,9 @@ func TestP3_FencePublicationFailsClosedWhenADatacenterIsDown(t *testing.T) {
 	claim, claimErr := store.ClaimBlockDelete(orgUUID, blockID, attempt)
 	switch claim.Outcome {
 	case gcpkg.BlockClaimAmbiguous:
-		// SERIAL settlement after EACH_QUORUM failure. err may be nil: the settling
-		// read can see the still-unowned row and classify that as Ambiguous.
+		// SERIAL settlement after EACH_QUORUM failure, or SERIAL seeing our claim
+		// without a renewed EACH_QUORUM visibility proof. err may be nil: the
+		// settling read can see the still-unowned row and classify that as Ambiguous.
 	case gcpkg.BlockClaimAcquired:
 		t.Errorf("P3 REGRESSION: ClaimBlockDelete acquired with dc-na down; a claim a dc-na writer cannot see is a fence that does not fence (err=%v)", claimErr)
 	default:

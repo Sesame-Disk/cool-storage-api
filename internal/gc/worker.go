@@ -1369,9 +1369,12 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			// fence permanent. A metric and a log get the same human attention without
 			// throwing away the only thing that can still lift it, and the moment the
 			// underlying cause is fixed the next pass takes the stale claim over.
+			//
+			// This includes SERIAL settlement failing, and SERIAL seeing our claim while
+			// the EACH_QUORUM visibility confirmation does not.
 			metrics.GCErrorsTotal.WithLabelValues("block_claim_unsettled").Inc()
 			w.recordDestructiveBlocked(destructivePathBlock)
-			log.Printf("[GC Worker] Block %s: the delete claim could not be settled even in the serial domain; retaining claim and candidate and postponing: %v", item.ItemID, err)
+			log.Printf("[GC Worker] Block %s: the delete claim could not be confirmed after serial settlement; retaining claim and candidate and postponing: %v", item.ItemID, err)
 			return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: err}
 		}
 		// An LWT is more exposed than a plain read — Paxos needs its serial quorum on
@@ -1426,8 +1429,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		log.Printf("[GC Worker] Block %s: canonical row carries no usable physical identity; refusing every destructive step and postponing — this will NOT self-heal and needs a human", item.ItemID)
 		return blockCandidateAuthorityInvalidError{ItemID: item.ItemID}
 	case BlockClaimAmbiguous:
-		// The claim's outcome could not be established even in the serial domain.
-		// Retain the claim, retain the candidate, finalize nothing, release nothing (R20).
+		// The claim's outcome could not be established: SERIAL settlement was
+		// inconclusive, or SERIAL saw our claim without EACH_QUORUM proof that the
+		// fence is visible in every DC. Retain the claim, retain the candidate,
+		// finalize nothing, release nothing (R20).
 		w.recordDestructiveBlocked(destructivePathBlock)
 		log.Printf("[GC Worker] Block %s: the delete claim's outcome is unsettled; retaining claim and candidate and postponing", item.ItemID)
 		return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: errBlockClaimUnsettled}

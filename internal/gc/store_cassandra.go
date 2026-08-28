@@ -2848,6 +2848,74 @@ func (s *CassandraStore) settleBlockDeleteClaimState(orgID uuid.UUID, blockID st
 	return row, true, nil
 }
 
+func (s *CassandraStore) confirmSettledBlockClaimVisibility(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error) {
+	// SERIAL settlement answered which claim Paxos chose. Writer fence reads are
+	// LOCAL_QUORUM, so Acquired after an uncertain LWT still needs the canonical
+	// row visible at EACH_QUORUM — the same split SameTarget uses for orphans.
+	row, found, err := s.readBlockDeleteClaimEachQuorum(orgID, blockID)
+	classified := classifySettledBlockClaimVisibility(row, found, err, attempt)
+	if classified.Outcome != BlockClaimAcquired {
+		cause := err
+		if cause == nil && !found {
+			cause = errors.New("settled block claim is not visible at EACH_QUORUM")
+		} else if cause == nil {
+			cause = fmt.Errorf("settled block claim is not the exact authority at EACH_QUORUM")
+		}
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", cause)
+	}
+	return classified, nil
+}
+
+func (s *CassandraStore) readBlockDeleteClaimEachQuorum(orgID uuid.UUID, blockID string) (blockDeleteClaimRow, bool, error) {
+	var row blockDeleteClaimRow
+	var storageClass, storageKey, gcState, gcClaimID *string
+	var gcClaimedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT storage_class, storage_key, gc_state, gc_claim_id, gc_claimed_at
+		FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).
+		Consistency(gocql.EachQuorum).
+		Scan(&storageClass, &storageKey, &gcState, &gcClaimID, &gcClaimedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return blockDeleteClaimRow{}, false, nil
+		}
+		return blockDeleteClaimRow{}, false, err
+	}
+	if storageClass != nil {
+		row.Target.StorageClass = *storageClass
+	}
+	if storageKey != nil {
+		row.Target.StorageKey = *storageKey
+	}
+	if gcState != nil {
+		row.GCState = *gcState
+	}
+	if gcClaimID != nil {
+		row.GCClaimID = *gcClaimID
+	}
+	if gcClaimedAt != nil {
+		row.GCClaimedAt = *gcClaimedAt
+	}
+	return row, true, nil
+}
+
+func classifySettledBlockClaimVisibility(row blockDeleteClaimRow, found bool, readErr error, attempt BlockDeleteAuthority) BlockClaimResult {
+	if readErr != nil || !found {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	got := row.result(attempt, attempt.ClaimedAt.Add(-blockDeleteClaimStaleAfter))
+	if got.Outcome != BlockClaimAcquired {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	stored := row.GCClaimedAt.UTC().Truncate(time.Millisecond)
+	expected := attempt.ClaimedAt.UTC().Truncate(time.Millisecond)
+	if !stored.Equal(expected) {
+		return BlockClaimResult{Outcome: BlockClaimAmbiguous}
+	}
+	return got
+}
+
 // blockDeleteClaimRow is the claim-relevant projection of a `blocks` row, however it
 // was observed — from a CAS result's current values or from a serial settling read.
 type blockDeleteClaimRow struct {
@@ -2893,7 +2961,10 @@ func (row blockDeleteClaimRow) classify(attempt BlockDeleteAuthority, staleBefor
 		return BlockClaimFreshOwner
 	}
 	if row.GCClaimID == attempt.ClaimID {
-		// Our own claim, already committed by a Paxos round we lost the answer to.
+		// Our own claim in the serial domain. Callers that observed this after an
+		// uncertain LWT must still confirm EACH_QUORUM visibility before treating
+		// it as BlockClaimAcquired; classify itself does not know the observation
+		// origin.
 		return BlockClaimAcquired
 	}
 	if strings.TrimSpace(row.GCClaimID) == "" || row.GCClaimedAt.IsZero() {
@@ -2941,6 +3012,11 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		// The LWT's outcome is unknown: it may have committed. Settle in the serial
 		// domain rather than guessing, and if that cannot be established either, stay
 		// ambiguous — the caller then retains claim and candidate and stops (R20).
+		//
+		// SERIAL ownership is not EACH_QUORUM visibility. Paxos can accept on a
+		// majority while the EACH_QUORUM learn fails (a down DC). Treat our own
+		// settled claim as Acquired only after the canonical row is visible at
+		// EACH_QUORUM, the same split SameTarget uses for orphans.
 		row, found, settleErr := s.settleBlockDeleteClaimState(orgID, blockID)
 		if settleErr != nil {
 			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, err, settleErr)
@@ -2948,7 +3024,11 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		if !found {
 			return BlockClaimResult{Outcome: BlockClaimMissing}, nil
 		}
-		return row.result(attempt, staleBefore), nil
+		settled := row.result(attempt, staleBefore)
+		if settled.Outcome == BlockClaimAcquired {
+			return s.confirmSettledBlockClaimVisibility(orgID, blockID, attempt)
+		}
+		return settled, nil
 	}
 	if applied {
 		return BlockClaimResult{Outcome: BlockClaimAcquired, Owner: attempt}, nil

@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-08-27
-**Session**: X1/P4b-1 write-once orphan publication — P4a/R14a and R16 remain GREEN; P4b-1 SameTarget requires pending_s3 and canonical EACH_QUORUM; R14b claim->orphan binding stays OPEN
+**Last Updated**: 2026-08-28
+**Session**: X1/P4b-1 write-once orphan publication — P4a now confirms settled own claims at EACH_QUORUM; R14a and R16 remain GREEN; P4b-1 SameTarget requires pending_s3 and canonical EACH_QUORUM; R14b claim->orphan binding stays OPEN
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -54,9 +54,14 @@ production blocker, and no status document should say that it is.
 this file and every earlier mutation count. The script output is authoritative.
 `internal/integration/p4a_claim_authority_test.go` has four real-Cassandra legs: exact
 ownership/takeover, physical ABA, retry under real CAS, and stale-claim release bound to
-the observed incarnation. `scripts/p4a-mutation-validation.sh` runs **44** active mutations
-end-to-end after the queue-primitive draft was withdrawn, and the script prints its own total
-on a clean run — cite that, not a number copied from prose.
+the observed incarnation. `scripts/p4a-mutation-validation.sh` prints its own total on a
+clean run — cite that, not a number copied from prose.
+
+**P4a claim visibility (2026-08-28):** After an uncertain LWT, SERIAL seeing our own
+`claimID` is not `BlockClaimAcquired`. Production confirms the canonical `blocks` row at
+`EACH_QUORUM` (exact P, `deleting`, claim id, `claimed_at`) before granting destructive
+authority — the same split P4b-1 uses for orphan `SameTarget`. Direct `applied=true`
+stays Acquired. A new mutation (`m_settled_own_claim_skips_each_quorum`) holds that gate.
 
 A fourth review pass closed ordinary post-claim `GetBlockInfo` errors and divergent
 locators: each now releases the exact claim, preserves the candidate, and postpones
@@ -127,7 +132,8 @@ confirms canonical `EACH_QUORUM` visibility before finalize and does not renew T
 (R28: crash-retry still authorizes Finalize because `Created` already inserted the
 fence; remaining TTL is not a lease). `NotPublished` requires SERIAL-confirmed absence.
 With a datacenter down, P3 accepts `BlockClaimAmbiguous` (err may be nil after
-SERIAL settlement) and orphan `NotPublished` or `Ambiguous`; never claim
+SERIAL settlement of an unowned row, or after SERIAL sees our claim without
+`EACH_QUORUM` confirmation) and orphan `NotPublished` or `Ambiguous`; never claim
 `Acquired` or orphan `Created`/`SameTarget`. This is P4b-1 only: the remaining R14b work must carry
 the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
 

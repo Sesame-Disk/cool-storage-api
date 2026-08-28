@@ -184,6 +184,7 @@ type MockStore struct {
 	getBlockGCCandidateErr                         error
 	deleteBlockGCCandidateDiscoveryErr             error
 	claimBlockDeleteSettleErr                      error
+	claimBlockDeleteEachQuorumErr                  error
 	getBlockInfoHook                               func(BlockInfo) BlockInfo
 	getBlockInfoErr                                error
 	claimAttempts                                  []BlockDeleteAuthority
@@ -2606,6 +2607,15 @@ func (m *MockStore) SetClaimBlockDeleteSettleErrForTest(err error) {
 	m.claimBlockDeleteSettleErr = err
 }
 
+// SetClaimBlockDeleteEachQuorumErrForTest models SERIAL settlement seeing our claim
+// while the canonical EACH_QUORUM visibility read cannot complete. Production then
+// returns Ambiguous, not Acquired.
+func (m *MockStore) SetClaimBlockDeleteEachQuorumErrForTest(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimBlockDeleteEachQuorumErr = err
+}
+
 // SetGetBlockGCCandidateErrForTest injects a failure into the candidate authority read.
 func (m *MockStore) SetGetBlockGCCandidateErrForTest(err error) {
 	m.mu.Lock()
@@ -2755,7 +2765,9 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 		// only a settlement that ALSO fails leaves the outcome unknown. Reporting every
 		// injected error as ambiguous made the mock unable to express the case that
 		// matters most — an LWT that timed out after committing, which the settling read
-		// then recognises as our own claim.
+		// then recognises as our own claim. SERIAL ownership is still not EACH_QUORUM
+		// visibility: claimBlockDeleteEachQuorumErr models a learn that never became
+		// visible in every DC.
 		if m.claimBlockDeleteSettleErr != nil {
 			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("claim block %s: LWT failed (%v) and the serial settling read failed too: %w", blockID, m.claimBlockDeleteErr, m.claimBlockDeleteSettleErr)
 		}
@@ -2771,7 +2783,11 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 		if b.GCClaimedAt != nil {
 			settled.GCClaimedAt = *b.GCClaimedAt
 		}
-		return settled.result(attempt, staleBefore), nil
+		result := settled.result(attempt, staleBefore)
+		if result.Outcome == BlockClaimAcquired && m.claimBlockDeleteEachQuorumErr != nil {
+			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", m.claimBlockDeleteEachQuorumErr)
+		}
+		return result, nil
 	}
 	b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 	if !ok {

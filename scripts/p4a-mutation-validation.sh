@@ -222,6 +222,13 @@ m_settlement_read_is_ordinary() {
   restore
 }
 
+m_settled_own_claim_skips_each_quorum() {
+  mutate "$STORE" 's{if settled\.Outcome == BlockClaimAcquired \{\s+return s\.confirmSettledBlockClaimVisibility\(orgID, blockID, attempt\)\s+\}\s+return settled, nil}{return settled, nil}'
+  expect_red 'TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum' 'SERIAL own claim must confirm EACH_QUORUM' \
+    'SERIAL-settled own claim treated as Acquired without EACH_QUORUM visibility (Paxos accepted, learn failed)'
+  restore
+}
+
 m_candidate_drops_storage_key() {
   mutate "$STORE" 's{INSERT INTO gc_block_candidates \(org_id, block_id, storage_class, storage_key, candidate_at\)(\s+)VALUES \(\?, \?, \?, \?, \?\) IF NOT EXISTS}{INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)$1VALUES (?, ?, ?, ?) IF NOT EXISTS}'
   expect_red 'TestP4ACandidatesCarryTheExactKeyAndNeverDeriveIt' 'must carry storage_key' \
@@ -468,6 +475,7 @@ MUTATIONS=(
   m_migration_candidate_key_adds_candidate_at
   m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
+  m_settled_own_claim_skips_each_quorum
   m_candidate_authority_read_is_ordinary
   m_expiry_bucket_hashes_raw_timestamps
   m_candidate_drops_storage_key

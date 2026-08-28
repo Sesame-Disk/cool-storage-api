@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4a follow-up: SERIAL own claim is not EACH_QUORUM Acquired
+
+`ClaimBlockDelete` no longer treats a SERIAL-settled own `claimID` as
+`BlockClaimAcquired` after an uncertain LWT. Paxos can accept on a majority while
+the `EACH_QUORUM` learn fails; SERIAL may then observe that proposal. Acquired
+after an LWT error requires a canonical `blocks` read at `EACH_QUORUM` matching
+exact P, `gc_state=deleting`, claim id and `claimed_at`. Direct `applied=true`
+is unchanged. This is the same split P4b-1 already uses for orphan `SameTarget`.
+
 ## 2026-08-28 - P4b-1 follow-up: SameTarget requires the exact pending_s3 token
 
 `recovery_phase` is compared without TrimSpace, matching the strict identity
