@@ -230,6 +230,20 @@ m_settled_own_claim_skips_each_quorum() {
   restore
 }
 
+m_settled_claim_visibility_downgrades_to_local_quorum() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) readBlockDeleteClaimEachQuorum.*?Consistency\(gocql\.)EachQuorum(\))~${1}LocalQuorum$2~s'
+  expect_red 'TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum' 'must pin regular visibility to gocql.EachQuorum' \
+    'settled-claim visibility downgraded to LOCAL_QUORUM (a writer in another DC can still miss the fence)'
+  restore
+}
+
+m_claim_retries_uncertain_lwt() {
+  mutate "$STORE" 's~(func \(s \*CassandraStore\) ClaimBlockDelete.*?SerialConsistency\(gocql\.Serial\)\.\s*)Idempotent\(false\)\.\s*RetryPolicy\(&gocql\.SimpleRetryPolicy\{NumRetries: 0\}\)\.\s*SetSpeculativeExecutionPolicy\(&gocql\.NonSpeculativeExecution\{\}\)\.\s*~${1}~s'
+  expect_red 'TestP4AClaimBlockDeleteDoesNotRetryOrSpeculate' 'must explicitly pin Idempotent(false)' \
+    'claim LWT retries or speculates (the driver can hide the uncertain result that settlement must classify)'
+  restore
+}
+
 m_blocks_disables_blocking_read_repair() {
   mutate "$SCHEMA001" 's{PRIMARY KEY \(\(org_id, block_id\)\)\s+\);\s+-- Row-per-reference liveness model}{PRIMARY KEY ((org_id, block_id))\n) WITH read_repair = NONE;\n\n-- Row-per-reference liveness model}'
   expect_red 'TestP4A_CanonicalBlocksSchemaDoesNotDisableBlockingReadRepair' 'blocking read repair at EACH_QUORUM' \
@@ -484,6 +498,8 @@ MUTATIONS=(
   m_stale_discovery_failure_burns_a_retry
   m_settlement_read_is_ordinary
   m_settled_own_claim_skips_each_quorum
+  m_settled_claim_visibility_downgrades_to_local_quorum
+  m_claim_retries_uncertain_lwt
   m_blocks_disables_blocking_read_repair
   m_candidate_authority_read_is_ordinary
   m_expiry_bucket_hashes_raw_timestamps

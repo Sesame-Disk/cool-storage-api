@@ -3010,6 +3010,9 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attem
 		attempt.Target.StorageClass, attempt.Target.StorageKey).
 		Consistency(gocql.EachQuorum).
 		SerialConsistency(gocql.Serial).
+		Idempotent(false).
+		RetryPolicy(&gocql.SimpleRetryPolicy{NumRetries: 0}).
+		SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{}).
 		MapScanCAS(existing)
 	if err != nil {
 		// The LWT's outcome is unknown: it may have committed. Settle in the serial

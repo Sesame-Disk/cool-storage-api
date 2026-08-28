@@ -2784,8 +2784,18 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt Bl
 			settled.GCClaimedAt = *b.GCClaimedAt
 		}
 		result := settled.result(attempt, staleBefore)
-		if result.Outcome == BlockClaimAcquired && m.claimBlockDeleteEachQuorumErr != nil {
-			return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", m.claimBlockDeleteEachQuorumErr)
+		if result.Outcome == BlockClaimAcquired {
+			// Keep the mock's uncertain-LWT path aligned with production: SERIAL ownership
+			// is not enough, and the canonical visibility classifier also checks claimed_at.
+			confirmed := classifySettledBlockClaimVisibility(settled, true, m.claimBlockDeleteEachQuorumErr, attempt)
+			if confirmed.Outcome != BlockClaimAcquired {
+				cause := m.claimBlockDeleteEachQuorumErr
+				if cause == nil {
+					cause = errors.New("settled block claim is not the exact authority at EACH_QUORUM")
+				}
+				return BlockClaimResult{Outcome: BlockClaimAmbiguous}, fmt.Errorf("confirm settled block claim visibility at EACH_QUORUM: %w", cause)
+			}
+			return confirmed, nil
 		}
 		return result, nil
 	}

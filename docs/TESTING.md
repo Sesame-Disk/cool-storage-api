@@ -899,7 +899,7 @@ Each of these exists because the obvious version of the test proves nothing.
 | `P3_EXPECT_DC_DOWN=1` | leg 1 passing against a healthy cluster, where the publications would simply succeed |
 | leg 2 skips when `P3_EXPECT_DC_DOWN` is set | running the handoff leg against a cluster with a DC missing |
 | `p3RequireUnavailableAtEachQuorum` | `err != nil` counting as proof on the orphan `NotPublished` path. A write timeout on an LWT (`WriteType: CAS`) may still have been accepted, so only `Unavailable` **at EACH_QUORUM** is accepted there |
-| claim `BlockClaimAmbiguous` (not `claimErr != nil`) | P4a SERIAL settlement returning `Ambiguous` with `err=nil` after EACH_QUORUM fails, **or** SERIAL seeing our claim without a renewed EACH_QUORUM visibility proof. The worker fail-closes on Outcome; treating nil error as success is a false P3 regression. SERIAL ownership is not `Acquired` |
+| claim `BlockClaimAmbiguous` (not `claimErr != nil`) | P4a SERIAL settlement returning `Ambiguous` with `err=nil` after it confirms an unowned row, **or** SERIAL seeing our claim while the renewed `EACH_QUORUM` visibility proof fails (that path carries a non-nil error). The worker fail-closes on Outcome; treating nil error as success is a false P3 regression. SERIAL ownership is not `Acquired` |
 | post-refusal fence read from dc-eu **and** dc-asia | treating "the LWT errored" as "nothing exists". Required only when orphan publication is `NotPublished` (SERIAL-confirmed absence). `Ambiguous` may leave a partial row on survivors and must still not authorize `FinalizeBlockDelete` |
 | `BlockExists` check after finalize in leg 2 | measuring an orphan read instead of the rowless-mint gate |
 | fresh org/block id per run | a previous run's rows deciding this run's assertions |
@@ -911,6 +911,7 @@ Each of these exists because the obvious version of the test proves nothing.
 | `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at. A mutation that fails to COMPILE trips this too, which is how the takeover mutation was caught proving nothing |
 | `m_stale_release_ignores_incarnation` mutates the store AND the mock | a green run hiding that the incarnation check lives in two mirrored places with neither protecting the other: the unit suite drives `MockStore`, so mutating production alone leaves it green |
 | `TestP4A_*` destructive-path tests use `testSHA256BlockID` | passing for the wrong reason. A non-SHA-256 id is rejected by `ValidatePhysicalLocator` before the walk reaches the step under test, so the assertion would hold whether or not the invariant does |
+| `TestP4A_MockSettledOwnClaimRequiresExactClaimedAt` | the in-memory uncertain-LWT path accepting a claim that production rejects because its canonical `claimed_at` does not match |
 
 ### Proving the legs can fail
 
@@ -939,6 +940,16 @@ docker exec dc3run sh -c 'cp internal/gc/store_cassandra.go /tmp/sc.bak &&
   internal/gc/store_cassandra.go'
 # ... re-run leg 1, expect FAIL ...
 docker exec dc3run sh -c 'cp /tmp/sc.bak internal/gc/store_cassandra.go'
+```
+
+### P4a and P4b mutation evidence
+
+The P4a mutation script covers the exact claim authority, serial settlement, settled-claim
+`EACH_QUORUM` confirmation, the explicit no-retry/no-speculation LWT policy and the
+`blocks.read_repair=BLOCKING` premise. Run it in Docker:
+
+```bash
+docker compose --profile test run --rm --build gotest bash scripts/p4a-mutation-validation.sh
 ```
 
 ### P4b orphan publication evidence

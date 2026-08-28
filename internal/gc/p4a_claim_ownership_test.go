@@ -710,6 +710,23 @@ func TestP4A_SettledOwnClaimIsAcquiredWhenEachQuorumConfirms(t *testing.T) {
 	}
 }
 
+func TestP4A_MockSettledOwnClaimRequiresExactClaimedAt(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	candidate := p4aSeedBlockCandidate(t, store, orgID, "blk-eq-claimed-at")
+	attempt := p4aAttempt(candidate, time.Now().UTC())
+	store.SeedBlockClaimForTest(orgID, "blk-eq-claimed-at", attempt.ClaimID, attempt.ClaimedAt.Add(-time.Second))
+	store.SetClaimBlockDeleteErrForTest(errors.New("gocql: no response received from cassandra within timeout period"))
+
+	claim, err := store.ClaimBlockDelete(orgID, "blk-eq-claimed-at", attempt)
+	if claim.Outcome != BlockClaimAmbiguous {
+		t.Fatalf("SERIAL own claim with a different claimed_at = %s, want ambiguous", claim.Outcome)
+	}
+	if err == nil {
+		t.Fatal("claimed_at mismatch during EACH_QUORUM confirmation must surface as an error")
+	}
+}
+
 // TestP4A_EnsureBlockGCCandidateRefusesWithoutAnExactIncarnation is the source-side gate:
 // a candidate that cannot name P is never written at all, so no later code path has to
 // remember to check for one.
