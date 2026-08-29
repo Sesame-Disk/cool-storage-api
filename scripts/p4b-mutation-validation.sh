@@ -56,23 +56,23 @@ expect_red() {
 }
 
 m_lwt_loses_write_once() {
-  mutate "$STORE" 's{VALUES \(\?, \?, \?, \?, \?, \?, \?, \?, \?, \?\) IF NOT EXISTS}{VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)}'
+  mutate "$STORE" 's{VALUES \(\?, \?, \?, \?, \?, \?, \?, \?, \?, \?, \?, \?\) IF NOT EXISTS}{VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)}'
   expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'IF NOT EXISTS' \
     'orphan publication loses its write-once LWT'
   restore
 }
 
 m_settlement_read_is_ordinary() {
-  mutate "$STORE" 's{(SELECT storage_class, storage_key, first_seen_at\s+FROM gc_s3_orphans\s+WHERE org_id = \? AND block_id = \?\s+`, orgID\.String\(\), blockID\)\.\s+)Consistency\(gocql\.Serial\)\.}{$1}'
+  mutate "$STORE" 's{(SELECT storage_class, storage_key, first_seen_at, gc_claim_id, gc_claimed_at\s+FROM gc_s3_orphans\s+WHERE org_id = \? AND block_id = \?\s+`, orgID\.String\(\), blockID\)\.\s+)Consistency\(gocql\.Serial\)\.}{$1}'
   expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'must read the canonical row at Consistency(gocql.Serial)' \
     'orphan settlement read is downgraded from SERIAL'
   restore
 }
 
 m_same_target_uses_proposed_timestamp() {
-  mutate "$MOCK" 's{result\.FirstSeenAt = existing\.FirstSeenAt}{result.FirstSeenAt = now}'
+  mutate "$STORE" 's{FirstSeenAt:       row.FirstSeenAt,\s+ExistingTarget:    row.Target}{FirstSeenAt: time.Now().UTC(), ExistingTarget: row.Target}'
   expect_red 'TestStore_StartBlockDeleteOrphan_SameTargetUsesStoredFirstSeenAndRepairsProjection' 'effective first_seen_at' \
-    'same-target retry uses the proposed timestamp instead of the stored lifecycle token'
+    'same-authority retry uses the proposed timestamp instead of the stored lifecycle token'
   restore
 }
 
@@ -99,9 +99,9 @@ m_empty_nonapplied_means_not_published() {
 }
 
 m_same_target_skips_canonical_each_quorum_confirmation() {
-  mutate "$STORE" 's{info, found, err := s\.GetS3OrphanGlobal\(orgID, blockID\)\s+confirmed := classifyCanonicalOrphanVisibility\(info, found, err, proposed, result\.FirstSeenAt, result\)\s+if confirmed\.Outcome != StartBlockDeleteOrphanSameTarget \{\s+return confirmed\s+\}\s+return s\.ensureS3OrphanProjectionResult\(orgID, blockID, confirmed\)}{return s.ensureS3OrphanProjectionResult(orgID, blockID, result)}'
-  expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'SameTarget confirmation must read the canonical row at EACH_QUORUM through GetS3OrphanGlobal' \
-    'SameTarget authorizes finalize without confirming canonical EACH_QUORUM visibility'
+  mutate "$STORE" 's{info, found, err := s\.GetS3OrphanGlobal\(orgID, blockID\)\s+confirmed := classifyCanonicalOrphanVisibility\(info, found, err, proposed, result\.FirstSeenAt, result\)\s+if confirmed\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+return confirmed\s+\}\s+return s\.ensureS3OrphanProjectionResult\(orgID, blockID, confirmed\)}{return s.ensureS3OrphanProjectionResult(orgID, blockID, result)}'
+  expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'SameAuthority confirmation must read the canonical row at EACH_QUORUM through GetS3OrphanGlobal' \
+    'SameAuthority authorizes finalize without confirming canonical EACH_QUORUM visibility'
   restore
 }
 
@@ -120,7 +120,7 @@ m_same_target_ignores_recovery_phase() {
 }
 
 m_same_target_compares_only_storage_key() {
-  mutate "$STORE" 's{if row\.Target == proposed}{if row.Target.StorageKey == proposed.StorageKey}'
+  mutate "$STORE" 's{if row\.Target != proposed\.Target}{if row.Target.StorageKey != proposed.Target.StorageKey}'
   expect_red 'TestP4B_SettledOrphanClassification' 'want different_target' \
     'exact-P classification compares only storage_key and treats a different class as same-target'
   restore

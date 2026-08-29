@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-28
-**Session**: X1/P4a audit hardening — settled-claim mock parity, explicit no-retry LWT policy and load-bearing EACH_QUORUM mutation evidence; R14a and R16 remain GREEN; R14b claim->orphan binding stays OPEN
+**Session**: X1/P4b-2 orphan authority handoff — R14b GREEN (claim→orphan→finalize bound to exact (P,D)); P4a R14a/R16 remain GREEN including #193 audit hardening; P4b-1 write-once + SameAuthority remain; X1 still OPEN; GC_ENABLED=false
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -106,12 +106,11 @@ matched literal `\n\t\t` against a CRLF working tree, so it silently applied NOT
 aborted the run before the remaining mutations were reached. Fixed to whitespace runs, per
 the rule the script's own header states.
 
-P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. P4b-1 now classifies
-`StartBlockDeleteOrphan` outcomes, settles uncertain publication in the serial domain and
-keeps ambiguous, invalid and projection-unconfirmed states fail-closed. **Explicitly still
-open:** claim authority is not yet carried into orphan publication, and `FinalizeBlockDelete`
-remains outside that binding. Those are the orphan-publication follow-ups (R14b/P4b), not a
-queue-policy question. `GC_ENABLED=false` remains required.
+P4a remains R14a GREEN / R16 GREEN / R20 claim-side PARTIAL. P4b-2 now carries that
+claim authority through orphan publication and finalize: `CommitBlockDeleteOrphanHandoff`
+is the irreversible commit on `blocks`, resume is `CommittedOwner` of the stored D, and
+`SameAuthority` / `DifferentAuthority` replace same-P-only `SameTarget`. **Explicitly still
+open:** X1 itself, R18/R27, P4c-orphan PK, and enabling GC. `GC_ENABLED=false` remains required.
 
 **Queue lifecycle review update (2026-08-27):** The attempted generic LWT hardening of
 `RequeueItem` is withdrawn from this branch. `CompleteItem`, `FailItem` and `RequeueItem`
@@ -151,8 +150,33 @@ With a datacenter down, P3 accepts `BlockClaimAmbiguous` (err may be nil after
 SERIAL settlement of an unowned row; when SERIAL sees our claim but
 `EACH_QUORUM` confirmation is unavailable, the outcome is Ambiguous with a non-nil
 error) and orphan `NotPublished` or `Ambiguous`; never claim
-`Acquired` or orphan `Created`/`SameTarget`. This is P4b-1 only: the remaining R14b work must carry
-the exact P4a claim authority into publication, so `GC_ENABLED=false` remains required.
+`Acquired` or orphan `Created`/`SameAuthority`. P4b-2 then binds that publication to the
+exact P4a claim authority. `GC_ENABLED=false` remains required.
+
+**P4b-2 update (2026-08-28):** R14b is GREEN. Migration `019` adds `blocks.gc_orphan_handoff`
+(null until commit, never written false) and `gc_s3_orphans.gc_claim_id` / `gc_claimed_at`.
+Migration `020` adds `gc_block_delete_lifecycles` (PK `((org_id, block_id), claim_id)`,
+phases `published`/`terminal`, never DELETE). Do not fold 019 or 020 into
+`001_initial_schema.cql`. `CommitBlockDeleteOrphanHandoff` is the irreversible commit
+(EACH_QUORUM + SERIAL, exact `(P,D)`). `AlreadyCommitted` and `CommittedOwner` require
+canonical `EACH_QUORUM` visibility; an empty non-applied handoff CAS SERIAL-settles.
+After commit: no release, takeover, Complete, Requeue, Fail, or retry++. `CommittedOwner`
+revalidates locator/store/topology, then treats `BlockHasReferencesGlobal` as a
+contradiction detector (error or refs>0 → `committed_pending`; R3 stays OPEN). Orphan
+publication INSERTs the lifecycle tombstone first and SERIAL-re-reads it after the
+orphan INSERT; terminal D cannot recreate an authorizing orphan. Finalize
+`AlreadyFinalized` requires an exact published `(P,D)` certificate and does **not**
+authorize S3 — only applied `Finalized` does. Missing/mismatch/garbage certificates
+fail closed. `RecoverS3Orphans` `pending_s3` SERIAL-observes D before S3 and will not
+DELETE against terminal (stale-orphan clear is allowed). Production `DeleteS3Orphan`
+runs only after `published → terminal`. Never-delete lifecycle partitions grow by one
+row per D (operational follow-up). Evidence: unit + `scripts/p4b-authority-mutation-validation.sh`;
+real Cassandra `internal/integration/p4b_claim_orphan_authority_test.go` under
+`SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. 3-DC P3 fail-closed: with dc-na down,
+`CommitBlockDeleteOrphanHandoff` from dc-eu is Ambiguous, not
+Committed/AlreadyCommitted. P4b-1's write-once script stays
+`scripts/p4b-mutation-validation.sh`. X1 stays OPEN (winner-`Finalized` Physical ABA
+is not closed here). `GC_ENABLED=false`.
 
 ### Inter-session Update (2026-05-21)
 

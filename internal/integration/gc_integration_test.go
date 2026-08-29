@@ -2378,7 +2378,7 @@ func TestGC_StartBlockDeleteOrphan_DifferentTargetPreservesCurrentLifecycleState
 	})
 
 	wantStorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)
-	result := store.StartBlockDeleteOrphan(orgID, blockID, "hot", wantStorageKey, "sha1-new", time.Now().UTC())
+	result := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "hot", wantStorageKey), "sha1-new", time.Now().UTC())
 	if result.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
 		t.Fatalf("StartBlockDeleteOrphan: outcome=%s cause=%v, want different_target", result.Outcome, result.Cause)
 	}

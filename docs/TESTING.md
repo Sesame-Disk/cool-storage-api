@@ -827,7 +827,7 @@ docker run --rm --network sesamefs-cassandra-3dc_default \
   -e CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   sesamefs-3dc go run ./cmd/sesamefs migrate
 
-# 4. P3 leg 1 -- fail-closed publication. dc-na MUST be stopped.
+# 4. P3 leg 1 -- fail-closed publication (claim, orphan handoff, orphan). dc-na MUST be stopped.
 docker compose -f docker-compose.cassandra-3dc.yaml stop cassandra-na
 docker exec \
   -e X2_DC_HOSTS='dc-na=cassandra-na:9042,dc-eu=cassandra-eu:9042,dc-asia=cassandra-asia:9042' \
@@ -958,7 +958,7 @@ docker compose --profile test run --rm --build gotest bash scripts/p4a-mutation-
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical
-`EACH_QUORUM` visibility and `pending_s3` before `SameTarget` success, stored
+`EACH_QUORUM` visibility and `pending_s3` before `SameAuthority` success, stored
 `first_seen_at`, target conflicts, advanced-phase refusal and projection uncertainty.
 The mutation script proves those guards are load-bearing:
 
@@ -966,10 +966,26 @@ The mutation script proves those guards are load-bearing:
 docker compose run --rm --build gotest bash scripts/p4b-mutation-validation.sh
 ```
 
+P4b-2 / R14b adds the irreversible orphan-handoff commit and exact `(P, D)` binding,
+plus the audit-closure tombstone on `gc_block_delete_lifecycles` (migration `020`).
+`AlreadyCommitted` / `CommittedOwner` require `EACH_QUORUM` visibility. `AlreadyFinalized`
+is classification only (exact published certificate); only applied `Finalized`
+authorizes `processBlock` S3. Publication SERIAL-re-reads the tombstone after the
+orphan INSERT; `pending_s3` recovery SERIAL-observes D before S3. Its sibling
+mutation script must stay red when those predicates are removed:
+
+```bash
+docker compose run --rm --build gotest bash scripts/p4b-authority-mutation-validation.sh
+```
+
 The real-Cassandra legs are `TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra`,
 `TestP4B_SerialSettlementClassifiesRealCassandra`,
-`TestP4B_LifecycleAdvancedAtRealCassandra`, and
-`TestP4B_CanonicalOrphanReadRepairIsBlocking`.
+`TestP4B_LifecycleAdvancedAtRealCassandra`,
+`TestP4B_CanonicalOrphanReadRepairIsBlocking`,
+`TestP4B_ClaimOrphanAuthorityIsBoundAtRealCassandra`, and the P4b-2 audit legs in
+the same file (late loser, crash post-handoff, crash post-orphan, second
+`CommitHandoff`, finalize vs terminal, P1/P2, replay-after-terminal,
+recovery terminal+orphan does not DELETE S3).
 The standard integration containers run them with `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`.
 P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
 `TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,

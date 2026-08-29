@@ -55,17 +55,27 @@ func TestP4ADestructiveMutationsNameTheExactIncarnation(t *testing.T) {
 			query:    "UPDATE blocks SET gc_state",
 			// gc_* must be null-checked so the claim cannot take a row owned by the
 			// upload path's repairing_stub, and cannot materialize a stub row.
-			columns: []string{"storage_class = ?", "storage_key = ?", "gc_state = null", "gc_claim_id = null", "gc_claimed_at = null"},
+			columns: []string{"storage_class = ?", "storage_key = ?", "gc_state = null", "gc_claim_id = null", "gc_claimed_at = null", "gc_orphan_handoff = null"},
 		},
 		{
 			function: "ReleaseBlockClaim",
 			query:    "UPDATE blocks SET gc_state = null",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_claim_id = ?", "gc_claimed_at = ?"},
+			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_claim_id = ?", "gc_claimed_at = ?", "gc_orphan_handoff = null"},
 		},
 		{
 			function: "FinalizeBlockDelete",
 			query:    "DELETE FROM blocks",
-			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_claim_id = ?", "gc_claimed_at = ?"},
+			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_claim_id = ?", "gc_claimed_at = ?", "gc_orphan_handoff = true"},
+		},
+		{
+			function: "CommitBlockDeleteOrphanHandoff",
+			query:    "UPDATE blocks SET gc_orphan_handoff",
+			columns:  []string{"storage_class = ?", "storage_key = ?", "gc_state = ?", "gc_claim_id = ?", "gc_claimed_at = ?", "gc_orphan_handoff = null"},
+		},
+		{
+			function: "TerminateBlockDeleteLifecycle",
+			query:    "UPDATE gc_block_delete_lifecycles SET phase",
+			columns:  []string{"phase = ?", "storage_class = ?", "storage_key = ?", "claimed_at = ?"},
 		},
 		{
 			function: "DeleteBlockGCCandidate",
@@ -197,6 +207,9 @@ func TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum(t *testing.T) {
 	if !strings.Contains(claim, "if settled.Outcome == BlockClaimAcquired") ||
 		!strings.Contains(claim, "return s.confirmSettledBlockClaimVisibility") {
 		t.Fatal("LWT error + SERIAL own claim must confirm EACH_QUORUM visibility before Acquired")
+	}
+	if strings.Count(claim, "maybeConfirmCommittedOwnerEachQuorum") != 2 {
+		t.Fatal("LWT-error settlement and CAS-map CommittedOwner must both confirm EACH_QUORUM visibility")
 	}
 
 	confirm := formattedGCFunction(t, file, "confirmSettledBlockClaimVisibility")
@@ -351,6 +364,8 @@ func TestP4ADestructiveStepsUseTheClaimsLocator(t *testing.T) {
 	}
 
 	// The locator variables must be assigned from the claim's authority.
+	// After the orphan-handoff commit point this is `deleteAuthority` (the
+	// acquired attempt, or the stored D a CommittedOwner resumed).
 	var fromAttempt int
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		assign, ok := node.(*ast.AssignStmt)
@@ -361,13 +376,13 @@ func TestP4ADestructiveStepsUseTheClaimsLocator(t *testing.T) {
 		if !ok || (name.Name != "storageKey" && name.Name != "storageClass") {
 			return true
 		}
-		if p4aRendersAs(assign.Rhs[0], "attempt.Target.") {
+		if p4aRendersAs(assign.Rhs[0], "attempt.Target.") || p4aRendersAs(assign.Rhs[0], "deleteAuthority.Target.") {
 			fromAttempt++
 		}
 		return true
 	})
 	if fromAttempt < 2 {
-		t.Errorf("processBlock must take storageClass and storageKey from attempt.Target (found %d of 2); sourcing them from a post-claim re-read publishes and deletes whichever incarnation that read happens to show (R14)", fromAttempt)
+		t.Errorf("processBlock must take storageClass and storageKey from deleteAuthority.Target (found %d of 2); sourcing them from a post-claim re-read publishes and deletes whichever incarnation that read happens to show (R14)", fromAttempt)
 	}
 
 	// And the divergence between the claim and the read-back must abort, not be ignored.

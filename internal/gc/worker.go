@@ -168,6 +168,29 @@ func (e blockClaimForeignOwnerError) FailureCode() string {
 	return GCFailureCodeBlockClaimForeignOwner
 }
 
+// blockDeleteCommittedPendingError is returned after the orphan-handoff commit
+// point. The destructive authority is irreversible: this attempt may not release,
+// take over, complete, requeue, fail, or spend a retry.
+type blockDeleteCommittedPendingError struct {
+	ItemID string
+	Err    error
+}
+
+func (e blockDeleteCommittedPendingError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("block %s: committed delete authority is pending (%v)", e.ItemID, e.Err)
+	}
+	return fmt.Sprintf("block %s: committed delete authority is pending", e.ItemID)
+}
+
+func (e blockDeleteCommittedPendingError) FailureCode() string {
+	return GCFailureCodeBlockDeleteCommittedPending
+}
+
+func (e blockDeleteCommittedPendingError) Unwrap() error {
+	return e.Err
+}
+
 // blockCandidateWithinGraceError says the candidate names an incarnation that has not
 // yet served its own grace period. See GCFailureCodeBlockCandidateWithinGrace.
 type blockCandidateWithinGraceError struct {
@@ -494,6 +517,20 @@ func (w *Worker) releaseClaimThenFailWithRetry(item QueueItem, attempt BlockDele
 	return originalErr
 }
 
+func (w *Worker) unwindBeforeOrAfterHandoff(alreadyCommitted bool, item QueueItem, attempt BlockDeleteAuthority, reason string) error {
+	if alreadyCommitted {
+		return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: errors.New(reason)}
+	}
+	return w.releaseAndPostponeUnreliableRead(item, attempt, reason)
+}
+
+func (w *Worker) failBeforeOrAfterHandoff(alreadyCommitted bool, item QueueItem, attempt BlockDeleteAuthority, originalErr error, onOwnedFailure ...func()) error {
+	if alreadyCommitted {
+		return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: originalErr}
+	}
+	return w.releaseClaimThenFailWithRetry(item, attempt, originalErr, onOwnedFailure...)
+}
+
 // recordDestructiveBlocked marks that a destructive path refused a delete because the
 // environment could not authorize it.
 //
@@ -605,6 +642,8 @@ func shouldLeaveQueueUntouched(err error) bool {
 		GCFailureCodeBlockOrphanProjectionUnconfirmed,
 		GCFailureCodeBlockOrphanLifecycleAdvanced,
 		GCFailureCodeBlockOrphanInvalid:
+		return true
+	case GCFailureCodeBlockDeleteCommittedPending:
 		return true
 	default:
 		return false
@@ -727,6 +766,12 @@ type Worker struct {
 	// topologyGateMu protects the short-lived cache of a PASSING gate result.
 	topologyGateMu      sync.Mutex
 	topologyGateOKUntil time.Time
+
+	// Test-only barriers. Production leaves them nil.
+	pauseBeforeFinalize        chan struct{}
+	pauseBeforeFinalizeEntered chan struct{}
+	pauseAfterFinalize         chan struct{}
+	pauseAfterFinalizeEntered  chan struct{}
 }
 
 // destructiveTopologyGateTTL is how long a PASSING topology gate result may be
@@ -845,6 +890,36 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 	}
 	worker.dryRun.Store(dryRun)
 	return worker
+}
+
+// PauseBeforeFinalizeForTest parks processBlock immediately before FinalizeBlockDelete.
+func (w *Worker) PauseBeforeFinalizeForTest() (entered <-chan struct{}, resume func()) {
+	enteredCh := make(chan struct{})
+	gate := make(chan struct{})
+	w.pauseBeforeFinalizeEntered = enteredCh
+	w.pauseBeforeFinalize = gate
+	return enteredCh, func() { close(gate) }
+}
+
+// PauseAfterFinalizeForTest parks processBlock after FinalizeBlockDelete returns and
+// before any physical delete decision.
+func (w *Worker) PauseAfterFinalizeForTest() (entered <-chan struct{}, resume func()) {
+	enteredCh := make(chan struct{})
+	gate := make(chan struct{})
+	w.pauseAfterFinalizeEntered = enteredCh
+	w.pauseAfterFinalize = gate
+	return enteredCh, func() { close(gate) }
+}
+
+func waitWorkerTestPause(entered *chan struct{}, gate chan struct{}) {
+	if gate == nil {
+		return
+	}
+	if entered != nil && *entered != nil {
+		close(*entered)
+		*entered = nil
+	}
+	<-gate
 }
 
 // SetDestructiveTopologyGate overrides the check that must pass before this worker
@@ -1281,26 +1356,25 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return blockClaimReleaseUnconfirmedError{ItemID: item.ItemID, Err: relErr}
 		}
 		switch outcome {
+		case BlockClaimCommittedHandoff:
+			// A committed delete is not a stale releasable claim. Resume through
+			// ClaimBlockDelete so CommittedOwner can finish the stored authority.
+			log.Printf("[GC Worker] Block %s: local refs observed but the delete handoff is already committed; resuming that authority instead of releasing", item.ItemID)
 		case BlockClaimReleased:
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_stale_claim_released").Inc()
 			log.Printf("[GC Worker] Block %s: released a stale delete claim left by an earlier attempt", item.ItemID)
 		case BlockClaimTooFresh:
-			// Same reasoning as the error above, for the case that looks like success.
-			// The claim is too young to hand back — it may belong to a worker still
-			// deleting — but it may equally belong to one that just died, and this
-			// candidate is the only thing that will ever revisit the block. Settling
-			// now would leave gc_state='deleting' with nothing left to clear it.
-			// Postpone: no retry burned, no DLQ, and the next pass finds the claim
-			// old enough to release.
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_claim_not_yet_stale").Inc()
 			log.Printf("[GC Worker] Block %s is referenced but still carries a recent delete claim; postponing until it ages out", item.ItemID)
 			return blockClaimNotYetStaleError{ItemID: item.ItemID}
 		}
-		if err := w.settleBlockCandidate(item, candidate); err != nil {
-			return err
+		if outcome != BlockClaimCommittedHandoff {
+			if err := w.settleBlockCandidate(item, candidate); err != nil {
+				return err
+			}
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
 		}
-		metrics.GCItemsSkippedTotal.Inc()
-		return nil
 	}
 
 	// A candidate with no usable incarnation cannot be reached from here any more:
@@ -1387,6 +1461,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 	metrics.GCBlockDeleteClaimTotal.WithLabelValues(outcome.String()).Inc()
 
+	alreadyCommitted := false
+	deleteAuthority := attempt
+
 	// A NON-APPLIED CLAIM IS NOT COMPLETION (R16). Each of these outcomes demands a
 	// different response, and collapsing them into "row gone, drop the candidate" is the
 	// defect this classifier exists to remove: it consumed the work item whenever
@@ -1394,6 +1471,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	switch outcome {
 	case BlockClaimAcquired:
 		// Fall through to claim-then-verify below.
+	case BlockClaimCommittedOwner:
+		alreadyCommitted = true
+		deleteAuthority = claim.Owner
+		log.Printf("[GC Worker] Block %s: resuming committed delete authority %s; no new claim, no takeover; refs are a contradiction detector", item.ItemID, deleteAuthority.ClaimID)
 	case BlockClaimTargetChanged:
 		// The row is a different physical incarnation than this candidate authorized.
 		// This candidate's life is over and its work is irrelevant; the incarnation
@@ -1457,141 +1538,143 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// aborts the delete: fail closed, never delete on an uncertain read. The claim is
 	// handed back on the way out (see below) so failing closed does not also fence
 	// the block.
-	hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
-	if err != nil {
-		// Hand the claim back before giving up. Holding it would leave
-		// gc_state='deleting' behind an error that an unavailable DC makes
-		// systematic rather than rare, and every writer of this content would see
-		// BlockDeleteFenceActive until some later attempt happened to clear it.
-		// Failing closed must not mean fencing the block indefinitely.
-		// Owner-exact — see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above; this is
-		// the site whose systematic failure mode decides why every post-claim path
-		// releases rather than holding the fence through an outage.
-		//
-		// A failed release RETURNS here rather than warning and falling through to the
-		// classifier below. It used to only log, which meant the queue policy was
-		// decided from the verify's error while the fence was still up: a ReadFailure
-		// verify plus a failing release spent five retries and reached the DLQ with
-		// gc_state='deleting' left standing. See releaseBlockClaim — the release error
-		// dominates until the fence is confirmed gone, and the verify's own error is
-		// reached again on a later pass.
-		// The outcome is captured, not discarded: the retryable branch below must know
-		// whether the fence it just handed back was still this attempt's. See
-		// refuseRetryForForeignClaimOwner. The release has to happen HERE rather than
-		// inside each branch, because both branches abandon the claim.
-		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
-		if relErr != nil {
-			log.Printf("[GC Worker] Block %s: global liveness verify failed (%v) AND the claim could not be handed back; postponing on the release, the verify error will be re-reached once the fence is off", item.ItemID, err)
-			return relErr
-		}
-
-		// The delete is abandoned either way — an error here never authorizes
-		// destruction. What is decided below is only the QUEUE policy, and the same
-		// classifier rule applies here as at every other statement in the walk:
-		// postpone what the environment caused, spend retries on what it did not — and,
-		// before either, hand the decision away entirely if this attempt no longer owns
-		// the fence it just gave back.
-		// WHAT THE ENVIRONMENT DID IS RECORDED FIRST; WHAT HAPPENS TO THE ITEM IS DECIDED
-		// AFTER, AND ONLY BY AN ATTEMPT THAT STILL OWNS ITS FENCE.
-		//
-		// An outage is real whoever holds the claim, so the availability signal is raised
-		// before authority is consulted — suppressing it for a late loser would hide a
-		// datacenter that is genuinely unreachable. Everything below that line is a
-		// statement about the ITEM: which error to return, whether a retry is spent, and
-		// whether the queue row moves. Those a late loser has no standing to make.
-		unavailable := isClusterUnavailableError(err)
-		if unavailable {
-			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
-			w.recordDestructiveBlocked(destructivePathBlock)
-		}
-
-		// The ownership check sits ABOVE the availability split, not inside one half of
-		// it. It used to guard only the non-availability branch, which left the other
-		// branch returning a postponing error — and postponing is RequeueItem, so a stale
-		// attempt still mutated the queue row it had been holding since before it lost
-		// the claim. Both halves abandon the walk; both must answer to the same authority.
-		if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
-			return foreign
-		}
-
-		if unavailable {
-			log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
-			return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
-		}
-
-		// This branch is easy to get wrong in the safe-looking direction. Treating every
-		// failure here as environmental keeps the fail-closed guarantee intact, but it
-		// makes an item-specific, permanent error postpone for eternity: no retry spent,
-		// no DLQ entry, nobody told. A ReadFailure from a tombstone-heavy
-		// block_references partition is exactly that shape. liveness_verify_failed is the
-		// item-specific half of the blocked/liveness pair, which is why it is raised here
-		// rather than beside the availability counter above.
-		metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
-		log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
-		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
-	}
-	// The read returned, which is this path's only proof that the environment can still
-	// authorize a delete. Recorded here, BEFORE looking at what it found: a still
-	// referenced block is not a delete, but the read that established it is evidence
-	// all the same, and waiting for a completed delete would leave a fleet of live
-	// blocks reading as permanently blocked.
-	w.recordDestructiveLivenessSuccess(destructivePathBlock)
-	if hasRefs {
-		blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
-		if infoErr != nil {
-			return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("failed to load re-referenced block info: %v", infoErr))
-		}
-		if blockInfo.CreatedAt == nil || blockInfo.StorageClass == "" {
-			// A STUB-SHAPED READ HERE IS A STALE READ, NOT A STUB. The claim CAS named
-			// `IF storage_class = ? AND storage_key = ?` with this attempt's non-empty
-			// locator and committed at EACH_QUORUM in the serial domain, so a successful
-			// claim is proof the row carried that locator. GetBlockInfo is an ordinary
-			// read and can land on a replica holding only the gc_* columns the claim
-			// itself just wrote.
+	if !alreadyCommitted {
+		hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
+		if err != nil {
+			// Hand the claim back before giving up. Holding it would leave
+			// gc_state='deleting' behind an error that an unavailable DC makes
+			// systematic rather than rare, and every writer of this content would see
+			// BlockDeleteFenceActive until some later attempt happened to clear it.
+			// Failing closed must not mean fencing the block indefinitely.
+			// Owner-exact — see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above; this is
+			// the site whose systematic failure mode decides why every post-claim path
+			// releases rather than holding the fence through an outage.
 			//
-			// The old shape tried DeleteClaimedBlockStub anyway. Its CAS runs in the serial
-			// domain and correctly refused — but the refusal came back as a plain error, so
-			// the item spent a retry with the fence still up, re-claimed on the next cycle,
-			// and after enough cycles parked in the DLQ that ItemBlock never leaves, with
-			// gc_state='deleting' standing on a block the EACH_QUORUM verify had just
-			// proved is still referenced.
+			// A failed release RETURNS here rather than warning and falling through to the
+			// classifier below. It used to only log, which meant the queue policy was
+			// decided from the verify's error while the fence was still up: a ReadFailure
+			// verify plus a failing release spent five retries and reached the DLQ with
+			// gc_state='deleting' left standing. See releaseBlockClaim — the release error
+			// dominates until the fence is confirmed gone, and the verify's own error is
+			// reached again on a later pass.
+			// The outcome is captured, not discarded: the retryable branch below must know
+			// whether the fence it just handed back was still this attempt's. See
+			// refuseRetryForForeignClaimOwner. The release has to happen HERE rather than
+			// inside each branch, because both branches abandon the claim.
+			released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+			if relErr != nil {
+				log.Printf("[GC Worker] Block %s: global liveness verify failed (%v) AND the claim could not be handed back; postponing on the release, the verify error will be re-reached once the fence is off", item.ItemID, err)
+				return relErr
+			}
+
+			// The delete is abandoned either way — an error here never authorizes
+			// destruction. What is decided below is only the QUEUE policy, and the same
+			// classifier rule applies here as at every other statement in the walk:
+			// postpone what the environment caused, spend retries on what it did not — and,
+			// before either, hand the decision away entirely if this attempt no longer owns
+			// the fence it just gave back.
+			// WHAT THE ENVIRONMENT DID IS RECORDED FIRST; WHAT HAPPENS TO THE ITEM IS DECIDED
+			// AFTER, AND ONLY BY AN ATTEMPT THAT STILL OWNS ITS FENCE.
 			//
-			// So: hand our own fence back, and postpone. Nothing is wrong with the block.
-			return w.releaseAndPostponeUnreliableRead(item, attempt, "re-referenced block reads back with no canonical locator")
+			// An outage is real whoever holds the claim, so the availability signal is raised
+			// before authority is consulted — suppressing it for a late loser would hide a
+			// datacenter that is genuinely unreachable. Everything below that line is a
+			// statement about the ITEM: which error to return, whether a retry is spent, and
+			// whether the queue row moves. Those a late loser has no standing to make.
+			unavailable := isClusterUnavailableError(err)
+			if unavailable {
+				metrics.GCErrorsTotal.WithLabelValues("liveness_verify_unavailable").Inc()
+				w.recordDestructiveBlocked(destructivePathBlock)
+			}
+
+			// The ownership check sits ABOVE the availability split, not inside one half of
+			// it. It used to guard only the non-availability branch, which left the other
+			// branch returning a postponing error — and postponing is RequeueItem, so a stale
+			// attempt still mutated the queue row it had been holding since before it lost
+			// the claim. Both halves abandon the walk; both must answer to the same authority.
+			if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
+				return foreign
+			}
+
+			if unavailable {
+				log.Printf("[GC Worker] Block %s: global liveness verify failed; failing closed without deleting: %v", item.ItemID, err)
+				return failedClosedError{Reason: "failed to re-check block references", ItemID: item.ItemID, Err: err}
+			}
+
+			// This branch is easy to get wrong in the safe-looking direction. Treating every
+			// failure here as environmental keeps the fail-closed guarantee intact, but it
+			// makes an item-specific, permanent error postpone for eternity: no retry spent,
+			// no DLQ entry, nobody told. A ReadFailure from a tombstone-heavy
+			// block_references partition is exactly that shape. liveness_verify_failed is the
+			// item-specific half of the blocked/liveness pair, which is why it is raised here
+			// rather than beside the availability counter above.
+			metrics.GCErrorsTotal.WithLabelValues("liveness_verify_failed").Inc()
+			log.Printf("[GC Worker] Block %s: global liveness verify failed for a non-availability reason; not deleting, and spending a retry so it can reach the DLQ: %v", item.ItemID, err)
+			return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 		}
-		// Owner-exact, and the ONE release in this walk whose ANSWER is load-bearing:
-		// see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above.
-		//
-		// THE most load-bearing release in the walk: the EACH_QUORUM verify just proved
-		// this block is still referenced, so a fence left standing here is standing on
-		// live data. Routed through releaseBlockClaim, which postpones on ANY failure —
-		// failClosedIfUnavailable would let a non-availability error spend the budget,
-		// and the next pass cannot be relied on to settle it through the safe pre-check
-		// path, because that pre-check is the LOCAL read and may keep answering false
-		// while the reference lives in another datacenter.
-		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
-		if relErr != nil {
-			return relErr
+		// The read returned, which is this path's only proof that the environment can still
+		// authorize a delete. Recorded here, BEFORE looking at what it found: a still
+		// referenced block is not a delete, but the read that established it is evidence
+		// all the same, and waiting for a completed delete would leave a fleet of live
+		// blocks reading as permanently blocked.
+		w.recordDestructiveLivenessSuccess(destructivePathBlock)
+		if hasRefs {
+			blockInfo, infoErr := w.store.GetBlockInfo(item.OrgID, item.ItemID)
+			if infoErr != nil {
+				return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("failed to load re-referenced block info: %v", infoErr))
+			}
+			if blockInfo.CreatedAt == nil || blockInfo.StorageClass == "" {
+				// A STUB-SHAPED READ HERE IS A STALE READ, NOT A STUB. The claim CAS named
+				// `IF storage_class = ? AND storage_key = ?` with this attempt's non-empty
+				// locator and committed at EACH_QUORUM in the serial domain, so a successful
+				// claim is proof the row carried that locator. GetBlockInfo is an ordinary
+				// read and can land on a replica holding only the gc_* columns the claim
+				// itself just wrote.
+				//
+				// The old shape tried DeleteClaimedBlockStub anyway. Its CAS runs in the serial
+				// domain and correctly refused — but the refusal came back as a plain error, so
+				// the item spent a retry with the fence still up, re-claimed on the next cycle,
+				// and after enough cycles parked in the DLQ that ItemBlock never leaves, with
+				// gc_state='deleting' standing on a block the EACH_QUORUM verify had just
+				// proved is still referenced.
+				//
+				// So: hand our own fence back, and postpone. Nothing is wrong with the block.
+				return w.releaseAndPostponeUnreliableRead(item, attempt, "re-referenced block reads back with no canonical locator")
+			}
+			// Owner-exact, and the ONE release in this walk whose ANSWER is load-bearing:
+			// see "WHY THE POST-CLAIM RELEASES ARE OWNER-EXACT" above.
+			//
+			// THE most load-bearing release in the walk: the EACH_QUORUM verify just proved
+			// this block is still referenced, so a fence left standing here is standing on
+			// live data. Routed through releaseBlockClaim, which postpones on ANY failure —
+			// failClosedIfUnavailable would let a non-availability error spend the budget,
+			// and the next pass cannot be relied on to settle it through the safe pre-check
+			// path, because that pre-check is the LOCAL read and may keep answering false
+			// while the reference lives in another datacenter.
+			released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+			if relErr != nil {
+				return relErr
+			}
+			// SETTLING IS ONLY SOUND IF THE RELEASE RELEASED *THIS* ATTEMPT'S FENCE.
+			//
+			// Not-owner here means this attempt no longer owns the fence — the late-loser shape the
+			// staleness window makes ordinary, not exotic. The candidate is unchanged, so its CAS would
+			// happily apply; that is precisely the trap. Consuming it drops the only work item
+			// that could take the new owner's claim over if that owner dies, which is the same
+			// standing-fence-with-no-recovery state BlockClaimFreshOwner refuses to create at
+			// the claim. Reached from the other side, it needs the same answer.
+			if released != BlockReleaseReleased {
+				metrics.GCBlockDeleteClaimTotal.WithLabelValues("settle_refused_foreign_owner").Inc()
+				log.Printf("[GC Worker] Block %s: re-referenced after claim, but this attempt no longer owns the delete claim; preserving the candidate for the authoritative lifecycle or a later recovery pass", item.ItemID)
+				return blockClaimForeignOwnerError{ItemID: item.ItemID}
+			}
+			if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
+				return w.failClosedIfUnavailable("failed to clear block GC candidate after re-reference", item.ItemID, err)
+			}
+			log.Printf("[GC Worker] Block %s re-referenced after claim, skipping deletion", item.ItemID)
+			metrics.GCItemsSkippedTotal.Inc()
+			return nil
 		}
-		// SETTLING IS ONLY SOUND IF THE RELEASE RELEASED *THIS* ATTEMPT'S FENCE.
-		//
-		// Not-owner here means this attempt no longer owns the fence — the late-loser shape the
-		// staleness window makes ordinary, not exotic. The candidate is unchanged, so its CAS would
-		// happily apply; that is precisely the trap. Consuming it drops the only work item
-		// that could take the new owner's claim over if that owner dies, which is the same
-		// standing-fence-with-no-recovery state BlockClaimFreshOwner refuses to create at
-		// the claim. Reached from the other side, it needs the same answer.
-		if released != BlockReleaseReleased {
-			metrics.GCBlockDeleteClaimTotal.WithLabelValues("settle_refused_foreign_owner").Inc()
-			log.Printf("[GC Worker] Block %s: re-referenced after claim, but this attempt no longer owns the delete claim; preserving the candidate for the authoritative lifecycle or a later recovery pass", item.ItemID)
-			return blockClaimForeignOwnerError{ItemID: item.ItemID}
-		}
-		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidate.Identity()); err != nil {
-			return w.failClosedIfUnavailable("failed to clear block GC candidate after re-reference", item.ItemID, err)
-		}
-		log.Printf("[GC Worker] Block %s re-referenced after claim, skipping deletion", item.ItemID)
-		metrics.GCItemsSkippedTotal.Inc()
-		return nil
 	}
 
 	// 3. Persist the S3-pending record BEFORE removing the DB row. This closes the
@@ -1599,7 +1682,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// before recording recovery metadata for the later S3 delete.
 	blockInfo, err := w.store.GetBlockInfo(item.OrgID, item.ItemID)
 	if err != nil {
-		return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("failed to load canonical block info: %v", err))
+		return w.unwindBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority, fmt.Sprintf("failed to load canonical block info: %v", err))
 	}
 	// THE DESTRUCTIVE LOCATOR IS THE ONE THE CLAIM AUTHORIZED, NOT THE ONE READ BACK.
 	//
@@ -1609,22 +1692,22 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// the S3 delete from it would mean publishing and destroying whatever incarnation
 	// happens to be visible here, which is the same "re-read blocks and destroy what is
 	// there now" that the candidate authority at the top of this walk exists to forbid.
-	// FinalizeBlockDelete was already bound to `attempt`; the two steps that actually
-	// touch bytes were not.
+	// FinalizeBlockDelete and StartBlockDeleteOrphan are bound to `deleteAuthority`;
+	// the two steps that actually touch bytes must stay on that same incarnation.
 	//
 	// So blockInfo is used only for what the claim cannot carry — the stub discriminator
 	// and sha1 — and any disagreement about the incarnation aborts before anything is
 	// published or deleted.
-	storageClass := attempt.Target.StorageClass
-	storageKey := attempt.Target.StorageKey
-	if observed := (BlockDeleteTarget{StorageClass: blockInfo.StorageClass, StorageKey: blockInfo.StorageKey}); !observed.IsZero() && observed != attempt.Target {
+	storageClass := deleteAuthority.Target.StorageClass
+	storageKey := deleteAuthority.Target.StorageKey
+	if observed := (BlockDeleteTarget{StorageClass: blockInfo.StorageClass, StorageKey: blockInfo.StorageKey}); !observed.IsZero() && observed != deleteAuthority.Target {
 		metrics.GCErrorsTotal.WithLabelValues("block_incarnation_divergence").Inc()
-		return w.releaseAndPostponeUnreliableRead(item, attempt, fmt.Sprintf("canonical row reads back as %s but claim authorized %s", observed, attempt.Target))
+		return w.unwindBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority, fmt.Sprintf("canonical row reads back as %s but claim authorized %s", observed, deleteAuthority.Target))
 	}
 	if blockInfo.StorageClass == "" {
 		// SAME RULE AS THE RE-REFERENCED BRANCH, AND FOR THE SAME REASON. The claim
-		// already proved in the serial domain that this row carries attempt.Target, whose
-		// storage class is non-empty by construction (candidate.Target.IsZero() was
+		// already proved in the serial domain that this row carries deleteAuthority.Target,
+		// whose storage class is non-empty by construction (candidate.Target.IsZero() was
 		// checked before the claim). So an empty class read back here is not a malformed
 		// row and not a stub — it is a replica that has not caught up, and it says nothing
 		// the item can be blamed for.
@@ -1632,34 +1715,34 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// This used to split into "stub, delete it" and "malformed, DLQ it". Both were
 		// unreachable by truth and reachable by staleness, and both spent the retry budget
 		// with a fence standing.
-		return w.releaseAndPostponeUnreliableRead(item, attempt, "canonical row reads back with no storage class")
+		return w.unwindBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority, "canonical row reads back with no storage class")
 	}
 	if !config.IsCanonicalStorageClassName(storageClass) {
-		return w.releaseClaimThenFailWithRetry(item, attempt,
+		return w.failBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority,
 			fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass))
 	}
 	if storageKey == "" || strings.TrimSpace(storageKey) != storageKey {
-		return w.releaseClaimThenFailWithRetry(item, attempt,
+		return w.failBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority,
 			fmt.Errorf("block %s has empty canonical storage key", item.ItemID))
 	}
-	// Resolve the destination store HERE, in the authorization phase, rather than
-	// after the row is gone. Two reasons, and the second is the one that matters:
+	// Resolve the destination store HERE, before the irreversible handoff. Two reasons,
+	// and the second is the one that matters:
 	//
 	//   - the persisted locator can only be validated by the org-scoped store that
 	//     owns its physical naming rules. A mismatch must abort BEFORE
-	//     StartBlockDeleteOrphan and FinalizeBlockDelete, or a suspicious row is
-	//     already half-destroyed by the time anyone refuses to touch its bytes.
-	//   - a store that will not resolve now hands the claim back instead of stranding
-	//     a deleted row whose object nothing is left to remove.
+	//     CommitBlockDeleteOrphanHandoff, or a suspicious row is already irreversible
+	//     by the time anyone refuses to touch its bytes.
+	//   - a store that will not resolve now hands the claim back (Acquired path) instead
+	//     of stranding a deleted row whose object nothing is left to remove.
 	var blockStore BlockStoreDeleter
 	if w.storage != nil {
 		resolved, resolveErr := w.storage.GetBlockStoreForOrg(item.OrgID.String(), storageClass)
 		if resolveErr != nil {
-			return w.releaseClaimThenFailWithRetry(item, attempt,
+			return w.failBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority,
 				fmt.Errorf("failed to get block store for org %s class %s: %w", item.OrgID, storageClass, resolveErr))
 		}
 		if validateErr := resolved.ValidatePhysicalLocator(item.ItemID, storageKey); validateErr != nil {
-			return w.releaseClaimThenFailWithRetry(item, attempt,
+			return w.failBeforeOrAfterHandoff(alreadyCommitted, item, deleteAuthority,
 				fmt.Errorf("block %s persisted physical locator %q failed validation: %w", item.ItemID, storageKey, validateErr),
 				func() { metrics.GCErrorsTotal.WithLabelValues("block_storage_key_mismatch").Inc() })
 		}
@@ -1669,20 +1752,29 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
 
-	// Re-check the gate on the way out of the authorization phase and into the
-	// destructive one, ignoring the cache. The first check ran several statements
-	// ago, and a keyspace can be ALTERed at any moment, so passing it once does not
-	// mean the EACH_QUORUM argument still holds now — the gate detects drift, it does
-	// not prevent a concurrent ALTER. This does not close that window (nothing here
-	// can; topology changes under enabled destructive GC are outside the supported
-	// procedure), it narrows it from "the whole walk" to "these two statements".
+	// Re-check the gate on the way out of the authorization phase, ignoring the cache.
+	// The first check ran several statements ago, and a keyspace can be ALTERed at any
+	// moment, so passing it once does not mean the EACH_QUORUM argument still holds now
+	// — the gate detects drift, it does not prevent a concurrent ALTER. This does not
+	// close that window (nothing here can; topology changes under enabled destructive
+	// GC are outside the supported procedure), it narrows it from "the whole walk" to
+	// "these two statements".
 	//
 	// It must be the FRESH form. A walk takes milliseconds, so a cached check here
 	// would return the pass this same walk stored moments ago and assert nothing at
 	// all — defence in depth in appearance only. The read is paid once per block that
 	// is actually about to be destroyed, not once per candidate.
+	//
+	// On the Acquired path this is the last precondition BEFORE CommitBlockDeleteOrphanHandoff.
+	// On the CommittedOwner path the same gate is execution safety, not authorization:
+	// topology may have changed while the process was dead. A failure there cannot
+	// release a committed authority.
 	if err := w.checkDestructiveTopologyFresh(destructivePathBlock); err != nil {
-		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete at the commit point; failing closed: %v", item.ItemID, err)
+		if alreadyCommitted {
+			log.Printf("[GC Worker] Block %s: destructive topology gate rejected execution after committed handoff; leaving the queue untouched: %v", item.ItemID, err)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: err}
+		}
+		log.Printf("[GC Worker] Block %s: destructive topology gate rejected the delete before the orphan-handoff commit; failing closed: %v", item.ItemID, err)
 		// Hand the claim back: the block is provably unreferenced, so the fence buys
 		// nothing here, and holding it under a systematic rejection would fence this
 		// content for as long as the topology stays wrong.
@@ -1693,32 +1785,74 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		// being true when a lost claim started meaning NO durable queue mutation at all:
 		// postponing is RequeueItem, and a stale attempt reaching this gate has been
 		// holding its copy of the queue row since before it lost the claim.
-		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt)
+		released, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, deleteAuthority)
 		if relErr != nil {
 			return relErr
 		}
 		if foreign := w.refuseRetryForForeignClaimOwner(item.ItemID, released, err); foreign != nil {
 			return foreign
 		}
-		return failedClosedError{Reason: "destructive topology gate rejected block at the commit point", ItemID: item.ItemID, Err: err}
+		return failedClosedError{Reason: "destructive topology gate rejected block before orphan-handoff commit", ItemID: item.ItemID, Err: err}
 	}
 
-	publication := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, storageClass, storageKey, blockInfo.Sha1, w.clock().UTC())
+	if alreadyCommitted {
+		hasRefs, err = w.store.BlockHasReferencesGlobal(item.OrgID, item.ItemID)
+		if err != nil {
+			log.Printf("[GC Worker] Block %s: committed-owner refs contradiction read failed; leaving the queue untouched: %v", item.ItemID, err)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: err}
+		}
+		if hasRefs {
+			log.Printf("[GC Worker] Block %s: committed-owner refs contradiction; leaving the stored authority standing and not deleting", item.ItemID)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: errors.New("committed delete authority observed references after handoff")}
+		}
+	}
+
+	if !alreadyCommitted {
+		handoff, handoffErr := w.store.CommitBlockDeleteOrphanHandoff(item.OrgID, item.ItemID, deleteAuthority)
+		metrics.GCBlockDeleteHandoffTotal.WithLabelValues(handoff.Outcome.String()).Inc()
+		switch handoff.Outcome {
+		case BlockDeleteHandoffCommitted, BlockDeleteHandoffAlreadyCommitted:
+			alreadyCommitted = true
+			if !handoff.Authority.IsZero() {
+				deleteAuthority = handoff.Authority.Authority()
+			}
+		case BlockDeleteHandoffNotOwner, BlockDeleteHandoffTargetChanged:
+			log.Printf("[GC Worker] Block %s: orphan-handoff commit lost the claim (%s); preserving the candidate", item.ItemID, handoff.Outcome)
+			return blockClaimForeignOwnerError{ItemID: item.ItemID}
+		default:
+			w.recordDestructiveBlocked(destructivePathBlock)
+			cause := handoff.Cause
+			if cause == nil {
+				cause = handoffErr
+			}
+			if cause == nil {
+				cause = fmt.Errorf("orphan-handoff commit outcome %s", handoff.Outcome)
+			}
+			log.Printf("[GC Worker] Block %s: orphan-handoff commit is unsettled (%s); retaining claim and candidate: %v", item.ItemID, handoff.Outcome, cause)
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: cause}
+		}
+	}
+
+	// ==================== AUTHORITY IRREVERSIBLE ====================
+	// CommitBlockDeleteOrphanHandoff (or a CommittedOwner resume) has bound this
+	// walk to stored (P, D). From here: no release, no takeover, no Complete,
+	// no Requeue, no Fail, no retry++, no candidate delete.
+
+	publication := w.store.StartBlockDeleteOrphan(item.OrgID, item.ItemID, committedBlockDeleteAuthority(deleteAuthority), blockInfo.Sha1, w.clock().UTC())
+	metrics.GCBlockDeleteOrphanPublicationTotal.WithLabelValues(publication.Outcome.String()).Inc()
 	var orphanFirstSeenAt time.Time
 	switch publication.Outcome {
-	case StartBlockDeleteOrphanCreated, StartBlockDeleteOrphanSameTarget:
-		// Created already proved canonical EACH_QUORUM on the LWT. SameTarget carries
+	case StartBlockDeleteOrphanCreated, StartBlockDeleteOrphanSameAuthority:
+		// Created already proved canonical EACH_QUORUM on the LWT. SameAuthority carries
 		// the stored lifecycle token and is returned only after canonical EACH_QUORUM
-		// visibility, a still-pending_s3 phase, and the identity-only discovery
-		// projection were acknowledged.
+		// visibility, a still-pending_s3 phase, exact (P, D), and the identity-only
+		// discovery projection were acknowledged.
 		if publication.FirstSeenAt.IsZero() {
-			return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: errors.New("orphan publication returned no first_seen_at")}
+			return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: errors.New("orphan publication returned no first_seen_at")}
 		}
 		orphanFirstSeenAt = publication.FirstSeenAt
-	case StartBlockDeleteOrphanDifferentTarget:
-		return w.releaseOrphanClaimAndPostpone(item, attempt, GCFailureCodeBlockOrphanConflict, publication.Cause)
-	case StartBlockDeleteOrphanNotPublished:
-		return w.releaseOrphanClaimAndPostpone(item, attempt, GCFailureCodeBlockOrphanNotPublished, publication.Cause)
+	case StartBlockDeleteOrphanDifferentTarget, StartBlockDeleteOrphanDifferentAuthority, StartBlockDeleteOrphanUnboundAuthority, StartBlockDeleteOrphanNotPublished:
+		return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: publication.Cause}
 	case StartBlockDeleteOrphanAmbiguous:
 		// The BLOCK path is the one being blocked here, not the orphan recovery scanner:
 		// this walk records its liveness success under destructivePathBlock, and the
@@ -1737,10 +1871,23 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return blockOrphanPublicationError{ItemID: item.ItemID, Code: GCFailureCodeBlockOrphanUnsettled, Err: fmt.Errorf("unhandled orphan publication outcome %s", publication.Outcome)}
 	}
 
-	// 4. Now remove the claimed DB row. If this fails, the row stays claimed and
-	// the queue item will retry; the pending S3 row already preserves recovery state.
-	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, attempt); err != nil {
-		return w.failClosedIfUnavailable("failed to finalize claimed block delete", item.ItemID, err)
+	// 4. Now remove the claimed DB row. After handoff this cannot spend a retry or
+	// reach the DLQ: the stored (P, D) must stay standing until finalize applies.
+	waitWorkerTestPause(&w.pauseBeforeFinalizeEntered, w.pauseBeforeFinalize)
+	finalized, finalizeErr := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, committedBlockDeleteAuthority(deleteAuthority))
+	waitWorkerTestPause(&w.pauseAfterFinalizeEntered, w.pauseAfterFinalize)
+	if !finalized.authorizesPhysicalDelete() {
+		cause := finalizeErr
+		if cause == nil {
+			cause = finalized.Cause
+		}
+		if cause == nil {
+			cause = fmt.Errorf("finalize outcome %s", finalized.Outcome)
+		}
+		if finalized.Outcome == BlockDeleteFinalizeAmbiguous {
+			w.recordDestructiveBlocked(destructivePathBlock)
+		}
+		return blockDeleteCommittedPendingError{ItemID: item.ItemID, Err: cause}
 	}
 
 	// With no storage provider (degenerate/no-storage-manager config) there is no S3
@@ -1770,7 +1917,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// 5. Finalize the recovery row after the physical delete. The forward mapping
 	// is logical metadata and intentionally survives this physical GC lifecycle.
 	if clearRecoveryRow {
-		if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
+		if err := w.terminateThenDeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt, committedBlockDeleteAuthority(deleteAuthority)); err != nil {
 			log.Printf("[GC Worker] WARNING: block %s physical cleanup succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
@@ -1783,6 +1930,24 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_deleted").Inc()
 	log.Printf("[GC Worker] Deleted block %s", item.ItemID)
 	return nil
+}
+
+func (w *Worker) terminateThenDeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time, authority CommittedBlockDeleteAuthority) error {
+	if authority.IsZero() {
+		return fmt.Errorf("refusing to clear S3 orphan %s without a committed lifecycle authority", blockID)
+	}
+	terminated, err := w.store.TerminateBlockDeleteLifecycle(orgID, blockID, authority)
+	if !terminated.ok() {
+		cause := err
+		if cause == nil {
+			cause = terminated.Cause
+		}
+		if cause == nil {
+			cause = fmt.Errorf("lifecycle terminate outcome %s", terminated.Outcome)
+		}
+		return cause
+	}
+	return w.store.DeleteS3Orphan(orgID, blockID, firstSeenAt)
 }
 
 // releaseAndPostponeUnreliableRead hands this attempt's fence back and postpones when a
@@ -2093,7 +2258,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 						}
 						continue
 					}
-					if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
+					if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: failed to finalize post-S3 orphan row %s: %v", canonicalCommit.BlockID, err)
 						if phaseErr == nil {
 							phaseErr = fmt.Errorf("finalize post-S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)
@@ -2110,6 +2275,42 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					log.Printf("[GC Worker] S3 orphan recovery: canonical row has unsupported recovery phase %q for org=%s block=%s; retaining cursor", phase, canonical.OrgID, canonical.BlockID)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("unsupported canonical S3 orphan recovery phase %q for org=%s block=%s", phase, canonical.OrgID, canonical.BlockID)
+					}
+					continue
+				}
+				lifecycle := w.store.ObserveBlockDeleteLifecycle(canonical.OrgID, canonical.BlockID, committedBlockDeleteAuthority(canonical.Authority))
+				switch lifecycle.Outcome {
+				case StartBlockDeleteOrphanSameAuthority:
+					// published + exact (P, D): continue the existing pending_s3 path.
+				case StartBlockDeleteOrphanLifecycleAdvanced:
+					canonicalCommit, reloadErr := reloadCanonical(canonical)
+					if reloadErr != nil {
+						w.recordS3OrphanCanonicalReloadFailure(reloadErr)
+						log.Printf("[GC Worker] S3 orphan recovery: refusing stale-orphan clear for %s after canonical reload: %v", canonical.BlockID, reloadErr)
+						if phaseErr == nil {
+							phaseErr = reloadErr
+						}
+						continue
+					}
+					if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: failed to clear terminal-lifecycle orphan row %s: %v", canonicalCommit.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("clear terminal-lifecycle S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)
+						}
+						continue
+					}
+					recovered++
+					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+					log.Printf("[GC Worker] Cleared stale pending_s3 orphan for terminal lifecycle %s (org=%s); physical delete not authorized", canonicalCommit.BlockID, canonicalCommit.OrgID)
+					continue
+				default:
+					log.Printf("[GC Worker] S3 orphan recovery: lifecycle observation %s for org=%s block=%s; failing closed before S3: %v", lifecycle.Outcome, canonical.OrgID, canonical.BlockID, lifecycle.Cause)
+					if phaseErr == nil {
+						cause := lifecycle.Cause
+						if cause == nil {
+							cause = fmt.Errorf("lifecycle observation %s", lifecycle.Outcome)
+						}
+						phaseErr = fmt.Errorf("S3 orphan recovery refused for org=%s block=%s: %w", canonical.OrgID, canonical.BlockID, cause)
 					}
 					continue
 				}
@@ -2276,7 +2477,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := w.store.DeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt); err != nil {
+				if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", canonicalCommit.BlockID, err)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("clear S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)

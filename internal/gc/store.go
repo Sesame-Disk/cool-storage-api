@@ -112,6 +112,11 @@ const (
 	// decision at all. Collapsing them would silently move the candidate code off its
 	// documented postpone path, because the untouched check runs first.
 	GCFailureCodeBlockOrphanInvalid = "block_orphan_invalid"
+	// GCFailureCodeBlockDeleteCommittedPending marks a walk that already crossed the
+	// irreversible orphan-handoff commit point. The claim, candidate and queue row
+	// must stay exactly as they are: no release, no takeover, no retry increment,
+	// no Complete/Requeue/Fail. Recovery resumes the stored authority.
+	GCFailureCodeBlockDeleteCommittedPending = "block_delete_committed_pending"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -205,10 +210,17 @@ type GCStore interface {
 	// a caller that decides to take a stale claim over can CAS against exactly that
 	// authority instead of re-reading and adopting whoever it finds the second time.
 	ClaimBlockDelete(orgID uuid.UUID, blockID string, attempt BlockDeleteAuthority) (BlockClaimResult, error)
+	// CommitBlockDeleteOrphanHandoff is the irreversible commit point of a block
+	// delete. It records that exact authority (P, D) has passed the last liveness
+	// authorization and may no longer be released, taken over, or replaced. Only the
+	// current delete owner of that exact incarnation can apply it, and only while
+	// gc_orphan_handoff is still unset.
+	CommitBlockDeleteOrphanHandoff(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) (BlockDeleteHandoffResult, error)
 	// ReleaseBlockClaim clears gc_state only while the exact authority — incarnation,
-	// claim id AND claimed_at — still owns the row. This stops an attempt from releasing
-	// a claim it did not win, and stops an attempt that already lost the row to a stale
-	// takeover from dropping the new owner's fence.
+	// claim id AND claimed_at — still owns the row AND the orphan handoff has not
+	// committed. A committed destructive authority cannot be handed back. This stops an
+	// attempt from releasing a claim it did not win, and stops an attempt that already
+	// lost the row to a stale takeover from dropping the new owner's fence.
 	//
 	// It returns an outcome rather than an error for the not-applied case, because under
 	// per-attempt identity a lost race is an EXPECTED result and not a failure. See
@@ -249,8 +261,13 @@ type GCStore interface {
 	// applied=false means the row changed and callers must retry rather than
 	// treating the stale observation as success.
 	DeleteClaimedBlockStub(orgID uuid.UUID, blockID, claimID string) (bool, error)
-	// FinalizeBlockDelete removes the block row only while the exact authority still
-	// owns it — incarnation, claim id and claimed_at.
+	// FinalizeBlockDelete removes the block row only while the exact committed
+	// authority still owns it — incarnation, claim id, claimed_at, and
+	// gc_orphan_handoff=true. Skipping the handoff cannot finalize.
+	//
+	// AlreadyFinalized classifies "blocks is gone and the lifecycle certificate is
+	// still published for this exact (P, D)". It is not permission to delete bytes;
+	// only Finalized (this executor applied the DELETE) authorizes processBlock S3.
 	//
 	// It deliberately does NOT pin Consistency(EACH_QUORUM) the way ClaimBlockDelete
 	// does. The window this DELETE opens — a writer in another DC that has not yet seen
@@ -258,7 +275,7 @@ type GCStore interface {
 	// EACH_QUORUM and is written BEFORE this call. That row, not this one, is the fence
 	// that spans the physical delete; see db.BlockAuthorityRead for the intersection
 	// argument this relies on.
-	FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority BlockDeleteAuthority) error
+	FinalizeBlockDelete(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) (BlockDeleteFinalizeResult, error)
 	// EnsureBlockGCCandidate records a block as a delete candidate together with the
 	// EXACT physical incarnation it was observed at.
 	//
@@ -314,7 +331,11 @@ type GCStore interface {
 	// StartBlockDeleteOrphan records the durable recovery row for a block deletion
 	// without overwriting an existing lifecycle. Callers must branch on the returned
 	// outcome rather than treating every non-created result as completion.
-	StartBlockDeleteOrphan(orgID uuid.UUID, blockID, storageClass, storageKey, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult
+	StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult
+	// ObserveBlockDeleteLifecycle is the SERIAL settlement read of D's tombstone.
+	// Recovery uses it as an absolute veto: terminal D must not drive a pending_s3
+	// physical delete. SameAuthority means published + exact (P, D).
+	ObserveBlockDeleteLifecycle(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) StartBlockDeleteOrphanResult
 	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
 	// destructive recovery path. It supplies recovery state and the physical
 	// backend selector; it is not a Paxos settlement read and does not authorize
@@ -332,6 +353,10 @@ type GCStore interface {
 	MarkS3OrphanMappingCleanupPending(orgID uuid.UUID, blockID, externalSHA1 string, now time.Time) error
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID string, expectedFirstSeenAt time.Time, errMsg string, now time.Time) error
 	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
+	// TerminateBlockDeleteLifecycle CASes the durable D tombstone from published
+	// to terminal. Callers must do this BEFORE DeleteS3Orphan so a stale copy of D
+	// cannot recreate the orphan after the canonical row is gone.
+	TerminateBlockDeleteLifecycle(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) (BlockDeleteLifecycleTerminateResult, error)
 
 	// Commit operations (worker)
 	GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error)
@@ -667,6 +692,50 @@ func (a BlockDeleteAuthority) IsZero() bool {
 	return a.Target.IsZero() || strings.TrimSpace(a.ClaimID) == "" || a.ClaimedAt.IsZero()
 }
 
+func (a BlockDeleteAuthority) sameClaim(other BlockDeleteAuthority) bool {
+	if a.ClaimID != other.ClaimID {
+		return false
+	}
+	return a.ClaimedAt.UTC().Truncate(time.Millisecond).Equal(other.ClaimedAt.UTC().Truncate(time.Millisecond))
+}
+
+func (a BlockDeleteAuthority) sameAuthority(other BlockDeleteAuthority) bool {
+	return a.Target == other.Target && a.sameClaim(other)
+}
+
+// CommittedBlockDeleteAuthority is a delete authority that has crossed the
+// irreversible orphan-handoff commit point (or been resumed from one). Orphan
+// publication and finalize accept this type so a raw uncommitted attempt cannot
+// be passed by accident.
+//
+// The wrapped authority is unexported so another package cannot fabricate one
+// with a composite literal. That is a type-system reminder, not the safety
+// boundary: Cassandra still validates handoff=true, the lifecycle tombstone,
+// and exact (P, D). Tests outside this package use
+// CommittedBlockDeleteAuthorityForTest.
+type CommittedBlockDeleteAuthority struct {
+	authority BlockDeleteAuthority
+}
+
+func committedBlockDeleteAuthority(authority BlockDeleteAuthority) CommittedBlockDeleteAuthority {
+	return CommittedBlockDeleteAuthority{authority: authority}
+}
+
+// CommittedBlockDeleteAuthorityForTest wraps a raw authority for fixtures.
+// Production callers must obtain this type from ClaimBlockDelete (CommittedOwner)
+// or CommitBlockDeleteOrphanHandoff. Cassandra re-validates the durable predicates.
+func CommittedBlockDeleteAuthorityForTest(authority BlockDeleteAuthority) CommittedBlockDeleteAuthority {
+	return committedBlockDeleteAuthority(authority)
+}
+
+func (c CommittedBlockDeleteAuthority) Authority() BlockDeleteAuthority {
+	return c.authority
+}
+
+func (c CommittedBlockDeleteAuthority) IsZero() bool {
+	return c.authority.IsZero()
+}
+
 type ProvisionalBlockRefExpiryInfo struct {
 	OrgID        uuid.UUID
 	BlockID      string
@@ -789,6 +858,11 @@ type S3OrphanInfo struct {
 	LastAttemptAt time.Time
 	RetryCount    int
 	LastError     string
+	Authority     BlockDeleteAuthority
+}
+
+func (o S3OrphanInfo) target() BlockDeleteTarget {
+	return BlockDeleteTarget{StorageClass: o.StorageClass, StorageKey: o.StorageKey}
 }
 
 // StartBlockDeleteOrphanOutcome classifies the result of the single-use orphan
@@ -800,18 +874,26 @@ const (
 	// was uncertain and serial settlement, or canonical EACH_QUORUM visibility,
 	// could not be established.
 	StartBlockDeleteOrphanAmbiguous StartBlockDeleteOrphanOutcome = iota
-	// StartBlockDeleteOrphanCreated means the proposed physical identity was
-	// inserted at EACH_QUORUM and its discovery projection was acknowledged.
+	// StartBlockDeleteOrphanCreated means the proposed physical identity and
+	// claim authority were inserted at EACH_QUORUM and its discovery projection
+	// was acknowledged.
 	StartBlockDeleteOrphanCreated
-	// StartBlockDeleteOrphanSameTarget means an existing orphan carries the exact
-	// proposed physical identity, that row is visible at EACH_QUORUM, still in
+	// StartBlockDeleteOrphanSameAuthority means an existing orphan carries the
+	// exact proposed (P, D), that row is visible at EACH_QUORUM, still in
 	// pending_s3, and the discovery projection was acknowledged. Its lifecycle
 	// state was not changed. Confirmation proves visibility now; it does not
 	// renew the row's remaining TTL (R27/R28).
-	StartBlockDeleteOrphanSameTarget
+	StartBlockDeleteOrphanSameAuthority
 	// StartBlockDeleteOrphanDifferentTarget means an existing orphan carries a
 	// different physical identity. The existing lifecycle was not changed.
 	StartBlockDeleteOrphanDifferentTarget
+	// StartBlockDeleteOrphanDifferentAuthority means an existing orphan names
+	// the same physical incarnation but a different claim authority. That is a
+	// competing lifecycle, never an idempotent resume.
+	StartBlockDeleteOrphanDifferentAuthority
+	// StartBlockDeleteOrphanUnboundAuthority means an existing orphan names P
+	// but has no durable claim identity. Historical rows are not adopted.
+	StartBlockDeleteOrphanUnboundAuthority
 	// StartBlockDeleteOrphanNotPublished means serial settlement found no row.
 	StartBlockDeleteOrphanNotPublished
 	// StartBlockDeleteOrphanInvalid means the proposed input is invalid, or the
@@ -821,9 +903,10 @@ const (
 	// StartBlockDeleteOrphanProjectionUnconfirmed means the canonical orphan is
 	// known, but its discovery projection was not durably acknowledged.
 	StartBlockDeleteOrphanProjectionUnconfirmed
-	// StartBlockDeleteOrphanLifecycleAdvanced means the existing row matches the
-	// proposed physical identity but is no longer in pending_s3, so it cannot
-	// authorize a new physical delete. The existing lifecycle was not changed.
+	// StartBlockDeleteOrphanLifecycleAdvanced means the existing orphan matches
+	// the proposed physical identity but is no longer in pending_s3, OR the
+	// durable D tombstone is already terminal. Neither authorizes a new
+	// physical delete. The existing lifecycle was not changed.
 	StartBlockDeleteOrphanLifecycleAdvanced
 )
 
@@ -833,10 +916,14 @@ func (o StartBlockDeleteOrphanOutcome) String() string {
 		return "ambiguous"
 	case StartBlockDeleteOrphanCreated:
 		return "created"
-	case StartBlockDeleteOrphanSameTarget:
-		return "same_target"
+	case StartBlockDeleteOrphanSameAuthority:
+		return "same_authority"
 	case StartBlockDeleteOrphanDifferentTarget:
 		return "different_target"
+	case StartBlockDeleteOrphanDifferentAuthority:
+		return "different_authority"
+	case StartBlockDeleteOrphanUnboundAuthority:
+		return "unbound_authority"
 	case StartBlockDeleteOrphanNotPublished:
 		return "not_published"
 	case StartBlockDeleteOrphanInvalid:
@@ -855,11 +942,12 @@ func (o StartBlockDeleteOrphanOutcome) String() string {
 // for projection repair instead of the proposed timestamp. Cause is diagnostic
 // only and never grants permission to finalize or delete.
 type StartBlockDeleteOrphanResult struct {
-	Outcome        StartBlockDeleteOrphanOutcome
-	FirstSeenAt    time.Time
-	ExistingTarget BlockDeleteTarget
-	Submitted      bool
-	Cause          error
+	Outcome           StartBlockDeleteOrphanOutcome
+	FirstSeenAt       time.Time
+	ExistingTarget    BlockDeleteTarget
+	ExistingAuthority BlockDeleteAuthority
+	Submitted         bool
+	Cause             error
 }
 
 const (
@@ -867,7 +955,46 @@ const (
 	// Historical name. After R11a this phase means the physical S3 delete has
 	// completed and only orphan finalization remains; it performs no mapping delete.
 	S3OrphanPhasePendingMappingCleanup = "pending_mapping_cleanup"
+
+	BlockDeleteLifecyclePhasePublished = "published"
+	BlockDeleteLifecyclePhaseTerminal  = "terminal"
 )
+
+type BlockDeleteLifecycleTerminateOutcome int
+
+const (
+	BlockDeleteLifecycleTerminateAmbiguous BlockDeleteLifecycleTerminateOutcome = iota
+	BlockDeleteLifecycleTerminated
+	BlockDeleteLifecycleAlreadyTerminal
+	BlockDeleteLifecycleNotOwner
+	BlockDeleteLifecycleInvalid
+)
+
+func (o BlockDeleteLifecycleTerminateOutcome) String() string {
+	switch o {
+	case BlockDeleteLifecycleTerminateAmbiguous:
+		return "ambiguous"
+	case BlockDeleteLifecycleTerminated:
+		return "terminated"
+	case BlockDeleteLifecycleAlreadyTerminal:
+		return "already_terminal"
+	case BlockDeleteLifecycleNotOwner:
+		return "not_owner"
+	case BlockDeleteLifecycleInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+type BlockDeleteLifecycleTerminateResult struct {
+	Outcome BlockDeleteLifecycleTerminateOutcome
+	Cause   error
+}
+
+func (r BlockDeleteLifecycleTerminateResult) ok() bool {
+	return r.Outcome == BlockDeleteLifecycleTerminated || r.Outcome == BlockDeleteLifecycleAlreadyTerminal
+}
 
 // ShareLinkInfo holds data about a share link needed by the scanner.
 type ShareLinkInfo struct {
@@ -1073,6 +1200,10 @@ const (
 	// against every future upload of its content, permanently. Postpone instead and
 	// let a later pass release the claim once it has aged out.
 	BlockClaimTooFresh
+	// BlockClaimCommittedHandoff: the row carries a committed destructive
+	// authority. It is not a stale claim and must not be released. The caller
+	// must resume through ClaimBlockDelete rather than postponing as not-yet-stale.
+	BlockClaimCommittedHandoff
 )
 
 func (o BlockClaimReleaseOutcome) String() string {
@@ -1083,6 +1214,8 @@ func (o BlockClaimReleaseOutcome) String() string {
 		return "released"
 	case BlockClaimTooFresh:
 		return "too_fresh"
+	case BlockClaimCommittedHandoff:
+		return "committed_handoff"
 	default:
 		return "unknown"
 	}
@@ -1137,6 +1270,11 @@ const (
 	// settling read could not establish it either. Retain the claim, retain the
 	// candidate, finalize nothing, release nothing. Fail closed (R20).
 	BlockClaimAmbiguous
+	// BlockClaimCommittedOwner: the exact incarnation already carries a committed
+	// orphan handoff, confirmed visible at EACH_QUORUM. Resume the STORED authority.
+	// Do not mint a new claim, do not take over. Refs are re-checked as a
+	// contradiction detector (R3 still OPEN), not as a new authorization.
+	BlockClaimCommittedOwner
 )
 
 func (o BlockClaimOutcome) String() string {
@@ -1155,9 +1293,98 @@ func (o BlockClaimOutcome) String() string {
 		return "invalid"
 	case BlockClaimAmbiguous:
 		return "ambiguous"
+	case BlockClaimCommittedOwner:
+		return "committed_owner"
 	default:
 		return "unknown"
 	}
+}
+
+// BlockDeleteHandoffOutcome classifies CommitBlockDeleteOrphanHandoff.
+type BlockDeleteHandoffOutcome int
+
+const (
+	BlockDeleteHandoffAmbiguous BlockDeleteHandoffOutcome = iota
+	BlockDeleteHandoffCommitted
+	BlockDeleteHandoffAlreadyCommitted
+	BlockDeleteHandoffNotOwner
+	BlockDeleteHandoffTargetChanged
+	BlockDeleteHandoffInvalid
+)
+
+func (o BlockDeleteHandoffOutcome) String() string {
+	switch o {
+	case BlockDeleteHandoffAmbiguous:
+		return "ambiguous"
+	case BlockDeleteHandoffCommitted:
+		return "committed"
+	case BlockDeleteHandoffAlreadyCommitted:
+		return "already_committed"
+	case BlockDeleteHandoffNotOwner:
+		return "not_owner"
+	case BlockDeleteHandoffTargetChanged:
+		return "target_changed"
+	case BlockDeleteHandoffInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockDeleteHandoffResult is the classified handoff. Authority is populated for
+// Committed and AlreadyCommitted so callers can continue without reconstructing D.
+type BlockDeleteHandoffResult struct {
+	Outcome   BlockDeleteHandoffOutcome
+	Authority CommittedBlockDeleteAuthority
+	Cause     error
+}
+
+// BlockDeleteFinalizeOutcome classifies FinalizeBlockDelete.
+type BlockDeleteFinalizeOutcome int
+
+const (
+	BlockDeleteFinalizeAmbiguous BlockDeleteFinalizeOutcome = iota
+	BlockDeleteFinalized
+	BlockDeleteAlreadyFinalized
+	BlockDeleteAlreadyComplete
+	BlockDeleteNotAuthority
+	BlockDeleteInvalid
+)
+
+func (o BlockDeleteFinalizeOutcome) String() string {
+	switch o {
+	case BlockDeleteFinalizeAmbiguous:
+		return "ambiguous"
+	case BlockDeleteFinalized:
+		return "finalized"
+	case BlockDeleteAlreadyFinalized:
+		return "already_finalized"
+	case BlockDeleteAlreadyComplete:
+		return "already_complete"
+	case BlockDeleteNotAuthority:
+		return "not_authority"
+	case BlockDeleteInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+type BlockDeleteFinalizeResult struct {
+	Outcome BlockDeleteFinalizeOutcome
+	Cause   error
+}
+
+func (r BlockDeleteFinalizeResult) ok() bool {
+	return r.Outcome == BlockDeleteFinalized || r.Outcome == BlockDeleteAlreadyFinalized
+}
+
+// authorizesPhysicalDelete is the only finalize outcome that may continue to an
+// immediate S3 DELETE from processBlock. AlreadyFinalized means another executor
+// already won DELETE blocks; recovery owns the bytes. AlreadyComplete means D is
+// terminal and must never delete again.
+func (r BlockDeleteFinalizeResult) authorizesPhysicalDelete() bool {
+	return r.Outcome == BlockDeleteFinalized
 }
 
 // BlockReleaseOutcome classifies what ReleaseBlockClaim did.

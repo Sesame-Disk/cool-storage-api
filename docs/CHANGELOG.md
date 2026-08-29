@@ -8,6 +8,42 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - P4b-2 tombstone blockers: exact certificate, one physical DELETE, SERIAL post-check
+
+Closed the confirmed #194 tombstone holes without redesigning handoff, 019, or 020.
+`AlreadyFinalized` now requires an exact published `(P, D)` lifecycle certificate
+(SERIAL settlement; missing/mismatch/garbage fail closed; `terminal` stays
+`AlreadyComplete`). `processBlock` authorizes S3 only on applied `Finalized`;
+`AlreadyFinalized` is `committed_pending` with no S3, terminate, or orphan clear.
+`StartBlockDeleteOrphan` SERIAL-re-reads the tombstone after the orphan INSERT.
+`RecoverS3Orphans` `pending_s3` SERIAL-observes D before any physical DELETE and
+clears a stale orphan when D is already terminal. X1 Physical ABA (winner of
+`DELETE blocks` pausing after authorization) stays OPEN. Never-delete lifecycle
+partition growth is operational follow-up. `GC_ENABLED=false`.
+
+## 2026-08-28 - P4b-2 audit closures: EACH_QUORUM committed authority, refs contradiction, D tombstone
+
+Closed the confirmed P4b-2 / R14b audit holes without redesigning the handoff.
+`AlreadyCommitted` and `CommittedOwner` now confirm canonical `EACH_QUORUM`
+visibility (empty handoff CAS maps SERIAL-settle). `CommittedOwner` re-checks
+`BlockHasReferencesGlobal` as a contradiction detector; R3 stays OPEN. Migration
+`020` adds never-deleted `gc_block_delete_lifecycles` so a terminal D cannot
+republish an orphan or authorize S3 after finalize. Production clears
+`gc_s3_orphans` only after `published → terminal`. `CommittedBlockDeleteAuthority`
+is opaque; Cassandra still validates. R12 allowlist is the count source (10
+conditional `blocks` statements). X1 stays OPEN. `GC_ENABLED=false`.
+
+## 2026-08-28 - P4b-2 / R14b: bind orphan handoff and finalize to exact delete authority
+
+`CommitBlockDeleteOrphanHandoff` is the irreversible `blocks` marker
+(`gc_orphan_handoff`, never written false) that binds claim → orphan → finalize
+to exact `(P, D)`. Resume is `CommittedOwner` of the stored claim; release and
+stale takeover refuse a committed handoff. Orphan publication persists D and
+classifies `SameAuthority` vs `DifferentAuthority`. Finalize requires
+`handoff=true`. Post-commit failures leave the queue untouched. Migration `019`
+is ALTER-only and is not folded into `001_initial_schema.cql`. X1 stays OPEN.
+`GC_ENABLED=false` remains required.
+
 ## 2026-08-28 - P4a evidence precision follow-up
 
 The claim execution-policy mutation is now three independent source-contract

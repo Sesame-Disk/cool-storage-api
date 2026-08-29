@@ -92,7 +92,7 @@ func TestP4A_LoserCannotReleaseOrFinalizeTheWinnersClaim(t *testing.T) {
 		t.Fatalf("the loser dropped the winner's fence (block=%+v)", blk)
 	}
 
-	if err := store.FinalizeBlockDelete(orgID, "blk-loser", loser); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, "blk-loser", committedBlockDeleteAuthority(loser)); err == nil {
 		t.Fatal("the loser finalized a delete it never owned; the canonical row would vanish under the winner")
 	}
 	if store.GetBlock(orgID, "blk-loser") == nil {
@@ -143,7 +143,7 @@ func TestP4A_TakenOverAttemptCannotActAfterwards(t *testing.T) {
 	if blk := store.GetBlock(orgID, "blk-takeover"); blk == nil || blk.GCClaimID != attemptB.ClaimID {
 		t.Fatalf("A dropped B's fence after losing ownership (block=%+v)", blk)
 	}
-	if err := store.FinalizeBlockDelete(orgID, "blk-takeover", attemptA); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, "blk-takeover", committedBlockDeleteAuthority(attemptA)); err == nil {
 		t.Fatal("A finalized after being taken over; B's delete would lose its canonical row mid-flight")
 	}
 }
@@ -181,7 +181,7 @@ func TestP4A_CandidateForDeadIncarnationCannotTouchTheLiveOne(t *testing.T) {
 	if outcome, err := store.ReleaseBlockClaim(orgID, "blk-aba", staleAttempt); err != nil || outcome != BlockReleaseNotOwner {
 		t.Fatalf("stale release = %s, %v; want not_owner", outcome, err)
 	}
-	if err := store.FinalizeBlockDelete(orgID, "blk-aba", staleAttempt); err == nil {
+	if _, err := store.FinalizeBlockDelete(orgID, "blk-aba", committedBlockDeleteAuthority(staleAttempt)); err == nil {
 		t.Fatal("a candidate for a dead incarnation finalized the delete of the live one; those bytes are still referenced")
 	}
 	if store.GetBlock(orgID, "blk-aba") == nil {

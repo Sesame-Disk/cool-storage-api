@@ -56,14 +56,14 @@ func TestR22aDiscoveryWriterSurface(t *testing.T) {
 		"(*CassandraStore).MarkS3OrphanMappingCleanupPending": 1,
 	}
 	// Direct lexical calls, not transitive ones. Created publishes from
-	// StartBlockDeleteOrphan; SameTarget only publishes after
-	// confirmSameTargetOrphanResult has acknowledged canonical EACH_QUORUM
+	// StartBlockDeleteOrphan; SameAuthority only publishes after
+	// confirmSameAuthorityOrphanResult has acknowledged canonical EACH_QUORUM
 	// visibility. Counting three wrappers on StartBlockDeleteOrphan would
 	// reject that split and miss an unauthorized helper that published
 	// without confirming the canonical row.
 	allowedProjectionWrapperCallsites := map[string]int{
-		"(*CassandraStore).StartBlockDeleteOrphan":        1,
-		"(*CassandraStore).confirmSameTargetOrphanResult": 1,
+		"(*CassandraStore).StartBlockDeleteOrphan":           1,
+		"(*CassandraStore).confirmSameAuthorityOrphanResult": 1,
 	}
 
 	// Identifiers removed by R22a, kept by name so a revert is caught even if the
