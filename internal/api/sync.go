@@ -4183,10 +4183,11 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 // path those checks cannot see.
 // Filed as R25 in docs/GC-X1-CLOSURE-OPTIONS.md.
 //
-// This closes R25 only. It does not add the publication fence check itself —
-// R3's post-stage validation of the canonical incarnation does not exist on any
-// path yet. What it buys is that the check, once written, applies here too
-// instead of being bypassed. R3 and X1 stay open.
+// R25 is the handshake. R3's post-stage check now runs inside
+// StagePublishAttemptReferences, so this repair path is checked the same way
+// as a first publish. It does not close R18, R27, R29 integration, R30, R31,
+// or X1: a crash leftover pub: is still R18, and HEAD can still depend on a
+// TTL pub: until R31.
 //
 // The extra cost is one staged pub: reference per added block, on a retry that
 // already committed to the full-tree reconciliation. Today that is one statement

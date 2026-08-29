@@ -858,11 +858,15 @@ The script does all of the above in one command:
 
 ```bash
 ./scripts/x2-multidc-validation.sh --keep     # X2 legs, leaves the fixture up
+./scripts/x2-multidc-validation.sh --r3       # R3 legs (schema, then exit before X2 divergence)
 ./scripts/x2-multidc-validation.sh --p3       # P3 legs (skips the X2 legs entirely)
 ```
 
-`--p3` runs the schema step and then the P3 legs, and exits before X2's
-hinted-handoff disable and divergence build. It does NOT inherit X2 fixture state.
+`--r3` and `--p3` run the schema step and then their own legs, and exit before X2's
+hinted-handoff disable and divergence build. They do NOT inherit X2 fixture state.
+`--r3` is not folded into `--p3`: P3 proves fence *publication* fail-closed; R3
+proves a dc-na writer *read* of that fence. The fixture is RF=1/DC, so
+`LOCAL_QUORUM ≡ ONE`; the read-level pin is `TestR3FenceReadConsistencyIsLocalQuorum`.
 
 ### Windows / blocked binaries
 
@@ -906,6 +910,7 @@ Each of these exists because the obvious version of the test proves nothing.
 | script requires the `--- PASS:` line | a skipped package reporting success |
 | `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` | the P4a claim-authority legs skipping their way to exit 0 against a stack that never came up. It is pinned in `docker-compose.yaml` **and** listed in the integration `TestMain` OR-chain — a gate missing from that chain still fails its own skip, but cannot stop `TestMain` from exiting 0 when nothing ran at all |
 | `SESAMEFS_REQUIRE_P4B_EVIDENCE=1` | the P4b orphan-publication legs skipping their real-Cassandra write-once, SERIAL, lifecycle-advanced and read-repair assertions. It is pinned in `docker-compose.yaml` and listed in the integration `TestMain` OR-chain |
+| `SESAMEFS_REQUIRE_R3_EVIDENCE=1` | the R3 post-stage publish-authority legs skipping their real-Cassandra claim/handoff/orphan/missing/repairing_stub assertions. It is pinned in `docker-compose.yaml` and listed in the integration `TestMain` OR-chain |
 | `p4aRequireEvidence`'s `gate.observed` check | a leg that runs, passes, and asserts nothing: the test must reach its evidence log line, not merely avoid failing |
 | `mutate()` in `scripts/p4a-mutation-validation.sh` compares the file after patching | a mutation whose pattern matched nothing being reported as "the guard held". Line endings and indentation differ between the working tree and the container's COPY, which is exactly how the X2 script caught an inert mutation |
 | `expect_red` greps for the specific P4a assertion | a mutation that turns the suite red for an unrelated reason counting as evidence for the guard it was aimed at. A mutation that fails to COMPILE trips this too, which is how the takeover mutation was caught proving nothing |
@@ -991,6 +996,25 @@ P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
 `TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,
 because settled own-claim confirmation is an `EACH_QUORUM` read of that table.
 
+### R3 publish-authority evidence
+
+R3 is the post-stage `pub:` check: after a complete stage,
+`ValidatePublishAttemptAuthority` must see an Active canonical row (no deleting
+claim, committed handoff, repairing_stub, orphan, missing row, or invalid locator)
+or roll back this attempt. Unit tests cover classification, add-then-check order,
+attempt-scoped rollback, and the `LOCAL_QUORUM` pin. Integration legs live in
+`internal/integration/r3_publish_fence_test.go`. The mutation script must stay red
+when those predicates are removed:
+
+```bash
+docker compose run --rm --build gotest bash scripts/r3-publish-fence-mutation-validation.sh
+```
+
+Cross-DC visibility is a separate fixture (`scripts/x2-multidc-validation.sh --r3`):
+dc-eu publishes the claim/orphan, dc-na `ValidatePublishAttemptAuthority` refuses.
+The standard integration containers run the Cassandra legs with
+`SESAMEFS_REQUIRE_R3_EVIDENCE=1`.
+
 ### What these legs do NOT cover
 
 The pinned **read** level. `BlockFenceReadConsistency` is `LOCAL_QUORUM` because
@@ -998,8 +1022,8 @@ The pinned **read** level. `BlockFenceReadConsistency` is `LOCAL_QUORUM` because
 With RF 1 per datacenter, `LOCAL_QUORUM` and `ONE` both resolve to the single local
 replica, so they are indistinguishable on this fixture. That pin defends a
 deployment with RF > 1 inside a datacenter, and stays covered by
-`TestP3FenceReadConsistencyIsLocalQuorum` and the AST guard in
-`internal/integration/p3_repair_authority_guard_test.go`.
+`TestP3FenceReadConsistencyIsLocalQuorum`, `TestR3FenceReadConsistencyIsLocalQuorum`,
+and the AST guard in `internal/integration/p3_repair_authority_guard_test.go`.
 
 Full runbook and closure findings: `docs/GC-X2-MULTIDC-VALIDATION.md`.
 

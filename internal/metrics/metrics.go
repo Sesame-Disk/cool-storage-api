@@ -696,6 +696,28 @@ var (
 		[]string{"result"},
 	)
 
+	// PublishAttemptAuthorityCheckTotal records the R3 post-stage verdict
+	// for one publication attempt (the first non-Active outcome, or active).
+	// Labels are the outcome names only — never block, attempt, library, or key.
+	PublishAttemptAuthorityCheckTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "publish_attempt_authority_check_total",
+			Help: "Post-stage publish-attempt authority checks by result.",
+		},
+		[]string{"result"},
+	)
+
+	// PublishAttemptRollbackTotal records whether a denied attempt's pub:
+	// rows were removed. error means the denial still stands and publication
+	// must not succeed; surviving rows are fail-closed liveness (R18).
+	PublishAttemptRollbackTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "publish_attempt_rollback_total",
+			Help: "Rollbacks of denied publish-attempt pub: rows by result.",
+		},
+		[]string{"result"},
+	)
+
 	// SyncPutBlockBodyBytes measures request bodies on the desktop-sync block
 	// route that passed the size gate. The cap on that route was originally
 	// derived from the web uploader's chunk ceiling rather than from observed
@@ -1248,6 +1270,8 @@ func Register() {
 		BlockUploadMappingRetriesTotal,
 		BlockUploadRepairAuthorityTotal,
 		BlockUploadRepairMetadataTotal,
+		PublishAttemptAuthorityCheckTotal,
+		PublishAttemptRollbackTotal,
 		SyncPutBlockBodyBytes,
 		SyncPutBlockRejectedTotal,
 		SyncPutBlockInflightCurrent,

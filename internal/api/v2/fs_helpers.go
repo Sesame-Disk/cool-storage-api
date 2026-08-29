@@ -81,6 +81,12 @@ var stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pendi
 	return h.createPendingPublishedFileRow(repoID, pending)
 }
 
+// stagePendingPublishedFilesFinishCheckedFn is the R3 post-stage check for
+// funnel B. It runs once after every pub: row of this attempt is written, never
+// before. The default is FinishCheckedPublishAttempt; tests stub Active so a
+// dummy *DB{} does not become a false Unavailable.
+var stagePendingPublishedFilesFinishCheckedFn = db.FinishCheckedPublishAttempt
+
 // registerUploadedBlockAddProvisionalRefFn writes the provisional reference and
 // its GC expiry tracking together. They are one call because they must be one
 // write: a reference without tracking is invisible to GC Phase 0 and pins the
@@ -1456,6 +1462,11 @@ func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, p
 		stagedBlockIDs = append(stagedBlockIDs, pending.internalBlockIDs...)
 	}
 
+	if err := stagePendingPublishedFilesFinishCheckedFn(h.db, orgID, repoID, attemptID, stagedBlockIDs); err != nil {
+		// FinishChecked already rolled back this attempt's pub: rows (or
+		// joined a rollback failure). Do not treat either outcome as success.
+		return err
+	}
 	return nil
 }
 

@@ -9,7 +9,8 @@
 # command is a procedure that quietly stops being run.
 #
 #   ./scripts/x2-multidc-validation.sh            # full run, tears the stack down
-#   ./scripts/x2-multidc-validation.sh --keep     # leave the stack up afterwards
+#   ./scripts/x2-multidc-validation.sh --r3      # R3 post-stage check: EU fence, NA writer refuses
+#   ./scripts/x2-multidc-validation.sh --p3        # P3 writer-fence fail-closed + visibility
 #   ./scripts/x2-multidc-validation.sh --no-up    # reuse an already-running stack
 #   ./scripts/x2-multidc-validation.sh --mutate   # prove leg 1 goes RED when the
 #                                                 # destructive read is downgraded to
@@ -65,6 +66,7 @@ DO_DOWN=1
 DO_MUTATE=0
 MUTATE_TO=""
 DO_P3=0
+DO_R3=0
 P3_MUTATE=0
 for arg in "$@"; do
   case "$arg" in
@@ -75,6 +77,7 @@ for arg in "$@"; do
     --p3)               DO_P3=1; DO_UP=0; DO_DOWN=0 ;;
     --p3-mutate)        DO_P3=1; P3_MUTATE=1; MUTATE_TO=LocalQuorum; DO_UP=0; DO_DOWN=0 ;;
     --p3-mutate-quorum) DO_P3=1; P3_MUTATE=1; MUTATE_TO=Quorum;      DO_UP=0; DO_DOWN=0 ;;
+    --r3)               DO_R3=1; DO_DOWN=0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -395,6 +398,29 @@ CASSANDRA_HOSTS="127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242}" CASSANDRA_LOCAL_DC=d
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
   go run ./cmd/sesamefs migrate
+
+# ---------------------------------------------------------------------------
+# R3 post-stage publish authority, on the same fixture.
+#
+# After the schema, BEFORE X2's hinted-handoff disable. R3 is a LOCAL_QUORUM
+# writer read of a fence GC published at EACH_QUORUM. The 3-DC proof is the
+# intersection: dc-eu publishes the claim/orphan, dc-na's
+# ValidatePublishAttemptAuthority must refuse. RF=1/DC makes LOCAL_QUORUM
+# indistinguishable from ONE, so the read-level pin stays in the unit/AST
+# suite. Do not fold these legs into --p3.
+if [ "${DO_R3:-0}" = "1" ]; then
+  for n in "${NODES[@]}"; do wait_healthy "$n"; done
+  point_harness_at "${CASSANDRA_NA_HOST_PORT:-9242}" dc-na
+
+  step "R3 LEG 1 -- a claim published in dc-eu is refused by dc-na ValidatePublishAttemptAuthority"
+  run_leg "R3 leg 1 (cross-DC claim fence)" TestR3_WriterInAnotherDatacenterRejectsClaimedBlock
+
+  step "R3 LEG 2 -- an orphan published in dc-eu is refused by dc-na ValidatePublishAttemptAuthority"
+  run_leg "R3 leg 2 (cross-DC orphan fence)" TestR3_WriterInAnotherDatacenterRejectsOrphanFence
+
+  printf '\n\033[32mR3 cross-DC legs green (claim visibility, orphan visibility).\033[0m\n'
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # P3 writer-fence legs, on the same fixture.

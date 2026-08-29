@@ -34,13 +34,12 @@ import (
 // inside the HEAD CAS retry loop — so that belongs to the integration leg, not
 // here. Do not cite this file as proof that every production path stages.
 //
-// WHY THE HANDSHAKE AND NOT THE FENCE
+// WHY THE HANDSHAKE AND NOT ONLY THE FENCE
 // ------------------------------------
-// The safety consequence — a fenced block must not gain a permanent reference —
-// belongs to the integration leg, which cannot go green until R3's post-check
-// exists on any path at all, so it gates X1 closure rather than one PR. The
-// handshake gates the R25 fix on its own: it is green as soon as the repair
-// path re-establishes pub:, with no protocol decision required.
+// The safety consequence — a fenced block must not keep this attempt's pub: or
+// continue to publication — is R3 (`ValidatePublishAttemptAuthority` after a
+// complete stage). These tests still gate R25: the repair path must re-establish
+// pub: so that check is reachable.
 
 const (
 	handshakeOrgID    = "00000000-0000-0000-0000-000000000001"

@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - R3: post-stage publish authority check
+
+Publication linearization is now `stage pub: → post-stage authority check → only
+Active continues to HEAD/CAS → Promote pub:→fs:`. `ValidatePublishAttemptAuthority`
+reads canonical then orphan at `LOCAL_QUORUM`, treats `gc_orphan_handoff=true` as
+Deleting, and rejects deleting / repairing_stub / orphan / missing / invalid.
+Denial rolls back **this attempt's** `pub:` rows; rollback failure is not success.
+Wired after a complete stage in `StagePublishAttemptReferences` (sync, SeafHTTP)
+and `stagePendingPublishedFiles` (v2 CreateFile/upload/copy/OnlyOffice). v2 durable
+repair stays promote-only. R18, R27, R29 integration, R30, R31, Physical ABA and X1
+stay OPEN. `GC_ENABLED=false`.
+
 ## 2026-08-28 - P4b-2 tombstone blockers: exact certificate, one physical DELETE, SERIAL post-check
 
 Closed the confirmed #194 tombstone holes without redesigning handoff, 019, or 020.

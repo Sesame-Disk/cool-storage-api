@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-08-28
-**Session**: X1/P4b-2 orphan authority handoff — R14b GREEN (claim→orphan→finalize bound to exact (P,D)); P4a R14a/R16 remain GREEN including #193 audit hardening; P4b-1 write-once + SameAuthority remain; X1 still OPEN; GC_ENABLED=false
+**Session**: X1/R3 post-stage publish authority check GREEN; P4b-2 / R14b remain GREEN; X1 still OPEN; GC_ENABLED=false
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -177,6 +177,14 @@ real Cassandra `internal/integration/p4b_claim_orphan_authority_test.go` under
 Committed/AlreadyCommitted. P4b-1's write-once script stays
 `scripts/p4b-mutation-validation.sh`. X1 stays OPEN (winner-`Finalized` Physical ABA
 is not closed here). `GC_ENABLED=false`.
+
+**R3 update (2026-08-28):** The `pub:` post-stage check is GREEN.
+`stage pub: → ValidatePublishAttemptAuthority → only Active continues → HEAD → Promote`.
+Two funnels: `StagePublishAttemptReferences` (sync/SeafHTTP) and
+`stagePendingPublishedFiles` (v2). v2 durable repair is promote-only. Rollback is
+this attempt only; rollback failure is not success. Still OPEN: R18, R27, R29
+integration, R30, R31, Physical ABA, X1. Next publication slice is R31, not
+another handshake. `GC_ENABLED=false`.
 
 ### Inter-session Update (2026-05-21)
 

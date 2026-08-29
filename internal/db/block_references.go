@@ -706,6 +706,11 @@ func RemovePublishAttemptReferences(database *DB, orgID, attemptID string, block
 // attempt-local pub:<attempt> rows that keep blocks alive until HEAD publish wins.
 // If a partial stage fails, this helper cleans up the rows written by this call
 // before returning so direct callers do not leak stuck publish-attempt refs.
+//
+// After a complete stage it runs the R3 post-check (FinishCheckedPublishAttempt).
+// The check is AFTER the write on purpose: a pre-stage check cannot close the
+// race where GC already authorized on refs==0. Failure rolls back this
+// attempt only and is never publication success.
 func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string, blockIDs []string, resolve BlockIDResolver) ([]string, error) {
 	resolved := blockIDs
 	if resolve != nil {
@@ -721,6 +726,9 @@ func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string
 		if cleanupErr := RemovePublishAttemptReferences(database, orgID, attemptID, staged); cleanupErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("rollback staged publish-attempt refs for %s: %w", attemptID, cleanupErr))
 		}
+		return nil, err
+	}
+	if err := FinishCheckedPublishAttempt(database, orgID, repoID, attemptID, staged); err != nil {
 		return nil, err
 	}
 	return staged, nil

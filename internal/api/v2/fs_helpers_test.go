@@ -1130,11 +1130,13 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 	oldAdd := stagePendingPublishedFilesAddReferencesFn
 	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
 	oldPersist := stagePendingPublishedFilesPersistFn
+	oldFinish := stagePendingPublishedFilesFinishCheckedFn
 	t.Cleanup(func() {
 		stagePendingPublishedFilesResolveFn = oldResolve
 		stagePendingPublishedFilesAddReferencesFn = oldAdd
 		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
 		stagePendingPublishedFilesPersistFn = oldPersist
+		stagePendingPublishedFilesFinishCheckedFn = oldFinish
 	})
 
 	persistCalls := 0
@@ -1184,6 +1186,17 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 		t.Fatalf("remove should not run on successful stage, got %s/%s %#v", orgID, attemptID, blockIDs)
 		return nil
 	}
+	finishCalls := 0
+	stagePendingPublishedFilesFinishCheckedFn = func(database *db.DB, orgID, repoID, attemptID string, staged []string) error {
+		finishCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" {
+			t.Fatalf("finish-checked args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, attemptID)
+		}
+		if len(staged) != 1 || staged[0] != "sha256-1" {
+			t.Fatalf("finish-checked staged = %#v, want []string{\"sha256-1\"}", staged)
+		}
+		return nil
+	}
 
 	pending := &pendingPublishedFile{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}}
 	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "commit-1", []*pendingPublishedFile{pending})
@@ -1199,6 +1212,9 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 	if persistCalls != 1 {
 		t.Fatalf("persistCalls = %d, want 1", persistCalls)
 	}
+	if finishCalls != 1 {
+		t.Fatalf("finishCalls = %d, want 1; R3 must run after a complete funnel-B stage", finishCalls)
+	}
 	if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
 		t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
 	}
@@ -1210,11 +1226,13 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 	oldAdd := stagePendingPublishedFilesAddReferencesFn
 	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
 	oldPersist := stagePendingPublishedFilesPersistFn
+	oldFinish := stagePendingPublishedFilesFinishCheckedFn
 	t.Cleanup(func() {
 		stagePendingPublishedFilesResolveFn = oldResolve
 		stagePendingPublishedFilesAddReferencesFn = oldAdd
 		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
 		stagePendingPublishedFilesPersistFn = oldPersist
+		stagePendingPublishedFilesFinishCheckedFn = oldFinish
 	})
 
 	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
@@ -1247,6 +1265,10 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 		}
 		return cleanupErr
 	}
+	stagePendingPublishedFilesFinishCheckedFn = func(database *db.DB, orgID, repoID, attemptID string, staged []string) error {
+		t.Fatalf("finish-checked must not run after a partial add failure, got %s/%s/%s %#v", orgID, repoID, attemptID, staged)
+		return nil
+	}
 
 	pending := []*pendingPublishedFile{
 		{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}},
@@ -1270,6 +1292,103 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 	}
 	if len(pending[1].internalBlockIDs) != 1 || pending[1].internalBlockIDs[0] != "resolved-sha1-2" {
 		t.Fatalf("pending[1].internalBlockIDs = %#v, want []string{\"resolved-sha1-2\"}", pending[1].internalBlockIDs)
+	}
+}
+
+func TestStagePendingPublishedFiles_FinishCheckedRunsAfterEveryAdd(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
+	oldFinish := stagePendingPublishedFilesFinishCheckedFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
+		stagePendingPublishedFilesFinishCheckedFn = oldFinish
+	})
+
+	var events []string
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
+		return []string{"resolved-" + blockIDs[0]}, nil
+	}
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		return nil
+	}
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		events = append(events, "add:"+strings.Join(blockIDs, ","))
+		return nil
+	}
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatalf("remove must not run on a successful finish-checked stage, got %#v", blockIDs)
+		return nil
+	}
+	stagePendingPublishedFilesFinishCheckedFn = func(database *db.DB, orgID, repoID, attemptID string, staged []string) error {
+		events = append(events, "check:"+strings.Join(staged, ","))
+		if len(staged) != 2 || staged[0] != "resolved-a" || staged[1] != "resolved-b" {
+			t.Fatalf("finish-checked staged = %#v, want both files of this attempt", staged)
+		}
+		return nil
+	}
+
+	pending := []*pendingPublishedFile{
+		{fsID: "fs-1", externalBlockIDs: []string{"a"}},
+		{fsID: "fs-2", externalBlockIDs: []string{"b"}},
+	}
+	if err := helper.stagePendingPublishedFiles("org-1", "repo-1", "attempt-1", pending); err != nil {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want nil", err)
+	}
+	want := []string{"add:resolved-a", "add:resolved-b", "check:resolved-a,resolved-b"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %#v, want %#v; R3 must run after every add, never before the first", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("events = %#v, want %#v; checking before a complete stage cannot close the refs==0 race", events, want)
+		}
+	}
+}
+
+func TestStagePendingPublishedFiles_FinishCheckedDenialIsNotSuccess(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
+	oldFinish := stagePendingPublishedFilesFinishCheckedFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
+		stagePendingPublishedFilesFinishCheckedFn = oldFinish
+	})
+
+	denied := fmt.Errorf("%w: deleting", db.ErrBlockPublishAuthorityDenied)
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID, libraryID string, blockIDs []string) ([]string, error) {
+		return []string{"sha256-1"}, nil
+	}
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		return nil
+	}
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		return nil
+	}
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatalf("funnel B must not double-rollback; FinishChecked already rolled back, got %#v", blockIDs)
+		return nil
+	}
+	stagePendingPublishedFilesFinishCheckedFn = func(database *db.DB, orgID, repoID, attemptID string, staged []string) error {
+		return denied
+	}
+
+	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "attempt-1", []*pendingPublishedFile{
+		{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}},
+	})
+	if !errors.Is(err, db.ErrBlockPublishAuthorityDenied) {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want ErrBlockPublishAuthorityDenied", err)
 	}
 }
 
