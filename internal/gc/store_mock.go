@@ -244,10 +244,12 @@ type MockStore struct {
 	// S3 orphan discovery rows keyed by the full projection PK.
 	s3OrphanProjections map[mockS3OrphanProjectionKey]S3OrphanDiscoveryInfo
 	// Durable D tombstones keyed by "orgID:blockID:claimID". Never deleted.
-	blockDeleteLifecycles     map[string]*blockDeleteLifecycleRow
-	commitHandoffErr          error
-	commitHandoffSettleErr    error
-	commitHandoffEmptyCASOnce bool
+	blockDeleteLifecycles                  map[string]*blockDeleteLifecycleRow
+	commitHandoffErr                       error
+	commitHandoffSettleErr                 error
+	pauseAfterLifecycleBeforeOrphan        chan struct{}
+	pauseAfterLifecycleBeforeOrphanEntered chan struct{}
+	commitHandoffEmptyCASOnce              bool
 }
 
 var _ GCStore = (*MockStore)(nil)
@@ -2970,14 +2972,17 @@ func (m *MockStore) classifyMockFinalizeAbsentRow(orgID uuid.UUID, blockID strin
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	existing, found := m.s3Orphans[key]
 	if found && existing.Authority.sameAuthority(proposed) {
-		life := m.blockDeleteLifecycles[mockBlockDeleteLifecycleKey(orgID, blockID, proposed.ClaimID)]
-		if life != nil && life.Phase == BlockDeleteLifecyclePhaseTerminal {
-			return BlockDeleteFinalizeResult{
-				Outcome: BlockDeleteAlreadyComplete,
-				Cause:   errors.New("lifecycle is terminal; physical delete is not authorized"),
-			}, errors.New("lifecycle is terminal; physical delete is not authorized")
+		var life blockDeleteLifecycleRow
+		lifeRow := m.blockDeleteLifecycles[mockBlockDeleteLifecycleKey(orgID, blockID, proposed.ClaimID)]
+		lifeFound := lifeRow != nil
+		if lifeFound {
+			life = *lifeRow
 		}
-		return BlockDeleteFinalizeResult{Outcome: BlockDeleteAlreadyFinalized}, nil
+		classified := classifyFinalizeAbsentLifecycle(life, lifeFound, nil, proposed, nil)
+		if classified.Outcome == BlockDeleteAlreadyFinalized {
+			return classified, nil
+		}
+		return classified, classified.Cause
 	}
 	return BlockDeleteFinalizeResult{
 		Outcome: BlockDeleteNotAuthority,
@@ -4601,14 +4606,28 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, auth
 		return result
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	lifecycle := m.insertMockBlockDeleteLifecycleLocked(orgID, blockID, proposed)
 	if lifecycle.Outcome == StartBlockDeleteOrphanLifecycleAdvanced {
+		m.mu.Unlock()
 		return lifecycle
 	}
 	if lifecycle.Outcome != StartBlockDeleteOrphanCreated && lifecycle.Outcome != StartBlockDeleteOrphanSameAuthority {
+		m.mu.Unlock()
 		return lifecycle
 	}
+	pause := m.pauseAfterLifecycleBeforeOrphan
+	entered := m.pauseAfterLifecycleBeforeOrphanEntered
+	if pause != nil {
+		m.pauseAfterLifecycleBeforeOrphan = nil
+		m.pauseAfterLifecycleBeforeOrphanEntered = nil
+		m.mu.Unlock()
+		if entered != nil {
+			close(entered)
+		}
+		<-pause
+		m.mu.Lock()
+	}
+	defer m.mu.Unlock()
 	result.Submitted = true
 	now = now.UTC()
 	externalSHA1 = strings.TrimSpace(externalSHA1)
@@ -4637,7 +4656,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, auth
 			return classified
 		}
 		if classified.Outcome == StartBlockDeleteOrphanSameAuthority {
-			return m.confirmSameAuthorityOrphanResultLocked(orgID, blockID, classified)
+			return m.confirmPublishedLifecycleAfterOrphanLocked(orgID, blockID, proposed, m.confirmSameAuthorityOrphanResultLocked(orgID, blockID, classified))
 		}
 		return classified
 	}
@@ -4656,7 +4675,7 @@ func (m *MockStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, auth
 	result.Outcome = StartBlockDeleteOrphanCreated
 	result.FirstSeenAt = orphan.FirstSeenAt
 	result.ExistingAuthority = proposed
-	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+	return m.confirmPublishedLifecycleAfterOrphanLocked(orgID, blockID, proposed, m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result))
 }
 
 func (m *MockStore) confirmSameAuthorityOrphanResultLocked(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
@@ -4673,6 +4692,58 @@ func (m *MockStore) confirmSameAuthorityOrphanResultLocked(orgID uuid.UUID, bloc
 		return result
 	}
 	return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)
+}
+
+func (m *MockStore) ObserveBlockDeleteLifecycle(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) StartBlockDeleteOrphanResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if authority.IsZero() {
+		return StartBlockDeleteOrphanResult{
+			Outcome: StartBlockDeleteOrphanInvalid,
+			Cause:   fmt.Errorf("observe lifecycle for org=%s block=%s without a complete committed delete authority", orgID, blockID),
+		}
+	}
+	return m.observeBlockDeleteLifecycleLocked(orgID, blockID, authority.Authority())
+}
+
+func (m *MockStore) observeBlockDeleteLifecycleLocked(orgID uuid.UUID, blockID string, proposed BlockDeleteAuthority) StartBlockDeleteOrphanResult {
+	if proposed.IsZero() {
+		return StartBlockDeleteOrphanResult{
+			Outcome: StartBlockDeleteOrphanInvalid,
+			Cause:   errors.New("observe lifecycle without a complete delete authority"),
+		}
+	}
+	row := m.blockDeleteLifecycles[mockBlockDeleteLifecycleKey(orgID, blockID, proposed.ClaimID)]
+	if row == nil {
+		return StartBlockDeleteOrphanResult{
+			Outcome: StartBlockDeleteOrphanNotPublished,
+			Cause:   errors.New("block-delete lifecycle row is absent"),
+		}
+	}
+	return classifyBlockDeleteLifecycleRow(*row, proposed)
+}
+
+func (m *MockStore) confirmPublishedLifecycleAfterOrphanLocked(orgID uuid.UUID, blockID string, proposed BlockDeleteAuthority, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	return confirmPublishedLifecycleCertificate(result, m.observeBlockDeleteLifecycleLocked(orgID, blockID, proposed))
+}
+
+// ForcePauseAfterLifecycleBeforeOrphanForTest parks StartBlockDeleteOrphan after
+// the durable D tombstone is inserted and before the orphan row. The lock is
+// released during the wait so a concurrent executor can terminate D.
+func (m *MockStore) ForcePauseAfterLifecycleBeforeOrphanForTest() (entered <-chan struct{}, resume func()) {
+	enteredCh := make(chan struct{})
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.pauseAfterLifecycleBeforeOrphan = gate
+	m.pauseAfterLifecycleBeforeOrphanEntered = enteredCh
+	m.mu.Unlock()
+	return enteredCh, func() { close(gate) }
+}
+
+func (m *MockStore) DropBlockDeleteLifecycleForTest(orgID uuid.UUID, blockID, claimID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blockDeleteLifecycles, mockBlockDeleteLifecycleKey(orgID, blockID, claimID))
 }
 
 func (m *MockStore) insertMockBlockDeleteLifecycleLocked(orgID uuid.UUID, blockID string, proposed BlockDeleteAuthority) StartBlockDeleteOrphanResult {

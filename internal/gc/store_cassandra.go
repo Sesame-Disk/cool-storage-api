@@ -2047,25 +2047,25 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 		SetSpeculativeExecutionPolicy(&gocql.NonSpeculativeExecution{}).
 		MapScanCAS(existing)
 	if err != nil {
-		return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, err)
+		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, err))
 	}
 	if applied {
 		result.Outcome = StartBlockDeleteOrphanCreated
 		result.FirstSeenAt = now
 		result.ExistingAuthority = proposed
-		return s.ensureS3OrphanProjectionResult(orgID, blockID, result)
+		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.ensureS3OrphanProjectionResult(orgID, blockID, result))
 	}
 
 	classified := classifyNonAppliedOrphanCAS(existing, proposed)
 	if classified.NeedsSettlement {
-		return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, nil)
+		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, nil))
 	}
 	classified.Result.Submitted = true
 	if classified.Result.Outcome == StartBlockDeleteOrphanInvalid && classified.Result.Cause != nil {
 		classified.Result.Cause = fmt.Errorf("classify existing S3 orphan for org=%s block=%s: %w", orgID, blockID, classified.Result.Cause)
 	}
 	if classified.Result.Outcome == StartBlockDeleteOrphanSameAuthority {
-		return s.confirmSameAuthorityOrphanResult(orgID, blockID, proposed, classified.Result)
+		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.confirmSameAuthorityOrphanResult(orgID, blockID, proposed, classified.Result))
 	}
 	return classified.Result
 }
@@ -2510,6 +2510,62 @@ func (s *CassandraStore) confirmSameAuthorityOrphanResult(orgID uuid.UUID, block
 		return confirmed
 	}
 	return s.ensureS3OrphanProjectionResult(orgID, blockID, confirmed)
+}
+
+// ObserveBlockDeleteLifecycle is the SERIAL settlement read of D's tombstone.
+// SameAuthority means published + exact (P, D). LifecycleAdvanced means terminal
+// + exact (P, D). Missing, mismatch, garbage and SERIAL failure fail closed.
+func (s *CassandraStore) ObserveBlockDeleteLifecycle(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) StartBlockDeleteOrphanResult {
+	if authority.IsZero() {
+		return StartBlockDeleteOrphanResult{
+			Outcome: StartBlockDeleteOrphanInvalid,
+			Cause:   fmt.Errorf("observe lifecycle for org=%s block=%s without a complete committed delete authority", orgID, blockID),
+		}
+	}
+	proposed := authority.Authority()
+	row, found, err := s.settleBlockDeleteLifecycleState(orgID, blockID, proposed.ClaimID)
+	if err != nil {
+		return StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanAmbiguous, Cause: err}
+	}
+	if !found {
+		return StartBlockDeleteOrphanResult{
+			Outcome: StartBlockDeleteOrphanNotPublished,
+			Cause:   errors.New("block-delete lifecycle row is absent"),
+		}
+	}
+	return classifyBlockDeleteLifecycleRow(row, proposed)
+}
+
+// confirmPublishedLifecycleAfterOrphan re-reads the durable D tombstone at SERIAL
+// after the orphan row is created or confirmed. A concurrent executor can have
+// advanced published → terminal in that window; Created/SameAuthority must not
+// survive that observation.
+func (s *CassandraStore) confirmPublishedLifecycleAfterOrphan(orgID uuid.UUID, blockID string, proposed BlockDeleteAuthority, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	return confirmPublishedLifecycleCertificate(result, s.ObserveBlockDeleteLifecycle(orgID, blockID, committedBlockDeleteAuthority(proposed)))
+}
+
+func confirmPublishedLifecycleCertificate(result, observed StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	if result.Outcome != StartBlockDeleteOrphanCreated && result.Outcome != StartBlockDeleteOrphanSameAuthority {
+		return result
+	}
+	switch observed.Outcome {
+	case StartBlockDeleteOrphanSameAuthority:
+		return result
+	case StartBlockDeleteOrphanLifecycleAdvanced:
+		observed.FirstSeenAt = result.FirstSeenAt
+		observed.Submitted = result.Submitted
+		return observed
+	default:
+		if observed.Outcome == StartBlockDeleteOrphanNotPublished {
+			observed.Outcome = StartBlockDeleteOrphanAmbiguous
+			if observed.Cause == nil {
+				observed.Cause = errors.New("lifecycle certificate disappeared after orphan publication")
+			}
+		}
+		observed.FirstSeenAt = result.FirstSeenAt
+		observed.Submitted = result.Submitted
+		return observed
+	}
 }
 
 func (s *CassandraStore) settleS3OrphanState(orgID uuid.UUID, blockID string) (s3OrphanCASRow, bool, error) {
@@ -3715,6 +3771,42 @@ func classifyFinalizeAgainstRow(row blockDeleteClaimRow, authority CommittedBloc
 	return result
 }
 
+// classifyFinalizeAbsentLifecycle is the positive certificate for AlreadyFinalized.
+// Cassandra and the mock must share this predicate. AlreadyFinalized is
+// classification only: it does not authorize processBlock to delete bytes.
+func classifyFinalizeAbsentLifecycle(life blockDeleteLifecycleRow, lifeFound bool, lifeErr error, proposed BlockDeleteAuthority, cause error) BlockDeleteFinalizeResult {
+	if lifeErr != nil {
+		return BlockDeleteFinalizeResult{Outcome: BlockDeleteFinalizeAmbiguous, Cause: lifeErr}
+	}
+	if !lifeFound {
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   errors.New("block-delete lifecycle certificate is absent"),
+		}
+	}
+	stored := BlockDeleteAuthority{Target: life.Target, ClaimID: life.ClaimID, ClaimedAt: life.ClaimedAt}
+	if !stored.sameAuthority(proposed) {
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteNotAuthority,
+			Cause:   errors.New("block-delete lifecycle certificate does not match the proposed (P, D)"),
+		}
+	}
+	switch life.Phase {
+	case BlockDeleteLifecyclePhasePublished:
+		return BlockDeleteFinalizeResult{Outcome: BlockDeleteAlreadyFinalized, Cause: cause}
+	case BlockDeleteLifecyclePhaseTerminal:
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteAlreadyComplete,
+			Cause:   errors.New("lifecycle is terminal; physical delete is not authorized"),
+		}
+	default:
+		return BlockDeleteFinalizeResult{
+			Outcome: BlockDeleteInvalid,
+			Cause:   fmt.Errorf("block-delete lifecycle phase %q is not a known published/terminal value", life.Phase),
+		}
+	}
+}
+
 func (s *CassandraStore) classifyFinalizeAbsentRow(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority, cause error) (BlockDeleteFinalizeResult, error) {
 	info, found, err := s.GetS3OrphanGlobal(orgID, blockID)
 	if err != nil {
@@ -3724,20 +3816,16 @@ func (s *CassandraStore) classifyFinalizeAbsentRow(orgID uuid.UUID, blockID stri
 		}, fmt.Errorf("finalize block %s: row absent and orphan visibility failed: %w", blockID, err)
 	}
 	if found && info.Authority.sameAuthority(authority.Authority()) {
-		life, lifeFound, lifeErr := s.readBlockDeleteLifecycle(orgID, blockID, authority.Authority().ClaimID)
-		if lifeErr != nil {
-			return BlockDeleteFinalizeResult{
-				Outcome: BlockDeleteFinalizeAmbiguous,
-				Cause:   fmt.Errorf("finalize block %s: row absent and lifecycle visibility failed: %w", blockID, lifeErr),
-			}, fmt.Errorf("finalize block %s: row absent and lifecycle visibility failed: %w", blockID, lifeErr)
+		life, lifeFound, lifeErr := s.settleBlockDeleteLifecycleState(orgID, blockID, authority.Authority().ClaimID)
+		classified := classifyFinalizeAbsentLifecycle(life, lifeFound, lifeErr, authority.Authority(), cause)
+		if classified.Cause != nil && classified.Outcome != BlockDeleteAlreadyFinalized {
+			classified.Cause = fmt.Errorf("finalize block %s: %w", blockID, classified.Cause)
 		}
-		if lifeFound && life.Phase == BlockDeleteLifecyclePhaseTerminal {
-			return BlockDeleteFinalizeResult{
-				Outcome: BlockDeleteAlreadyComplete,
-				Cause:   cause,
-			}, fmt.Errorf("finalize block %s: lifecycle is terminal; physical delete is not authorized", blockID)
+		if classified.Outcome == BlockDeleteAlreadyFinalized {
+			classified.Cause = cause
+			return classified, nil
 		}
-		return BlockDeleteFinalizeResult{Outcome: BlockDeleteAlreadyFinalized, Cause: cause}, nil
+		return classified, classified.Cause
 	}
 	result := BlockDeleteFinalizeResult{
 		Outcome: BlockDeleteNotAuthority,

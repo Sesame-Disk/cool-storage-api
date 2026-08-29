@@ -766,6 +766,12 @@ type Worker struct {
 	// topologyGateMu protects the short-lived cache of a PASSING gate result.
 	topologyGateMu      sync.Mutex
 	topologyGateOKUntil time.Time
+
+	// Test-only barriers. Production leaves them nil.
+	pauseBeforeFinalize        chan struct{}
+	pauseBeforeFinalizeEntered chan struct{}
+	pauseAfterFinalize         chan struct{}
+	pauseAfterFinalizeEntered  chan struct{}
 }
 
 // destructiveTopologyGateTTL is how long a PASSING topology gate result may be
@@ -884,6 +890,36 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 	}
 	worker.dryRun.Store(dryRun)
 	return worker
+}
+
+// PauseBeforeFinalizeForTest parks processBlock immediately before FinalizeBlockDelete.
+func (w *Worker) PauseBeforeFinalizeForTest() (entered <-chan struct{}, resume func()) {
+	enteredCh := make(chan struct{})
+	gate := make(chan struct{})
+	w.pauseBeforeFinalizeEntered = enteredCh
+	w.pauseBeforeFinalize = gate
+	return enteredCh, func() { close(gate) }
+}
+
+// PauseAfterFinalizeForTest parks processBlock after FinalizeBlockDelete returns and
+// before any physical delete decision.
+func (w *Worker) PauseAfterFinalizeForTest() (entered <-chan struct{}, resume func()) {
+	enteredCh := make(chan struct{})
+	gate := make(chan struct{})
+	w.pauseAfterFinalizeEntered = enteredCh
+	w.pauseAfterFinalize = gate
+	return enteredCh, func() { close(gate) }
+}
+
+func waitWorkerTestPause(entered *chan struct{}, gate chan struct{}) {
+	if gate == nil {
+		return
+	}
+	if entered != nil && *entered != nil {
+		close(*entered)
+		*entered = nil
+	}
+	<-gate
 }
 
 // SetDestructiveTopologyGate overrides the check that must pass before this worker
@@ -1837,8 +1873,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// 4. Now remove the claimed DB row. After handoff this cannot spend a retry or
 	// reach the DLQ: the stored (P, D) must stay standing until finalize applies.
+	waitWorkerTestPause(&w.pauseBeforeFinalizeEntered, w.pauseBeforeFinalize)
 	finalized, finalizeErr := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, committedBlockDeleteAuthority(deleteAuthority))
-	if !finalized.ok() {
+	waitWorkerTestPause(&w.pauseAfterFinalizeEntered, w.pauseAfterFinalize)
+	if !finalized.authorizesPhysicalDelete() {
 		cause := finalizeErr
 		if cause == nil {
 			cause = finalized.Cause
@@ -2237,6 +2275,42 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					log.Printf("[GC Worker] S3 orphan recovery: canonical row has unsupported recovery phase %q for org=%s block=%s; retaining cursor", phase, canonical.OrgID, canonical.BlockID)
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("unsupported canonical S3 orphan recovery phase %q for org=%s block=%s", phase, canonical.OrgID, canonical.BlockID)
+					}
+					continue
+				}
+				lifecycle := w.store.ObserveBlockDeleteLifecycle(canonical.OrgID, canonical.BlockID, committedBlockDeleteAuthority(canonical.Authority))
+				switch lifecycle.Outcome {
+				case StartBlockDeleteOrphanSameAuthority:
+					// published + exact (P, D): continue the existing pending_s3 path.
+				case StartBlockDeleteOrphanLifecycleAdvanced:
+					canonicalCommit, reloadErr := reloadCanonical(canonical)
+					if reloadErr != nil {
+						w.recordS3OrphanCanonicalReloadFailure(reloadErr)
+						log.Printf("[GC Worker] S3 orphan recovery: refusing stale-orphan clear for %s after canonical reload: %v", canonical.BlockID, reloadErr)
+						if phaseErr == nil {
+							phaseErr = reloadErr
+						}
+						continue
+					}
+					if err := w.terminateThenDeleteS3Orphan(canonicalCommit.OrgID, canonicalCommit.BlockID, canonicalCommit.FirstSeenAt, committedBlockDeleteAuthority(canonicalCommit.Authority)); err != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: failed to clear terminal-lifecycle orphan row %s: %v", canonicalCommit.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("clear terminal-lifecycle S3 orphan row for block %s: %w", canonicalCommit.BlockID, err)
+						}
+						continue
+					}
+					recovered++
+					metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+					log.Printf("[GC Worker] Cleared stale pending_s3 orphan for terminal lifecycle %s (org=%s); physical delete not authorized", canonicalCommit.BlockID, canonicalCommit.OrgID)
+					continue
+				default:
+					log.Printf("[GC Worker] S3 orphan recovery: lifecycle observation %s for org=%s block=%s; failing closed before S3: %v", lifecycle.Outcome, canonical.OrgID, canonical.BlockID, lifecycle.Cause)
+					if phaseErr == nil {
+						cause := lifecycle.Cause
+						if cause == nil {
+							cause = fmt.Errorf("lifecycle observation %s", lifecycle.Outcome)
+						}
+						phaseErr = fmt.Errorf("S3 orphan recovery refused for org=%s block=%s: %w", canonical.OrgID, canonical.BlockID, cause)
 					}
 					continue
 				}

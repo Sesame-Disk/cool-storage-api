@@ -163,15 +163,20 @@ canonical `EACH_QUORUM` visibility; an empty non-applied handoff CAS SERIAL-sett
 After commit: no release, takeover, Complete, Requeue, Fail, or retry++. `CommittedOwner`
 revalidates locator/store/topology, then treats `BlockHasReferencesGlobal` as a
 contradiction detector (error or refs>0 → `committed_pending`; R3 stays OPEN). Orphan
-publication INSERTs the lifecycle tombstone first; terminal D cannot recreate the orphan
-or authorize S3. Finalize `AlreadyFinalized` does not authorize S3 when the tombstone is
-terminal. Production `DeleteS3Orphan` runs only after `published → terminal`. Evidence:
-unit + `scripts/p4b-authority-mutation-validation.sh`; real Cassandra
-`internal/integration/p4b_claim_orphan_authority_test.go` under
+publication INSERTs the lifecycle tombstone first and SERIAL-re-reads it after the
+orphan INSERT; terminal D cannot recreate an authorizing orphan. Finalize
+`AlreadyFinalized` requires an exact published `(P,D)` certificate and does **not**
+authorize S3 — only applied `Finalized` does. Missing/mismatch/garbage certificates
+fail closed. `RecoverS3Orphans` `pending_s3` SERIAL-observes D before S3 and will not
+DELETE against terminal (stale-orphan clear is allowed). Production `DeleteS3Orphan`
+runs only after `published → terminal`. Never-delete lifecycle partitions grow by one
+row per D (operational follow-up). Evidence: unit + `scripts/p4b-authority-mutation-validation.sh`;
+real Cassandra `internal/integration/p4b_claim_orphan_authority_test.go` under
 `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`. 3-DC P3 fail-closed: with dc-na down,
 `CommitBlockDeleteOrphanHandoff` from dc-eu is Ambiguous, not
 Committed/AlreadyCommitted. P4b-1's write-once script stays
-`scripts/p4b-mutation-validation.sh`. X1 stays OPEN. `GC_ENABLED=false`.
+`scripts/p4b-mutation-validation.sh`. X1 stays OPEN (winner-`Finalized` Physical ABA
+is not closed here). `GC_ENABLED=false`.
 
 ### Inter-session Update (2026-05-21)
 

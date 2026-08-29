@@ -968,9 +968,11 @@ docker compose run --rm --build gotest bash scripts/p4b-mutation-validation.sh
 
 P4b-2 / R14b adds the irreversible orphan-handoff commit and exact `(P, D)` binding,
 plus the audit-closure tombstone on `gc_block_delete_lifecycles` (migration `020`).
-`AlreadyCommitted` / `CommittedOwner` require `EACH_QUORUM` visibility; a terminal
-lifecycle cannot recreate the orphan or authorize S3. Its sibling mutation script
-must stay red when those predicates are removed:
+`AlreadyCommitted` / `CommittedOwner` require `EACH_QUORUM` visibility. `AlreadyFinalized`
+is classification only (exact published certificate); only applied `Finalized`
+authorizes `processBlock` S3. Publication SERIAL-re-reads the tombstone after the
+orphan INSERT; `pending_s3` recovery SERIAL-observes D before S3. Its sibling
+mutation script must stay red when those predicates are removed:
 
 ```bash
 docker compose run --rm --build gotest bash scripts/p4b-authority-mutation-validation.sh
@@ -982,7 +984,8 @@ The real-Cassandra legs are `TestP4B_OrphanPublicationIsWriteOnceAtRealCassandra
 `TestP4B_CanonicalOrphanReadRepairIsBlocking`,
 `TestP4B_ClaimOrphanAuthorityIsBoundAtRealCassandra`, and the P4b-2 audit legs in
 the same file (late loser, crash post-handoff, crash post-orphan, second
-`CommitHandoff`, finalize vs terminal, P1/P2, replay-after-terminal).
+`CommitHandoff`, finalize vs terminal, P1/P2, replay-after-terminal,
+recovery terminal+orphan does not DELETE S3).
 The standard integration containers run them with `SESAMEFS_REQUIRE_P4B_EVIDENCE=1`.
 P4a pins the same effective `read_repair=BLOCKING` contract on `blocks` via
 `TestP4A_CanonicalBlockReadRepairIsBlocking` under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1`,

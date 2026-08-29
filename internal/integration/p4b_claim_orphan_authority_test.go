@@ -3,6 +3,9 @@
 package integration
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -262,6 +265,9 @@ func TestP4B_FinalizeAlreadyFinalizedRequiresNonTerminalLifecycleAtRealCassandra
 	if err != nil || second.Outcome != gcpkg.BlockDeleteAlreadyFinalized {
 		t.Fatalf("second finalize while published = %+v, %v; want already_finalized", second, err)
 	}
+	if p4bFinalizeAuthorizesPhysicalDelete(second) {
+		t.Fatal("AlreadyFinalized must not authorize physical delete")
+	}
 	if _, err := store.TerminateBlockDeleteLifecycle(orgID, blockID, committed); err != nil {
 		t.Fatalf("terminate: %v", err)
 	}
@@ -373,7 +379,7 @@ func TestP4B_ReplayAfterTerminalDoesNotDeleteP1AtRealCassandra(t *testing.T) {
 }
 
 func p4bFinalizeAuthorizesPhysicalDelete(result gcpkg.BlockDeleteFinalizeResult) bool {
-	return result.Outcome == gcpkg.BlockDeleteFinalized || result.Outcome == gcpkg.BlockDeleteAlreadyFinalized
+	return result.Outcome == gcpkg.BlockDeleteFinalized
 }
 
 func p4bLifecyclePhaseForTest(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID, claimID string) string {
@@ -387,4 +393,39 @@ func p4bLifecyclePhaseForTest(t *testing.T, database *dbpkg.DB, orgID uuid.UUID,
 		t.Fatalf("read lifecycle phase: %v", err)
 	}
 	return phase
+}
+
+func TestP4B_RecoverS3OrphansTerminalLifecycleDoesNotDeleteAtRealCassandra(t *testing.T) {
+	requireCassandra(t)
+	gate := p4bRequireEvidence(t)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	sum := sha256.Sum256([]byte("p4b-recovery-terminal-" + uuid.NewString()))
+	blockID := hex.EncodeToString(sum[:])
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-recover", "prev", time.Now().UTC())
+	committed := testCommittedOrphanAuthority(blockID, "hot", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID))
+	if _, err := store.TerminateBlockDeleteLifecycle(orgID, blockID, committed); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	t.Cleanup(func() { _ = store.DeleteS3Orphan(orgID, blockID, firstSeenAt) })
+
+	observed := store.ObserveBlockDeleteLifecycle(orgID, blockID, committed)
+	if observed.Outcome != gcpkg.StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("observe terminal lifecycle = %s, want lifecycle_advanced: %v", observed.Outcome, observed.Cause)
+	}
+
+	sp := &gcpkg.MockStorageProvider{}
+	w := gcpkg.NewWorker(store, sp, gcpkg.NewQueue(store), 100, 0, false, &gcpkg.Stats{})
+	w.SetDestructiveTopologyGate(func() error { return nil })
+	if _, err := w.RecoverS3Orphans(context.Background(), 100); err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("terminal lifecycle must not authorize recovery S3: %v", got)
+	}
+	if _, found, err := store.GetS3OrphanGlobal(orgID, blockID); err != nil || found {
+		t.Fatalf("stale pending_s3 orphan should be cleared: found=%v err=%v", found, err)
+	}
+	gate.observed = true
 }

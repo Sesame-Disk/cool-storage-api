@@ -186,11 +186,9 @@ m_committed_owner_skips_refs() {
 
 m_orphan_skips_lifecycle() {
   mutate "$STORE" 's#lifecycle := s\.insertBlockDeleteLifecycle\(orgID, blockID, proposed\)\s+if lifecycle\.Outcome == StartBlockDeleteOrphanLifecycleAdvanced \{\s+return lifecycle\s+\}\s+if lifecycle\.Outcome != StartBlockDeleteOrphanCreated && lifecycle\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+return lifecycle\s+\}\s+##'
-  mutate "$MOCK" 's#lifecycle := m\.insertMockBlockDeleteLifecycleLocked\(orgID, blockID, proposed\)\s+if lifecycle\.Outcome == StartBlockDeleteOrphanLifecycleAdvanced \{\s+return lifecycle\s+\}\s+if lifecycle\.Outcome != StartBlockDeleteOrphanCreated && lifecycle\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+return lifecycle\s+\}\s+##'
+  mutate "$MOCK" 's#lifecycle := m\.insertMockBlockDeleteLifecycleLocked\(orgID, blockID, proposed\)\s+if lifecycle\.Outcome == StartBlockDeleteOrphanLifecycleAdvanced \{\s+m\.mu\.Unlock\(\)\s+return lifecycle\s+\}\s+if lifecycle\.Outcome != StartBlockDeleteOrphanCreated && lifecycle\.Outcome != StartBlockDeleteOrphanSameAuthority \{\s+m\.mu\.Unlock\(\)\s+return lifecycle\s+\}\s+##'
   expect_red 'TestP4B_StartBlockDeleteOrphanSourceContract' 'must insert the durable D tombstone' \
     'StartBlockDeleteOrphan no longer inserts the lifecycle tombstone'
-  expect_red 'TestP4B_WorkerAlreadyFinalizedWithTerminalLifecycleDoesNotDeleteS3' 'must not authorize physical delete' \
-    'mock StartBlockDeleteOrphan no longer consults the lifecycle tombstone'
   restore
 }
 
@@ -203,10 +201,51 @@ m_clear_orphan_skips_terminal() {
 
 m_terminal_lifecycle_is_same_authority() {
   mutate "$STORE" 's#case BlockDeleteLifecyclePhaseTerminal:\s+result\.Outcome = StartBlockDeleteOrphanLifecycleAdvanced\s+result\.Cause = errors\.New\("block-delete lifecycle is terminal; D is no longer destructive authority"\)#case BlockDeleteLifecyclePhaseTerminal:\n\t\tresult.Outcome = StartBlockDeleteOrphanSameAuthority#'
-  mutate "$STORE" 's#if lifeFound && life\.Phase == BlockDeleteLifecyclePhaseTerminal#if false && lifeFound && life.Phase == BlockDeleteLifecyclePhaseTerminal#'
-  mutate "$MOCK" 's#if life != nil && life\.Phase == BlockDeleteLifecyclePhaseTerminal#if false && life != nil && life.Phase == BlockDeleteLifecyclePhaseTerminal#'
+  mutate "$STORE" 's#case BlockDeleteLifecyclePhaseTerminal:\s+return BlockDeleteFinalizeResult\{\s+Outcome: BlockDeleteAlreadyComplete,\s+Cause:   errors\.New\("lifecycle is terminal; physical delete is not authorized"\),\s+\}#case BlockDeleteLifecyclePhaseTerminal:\n\t\treturn BlockDeleteFinalizeResult{Outcome: BlockDeleteAlreadyFinalized, Cause: cause}#'
   expect_red 'TestP4B_AlreadyFinalizedDoesNotAuthorizeWhenLifecycleTerminal' 'want already_complete' \
     'phase=terminal is treated as SameAuthority / AlreadyFinalized that authorizes S3'
+  restore
+}
+
+m_finalize_ignores_lifecycle_certificate() {
+  mutate "$STORE" 's#if !lifeFound \{\s+return BlockDeleteFinalizeResult\{\s+Outcome: BlockDeleteNotAuthority#if false \&\& !lifeFound {\n\treturn BlockDeleteFinalizeResult{\n\t\tOutcome: BlockDeleteNotAuthority#'
+  mutate "$STORE" 's#if !stored\.sameAuthority\(proposed\) \{\s+return BlockDeleteFinalizeResult\{\s+Outcome: BlockDeleteNotAuthority#if false \&\& !stored.sameAuthority(proposed) {\n\treturn BlockDeleteFinalizeResult{\n\t\tOutcome: BlockDeleteNotAuthority#'
+  mutate "$STORE" 's#default:\s+return BlockDeleteFinalizeResult\{\s+Outcome: BlockDeleteInvalid#default:\n\t\treturn BlockDeleteFinalizeResult{\n\t\t\tOutcome: BlockDeleteAlreadyFinalized#'
+  expect_red 'TestP4B_FinalizeAbsentRequiresExactPublishedLifecycleCertificate' 'want fail-closed' \
+    'missing/mismatch/garbage lifecycle still yields AlreadyFinalized'
+  restore
+}
+
+m_already_finalized_authorizes_s3() {
+  mutate "$WORKER" 's#finalized\.authorizesPhysicalDelete\(\)#finalized.ok()#'
+  expect_red 'TestP4B_WorkerAlreadyFinalizedLoserDoesNotDeleteP1AfterWriterPut' 'AlreadyFinalized must not emit a second DELETE of P1' \
+    'AlreadyFinalized is treated as permission to delete bytes'
+  restore
+}
+
+m_orphan_skips_lifecycle_postcheck() {
+  mutate "$STORE" 's#return s\.confirmPublishedLifecycleAfterOrphan\(orgID, blockID, proposed, s\.ensureS3OrphanProjectionResult\(orgID, blockID, result\)\)#return s.ensureS3OrphanProjectionResult(orgID, blockID, result)#'
+  mutate "$STORE" 's#return s\.confirmPublishedLifecycleAfterOrphan\(orgID, blockID, proposed, s\.confirmSameAuthorityOrphanResult\(orgID, blockID, proposed, classified\.Result\)\)#return s.confirmSameAuthorityOrphanResult(orgID, blockID, proposed, classified.Result)#'
+  mutate "$STORE" 's#return s\.confirmPublishedLifecycleAfterOrphan\(orgID, blockID, proposed, s\.settleStartBlockDeleteOrphan\(orgID, blockID, proposed, err\)\)#return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, err)#'
+  mutate "$STORE" 's#return s\.confirmPublishedLifecycleAfterOrphan\(orgID, blockID, proposed, s\.settleStartBlockDeleteOrphan\(orgID, blockID, proposed, nil\)\)#return s.settleStartBlockDeleteOrphan(orgID, blockID, proposed, nil)#'
+  mutate "$MOCK" 's#return m\.confirmPublishedLifecycleAfterOrphanLocked\(orgID, blockID, proposed, m\.confirmSameAuthorityOrphanResultLocked\(orgID, blockID, classified\)\)#return m.confirmSameAuthorityOrphanResultLocked(orgID, blockID, classified)#'
+  mutate "$MOCK" 's#return m\.confirmPublishedLifecycleAfterOrphanLocked\(orgID, blockID, proposed, m\.ensureS3OrphanProjectionResultLocked\(orgID, blockID, result\)\)#return m.ensureS3OrphanProjectionResultLocked(orgID, blockID, result)#'
+  expect_red 'TestP4B_StartBlockDeleteOrphanPostCheckSeesTerminalAfterPublicationRace' 'must not return Created' \
+    'StartBlockDeleteOrphan no longer SERIAL-checks the lifecycle after orphan INSERT'
+  restore
+}
+
+m_recovery_ignores_terminal_lifecycle() {
+  mutate "$WORKER" 's#lifecycle := w\.store\.ObserveBlockDeleteLifecycle\(canonical\.OrgID, canonical\.BlockID, committedBlockDeleteAuthority\(canonical\.Authority\)\)#lifecycle := StartBlockDeleteOrphanResult{Outcome: StartBlockDeleteOrphanSameAuthority}#'
+  expect_red 'TestP4B_RecoverS3OrphansTerminalLifecycleDoesNotDeleteS3' 'must not authorize recovery S3' \
+    'pending_s3 recovery ignores a terminal lifecycle tombstone'
+  restore
+}
+
+m_lifecycle_veto_uses_each_quorum() {
+  mutate "$STORE" 's{(func \(s \*CassandraStore\) settleBlockDeleteLifecycleState.*?Consistency\()gocql\.Serial}{$1gocql.EachQuorum}s'
+  expect_red 'TestP4B_InsertBlockDeleteLifecycleSourceContract' 'must read at Consistency(gocql.Serial)' \
+    'lifecycle decision reads are downgraded from SERIAL to EACH_QUORUM'
   restore
 }
 
@@ -230,6 +269,11 @@ MUTATIONS=(
   m_orphan_skips_lifecycle
   m_clear_orphan_skips_terminal
   m_terminal_lifecycle_is_same_authority
+  m_finalize_ignores_lifecycle_certificate
+  m_already_finalized_authorizes_s3
+  m_orphan_skips_lifecycle_postcheck
+  m_recovery_ignores_terminal_lifecycle
+  m_lifecycle_veto_uses_each_quorum
 )
 
 if [ "${1:-}" = "--list" ]; then

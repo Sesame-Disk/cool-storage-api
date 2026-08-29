@@ -42,6 +42,38 @@ func TestP4B_InsertBlockDeleteLifecycleSourceContract(t *testing.T) {
 	if !strings.Contains(terminate, "IF phase = ?") {
 		t.Fatal("lifecycle terminate must condition on the published phase")
 	}
+
+	absent := formattedGCFunction(t, file, "classifyFinalizeAbsentRow")
+	if !strings.Contains(absent, "settleBlockDeleteLifecycleState") {
+		t.Fatal("absent-row finalize must classify from a SERIAL lifecycle settlement")
+	}
+	if !strings.Contains(absent, "classifyFinalizeAbsentLifecycle") {
+		t.Fatal("absent-row finalize must use the shared lifecycle certificate")
+	}
+	if strings.Contains(absent, "readBlockDeleteLifecycle") {
+		t.Fatal("absent-row finalize must not classify from an EACH_QUORUM lifecycle read")
+	}
+
+	observe := formattedGCFunction(t, file, "ObserveBlockDeleteLifecycle")
+	if !strings.Contains(observe, "settleBlockDeleteLifecycleState") {
+		t.Fatal("ObserveBlockDeleteLifecycle must settle in the SERIAL domain")
+	}
+	if strings.Contains(observe, "readBlockDeleteLifecycle") {
+		t.Fatal("ObserveBlockDeleteLifecycle must not use the EACH_QUORUM lifecycle read")
+	}
+
+	post := formattedGCFunction(t, file, "confirmPublishedLifecycleAfterOrphan")
+	if !strings.Contains(post, "ObserveBlockDeleteLifecycle") && !strings.Contains(post, "settleBlockDeleteLifecycleState") {
+		t.Fatal("orphan publication post-check must SERIAL-observe the lifecycle tombstone")
+	}
+
+	settle := findGCFunction(file, "settleBlockDeleteLifecycleState")
+	if settle == nil {
+		t.Fatal("settleBlockDeleteLifecycleState not found")
+	}
+	if !gcQueryMethodHas(settle, "FROM gc_block_delete_lifecycles", "Consistency", "Serial") {
+		t.Fatal("settleBlockDeleteLifecycleState must read at Consistency(gocql.Serial)")
+	}
 }
 
 func TestP4B_LifecycleTableIsNotFoldedIntoInitialSchema(t *testing.T) {
@@ -106,6 +138,26 @@ func TestP4B_ProcessBlockCommittedOwnerRechecksRefs(t *testing.T) {
 	}
 	if strings.Count(string(source), "w.store.DeleteS3Orphan") != 1 {
 		t.Fatal("production DeleteS3Orphan must only run from terminateThenDeleteS3Orphan")
+	}
+	if !strings.Contains(text, "authorizesPhysicalDelete") {
+		t.Fatal("processBlock must require an applied Finalized outcome before S3")
+	}
+	if strings.Index(text, "authorizesPhysicalDelete") > strings.Index(text, "deleteS3WithRetry") {
+		t.Fatal("authorizesPhysicalDelete must gate deleteS3WithRetry")
+	}
+	if strings.Contains(text, "if !finalized.ok()") {
+		t.Fatal("processBlock must not treat AlreadyFinalized as S3 permission via ok()")
+	}
+
+	recovery := formattedGCFunction(t, file, "RecoverS3Orphans")
+	if !strings.Contains(recovery, "ObserveBlockDeleteLifecycle") {
+		t.Fatal("pending_s3 recovery must observe the SERIAL lifecycle tombstone before S3")
+	}
+	if strings.Index(recovery, "ObserveBlockDeleteLifecycle") > strings.Index(recovery, "DeleteBlockByStorageKey") {
+		t.Fatal("recovery must veto terminal D before DeleteBlockByStorageKey")
+	}
+	if strings.Contains(recovery, "readBlockDeleteLifecycle") {
+		t.Fatal("recovery must not classify destruction from an EACH_QUORUM lifecycle read")
 	}
 }
 
@@ -444,6 +496,253 @@ func TestP4B_CommittedP1DoesNotPublishOrFinalizeP2(t *testing.T) {
 	if blk := store.GetBlock(orgID, blockID); blk == nil || blk.GCClaimID != "d1" {
 		t.Fatalf("P2 lifecycle disturbed P1: %+v", blk)
 	}
+}
+
+func TestP4B_FinalizeAbsentRequiresExactPublishedLifecycleCertificate(t *testing.T) {
+	orgID := uuid.New()
+	blockID := "blk-cert"
+	d1 := testDeleteAuthority(blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID))
+	committed := committedBlockDeleteAuthority(d1)
+	firstSeen := time.Now().UTC().Truncate(time.Millisecond)
+
+	t.Run("missing_lifecycle", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		store.DropBlockDeleteLifecycleForTest(orgID, blockID, d1.ClaimID)
+		finalized, _ := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if finalized.ok() || finalized.authorizesPhysicalDelete() || finalized.Outcome == BlockDeleteAlreadyFinalized {
+			t.Fatalf("missing lifecycle = %+v; want fail-closed, not already_finalized", finalized)
+		}
+	})
+	t.Run("claimed_at_mismatch", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		other := d1
+		other.ClaimedAt = d1.ClaimedAt.Add(time.Second)
+		store.SeedBlockDeleteLifecycleForTest(orgID, blockID, other, BlockDeleteLifecyclePhasePublished)
+		finalized, _ := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if finalized.ok() || finalized.authorizesPhysicalDelete() || finalized.Outcome == BlockDeleteAlreadyFinalized {
+			t.Fatalf("claimed_at mismatch = %+v; want fail-closed", finalized)
+		}
+	})
+	t.Run("physical_mismatch", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		other := d1
+		other.Target.StorageKey = d1.Target.StorageKey + ".p2"
+		store.SeedBlockDeleteLifecycleForTest(orgID, blockID, other, BlockDeleteLifecyclePhasePublished)
+		finalized, _ := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if finalized.ok() || finalized.authorizesPhysicalDelete() || finalized.Outcome == BlockDeleteAlreadyFinalized {
+			t.Fatalf("P mismatch = %+v; want fail-closed", finalized)
+		}
+	})
+	t.Run("garbage_phase", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		store.SeedBlockDeleteLifecycleForTest(orgID, blockID, d1, "garbage")
+		finalized, _ := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if finalized.ok() || finalized.authorizesPhysicalDelete() || finalized.Outcome == BlockDeleteAlreadyFinalized {
+			t.Fatalf("garbage phase = %+v; want fail-closed", finalized)
+		}
+		if finalized.Outcome != BlockDeleteInvalid {
+			t.Fatalf("garbage phase outcome = %s, want invalid", finalized.Outcome)
+		}
+	})
+	t.Run("published_already_finalized_is_not_physical_authority", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		finalized, err := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if err != nil || finalized.Outcome != BlockDeleteAlreadyFinalized {
+			t.Fatalf("published certificate = %+v, %v; want already_finalized", finalized, err)
+		}
+		if finalized.authorizesPhysicalDelete() {
+			t.Fatal("AlreadyFinalized must not authorize physical delete")
+		}
+		if !finalized.ok() {
+			t.Fatal("AlreadyFinalized remains ok() for classification; physical delete uses authorizesPhysicalDelete")
+		}
+	})
+	t.Run("terminal_already_complete", func(t *testing.T) {
+		store := NewMockStore()
+		if result := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", firstSeen); result.Outcome != StartBlockDeleteOrphanCreated {
+			t.Fatalf("publish = %s: %v", result.Outcome, result.Cause)
+		}
+		if _, err := store.TerminateBlockDeleteLifecycle(orgID, blockID, committed); err != nil {
+			t.Fatalf("terminate: %v", err)
+		}
+		finalized, _ := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if finalized.Outcome != BlockDeleteAlreadyComplete || finalized.ok() || finalized.authorizesPhysicalDelete() {
+			t.Fatalf("terminal = %+v; want already_complete", finalized)
+		}
+	})
+}
+
+func TestP4B_StartBlockDeleteOrphanPostCheckSeesTerminalAfterPublicationRace(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	blockID := "blk-toctou"
+	d1 := testDeleteAuthority(blockID, "hot", MockCanonicalStorageKey(orgID.String(), blockID))
+	committed := committedBlockDeleteAuthority(d1)
+	created := store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1", time.Now().UTC().Truncate(time.Millisecond))
+	if created.Outcome != StartBlockDeleteOrphanCreated {
+		t.Fatalf("A publish = %s: %v", created.Outcome, created.Cause)
+	}
+
+	entered, resume := store.ForcePauseAfterLifecycleBeforeOrphanForTest()
+	done := make(chan StartBlockDeleteOrphanResult, 1)
+	go func() {
+		done <- store.StartBlockDeleteOrphan(orgID, blockID, committed, "sha1-b", time.Now().UTC())
+	}()
+	waitP4BTestChan(t, entered, "B did not pause after lifecycle INSERT")
+	if _, err := store.TerminateBlockDeleteLifecycle(orgID, blockID, committed); err != nil {
+		t.Fatalf("A terminate: %v", err)
+	}
+	if err := store.DeleteS3Orphan(orgID, blockID, created.FirstSeenAt); err != nil {
+		t.Fatalf("A clear orphan: %v", err)
+	}
+	resume()
+	b := waitP4BTestResult(t, done, "B StartBlockDeleteOrphan")
+	if b.Outcome == StartBlockDeleteOrphanCreated || b.Outcome == StartBlockDeleteOrphanSameAuthority {
+		t.Fatalf("B after terminal D = %s; must not return Created/SameAuthority after the SERIAL post-check", b.Outcome)
+	}
+	if b.Outcome != StartBlockDeleteOrphanLifecycleAdvanced {
+		t.Fatalf("B after terminal D = %s, want lifecycle_advanced", b.Outcome)
+	}
+}
+
+func TestP4B_WorkerAlreadyFinalizedLoserDoesNotDeleteP1AfterWriterPut(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	wA := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	wB := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("p4b-already-finalized-loser")
+	store.AddBlock(orgID, blockID, "hot", 0)
+	candidateAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	ensureAndEnqueueBlockForTest(t, store, orgID, blockID, "hot", candidateAt, 0)
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("queue depth = %d, want 1", len(items))
+	}
+	item := items[0]
+	p1Key := MockCanonicalStorageKey(orgID.String(), blockID)
+
+	aBefore, resumeABefore := wA.PauseBeforeFinalizeForTest()
+	aAfter, resumeAAfter := wA.PauseAfterFinalizeForTest()
+	bBefore, resumeBBefore := wB.PauseBeforeFinalizeForTest()
+	bAfter, resumeBAfter := wB.PauseAfterFinalizeForTest()
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() { errA <- wA.processBlock(context.Background(), item) }()
+	waitP4BTestChan(t, aBefore, "A did not pause before finalize")
+	go func() { errB <- wB.processBlock(context.Background(), item) }()
+	waitP4BTestChan(t, bBefore, "B did not pause before finalize")
+
+	resumeABefore()
+	waitP4BTestChan(t, aAfter, "A did not pause after finalize")
+	resumeBBefore()
+	waitP4BTestChan(t, bAfter, "B did not pause after AlreadyFinalized")
+
+	resumeAAfter()
+	if err := waitP4BTestErr(t, errA, "A processBlock"); err != nil {
+		t.Fatalf("A processBlock: %v", err)
+	}
+	afterA := append([]ScopedBlockDelete(nil), sp.ScopedBlockDeletes()...)
+	if countScopedDeletes(afterA, p1Key) != 1 {
+		t.Fatalf("A physical deletes of P1 = %v, want exactly one", afterA)
+	}
+
+	resumeBAfter()
+	errBResult := waitP4BTestErr(t, errB, "B processBlock")
+	got := sp.ScopedBlockDeletes()
+	if countScopedDeletes(got, p1Key) != 1 {
+		t.Fatalf("AlreadyFinalized must not emit a second DELETE of P1: %v (after A: %v)", got, afterA)
+	}
+	if errBResult == nil {
+		t.Fatal("AlreadyFinalized must not emit a second DELETE of P1: B completed processBlock instead of committed_pending")
+	}
+}
+
+func TestP4B_RecoverS3OrphansTerminalLifecycleDoesNotDeleteS3(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	w := NewWorker(store, sp, NewQueue(store), 100, 0, false, &Stats{})
+	orgID := uuid.New()
+	blockID := testSHA256BlockID("p4b-recovery-terminal")
+	firstSeenAt := seedS3Orphan(t, store, orgID, blockID, "hot", "sha1-recover", "prev", time.Now())
+	committed := testCommittedOrphanAuthorityForOrg(orgID, blockID, "hot")
+	if _, err := store.TerminateBlockDeleteLifecycle(orgID, blockID, committed); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	if _, found, err := store.GetS3OrphanGlobal(orgID, blockID); err != nil || !found {
+		t.Fatalf("seed orphan missing: found=%v err=%v first_seen_at=%v", found, err, firstSeenAt)
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1 stale-orphan clear", recovered)
+	}
+	if got := sp.DeletedBlocks(); len(got) != 0 {
+		t.Fatalf("terminal lifecycle must not authorize recovery S3: %v", got)
+	}
+	if store.S3OrphanCount() != 0 {
+		t.Fatalf("stale pending_s3 orphan should be cleared, got %d", store.S3OrphanCount())
+	}
+}
+
+func waitP4BTestChan(t *testing.T, ch <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+func waitP4BTestResult(t *testing.T, ch <-chan StartBlockDeleteOrphanResult, what string) StartBlockDeleteOrphanResult {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s timed out", what)
+		return StartBlockDeleteOrphanResult{}
+	}
+}
+
+func waitP4BTestErr(t *testing.T, ch <-chan error, what string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s timed out", what)
+		return nil
+	}
+}
+
+func countScopedDeletes(deletes []ScopedBlockDelete, storageKey string) int {
+	n := 0
+	for _, del := range deletes {
+		if del.StorageKey == storageKey {
+			n++
+		}
+	}
+	return n
 }
 
 func TestP4B_CommittedBlockDeleteAuthorityIsOpaqueOutsidePackage(t *testing.T) {

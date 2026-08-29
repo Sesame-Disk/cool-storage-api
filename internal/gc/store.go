@@ -265,6 +265,10 @@ type GCStore interface {
 	// authority still owns it — incarnation, claim id, claimed_at, and
 	// gc_orphan_handoff=true. Skipping the handoff cannot finalize.
 	//
+	// AlreadyFinalized classifies "blocks is gone and the lifecycle certificate is
+	// still published for this exact (P, D)". It is not permission to delete bytes;
+	// only Finalized (this executor applied the DELETE) authorizes processBlock S3.
+	//
 	// It deliberately does NOT pin Consistency(EACH_QUORUM) the way ClaimBlockDelete
 	// does. The window this DELETE opens — a writer in another DC that has not yet seen
 	// the row vanish — is covered by the gc_s3_orphans row, which IS published at
@@ -328,6 +332,10 @@ type GCStore interface {
 	// without overwriting an existing lifecycle. Callers must branch on the returned
 	// outcome rather than treating every non-created result as completion.
 	StartBlockDeleteOrphan(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority, externalSHA1 string, now time.Time) StartBlockDeleteOrphanResult
+	// ObserveBlockDeleteLifecycle is the SERIAL settlement read of D's tombstone.
+	// Recovery uses it as an absolute veto: terminal D must not drive a pending_s3
+	// physical delete. SameAuthority means published + exact (P, D).
+	ObserveBlockDeleteLifecycle(orgID uuid.UUID, blockID string, authority CommittedBlockDeleteAuthority) StartBlockDeleteOrphanResult
 	// GetS3OrphanGlobal reads the canonical orphan row at EACH_QUORUM for the
 	// destructive recovery path. It supplies recovery state and the physical
 	// backend selector; it is not a Paxos settlement read and does not authorize
@@ -1369,6 +1377,14 @@ type BlockDeleteFinalizeResult struct {
 
 func (r BlockDeleteFinalizeResult) ok() bool {
 	return r.Outcome == BlockDeleteFinalized || r.Outcome == BlockDeleteAlreadyFinalized
+}
+
+// authorizesPhysicalDelete is the only finalize outcome that may continue to an
+// immediate S3 DELETE from processBlock. AlreadyFinalized means another executor
+// already won DELETE blocks; recovery owns the bytes. AlreadyComplete means D is
+// terminal and must never delete again.
+func (r BlockDeleteFinalizeResult) authorizesPhysicalDelete() bool {
+	return r.Outcome == BlockDeleteFinalized
 }
 
 // BlockReleaseOutcome classifies what ReleaseBlockClaim did.

@@ -60,6 +60,12 @@ func TestP4B_StartBlockDeleteOrphanSourceContract(t *testing.T) {
 	if got := strings.Count(text, "ensureS3OrphanProjectionResult"); got != 1 {
 		t.Fatalf("StartBlockDeleteOrphan projection wrapper calls = %d, want 1 Created path; SameAuthority must confirm canonical visibility first", got)
 	}
+	if !strings.Contains(text, "confirmPublishedLifecycleAfterOrphan") {
+		t.Fatal("StartBlockDeleteOrphan must SERIAL re-read the lifecycle tombstone after orphan publication")
+	}
+	if strings.Index(text, "INSERT INTO gc_s3_orphans") > strings.Index(text, "confirmPublishedLifecycleAfterOrphan") {
+		t.Fatal("lifecycle SERIAL post-check must run after the gc_s3_orphans INSERT")
+	}
 
 	settlement := findGCFunction(file, "settleS3OrphanState")
 	if settlement == nil {
