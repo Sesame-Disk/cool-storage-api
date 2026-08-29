@@ -1000,11 +1000,23 @@ because settled own-claim confirmation is an `EACH_QUORUM` read of that table.
 
 R3 is the post-stage `pub:` check: after a complete stage,
 `ValidatePublishAttemptAuthority` must see an Active canonical row (no deleting
-claim, committed handoff, repairing_stub, orphan, missing row, or invalid locator)
-or roll back this attempt. Unit tests cover classification, add-then-check order,
-attempt-scoped rollback, and the `LOCAL_QUORUM` pin. Integration legs live in
-`internal/integration/r3_publish_fence_test.go`. The mutation script must stay red
-when those predicates are removed:
+claim, committed handoff, `gc_orphan_handoff=false`, repairing_stub, orphan,
+missing row, invalid locator, or read error) or roll back this attempt. Unit tests
+cover classification, add-then-check order, attempt-scoped rollback, the
+`LOCAL_QUORUM` pin, orphan-read fail-closed, and that production stage+promote
+callers abort on stage error (including inside `retryLibraryHeadMutation`
+callbacks; the outer retry err-guard is not that abort). Integration legs live in
+`internal/integration/r3_publish_fence_test.go`, including writer-`pub:`-first
+visibility to `BlockHasReferencesGlobal`. The mutation script must stay red
+when those predicates are removed.
+
+Each unique staged block adds two sequential `LOCAL_QUORUM` reads (canonical
+then orphan) on the publication path. Do not batch those in this slice;
+measure 100/1k/10k publications as a later follow-up.
+
+Cleanup of R3 Cassandra fixtures must go through `DeleteS3Orphan` so
+`gc_s3_orphans_by_day` cannot leak into the local scanner as
+`canonical S3 orphan missing`.
 
 ```bash
 docker compose run --rm --build gotest bash scripts/r3-publish-fence-mutation-validation.sh

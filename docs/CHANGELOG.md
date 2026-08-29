@@ -8,6 +8,19 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-28 - R3 follow-up: Stage-error abort, orphan-read evidence, handoff=false
+
+Hardened #195 without changing the handshake. Production stage+promote
+callers must abort on stage error (`if err != nil { return }`), not just
+appear earlier in the file, including inside `retryLibraryHeadMutation`
+callbacks. `gc_orphan_handoff=false` is Invalid. Orphan-read
+failure is Unavailable and rolls back this attempt. Test cleanup uses
+`DeleteS3Orphan` so `gc_s3_orphans_by_day` cannot leak into the local scanner.
+The check still costs two sequential `LOCAL_QUORUM` reads per staged block
+(canonical then orphan); measuring 100/1k/10k publications is follow-up,
+not this slice. R18, R27, R29, R30, R31, Physical ABA and X1 stay OPEN.
+`GC_ENABLED=false`.
+
 ## 2026-08-28 - R3: post-stage publish authority check
 
 Publication linearization is now `stage pub: → post-stage authority check → only

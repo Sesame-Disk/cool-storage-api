@@ -1390,6 +1390,8 @@ func TestStagePendingPublishedFiles_FinishCheckedDenialIsNotSuccess(t *testing.T
 	if !errors.Is(err, db.ErrBlockPublishAuthorityDenied) {
 		t.Fatalf("stagePendingPublishedFiles() error = %v, want ErrBlockPublishAuthorityDenied", err)
 	}
+	// Promote is the caller's job. Funnel B returning denial is the abort;
+	// production callers are pinned by TestR3ProductionStageErrorsAbortBeforePromote.
 }
 
 func TestPrepareFileFSObjectForPublish_DefersPersistenceUntilStage(t *testing.T) {

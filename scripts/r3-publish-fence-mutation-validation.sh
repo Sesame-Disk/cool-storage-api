@@ -97,9 +97,23 @@ m_ignore_deleting() {
 }
 
 m_ignore_handoff() {
-  mutate "$AUTH" 's#if row\.GCOrphanHandoff != nil && \*row\.GCOrphanHandoff \{#if false \&\& row.GCOrphanHandoff != nil \&\& *row.GCOrphanHandoff {#'
+  mutate "$AUTH" 's#if row\.GCOrphanHandoff != nil \{#if false \&\& row.GCOrphanHandoff != nil {#'
   expect_red './internal/db' 'TestValidatePublishAttemptAuthorityHandoffIsNeverActive' 'ignoring handoff' \
     'gc_orphan_handoff=true is treated as Active'
+  restore
+}
+
+m_accept_handoff_false() {
+  mutate "$AUTH" 's#return BlockPublishAuthorityInvalid, fmt\.Errorf\("%w: block %s has gc_orphan_handoff=false; only null-to-true is a valid handoff", ErrBlockPublishAuthorityDenied, blockID\)#return BlockPublishAuthorityActive, nil#'
+  expect_red './internal/db' 'TestValidatePublishAttemptAuthorityHandoffFalseIsInvalid' 'false must not be treated as Active' \
+    'gc_orphan_handoff=false is treated as Active'
+  restore
+}
+
+m_orphan_read_error_is_absent() {
+  mutate "$AUTH" 's#if err != nil \{\s+return BlockPublishAuthorityUnavailable, fmt\.Errorf\("%w: read S3 orphan publish fence for %s: %w", ErrBlockPublishAuthorityDenied, blockID, err\)\s+\}#if err != nil {\n\t\thasOrphan = false\n\t\terr = nil\n\t}#'
+  expect_red './internal/db' 'TestValidatePublishAttemptAuthorityClassifiesWriterFence|TestFinishCheckedPublishAttemptOrphanReadErrorRollsBack' 'want unavailable' \
+    'an orphan read error is treated as no orphan'
   restore
 }
 
@@ -118,7 +132,7 @@ m_ignore_orphan() {
 }
 
 m_accept_missing() {
-  mutate "$AUTH" 's#if !found \{#if false \&\& !found {#'
+  mutate "$AUTH" 's#return BlockPublishAuthorityMissing, fmt\.Errorf\("%w: canonical row for block %s is absent", ErrBlockPublishAuthorityDenied, blockID\)#return BlockPublishAuthorityActive, nil#'
   expect_red './internal/db' 'TestValidatePublishAttemptAuthorityClassifiesWriterFence' 'want missing' \
     'an absent canonical row is treated as Active'
   restore
@@ -204,6 +218,55 @@ m_direct_add() {
   restore
 }
 
+m_sync_repair_drop_return() {
+  mutate "$SYNC" 's#delta, err := h\.stageSyncCommitBlockDelta\(orgID, repoID, targetCommitID\)\s+if err != nil \{\s+return err\s+\}\s+return h\.finalizeSyncCommitBlockDelta#delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, targetCommitID)\n\tif err != nil {\n\t\t_ = err\n\t}\n\treturn h.finalizeSyncCommitBlockDelta#'
+  expect_red './internal/api' 'TestPublishedSyncRepairPartialStageFailureDoesNotFinalize' 'want stage boom' \
+    'sync repair continues to promote after a stage error'
+  restore
+}
+
+m_head_drop_return() {
+  mutate "$SYNC" 's#c\.JSON\(http\.StatusServiceUnavailable, gin\.H\{"error": "sync head publish block references pending; retry"\}\)\s+return#c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block references pending; retry"})#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'handleSyncHeadPromotion continues after a stage error'
+  restore
+}
+
+m_automerge_drop_return() {
+  mutate "$SYNC" 's#delta, err := h\.stageSyncCommitBlockDelta\(orgID, repoID, mergedCommitID\)\s+if err != nil \{\s+return false, err\s+\}#delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, mergedCommitID)\n\tif err != nil {\n\t\t_ = err\n\t}#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'tryAutoMergeSyncHeadPromotion continues after a stage error'
+  restore
+}
+
+m_seafhttp_drop_return() {
+  mutate "internal/api/seafhttp.go" 's#return "", "", 0, 0, fmt\.Errorf\("failed to stage publish-attempt block references: %w", err\)#_ = err#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'SeafHTTP continues after a stage error'
+  restore
+}
+
+m_createfile_drop_return() {
+  mutate "$FILES" 's#if err := fsHelper\.stagePendingPublishedFiles\(([^;]+)\); err != nil \{#_ = fsHelper.stagePendingPublishedFiles($1); if false {#g'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'CreateFile/upload continue after a stage error'
+  restore
+}
+
+m_copy_drop_return() {
+  mutate "internal/api/v2/batch_operations.go" 's#if err := fsHelper\.stagePendingPublishedFiles\(([^;]+)\); err != nil \{#_ = fsHelper.stagePendingPublishedFiles($1); if false {#g'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'copy/move continues after a stage error'
+  restore
+}
+
+m_onlyoffice_drop_return() {
+  mutate "internal/api/v2/onlyoffice.go" 's#if err := fsHelper\.stagePendingPublishedFiles\(([^;]+)\); err != nil \{#_ = fsHelper.stagePendingPublishedFiles($1); if false {#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'OnlyOffice continues after a stage error'
+  restore
+}
+
 m_v2_repair_runs_r3() {
   mutate "$REPAIR" 's#if err := publishedBlockReferenceRepairPromoteFn\(helper, repair\.OrgID, repair\.RepoID, repair\.CommitID, pending\); err != nil \{#if err := db.FinishCheckedPublishAttempt(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.StagedBlockIDs); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := publishedBlockReferenceRepairPromoteFn(helper, repair.OrgID, repair.RepoID, repair.CommitID, pending); err != nil {#'
   expect_red './internal/api' 'TestR3PublishRepairMustNotRunAuthorityCheck' 'promote-only' \
@@ -217,6 +280,8 @@ MUTATIONS=(
   m_check_before_stage
   m_ignore_deleting
   m_ignore_handoff
+  m_accept_handoff_false
+  m_orphan_read_error_is_absent
   m_ignore_repairing_stub
   m_ignore_orphan
   m_accept_missing
@@ -227,9 +292,16 @@ MUTATIONS=(
   m_rollback_without_attempt_id
   m_rollback_failure_is_success
   m_sync_repair_skips_stage
+  m_sync_repair_drop_return
+  m_head_drop_return
+  m_automerge_drop_return
+  m_seafhttp_drop_return
   m_createfile_bypass
+  m_createfile_drop_return
   m_copy_bypass
+  m_copy_drop_return
   m_onlyoffice_bypass
+  m_onlyoffice_drop_return
   m_direct_add
   m_v2_repair_runs_r3
 )

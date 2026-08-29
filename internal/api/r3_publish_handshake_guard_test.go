@@ -13,8 +13,11 @@ import (
 
 // R3's safety argument is an order, not a function-name allowlist. A CreateFile
 // that still "calls stagePendingPublishedFiles" somewhere can later promote
-// without staging. These guards read production source and require stage < promote
-// by offset in every request path.
+// without staging. These guards read production source and require stage before
+// promote by offset, and that each stage error aborts (`if err != nil { return }`)
+// rather than continuing to promote. Abort is the statement that owns the
+// call, including inside retry callbacks; the outer retry `if err != nil`
+// is not credited to a nested stage.
 
 var r3PromoteNames = map[string]bool{
 	"PromotePublishAttemptReferences":           true,
@@ -109,6 +112,72 @@ func TestR3ProductionPromoteCallersStageBeforePromote(t *testing.T) {
 	}
 }
 
+func TestR3ProductionStageErrorsAbortBeforePromote(t *testing.T) {
+	checked := 0
+	for _, file := range r3ProductionFiles(t) {
+		for _, decl := range file.syntax.Decls {
+			name := r3EnclosingName(decl)
+			if r3PromoteOnlyHelpers[name] || r3PublishRepairPromoteOnly[name] {
+				continue
+			}
+			if len(r3CallPositions(decl, r3PromoteNames)) == 0 {
+				continue
+			}
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			for _, call := range r3StageCalls(fn, r3StageNames) {
+				checked++
+				if !r3StageErrorReturns(fn, call) {
+					t.Errorf("%s: %s stage at offset %d does not abort on error before promote", file.path, name, int(call.Pos()))
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no stage calls in dual stage+promote functions; the abort guard is vacuous")
+	}
+}
+
+func TestR3StageErrorAbortLooksInsideRetryCallback(t *testing.T) {
+	guarded := `package p
+func f() {
+	err := retry(func() error {
+		if err := stagePendingPublishedFiles(); err != nil {
+			return err
+		}
+		promotePendingPublishedFiles()
+		return nil
+	})
+	if err != nil {
+		return
+	}
+}
+`
+	dropped := `package p
+func f() {
+	err := retry(func() error {
+		_ = stagePendingPublishedFiles()
+		if false {
+			return err
+		}
+		promotePendingPublishedFiles()
+		return nil
+	})
+	if err != nil {
+		return
+	}
+}
+`
+	if !r3SnippetStageAborts(t, guarded) {
+		t.Fatal("retry callback with if-err-return must count as aborting")
+	}
+	if r3SnippetStageAborts(t, dropped) {
+		t.Fatal("dropping the callback return must not be credited to the outer retry err-guard")
+	}
+}
+
 func TestR3PublishRepairMustNotRunAuthorityCheck(t *testing.T) {
 	path := filepath.Join("v2", "publish_repair.go")
 	source, err := os.ReadFile(path)
@@ -130,6 +199,32 @@ func TestR3PublishRepairMustNotRunAuthorityCheck(t *testing.T) {
 		}
 		return true
 	})
+}
+
+func TestR3FunnelBHelperDoesNotPromote(t *testing.T) {
+	path := filepath.Join("v2", "fs_helpers.go")
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range file.Decls {
+		function, ok := decl.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "stagePendingPublishedFiles" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if r3PromoteNames[r3CalledName(call)] {
+				t.Errorf("stagePendingPublishedFiles calls %s; funnel B must return denial, not promote", r3CalledName(call))
+			}
+			return true
+		})
+		return
+	}
+	t.Fatal("stagePendingPublishedFiles not found")
 }
 
 func TestR3FunnelBFinishCheckedRunsAfterAdds(t *testing.T) {
@@ -245,6 +340,161 @@ func r3CallPositions(decl ast.Decl, names map[string]bool) []int {
 	})
 	sort.Ints(positions)
 	return positions
+}
+
+func r3StageCalls(fn *ast.FuncDecl, names map[string]bool) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	ast.Inspect(fn, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if names[r3CalledName(call)] {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	return calls
+}
+
+func r3StageErrorReturns(fn *ast.FuncDecl, stage *ast.CallExpr) bool {
+	found := false
+	var walk func(stmts []ast.Stmt)
+	walk = func(stmts []ast.Stmt) {
+		for i, stmt := range stmts {
+			// Copy/CreateFile/OnlyOffice stage inside retryLibraryHeadMutation
+			// callbacks. The outer `err := retry(...); if err != nil { return }`
+			// is not this stage's abort: dropping the inner return still
+			// continues to promote inside the callback.
+			r3WalkNestedFuncLits(stmt, walk)
+			switch s := stmt.(type) {
+			case *ast.IfStmt:
+				if r3NodeContainsCall(s.Init, stage) && r3IfGuardsError(s) {
+					found = true
+				}
+				if s.Body != nil {
+					walk(s.Body.List)
+				}
+				switch elseStmt := s.Else.(type) {
+				case *ast.BlockStmt:
+					walk(elseStmt.List)
+				case *ast.IfStmt:
+					walk([]ast.Stmt{elseStmt})
+				}
+			case *ast.AssignStmt:
+				if r3NodeContainsCall(s, stage) && i+1 < len(stmts) {
+					if ifs, ok := stmts[i+1].(*ast.IfStmt); ok && r3IfGuardsError(ifs) {
+						found = true
+					}
+				}
+			case *ast.ForStmt:
+				if s.Body != nil {
+					walk(s.Body.List)
+				}
+			case *ast.RangeStmt:
+				if s.Body != nil {
+					walk(s.Body.List)
+				}
+			case *ast.BlockStmt:
+				walk(s.List)
+			case *ast.SwitchStmt:
+				if s.Body == nil {
+					continue
+				}
+				for _, clause := range s.Body.List {
+					if cc, ok := clause.(*ast.CaseClause); ok {
+						walk(cc.Body)
+					}
+				}
+			}
+		}
+	}
+	walk(fn.Body.List)
+	return found
+}
+
+func r3WalkNestedFuncLits(node ast.Node, walk func([]ast.Stmt)) {
+	if node == nil {
+		return
+	}
+	ast.Inspect(node, func(n ast.Node) bool {
+		lit, ok := n.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		if lit.Body != nil {
+			walk(lit.Body.List)
+		}
+		return false
+	})
+}
+
+func r3SnippetStageAborts(t *testing.T, src string) bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "snippet.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn, ok := file.Decls[0].(*ast.FuncDecl)
+	if !ok || fn.Body == nil {
+		t.Fatal("expected function snippet")
+	}
+	calls := r3StageCalls(fn, r3StageNames)
+	if len(calls) != 1 {
+		t.Fatalf("want 1 stage call, got %d", len(calls))
+	}
+	return r3StageErrorReturns(fn, calls[0])
+}
+
+func r3IfGuardsError(ifs *ast.IfStmt) bool {
+	return r3ExprMentionsErr(ifs.Cond) && r3BlockHasReturn(ifs.Body)
+}
+
+func r3ExprMentionsErr(expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if ok && ident.Name == "err" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func r3BlockHasReturn(block *ast.BlockStmt) bool {
+	if block == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		if _, ok := n.(*ast.ReturnStmt); ok {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func r3NodeContainsCall(node ast.Node, want *ast.CallExpr) bool {
+	if node == nil || want == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if ok && call.Pos() == want.Pos() {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func r3CalledName(call *ast.CallExpr) string {

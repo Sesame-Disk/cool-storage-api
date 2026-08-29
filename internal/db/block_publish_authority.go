@@ -124,8 +124,11 @@ func classifyOnePublishAttemptAuthority(database *DB, orgID, blockID string) (Bl
 	if row.CreatedAt == nil || !config.IsCanonicalStorageClassName(row.StorageClass) || row.StorageKey == "" || strings.TrimSpace(row.StorageKey) != row.StorageKey {
 		return BlockPublishAuthorityInvalid, fmt.Errorf("%w: block %s has incomplete or malformed canonical locator", ErrBlockPublishAuthorityDenied, blockID)
 	}
-	if row.GCOrphanHandoff != nil && *row.GCOrphanHandoff {
-		return BlockPublishAuthorityDeleting, fmt.Errorf("%w: block %s has a committed orphan handoff", ErrBlockPublishAuthorityDenied, blockID)
+	if row.GCOrphanHandoff != nil {
+		if *row.GCOrphanHandoff {
+			return BlockPublishAuthorityDeleting, fmt.Errorf("%w: block %s has a committed orphan handoff", ErrBlockPublishAuthorityDenied, blockID)
+		}
+		return BlockPublishAuthorityInvalid, fmt.Errorf("%w: block %s has gc_orphan_handoff=false; only null-to-true is a valid handoff", ErrBlockPublishAuthorityDenied, blockID)
 	}
 	activeClaim, repairClaim, ownershipErr := classifyBlockClaimOwnership(row.GCState, row.GCClaimID, row.GCClaimedAt)
 	if ownershipErr != nil {

@@ -43,8 +43,12 @@ func r3TestBlockID(seed string) string {
 func r3CleanupBlock(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string) {
 	t.Helper()
 	t.Cleanup(func() {
+		// DeleteS3Orphan reads first_seen_at from the canonical row, then
+		// removes both gc_s3_orphans and gc_s3_orphans_by_day. A raw DELETE of
+		// the canonical row first leaves the discovery index behind and the
+		// local scanner reports "canonical S3 orphan missing".
+		_ = gcpkg.NewCassandraStore(database).DeleteS3Orphan(orgID, blockID, time.Time{})
 		_ = database.Session().Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
-		_ = database.Session().Query(`DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
 		_ = database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec()
 	})
 }
@@ -245,17 +249,22 @@ func TestR3_RepairingStubMissingAndInvalidAreDenied(t *testing.T) {
 
 	repairID := r3TestBlockID("r3-repair")
 	r3CleanupBlock(t, database, orgID, repairID)
-	seedCanonicalBlockRowForTest(t, database, orgID, repairID, "hot")
 	claimedAt := time.Now().UTC()
+	// Production repairing_stub is a metadata-free upload claim
+	// (created_at and storage_class null). Locator validation therefore
+	// classifies it Invalid before Repairing; both are fail-closed.
 	if err := database.Session().Query(`
-		UPDATE blocks SET gc_state = ?, gc_claim_id = ?, gc_claimed_at = ?
-		WHERE org_id = ? AND block_id = ?
-	`, dbpkg.BlockGCStateRepairingStub, "r3-repair-"+uuid.NewString(), claimedAt, orgID.String(), repairID).Exec(); err != nil {
-		t.Fatalf("stamp repairing_stub: %v", err)
+		INSERT INTO blocks (org_id, block_id, gc_state, gc_claim_id, gc_claimed_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, orgID.String(), repairID, dbpkg.BlockGCStateRepairingStub, "r3-repair-"+uuid.NewString(), claimedAt).Exec(); err != nil {
+		t.Fatalf("insert metadata-free repairing_stub: %v", err)
 	}
 	outcome, err = dbpkg.ValidatePublishAttemptAuthority(database, orgID.String(), []string{repairID})
-	if outcome != dbpkg.BlockPublishAuthorityRepairing {
-		t.Fatalf("repairing_stub = %v, %v; want repairing", outcome, err)
+	if outcome == dbpkg.BlockPublishAuthorityActive {
+		t.Fatalf("production-shaped repairing_stub = %v, %v; must not be Active", outcome, err)
+	}
+	if outcome != dbpkg.BlockPublishAuthorityRepairing && outcome != dbpkg.BlockPublishAuthorityInvalid {
+		t.Fatalf("repairing_stub = %v, %v; want repairing or invalid (never Active)", outcome, err)
 	}
 
 	invalidID := r3TestBlockID("r3-invalid")
@@ -297,6 +306,58 @@ func TestR3_EmptyBatchIsVacuouslyActive(t *testing.T) {
 	}
 	gate.observed = true
 	t.Logf("R3_EVIDENCE empty-batch active")
+}
+
+func TestR3_WriterPubFirstMakesGCSeeReference(t *testing.T) {
+	requireCassandra(t)
+	gate := r3RequireEvidence(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	repoID := uuid.NewString()
+	blockID := r3TestBlockID("r3-pub-first")
+	r3CleanupBlock(t, database, orgID, blockID)
+	target := seedCanonicalBlockRowForTest(t, database, orgID, blockID, "hot")
+
+	attemptID := "r3-pub-first-" + uuid.NewString()
+	if err := dbpkg.AddPublishAttemptReferences(database, orgID.String(), repoID, attemptID, []string{blockID}); err != nil {
+		t.Fatalf("AddPublishAttemptReferences: %v", err)
+	}
+	hasRefs, err := store.BlockHasReferencesGlobal(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferencesGlobal after pub:: %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("R3 REGRESSION: GC verify missed this attempt's pub:; a post-stage LQ check cannot close the race if pub: is invisible")
+	}
+
+	authority := gcpkg.BlockDeleteAuthority{
+		Target:    target,
+		ClaimID:   "r3-pub-first-" + uuid.NewString(),
+		ClaimedAt: time.Now().UTC().Truncate(time.Millisecond),
+	}
+	claim, err := store.ClaimBlockDelete(orgID, blockID, authority)
+	if err != nil || claim.Outcome != gcpkg.BlockClaimAcquired {
+		t.Fatalf("claim after pub: = %s, %v; want acquired (refs are checked after claim)", claim.Outcome, err)
+	}
+	hasRefs, err = store.BlockHasReferencesGlobal(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferencesGlobal after claim: %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("R3 REGRESSION: claim succeeded and then GC verify missed pub:; both sides would continue")
+	}
+
+	err = dbpkg.FinishCheckedPublishAttempt(database, orgID.String(), repoID, attemptID, []string{blockID})
+	if !errors.Is(err, dbpkg.ErrBlockPublishAuthorityDenied) {
+		t.Fatalf("FinishChecked after claim = %v, want denied", err)
+	}
+	if r3HasAttemptRef(t, database, orgID, blockID, attemptID) {
+		t.Fatal("denied FinishChecked must roll back this attempt's pub:")
+	}
+	gate.observed = true
+	t.Logf("R3_EVIDENCE pub-first org=%s block=%s attempt=%s", orgID, blockID, attemptID)
 }
 
 func TestR3_FenceReadConsistencyPinIsLocalQuorum(t *testing.T) {

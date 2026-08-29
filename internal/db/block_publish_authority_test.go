@@ -107,6 +107,13 @@ func TestValidatePublishAttemptAuthorityClassifiesWriterFence(t *testing.T) {
 		}(), found: true, want: BlockPublishAuthorityInvalid},
 		{name: "non-sha256", blockID: "not-a-sha256", want: BlockPublishAuthorityInvalid},
 		{name: "canonical read error", blockID: installTestBlockID, readErr: errors.New("cassandra down"), want: BlockPublishAuthorityUnavailable},
+		{name: "orphan read error", blockID: installTestBlockID, row: r3ActiveAuthorityRow(), found: true, orphanErr: errors.New("orphan cassandra down"), want: BlockPublishAuthorityUnavailable},
+		{name: "handoff false", blockID: installTestBlockID, row: func() publishAttemptAuthorityRow {
+			row := r3ActiveAuthorityRow()
+			handoffFalse := false
+			row.GCOrphanHandoff = &handoffFalse
+			return row
+		}(), found: true, want: BlockPublishAuthorityInvalid},
 	}
 
 	for _, test := range tests {
@@ -150,6 +157,25 @@ func TestValidatePublishAttemptAuthorityHandoffIsNeverActive(t *testing.T) {
 	outcome, err := ValidatePublishAttemptAuthority(&DB{}, "org-1", []string{installTestBlockID})
 	if outcome != BlockPublishAuthorityDeleting {
 		t.Fatalf("handoff=true outcome = %v, want deleting; ignoring handoff must never be treated as Active", outcome)
+	}
+	if !errors.Is(err, ErrBlockPublishAuthorityDenied) {
+		t.Fatalf("error = %v, want ErrBlockPublishAuthorityDenied", err)
+	}
+}
+
+func TestValidatePublishAttemptAuthorityHandoffFalseIsInvalid(t *testing.T) {
+	withPublishAuthoritySeams(t)
+	handoffFalse := false
+	row := r3ActiveAuthorityRow()
+	row.GCOrphanHandoff = &handoffFalse
+	readPublishAttemptAuthorityFn = func(*DB, string, string) (publishAttemptAuthorityRow, bool, error) {
+		return row, true, nil
+	}
+	publishAttemptHasS3OrphanFn = func(*DB, string, string) (bool, error) { return false, nil }
+
+	outcome, err := ValidatePublishAttemptAuthority(&DB{}, "org-1", []string{installTestBlockID})
+	if outcome != BlockPublishAuthorityInvalid {
+		t.Fatalf("handoff=false outcome = %v, want invalid; false must not be treated as Active", outcome)
 	}
 	if !errors.Is(err, ErrBlockPublishAuthorityDenied) {
 		t.Fatalf("error = %v, want ErrBlockPublishAuthorityDenied", err)
@@ -256,6 +282,29 @@ func TestFinishCheckedPublishAttemptActiveDoesNotRollback(t *testing.T) {
 	}
 	if err := FinishCheckedPublishAttempt(&DB{}, "org-1", "repo-1", "attempt-1", []string{installTestBlockID}); err != nil {
 		t.Fatalf("Active FinishCheckedPublishAttempt() = %v, want nil", err)
+	}
+}
+
+func TestFinishCheckedPublishAttemptOrphanReadErrorRollsBack(t *testing.T) {
+	withPublishAuthoritySeams(t)
+	readPublishAttemptAuthorityFn = func(*DB, string, string) (publishAttemptAuthorityRow, bool, error) {
+		return r3ActiveAuthorityRow(), true, nil
+	}
+	publishAttemptHasS3OrphanFn = func(*DB, string, string) (bool, error) {
+		return false, errors.New("orphan read boom")
+	}
+	removed := 0
+	removePublishAttemptReferenceFn = func(*DB, string, string, string) error {
+		removed++
+		return nil
+	}
+
+	err := FinishCheckedPublishAttempt(&DB{}, "org-1", "repo-1", "attempt-1", []string{installTestBlockID})
+	if !errors.Is(err, ErrBlockPublishAuthorityDenied) {
+		t.Fatalf("orphan read error FinishChecked = %v, want ErrBlockPublishAuthorityDenied", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1; orphan-read failure must roll back this attempt", removed)
 	}
 }
 
