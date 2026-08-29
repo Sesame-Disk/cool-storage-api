@@ -14,10 +14,18 @@ import (
 // R3's safety argument is an order, not a function-name allowlist. A CreateFile
 // that still "calls stagePendingPublishedFiles" somewhere can later promote
 // without staging. These guards read production source and require stage before
-// promote by offset, and that each stage error aborts (`if err != nil { return }`)
-// rather than continuing to promote. Abort is the statement that owns the
-// call, including inside retry callbacks; the outer retry `if err != nil`
-// is not credited to a nested stage.
+// promote by offset, and that each stage error aborts (`if err != nil { return }`
+// or `if nil != err { return }`) rather than continuing to promote.
+//
+// Abort is the statement that owns the call, including inside retry callbacks:
+// the assigned error ident must be compared with != nil, and that if-body must
+// contain a direct return — not merely mention `err`, and not a ReturnStmt
+// buried under `if false`. The outer retry `if err != nil` is not credited to
+// a nested stage.
+//
+// This is not a CFG/dominance analyzer. A sibling branch that promotes without
+// staging is still a lexical-offset hole; new promote callers hit the
+// allowlist, and we do not enlarge R3 to build a control-flow graph.
 
 var r3PromoteNames = map[string]bool{
 	"PromotePublishAttemptReferences":           true,
@@ -76,6 +84,9 @@ var r3AuthorityNames = map[string]bool{
 }
 
 func TestR3ProductionPromoteCallersStageBeforePromote(t *testing.T) {
+	// First stage offset vs first promote offset is not dominance: a later
+	// sibling branch can still promote without staging. New promote callers
+	// are caught by the allowlist; a CFG analyzer is out of scope for R3.
 	callers := map[string]bool{}
 	for _, file := range r3ProductionFiles(t) {
 		for _, decl := range file.syntax.Decls {
@@ -175,6 +186,55 @@ func f() {
 	}
 	if r3SnippetStageAborts(t, dropped) {
 		t.Fatal("dropping the callback return must not be credited to the outer retry err-guard")
+	}
+}
+
+func TestR3StageErrorAbortRequiresNotNilAndDirectReturn(t *testing.T) {
+	eqNil := `package p
+func f() {
+	if err := stagePendingPublishedFiles(); err == nil {
+		return
+	}
+	promotePendingPublishedFiles()
+}
+`
+	buriedReturn := `package p
+func f() {
+	if err := stagePendingPublishedFiles(); err != nil {
+		if false {
+			return
+		}
+	}
+	promotePendingPublishedFiles()
+}
+`
+	ok := `package p
+func f() {
+	if err := stagePendingPublishedFiles(); err != nil {
+		return
+	}
+	promotePendingPublishedFiles()
+}
+`
+	okSwapped := `package p
+func f() {
+	if err := stagePendingPublishedFiles(); nil != err {
+		return
+	}
+	promotePendingPublishedFiles()
+}
+`
+	if r3SnippetStageAborts(t, eqNil) {
+		t.Fatal("err == nil must not count as aborting; stage failure would fall through to promote")
+	}
+	if r3SnippetStageAborts(t, buriedReturn) {
+		t.Fatal("a return buried under if false must not count as aborting")
+	}
+	if !r3SnippetStageAborts(t, ok) {
+		t.Fatal("err != nil { return } must count as aborting")
+	}
+	if !r3SnippetStageAborts(t, okSwapped) {
+		t.Fatal("nil != err { return } must count as aborting")
 	}
 }
 
@@ -369,7 +429,7 @@ func r3StageErrorReturns(fn *ast.FuncDecl, stage *ast.CallExpr) bool {
 			r3WalkNestedFuncLits(stmt, walk)
 			switch s := stmt.(type) {
 			case *ast.IfStmt:
-				if r3NodeContainsCall(s.Init, stage) && r3IfGuardsError(s) {
+				if r3NodeContainsCall(s.Init, stage) && r3IfAbortsOnIdent(s, r3AssignedErrName(s.Init)) {
 					found = true
 				}
 				if s.Body != nil {
@@ -383,7 +443,7 @@ func r3StageErrorReturns(fn *ast.FuncDecl, stage *ast.CallExpr) bool {
 				}
 			case *ast.AssignStmt:
 				if r3NodeContainsCall(s, stage) && i+1 < len(stmts) {
-					if ifs, ok := stmts[i+1].(*ast.IfStmt); ok && r3IfGuardsError(ifs) {
+					if ifs, ok := stmts[i+1].(*ast.IfStmt); ok && r3IfAbortsOnIdent(ifs, r3AssignedErrName(s)) {
 						found = true
 					}
 				}
@@ -446,36 +506,50 @@ func r3SnippetStageAborts(t *testing.T, src string) bool {
 	return r3StageErrorReturns(fn, calls[0])
 }
 
-func r3IfGuardsError(ifs *ast.IfStmt) bool {
-	return r3ExprMentionsErr(ifs.Cond) && r3BlockHasReturn(ifs.Body)
+func r3IfAbortsOnIdent(ifs *ast.IfStmt, name string) bool {
+	return name != "" && name != "_" && r3CondIsIdentNotNil(ifs.Cond, name) && r3BlockHasDirectReturn(ifs.Body)
 }
 
-func r3ExprMentionsErr(expr ast.Expr) bool {
-	found := false
-	ast.Inspect(expr, func(n ast.Node) bool {
-		ident, ok := n.(*ast.Ident)
-		if ok && ident.Name == "err" {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
+func r3AssignedErrName(node ast.Node) string {
+	assign, ok := node.(*ast.AssignStmt)
+	if !ok || len(assign.Lhs) == 0 {
+		return ""
+	}
+	ident, ok := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return ident.Name
 }
 
-func r3BlockHasReturn(block *ast.BlockStmt) bool {
+func r3CondIsIdentNotNil(expr ast.Expr, name string) bool {
+	bin, ok := expr.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.NEQ {
+		return false
+	}
+	return r3IsNamedIdent(bin.X, name) && r3IsNilIdent(bin.Y) || r3IsNilIdent(bin.X) && r3IsNamedIdent(bin.Y, name)
+}
+
+func r3IsNamedIdent(expr ast.Expr, name string) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && ident.Name == name
+}
+
+func r3IsNilIdent(expr ast.Expr) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && ident.Name == "nil"
+}
+
+func r3BlockHasDirectReturn(block *ast.BlockStmt) bool {
 	if block == nil {
 		return false
 	}
-	found := false
-	ast.Inspect(block, func(n ast.Node) bool {
-		if _, ok := n.(*ast.ReturnStmt); ok {
-			found = true
-			return false
+	for _, stmt := range block.List {
+		if _, ok := stmt.(*ast.ReturnStmt); ok {
+			return true
 		}
-		return true
-	})
-	return found
+	}
+	return false
 }
 
 func r3NodeContainsCall(node ast.Node, want *ast.CallExpr) bool {

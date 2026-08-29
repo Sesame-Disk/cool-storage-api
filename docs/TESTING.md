@@ -1005,7 +1005,8 @@ missing row, invalid locator, or read error) or roll back this attempt. Unit tes
 cover classification, add-then-check order, attempt-scoped rollback, the
 `LOCAL_QUORUM` pin, orphan-read fail-closed, and that production stage+promote
 callers abort on stage error (including inside `retryLibraryHeadMutation`
-callbacks; the outer retry err-guard is not that abort). Integration legs live in
+callbacks; the assigned error must be `!= nil` with a direct return — not
+`err == nil` or a return buried under `if false`). Integration legs live in
 `internal/integration/r3_publish_fence_test.go`, including writer-`pub:`-first
 visibility to `BlockHasReferencesGlobal`. The mutation script must stay red
 when those predicates are removed.

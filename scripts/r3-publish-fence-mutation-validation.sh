@@ -267,6 +267,27 @@ m_onlyoffice_drop_return() {
   restore
 }
 
+m_stage_err_eq_nil() {
+  mutate "$FILES" 's#if err := fsHelper\.stagePendingPublishedFiles\(([^;]+)\); err != nil \{#if err := fsHelper.stagePendingPublishedFiles($1); err == nil {#g'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'CreateFile/upload abort when stage succeeds instead of when it fails'
+  restore
+}
+
+m_stage_return_if_false() {
+  mutate "$SYNC" 's#delta, err := h\.stageSyncCommitBlockDelta\(orgID, repoID, targetCommitID\)\s+if err != nil \{\s+return err\s+\}#delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, targetCommitID)\n\tif err != nil {\n\t\tif false {\n\t\t\treturn err\n\t\t}\n\t}#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'sync repair hides the stage-error return under if false'
+  restore
+}
+
+m_stage_cond_never() {
+  mutate "internal/api/v2/batch_operations.go" 's#if err := fsHelper\.stagePendingPublishedFiles\(([^;]+)\); err != nil \{#if err := fsHelper.stagePendingPublishedFiles($1); false {#'
+  expect_red './internal/api' 'TestR3ProductionStageErrorsAbortBeforePromote' 'does not abort on error before promote' \
+    'copy/move stage-error cond is never true so failure continues to promote'
+  restore
+}
+
 m_v2_repair_runs_r3() {
   mutate "$REPAIR" 's#if err := publishedBlockReferenceRepairPromoteFn\(helper, repair\.OrgID, repair\.RepoID, repair\.CommitID, pending\); err != nil \{#if err := db.FinishCheckedPublishAttempt(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.StagedBlockIDs); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := publishedBlockReferenceRepairPromoteFn(helper, repair.OrgID, repair.RepoID, repair.CommitID, pending); err != nil {#'
   expect_red './internal/api' 'TestR3PublishRepairMustNotRunAuthorityCheck' 'promote-only' \
@@ -302,6 +323,9 @@ MUTATIONS=(
   m_copy_drop_return
   m_onlyoffice_bypass
   m_onlyoffice_drop_return
+  m_stage_err_eq_nil
+  m_stage_return_if_false
+  m_stage_cond_never
   m_direct_add
   m_v2_repair_runs_r3
 )

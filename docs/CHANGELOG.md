@@ -8,6 +8,16 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-08-29 - R3 AST abort guard: err != nil and a direct return
+
+The stage-error abort guard now requires the assigned stage error to be
+compared with `!= nil` (or `nil != err`) and a direct `return` in that
+if-body. Mentioning `err` plus any nested ReturnStmt was a false green
+(`err == nil`, or `if false { return }`). This is still not a CFG
+analyzer; a sibling promote without stage stays accepted lexical-offset
+debt. Mutation count is 32. R18, R27, R29, R30, R31, Physical ABA and X1
+stay OPEN. `GC_ENABLED=false`.
+
 ## 2026-08-28 - R3 follow-up: Stage-error abort, orphan-read evidence, handoff=false
 
 Hardened #195 without changing the handshake. Production stage+promote

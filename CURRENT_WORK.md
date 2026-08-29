@@ -181,8 +181,9 @@ is not closed here). `GC_ENABLED=false`.
 **R3 update (2026-08-28):** The `pub:` post-stage check is GREEN, with
 follow-up evidence: stage-error abort before promote, orphan-read fail-closed,
 `gc_orphan_handoff=false` is Invalid, and writer-`pub:`-first is visible to
-`BlockHasReferencesGlobal`. Stage-error abort is the callback `if err != nil`,
-not the outer retry err-guard. Two sequential `LOCAL_QUORUM` reads per staged
+`BlockHasReferencesGlobal`. Stage-error abort is the callback `if err != nil`
+with a direct return, not `err == nil`, not a buried `if false { return }`,
+and not the outer retry err-guard. Two sequential `LOCAL_QUORUM` reads per staged
 block (canonical then orphan) are the publication-path cost; do not batch in
 this slice. Still OPEN: R18, R27, R29 integration, R30, R31, Physical ABA, X1.
 Next publication slice is R31, not another handshake. `GC_ENABLED=false`.
