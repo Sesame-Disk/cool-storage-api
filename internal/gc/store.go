@@ -884,8 +884,10 @@ const (
 	// state was not changed. Confirmation proves visibility now; it does not
 	// renew the row's remaining TTL (R27/R28).
 	StartBlockDeleteOrphanSameAuthority
-	// StartBlockDeleteOrphanDifferentTarget means an existing orphan carries a
-	// different physical identity. The existing lifecycle was not changed.
+	// StartBlockDeleteOrphanDifferentTarget means the durable lifecycle or
+	// canonical orphan that classified this result names a different physical
+	// identity from the proposal. A lifecycle-only result may not describe the
+	// current canonical orphan. The existing lifecycle was not changed.
 	StartBlockDeleteOrphanDifferentTarget
 	// StartBlockDeleteOrphanDifferentAuthority means an existing orphan names
 	// the same physical incarnation but a different claim authority. That is a
@@ -937,10 +939,12 @@ func (o StartBlockDeleteOrphanOutcome) String() string {
 	}
 }
 
-// StartBlockDeleteOrphanResult is the complete publication result. FirstSeenAt
-// is always the canonical lifecycle token when a row was found; it must be used
-// for projection repair instead of the proposed timestamp. Cause is diagnostic
-// only and never grants permission to finalize or delete.
+// StartBlockDeleteOrphanResult is the complete publication result. FirstSeenAt,
+// when non-zero, is the canonical orphan lifecycle token only when the orphan
+// corresponding to ExistingAuthority was observed; lifecycle-only conflicts may
+// leave it zero. When present, it must be used for projection repair instead of
+// the proposed timestamp. Cause is diagnostic only and never grants permission
+// to finalize or delete.
 type StartBlockDeleteOrphanResult struct {
 	Outcome           StartBlockDeleteOrphanOutcome
 	FirstSeenAt       time.Time

@@ -88,8 +88,8 @@ func TestGC_UpdateS3OrphanAttempt_DoesNotResurrectClearedOrphan(t *testing.T) {
 // gate. A non-creating condition prevents an update after a clear from
 // recreating a row, but existence alone does not stop that same delayed update
 // from landing on a new P2 row with the same primary key when its observed
-// first_seen_at differs. It is a stale-token guard, not a unique lifecycle ID;
-// StartBlockDeleteOrphan can reuse the value when resetting an existing row.
+// first_seen_at differs. It is a stale-token guard for a new lifecycle claim;
+// P2 must use a distinct claim ID because P4b-2 retains P1's tombstone.
 func TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken(t *testing.T) {
 	requireCassandra(t)
 
@@ -107,7 +107,7 @@ func TestGC_UpdateS3OrphanAttempt_RejectsDifferentLifecycleToken(t *testing.T) {
 	if err := store.DeleteS3Orphan(orgID, blockID, p1FirstSeenAt); err != nil {
 		t.Fatalf("DeleteS3Orphan P1: %v", err)
 	}
-	p2 := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthority(blockID, "cold", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID)), "sha1-p2", p2FirstSeenAt)
+	p2 := store.StartBlockDeleteOrphan(orgID, blockID, testCommittedOrphanAuthorityWithClaimID(blockID, "cold", syntheticCanonicalStorageKeyForTest(orgID.String(), blockID), "test-orphan-claim:p2:"+uuid.NewString()), "sha1-p2", p2FirstSeenAt)
 	if p2.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
 		t.Fatalf("StartBlockDeleteOrphan P2: outcome=%s cause=%v, want created", p2.Outcome, p2.Cause)
 	}

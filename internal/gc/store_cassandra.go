@@ -1997,7 +1997,8 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 // StartBlockDeleteOrphan records the durable recovery row for a block delete
 // lifecycle without overwriting an existing lifecycle. The canonical insert is
 // single-use: an uncertain result is settled in the SERIAL domain rather than
-// repeating the mutation, and the existing row's first_seen_at is always reused.
+// repeating the mutation, and a matching canonical orphan's first_seen_at is
+// reused when it is observed.
 //
 // SERIAL settlement and canonical EACH_QUORUM visibility are different facts.
 // SERIAL answers which value Paxos chose. Writer fence reads are LOCAL_QUORUM, so
@@ -2028,6 +2029,9 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 		return lifecycle
 	}
 	if lifecycle.Outcome != StartBlockDeleteOrphanCreated && lifecycle.Outcome != StartBlockDeleteOrphanSameAuthority {
+		if lifecycle.Outcome == StartBlockDeleteOrphanDifferentTarget {
+			return s.attachMatchingS3OrphanFirstSeenAt(orgID, blockID, lifecycle)
+		}
 		return lifecycle
 	}
 	now = now.UTC()
@@ -2068,6 +2072,22 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.confirmSameAuthorityOrphanResult(orgID, blockID, proposed, classified.Result))
 	}
 	return classified.Result
+}
+
+// attachMatchingS3OrphanFirstSeenAt completes a conflict result classified
+// from the lifecycle tombstone only when the canonical orphan belongs to that
+// exact (P, D). A current orphan from another lifecycle is not related data.
+func (s *CassandraStore) attachMatchingS3OrphanFirstSeenAt(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	orphan, found, err := s.GetS3OrphanGlobal(orgID, blockID)
+	if err != nil {
+		result.Cause = errors.Join(result.Cause, fmt.Errorf("read matching canonical S3 orphan for org=%s block=%s: %w", orgID, blockID, err))
+		return result
+	}
+	if !found || orphan.FirstSeenAt.IsZero() || !orphan.Authority.sameAuthority(result.ExistingAuthority) {
+		return result
+	}
+	result.FirstSeenAt = orphan.FirstSeenAt.UTC()
+	return result
 }
 
 type blockDeleteLifecycleRow struct {
