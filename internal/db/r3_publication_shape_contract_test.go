@@ -147,7 +147,7 @@ func r3IsCQLEntryPoint(call *ast.CallExpr) bool {
 }
 
 func r3CallCQLText(call *ast.CallExpr) (string, bool) {
-	if !r3IsCQLEntryPoint(call) {
+	if r3PublicationCallName(call) != "Query" {
 		return "", false
 	}
 	if len(call.Args) == 0 {
@@ -156,13 +156,19 @@ func r3CallCQLText(call *ast.CallExpr) (string, bool) {
 	return r3ProgramString(call.Args[0], map[string]string{})
 }
 
-// r3InspectCQLCall separates "this is a Query/Bind callsite" from "we can
-// reconstruct its statement text". Unresolved constants, variables, and
-// builders still consume the CQL budget. A resolved string that is not a CQL
-// verb (for example gin's c.Query("p")) does not.
+// r3InspectCQLCall separates "this is a Query/Bind entry point" from "we can
+// reconstruct a CQL statement". Bind's first argument is a bound value, not
+// the statement, so Bind always consumes the source-callsite budget. Query
+// still distinguishes unresolved/builders (count) from a resolved non-CQL
+// string such as gin's c.Query("p") (ignore). This is a lexical entry-point
+// count, not a claim that Cassandra already received the request; physical
+// submission is typically Exec/Scan/Iter.
 func r3InspectCQLCall(call *ast.CallExpr) (authority bool, cqlCallsite bool) {
 	if !r3IsCQLEntryPoint(call) {
 		return false, false
+	}
+	if r3PublicationCallName(call) == "Bind" {
+		return false, true
 	}
 	text, ok := r3CallCQLText(call)
 	if !ok {
@@ -173,6 +179,18 @@ func r3InspectCQLCall(call *ast.CallExpr) (authority bool, cqlCallsite bool) {
 		return true, true
 	}
 	return false, r3CQLVerbPattern.MatchString(normalized)
+}
+
+// r3CallIsBetweenStageAndHeadInvocation is the lexical stage -> HEAD window,
+// including argument and receiver evaluation of HEAD itself. Go evaluates
+// those before the call, so a DB read in a HEAD argument is still pre-HEAD.
+// The outer HEAD CallExpr is excluded; calls after HEAD.End() are not in
+// this interval.
+func r3CallIsBetweenStageAndHeadInvocation(call, stage, head *ast.CallExpr) bool {
+	if call == nil || stage == nil || head == nil || call == head {
+		return false
+	}
+	return call.Pos() > stage.End() && call.End() <= head.End()
 }
 
 func r3PublicationSinkName(name string) bool {
@@ -263,10 +281,11 @@ func r3AssertNoPublicationSink(t *testing.T, body ast.Node, seam, authorized str
 }
 
 // TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls freezes the real
-// publication funnels' lexical stage -> HEAD boundary. Direct DB access includes
-// ident.db.Method, a local alias of that field, a method value taken from it,
-// and Query/Bind CQL entry points regardless of how the session was obtained
-// or whether the statement text can be reconstructed. It is a narrow source
+// publication funnels' lexical stage -> HEAD boundary, including evaluation
+// of HEAD's receiver and arguments. Direct DB access includes ident.db.Method,
+// a local alias of that field, a method value taken from it, Query CQL entry
+// points, and Bind entry points. Bind always counts; Query counts when the
+// statement is unresolved or reconstructs as CQL. It is a narrow source
 // contract, not a general control-flow or RTT analysis.
 func TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls(t *testing.T) {
 	root := r3RepositoryRoot(t)
@@ -299,7 +318,7 @@ func TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls(t *testing.T) {
 			cqlCalls := 0
 			ast.Inspect(fn.Body, func(node ast.Node) bool {
 				call, ok := node.(*ast.CallExpr)
-				if !ok || call.Pos() <= stages[0].End() || call.End() >= head.Pos() {
+				if !ok || !r3CallIsBetweenStageAndHeadInvocation(call, stages[0], head) {
 					return true
 				}
 				name := r3PublicationCallName(call)

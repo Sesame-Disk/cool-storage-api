@@ -130,7 +130,7 @@ normal materialize -> publish
 static reachable CQL callsite budget remains at its recorded baseline
 known-loop authorized staging sink remains one call per guarded loop element
 unlisted direct database calls at guarded stage -> HEAD boundaries = 0
-pre-acquired session Query/Bind (literal, constant, variable, or builder) and local db aliases in those boundaries = 0
+pre-acquired session Query/Bind entry points (including Bind of a Query created before stage, and Query whose text is a literal, constant, variable, or builder) and local db aliases in those boundaries = 0
 canonical/orphan authority reads added = 0
 ```
 
@@ -146,9 +146,9 @@ function seam fails closed; a seam with an explicit alias is followed.
 resolution for indexed struct fields and methods (for example `h.db.Method`),
 follows local aliases of directly resolvable functions, and fails closed for a
 local method value on an indexed receiver when it cannot resolve the target.
-It freezes the number of structurally reachable submitted CQL callsites for
-every guarded root. These are static source callsites, not physical network
-RTTs or a proof of arbitrary runtime multiplicity. Any intentional new CQL
+It freezes the number of structurally reachable CQL source callsites for
+every guarded root. These are static source entry points, not physical
+Cassandra submissions or a proof of arbitrary runtime multiplicity. Any intentional new CQL
 therefore requires explicit review and a baseline update. This is a deliberately
 scoped source analyzer, not a claim of universal Go compiler/type analysis.
 
@@ -166,16 +166,21 @@ on the current functions. The scope is intentionally these known loops, not a
 generic complexity analyzer.
 `TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls` freezes the direct
 database surface in the enumerated v2, OnlyOffice, cross-repo copy/move
-(`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries. Direct
-access includes `ident.db.Method`, a local alias of that field, a method
-value taken from it, and `Query`/`Bind` CQL entry points regardless of how
-the session was obtained. Every such entry point consumes the CQL callsite
-budget even when the statement text cannot be reconstructed; resolved text
-is used only to classify canonical `blocks` / `gc_s3_orphans` SELECTs.
-Those authority SELECTs are rejected even when the CQL callsite count is
-unchanged.
-SeafHTTP keeps its existing commit INSERT as the frozen baseline. The test
-does not claim to prove every possible interprocedural path.
+(`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries. The
+interval is after stage through evaluation of HEAD's receiver and arguments
+(those run before HEAD is invoked); the outer HEAD call itself is excluded.
+Direct access includes `ident.db.Method`, a local alias of that field, a
+method value taken from it, `Query` entry points, and `Bind` entry points
+regardless of how the session was obtained. `Bind` always consumes the CQL
+source-callsite budget because its arguments are bound values, not the
+statement. `Query` consumes that budget when the statement cannot be
+reconstructed or reconstructs as CQL; resolved text is used only to
+classify canonical `blocks` / `gc_s3_orphans` SELECTs. Those authority
+SELECTs are rejected even when the CQL source-callsite count is unchanged.
+These are lexical CQL entry points, not a count of physically submitted
+Cassandra requests. SeafHTTP keeps its existing commit INSERT as the frozen
+baseline. The test does not claim to prove every possible interprocedural
+path.
 `TestR3MaterializationHasNoUnlistedDirectDBCall` similarly prevents a direct
 post-metadata database read being appended to `RegisterUploadedBlockTarget`,
 including a local `h.db` alias or method value; the established pin/fence/
@@ -184,13 +189,14 @@ metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Thirty-one isolated mutations prove red for the
+normal pre-HEAD R3 hot path. Thirty-three isolated mutations prove red for the
 seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
 authority reads, typed receiver and method-value dispatch, an extra per-block
 CQL INSERT, duplicated existing fan-out calls, a second named wrapper in each
 known loop, a second publication sink hidden in an allowed persist seam or
 nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db` alias/method-value and
 sync stage-to-HEAD reads, Query/Bind whose statement is a constant or variable,
+a Bind of a Query acquired before stage, a DB read inside a HEAD argument,
 and post-metadata materialization reads including a local `db` alias.
 
 ## Outcome and next steps

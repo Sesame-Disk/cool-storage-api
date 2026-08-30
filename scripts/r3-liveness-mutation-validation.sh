@@ -128,6 +128,8 @@ MUTATIONS=(
   m_v2_dynamic_query_after_stage
   m_v2_const_query_after_stage
   m_v2_dynamic_insert_after_stage
+  m_v2_preacquired_query_literal_bind_after_stage
+  m_v2_db_read_inside_head_argument
   m_v2_local_db_alias_post_stage_read
   m_v2_local_db_method_value_post_stage_read
   m_sync_post_stage_authority_read_before_head

@@ -128,6 +128,22 @@ m_v2_dynamic_insert_after_stage() {
     'v2/finalizeStoredUploadMetadataOnce direct CQL callsites' 'a Query whose INSERT text is a variable still consumes the stage-to-HEAD CQL budget'
 }
 
+m_v2_preacquired_query_literal_bind_after_stage() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := fsHelper.stagePendingPublishedFiles)@$1\tsession := h.db.Session()\n\tprepared := session.Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?")\n$2@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\t_ = prepared.Bind("my-org", "r3-block")\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce direct CQL callsites' 'a pre-acquired Query Bind between stage and HEAD still consumes the CQL source-callsite budget'
+}
+
+m_v2_db_read_inside_head_argument() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralStringReturningRead(orgID, blockID string) string {\n\t_ = database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n\treturn ""\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(if err := fsHelper.UpdateLibraryHeadFromSnapshot\(snapshot, repoID, newCommitID, snapshot\.HeadCommitID\); err != nil \{)@$1if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, h.db.R3NeutralStringReturningRead(orgID, "r3-block"), snapshot.HeadCommitID); err != nil {@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds direct DB method R3NeutralStringReturningRead' 'a DB read in a HEAD argument is still in the stage-to-HEAD interval'
+}
+
 m_v2_local_db_alias_post_stage_read() {
   reset_fixture
   mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralAliasPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
