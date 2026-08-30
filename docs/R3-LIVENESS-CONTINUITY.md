@@ -5,7 +5,7 @@
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
 The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
-Both Docker integration services set it, so a missing stack or skipped race cannot report green.
+Both Docker integration services set it. `TestMain` also requires the race test to execute after `m.Run()`, so a missing stack, a skip, or a `-run` filter that excludes the evidence cannot report green.
 
 ## Question and vocabulary
 
@@ -46,15 +46,24 @@ characterizes both races:
 writer up -> GC claim -> EACH_QUORUM refs=true -> GC releases
 ```
 
-and:
+and two GC-first variants whose `up:` is created by the productive writer call:
 
 ```text
-GC claim -> EACH_QUORUM refs=false -> writer up
-  -> writer sees deleting row or orphan -> writer rejects
+GC claim -> EACH_QUORUM refs=false
+  -> writer RegisterUploadedBlockTarget writes exact up:
+  -> canonical gc_state=deleting fence -> writer rejects before metadata
+
+GC claim -> EACH_QUORUM refs=false -> irreversible orphan handoff
+  -> finalize removes canonical blocks row
+  -> assert canonical absent + exact orphan present
+  -> writer RegisterUploadedBlockTarget writes exact up:
+  -> orphan-only fence -> writer rejects before metadata
 ```
 
 The evidence stops at the authority decision. It does not repeat #194's
-physical-delete tests.
+physical S3-delete tests. A separate runtime contract makes the active-fence
+branch fatal if repair, representation resolution, or install metadata is
+reached.
 
 ## Provenance inventory
 
@@ -106,11 +115,20 @@ normal materialize -> publish
 submitted R3 canonical/orphan authority CQL operations added = 0
 ```
 
-`TestR3PublicationHotPathHasNoPerBlockAuthorityReads` walks the local call graph
-of publication/stage/finalize roots. It rejects canonical `blocks` authority
-SELECTs, `gc_s3_orphans` SELECTs, and known authority classifiers. The mutation
-suite proves that inserting such a helper into the per-block publication path
-makes the guard red.
+`TestR3PublicationHotPathHasNoPerBlockAuthorityReads` retains the lightweight
+local source check. `TestR3PublicationHotPathIsFailClosed` indexes the db, v2,
+and API packages and follows direct calls, cross-package selectors,
+package-level function aliases, and function literals stored in seams. It
+rejects known authority classifiers and resolvable canonical `blocks` or
+`gc_s3_orphans` SELECTs, including qualified/quoted CQL. An unknown called
+function seam fails closed; a seam with an explicit alias is followed.
+
+The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
+and the normal stage/promote/finalize paths. They intentionally exclude
+`repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
+normal pre-HEAD R3 hot path. Ten isolated mutations prove red for the seven
+handshake/cost regressions plus a hidden FuncLit authority read, a cross-package
+wrapper, and qualified inline authority CQL.
 
 ## Outcome and next steps
 

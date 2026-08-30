@@ -98,6 +98,12 @@ func TestMain(m *testing.M) {
 	}()
 
 	code := m.Run()
+	if os.Getenv(r3CharacterizationEvidenceEnv) == "1" && !r3CharacterizationEvidenceObserved {
+		fmt.Printf("%s=1 requires TestR3WriterGCHandshakeAtRealCassandra to execute; check -run filters\n", r3CharacterizationEvidenceEnv)
+		if code == 0 {
+			code = 1
+		}
+	}
 	afterCleanupDone = true
 	cleanupIntegrationEphemeralLibraries("after")
 	if verifyErr := verifyNoOrphanAdminLibraryProjectionsWithRetry(5*time.Second, 250*time.Millisecond); verifyErr != nil {

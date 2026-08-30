@@ -15,6 +15,7 @@ import (
 	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -124,8 +125,6 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 		if hasRefs, err := store.BlockHasReferencesGlobal(orgID, blockID); err != nil || hasRefs {
 			t.Fatalf("GC global liveness before writer pin = %v, %v; want false, nil", hasRefs, err)
 		}
-
-		addR3UploadPin(t, database, orgID, blockID, referrer)
 		err = v2pkg.NewFSHelper(database).RegisterUploadedBlockTarget(
 			t.Context(), orgID.String(), uuid.NewString(), blockID, operationID, 1,
 			v2pkg.BlockMaterializationTarget{StorageClass: target.StorageClass, StorageKey: target.StorageKey}, "",
@@ -133,6 +132,7 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 		if !errors.Is(err, v2pkg.ErrBlockDeleteInProgress) {
 			t.Fatalf("R3 GC-WINS DELETING EVIDENCE: materialization error = %v, want ErrBlockDeleteInProgress", err)
 		}
+		assertR3ProductiveUploadPinVisible(t, database, store, orgID, blockID, referrer)
 		if released, releaseErr := store.ReleaseBlockClaim(orgID, blockID, attempt); releaseErr != nil || released != gcpkg.BlockReleaseReleased {
 			t.Fatalf("cleanup release GC claim = %s, %v", released, releaseErr)
 		}
@@ -170,8 +170,21 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 				t.Logf("cleanup R3 orphan: %v", err)
 			}
 		})
-
-		addR3UploadPin(t, database, orgID, blockID, referrer)
+		committed := gcpkg.CommittedBlockDeleteAuthorityForTest(attempt)
+		finalized, err := store.FinalizeBlockDelete(orgID, blockID, committed)
+		if err != nil || !p4bFinalizeAuthorizesPhysicalDelete(finalized) {
+			t.Fatalf("finalize canonical block before orphan-only writer fence = %+v, %v", finalized, err)
+		}
+		if _, err := store.GetBlockInfo(orgID, blockID); !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("canonical block after finalize error = %v, want gocql.ErrNotFound", err)
+		}
+		orphan, found, err := store.GetS3OrphanGlobal(orgID, blockID)
+		if err != nil || !found {
+			t.Fatalf("orphan-only fence visible=%v err=%v; want true, nil", found, err)
+		}
+		if orphan.Authority.ClaimID != attempt.ClaimID || orphan.StorageKey != target.StorageKey {
+			t.Fatalf("orphan-only authority = claim %q key %q, want claim %q key %q", orphan.Authority.ClaimID, orphan.StorageKey, attempt.ClaimID, target.StorageKey)
+		}
 		err = v2pkg.NewFSHelper(database).RegisterUploadedBlockTarget(
 			t.Context(), orgID.String(), uuid.NewString(), blockID, operationID, 1,
 			v2pkg.BlockMaterializationTarget{StorageClass: target.StorageClass, StorageKey: target.StorageKey}, "",
@@ -179,9 +192,11 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 		if !errors.Is(err, v2pkg.ErrBlockDeleteInProgress) {
 			t.Fatalf("R3 GC-WINS ORPHAN EVIDENCE: materialization error = %v, want ErrBlockDeleteInProgress", err)
 		}
+		assertR3ProductiveUploadPinVisible(t, database, store, orgID, blockID, referrer)
 	})
 
 	gate.observed = true
+	r3CharacterizationEvidenceObserved = true
 	t.Log("R3_LIVENESS_CHARACTERIZATION_EVIDENCE writer_wins=1 deleting_fence=1 orphan_fence=1")
 }
 

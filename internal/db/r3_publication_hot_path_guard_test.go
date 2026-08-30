@@ -111,7 +111,7 @@ func TestR3PublicationHotPathHasNoPerBlockAuthorityReads(t *testing.T) {
 	surfaces := []r3PublicationSurface{
 		{directory: filepath.Join(root, "internal", "db"), roots: []string{"AddPublishAttemptReferences", "StagePublishAttemptReferences", "PromotePublishAttemptReferences"}},
 		{directory: filepath.Join(root, "internal", "api", "v2"), roots: []string{"stagePendingPublishedFiles", "promotePendingPublishedFiles"}},
-		{directory: filepath.Join(root, "internal", "api"), roots: []string{"stageSyncCommitBlockDelta", "finalizeSyncCommitBlockDelta", "repairPublishedSyncCommitBlockDelta"}},
+		{directory: filepath.Join(root, "internal", "api"), roots: []string{"stageSyncCommitBlockDelta", "finalizeSyncCommitBlockDelta"}},
 	}
 
 	for _, surface := range surfaces {

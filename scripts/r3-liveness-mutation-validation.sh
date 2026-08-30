@@ -74,7 +74,7 @@ m_continue_on_fence() {
   reset_fixture
   mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's/if deleteFenceActive \{/if false \&\& deleteFenceActive {/'
   expect_red ./internal/api/v2 '^TestR3RegisterUploadedBlockTargetRejectsActiveFence$' \
-    'active post-pin fence must return ErrBlockDeleteInProgress' 'writer continues on active fence'
+    'an active post-pin fence must return ErrBlockDeleteInProgress' 'writer continues on active fence'
 }
 
 m_metadata_before_fence() {
@@ -99,6 +99,8 @@ m_authority_read_in_finalize() {
     'per-block authority helper ValidateBlockPublishAuthority' 'v2 publication primitive gains an authority read'
 }
 
+source scripts/r3-hotpath-extra-mutations.sh
+
 MUTATIONS=(
   m_fence_before_up
   m_no_up
@@ -107,6 +109,9 @@ MUTATIONS=(
   m_metadata_before_fence
   m_drop_up_after_success
   m_authority_read_in_finalize
+  m_authority_read_hidden_in_add_ref_funcvar
+  m_cross_package_authority_wrapper
+  m_qualified_inline_authority_select
 )
 
 if [ "${1:-}" = "--list" ]; then
