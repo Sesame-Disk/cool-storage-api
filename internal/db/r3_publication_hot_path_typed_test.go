@@ -214,6 +214,11 @@ func r3TypedLocalBindings(callable *r3TypedCallable, program *r3TypedProgram) (m
 				right := value.Rhs[position]
 				if target, ok := r3ProgramAlias(right, callable.symbol.pkg, callable.imports); ok {
 					aliases[name.Name] = append(aliases[name.Name], target)
+					delete(unknown, name.Name)
+					continue
+				}
+				if r3TypedMethodValueOnIndexedReceiver(right, callable, program, typesByName, aliases) {
+					unknown[name.Name] = true
 					continue
 				}
 				if typeRef, ok := r3TypedExprType(right, callable, program, typesByName, aliases); ok {
@@ -238,6 +243,11 @@ func r3TypedLocalBindings(callable *r3TypedCallable, program *r3TypedProgram) (m
 					if position < len(spec.Values) {
 						if target, ok := r3ProgramAlias(spec.Values[position], callable.symbol.pkg, callable.imports); ok {
 							aliases[name.Name] = append(aliases[name.Name], target)
+							delete(unknown, name.Name)
+							continue
+						}
+						if r3TypedMethodValueOnIndexedReceiver(spec.Values[position], callable, program, typesByName, aliases) {
+							unknown[name.Name] = true
 						}
 					}
 				}
@@ -246,6 +256,18 @@ func r3TypedLocalBindings(callable *r3TypedCallable, program *r3TypedProgram) (m
 		return true
 	})
 	return typesByName, aliases, unknown
+}
+
+func r3TypedMethodValueOnIndexedReceiver(expr ast.Expr, callable *r3TypedCallable, program *r3TypedProgram, locals map[string]r3TypedType, aliases map[string][]r3ProgramSymbol) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	receiver, ok := r3TypedExprType(selector.X, callable, program, locals, aliases)
+	if !ok || !program.packages[receiver.pkg] {
+		return false
+	}
+	return len(program.methods[receiver][selector.Sel.Name]) > 0
 }
 
 func r3TypedExprType(expr ast.Expr, callable *r3TypedCallable, program *r3TypedProgram, locals map[string]r3TypedType, aliases map[string][]r3ProgramSymbol) (r3TypedType, bool) {

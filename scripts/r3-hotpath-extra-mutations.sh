@@ -45,3 +45,57 @@ m_extra_per_block_cql_insert() {
   expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
     'db.AddPublishAttemptReferences submitted CQL callsites = 3, want 2' 'extra per-block CQL INSERT exceeds the frozen budget'
 }
+
+m_local_receiver_method_value_authority_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralMethodValueRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(func \(h \*FSHelper\) stagePendingPublishedFiles\([^\{]+\{)@$1\n\tr3MethodValueCheck := h.db.R3NeutralMethodValueRead\n\t_ = r3MethodValueCheck(orgID, "r3-block")@'
+  expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
+    'unresolved local function seam r3MethodValueCheck' 'receiver method value cannot hide an authority read'
+}
+
+m_duplicate_existing_per_block_publication_io() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(\tif err := stagePendingPublishedFilesAddReferencesFn\(h\.db, orgID, repoID, attemptID, resolved\); err != nil \{)@\tif err := stagePendingPublishedFilesAddReferencesFn(h.db, orgID, repoID, attemptID, resolved); err != nil {\n\t\treturn err\n\t}\n$1@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'stagePendingPublishedFiles calls AddReferences 2 times per pending file, want 1' 'duplicated existing per-file staging I/O exceeds the fan-out contract'
+}
+
+m_duplicate_existing_per_normalized_block_io() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(if err := addPublishAttemptReferenceFn\(database, orgID, blockID, referrer, repoID\); err != nil \{)@if err := addPublishAttemptReferenceFn(database, orgID, blockID, referrer, repoID); err != nil {\n\t\t\treturn staged, err\n\t\t}\n\t\t$1@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'addPublishAttemptReferencesRows calls addPublishAttemptReferenceFn 2 times per block, want 1' 'duplicated existing per-block reference I/O exceeds the fan-out contract'
+}
+
+m_v2_post_stage_authority_read_before_head() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tif err := h.db.R3NeutralPostStageRead(orgID, "r3-block"); err != nil { return "", 0, 0, err }\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds direct DB method R3NeutralPostStageRead' 'v2 stage-to-HEAD boundary gains an authority read'
+}
+
+m_v2_fshelper_post_stage_authority_read_before_head() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralFSHelperPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tif err := fsHelper.db.R3NeutralFSHelperPostStageRead(orgID, "r3-block"); err != nil { return "", 0, 0, err }\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds direct DB method R3NeutralFSHelperPostStageRead' 'v2 fsHelper.db stage-to-HEAD boundary gains an authority read'
+}
+
+m_sync_post_stage_authority_read_before_head() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/sync.go" 's@(func \(h \*SyncHandler\) handleSyncHeadPromotion[\s\S]*?)(\t\tcleanupStaged := true)@$1\t\tif err := h.db.R3NeutralPostStageRead(orgID, "r3-block"); err != nil { return }\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'sync/handleSyncHeadPromotion adds direct DB method R3NeutralPostStageRead' 'sync stage-to-HEAD boundary gains an authority read'
+}
+
+m_materialization_post_metadata_authority_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralPostMetadataRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(WithLabelValues\("applied"\)\.Inc\(\))@$1\n\tif err := h.db.R3NeutralPostMetadataRead(orgID, blockID); err != nil { return err }@'
+  expect_red ./internal/db '^TestR3MaterializationHasNoUnlistedDirectDBCall$' \
+    'R3 MATERIALIZATION BUDGET: direct DB method R3NeutralPostMetadataRead' 'materialization gains a post-metadata authority read'
+}

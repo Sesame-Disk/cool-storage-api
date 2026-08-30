@@ -115,6 +115,13 @@ MUTATIONS=(
   m_cross_package_receiver_method
   m_local_function_alias_authority_read
   m_extra_per_block_cql_insert
+  m_local_receiver_method_value_authority_read
+  m_duplicate_existing_per_block_publication_io
+  m_duplicate_existing_per_normalized_block_io
+  m_v2_post_stage_authority_read_before_head
+  m_v2_fshelper_post_stage_authority_read_before_head
+  m_sync_post_stage_authority_read_before_head
+  m_materialization_post_metadata_authority_read
 )
 
 if [ "${1:-}" = "--list" ]; then

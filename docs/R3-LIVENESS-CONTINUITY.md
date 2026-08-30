@@ -5,10 +5,13 @@
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
 The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
-Both Docker integration services set it. `TestMain` requires all three race legs
-(writer wins, canonical deleting fence, and orphan-only fence) to complete after
-`m.Run()`. A missing stack, a skip, or a partial `-run` subtest filter therefore
-cannot report green.
+The default full integration command of both Docker services sets it only for
+that command. `TestMain` requires all three race legs (writer wins, canonical
+deleting fence, and orphan-only fence) to complete after `m.Run()`. A missing
+stack or a skip therefore cannot report green in the full gate, while a caller
+that replaces the command with a directed `-run` does not inherit an unrelated
+R3 requirement. A directed R3 run opts in explicitly with
+`-e SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
 
 ## Question and vocabulary
 
@@ -118,7 +121,9 @@ network RTTs:
 
 ```text
 normal materialize -> publish
-additional structurally reachable per-block CQL callsites = 0
+static reachable CQL callsite budget remains at its recorded baseline
+known per-element staging fan-out remains one call per guarded loop element
+unlisted direct database calls at guarded stage -> HEAD boundaries = 0
 canonical/orphan authority reads added = 0
 ```
 
@@ -132,19 +137,36 @@ function seam fails closed; a seam with an explicit alias is followed.
 
 `TestR3PublicationHotPathTypedReceiversAndCQLBudget` adds explicit receiver-type
 resolution for indexed struct fields and methods (for example `h.db.Method`),
-follows local aliases of directly resolvable functions, and freezes the number
-of structurally reachable submitted CQL callsites for every guarded root. These
-are static source callsites, not physical network RTTs. Any intentional new CQL
+follows local aliases of directly resolvable functions, and fails closed for a
+local method value on an indexed receiver when it cannot resolve the target.
+It freezes the number of structurally reachable submitted CQL callsites for
+every guarded root. These are static source callsites, not physical network
+RTTs or a proof of arbitrary runtime multiplicity. Any intentional new CQL
 therefore requires explicit review and a baseline update. This is a deliberately
 scoped source analyzer, not a claim of universal Go compiler/type analysis.
+
+`TestR3PublicationKnownFanoutIsSinglePass` supplies the narrow multiplicity
+contract the static budget cannot provide: it freezes exactly one staging call
+per `pendingFiles` element and one reference insert per `NormalizeBlockIDs`
+loop element. The scope is intentionally these known loops, not a generic
+complexity analyzer.
+`TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls` freezes the direct
+`*.db.Method` surface in the enumerated v2, OnlyOffice, copy/move, SeafHTTP, and
+sync stage-to-HEAD boundaries, including both `h.db` and `fsHelper.db`. It
+catches an added direct per-block read in that interval; it does not claim to
+prove every possible interprocedural path.
+`TestR3MaterializationHasNoUnlistedDirectDBCall` similarly prevents a direct
+post-metadata database read being appended to `RegisterUploadedBlockTarget`;
+the established pin/fence/metadata seams remain its allowed I/O.
 
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Thirteen isolated mutations prove red for the seven
-handshake/cost regressions plus a hidden FuncLit authority read, a cross-package
-wrapper, qualified inline authority CQL, a typed cross-package receiver method,
-a local function alias, and an additional non-authority per-block CQL INSERT.
+normal pre-HEAD R3 hot path. Twenty isolated mutations prove red for the seven
+handshake/cost regressions plus hidden FuncLit/cross-package/qualified authority
+reads, typed receiver and method-value dispatch, an extra per-block CQL INSERT,
+duplicated existing fan-out calls, v2 `h.db`/`fsHelper.db` and sync stage-to-HEAD
+reads, and a post-metadata materialization read.
 
 ## Outcome and next steps
 

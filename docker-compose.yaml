@@ -543,7 +543,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2; ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3; go test -tags integration -v -count=1 -timeout 10m ./internal/integration/...
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2; ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3; SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 10m ./internal/integration/...
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
@@ -555,7 +555,6 @@ services:
       - SESAMEFS_REQUIRE_P3_EVIDENCE=1
       - SESAMEFS_REQUIRE_P4A_EVIDENCE=1
       - SESAMEFS_REQUIRE_P4B_EVIDENCE=1
-      - SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1
       # R26 is the exact-P IDENTITY half: it needs the real engine because what
       # it changed is a set of PRIMARY KEYs, and a map-backed mock keeps rows
       # apart under any key the Go code invents.
@@ -586,7 +585,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2 && ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 && go test -tags integration -v -count=1 -timeout 10m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
+      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2 && ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 && SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 10m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
@@ -598,7 +597,6 @@ services:
       - SESAMEFS_REQUIRE_P3_EVIDENCE=1
       - SESAMEFS_REQUIRE_P4A_EVIDENCE=1
       - SESAMEFS_REQUIRE_P4B_EVIDENCE=1
-      - SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1
       # R26 is the exact-P IDENTITY half: it needs the real engine because what
       # it changed is a set of PRIMARY KEYs, and a map-backed mock keeps rows
       # apart under any key the Go code invents.
