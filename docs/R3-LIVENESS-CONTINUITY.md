@@ -1,12 +1,11 @@
 # R3 liveness-continuity characterization
 
-**Baseline parent:** `c0da425a4` (`main` containing #194 and #196)  
-**Scope:** characterization only; no publication behavior changes  
+**Baseline parent:** `c0da425a4` (`main` containing #194 and #196)
+**Scope:** characterization only; no publication behavior changes
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
-The real-Cassandra evidence gate for a focused run is
-`SESAMEFS_REQUIRE_P4B_EVIDENCE`. Standard full integration runs
-also carry the existing P4b evidence gate and exercise the same Cassandra stack.
+The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
+Both Docker integration services set it, so a missing stack or skipped race cannot report green.
 
 ## Question and vocabulary
 

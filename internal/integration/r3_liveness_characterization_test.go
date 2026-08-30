@@ -18,7 +18,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const r3CharacterizationEvidenceEnv = "SESAMEFS_REQUIRE_P4B_EVIDENCE"
+const r3CharacterizationEvidenceEnv = "SESAMEFS_REQUIRE_R3_CHARACTERIZATION"
 
 type r3CharacterizationEvidenceGate struct{ observed bool }
 
@@ -191,7 +191,7 @@ func TestR3CharacterizationBaseIsDocumented(t *testing.T) {
 		t.Fatalf("read R3 characterization document: %v", err)
 	}
 	text := string(raw)
-	for _, required := range []string{"c0da425a4", "R3 remains OPEN", "GC_ENABLED=false", fmt.Sprintf("`%s`", r3CharacterizationEvidenceEnv)} {
+	for _, required := range []string{"c0da425a4", "R3 remains OPEN", "GC_ENABLED=false", fmt.Sprintf("`%s=1`", r3CharacterizationEvidenceEnv)} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("R3 characterization document is missing %q", required)
 		}
