@@ -98,8 +98,8 @@ func TestMain(m *testing.M) {
 	}()
 
 	code := m.Run()
-	if os.Getenv(r3CharacterizationEvidenceEnv) == "1" && !r3CharacterizationEvidenceObserved {
-		fmt.Printf("%s=1 requires TestR3WriterGCHandshakeAtRealCassandra to execute; check -run filters\n", r3CharacterizationEvidenceEnv)
+	if os.Getenv(r3CharacterizationEvidenceEnv) == "1" && !r3CharacterizationEvidence.complete() {
+		fmt.Printf("%s=1 requires all R3 Cassandra legs; missing=%s (check -run filters)\n", r3CharacterizationEvidenceEnv, strings.Join(r3CharacterizationEvidence.missing(), ","))
 		if code == 0 {
 			code = 1
 		}

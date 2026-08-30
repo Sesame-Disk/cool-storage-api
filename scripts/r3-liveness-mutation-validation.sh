@@ -51,9 +51,9 @@ expect_red() {
 m_fence_before_up() {
   reset_fixture
   local file="$FIXTURE/internal/api/v2/fs_helpers.go"
-  mutate "$file" 's/registerUploadedBlockAddProvisionalRefFn/R3_SWAP_TMP/g; s/registerUploadedBlockFenceActiveFn/registerUploadedBlockAddProvisionalRefFn/g; s/R3_SWAP_TMP/registerUploadedBlockFenceActiveFn/g'
+  mutate "$file" 's@(\tif err := registerUploadedBlockAddProvisionalRefFn\(h, orgID, blockID, referrer, libraryID, target\.StorageClass, expiresAt\); err != nil \{)@\t_, _ = registerUploadedBlockFenceActiveFn(h, orgID, blockID)\n$1@'
   expect_red ./internal/api/v2 '^TestR3RegisterUploadedBlockTargetPinsBeforeAuthority$' \
-    'provisional up must precede post-pin fence' 'fence moves before up'
+    'provisional up must precede post-pin fence' 'fence executes before up'
 }
 
 m_no_up() {
@@ -80,9 +80,9 @@ m_continue_on_fence() {
 m_metadata_before_fence() {
   reset_fixture
   local file="$FIXTURE/internal/api/v2/fs_helpers.go"
-  mutate "$file" 's/registerUploadedBlockFenceActiveFn/R3_SWAP_TMP/g; s/registerUploadedBlockRepairMetadataFn/registerUploadedBlockFenceActiveFn/g; s/R3_SWAP_TMP/registerUploadedBlockRepairMetadataFn/g'
+  mutate "$file" 's@(\tdeleteFenceActive, err := registerUploadedBlockFenceActiveFn\(h, orgID, blockID\))@\t_ = registerUploadedBlockRepairMetadataFn(h, orgID, libraryID, blockID, sha1ID, sizeBytes, target)\n$1@'
   expect_red ./internal/api/v2 '^TestR3RegisterUploadedBlockTargetPinsBeforeAuthority$' \
-    'metadata authority must remain downstream of the post-pin fence' 'metadata moves before fence'
+    'metadata authority must remain downstream of the post-pin fence' 'metadata executes before fence'
 }
 
 m_drop_up_after_success() {
@@ -112,6 +112,9 @@ MUTATIONS=(
   m_authority_read_hidden_in_add_ref_funcvar
   m_cross_package_authority_wrapper
   m_qualified_inline_authority_select
+  m_cross_package_receiver_method
+  m_local_function_alias_authority_read
+  m_extra_per_block_cql_insert
 )
 
 if [ "${1:-}" = "--list" ]; then

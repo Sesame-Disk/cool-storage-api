@@ -22,3 +22,26 @@ m_qualified_inline_authority_select() {
   expect_red ./internal/db '^TestR3PublicationHotPathIsFailClosed$' \
     'submitted canonical/orphan CQL authority read' 'qualified inline authority SELECT enters publication'
 }
+
+m_cross_package_receiver_method() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralReceiverRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(func \(h \*FSHelper\) stagePendingPublishedFiles\([^\{]+\{)@$1\n\t_ = h.db.R3NeutralReceiverRead(orgID, "r3-block")@'
+  expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
+    'canonical/orphan authority CQL is reachable' 'typed receiver method hides a cross-package authority read'
+}
+
+m_local_function_alias_authority_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func R3NeutralLocalAliasRead(database *DB) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks").Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(func \(h \*FSHelper\) stagePendingPublishedFiles\([^\{]+\{)@$1\n\tr3LocalCheck := db.R3NeutralLocalAliasRead\n\t_ = r3LocalCheck(h.db)@'
+  expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
+    'canonical/orphan authority CQL is reachable' 'local function alias hides an authority read'
+}
+
+m_extra_per_block_cql_insert() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's/(var addPublishAttemptReferenceFn = func[^\{]+\{)/$1\n\t_ = database.Session().Query("INSERT INTO r3_publication_guards (org_id, block_id) VALUES (?, ?)", orgID, blockID).Exec()/'
+  expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
+    'db.AddPublishAttemptReferences submitted CQL callsites = 3, want 2' 'extra per-block CQL INSERT exceeds the frozen budget'
+}

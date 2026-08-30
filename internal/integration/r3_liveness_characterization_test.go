@@ -33,7 +33,7 @@ func r3RequireCharacterizationEvidence(t *testing.T) *r3CharacterizationEvidence
 		if t.Skipped() {
 			t.Errorf("%s=1 requires real Cassandra R3 evidence, but the test skipped", r3CharacterizationEvidenceEnv)
 		} else if !t.Failed() && !gate.observed {
-			t.Errorf("%s=1 completed without R3 liveness evidence", r3CharacterizationEvidenceEnv)
+			t.Errorf("%s=1 incomplete R3 liveness evidence; missing=%s", r3CharacterizationEvidenceEnv, strings.Join(r3CharacterizationEvidence.missing(), ","))
 		}
 	})
 	return gate
@@ -107,6 +107,7 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 		if err != nil || fenced {
 			t.Fatalf("writer fence after GC release = %v, %v; want false, nil", fenced, err)
 		}
+		r3CharacterizationEvidence.writerWins = true
 	})
 
 	t.Run("GC claim wins and deleting row fences writer", func(t *testing.T) {
@@ -136,6 +137,7 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 		if released, releaseErr := store.ReleaseBlockClaim(orgID, blockID, attempt); releaseErr != nil || released != gcpkg.BlockReleaseReleased {
 			t.Fatalf("cleanup release GC claim = %s, %v", released, releaseErr)
 		}
+		r3CharacterizationEvidence.deletingFence = true
 	})
 
 	t.Run("GC orphan fences writer after irreversible handoff", func(t *testing.T) {
@@ -193,11 +195,11 @@ func TestR3WriterGCHandshakeAtRealCassandra(t *testing.T) {
 			t.Fatalf("R3 GC-WINS ORPHAN EVIDENCE: materialization error = %v, want ErrBlockDeleteInProgress", err)
 		}
 		assertR3ProductiveUploadPinVisible(t, database, store, orgID, blockID, referrer)
+		r3CharacterizationEvidence.orphanOnlyFence = true
 	})
 
-	gate.observed = true
-	r3CharacterizationEvidenceObserved = true
-	t.Log("R3_LIVENESS_CHARACTERIZATION_EVIDENCE writer_wins=1 deleting_fence=1 orphan_fence=1")
+	gate.observed = r3CharacterizationEvidence.complete()
+	t.Logf("R3_LIVENESS_CHARACTERIZATION_EVIDENCE writer_wins=%t deleting_fence=%t orphan_fence=%t", r3CharacterizationEvidence.writerWins, r3CharacterizationEvidence.deletingFence, r3CharacterizationEvidence.orphanOnlyFence)
 }
 
 func TestR3CharacterizationBaseIsDocumented(t *testing.T) {
