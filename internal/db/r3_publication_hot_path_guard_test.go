@@ -109,7 +109,7 @@ func r3ContainsAuthoritySelect(fn *ast.FuncDecl) bool {
 func TestR3PublicationHotPathHasNoPerBlockAuthorityReads(t *testing.T) {
 	root := r3RepositoryRoot(t)
 	surfaces := []r3PublicationSurface{
-		{directory: filepath.Join(root, "internal", "db"), roots: []string{"StagePublishAttemptReferences", "PromotePublishAttemptReferences"}},
+		{directory: filepath.Join(root, "internal", "db"), roots: []string{"AddPublishAttemptReferences", "StagePublishAttemptReferences", "PromotePublishAttemptReferences"}},
 		{directory: filepath.Join(root, "internal", "api", "v2"), roots: []string{"stagePendingPublishedFiles", "promotePendingPublishedFiles"}},
 		{directory: filepath.Join(root, "internal", "api"), roots: []string{"stageSyncCommitBlockDelta", "finalizeSyncCommitBlockDelta", "repairPublishedSyncCommitBlockDelta"}},
 	}

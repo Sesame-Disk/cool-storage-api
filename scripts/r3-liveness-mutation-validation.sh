@@ -94,9 +94,9 @@ m_drop_up_after_success() {
 
 m_authority_read_in_finalize() {
   reset_fixture
-  mutate "$FIXTURE/internal/db/block_references.go" 's/(func StagePublishAttemptReferences[^\{]+\{)/$1\n\t_ = ValidateBlockPublishAuthority()/'
+  mutate "$FIXTURE/internal/db/block_references.go" 's/(func AddPublishAttemptReferences[^\{]+\{)/$1\n\t_ = ValidateBlockPublishAuthority()/'
   expect_red ./internal/db '^TestR3PublicationHotPathHasNoPerBlockAuthorityReads$' \
-    'per-block authority helper ValidateBlockPublishAuthority' 'publication loop gains an authority read'
+    'per-block authority helper ValidateBlockPublishAuthority' 'v2 publication primitive gains an authority read'
 }
 
 MUTATIONS=(

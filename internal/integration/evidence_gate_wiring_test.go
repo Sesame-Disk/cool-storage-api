@@ -30,10 +30,10 @@ import (
 // `SESAMEFS_REQUIRE_R26_EVIDENCE=1 go test ...` against a dead stack would have
 // exited 0.
 //
-// So this discovers the gates from the source instead of from a hand-kept list: any
-// SESAMEFS_REQUIRE_*_EVIDENCE the package mentions must appear in TestMain's
-// requireEvidence chain. Adding a gate and forgetting to wire it is now a test
-// failure rather than a silent hole.
+// So this discovers the gates from the source instead of from a hand-kept list:
+// any SESAMEFS_REQUIRE_*_EVIDENCE or SESAMEFS_REQUIRE_*_CHARACTERIZATION the
+// package mentions must appear in TestMain's requireEvidence chain. Adding a
+// gate and forgetting to wire it is now a test failure rather than a silent hole.
 func TestEveryEvidenceGateIsWiredIntoTestMain(t *testing.T) {
 	const testMainFile = "integration_test.go"
 
@@ -63,7 +63,7 @@ func TestEveryEvidenceGateIsWiredIntoTestMain(t *testing.T) {
 }
 
 var (
-	evidenceGatePattern  = regexp.MustCompile(`SESAMEFS_REQUIRE_[A-Z0-9_]+_EVIDENCE`)
+	evidenceGatePattern  = regexp.MustCompile(`SESAMEFS_REQUIRE_[A-Z0-9_]+_(?:EVIDENCE|CHARACTERIZATION)`)
 	requireEvidenceStart = regexp.MustCompile(`requireEvidence\s*:?=`)
 )
 
