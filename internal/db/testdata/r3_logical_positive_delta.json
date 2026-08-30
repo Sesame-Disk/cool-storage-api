@@ -1,0 +1,8 @@
+[
+  {"name":"overlap","old":["A","B","C"],"new":["A","B","C","D","E"],"want":["D","E"]},
+  {"name":"identical","old":["A","B","C"],"new":["A","B","C"],"want":[]},
+  {"name":"reordered","old":["A","B"],"new":["B","A"],"want":[]},
+  {"name":"duplicates","old":["A","A","B"],"new":["A","A","C"],"want":["C"]},
+  {"name":"metadata-only","old":["A","B"],"new":["A","B"],"want":[]},
+  {"name":"external-aliases-deduplicate","old":["sha1-old"],"new":["sha1-new","sha256-Y"],"aliases":{"sha1-old":"sha256-X","sha1-new":"sha256-X"},"want":["sha256-Y"]}
+]
