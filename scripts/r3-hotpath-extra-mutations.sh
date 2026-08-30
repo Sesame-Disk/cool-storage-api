@@ -82,6 +82,44 @@ m_wrapper_second_insert_in_normalized_block_loop() {
     'unlisted call r3DuplicateNormalizedBlockInsert' 'a second named wrapper in the NormalizeBlockIDs loop exceeds the fan-out contract'
 }
 
+m_persist_fn_second_publication_sink() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(var stagePendingPublishedFilesPersistFn = func[^\{]+\{)@$1\n\t_ = db.AddPublishAttemptReferences(h.db, pending.cleanupOrgID, repoID, pending.cleanupAttemptID, pending.internalBlockIDs)@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'stagePendingPublishedFilesPersistFn reaches AddPublishAttemptReferences' 'an allowed persist seam cannot become a second publication sink'
+}
+
+m_funclit_second_publication_sink() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(if err := stagePendingPublishedFilesAddReferencesFn\(h\.db, orgID, repoID, attemptID, resolved\); err != nil \{)@func() { _ = db.AddPublishAttemptReferences(h.db, orgID, repoID, attemptID, resolved) }()\n\t\t$1@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'has a nested FuncLit' 'a nested FuncLit in the pendingFiles loop exceeds the fan-out contract'
+}
+
+m_v2_session_query_after_stage() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := fsHelper.stagePendingPublishedFiles)@$1\tsession := h.db.Session()\n$2@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\t_ = session.Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, "r3-block")\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds authority CQL' 'a pre-acquired session Query between stage and HEAD is an authority read'
+}
+
+m_v2_local_db_alias_post_stage_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralAliasPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tdatabase := h.db\n\tif err := database.R3NeutralAliasPostStageRead(orgID, "r3-block"); err != nil { return "", 0, 0, err }\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds direct DB method R3NeutralAliasPostStageRead' 'a local db alias cannot hide a stage-to-HEAD authority read'
+}
+
+m_v2_local_db_method_value_post_stage_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralMethodValuePostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tr3PostStageRead := h.db.R3NeutralMethodValuePostStageRead\n\tif err := r3PostStageRead(orgID, "r3-block"); err != nil { return "", 0, 0, err }\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce adds db method value r3PostStageRead' 'a db method value cannot hide a stage-to-HEAD authority read'
+}
+
 m_v2_post_stage_authority_read_before_head() {
   reset_fixture
   mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
@@ -112,4 +150,12 @@ m_materialization_post_metadata_authority_read() {
   mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(WithLabelValues\("applied"\)\.Inc\(\))@$1\n\tif err := h.db.R3NeutralPostMetadataRead(orgID, blockID); err != nil { return err }@'
   expect_red ./internal/db '^TestR3MaterializationHasNoUnlistedDirectDBCall$' \
     'R3 MATERIALIZATION BUDGET: direct DB method R3NeutralPostMetadataRead' 'materialization gains a post-metadata authority read'
+}
+
+m_materialization_local_db_alias_read() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralAliasPostMetadataRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(WithLabelValues\("applied"\)\.Inc\(\))@$1\n\tdatabase := h.db\n\tif err := database.R3NeutralAliasPostMetadataRead(orgID, blockID); err != nil { return err }@'
+  expect_red ./internal/db '^TestR3MaterializationHasNoUnlistedDirectDBCall$' \
+    'R3 MATERIALIZATION BUDGET: direct DB method R3NeutralAliasPostMetadataRead' 'a local db alias cannot hide a post-metadata materialization read'
 }

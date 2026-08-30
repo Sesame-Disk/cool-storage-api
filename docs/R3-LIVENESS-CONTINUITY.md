@@ -130,6 +130,7 @@ normal materialize -> publish
 static reachable CQL callsite budget remains at its recorded baseline
 known-loop authorized staging sink remains one call per guarded loop element
 unlisted direct database calls at guarded stage -> HEAD boundaries = 0
+pre-acquired session Query/Bind and local db aliases in those boundaries = 0
 canonical/orphan authority reads added = 0
 ```
 
@@ -155,29 +156,39 @@ scoped source analyzer, not a claim of universal Go compiler/type analysis.
 contract the static budget cannot provide: it freezes the authorized staging
 sink in two known loops (`stagePendingPublishedFilesAddReferencesFn` per
 `pendingFiles` element, `addPublishAttemptReferenceFn` per `NormalizeBlockIDs`
-element) and fail-closes any other call in those loop bodies. That is a freeze
-of the direct sinks in those loops, not a proof of arbitrary runtime
-multiplicity or of helpers defined outside the loop. Companion runtime tests
-count seam invocations on the current functions. The scope is intentionally
-these known loops, not a generic complexity analyzer.
+element), fail-closes any other named call or nested FuncLit in those loop
+bodies, and requires that the allowed helper seams (`PersistFn`, `ResolveFn`,
+rollback, `createPendingPublishedFileRow`) do not themselves reach a
+publication primitive. That is a freeze of the authorized route in those
+loops, not a proof of arbitrary runtime multiplicity or of helpers defined
+outside the inspected seams. Companion runtime tests count seam invocations
+on the current functions. The scope is intentionally these known loops, not a
+generic complexity analyzer.
 `TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls` freezes the direct
-`*.db.Method` surface in the enumerated v2, OnlyOffice, cross-repo copy/move
-(`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries, including
-both `h.db` and `fsHelper.db`. It catches an added direct per-block read in
-that interval; it does not claim to prove every possible interprocedural path.
+database surface in the enumerated v2, OnlyOffice, cross-repo copy/move
+(`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries. Direct
+access includes `ident.db.Method`, a local alias of that field, a method
+value taken from it, and `Query`/`Bind` CQL entry points regardless of how
+the session was obtained. Canonical `blocks` / `gc_s3_orphans` SELECTs in
+that interval are rejected even when the CQL callsite count is unchanged.
+SeafHTTP keeps its existing commit INSERT as the frozen baseline. The test
+does not claim to prove every possible interprocedural path.
 `TestR3MaterializationHasNoUnlistedDirectDBCall` similarly prevents a direct
-post-metadata database read being appended to `RegisterUploadedBlockTarget`;
-the established pin/fence/metadata seams remain its allowed I/O.
+post-metadata database read being appended to `RegisterUploadedBlockTarget`,
+including a local `h.db` alias or method value; the established pin/fence/
+metadata seams remain its allowed I/O.
 
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Twenty-two isolated mutations prove red for the
+normal pre-HEAD R3 hot path. Twenty-eight isolated mutations prove red for the
 seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
 authority reads, typed receiver and method-value dispatch, an extra per-block
 CQL INSERT, duplicated existing fan-out calls, a second named wrapper in each
-known loop, v2 `h.db`/`fsHelper.db` and sync stage-to-HEAD reads, and a
-post-metadata materialization read.
+known loop, a second publication sink hidden in an allowed persist seam or
+nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db` alias/method-value and
+sync stage-to-HEAD reads, and post-metadata materialization reads including a
+local `db` alias.
 
 ## Outcome and next steps
 

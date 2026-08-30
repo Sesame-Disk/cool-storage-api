@@ -120,10 +120,16 @@ MUTATIONS=(
   m_duplicate_existing_per_normalized_block_io
   m_wrapper_second_stage_in_pending_files_loop
   m_wrapper_second_insert_in_normalized_block_loop
+  m_persist_fn_second_publication_sink
+  m_funclit_second_publication_sink
   m_v2_post_stage_authority_read_before_head
   m_v2_fshelper_post_stage_authority_read_before_head
+  m_v2_session_query_after_stage
+  m_v2_local_db_alias_post_stage_read
+  m_v2_local_db_method_value_post_stage_read
   m_sync_post_stage_authority_read_before_head
   m_materialization_post_metadata_authority_read
+  m_materialization_local_db_alias_read
 )
 
 if [ "${1:-}" = "--list" ]; then
@@ -133,7 +139,7 @@ fi
 
 for mutation in "${MUTATIONS[@]}"; do
   green "Running $mutation"
-  "$mutation"
+  "$mutation" || fail "$mutation returned non-zero"
 done
 
 green "R3 liveness/hot-path mutation evidence passed"
