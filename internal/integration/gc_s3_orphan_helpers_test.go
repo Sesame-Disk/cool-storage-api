@@ -39,9 +39,13 @@ func seedS3OrphanWithStorageKey(t *testing.T, store gcpkg.GCStore, orgID uuid.UU
 }
 
 func testCommittedOrphanAuthority(blockID, storageClass, storageKey string) gcpkg.CommittedBlockDeleteAuthority {
+	return testCommittedOrphanAuthorityWithClaimID(blockID, storageClass, storageKey, "test-orphan-claim:"+blockID)
+}
+
+func testCommittedOrphanAuthorityWithClaimID(blockID, storageClass, storageKey, claimID string) gcpkg.CommittedBlockDeleteAuthority {
 	return gcpkg.CommittedBlockDeleteAuthorityForTest(gcpkg.BlockDeleteAuthority{
 		Target:    gcpkg.BlockDeleteTarget{StorageClass: storageClass, StorageKey: storageKey},
-		ClaimID:   "test-orphan-claim:" + blockID,
+		ClaimID:   claimID,
 		ClaimedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 }

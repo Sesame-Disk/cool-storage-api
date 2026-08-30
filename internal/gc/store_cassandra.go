@@ -2028,6 +2028,9 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 		return lifecycle
 	}
 	if lifecycle.Outcome != StartBlockDeleteOrphanCreated && lifecycle.Outcome != StartBlockDeleteOrphanSameAuthority {
+		if lifecycle.Outcome == StartBlockDeleteOrphanDifferentTarget {
+			return s.preserveExistingS3OrphanFirstSeenAt(orgID, blockID, lifecycle)
+		}
 		return lifecycle
 	}
 	now = now.UTC()
@@ -2068,6 +2071,28 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 		return s.confirmPublishedLifecycleAfterOrphan(orgID, blockID, proposed, s.confirmSameAuthorityOrphanResult(orgID, blockID, proposed, classified.Result))
 	}
 	return classified.Result
+}
+
+// preserveExistingS3OrphanFirstSeenAt completes a conflict result classified
+// from the lifecycle tombstone. The tombstone carries the physical identity
+// and phase, while the canonical orphan owns the recovery token.
+func (s *CassandraStore) preserveExistingS3OrphanFirstSeenAt(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	var firstSeenAt time.Time
+	err := s.db.Session().Query(`
+		SELECT first_seen_at FROM gc_s3_orphans
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).
+		Consistency(gocql.EachQuorum).
+		Scan(&firstSeenAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return result
+		}
+		result.Cause = errors.Join(result.Cause, fmt.Errorf("read existing S3 orphan first_seen_at for org=%s block=%s: %w", orgID, blockID, err))
+		return result
+	}
+	result.FirstSeenAt = firstSeenAt.UTC()
+	return result
 }
 
 type blockDeleteLifecycleRow struct {
