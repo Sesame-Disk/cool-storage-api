@@ -2430,6 +2430,44 @@ func TestGC_StartBlockDeleteOrphan_DifferentTargetPreservesCurrentLifecycleState
 	}
 }
 
+func TestGC_StartBlockDeleteOrphan_DifferentTargetPreservesMatchingLifecycleToken(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-matching-lifecycle-token-%d", time.Now().UnixNano())
+	claimID := "test-orphan-claim:" + uuid.NewString()
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	p1StorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-p1")
+	p2StorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-p2")
+
+	p1Authority := testCommittedOrphanAuthorityWithClaimID(blockID, "hot", p1StorageKey, claimID)
+	p1 := store.StartBlockDeleteOrphan(orgID, blockID, p1Authority, "sha1-p1", firstSeenAt)
+	if p1.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
+		t.Fatalf("StartBlockDeleteOrphan P1: outcome=%s cause=%v", p1.Outcome, p1.Cause)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, p1.FirstSeenAt); err != nil {
+			t.Logf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+
+	// The retained D1 tombstone classifies the new target before the orphan LWT.
+	// The canonical orphan is still D1/P1, so its T1 token is the one to return.
+	staleD1 := testCommittedOrphanAuthorityWithClaimID(blockID, "cold", p2StorageKey, claimID)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, staleD1, "sha1-stale", firstSeenAt.Add(time.Second))
+	if result.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("StartBlockDeleteOrphan stale D1: outcome=%s cause=%v, want different_target", result.Outcome, result.Cause)
+	}
+	if result.ExistingAuthority.ClaimID != claimID || result.ExistingTarget != p1Authority.Authority().Target {
+		t.Fatalf("stale D1 result identified authority=%+v target=%+v, want claim=%q target=%+v", result.ExistingAuthority, result.ExistingTarget, claimID, p1Authority.Authority().Target)
+	}
+	if !result.FirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("matching orphan first_seen_at = %v, want D1 %v", result.FirstSeenAt, firstSeenAt)
+	}
+}
+
 func TestGC_StartBlockDeleteOrphan_DifferentTargetDoesNotBorrowNewLifecycleToken(t *testing.T) {
 	requireCassandra(t)
 
