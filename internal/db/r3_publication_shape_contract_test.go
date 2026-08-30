@@ -84,7 +84,7 @@ func TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls(t *testing.T) {
 	boundaries := []r3StageHeadBoundary{
 		{label: "v2/CreateFile", path: "internal/api/v2/files.go", function: "CreateFile", stage: "stagePendingPublishedFiles", head: "UpdateLibraryHeadFromSnapshot"},
 		{label: "v2/finalizeStoredUploadMetadataOnce", path: "internal/api/v2/files.go", function: "finalizeStoredUploadMetadataOnce", stage: "stagePendingPublishedFiles", head: "UpdateLibraryHeadFromSnapshot"},
-		{label: "v2/processSingleItem", path: "internal/api/v2/batch_operations.go", function: "processSingleItem", stage: "stagePendingPublishedFiles", head: "UpdateLibraryHeadFromSnapshot"},
+		{label: "v2/processSingleItem", path: "internal/api/v2/batch_operations.go", function: "processSingleItem", stage: "stagePendingPublishedFiles", head: "UpdateLibraryHeadFromSnapshot"}, // cross-repo copy/move only; same-repo does not stage pub:
 		{label: "v2/publishEditedDocumentMetadata", path: "internal/api/v2/onlyoffice.go", function: "publishEditedDocumentMetadata", stage: "stagePendingPublishedFiles", head: "UpdateLibraryHeadFromSnapshot"},
 		{label: "seafhttp/commitUploadedFileMultiBlockOnce", path: "internal/api/seafhttp.go", function: "commitUploadedFileMultiBlockOnce", stage: "stageSeafHTTPPublishAttemptReferences", head: "UpdateLibraryHeadFromSnapshot", sessionCalls: 1},
 		{label: "seafhttp/commitUploadedFileOnce", path: "internal/api/seafhttp.go", function: "commitUploadedFileOnce", stage: "stageSeafHTTPPublishAttemptReferences", head: "UpdateLibraryHeadFromSnapshot", sessionCalls: 1},
@@ -168,6 +168,28 @@ func r3CallsNamedInRangeBody(rangeStmt *ast.RangeStmt, name string) int {
 	return count
 }
 
+func r3AssertLoopHasOnlyListedCalls(t *testing.T, rangeStmt *ast.RangeStmt, function, loopName, authorizedSink string, allowed map[string]bool) {
+	t.Helper()
+	ast.Inspect(rangeStmt.Body, func(node ast.Node) bool {
+		if _, nested := node.(*ast.FuncLit); nested {
+			return false
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name := r3PublicationCallName(call)
+		if name == "" {
+			// Conversions such as []string(nil) are CallExprs without a callable name.
+			return true
+		}
+		if !allowed[name] {
+			t.Fatalf("R3 FANOUT: %s loop over %s has unlisted call %s; the authorized sink is %s", function, loopName, name, authorizedSink)
+		}
+		return true
+	})
+}
+
 func r3RangeIteratesName(expr ast.Expr, name string) bool {
 	switch value := expr.(type) {
 	case *ast.Ident:
@@ -200,8 +222,10 @@ func r3RangeOverName(fn *ast.FuncDecl, name string) *ast.RangeStmt {
 
 // TestR3PublicationKnownFanoutIsSinglePass is the limited multiplicity part of
 // the cost contract. The typed budget counts static callsites; this companion
-// freezes one call per element in the two known staging loops. It does not claim
-// to derive arbitrary loop bounds or physical Cassandra request counts.
+// freezes the authorized sink in two known staging loops and fail-closes any
+// other call in those loop bodies, including a differently named wrapper of the
+// same primitive. It does not claim to derive arbitrary loop bounds, follow
+// helpers defined outside the loop, or count physical Cassandra requests.
 func TestR3PublicationKnownFanoutIsSinglePass(t *testing.T) {
 	root := r3RepositoryRoot(t)
 	v2Functions := r3ParseProductionPackage(t, filepath.Join(root, "internal", "api", "v2"))
@@ -216,6 +240,15 @@ func TestR3PublicationKnownFanoutIsSinglePass(t *testing.T) {
 	if got := r3CallsNamedInRangeBody(v2Range, "stagePendingPublishedFilesAddReferencesFn"); got != 1 {
 		t.Fatalf("R3 FANOUT: stagePendingPublishedFiles calls AddReferences %d times per pending file, want 1", got)
 	}
+	r3AssertLoopHasOnlyListedCalls(t, v2Range, "stagePendingPublishedFiles", "pendingFiles", "stagePendingPublishedFilesAddReferencesFn", map[string]bool{
+		"Errorf":                                true,
+		"NormalizeBlockIDs":                     true,
+		"append":                                true,
+		"rollbackStagedRefs":                    true,
+		"stagePendingPublishedFilesAddReferencesFn": true,
+		"stagePendingPublishedFilesPersistFn":       true,
+		"stagePendingPublishedFilesResolveFn":       true,
+	})
 
 	dbFunctions := r3ParseProductionPackage(t, filepath.Join(root, "internal", "db"))
 	dbStage := dbFunctions["addPublishAttemptReferencesRows"]
@@ -229,4 +262,8 @@ func TestR3PublicationKnownFanoutIsSinglePass(t *testing.T) {
 	if got := r3CallsNamedInRangeBody(dbRange, "addPublishAttemptReferenceFn"); got != 1 {
 		t.Fatalf("R3 FANOUT: addPublishAttemptReferencesRows calls addPublishAttemptReferenceFn %d times per block, want 1", got)
 	}
+	r3AssertLoopHasOnlyListedCalls(t, dbRange, "addPublishAttemptReferencesRows", "blockIDs", "addPublishAttemptReferenceFn", map[string]bool{
+		"addPublishAttemptReferenceFn": true,
+		"append":                       true,
+	})
 }

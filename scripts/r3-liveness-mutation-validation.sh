@@ -118,6 +118,8 @@ MUTATIONS=(
   m_local_receiver_method_value_authority_read
   m_duplicate_existing_per_block_publication_io
   m_duplicate_existing_per_normalized_block_io
+  m_wrapper_second_stage_in_pending_files_loop
+  m_wrapper_second_insert_in_normalized_block_loop
   m_v2_post_stage_authority_read_before_head
   m_v2_fshelper_post_stage_authority_read_before_head
   m_sync_post_stage_authority_read_before_head

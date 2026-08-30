@@ -91,9 +91,15 @@ reached.
 | `CreateFileFromBlocks`, exact session `up:` | Session-owned `up:`, aligned nominally to 48h | Commit performs reuse/ownership checks | `pub:` is staged later | Pin can approach expiry between verification and `pub:`; no minimum remaining TTL is required | `classifyBlockForCommit`, `classifyBlockOwnership`, session commit | `CONDITIONAL` |
 | `CreateFileFromBlocks`, foreign `fs:` reuse | Foreign permanent ref | Probe/ownership check is before own `pub:` | Later attempt `pub:` | `foreign fs observed -> foreign fs removed -> GC claim -> refs=0 -> writer pub` | ownership accepts `fs:`; publication is a later step | `UNGUARDED` |
 | Dedup via foreign `fs:` where the publication path establishes no own `up:` | Foreign `fs:` | Pre-publication observation only | Later own `pub:` | Same last-foreign-ref interleaving as above; this excludes funnels such as `UploadFile` that register an own pin after reuse | `CreateFileFromBlocks` ownership path, block reference model and GC fs-object cascade | `UNGUARDED` |
-| Copy/move within one repo | Source immutable fs-object normally owns `fs:` | No writer-owned post-pin fence | Destination stage writes `pub:` | Source retention may bridge staging, but its exact relation to concurrent retention GC and destination stage is not encoded | copy/move stage call chains | `UNKNOWN` |
-| Cross-repo copy | Source-repo `fs:` borrowed by destination writer | No destination-owned post-pin fence | Destination `pub:` | Concurrent source deletion/retention GC can remove the borrowed ref; no cross-repo lease is demonstrated | `copyFSObjectToLibraryForPublish`, batch operations | `UNKNOWN` |
+| Cross-repo copy/move | Source-repo `fs:` borrowed by destination writer | No destination-owned post-pin fence | Destination `pub:` | Concurrent source deletion/retention GC can remove the borrowed ref; no cross-repo lease is demonstrated | `copyFSObjectToLibraryForPublish`, `processSingleItem` | `UNKNOWN` |
 | Repair after HEAD is visible | Existing `pub:` plus durable pending publication record, when present | Not a pre-HEAD materialization decision | Promotes permanent `fs:` | This is R31 convergence, not evidence that the original pre-HEAD R3 interval was continuous | pending published files and sync repair paths | `CONDITIONAL` / separate R31 concern |
+
+Same-repo copy/move is not listed as a block-publication funnel: the current
+path does not stage a new `pub:` dependency for those operations. Same-repo move
+follows `processSameRepoMove`; same-repo copy reuses the existing
+content-addressed fs_object/block-reference ownership. Any race in fs_object
+retention for those operations is a separate question and is not classified as
+R3 publication continuity here.
 
 The table intentionally records `UNKNOWN` where a source walk has not proved a
 temporal premise. This PR does not turn those rows green by assumption.
@@ -122,7 +128,7 @@ network RTTs:
 ```text
 normal materialize -> publish
 static reachable CQL callsite budget remains at its recorded baseline
-known per-element staging fan-out remains one call per guarded loop element
+known-loop authorized staging sink remains one call per guarded loop element
 unlisted direct database calls at guarded stage -> HEAD boundaries = 0
 canonical/orphan authority reads added = 0
 ```
@@ -146,15 +152,19 @@ therefore requires explicit review and a baseline update. This is a deliberately
 scoped source analyzer, not a claim of universal Go compiler/type analysis.
 
 `TestR3PublicationKnownFanoutIsSinglePass` supplies the narrow multiplicity
-contract the static budget cannot provide: it freezes exactly one staging call
-per `pendingFiles` element and one reference insert per `NormalizeBlockIDs`
-loop element. The scope is intentionally these known loops, not a generic
-complexity analyzer.
+contract the static budget cannot provide: it freezes the authorized staging
+sink in two known loops (`stagePendingPublishedFilesAddReferencesFn` per
+`pendingFiles` element, `addPublishAttemptReferenceFn` per `NormalizeBlockIDs`
+element) and fail-closes any other call in those loop bodies. That is a freeze
+of the direct sinks in those loops, not a proof of arbitrary runtime
+multiplicity or of helpers defined outside the loop. Companion runtime tests
+count seam invocations on the current functions. The scope is intentionally
+these known loops, not a generic complexity analyzer.
 `TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls` freezes the direct
-`*.db.Method` surface in the enumerated v2, OnlyOffice, copy/move, SeafHTTP, and
-sync stage-to-HEAD boundaries, including both `h.db` and `fsHelper.db`. It
-catches an added direct per-block read in that interval; it does not claim to
-prove every possible interprocedural path.
+`*.db.Method` surface in the enumerated v2, OnlyOffice, cross-repo copy/move
+(`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries, including
+both `h.db` and `fsHelper.db`. It catches an added direct per-block read in
+that interval; it does not claim to prove every possible interprocedural path.
 `TestR3MaterializationHasNoUnlistedDirectDBCall` similarly prevents a direct
 post-metadata database read being appended to `RegisterUploadedBlockTarget`;
 the established pin/fence/metadata seams remain its allowed I/O.
@@ -162,11 +172,12 @@ the established pin/fence/metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Twenty isolated mutations prove red for the seven
-handshake/cost regressions plus hidden FuncLit/cross-package/qualified authority
-reads, typed receiver and method-value dispatch, an extra per-block CQL INSERT,
-duplicated existing fan-out calls, v2 `h.db`/`fsHelper.db` and sync stage-to-HEAD
-reads, and a post-metadata materialization read.
+normal pre-HEAD R3 hot path. Twenty-two isolated mutations prove red for the
+seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
+authority reads, typed receiver and method-value dispatch, an extra per-block
+CQL INSERT, duplicated existing fan-out calls, a second named wrapper in each
+known loop, v2 `h.db`/`fsHelper.db` and sync stage-to-HEAD reads, and a
+post-metadata materialization read.
 
 ## Outcome and next steps
 

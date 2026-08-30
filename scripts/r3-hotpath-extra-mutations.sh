@@ -68,6 +68,20 @@ m_duplicate_existing_per_normalized_block_io() {
     'addPublishAttemptReferencesRows calls addPublishAttemptReferenceFn 2 times per block, want 1' 'duplicated existing per-block reference I/O exceeds the fan-out contract'
 }
 
+m_wrapper_second_stage_in_pending_files_loop() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/fs_helpers.go" 's@(if err := stagePendingPublishedFilesAddReferencesFn\(h\.db, orgID, repoID, attemptID, resolved\); err != nil \{)@_ = r3DuplicatePendingFileStage(h.db, orgID, repoID, attemptID, resolved)\n\t\t$1@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'unlisted call r3DuplicatePendingFileStage' 'a second named wrapper in the pendingFiles loop exceeds the fan-out contract'
+}
+
+m_wrapper_second_insert_in_normalized_block_loop() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's@(if err := addPublishAttemptReferenceFn\(database, orgID, blockID, referrer, repoID\); err != nil \{)@_ = r3DuplicateNormalizedBlockInsert(database, orgID, blockID, referrer, repoID)\n\t\t$1@'
+  expect_red ./internal/db '^TestR3PublicationKnownFanoutIsSinglePass$' \
+    'unlisted call r3DuplicateNormalizedBlockInsert' 'a second named wrapper in the NormalizeBlockIDs loop exceeds the fan-out contract'
+}
+
 m_v2_post_stage_authority_read_before_head() {
   reset_fixture
   mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
