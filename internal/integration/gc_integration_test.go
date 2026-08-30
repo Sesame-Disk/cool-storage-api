@@ -2430,6 +2430,56 @@ func TestGC_StartBlockDeleteOrphan_DifferentTargetPreservesCurrentLifecycleState
 	}
 }
 
+func TestGC_StartBlockDeleteOrphan_DifferentTargetDoesNotBorrowNewLifecycleToken(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-lifecycle-token-%d", time.Now().UnixNano())
+	d1ClaimID := "test-orphan-claim:d1:" + uuid.NewString()
+	d2ClaimID := "test-orphan-claim:d2:" + uuid.NewString()
+	p1FirstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	p2FirstSeenAt := p1FirstSeenAt.Add(time.Second)
+	p1StorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-p1")
+	p2StorageKey := syntheticCanonicalStorageKeyForTest(orgID.String(), blockID+"-p2")
+
+	p1Authority := testCommittedOrphanAuthorityWithClaimID(blockID, "hot", p1StorageKey, d1ClaimID)
+	p1 := store.StartBlockDeleteOrphan(orgID, blockID, p1Authority, "sha1-p1", p1FirstSeenAt)
+	if p1.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
+		t.Fatalf("StartBlockDeleteOrphan P1: outcome=%s cause=%v", p1.Outcome, p1.Cause)
+	}
+	if err := store.DeleteS3Orphan(orgID, blockID, p1.FirstSeenAt); err != nil {
+		t.Fatalf("DeleteS3Orphan P1: %v", err)
+	}
+
+	p2Authority := testCommittedOrphanAuthorityWithClaimID(blockID, "cold", p2StorageKey, d2ClaimID)
+	p2 := store.StartBlockDeleteOrphan(orgID, blockID, p2Authority, "sha1-p2", p2FirstSeenAt)
+	if p2.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
+		t.Fatalf("StartBlockDeleteOrphan P2: outcome=%s cause=%v", p2.Outcome, p2.Cause)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgID, blockID, p2.FirstSeenAt); err != nil {
+			t.Logf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+
+	// D1 is a durable tombstone, while the canonical orphan belongs to D2. The
+	// stale D1 proposal uses the current target to prove that target equality
+	// alone must not associate T2 with the old lifecycle.
+	staleD1 := testCommittedOrphanAuthorityWithClaimID(blockID, "cold", p2StorageKey, d1ClaimID)
+	result := store.StartBlockDeleteOrphan(orgID, blockID, staleD1, "sha1-stale", time.Now().UTC())
+	if result.Outcome != gcpkg.StartBlockDeleteOrphanDifferentTarget {
+		t.Fatalf("StartBlockDeleteOrphan stale D1: outcome=%s cause=%v, want different_target", result.Outcome, result.Cause)
+	}
+	if result.ExistingAuthority.ClaimID != d1ClaimID || result.ExistingTarget != p1Authority.Authority().Target {
+		t.Fatalf("stale D1 result identified authority=%+v target=%+v, want claim=%q target=%+v", result.ExistingAuthority, result.ExistingTarget, d1ClaimID, p1Authority.Authority().Target)
+	}
+	if !result.FirstSeenAt.IsZero() {
+		t.Fatalf("stale D1 borrowed current D2 first_seen_at=%v; want zero", result.FirstSeenAt)
+	}
+}
+
 // getGCGracePeriod reads the configured grace period from the admin status API.
 // Returns 0 if the field is absent or the server is too old to expose it.
 func getGCGracePeriod(t *testing.T) time.Duration {

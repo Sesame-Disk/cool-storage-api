@@ -938,9 +938,10 @@ func (o StartBlockDeleteOrphanOutcome) String() string {
 }
 
 // StartBlockDeleteOrphanResult is the complete publication result. FirstSeenAt
-// is always the canonical lifecycle token when a row was found; it must be used
-// for projection repair instead of the proposed timestamp. Cause is diagnostic
-// only and never grants permission to finalize or delete.
+// is the canonical orphan lifecycle token only when the orphan corresponding to
+// ExistingAuthority was observed; lifecycle-only conflicts may leave it zero.
+// It must be used for projection repair instead of the proposed timestamp. Cause
+// is diagnostic only and never grants permission to finalize or delete.
 type StartBlockDeleteOrphanResult struct {
 	Outcome           StartBlockDeleteOrphanOutcome
 	FirstSeenAt       time.Time

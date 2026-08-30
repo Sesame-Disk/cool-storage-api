@@ -1997,7 +1997,8 @@ func (s *CassandraStore) GetS3OrphanGlobal(orgID uuid.UUID, blockID string) (S3O
 // StartBlockDeleteOrphan records the durable recovery row for a block delete
 // lifecycle without overwriting an existing lifecycle. The canonical insert is
 // single-use: an uncertain result is settled in the SERIAL domain rather than
-// repeating the mutation, and the existing row's first_seen_at is always reused.
+// repeating the mutation, and a matching canonical orphan's first_seen_at is
+// reused when it is observed.
 //
 // SERIAL settlement and canonical EACH_QUORUM visibility are different facts.
 // SERIAL answers which value Paxos chose. Writer fence reads are LOCAL_QUORUM, so
@@ -2029,7 +2030,7 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 	}
 	if lifecycle.Outcome != StartBlockDeleteOrphanCreated && lifecycle.Outcome != StartBlockDeleteOrphanSameAuthority {
 		if lifecycle.Outcome == StartBlockDeleteOrphanDifferentTarget {
-			return s.preserveExistingS3OrphanFirstSeenAt(orgID, blockID, lifecycle)
+			return s.attachMatchingS3OrphanFirstSeenAt(orgID, blockID, lifecycle)
 		}
 		return lifecycle
 	}
@@ -2073,25 +2074,19 @@ func (s *CassandraStore) StartBlockDeleteOrphan(orgID uuid.UUID, blockID string,
 	return classified.Result
 }
 
-// preserveExistingS3OrphanFirstSeenAt completes a conflict result classified
-// from the lifecycle tombstone. The tombstone carries the physical identity
-// and phase, while the canonical orphan owns the recovery token.
-func (s *CassandraStore) preserveExistingS3OrphanFirstSeenAt(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
-	var firstSeenAt time.Time
-	err := s.db.Session().Query(`
-		SELECT first_seen_at FROM gc_s3_orphans
-		WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).
-		Consistency(gocql.EachQuorum).
-		Scan(&firstSeenAt)
+// attachMatchingS3OrphanFirstSeenAt completes a conflict result classified
+// from the lifecycle tombstone only when the canonical orphan belongs to that
+// exact (P, D). A current orphan from another lifecycle is not related data.
+func (s *CassandraStore) attachMatchingS3OrphanFirstSeenAt(orgID uuid.UUID, blockID string, result StartBlockDeleteOrphanResult) StartBlockDeleteOrphanResult {
+	orphan, found, err := s.GetS3OrphanGlobal(orgID, blockID)
 	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return result
-		}
-		result.Cause = errors.Join(result.Cause, fmt.Errorf("read existing S3 orphan first_seen_at for org=%s block=%s: %w", orgID, blockID, err))
+		result.Cause = errors.Join(result.Cause, fmt.Errorf("read matching canonical S3 orphan for org=%s block=%s: %w", orgID, blockID, err))
 		return result
 	}
-	result.FirstSeenAt = firstSeenAt.UTC()
+	if !found || orphan.FirstSeenAt.IsZero() || !orphan.Authority.sameAuthority(result.ExistingAuthority) {
+		return result
+	}
+	result.FirstSeenAt = orphan.FirstSeenAt.UTC()
 	return result
 }
 
