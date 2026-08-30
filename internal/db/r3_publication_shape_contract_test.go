@@ -141,15 +141,38 @@ func r3DirectDBMethodOn(call *ast.CallExpr, aliases map[string]bool) (string, bo
 	return "", false
 }
 
-func r3CallCQLText(call *ast.CallExpr) (string, bool) {
+func r3IsCQLEntryPoint(call *ast.CallExpr) bool {
 	name := r3PublicationCallName(call)
-	if name != "Query" && name != "Bind" {
+	return name == "Query" || name == "Bind"
+}
+
+func r3CallCQLText(call *ast.CallExpr) (string, bool) {
+	if !r3IsCQLEntryPoint(call) {
 		return "", false
 	}
 	if len(call.Args) == 0 {
 		return "", false
 	}
 	return r3ProgramString(call.Args[0], map[string]string{})
+}
+
+// r3InspectCQLCall separates "this is a Query/Bind callsite" from "we can
+// reconstruct its statement text". Unresolved constants, variables, and
+// builders still consume the CQL budget. A resolved string that is not a CQL
+// verb (for example gin's c.Query("p")) does not.
+func r3InspectCQLCall(call *ast.CallExpr) (authority bool, cqlCallsite bool) {
+	if !r3IsCQLEntryPoint(call) {
+		return false, false
+	}
+	text, ok := r3CallCQLText(call)
+	if !ok {
+		return false, true
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(text, `"`, ""))
+	if r3AuthoritySelectPattern.MatchString(normalized) {
+		return true, true
+	}
+	return false, r3CQLVerbPattern.MatchString(normalized)
 }
 
 func r3PublicationSinkName(name string) bool {
@@ -242,8 +265,9 @@ func r3AssertNoPublicationSink(t *testing.T, body ast.Node, seam, authorized str
 // TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls freezes the real
 // publication funnels' lexical stage -> HEAD boundary. Direct DB access includes
 // ident.db.Method, a local alias of that field, a method value taken from it,
-// and Query/Bind CQL entry points regardless of how the session was obtained.
-// It is a narrow source contract, not a general control-flow or RTT analysis.
+// and Query/Bind CQL entry points regardless of how the session was obtained
+// or whether the statement text can be reconstructed. It is a narrow source
+// contract, not a general control-flow or RTT analysis.
 func TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls(t *testing.T) {
 	root := r3RepositoryRoot(t)
 	boundaries := []r3StageHeadBoundary{
@@ -285,14 +309,10 @@ func TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls(t *testing.T) {
 				if methodValues[name] {
 					t.Fatalf("R3 PUBLICATION SHAPE: %s adds db method value %s between %s and %s", boundary.label, name, boundary.stage, boundary.head)
 				}
-				if text, ok := r3CallCQLText(call); ok {
-					normalized := strings.ToLower(strings.ReplaceAll(text, `"`, ""))
-					if r3AuthoritySelectPattern.MatchString(normalized) {
-						t.Fatalf("R3 PUBLICATION SHAPE: %s adds authority CQL between %s and %s", boundary.label, boundary.stage, boundary.head)
-					}
-					if r3CQLVerbPattern.MatchString(normalized) {
-						cqlCalls++
-					}
+				if authority, cqlCallsite := r3InspectCQLCall(call); authority {
+					t.Fatalf("R3 PUBLICATION SHAPE: %s adds authority CQL between %s and %s", boundary.label, boundary.stage, boundary.head)
+				} else if cqlCallsite {
+					cqlCalls++
 				}
 				method, directDB := r3DirectDBMethodOn(call, aliases)
 				if !directDB {
@@ -334,11 +354,8 @@ func TestR3MaterializationHasNoUnlistedDirectDBCall(t *testing.T) {
 		if methodValues[name] {
 			t.Fatalf("R3 MATERIALIZATION BUDGET: db method value %s in RegisterUploadedBlockTarget is unlisted", name)
 		}
-		if text, ok := r3CallCQLText(call); ok {
-			normalized := strings.ToLower(strings.ReplaceAll(text, `"`, ""))
-			if r3AuthoritySelectPattern.MatchString(normalized) || r3CQLVerbPattern.MatchString(normalized) {
-				t.Fatalf("R3 MATERIALIZATION BUDGET: direct CQL in RegisterUploadedBlockTarget is unlisted")
-			}
+		if _, cqlCallsite := r3InspectCQLCall(call); cqlCallsite {
+			t.Fatalf("R3 MATERIALIZATION BUDGET: direct CQL in RegisterUploadedBlockTarget is unlisted")
 		}
 		if method, directDB := r3DirectDBMethodOn(call, aliases); directDB {
 			t.Fatalf("R3 MATERIALIZATION BUDGET: direct DB method %s in RegisterUploadedBlockTarget is unlisted", method)

@@ -130,7 +130,7 @@ normal materialize -> publish
 static reachable CQL callsite budget remains at its recorded baseline
 known-loop authorized staging sink remains one call per guarded loop element
 unlisted direct database calls at guarded stage -> HEAD boundaries = 0
-pre-acquired session Query/Bind and local db aliases in those boundaries = 0
+pre-acquired session Query/Bind (literal, constant, variable, or builder) and local db aliases in those boundaries = 0
 canonical/orphan authority reads added = 0
 ```
 
@@ -169,8 +169,11 @@ database surface in the enumerated v2, OnlyOffice, cross-repo copy/move
 (`processSingleItem`), SeafHTTP, and sync stage-to-HEAD boundaries. Direct
 access includes `ident.db.Method`, a local alias of that field, a method
 value taken from it, and `Query`/`Bind` CQL entry points regardless of how
-the session was obtained. Canonical `blocks` / `gc_s3_orphans` SELECTs in
-that interval are rejected even when the CQL callsite count is unchanged.
+the session was obtained. Every such entry point consumes the CQL callsite
+budget even when the statement text cannot be reconstructed; resolved text
+is used only to classify canonical `blocks` / `gc_s3_orphans` SELECTs.
+Those authority SELECTs are rejected even when the CQL callsite count is
+unchanged.
 SeafHTTP keeps its existing commit INSERT as the frozen baseline. The test
 does not claim to prove every possible interprocedural path.
 `TestR3MaterializationHasNoUnlistedDirectDBCall` similarly prevents a direct
@@ -181,14 +184,14 @@ metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Twenty-eight isolated mutations prove red for the
+normal pre-HEAD R3 hot path. Thirty-one isolated mutations prove red for the
 seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
 authority reads, typed receiver and method-value dispatch, an extra per-block
 CQL INSERT, duplicated existing fan-out calls, a second named wrapper in each
 known loop, a second publication sink hidden in an allowed persist seam or
 nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db` alias/method-value and
-sync stage-to-HEAD reads, and post-metadata materialization reads including a
-local `db` alias.
+sync stage-to-HEAD reads, Query/Bind whose statement is a constant or variable,
+and post-metadata materialization reads including a local `db` alias.
 
 ## Outcome and next steps
 

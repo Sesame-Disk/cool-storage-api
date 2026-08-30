@@ -104,6 +104,30 @@ m_v2_session_query_after_stage() {
     'v2/finalizeStoredUploadMetadataOnce adds authority CQL' 'a pre-acquired session Query between stage and HEAD is an authority read'
 }
 
+m_v2_dynamic_query_after_stage() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := fsHelper.stagePendingPublishedFiles)@$1\tsession := h.db.Session()\n$2@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tquery := "SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?"\n\t_ = session.Query(query, orgID, "r3-block")\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce direct CQL callsites' 'a Query whose statement is a variable still consumes the stage-to-HEAD CQL budget'
+}
+
+m_v2_const_query_after_stage() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := fsHelper.stagePendingPublishedFiles)@$1\tsession := h.db.Session()\n$2@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tconst r3AuthorityQuery = "SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?"\n\t_ = session.Query(r3AuthorityQuery, orgID, "r3-block")\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce direct CQL callsites' 'a Query whose statement is a constant still consumes the stage-to-HEAD CQL budget'
+}
+
+m_v2_dynamic_insert_after_stage() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := fsHelper.stagePendingPublishedFiles)@$1\tsession := h.db.Session()\n$2@'
+  mutate "$FIXTURE/internal/api/v2/files.go" 's@(func \(h \*FileHandler\) finalizeStoredUploadMetadataOnce[\s\S]*?)(\tif err := queuePendingPublishedFileRepairs)@$1\tquery := "INSERT INTO r3_publication_guards (org_id, block_id) VALUES (?, ?)"\n\t_ = session.Query(query, orgID, "r3-block")\n$2@'
+  expect_red ./internal/db '^TestR3PublicationStageToHeadHasNoUnlistedDirectDBCalls$' \
+    'v2/finalizeStoredUploadMetadataOnce direct CQL callsites' 'a Query whose INSERT text is a variable still consumes the stage-to-HEAD CQL budget'
+}
+
 m_v2_local_db_alias_post_stage_read() {
   reset_fixture
   mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralAliasPostStageRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'
