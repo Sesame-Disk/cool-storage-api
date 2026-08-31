@@ -192,18 +192,20 @@ metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Thirty-four isolated mutations prove red for the
-seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
-authority reads, typed receiver and method-value dispatch, an extra per-block
-CQL INSERT, a single-argument `Bind` on a typed root, duplicated existing
-fan-out calls, a second named wrapper in each known loop, a second publication
-sink hidden in an allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db`
+normal pre-HEAD R3 hot path. The mutation suite covers the original thirty-four
+characterization mutations plus the two R3a provenance mutations. The
+characterization mutations prove red for the seven handshake/cost
+regressions plus hidden FuncLit/cross-package/qualified authority reads, typed
+receiver and method-value dispatch, an extra per-block CQL INSERT, a
+single-argument `Bind` on a typed root, duplicated existing fan-out calls, a
+second named wrapper in each known loop, a second publication sink hidden in an
+allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db`
 alias/method-value and sync stage-to-HEAD reads, Query/Bind whose statement is
 a constant or variable, a Bind of a Query acquired before stage, a DB read
 inside a HEAD argument, and post-metadata materialization reads including a
-local `db` alias. The R3a extension adds two further mutations proving that the
-session provenance check remains an exact referrer comparison and that
-`classifyBlockOwnership` cannot acquire an unlisted call.
+local `db` alias. The two R3a mutations prove that the session provenance check
+remains an exact referrer comparison and that `classifyBlockOwnership` cannot
+acquire an unlisted call.
 
 ## Explicit block-commit provenance
 
