@@ -512,13 +512,13 @@ func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testi
 	}
 }
 
-func TestCheckBlocksReadyParallel_PreservesCommittedFSReady(t *testing.T) {
+func TestCheckBlocksReadyParallel_PreservesBorrowedFSReady(t *testing.T) {
 	origClassify := checkBlocksClassifyOwnershipFn
 	t.Cleanup(func() {
 		checkBlocksClassifyOwnershipFn = origClassify
 	})
 	checkBlocksClassifyOwnershipFn = func(*db.DB, string, string, string) (blockCommitLivenessProvenance, error) {
-		return blockCommitLivenessCommittedFS, nil
+		return blockCommitLivenessBorrowedFS, nil
 	}
 
 	ready, err := checkBlocksReadyParallel(
@@ -534,7 +534,7 @@ func TestCheckBlocksReadyParallel_PreservesCommittedFSReady(t *testing.T) {
 		t.Fatalf("checkBlocksReadyParallel returned error: %v", err)
 	}
 	if !ready["borrowed"] {
-		t.Fatal("CommittedFS must remain ready under the current compatibility policy")
+		t.Fatal("BorrowedFS must remain ready under the current compatibility policy")
 	}
 }
 

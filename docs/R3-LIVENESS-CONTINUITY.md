@@ -1,7 +1,8 @@
 # R3 liveness-continuity characterization
 
-**Baseline parent:** `c0da425a4` (`main` containing #194 and #196)
-**Scope:** characterization only; no publication behavior changes
+**Characterization baseline:** `c0da425a4` (`main` containing #194 and #196)
+**R3a structural-refinement parent:** `9386dad` (#197 merged)
+**Scope:** characterization plus internal provenance refinement; no protocol/readiness/I/O behavior change
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
 The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
@@ -200,8 +201,9 @@ sink hidden in an allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db
 alias/method-value and sync stage-to-HEAD reads, Query/Bind whose statement is
 a constant or variable, a Bind of a Query acquired before stage, a DB read
 inside a HEAD argument, and post-metadata materialization reads including a
-local `db` alias. The R3a extension adds one further mutation proving that the
-session provenance check remains an exact referrer comparison.
+local `db` alias. The R3a extension adds two further mutations proving that the
+session provenance check remains an exact referrer comparison and that
+`classifyBlockOwnership` cannot acquire an unlisted call.
 
 ## Explicit block-commit provenance
 
@@ -210,15 +212,15 @@ The file-from-blocks classifier preserves three internal outcomes from the one
 
 ```text
 SessionUpload  exact up:<session> for this commit
-CommittedFS    fs:<library>:<fs_id> with no exact session up:
+BorrowedFS     any fs: prefix with no exact session up:
 None           no accepted reference
 ```
 
-`SessionUpload` takes precedence over `CommittedFS` regardless of referrer row
+`SessionUpload` takes precedence over `BorrowedFS` regardless of referrer row
 order. The current readiness policy deliberately maps both `SessionUpload` and
-`CommittedFS` to ready, while `None` remains `needs_upload`. `/blocks/check` and
+`BorrowedFS` to ready, while `None` remains `needs_upload`. `/blocks/check` and
 the commit path use that same policy, so this refinement changes no HTTP result,
-deduplication behavior, or storage I/O. `CommittedFS` remains the borrowed,
+deduplication behavior, or storage I/O. `BorrowedFS` remains the borrowed,
 unguarded R3 provenance; the race where its last foreign reference disappears
 before this writer stages `pub:` is still open and is not resolved here.
 

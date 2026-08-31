@@ -29,14 +29,14 @@ const (
 
 // blockCommitLivenessProvenance records which reference keeps a reusable block
 // alive for this commit. It is intentionally distinct from the current ready
-// policy: a committed fs: reference is accepted today but is borrowed liveness
-// for the purposes of the next R3 step.
+// policy: an fs: prefix is accepted today but is borrowed liveness for the
+// purposes of the next R3 step.
 type blockCommitLivenessProvenance uint8
 
 const (
 	blockCommitLivenessNone blockCommitLivenessProvenance = iota
 	blockCommitLivenessSessionUpload
-	blockCommitLivenessCommittedFS
+	blockCommitLivenessBorrowedFS
 )
 
 const blockVerifyConcurrency = 20
@@ -685,32 +685,32 @@ func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, decla
 // precedence over any fs: reference so the result is independent of Cassandra
 // row order.
 func classifyBlockReferrerProvenance(referrers []string, sessionReferrer string) blockCommitLivenessProvenance {
-	hasCommittedFS := false
+	hasBorrowedFS := false
 	for _, referrer := range referrers {
 		if referrer == sessionReferrer {
 			return blockCommitLivenessSessionUpload
 		}
 		if strings.HasPrefix(referrer, "fs:") {
-			hasCommittedFS = true
+			hasBorrowedFS = true
 		}
 	}
-	if hasCommittedFS {
-		return blockCommitLivenessCommittedFS
+	if hasBorrowedFS {
+		return blockCommitLivenessBorrowedFS
 	}
 	return blockCommitLivenessNone
 }
 
 // blockCommitProvenanceCurrentlyReady preserves the existing commit/check
-// policy. CommittedFS remains accepted deliberately; a later R3 PR will change
+// policy. BorrowedFS remains accepted deliberately; a later R3 PR will change
 // only that provenance's policy after its deduplication cost is audited.
 func blockCommitProvenanceCurrentlyReady(provenance blockCommitLivenessProvenance) bool {
 	return provenance == blockCommitLivenessSessionUpload ||
-		provenance == blockCommitLivenessCommittedFS
+		provenance == blockCommitLivenessBorrowedFS
 }
 
 // classifyBlockOwnership reports the liveness provenance for a block: this
-// session's own provisional reference, a permanent committed-file
-// ("fs:<library>:<fs_id>") reference, or no accepted reference. It deliberately
+// session's own provisional reference, a borrowed fs: reference
+// ("fs:<library>:<fs_id>" prefix), or no accepted reference. It deliberately
 // does NOT count a foreign publish-attempt ref ("pub:<attempt>") as permanent:
 // that ref is transient and disappears if the foreign attempt loses its HEAD
 // CAS and cleans up, which would leave this commit pointing at a block that can

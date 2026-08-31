@@ -3,6 +3,8 @@ package v2
 import (
 	"go/ast"
 	"go/token"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -12,8 +14,8 @@ func TestR3BlockOwnershipProvenanceMatrix(t *testing.T) {
 	ownReferrer := db.BlockReferrerForUpload("session-1")
 	foreignUploadReferrer := db.BlockReferrerForUpload("session-2")
 	foreignPublishReferrer := db.BlockReferrerForPublishAttempt("attempt-1")
-	committedReferrer := db.BlockReferrerForFSObject("library-1", "fs-1")
-	secondCommittedReferrer := db.BlockReferrerForFSObject("library-2", "fs-2")
+	borrowedReferrer := db.BlockReferrerForFSObject("library-1", "fs-1")
+	secondBorrowedReferrer := db.BlockReferrerForFSObject("library-2", "fs-2")
 
 	tests := []struct {
 		name      string
@@ -26,9 +28,9 @@ func TestR3BlockOwnershipProvenanceMatrix(t *testing.T) {
 			want:      blockCommitLivenessSessionUpload,
 		},
 		{
-			name:      "committed fs only",
-			referrers: []string{committedReferrer},
-			want:      blockCommitLivenessCommittedFS,
+			name:      "borrowed fs only",
+			referrers: []string{borrowedReferrer},
+			want:      blockCommitLivenessBorrowedFS,
 		},
 		{
 			name:      "foreign pub only",
@@ -46,19 +48,24 @@ func TestR3BlockOwnershipProvenanceMatrix(t *testing.T) {
 			want:      blockCommitLivenessNone,
 		},
 		{
-			name:      "committed fs before own session pin",
-			referrers: []string{committedReferrer, ownReferrer},
+			name:      "borrowed fs before own session pin",
+			referrers: []string{borrowedReferrer, ownReferrer},
 			want:      blockCommitLivenessSessionUpload,
 		},
 		{
-			name:      "own session pin before committed fs",
-			referrers: []string{ownReferrer, committedReferrer},
+			name:      "own session pin before borrowed fs",
+			referrers: []string{ownReferrer, borrowedReferrer},
 			want:      blockCommitLivenessSessionUpload,
 		},
 		{
-			name:      "multiple committed fs",
-			referrers: []string{committedReferrer, secondCommittedReferrer},
-			want:      blockCommitLivenessCommittedFS,
+			name:      "multiple borrowed fs",
+			referrers: []string{borrowedReferrer, secondBorrowedReferrer},
+			want:      blockCommitLivenessBorrowedFS,
+		},
+		{
+			name:      "session referrer prefix collision is not own session",
+			referrers: []string{ownReferrer + ":suffix"},
+			want:      blockCommitLivenessNone,
 		},
 	}
 
@@ -71,12 +78,12 @@ func TestR3BlockOwnershipProvenanceMatrix(t *testing.T) {
 	}
 }
 
-func TestR3BlockOwnershipProvenanceDistinguishesCommittedFS(t *testing.T) {
+func TestR3BlockOwnershipProvenanceDistinguishesBorrowedFS(t *testing.T) {
 	ownReferrer := db.BlockReferrerForUpload("session-1")
-	committedReferrer := db.BlockReferrerForFSObject("library-1", "fs-1")
-	got := classifyBlockReferrerProvenance([]string{committedReferrer}, ownReferrer)
-	if got != blockCommitLivenessCommittedFS {
-		t.Fatalf("foreign fs must be classified as committed-fs: got %d, want %d", got, blockCommitLivenessCommittedFS)
+	borrowedReferrer := db.BlockReferrerForFSObject("library-1", "fs-1")
+	got := classifyBlockReferrerProvenance([]string{borrowedReferrer}, ownReferrer)
+	if got != blockCommitLivenessBorrowedFS {
+		t.Fatalf("foreign fs must be classified as borrowed-fs: got %d, want %d", got, blockCommitLivenessBorrowedFS)
 	}
 }
 
@@ -86,7 +93,7 @@ func TestR3CurrentCommitReadinessPolicyPreservesForeignFSBehavior(t *testing.T) 
 		wantReady  bool
 	}{
 		{provenance: blockCommitLivenessSessionUpload, wantReady: true},
-		{provenance: blockCommitLivenessCommittedFS, wantReady: true},
+		{provenance: blockCommitLivenessBorrowedFS, wantReady: true},
 		{provenance: blockCommitLivenessNone, wantReady: false},
 		{provenance: blockCommitLivenessProvenance(255), wantReady: false},
 	}
@@ -101,24 +108,34 @@ func TestR3CurrentCommitReadinessPolicyPreservesForeignFSBehavior(t *testing.T) 
 func TestR3ClassifyBlockOwnershipUsesSingleReferrerPartitionRead(t *testing.T) {
 	path := r3SourcePath("internal", "api", "v2", "file_from_blocks.go")
 	_, fn := r3ParseFunction(t, path, "classifyBlockOwnership")
+	allowed := map[string]int{
+		"ListBlockReferrers":              1,
+		"classifyBlockReferrerProvenance": 1,
+	}
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if r3CallName(call) == "" {
+			t.Fatal("R3 OWNERSHIP READ CONTRACT: unresolved call in classifyBlockOwnership")
+		}
+		return true
+	})
 	calls := r3CallPositions(fn)
-	if got := len(calls["ListBlockReferrers"]); got != 1 {
-		t.Fatalf("R3 OWNERSHIP READ CONTRACT: ListBlockReferrers calls = %d, want 1", got)
+	var unlisted []string
+	for name := range calls {
+		if _, ok := allowed[name]; !ok {
+			unlisted = append(unlisted, name)
+		}
 	}
-	if got := len(calls["classifyBlockReferrerProvenance"]); got != 1 {
-		t.Fatalf("R3 OWNERSHIP READ CONTRACT: pure provenance classifier calls = %d, want 1", got)
+	sort.Strings(unlisted)
+	if len(unlisted) > 0 {
+		t.Fatalf("R3 OWNERSHIP READ CONTRACT: unlisted call %s in classifyBlockOwnership", strings.Join(unlisted, ", "))
 	}
-	forbidden := []string{
-		"BlockHasReferrer",
-		"BlockDeleteFenceActive",
-		"BlockHasReferencesGlobal",
-		"GetBlockInfo",
-		"GetS3OrphanGlobal",
-		"ValidateBlockPublishAuthority",
-	}
-	for _, name := range forbidden {
-		if got := len(calls[name]); got != 0 {
-			t.Fatalf("R3 OWNERSHIP READ CONTRACT: forbidden %s calls = %d, want 0", name, got)
+	for name, want := range allowed {
+		if got := len(calls[name]); got != want {
+			t.Fatalf("R3 OWNERSHIP READ CONTRACT: %s calls = %d, want %d", name, got, want)
 		}
 	}
 }
