@@ -481,9 +481,12 @@ func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testi
 	}()
 
 	var classifyCalls int
-	checkBlocksClassifyOwnershipFn = func(database *db.DB, orgID, referrer, blockID string) (bool, error) {
+	checkBlocksClassifyOwnershipFn = func(database *db.DB, orgID, referrer, blockID string) (blockCommitLivenessProvenance, error) {
 		classifyCalls++
-		return blockID == "present", nil
+		if blockID == "present" {
+			return blockCommitLivenessSessionUpload, nil
+		}
+		return blockCommitLivenessNone, nil
 	}
 
 	ready, err := checkBlocksReadyParallel(
@@ -506,6 +509,32 @@ func TestCheckBlocksReadyParallel_UsesCanonicalExistenceBeforeOwnership(t *testi
 	}
 	if !ready["present"] {
 		t.Fatal("block present in the canonical store and owned by the session should be ready")
+	}
+}
+
+func TestCheckBlocksReadyParallel_PreservesCommittedFSReady(t *testing.T) {
+	origClassify := checkBlocksClassifyOwnershipFn
+	t.Cleanup(func() {
+		checkBlocksClassifyOwnershipFn = origClassify
+	})
+	checkBlocksClassifyOwnershipFn = func(*db.DB, string, string, string) (blockCommitLivenessProvenance, error) {
+		return blockCommitLivenessCommittedFS, nil
+	}
+
+	ready, err := checkBlocksReadyParallel(
+		context.Background(),
+		nil,
+		"org",
+		"up:sess",
+		[]string{"borrowed"},
+		map[string]bool{"borrowed": true},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("checkBlocksReadyParallel returned error: %v", err)
+	}
+	if !ready["borrowed"] {
+		t.Fatal("CommittedFS must remain ready under the current compatibility policy")
 	}
 }
 
@@ -537,12 +566,12 @@ func TestCheckBlocksForSession_UsesCanonicalStoreBeforeOwnership(t *testing.T) {
 	}
 
 	var ownershipCalls atomic.Int32
-	checkBlocksClassifyOwnershipFn = func(_ *db.DB, gotOrgID, referrer, blockID string) (bool, error) {
+	checkBlocksClassifyOwnershipFn = func(_ *db.DB, gotOrgID, referrer, blockID string) (blockCommitLivenessProvenance, error) {
 		ownershipCalls.Add(1)
 		if gotOrgID != orgID || referrer != db.BlockReferrerForUpload("sess-1") || blockID != existingHash {
-			return false, fmt.Errorf("unexpected ownership classification: org=%q referrer=%q block=%q", gotOrgID, referrer, blockID)
+			return blockCommitLivenessNone, fmt.Errorf("unexpected ownership classification: org=%q referrer=%q block=%q", gotOrgID, referrer, blockID)
 		}
-		return true, nil
+		return blockCommitLivenessSessionUpload, nil
 	}
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
