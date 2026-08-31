@@ -101,14 +101,13 @@ func checkBlocksReusableCandidatesParallel(ctx context.Context, database *db.DB,
 
 // checkBlocksReadyParallel classifies, per hash already known reusable in the
 // metadata plane, whether the block is truly commit-ready for session-mode
-// /blocks/check: physically present in its canonical store and owned by this
-// session or permanently referenced (classifyBlockOwnership — the same helper
-// file_from_blocks.go's classifyBlockForCommit uses). This is the commit's
-// classifier minus the size check (check has no declared per-block sizes to
-// compare against; sizes only arrive in the commit manifest), so a block
-// /blocks/check reports "existing" is exactly the set the commit will accept
-// modulo size — closing the "check says existing, commit says needs_upload"
-// gap for anything both endpoints can see.
+// /blocks/check: physically present in its canonical store and backed by the
+// same provenance/current policy used by classifyBlockForCommit. This is the
+// commit's classifier minus the size check (check has no declared per-block
+// sizes to compare against; sizes only arrive in the commit manifest), so a
+// block /blocks/check reports "existing" is exactly the set the commit will
+// accept modulo size — closing the "check says existing, commit says
+// needs_upload" gap for anything both endpoints can see.
 func checkBlocksReadyParallel(ctx context.Context, database *db.DB, orgID, referrer string, hashes []string, existsMap map[string]bool, concurrency int) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	var mu sync.Mutex
@@ -129,12 +128,12 @@ func checkBlocksReadyParallel(ctx context.Context, database *db.DB, orgID, refer
 				mu.Unlock()
 				return nil
 			}
-			ready, err := checkBlocksClassifyOwnershipFn(database, orgID, referrer, hash)
+			provenance, err := checkBlocksClassifyOwnershipFn(database, orgID, referrer, hash)
 			if err != nil {
 				return err
 			}
 			mu.Lock()
-			result[hash] = ready
+			result[hash] = blockCommitProvenanceCurrentlyReady(provenance)
 			mu.Unlock()
 			return nil
 		})

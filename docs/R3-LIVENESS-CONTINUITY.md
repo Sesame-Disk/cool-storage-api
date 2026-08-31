@@ -1,7 +1,8 @@
 # R3 liveness-continuity characterization
 
-**Baseline parent:** `c0da425a4` (`main` containing #194 and #196)
-**Scope:** characterization only; no publication behavior changes
+**Characterization baseline:** `c0da425a4` (`main` containing #194 and #196)
+**R3a structural-refinement parent:** `9386dad` (#197 merged)
+**Scope:** characterization plus internal provenance refinement; no protocol/readiness/I/O behavior change
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
 The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
@@ -191,20 +192,43 @@ metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Thirty-four isolated mutations prove red for the
-seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
-authority reads, typed receiver and method-value dispatch, an extra per-block
-CQL INSERT, a single-argument `Bind` on a typed root, duplicated existing
-fan-out calls, a second named wrapper in each known loop, a second publication
-sink hidden in an allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db`
+normal pre-HEAD R3 hot path. The mutation suite covers the original thirty-four
+characterization mutations plus the two R3a provenance mutations. The
+characterization mutations prove red for the seven handshake/cost
+regressions plus hidden FuncLit/cross-package/qualified authority reads, typed
+receiver and method-value dispatch, an extra per-block CQL INSERT, a
+single-argument `Bind` on a typed root, duplicated existing fan-out calls, a
+second named wrapper in each known loop, a second publication sink hidden in an
+allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db`
 alias/method-value and sync stage-to-HEAD reads, Query/Bind whose statement is
 a constant or variable, a Bind of a Query acquired before stage, a DB read
 inside a HEAD argument, and post-metadata materialization reads including a
-local `db` alias.
+local `db` alias. The two R3a mutations prove that the session provenance check
+remains an exact referrer comparison and that `classifyBlockOwnership` cannot
+acquire an unlisted call.
+
+## Explicit block-commit provenance
+
+The file-from-blocks classifier preserves three internal outcomes from the one
+`ListBlockReferrers` partition read:
+
+```text
+SessionUpload  exact up:<session> for this commit
+BorrowedFS     any fs: prefix with no exact session up:
+None           no accepted reference
+```
+
+`SessionUpload` takes precedence over `BorrowedFS` regardless of referrer row
+order. The current readiness policy deliberately maps both `SessionUpload` and
+`BorrowedFS` to ready, while `None` remains `needs_upload`. `/blocks/check` and
+the commit path use that same policy, so this refinement changes no HTTP result,
+deduplication behavior, or storage I/O. `BorrowedFS` remains the borrowed,
+unguarded R3 provenance; the race where its last foreign reference disappears
+before this writer stages `pub:` is still open and is not resolved here.
 
 ## Outcome and next steps
 
-This characterization may change expectations, but production is not adapted
-in this PR. A later PR must select one provenance category, establish its exact
-continuity or slow-path protocol, and retain both zero-added-CQL-callsite and
-zero-added-authority-read contracts for normal materialize-to-publish traffic.
+This structural refinement changes no protocol behavior. A later PR must select
+one provenance category, establish its exact continuity or slow-path protocol,
+and retain both zero-added-CQL-callsite and zero-added-authority-read contracts
+for normal materialize-to-publish traffic.

@@ -27,6 +27,18 @@ const (
 	blockStatusSizeMismatch
 )
 
+// blockCommitLivenessProvenance records which reference keeps a reusable block
+// alive for this commit. It is intentionally distinct from the current ready
+// policy: an fs: prefix is accepted today but is borrowed liveness for the
+// purposes of the next R3 step.
+type blockCommitLivenessProvenance uint8
+
+const (
+	blockCommitLivenessNone blockCommitLivenessProvenance = iota
+	blockCommitLivenessSessionUpload
+	blockCommitLivenessBorrowedFS
+)
+
 const blockVerifyConcurrency = 20
 
 const (
@@ -645,7 +657,7 @@ func summarizeBlockVerification(start time.Time, blocks []fileFromBlocksBlock, u
 
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
 // live (ProbeBlockReuse == Reusable), physically present, at the declared size,
-// and owned by this session OR kept alive by a committed file ("fs:") reference.
+// and backed by a currently accepted liveness provenance.
 func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, string, error) {
 	probe, err := h.db.ProbeBlockReuse(orgID, hash)
 	if err != nil {
@@ -658,24 +670,51 @@ func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, decla
 	if int64(probe.SizeBytes) != declaredSize {
 		return blockStatusSizeMismatch, sha1, nil
 	}
-	owned, err := classifyBlockOwnership(h.db, orgID, referrer, hash)
+	provenance, err := classifyBlockOwnership(h.db, orgID, referrer, hash)
 	if err != nil {
 		return 0, "", err
 	}
-	if owned {
+	if blockCommitProvenanceCurrentlyReady(provenance) {
 		return blockStatusReady, sha1, nil
 	}
 	return blockStatusNeedsUpload, sha1, nil
 }
 
-// classifyBlockOwnership reports whether a block is committable: kept alive by
-// THIS session's own provisional reference, or by a permanent committed-file
-// ("fs:<library>:<fs_id>") reference (R8). It deliberately does NOT count a
-// foreign publish-attempt ref ("pub:<attempt>") as permanent: that ref is
-// transient and disappears if the foreign attempt loses its HEAD CAS and
-// cleans up, which would leave this commit pointing at a block that can be
-// GC'd — a block alive only via a foreign pub: ref is treated as not owned, so
-// the caller re-uploads it and materializes its own session-owned ref.
+// classifyBlockReferrerProvenance classifies the reference provenance for one
+// commit without performing I/O. The session's exact up: reference has
+// precedence over any fs: reference so the result is independent of Cassandra
+// row order.
+func classifyBlockReferrerProvenance(referrers []string, sessionReferrer string) blockCommitLivenessProvenance {
+	hasBorrowedFS := false
+	for _, referrer := range referrers {
+		if referrer == sessionReferrer {
+			return blockCommitLivenessSessionUpload
+		}
+		if strings.HasPrefix(referrer, "fs:") {
+			hasBorrowedFS = true
+		}
+	}
+	if hasBorrowedFS {
+		return blockCommitLivenessBorrowedFS
+	}
+	return blockCommitLivenessNone
+}
+
+// blockCommitProvenanceCurrentlyReady preserves the existing commit/check
+// policy. BorrowedFS remains accepted deliberately; a later R3 PR will change
+// only that provenance's policy after its deduplication cost is audited.
+func blockCommitProvenanceCurrentlyReady(provenance blockCommitLivenessProvenance) bool {
+	return provenance == blockCommitLivenessSessionUpload ||
+		provenance == blockCommitLivenessBorrowedFS
+}
+
+// classifyBlockOwnership reports the liveness provenance for a block: this
+// session's own provisional reference, a borrowed fs: reference
+// ("fs:<library>:<fs_id>" prefix), or no accepted reference. It deliberately
+// does NOT count a foreign publish-attempt ref ("pub:<attempt>") as permanent:
+// that ref is transient and disappears if the foreign attempt loses its HEAD
+// CAS and cleans up, which would leave this commit pointing at a block that can
+// be GC'd.
 //
 // This reads the block's reference partition ONCE via ListBlockReferrers
 // (finding 14): the previous version ran BlockHasReferrer (exact-match read)
@@ -684,15 +723,10 @@ func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, decla
 // session, but permanently referenced" case. ListBlockReferrers already
 // returns every referrer, a superset of what BlockHasReferrer checks, so a
 // single partition read now answers both questions.
-func classifyBlockOwnership(database *db.DB, orgID, referrer, blockID string) (bool, error) {
+func classifyBlockOwnership(database *db.DB, orgID, referrer, blockID string) (blockCommitLivenessProvenance, error) {
 	referrers, err := database.ListBlockReferrers(orgID, blockID)
 	if err != nil {
-		return false, err
+		return blockCommitLivenessNone, err
 	}
-	for _, r := range referrers {
-		if r == referrer || strings.HasPrefix(r, "fs:") {
-			return true, nil
-		}
-	}
-	return false, nil
+	return classifyBlockReferrerProvenance(referrers, referrer), nil
 }

@@ -99,6 +99,20 @@ m_authority_read_in_finalize() {
     'per-block authority helper ValidateBlockPublishAuthority' 'v2 publication primitive gains an authority read'
 }
 
+m_foreign_fs_is_not_session_pin() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/file_from_blocks.go" 's/if referrer == sessionReferrer \{/if strings.HasPrefix(referrer, "fs:") {/'
+  expect_red ./internal/api/v2 '^TestR3BlockOwnershipProvenanceChecksExactSessionReferrer$' \
+    'exact session referrer comparison not found' 'foreign fs mutation removes exact session provenance'
+}
+
+m_ownership_extra_db_io() {
+  reset_fixture
+  mutate "$FIXTURE/internal/api/v2/file_from_blocks.go" 's/return classifyBlockReferrerProvenance\(referrers, referrer\), nil/_ = database.Session().Query("SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n\treturn classifyBlockReferrerProvenance(referrers, referrer), nil/'
+  expect_red ./internal/api/v2 '^TestR3ClassifyBlockOwnershipUsesSingleReferrerPartitionRead$' \
+    'unlisted call' 'ownership classifier gains a second Cassandra operation'
+}
+
 source scripts/r3-hotpath-extra-mutations.sh
 
 MUTATIONS=(
@@ -109,6 +123,8 @@ MUTATIONS=(
   m_metadata_before_fence
   m_drop_up_after_success
   m_authority_read_in_finalize
+  m_foreign_fs_is_not_session_pin
+  m_ownership_extra_db_io
   m_authority_read_hidden_in_add_ref_funcvar
   m_cross_package_authority_wrapper
   m_qualified_inline_authority_select
