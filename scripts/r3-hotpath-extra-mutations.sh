@@ -46,6 +46,13 @@ m_extra_per_block_cql_insert() {
     'db.AddPublishAttemptReferences submitted CQL callsites = 3, want 2' 'extra per-block CQL INSERT exceeds the frozen budget'
 }
 
+m_typed_single_value_bind() {
+  reset_fixture
+  mutate "$FIXTURE/internal/db/block_references.go" 's/(var addPublishAttemptReferenceFn = func[^\{]+\{)/$1\n\t_ = prepared.Bind(blockID)/'
+  expect_red ./internal/db '^TestR3PublicationHotPathTypedReceiversAndCQLBudget$' \
+    'db.AddPublishAttemptReferences submitted CQL callsites = 3, want 2' 'a single-argument Query.Bind still consumes the typed CQL source-callsite budget'
+}
+
 m_local_receiver_method_value_authority_read() {
   reset_fixture
   mutate "$FIXTURE/internal/db/block_references.go" 's@(// AddPublishAttemptReferences stages)@func (database *DB) R3NeutralMethodValueRead(orgID, blockID string) error {\n\treturn database.Session().Query("SELECT gc_state FROM blocks WHERE org_id = ? AND block_id = ?", orgID, blockID).Exec()\n}\n\n$1@'

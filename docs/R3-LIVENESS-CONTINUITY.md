@@ -147,8 +147,10 @@ resolution for indexed struct fields and methods (for example `h.db.Method`),
 follows local aliases of directly resolvable functions, and fails closed for a
 local method value on an indexed receiver when it cannot resolve the target.
 It freezes the number of structurally reachable CQL source callsites for
-every guarded root. These are static source entry points, not physical
-Cassandra submissions or a proof of arbitrary runtime multiplicity. Any intentional new CQL
+every guarded root. `Query` with a statement argument and every `Bind`
+(including a single bound value) are CQL source entry points. These are
+static source entry points, not physical Cassandra submissions or a proof
+of arbitrary runtime multiplicity. Any intentional new CQL
 therefore requires explicit review and a baseline update. This is a deliberately
 scoped source analyzer, not a claim of universal Go compiler/type analysis.
 
@@ -189,15 +191,16 @@ metadata seams remain its allowed I/O.
 The guarded roots include the v2 staging primitive (`AddPublishAttemptReferences`)
 and the normal stage/promote/finalize paths. They intentionally exclude
 `repairPublishedSyncCommitBlockDelta`: it is post-HEAD R31 convergence, not the
-normal pre-HEAD R3 hot path. Thirty-three isolated mutations prove red for the
+normal pre-HEAD R3 hot path. Thirty-four isolated mutations prove red for the
 seven handshake/cost regressions plus hidden FuncLit/cross-package/qualified
 authority reads, typed receiver and method-value dispatch, an extra per-block
-CQL INSERT, duplicated existing fan-out calls, a second named wrapper in each
-known loop, a second publication sink hidden in an allowed persist seam or
-nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db` alias/method-value and
-sync stage-to-HEAD reads, Query/Bind whose statement is a constant or variable,
-a Bind of a Query acquired before stage, a DB read inside a HEAD argument,
-and post-metadata materialization reads including a local `db` alias.
+CQL INSERT, a single-argument `Bind` on a typed root, duplicated existing
+fan-out calls, a second named wrapper in each known loop, a second publication
+sink hidden in an allowed persist seam or nested FuncLit, v2 `h.db`/`fsHelper.db`/session/`db`
+alias/method-value and sync stage-to-HEAD reads, Query/Bind whose statement is
+a constant or variable, a Bind of a Query acquired before stage, a DB read
+inside a HEAD argument, and post-metadata materialization reads including a
+local `db` alias.
 
 ## Outcome and next steps
 

@@ -344,7 +344,7 @@ func r3TypedCallLabel(call *ast.CallExpr) string {
 
 func r3TypedCQLEntryPoint(call *ast.CallExpr) bool {
 	name := r3TypedCallLabel(call)
-	return (name == "Query" && len(call.Args) > 0) || (name == "Bind" && len(call.Args) >= 2)
+	return (name == "Query" && len(call.Args) > 0) || name == "Bind"
 }
 
 func r3TypedRootBudget(t *testing.T, program *r3TypedProgram, root r3ProgramSymbol) int {
