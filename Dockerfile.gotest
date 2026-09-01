@@ -1,7 +1,7 @@
 FROM golang:1.25-trixie
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends bash curl ca-certificates jq \
+	&& apt-get install -y --no-install-recommends bash curl ca-certificates jq perl \
 	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

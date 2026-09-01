@@ -7,10 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -176,4 +178,85 @@ func x1RegisterFenced(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID
 	if !errors.Is(err, v2pkg.ErrBlockDeleteInProgress) {
 		t.Fatalf("RegisterUploadedBlockTarget = %v, want ErrBlockDeleteInProgress", err)
 	}
+}
+
+func x1DeleteQueueRowKeepPending(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string, candidate gcpkg.BlockGCCandidateInfo) {
+	t.Helper()
+	identity := candidate.ItemIdentity()
+	err := database.Session().Query(`
+		DELETE FROM gc_queue
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ? AND candidate_storage_class = ? AND candidate_storage_key = ? AND identity_at = ?
+	`, orgID.String(), gcpkg.QueueBucket(orgID, gcpkg.ItemBlock, blockID), candidate.CandidateAt, string(gcpkg.ItemBlock), blockID, identity.Target().StorageClass, identity.Target().StorageKey, identity.IdentityAt).Exec()
+	if err != nil {
+		t.Fatalf("delete exact gc_queue row: %v", err)
+	}
+}
+
+func x1FailedItemExists(t *testing.T, store *gcpkg.CassandraStore, orgID uuid.UUID, blockID string) bool {
+	t.Helper()
+	items, err := store.ListFailedItems(orgID, 0)
+	if err != nil {
+		t.Fatalf("ListFailedItems: %v", err)
+	}
+	for _, item := range items {
+		if item.ItemID == blockID && item.ItemType == gcpkg.ItemBlock {
+			return true
+		}
+	}
+	return false
+}
+
+func x1RejectForeignTenantDelete(t *testing.T, k1 string) {
+	t.Helper()
+	foreign := newVerificationBlockStore(t, uuid.New().String())
+	err := foreign.DeleteBlockByStorageKey(t.Context(), k1)
+	if err == nil {
+		t.Fatal("E: foreign-tenant DeleteBlockByStorageKey must fail before S3")
+	}
+	if !strings.Contains(err.Error(), "outside tenant prefix") {
+		t.Fatalf("E: want tenant-prefix rejection, got %v", err)
+	}
+}
+
+func x1HasFSReferrer(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, blockID string) bool {
+	t.Helper()
+	referrers, err := database.ListBlockReferrers(orgID.String(), blockID)
+	if err != nil {
+		t.Fatalf("ListBlockReferrers: %v", err)
+	}
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "fs:") {
+			return true
+		}
+	}
+	return false
+}
+
+func x1ScanOrphanedBlocksWithRestoredCursor(t *testing.T, store *gcpkg.CassandraStore, cursorDay time.Time) int {
+	t.Helper()
+	key := gcpkg.BlockCandidatesScanCursorKey
+	prev, loadErr := store.LoadGCStats(key)
+	hadPrev := false
+	if loadErr == nil {
+		hadPrev = true
+	} else if !errors.Is(loadErr, gocql.ErrNotFound) {
+		t.Fatalf("LoadGCStats(%s): %v", key, loadErr)
+	}
+	database := shareProjectionDBForTest(t)
+	t.Cleanup(func() {
+		if hadPrev {
+			_ = store.SaveGCStats(key, prev)
+			return
+		}
+		_ = database.Session().Query(`DELETE FROM gc_stats WHERE stat_key = ?`, key).Exec()
+	})
+	if err := store.SaveGCStats(key, dbpkg.GCProjectionDateString(cursorDay)); err != nil {
+		t.Fatalf("save block-candidates cursor: %v", err)
+	}
+	scanner := gcpkg.NewScanner(store, gcpkg.NewQueue(store), &gcpkg.Stats{}, config.GCConfig{})
+	n, err := scanner.ScanOrphanedBlocksOnce(t.Context())
+	if err != nil {
+		t.Fatalf("ScanOrphanedBlocksOnce: %v", err)
+	}
+	return n
 }

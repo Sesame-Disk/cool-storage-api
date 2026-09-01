@@ -127,6 +127,40 @@ func TestX1F0b1LocksOnPendingItemsNotQueue(t *testing.T) {
 	if !x1BlockContainsIdent(body, "QueueItemExists") {
 		t.Fatal("F0b1 must also observe queue absence via QueueItemExists")
 	}
+	if !x1BlockContainsIdent(body, "x1DeleteQueueRowKeepPending") {
+		t.Fatal("F0b1 must delete the exact gc_queue row without touching pending")
+	}
+	if !x1BlockContainsIdent(body, "x1FailedItemExists") {
+		t.Fatal("F0b1 must assert DLQ absence")
+	}
+	if !x1BlockContainsIdent(body, "x1ScanOrphanedBlocksWithRestoredCursor") {
+		t.Fatal("F0b1 must run ScanOrphanedBlocksOnce via the restored-cursor helper")
+	}
+	if x1BlockContainsIdent(body, "FailItem") {
+		t.Fatal("F0b1 must not use FailItem; that writes DLQ")
+	}
+}
+
+func TestX1F0b2RunsScannerWithCursor(t *testing.T) {
+	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_characterization_test.go")
+	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
+	body := x1SubtestBody(t, fn, "candidateBehindCursor")
+	if !x1BlockContainsIdent(body, "x1ScanOrphanedBlocksWithRestoredCursor") {
+		t.Fatal("F0b2 must run ScanOrphanedBlocksOnce via the restored-cursor helper")
+	}
+	if !x1BlockContainsIdent(body, "QueueItemExists") {
+		t.Fatal("F0b2 must observe queue absence after the real scan")
+	}
+}
+
+func TestX1CandidateHarnessDoesNotPublishOrphan(t *testing.T) {
+	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_characterization_test.go")
+	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
+	for _, name := range []string{"StartBlockDeleteOrphan", "ObserveBlockDeleteLifecycle", "TerminateBlockDeleteLifecycle"} {
+		if x1BlockContainsIdent(fn.Body, name) {
+			t.Fatalf("candidate harness must not call %s", name)
+		}
+	}
 }
 
 func TestX1HUsesExportedPutCallback(t *testing.T) {
@@ -134,6 +168,36 @@ func TestX1HUsesExportedPutCallback(t *testing.T) {
 	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
 	_ = x1FirstCall(t, fn, "PutBlockMaterializationTarget")
 	_ = x1FirstCall(t, fn, "ObjectExists")
+	src, err := os.ReadFile(x1SourcePath("internal", "integration", "x1_strict_nonoverlap_characterization_test.go"))
+	if err != nil {
+		t.Fatalf("read characterization test: %v", err)
+	}
+	if !strings.Contains(string(src), "resurrected=") {
+		t.Fatal("H must observe ObjectExists after the residual PUT as resurrected=")
+	}
+}
+
+func TestX1EAttemptsFailedPhysicalDelete(t *testing.T) {
+	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_characterization_test.go")
+	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
+	body := x1SubtestBody(t, fn, "s3Failure")
+	if !x1BlockContainsIdent(body, "x1RejectForeignTenantDelete") {
+		t.Fatal("E must attempt a failed DeleteBlockByStorageKey via x1RejectForeignTenantDelete")
+	}
+	src, err := os.ReadFile(x1SourcePath("internal", "integration", "x1_strict_nonoverlap_characterization_test.go"))
+	if err != nil {
+		t.Fatalf("read characterization test: %v", err)
+	}
+	if !strings.Contains(string(src), `t.Fatal("E: P2 must not acquire canonical authority while P1 remains")`) {
+		t.Fatal("E must refuse P2 install while P1 remains")
+	}
+}
+
+func TestX1HelpersScanOrphanedBlocksOnce(t *testing.T) {
+	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_helpers_test.go")
+	fn := x1Func(t, file, "x1ScanOrphanedBlocksWithRestoredCursor")
+	_ = x1FirstCall(t, fn, "ScanOrphanedBlocksOnce")
+	_ = x1FirstCall(t, fn, "SaveGCStats")
 }
 
 func TestX1F2SafetyAndConvergenceAreSeparateAssignments(t *testing.T) {

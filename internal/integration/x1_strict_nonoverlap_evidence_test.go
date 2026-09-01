@@ -15,21 +15,21 @@ const x1NonoverlapCharacterizationEnv = "SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTE
 // is the conjunction of these fields, never a counter: marking one leg twice cannot
 // hide another. TestMain inspects missing() after m.Run().
 type x1NonoverlapEvidenceState struct {
-	writerFirst                    bool
-	gcFirst                        bool
-	refBeforeZeroProof             bool
-	refBetweenProofAndCut          bool
-	lateUploadRef                  bool
-	borrowedFSPublish              bool
-	s3Failure                      bool
-	postCommitResume               bool
-	pendingBlocksReenqueue         bool
-	candidateBehindCursor          bool
-	postDeleteCrash                bool
-	ambiguousFinalizeSafety        bool
-	ambiguousFinalizeConvergence   bool
-	lateRepairPut                  bool
-	nextIncarnation                bool
+	writerFirst                  bool
+	gcFirst                      bool
+	refBeforeZeroProof           bool
+	refBetweenProofAndCut        bool
+	lateUploadRef                bool
+	borrowedFSPublish            bool
+	s3Failure                    bool
+	postCommitResume             bool
+	pendingBlocksReenqueue       bool
+	candidateBehindCursor        bool
+	postDeleteCrash              bool
+	ambiguousFinalizeSafety      bool
+	ambiguousFinalizeConvergence bool
+	lateRepairPut                bool
+	nextIncarnation              bool
 }
 
 func (state x1NonoverlapEvidenceState) namedLegs() []struct {
@@ -148,6 +148,7 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		"ambiguousFinalizeSafety",
 		"ambiguousFinalizeConvergence",
 		"own liveness",
+		"HEAD is not characterized",
 		"PROMISING",
 		"PROMISING_WITH_PREREQUISITE",
 		"REJECT",

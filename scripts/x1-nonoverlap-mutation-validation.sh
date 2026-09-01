@@ -125,6 +125,38 @@ m_worker_driven_harness() {
     'must not drive worker.go processBlock' 'harness starts calling processBlock'
 }
 
+m_orphan_on_candidate() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/x1NonoverlapEvidence.writerFirst = true/_ = store.StartBlockDeleteOrphan(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(x1Attempt(target, "mut")), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", time.Now())\n\t\tx1NonoverlapEvidence.writerFirst = true/'
+  expect_red '^TestX1CandidateHarnessDoesNotPublishOrphan$' \
+    'must not call StartBlockDeleteOrphan' 'candidate harness publishes orphan'
+}
+
+m_f0b1_uses_failitem() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/x1DeleteQueueRowKeepPending\(t, database, orgID, blockID, candidate\)/x1DeleteQueueRowKeepPending(t, database, orgID, blockID, candidate)\n\t\t_ = store.FailItem(gcpkg.QueueItem{})/'
+  expect_red '^TestX1F0b1LocksOnPendingItemsNotQueue$' \
+    'must not use FailItem' 'F0b1 reconstructs queue-loss via FailItem/DLQ'
+}
+
+m_h_drops_resurrection_log() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/resurrected=%v/omitted=%v/'
+  expect_red '^TestX1HUsesExportedPutCallback$' \
+    'resurrected=' 'H no longer observes K1 resurrection'
+}
+
+m_e_allows_p2_while_p1() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/t\.Fatal\("E: P2 must not acquire canonical authority while P1 remains"\)/t.Log("E: P2 must not acquire canonical authority while P1 remains")/'
+  expect_red '^TestX1EAttemptsFailedPhysicalDelete$' \
+    'E must refuse P2 install while P1 remains' 'E no longer refuses P2 while P1 remains'
+}
+
 MUTATIONS=(
   m_finalize_before_delete
   m_f0b1_ignores_pending
@@ -133,6 +165,10 @@ MUTATIONS=(
   m_evidence_drops_named_leg
   m_lookback_shrinks
   m_worker_driven_harness
+  m_orphan_on_candidate
+  m_f0b1_uses_failitem
+  m_h_drops_resurrection_log
+  m_e_allows_p2_while_p1
 )
 
 if [ "${1:-}" = "--list" ]; then

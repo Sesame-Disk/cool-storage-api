@@ -139,6 +139,10 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		if err != nil || probe.Decision != dbpkg.BlockReuseBlockedByGC {
 			t.Fatalf("D1: new request probe = %+v %v; want BlockedByGC (no permanent reachability)", probe, err)
 		}
+		if x1HasFSReferrer(t, database, orgID, blockID) {
+			t.Fatal("D1: late up: must not already be an fs: referrer")
+		}
+		t.Log("D1: post-cut up: may exist; D unrevoked; new-request BlockedByGC. Whether up: can become fs:/HEAD is not characterized")
 		x1NonoverlapEvidence.lateUploadRef = true
 	})
 
@@ -179,11 +183,12 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		if err != nil {
 			t.Fatalf("D2: read pub: %v", err)
 		}
+		if !pubExists {
+			t.Fatal("D2: post-cut pub: staging must land for this characterization; subsequent HEAD is not characterized")
+		}
 		probe, probeErr := database.ProbeBlockReuse(orgID.String(), blockID)
 		t.Logf("D2 in-flight staging pub_exists=%v new_request_probe=%v err=%v", pubExists, probe.Decision, probeErr)
-		if pubExists {
-			t.Log("D2 UNGUARDED: post-cut pub: landed without own pin or fence; writer-side own-liveness before pub/HEAD is a prerequisite")
-		}
+		t.Log("D2 UNGUARDED: post-cut pub: staging is unguarded; subsequent HEAD is not characterized")
 		if probeErr != nil || probe.Decision != dbpkg.BlockReuseBlockedByGC {
 			t.Fatalf("D2: a new request must still see BlockedByGC after the cut; probe=%+v err=%v", probe, probeErr)
 		}
@@ -199,7 +204,11 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		x1Cleanup(t, database, orgID, blockID)
 		target := x1Target(storageClass, k1)
 		x1CommitHandoffAfterZeroRefs(t, store, orgID, blockID, x1Attempt(target, "E"))
-		// Candidate protocol: physical delete failed, so Finalize must not run.
+		x1RejectForeignTenantDelete(t, k1)
+		k1Exists, err := blockStore.ObjectExists(t.Context(), k1)
+		if err != nil || !k1Exists {
+			t.Fatalf("E: K1 must remain after failed DeleteBlockByStorageKey; exists=%v err=%v", k1Exists, err)
+		}
 		x1AssertCanonicalPresent(t, store, orgID, blockID, k1)
 		k2, err := blockStore.MintStorageKey(blockID)
 		if err != nil {
@@ -247,30 +256,35 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		x1Cleanup(t, database, orgID, blockID)
 		candidate := x1CandidateAndQueue(t, store, orgID, blockID, "hot", time.Now())
 		x1CommitHandoffAfterZeroRefs(t, store, orgID, blockID, x1Attempt(target, "F0b1"))
-		if err := store.FailItem(gcpkg.QueueItem{
-			OrgID:                    orgID,
-			QueuedAt:                 candidate.CandidateAt,
-			IdentityAt:               candidate.CandidateAt,
-			ItemType:                 gcpkg.ItemBlock,
-			ItemID:                   blockID,
-			LibraryID:                uuid.Nil,
-			StorageClass:             candidate.StorageClass(),
-			BlockGCCandidateIdentity: candidate.Identity(),
-		}, time.Now().UTC(), "x1-f0b1 constructed split", "x1_characterization"); err != nil {
-			t.Fatalf("F0b1: FailItem to split queue/pending: %v", err)
-		}
+		x1DeleteQueueRowKeepPending(t, database, orgID, blockID, candidate)
 		queueExists, err := store.QueueItemExists(orgID, candidate.CandidateAt, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
 		if err != nil || queueExists {
-			t.Fatalf("F0b1: queue should be absent; exists=%v err=%v", queueExists, err)
+			t.Fatalf("F0b1: queue should be absent after exact-row delete; exists=%v err=%v", queueExists, err)
 		}
 		pendingExists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
 		if err != nil || !pendingExists {
 			t.Fatalf("F0b1: pending should remain (scanner lock); exists=%v err=%v", pendingExists, err)
 		}
+		if x1FailedItemExists(t, store, orgID, blockID) {
+			t.Fatal("F0b1: constructed queue-loss must not create a DLQ row")
+		}
 		if !x1CandidateListedOnDay(t, store, orgID, blockID, candidate.CandidateAt) {
 			t.Fatal("F0b1: candidate must still be enumerable in the cursor window")
 		}
-		t.Log("F0b1: scanner PendingItemExists==true ⇒ continue, no re-enqueue; queue/pending are not a committed recovery root")
+		n := x1ScanOrphanedBlocksWithRestoredCursor(t, store, dbpkg.GCProjectionUTCDate(time.Now()).AddDate(0, 0, -1))
+		t.Logf("F0b1: ScanOrphanedBlocksOnce enqueued=%d (global phase; this item must not reappear on queue)", n)
+		queueExists, err = store.QueueItemExists(orgID, candidate.CandidateAt, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
+		if err != nil || queueExists {
+			t.Fatalf("F0b1: scanner must not reenqueue while pending is present; exists=%v err=%v", queueExists, err)
+		}
+		pendingExists, err = store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
+		if err != nil || !pendingExists {
+			t.Fatalf("F0b1: pending must survive the scan; exists=%v err=%v", pendingExists, err)
+		}
+		if x1FailedItemExists(t, store, orgID, blockID) {
+			t.Fatal("F0b1: scan must not create a DLQ row for this item")
+		}
+		t.Log("F0b1: queue-loss without DLQ; scanner pending lock skipped reenqueue; scanner lock ≠ recovery root")
 		x1NonoverlapEvidence.pendingBlocksReenqueue = true
 	})
 
@@ -285,17 +299,30 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 			t.Fatalf("F0b2: candidate: %v", err)
 		}
 		x1CommitHandoffAfterZeroRefs(t, store, orgID, blockID, x1Attempt(target, "F0b2"))
+		queueExists, err := store.QueueItemExists(orgID, candidate.CandidateAt, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
+		if err != nil || queueExists {
+			t.Fatalf("F0b2: queue must be absent before scan; exists=%v err=%v", queueExists, err)
+		}
+		pendingExists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
+		if err != nil || pendingExists {
+			t.Fatalf("F0b2: pending must be absent before scan; exists=%v err=%v", pendingExists, err)
+		}
+		if x1FailedItemExists(t, store, orgID, blockID) {
+			t.Fatal("F0b2: DLQ must be absent before scan")
+		}
 		if !x1CandidateListedOnDay(t, store, orgID, blockID, candidate.CandidateAt) {
 			t.Fatal("F0b2: candidate row still exists on its projection day")
 		}
-		cutoff := dbpkg.GCProjectionUTCDate(time.Now())
-		coldStart := cutoff.AddDate(0, 0, -7)
-		overlapStart := cutoff.AddDate(0, 0, -3)
-		candidateDay := dbpkg.GCProjectionUTCDate(candidate.CandidateAt)
-		if !candidateDay.Before(coldStart) || !candidateDay.Before(overlapStart) {
-			t.Fatalf("F0b2: stale candidate day %s should be behind cold-start %s and overlap %s", candidateDay.Format("2006-01-02"), coldStart.Format("2006-01-02"), overlapStart.Format("2006-01-02"))
+		n := x1ScanOrphanedBlocksWithRestoredCursor(t, store, dbpkg.GCProjectionUTCDate(time.Now()).AddDate(0, 0, -1))
+		t.Logf("F0b2: ScanOrphanedBlocksOnce with last_candidate_day=today-1 enqueued=%d", n)
+		if !x1CandidateListedOnDay(t, store, orgID, blockID, candidate.CandidateAt) {
+			t.Fatal("F0b2: candidate must still exist after the scan")
 		}
-		t.Log("F0b2: existence ≠ rediscovery; scanner does not walk days behind cursor-overlap or initial lookback")
+		queueExists, err = store.QueueItemExists(orgID, candidate.CandidateAt, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
+		if err != nil || queueExists {
+			t.Fatalf("F0b2: scanner must not rediscover a candidate behind the cursor; exists=%v err=%v", queueExists, err)
+		}
+		t.Log("F0b2: existence ≠ rediscovery; real cursor + ScanOrphanedBlocksOnce left queue absent")
 		x1NonoverlapEvidence.candidateBehindCursor = true
 	})
 
@@ -389,18 +416,23 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		retry, err := store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(authority))
 		t.Logf("F2-convergence: retry without orphan/020 outcome=%s err=%v (NotAuthority is classification, not a license to delete)", retry.Outcome, err)
 		if retry.Outcome != gcpkg.BlockDeleteNotAuthority {
-			t.Logf("F2-convergence: expected NotAuthority without lifecycle certificate, got %s", retry.Outcome)
+			t.Fatalf("F2-convergence: expected NotAuthority without lifecycle certificate, got %s err=%v", retry.Outcome, err)
 		}
 		claim, err := store.ClaimBlockDelete(orgID, blockID, x1Attempt(target, "F2c-retry"))
 		if err != nil {
 			t.Fatalf("F2-convergence: claim after finalize: %v", err)
 		}
-		t.Logf("F2-convergence: claim after lost finalize response = %s", claim.Outcome)
+		if claim.Outcome != gcpkg.BlockClaimMissing {
+			t.Fatalf("F2-convergence: claim after lost finalize response = %s, want missing", claim.Outcome)
+		}
 		pendingExists, err := store.PendingItemExists(orgID, uuid.Nil, gcpkg.ItemBlock, blockID, candidate.ItemIdentity())
 		if err != nil {
 			t.Fatalf("F2-convergence: pending: %v", err)
 		}
-		t.Logf("F2-convergence: candidate/pending leftover pending=%v (settlement may need a light completion path; 020 is not required for F2-safety)", pendingExists)
+		if !pendingExists {
+			t.Fatal("F2-convergence: leftover pending=true is the OPEN settlement observation")
+		}
+		t.Logf("F2-convergence OPEN: retry=%s claim=%s pending=%v; 020 is not required for F2-safety", retry.Outcome, claim.Outcome, pendingExists)
 		x1NonoverlapEvidence.ambiguousFinalizeConvergence = true
 	})
 

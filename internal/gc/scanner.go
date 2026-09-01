@@ -65,6 +65,13 @@ func (s *Scanner) ScanExpiredDeletedLibrariesOnce(ctx context.Context) (int, err
 	return s.scanExpiredDeletedLibraries(ctx)
 }
 
+// ScanOrphanedBlocksOnce runs only the orphaned-block rediscovery phase.
+// Integration tests use it so a full ScanOnce does not advance unrelated
+// scanner cursors. Callers must save and restore BlockCandidatesScanCursorKey.
+func (s *Scanner) ScanOrphanedBlocksOnce(ctx context.Context) (int, error) {
+	return s.scanOrphanedBlocks(ctx)
+}
+
 // SetOrphanRecoverer wires the S3 orphan recovery dependency. Optional; if
 // unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
 func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {
