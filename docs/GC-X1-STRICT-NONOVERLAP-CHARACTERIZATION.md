@@ -2,10 +2,13 @@
 
 **Characterization parent:** `c8b432ca5` (`main` containing #198)
 **Branch:** `test/x1-strict-nonoverlap-quiescence`
-**Scope:** investigation only; no protocol, schema, worker, or `GC_ENABLED` change.
+**Scope:** investigation only; no protocol, schema, worker, or production `GC_ENABLED` change.
 Scanner rediscovery hooks used by F0b live in `internal/gc/x1_integration_hooks.go`
 (`//go:build integration`) so the production `gc` API is unchanged.
-**Status:** X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
+**Production/fleet status:** X1 remains OPEN. R3 remains OPEN. Destructive GC remains
+disabled for deployment (`GC_ENABLED=false` fleet-wide). The Docker integration
+profile may run background GC on the primary test node; that is not the production
+activation state.
 
 The real Cassandra+MinIO evidence gate is `SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1`.
 `TestMain` requires all **15 named legs** after `m.Run()`. Completeness is `missing()` by
@@ -164,8 +167,10 @@ Terminal state of this document must be exactly one of:
 H resurrected K1 after `DeleteBlockByStorageKey`. D2 landed a post-cut `pub:`
 staging row without own pin or fence. F0b1/F0b2 showed queue/pending/cursor are
 not a durable recovery root. F2-convergence showed post-Finalize work items do
-not close. The GC reorder (keep canonical P → physical delete → finalize) held
-for E/F0a/F1/F2-safety/I.
+not close. The candidate authority/lifetime model held across E/F0a/F1/F2-safety/I.
+The physical-delete-before-finalize sequence itself is directly exercised by
+F1, F2-safety and I; E and F0a characterize its failure/resume states before
+physical retirement.
 
 Two independent prerequisites before any protocol switch:
 
@@ -184,9 +189,15 @@ Prerequisite B — committed-delete recovery
    not as delete authority)
 ```
 
-X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
+X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wide.
 
 ## Mutations
+
+These are **source/AST contract mutations**, not runtime mutation testing of a
+mutated binary against Cassandra+MinIO. `go test ./internal/gc` executes the
+unmodified repository; `X1_SOURCE_ROOT` points the AST contracts at an isolated
+fixture. Fifteen mutations staying RED means the static contracts detected those
+alterations.
 
 Load-bearing AST contracts live in `internal/gc/x1_nonoverlap_harness_contract_test.go`.
 They require `DeleteBlockByStorageKey` before `FinalizeBlockDelete` in F1, F2-safety,

@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -152,6 +153,7 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		"HEAD is not characterized",
 		"not yet fully specified",
 		"committed-delete recovery",
+		"source/AST contract mutations",
 		"PROMISING",
 		"PROMISING_WITH_PREREQUISITE",
 		"REJECT",
@@ -160,5 +162,14 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("X1 characterization document is missing %q", needle)
 		}
+	}
+	verdicts := regexp.MustCompile(`(?m)^\*\*Current verdict: ([A-Z_]+)\*\*\s*$`).FindAllStringSubmatch(text, -1)
+	if len(verdicts) != 1 {
+		t.Fatalf("document must declare exactly one Current verdict, got %d", len(verdicts))
+	}
+	switch verdicts[0][1] {
+	case "PROMISING", "PROMISING_WITH_PREREQUISITE", "REJECT":
+	default:
+		t.Fatalf("Current verdict %q is not a terminal state", verdicts[0][1])
 	}
 }

@@ -955,9 +955,10 @@ it in Docker:
 docker compose --profile test run --rm --build gotest bash scripts/p4a-mutation-validation.sh
 ```
 
-X1 strict-nonoverlap characterization uses the same isolated-fixture pattern
-(`scripts/x1-nonoverlap-mutation-validation.sh`). Perl is installed in
-`Dockerfile.gotest`. Run:
+X1 strict-nonoverlap characterization uses source/AST contract mutation
+validation (`scripts/x1-nonoverlap-mutation-validation.sh`): an isolated fixture
+is parsed by the AST contracts; it is not runtime mutation testing of a mutated
+binary. Perl is installed in `Dockerfile.gotest`. Run:
 
 ```bash
 docker compose --profile test run --rm --build gotest bash scripts/x1-nonoverlap-mutation-validation.sh
