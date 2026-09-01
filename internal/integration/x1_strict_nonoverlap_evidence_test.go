@@ -21,7 +21,7 @@ type x1NonoverlapEvidenceState struct {
 	refBetweenProofAndCut        bool
 	lateUploadRef                bool
 	borrowedFSPublish            bool
-	s3Failure                    bool
+	physicalDeleteFailure        bool
 	postCommitResume             bool
 	pendingBlocksReenqueue       bool
 	candidateBehindCursor        bool
@@ -46,7 +46,7 @@ func (state x1NonoverlapEvidenceState) namedLegs() []struct {
 		{"refBetweenProofAndCut", state.refBetweenProofAndCut},
 		{"lateUploadRef", state.lateUploadRef},
 		{"borrowedFSPublish", state.borrowedFSPublish},
-		{"s3Failure", state.s3Failure},
+		{"physicalDeleteFailure", state.physicalDeleteFailure},
 		{"postCommitResume", state.postCommitResume},
 		{"pendingBlocksReenqueue", state.pendingBlocksReenqueue},
 		{"candidateBehindCursor", state.candidateBehindCursor},
@@ -112,7 +112,7 @@ func TestX1CharacterizationEvidenceRequiresEveryNamedLeg(t *testing.T) {
 		refBetweenProofAndCut:        true,
 		lateUploadRef:                true,
 		borrowedFSPublish:            true,
-		s3Failure:                    true,
+		physicalDeleteFailure:        true,
 		postCommitResume:             true,
 		pendingBlocksReenqueue:       true,
 		candidateBehindCursor:        true,
@@ -145,6 +145,7 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		fmt.Sprintf("`%s=1`", x1NonoverlapCharacterizationEnv),
 		"writerFirst",
 		"pendingBlocksReenqueue",
+		"physicalDeleteFailure",
 		"ambiguousFinalizeSafety",
 		"ambiguousFinalizeConvergence",
 		"own liveness",

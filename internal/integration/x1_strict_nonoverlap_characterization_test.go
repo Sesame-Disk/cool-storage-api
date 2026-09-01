@@ -195,7 +195,7 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		x1NonoverlapEvidence.borrowedFSPublish = true
 	})
 
-	t.Run("s3Failure", func(t *testing.T) {
+	t.Run("physicalDeleteFailure", func(t *testing.T) {
 		storageClass := x1StorageClass(t)
 		orgID := uuid.New()
 		blockStore := newVerificationBlockStore(t, orgID.String())
@@ -225,7 +225,7 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		if state != "deleting" || !handoff || key != k1 {
 			t.Fatalf("E: retry identity drifted: state=%s handoff=%v key=%s", state, handoff, key)
 		}
-		x1NonoverlapEvidence.s3Failure = true
+		x1NonoverlapEvidence.physicalDeleteFailure = true
 	})
 
 	t.Run("postCommitResume", func(t *testing.T) {
@@ -479,11 +479,10 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		}
 		t.Logf("H residual PUT err=%v resurrected=%v claim=%s", putErr, exists, attempt.ClaimID)
 		if !exists {
-			t.Log("H: writer PUT did not recreate K1 after DeleteBlockByStorageKey")
-		} else {
-			t.Log("H PREREQUISITE: pre-PUT authority is not backed by own liveness visible to GC; need own pin → fence → existing-P PUT")
+			t.Fatal("H: expected residual authorized PUT to resurrect K1 on characterization baseline")
 		}
-		if exists && putErr != nil {
+		t.Log("H PREREQUISITE: pre-PUT authority is not backed by own liveness visible to GC; need own pin → fence → existing-P PUT")
+		if putErr != nil {
 			t.Logf("H: PUT returned error but object exists: %v", putErr)
 		}
 		x1NonoverlapEvidence.lateRepairPut = true

@@ -2,7 +2,9 @@
 
 **Characterization parent:** `c8b432ca5` (`main` containing #198)
 **Branch:** `test/x1-strict-nonoverlap-quiescence`
-**Scope:** investigation only; no protocol, schema, worker, or `GC_ENABLED` change
+**Scope:** investigation only; no protocol, schema, worker, or `GC_ENABLED` change.
+Scanner rediscovery hooks used by F0b live in `internal/gc/x1_integration_hooks.go`
+(`//go:build integration`) so the production `gc` API is unchanged.
 **Status:** X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
 
 The real Cassandra+MinIO evidence gate is `SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1`.
@@ -82,7 +84,7 @@ GC:     global zero → irreversible cut → keep canonical P → physical delet
 | `refBetweenProofAndCut` | C2 | late `up:` after zero-proof; handoff still commits; writer loses fence |
 | `lateUploadRef` | D1 | post-cut `up:` may exist; it must not revoke D. Becoming `fs:`/HEAD is not characterized |
 | `borrowedFSPublish` | D2 | post-cut `pub:` staging is unguarded; subsequent HEAD is not characterized |
-| `s3Failure` | E | failed `DeleteBlockByStorageKey` keeps K1 and P1 canonical; P2 cannot IF NOT EXISTS |
+| `physicalDeleteFailure` | E | failed `DeleteBlockByStorageKey` (tenant-prefix rejection, not MinIO 5xx) keeps K1 and P1 canonical; P2 cannot IF NOT EXISTS |
 | `postCommitResume` | F0a | crash after handoff; `CommittedOwner` resumes D from `blocks` |
 | `pendingBlocksReenqueue` | F0b1 | queue-loss without DLQ; scanner pending lock skips reenqueue |
 | `candidateBehindCursor` | F0b2 | old candidate + real cursor; `ScanOrphanedBlocksOnce` does not reenqueue |
@@ -97,8 +99,9 @@ GC:     global zero → irreversible cut → keep canonical P → physical delet
 Gated Docker re-run on 2026-08-31 after F0b1/F0b2/D1/D2/E evidence corrections
 (`go-integration-test`, `SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1`).
 `TestX1StrictNonoverlapCharacterization` reported `missing=[] complete=true`.
-Each row is an observation, not a production change. H RED (K1 resurrected)
-still completes the leg: that is the architectural finding.
+Each row is an observation, not a production change. H is fail-closed: if K1
+is not resurrected, the characterization baseline fails. A passing H means the
+writer hole reproduced (`resurrected=true`).
 
 | Field | Observation | Notes |
 |-------|-------------|-------|
@@ -108,14 +111,14 @@ still completes the leg: that is the architectural finding.
 | `refBetweenProofAndCut` | GREEN | late `up:` after zero-proof; Acquired path still committed handoff; resume was `CommittedOwner` with original D |
 | `lateUploadRef` | GREEN | post-cut `up:` row existed; `blocks` stayed `deleting`+handoff with original D; new-request probe `BlockedByGC`; no `fs:` referrer. Subsequent HEAD is not characterized |
 | `borrowedFSPublish` | RED (unguarded staging) | `pub_exists=true` after `AddPublishAttemptReferences`; new-request probe `BlockedByGC`. Post-cut `pub:` staging is unguarded; subsequent HEAD is not characterized |
-| `s3Failure` | GREEN | foreign-tenant `DeleteBlockByStorageKey` rejected (prefix); K1 remained; P1 canonical; P2 `InstallBlockMetadata` was not `Applied` |
+| `physicalDeleteFailure` | GREEN | foreign-tenant `DeleteBlockByStorageKey` rejected (prefix, before S3); K1 remained; P1 canonical; P2 `InstallBlockMetadata` was not `Applied` |
 | `postCommitResume` | GREEN | queue still present after handoff; a different claimer resumed `CommittedOwner` D from `blocks` |
 | `pendingBlocksReenqueue` | GREEN | exact `gc_queue` row deleted; pending kept; no DLQ; `ScanOrphanedBlocksOnce` with cursor `today-1` enqueued=0 for this item. Scanner lock ≠ recovery root |
 | `candidateBehindCursor` | GREEN | 30-day candidate, queue/pending/DLQ absent; cursor `gc.scan.block_candidates.last_candidate_day=today-1`; after `ScanOrphanedBlocksOnce` (enqueued=0) candidate still existed and queue still absent. Existence ≠ rediscovery |
 | `postDeleteCrash` | GREEN | `DeleteBlockByStorageKey` idempotent while canonical P1 remained; exact finalize then removed `blocks` |
 | `ambiguousFinalizeSafety` | GREEN | discarded first finalize (not a lost LWT); retry `not_authority`; K2 object intact. Stale D1 did not destroy the next incarnation |
 | `ambiguousFinalizeConvergence` | OPEN settlement | asserted retry `not_authority`, claim `missing`, leftover `pending=true`. Classification, not a license to delete. Work items did not close |
-| `lateRepairPut` | RED (prerequisite) | residual PUT `err=<nil> resurrected=true`. Pre-PUT authority is not backed by own liveness visible to GC |
+| `lateRepairPut` | RED (prerequisite) | residual PUT `err=<nil> resurrected=true`. Test fails if K1 is not resurrected. Pre-PUT authority is not backed by own liveness visible to GC |
 | `nextIncarnation` | GREEN | P2 `InstallBlockMetadata` refused while P1 canonical; applied after delete+finalize with `K2 != K1` |
 
 Current-protocol contrast (`TestX1CurrentProtocolFinalizeBeforeDeleteContrast`, not a gated leg):
@@ -176,6 +179,8 @@ X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
 ## Mutations
 
 Load-bearing AST contracts live in `internal/gc/x1_nonoverlap_harness_contract_test.go`.
+They require `DeleteBlockByStorageKey` before `FinalizeBlockDelete` in F1, F2-safety,
+F2-convergence, and I individually, and H must `Fatal` if K1 is not resurrected.
 The isolated-fixture script must stay RED when those predicates are removed.
 Perl is in `Dockerfile.gotest`. Run:
 

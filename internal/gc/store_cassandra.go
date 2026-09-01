@@ -183,10 +183,6 @@ const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
 const gcBlockCandidatesCursorKey = "gc.scan.block_candidates.last_candidate_day"
-
-// BlockCandidatesScanCursorKey is the gc_stats key for orphaned-block discovery.
-// Integration tests save and restore it around a scoped ScanOrphanedBlocksOnce.
-const BlockCandidatesScanCursorKey = gcBlockCandidatesCursorKey
 const gcProvisionalBlockRefsCursorKey = "gc.scan.provisional_block_refs.last_expiry_day"
 const gcS3OrphansCursorKey = "gc.scan.s3_orphans.last_first_seen_day"
 const gcFailedItemsExpiryCursorKey = "gc.scan.failed_items.last_expiry_day"

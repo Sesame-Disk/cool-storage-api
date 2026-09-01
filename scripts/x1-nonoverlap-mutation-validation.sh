@@ -74,7 +74,15 @@ m_finalize_before_delete() {
   local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
   mutate "$file" 's/x1Attempt\(target, "F1"\)\)\r?\n([ \t]+)if err := blockStore.DeleteBlockByStorageKey/x1Attempt(target, "F1"))\n${1}_, _ = store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(authority))\n${1}if err := blockStore.DeleteBlockByStorageKey/'
   expect_red '^TestX1CandidateHarnessDeletesBeforeFinalize$' \
-    'DeleteBlockByStorageKey before FinalizeBlockDelete' 'finalize before physical delete'
+    'postDeleteCrash must call DeleteBlockByStorageKey before FinalizeBlockDelete' 'finalize before physical delete'
+}
+
+m_f2_finalize_before_delete() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/x1Attempt\(target, "F2s"\)\)\r?\n([ \t]+)if err := blockStore.DeleteBlockByStorageKey/x1Attempt(target, "F2s"))\n${1}_, _ = store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(authority))\n${1}if err := blockStore.DeleteBlockByStorageKey/'
+  expect_red '^TestX1CandidateHarnessDeletesBeforeFinalize$' \
+    'ambiguousFinalizeSafety must call DeleteBlockByStorageKey before FinalizeBlockDelete' 'F2-safety finalize before physical delete'
 }
 
 m_f0b1_ignores_pending() {
@@ -144,9 +152,9 @@ m_f0b1_uses_failitem() {
 m_h_drops_resurrection_log() {
   reset_fixture
   local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
-  mutate "$file" 's/resurrected=%v/omitted=%v/'
+  mutate "$file" 's/t\.Fatal\("H: expected residual authorized PUT to resurrect K1 on characterization baseline"\)/t.Log("H: expected residual authorized PUT to resurrect K1 on characterization baseline")/'
   expect_red '^TestX1HUsesExportedPutCallback$' \
-    'resurrected=' 'H no longer observes K1 resurrection'
+    'H must fail the characterization baseline if K1 is not resurrected' 'H no longer fails closed when K1 is not resurrected'
 }
 
 m_e_allows_p2_while_p1() {
@@ -159,6 +167,7 @@ m_e_allows_p2_while_p1() {
 
 MUTATIONS=(
   m_finalize_before_delete
+  m_f2_finalize_before_delete
   m_f0b1_ignores_pending
   m_h_drops_put_wrapper
   m_f2_collapses_safety_and_convergence

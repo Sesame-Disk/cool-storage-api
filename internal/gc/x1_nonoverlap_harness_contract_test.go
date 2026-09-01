@@ -55,8 +55,13 @@ func x1CallName(call *ast.CallExpr) string {
 
 func x1FirstCall(t *testing.T, fn *ast.FuncDecl, name string) token.Pos {
 	t.Helper()
+	return x1FirstCallIn(t, fn.Body, fn.Name.Name, name)
+}
+
+func x1FirstCallIn(t *testing.T, body ast.Node, scope, name string) token.Pos {
+	t.Helper()
 	var pos token.Pos
-	ast.Inspect(fn.Body, func(node ast.Node) bool {
+	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -67,7 +72,7 @@ func x1FirstCall(t *testing.T, fn *ast.FuncDecl, name string) token.Pos {
 		return true
 	})
 	if pos == 0 {
-		t.Fatalf("X1 HARNESS CONTRACT: %s must call %s", fn.Name.Name, name)
+		t.Fatalf("X1 HARNESS CONTRACT: %s must call %s", scope, name)
 	}
 	return pos
 }
@@ -75,10 +80,18 @@ func x1FirstCall(t *testing.T, fn *ast.FuncDecl, name string) token.Pos {
 func TestX1CandidateHarnessDeletesBeforeFinalize(t *testing.T) {
 	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_characterization_test.go")
 	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
-	del := x1FirstCall(t, fn, "DeleteBlockByStorageKey")
-	fin := x1FirstCall(t, fn, "FinalizeBlockDelete")
-	if !(del < fin) {
-		t.Fatal("candidate harness must call DeleteBlockByStorageKey before FinalizeBlockDelete")
+	for _, name := range []string{
+		"postDeleteCrash",
+		"ambiguousFinalizeSafety",
+		"ambiguousFinalizeConvergence",
+		"nextIncarnation",
+	} {
+		body := x1SubtestBody(t, fn, name)
+		del := x1FirstCallIn(t, body, name, "DeleteBlockByStorageKey")
+		fin := x1FirstCallIn(t, body, name, "FinalizeBlockDelete")
+		if !(del < fin) {
+			t.Fatalf("%s must call DeleteBlockByStorageKey before FinalizeBlockDelete", name)
+		}
 	}
 }
 
@@ -175,12 +188,15 @@ func TestX1HUsesExportedPutCallback(t *testing.T) {
 	if !strings.Contains(string(src), "resurrected=") {
 		t.Fatal("H must observe ObjectExists after the residual PUT as resurrected=")
 	}
+	if !strings.Contains(string(src), `t.Fatal("H: expected residual authorized PUT to resurrect K1 on characterization baseline")`) {
+		t.Fatal("H must fail the characterization baseline if K1 is not resurrected")
+	}
 }
 
 func TestX1EAttemptsFailedPhysicalDelete(t *testing.T) {
 	_, file := x1ParseFile(t, "internal", "integration", "x1_strict_nonoverlap_characterization_test.go")
 	fn := x1Func(t, file, "TestX1StrictNonoverlapCharacterization")
-	body := x1SubtestBody(t, fn, "s3Failure")
+	body := x1SubtestBody(t, fn, "physicalDeleteFailure")
 	if !x1BlockContainsIdent(body, "x1RejectForeignTenantDelete") {
 		t.Fatal("E must attempt a failed DeleteBlockByStorageKey via x1RejectForeignTenantDelete")
 	}
@@ -227,7 +243,7 @@ func TestX1EvidenceMissingListsEveryNamedLeg(t *testing.T) {
 		"refBetweenProofAndCut",
 		"lateUploadRef",
 		"borrowedFSPublish",
-		"s3Failure",
+		"physicalDeleteFailure",
 		"postCommitResume",
 		"pendingBlocksReenqueue",
 		"candidateBehindCursor",
@@ -277,5 +293,33 @@ func TestX1HarnesMustNotCallProcessBlock(t *testing.T) {
 	}
 	if strings.Contains(string(src), "processBlock") || strings.Contains(string(src), "ProcessOrgOnce") {
 		t.Fatal("characterization harness must not drive worker.go processBlock")
+	}
+}
+
+func TestX1ScannerHooksAreIntegrationOnly(t *testing.T) {
+	scanner, err := os.ReadFile(x1SourcePath("internal", "gc", "scanner.go"))
+	if err != nil {
+		t.Fatalf("read scanner.go: %v", err)
+	}
+	if strings.Contains(string(scanner), "ScanOrphanedBlocksOnce") {
+		t.Fatal("ScanOrphanedBlocksOnce must not live in production scanner.go")
+	}
+	store, err := os.ReadFile(x1SourcePath("internal", "gc", "store_cassandra.go"))
+	if err != nil {
+		t.Fatalf("read store_cassandra.go: %v", err)
+	}
+	if strings.Contains(string(store), "BlockCandidatesScanCursorKey") {
+		t.Fatal("BlockCandidatesScanCursorKey must not be exported from production store_cassandra.go")
+	}
+	hooks, err := os.ReadFile(x1SourcePath("internal", "gc", "x1_integration_hooks.go"))
+	if err != nil {
+		t.Fatalf("read x1_integration_hooks.go: %v", err)
+	}
+	text := string(hooks)
+	if !strings.Contains(text, "//go:build integration") {
+		t.Fatal("x1_integration_hooks.go must be //go:build integration")
+	}
+	if !strings.Contains(text, "ScanOrphanedBlocksOnce") || !strings.Contains(text, "BlockCandidatesScanCursorKey") {
+		t.Fatal("integration hooks must define ScanOrphanedBlocksOnce and BlockCandidatesScanCursorKey")
 	}
 }
