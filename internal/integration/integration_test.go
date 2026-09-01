@@ -53,6 +53,7 @@ func TestMain(m *testing.M) {
 		os.Getenv("SESAMEFS_REQUIRE_P4B_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R3_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R26_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
@@ -107,6 +108,12 @@ func TestMain(m *testing.M) {
 	}
 	if os.Getenv(x1NonoverlapCharacterizationEnv) == "1" && !x1NonoverlapEvidence.complete() {
 		fmt.Printf("%s=1 requires all named X1 non-overlap legs; missing=%s (check -run filters)\n", x1NonoverlapCharacterizationEnv, strings.Join(x1NonoverlapEvidence.missing(), ","))
+		if code == 0 {
+			code = 1
+		}
+	}
+	if os.Getenv(borrowedFSHeadCharacterizationEnv) == "1" && !borrowedFSHeadEvidence.complete() {
+		fmt.Printf("%s=1 requires all named BorrowedFS HEAD legs; missing=%s (check -run filters)\n", borrowedFSHeadCharacterizationEnv, strings.Join(borrowedFSHeadEvidence.missing(), ","))
 		if code == 0 {
 			code = 1
 		}
