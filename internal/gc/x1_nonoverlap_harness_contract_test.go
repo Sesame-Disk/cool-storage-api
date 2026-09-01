@@ -207,6 +207,19 @@ func TestX1EAttemptsFailedPhysicalDelete(t *testing.T) {
 	if !strings.Contains(string(src), `t.Fatal("E: P2 must not acquire canonical authority while P1 remains")`) {
 		t.Fatal("E must refuse P2 install while P1 remains")
 	}
+	if !strings.Contains(string(src), `E: retry identity drifted`) {
+		t.Fatal("E must keep retry identity at exact K1")
+	}
+}
+
+func TestX1CommittedHandoffResumesOriginalD(t *testing.T) {
+	src, err := os.ReadFile(x1SourcePath("internal", "integration", "x1_strict_nonoverlap_characterization_test.go"))
+	if err != nil {
+		t.Fatalf("read characterization test: %v", err)
+	}
+	if !strings.Contains(string(src), "resume.Owner.ClaimID != attempt.ClaimID") {
+		t.Fatal("committed handoff must resume original D, not accept a new D")
+	}
 }
 
 func TestX1HelpersScanOrphanedBlocksOnce(t *testing.T) {

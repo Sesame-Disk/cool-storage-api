@@ -64,14 +64,16 @@ only when the row is already gone and a retry must be classified `AlreadyFinaliz
 
 ## Writer-side invariant under test
 
-H and D2 are the same missing writer-side rule. This PR characterizes H through
-the residual PUT and D2 through post-cut `pub:` staging. Subsequent HEAD is not
-characterized.
+H and D2 are writer-side holes. This PR characterizes H through the residual PUT
+and D2 through post-cut `pub:` staging. Subsequent HEAD is not characterized.
+The writer protocol through HEAD is not yet fully specified.
 
 ```text
-WRITER: own liveness → fence → PUT
-        own liveness → fence → pub staging   (HEAD is not characterized here)
+WRITER (characterized): residual PUT after authority (H)
+                        post-cut pub: staging without own pin (D2)
+WRITER (not characterized): continuity through HEAD
 GC:     global zero → irreversible cut → keep canonical P → physical delete → finalize
+DISCOVERY: queue / pending / cursor are not a durable recovery root for a committed delete
 ```
 
 ## Named evidence legs
@@ -83,8 +85,8 @@ GC:     global zero → irreversible cut → keep canonical P → physical delet
 | `refBeforeZeroProof` | C1 | pin before zero-proof revokes |
 | `refBetweenProofAndCut` | C2 | late `up:` after zero-proof; handoff still commits; writer loses fence |
 | `lateUploadRef` | D1 | post-cut `up:` may exist; it must not revoke D. Becoming `fs:`/HEAD is not characterized |
-| `borrowedFSPublish` | D2 | post-cut `pub:` staging is unguarded; subsequent HEAD is not characterized |
-| `physicalDeleteFailure` | E | failed `DeleteBlockByStorageKey` (tenant-prefix rejection, not MinIO 5xx) keeps K1 and P1 canonical; P2 cannot IF NOT EXISTS |
+| `borrowedFSPublish` | D2 | post-cut `pub:` staging is unguarded. Writer prerequisite is not yet fully specified; continuity through HEAD is not characterized |
+| `physicalDeleteFailure` | E | `DeleteBlockByStorageKey` rejected before the backend (foreign tenant prefix, not a MinIO 5xx). K1 and P1 stay canonical; P2 cannot IF NOT EXISTS |
 | `postCommitResume` | F0a | crash after handoff; `CommittedOwner` resumes D from `blocks` |
 | `pendingBlocksReenqueue` | F0b1 | queue-loss without DLQ; scanner pending lock skips reenqueue |
 | `candidateBehindCursor` | F0b2 | old candidate + real cursor; `ScanOrphanedBlocksOnce` does not reenqueue |
@@ -110,8 +112,8 @@ writer hole reproduced (`resurrected=true`).
 | `refBeforeZeroProof` | GREEN | pin before zero-proof made `BlockHasReferencesGlobal` true |
 | `refBetweenProofAndCut` | GREEN | late `up:` after zero-proof; Acquired path still committed handoff; resume was `CommittedOwner` with original D |
 | `lateUploadRef` | GREEN | post-cut `up:` row existed; `blocks` stayed `deleting`+handoff with original D; new-request probe `BlockedByGC`; no `fs:` referrer. Subsequent HEAD is not characterized |
-| `borrowedFSPublish` | RED (unguarded staging) | `pub_exists=true` after `AddPublishAttemptReferences`; new-request probe `BlockedByGC`. Post-cut `pub:` staging is unguarded; subsequent HEAD is not characterized |
-| `physicalDeleteFailure` | GREEN | foreign-tenant `DeleteBlockByStorageKey` rejected (prefix, before S3); K1 remained; P1 canonical; P2 `InstallBlockMetadata` was not `Applied` |
+| `borrowedFSPublish` | RED (unguarded staging) | `pub_exists=true` after `AddPublishAttemptReferences`; new-request probe `BlockedByGC`. Pre-HEAD hole only. Writer prerequisite is not yet fully specified; continuity through HEAD is not characterized |
+| `physicalDeleteFailure` | GREEN | foreign-tenant `DeleteBlockByStorageKey` rejected before MinIO (prefix). K1 remained; P1 canonical; P2 `InstallBlockMetadata` was not `Applied`. Not an S3 timeout/5xx |
 | `postCommitResume` | GREEN | queue still present after handoff; a different claimer resumed `CommittedOwner` D from `blocks` |
 | `pendingBlocksReenqueue` | GREEN | exact `gc_queue` row deleted; pending kept; no DLQ; `ScanOrphanedBlocksOnce` with cursor `today-1` enqueued=0 for this item. Scanner lock ≠ recovery root |
 | `candidateBehindCursor` | GREEN | 30-day candidate, queue/pending/DLQ absent; cursor `gc.scan.block_candidates.last_candidate_day=today-1`; after `ScanOrphanedBlocksOnce` (enqueued=0) candidate still existed and queue still absent. Existence ≠ rediscovery |
@@ -136,7 +138,7 @@ orphan + `FinalizeBlockDelete` before physical delete removed `blocks` while K1 
 | candidate / `gc_queue` / `gc_pending_items` | durable recovery root? | F0a: work binding only. F0b1: queue-loss without DLQ did not reenqueue (pending lock). F0b2: behind-cursor candidate was not rediscovered by the real scanner. F2-convergence: leftover `pending=true`, claim `missing` |
 | R18/R27 | safety or liveness? | still OPEN; not closed here |
 | E6 | loss vs duplicate work? | still OPEN; not closed here |
-| R3 | publication TOCTOU | still OPEN; D2 measured unguarded post-cut `pub:` staging. Subsequent HEAD is not characterized |
+| R3 | publication TOCTOU | still OPEN; D2 measured unguarded post-cut `pub:` staging. Writer prerequisite is not yet fully specified; continuity through HEAD is not characterized |
 
 ## Performance
 
@@ -147,7 +149,7 @@ writer hot path: +0 SERIAL, +0 EACH_QUORUM, +0 S3
 ```
 
 This PR does not promise 0 I/O to close R3. `BorrowedFS` still has no own-pin
-(#198). If the prerequisite is `own pin → fence → PUT/pub`, that cost is separate.
+(#198). Writer cost through HEAD is not specified here.
 
 ## Verdict
 
@@ -160,19 +162,27 @@ Terminal state of this document must be exactly one of:
 **Current verdict: PROMISING_WITH_PREREQUISITE**
 
 H resurrected K1 after `DeleteBlockByStorageKey`. D2 landed a post-cut `pub:`
-staging row without own pin or fence. Both are the same writer-side hole on
-the path *before* HEAD. Subsequent HEAD is not characterized here. The GC
-reorder (keep canonical P → physical delete → finalize) held for
-E/F0a/F1/F2-safety/I.
+staging row without own pin or fence. F0b1/F0b2 showed queue/pending/cursor are
+not a durable recovery root. F2-convergence showed post-Finalize work items do
+not close. The GC reorder (keep canonical P → physical delete → finalize) held
+for E/F0a/F1/F2-safety/I.
 
-Required writer prerequisite before any protocol change:
+Two independent prerequisites before any protocol switch:
 
 ```text
-own liveness → fence → PUT
-own liveness → fence → pub staging
-```
+Prerequisite A — writer quiescence / publication
+  own liveness → fence → PUT
+  D2 proves a pre-HEAD pub: staging hole.
+  Writer prerequisite is not yet fully specified;
+  continuity through HEAD requires a follow-up characterization
+  before any protocol switch. Subsequent HEAD is not characterized.
 
-(HEAD after that staging is not characterized here.)
+Prerequisite B — committed-delete recovery
+  durable rediscovery after queue loss
+  unambiguous post-Finalize settlement
+  (orphan/020 may remain temporarily as discovery/settlement,
+   not as delete authority)
+```
 
 X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
 
@@ -180,7 +190,8 @@ X1 remains OPEN. R3 remains OPEN. `GC_ENABLED=false`.
 
 Load-bearing AST contracts live in `internal/gc/x1_nonoverlap_harness_contract_test.go`.
 They require `DeleteBlockByStorageKey` before `FinalizeBlockDelete` in F1, F2-safety,
-F2-convergence, and I individually, and H must `Fatal` if K1 is not resurrected.
+F2-convergence, and I individually; H must `Fatal` if K1 is not resurrected;
+committed handoff must resume original D; E must keep retry identity at exact K1.
 The isolated-fixture script must stay RED when those predicates are removed.
 Perl is in `Dockerfile.gotest`. Run:
 

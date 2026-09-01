@@ -150,6 +150,8 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		"ambiguousFinalizeConvergence",
 		"own liveness",
 		"HEAD is not characterized",
+		"not yet fully specified",
+		"committed-delete recovery",
 		"PROMISING",
 		"PROMISING_WITH_PREREQUISITE",
 		"REJECT",

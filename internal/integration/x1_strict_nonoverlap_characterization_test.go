@@ -188,7 +188,7 @@ func TestX1StrictNonoverlapCharacterization(t *testing.T) {
 		}
 		probe, probeErr := database.ProbeBlockReuse(orgID.String(), blockID)
 		t.Logf("D2 in-flight staging pub_exists=%v new_request_probe=%v err=%v", pubExists, probe.Decision, probeErr)
-		t.Log("D2 UNGUARDED: post-cut pub: staging is unguarded; subsequent HEAD is not characterized")
+		t.Log("D2 UNGUARDED: post-cut pub: staging is unguarded; writer prerequisite is not yet fully specified; subsequent HEAD is not characterized")
 		if probeErr != nil || probe.Decision != dbpkg.BlockReuseBlockedByGC {
 			t.Fatalf("D2: a new request must still see BlockedByGC after the cut; probe=%+v err=%v", probe, probeErr)
 		}

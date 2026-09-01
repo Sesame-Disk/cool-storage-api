@@ -165,9 +165,34 @@ m_e_allows_p2_while_p1() {
     'E must refuse P2 install while P1 remains' 'E no longer refuses P2 while P1 remains'
 }
 
+m_handoff_accepts_new_d() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/resume.Owner.ClaimID != attempt.ClaimID/resume.Owner.ClaimID == attempt.ClaimID/g'
+  expect_red '^TestX1CommittedHandoffResumesOriginalD$' \
+    'must resume original D, not accept a new D' 'handoff accepts a new D'
+}
+
+m_e_drops_retry_identity() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/E: retry identity drifted/E: retry identity omitted/'
+  expect_red '^TestX1EAttemptsFailedPhysicalDelete$' \
+    'E must keep retry identity at exact K1' 'E no longer pins retry identity to K1'
+}
+
+m_i_finalize_before_delete() {
+  reset_fixture
+  local file="$FIXTURE/internal/integration/x1_strict_nonoverlap_characterization_test.go"
+  mutate "$file" 's/x1Attempt\(target, "I"\)\)\r?\n([ \t]+)whileRetiring :=/x1Attempt(target, "I"))\n${1}_, _ = store.FinalizeBlockDelete(orgID, blockID, gcpkg.CommittedBlockDeleteAuthorityForTest(authority))\n${1}whileRetiring :=/'
+  expect_red '^TestX1CandidateHarnessDeletesBeforeFinalize$' \
+    'nextIncarnation must call DeleteBlockByStorageKey before FinalizeBlockDelete' 'I finalize before physical delete'
+}
+
 MUTATIONS=(
   m_finalize_before_delete
   m_f2_finalize_before_delete
+  m_i_finalize_before_delete
   m_f0b1_ignores_pending
   m_h_drops_put_wrapper
   m_f2_collapses_safety_and_convergence
@@ -178,6 +203,8 @@ MUTATIONS=(
   m_f0b1_uses_failitem
   m_h_drops_resurrection_log
   m_e_allows_p2_while_p1
+  m_handoff_accepts_new_d
+  m_e_drops_retry_identity
 )
 
 if [ "${1:-}" = "--list" ]; then
