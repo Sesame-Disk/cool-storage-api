@@ -2181,10 +2181,12 @@ already part of the X1 closure work.
 
 W1 now closes the BorrowedFS `CreateFileFromBlocks` segment through the HEAD
 CAS: the writer establishes its own `up:<session>` liveness for each distinct
-borrowed block and validates the delete fence before HEAD. The seven-leg real
-Cassandra+MinIO evidence gate is green. This does not close the broader issue:
-R31/W2 still covers `up -> pub -> HEAD -> fs` crash continuity, and other writer
-funnels remain outside W1.
+borrowed block and re-validates the exact observed physical placement
+(`ValidateBlockRepairAuthority`, not a bare fence check -- a fence-only check
+cannot see a block GC has already fully retired) before HEAD. The eight-leg
+real Cassandra+MinIO evidence gate is green. This does not close the broader
+issue: R31/W2 still covers `up -> pub -> HEAD -> fs` crash continuity, and
+other writer funnels remain outside W1.
 
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):

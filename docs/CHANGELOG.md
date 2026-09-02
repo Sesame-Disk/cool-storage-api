@@ -8,6 +8,27 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 fix: exact-placement re-validation before HEAD (review finding)
+
+Review of the W1 PR found that its pre-HEAD `BlockDeleteFenceActive` check
+cannot see the terminal state where GC has ALREADY fully retired a BorrowedFS
+block (`FinalizeBlockDelete` + settled `DeleteS3Orphan`) between this commit's
+earlier verification and the pre-HEAD check: with no `gc_state='deleting'` row
+and no orphan row left, the fence reports false even though the placement this
+commit observed is gone. `validateBorrowedFSFences` now re-validates the exact
+observed `(storage_class, storage_key)` via `ValidateBlockRepairAuthority`
+(`BlockAuthorityStrong` / SERIAL) instead of a bare fence check, closing the
+gap while remaining a strict superset of the old check. Reproduced red without
+the fix and green with it on real Cassandra+MinIO
+(`gcFullyRetiredBeforeLateOwnPin`, the new eighth named leg). Also fixed:
+`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`'s historical `#200` verdict had
+been silently rewritten from `PROMISING_WITH_PREREQUISITE` to `PROMISING`,
+contradicting the document's own "not rewritten" freeze note; restored the
+historical verdict and recorded the W1 productization as a separate note.
+Also fixed a pre-existing, unrelated data race in
+`TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks` (concurrent map
+write in the test's own mock, not production code).
+
 ## 2026-09-02 - W1 PR closeout: historical seams, fence-abort `pub:` cleanup
 
 Marked the #200 productive-seams diagram as historical (before W1). GC-first

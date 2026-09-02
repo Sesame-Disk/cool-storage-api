@@ -999,10 +999,19 @@ Productize #200. No GC/orphan schema.
 
 **Current status (2026-09-02):** implemented in this PR. `CreateFileFromBlocks`
 establishes `up:<session>` for each distinct BorrowedFS block before session
-claim and checks the BorrowedFS delete fence immediately before HEAD (after
-`pub:` may already be staged — the #200 handshake, not the §14 full-writer
-ideal). Fence abort must drop that `pub:`. R31/W2 and X1 remain open; keep
-`GC_ENABLED=false` fleet-wide.
+claim and re-validates the exact observed physical placement immediately
+before HEAD (after `pub:` may already be staged — the #200 handshake, not the
+§14 full-writer ideal). Fence abort must drop that `pub:`. R31/W2 and X1
+remain open; keep `GC_ENABLED=false` fleet-wide.
+
+**W1 fix (2026-09-02):** a bare `BlockDeleteFenceActive` check cannot see the
+terminal state where GC has already fully retired a block (Finalize + settled
+orphan): no `gc_state='deleting'` row and no orphan row are left to report a
+fence, yet the placement this commit observed is gone. The pre-HEAD check now
+re-validates the exact observed `(storage_class, storage_key)` via
+`ValidateBlockRepairAuthority` instead, whose `Blocked`/`Changed` outcomes are
+a strict superset of the old fence check. Proven red without the fix and green
+with it on real Cassandra+MinIO by the `gcFullyRetiredBeforeLateOwnPin` leg.
 
 ### W2 — Full publication continuity / R31
 

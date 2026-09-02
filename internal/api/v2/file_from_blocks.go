@@ -707,11 +707,23 @@ func (h *FileHandler) ensureBorrowedFSOwnLiveness(ctx context.Context, orgID, li
 // validateBorrowedFSFences is the final writer-side check. It deliberately
 // reads only the BorrowedFS subset and runs immediately before HEAD CAS; the
 // GC-side destructive proof remains BlockHasReferencesGlobal at EACH_QUORUM.
+//
+// A fence-only check ("does GC currently claim or orphan this block?") cannot
+// see the terminal state where GC has ALREADY fully retired the observed
+// placement between this commit's earlier verification and this call: once
+// FinalizeBlockDelete has removed the canonical row and the orphan has
+// settled (DeleteS3Orphan), there is no gc_state='deleting' row and no
+// orphan row left to report a fence, yet the exact physical placement this
+// commit is about to publish against no longer exists. Re-validating the
+// exact observed (storage_class, storage_key) via ValidateBlockRepairAuthority
+// (BlockAuthorityStrong / SERIAL) closes that gap: BlockRepairAuthorityBlocked
+// reports an active claim or a pending orphan (a strict superset of the old
+// fence-only check), and BlockRepairAuthorityChanged additionally reports a
+// canonical row that is now absent or now names a different placement.
 func (h *FileHandler) validateBorrowedFSFences(orgID string, blocks []borrowedFSCommitBlock) error {
 	if len(blocks) == 0 {
 		return nil
 	}
-	fsHelper := NewFSHelper(h.db)
 	g, gctx := errgroup.WithContext(context.Background())
 	sem := make(chan struct{}, blockVerifyConcurrency)
 	for _, block := range blocks {
@@ -723,14 +735,20 @@ func (h *FileHandler) validateBorrowedFSFences(orgID string, blocks []borrowedFS
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			fenced, err := registerUploadedBlockFenceActiveFn(fsHelper, orgID, block.blockID)
-			if err != nil {
-				return fmt.Errorf("%w: validate BorrowedFS delete fence for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
+			outcome, err := validateBlockRepairAuthorityFn(h.db, orgID, block.blockID, db.BlockPhysicalLocation{
+				StorageClass: block.storageClass,
+				StorageKey:   block.storageKey,
+			})
+			switch outcome {
+			case db.BlockRepairAuthorityAuthorized:
+				return nil
+			case db.BlockRepairAuthorityBlocked, db.BlockRepairAuthorityChanged:
+				return fmt.Errorf("%w: BorrowedFS block %s is no longer safe to publish against: %w", ErrBlockDeleteInProgress, block.blockID, err)
+			case db.BlockRepairAuthorityPermanent:
+				return fmt.Errorf("validate BorrowedFS exact physical authority for %s: %w", block.blockID, err)
+			default:
+				return fmt.Errorf("%w: validate BorrowedFS exact physical authority for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
 			}
-			if fenced {
-				return fmt.Errorf("%w: BorrowedFS block %s is fenced by GC", ErrBlockDeleteInProgress, block.blockID)
-			}
-			return nil
 		})
 	}
 	return g.Wait()

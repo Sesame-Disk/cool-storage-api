@@ -140,6 +140,7 @@ func TestBorrowedFSOwnLivenessNamesArePinned(t *testing.T) {
 		"writerFirst",
 		"gcFirst",
 		"lateOwnPinAfterZeroProof",
+		"gcFullyRetiredBeforeLateOwnPin",
 		"upPubDedup",
 	} {
 		needle := `t.Run("` + name + `"`

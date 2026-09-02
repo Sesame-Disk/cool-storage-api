@@ -214,6 +214,68 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 		borrowedFSOwnLivenessEvidence.lateOwnPinAfterZeroProof = true
 	})
 
+	t.Run("gcFullyRetiredBeforeLateOwnPin", func(t *testing.T) {
+		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
+		blockStore := newVerificationBlockStore(t, fx.orgID)
+		var committed gcpkg.CommittedBlockDeleteAuthority
+		var firstSeenAt time.Time
+		borrowedFSInstallBarriers(t, fx,
+			func() {
+				fx.dropForeignFS(t)
+				attempt := x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "gc-fully-retired"))
+				committed = gcpkg.CommittedBlockDeleteAuthorityForTest(attempt)
+				publication := store.StartBlockDeleteOrphan(fx.orgUUID, fx.blockID, committed, fx.sha1ID, time.Now().UTC())
+				if publication.Outcome != gcpkg.StartBlockDeleteOrphanCreated {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: StartBlockDeleteOrphan = %s, %v", publication.Outcome, publication.Cause)
+				}
+				firstSeenAt = publication.FirstSeenAt
+				finalized, err := store.FinalizeBlockDelete(fx.orgUUID, fx.blockID, committed)
+				if err != nil || finalized.Outcome != gcpkg.BlockDeleteFinalized {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: FinalizeBlockDelete = %s, %v", finalized.Outcome, err)
+				}
+				// Physically retire the object too, so this leg models GC's full
+				// completed lifecycle -- not just the metadata half of it.
+				if err := blockStore.DeleteBlockByStorageKey(context.Background(), fx.target.StorageKey); err != nil {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: physical delete: %v", err)
+				}
+				if _, err := store.TerminateBlockDeleteLifecycle(fx.orgUUID, fx.blockID, committed); err != nil {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: TerminateBlockDeleteLifecycle: %v", err)
+				}
+				if err := store.DeleteS3Orphan(fx.orgUUID, fx.blockID, firstSeenAt); err != nil {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: DeleteS3Orphan: %v", err)
+				}
+				// GC has now settled the ENTIRE lifecycle: no canonical row, no
+				// orphan row, nothing left for a fence-only check to observe.
+				x1AssertCanonicalAbsent(t, store, fx.orgUUID, fx.blockID)
+			},
+			func() {
+				// The late own pin still lands unconditionally -- writing up: never
+				// re-checks the canonical row. This is the write-side of the race;
+				// the fix must be in the read-side gate below, not here.
+				fx.assertOwnPinVisible(t, store, "gcFullyRetiredBeforeLateOwnPin: late own pin must still land")
+				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
+				if err != nil {
+					t.Fatalf("gcFullyRetiredBeforeLateOwnPin: BlockDeleteFenceActive: %v", err)
+				}
+				if fenced {
+					t.Fatal("gcFullyRetiredBeforeLateOwnPin: BlockDeleteFenceActive must be false once GC has fully retired the block -- there is nothing left to fence, which is exactly why a fence-only check cannot catch this case")
+				}
+			},
+			func() { fx.assertPubCount(t, 1, "gcFullyRetiredBeforeLateOwnPin: pub: must be staged before HEAD") },
+			func() error { return nil },
+		)
+		rec := fx.commit(t)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("gcFullyRetiredBeforeLateOwnPin: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
+		}
+		fx.assertHeadUnchanged(t)
+		if fx.hasOwnFSReferrer(t) {
+			t.Fatal("gcFullyRetiredBeforeLateOwnPin: unexpected fs: after rejected publication")
+		}
+		fx.assertPubCount(t, 0, "gcFullyRetiredBeforeLateOwnPin: exact-authority rejection must drop staged pub:")
+		borrowedFSOwnLivenessEvidence.gcFullyRetiredBeforeLateOwnPin = true
+	})
+
 	t.Run("upPubDedup", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		borrowedFSInstallBarriers(t, fx,
@@ -254,6 +316,7 @@ type borrowedFSHeadFixture struct {
 	userID       string
 	sessionID    string
 	blockID      string
+	sha1ID       string
 	content      []byte
 	foreignFS    string
 	filename     string
@@ -305,6 +368,7 @@ func newBorrowedFSHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pkg.F
 		userID:       session.UserID,
 		sessionID:    sessionID,
 		blockID:      blockID,
+		sha1ID:       sha1ID,
 		content:      content,
 		foreignFS:    foreignFS,
 		filename:     "borrowedfs-head-" + uuid.NewString()[:8] + ".txt",

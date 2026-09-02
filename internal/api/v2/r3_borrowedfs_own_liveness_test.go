@@ -2,8 +2,11 @@ package v2
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 func TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks(t *testing.T) {
@@ -11,12 +14,18 @@ func TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks(t *testing.T) {
 	t.Cleanup(func() { registerUploadedBlockAddProvisionalRefFn = oldAdd })
 
 	wantReferrer := "up:session-1"
+	var mu sync.Mutex
 	calls := make(map[string]int)
 	registerUploadedBlockAddProvisionalRefFn = func(_ *FSHelper, orgID, blockID, referrer, libraryID, storageClass string, expiresAt time.Time) error {
 		if orgID != "org-1" || libraryID != "repo-1" || referrer != wantReferrer || storageClass != "hot" || expiresAt.Before(time.Now()) {
 			t.Fatalf("unexpected own-liveness arguments: %s/%s/%s/%s/%s", orgID, blockID, referrer, libraryID, storageClass)
 		}
+		// ensureBorrowedFSOwnLiveness fans distinct blocks out across concurrent
+		// goroutines (errgroup), so this map needs its own lock: Go maps are not
+		// safe for concurrent writes even to disjoint keys.
+		mu.Lock()
 		calls[blockID]++
+		mu.Unlock()
 		return nil
 	}
 
@@ -77,14 +86,37 @@ func TestBorrowedFSOwnLivenessFailureIsRetryable(t *testing.T) {
 }
 
 func TestBorrowedFSFenceRejectsActiveDelete(t *testing.T) {
-	oldFence := registerUploadedBlockFenceActiveFn
-	t.Cleanup(func() { registerUploadedBlockFenceActiveFn = oldFence })
+	oldAuthority := validateBlockRepairAuthorityFn
+	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
 
-	registerUploadedBlockFenceActiveFn = func(_ *FSHelper, _, blockID string) (bool, error) {
+	validateBlockRepairAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
 		if blockID != "b1" {
-			t.Fatalf("fence checked block %q, want b1", blockID)
+			t.Fatalf("authority checked block %q, want b1", blockID)
 		}
-		return true, nil
+		return db.BlockRepairAuthorityBlocked, db.ErrBlockRepairBlocked
+	}
+	blocks := []borrowedFSCommitBlock{{blockID: "b1", storageClass: "hot", storageKey: "k1"}}
+	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("validateBorrowedFSFences error = %v, want ErrBlockDeleteInProgress", err)
+	}
+}
+
+// TestBorrowedFSFenceRejectsFullyRetiredPlacement is the exact-P revalidation
+// this handshake was missing: BlockDeleteFenceActive alone reports false once
+// GC has fully retired a block (Finalize + settled orphan), because there is
+// no active claim and no orphan row left to observe -- but the placement this
+// commit observed no longer exists. ValidateBlockRepairAuthority reports that
+// terminal state as BlockRepairAuthorityChanged, and it must reject the commit
+// exactly like an active fence would.
+func TestBorrowedFSFenceRejectsFullyRetiredPlacement(t *testing.T) {
+	oldAuthority := validateBlockRepairAuthorityFn
+	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
+
+	validateBlockRepairAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		if blockID != "b1" {
+			t.Fatalf("authority checked block %q, want b1", blockID)
+		}
+		return db.BlockRepairAuthorityChanged, db.ErrBlockRepairAuthorityChanged
 	}
 	blocks := []borrowedFSCommitBlock{{blockID: "b1", storageClass: "hot", storageKey: "k1"}}
 	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
@@ -93,18 +125,18 @@ func TestBorrowedFSFenceRejectsActiveDelete(t *testing.T) {
 }
 
 func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
-	oldFence := registerUploadedBlockFenceActiveFn
-	t.Cleanup(func() { registerUploadedBlockFenceActiveFn = oldFence })
+	oldAuthority := validateBlockRepairAuthorityFn
+	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
 
-	fenceCalls := 0
-	registerUploadedBlockFenceActiveFn = func(*FSHelper, string, string) (bool, error) {
-		fenceCalls++
-		return false, nil
+	authorityCalls := 0
+	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+		authorityCalls++
+		return db.BlockRepairAuthorityAuthorized, nil
 	}
 	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", nil); err != nil {
 		t.Fatalf("empty BorrowedFS fence set: %v", err)
 	}
-	if fenceCalls != 0 {
-		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d fence calls, want 0", fenceCalls)
+	if authorityCalls != 0 {
+		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d authority calls, want 0", authorityCalls)
 	}
 }

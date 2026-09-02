@@ -21,6 +21,7 @@ type borrowedFSOwnLivenessEvidenceState struct {
 	writerFirst                  bool
 	gcFirst                      bool
 	lateOwnPinAfterZeroProof     bool
+	gcFullyRetiredBeforeLateOwnPin bool
 	upPubDedup                   bool
 }
 
@@ -38,6 +39,7 @@ func (state borrowedFSOwnLivenessEvidenceState) namedLegs() []struct {
 		{"writerFirst", state.writerFirst},
 		{"gcFirst", state.gcFirst},
 		{"lateOwnPinAfterZeroProof", state.lateOwnPinAfterZeroProof},
+		{"gcFullyRetiredBeforeLateOwnPin", state.gcFullyRetiredBeforeLateOwnPin},
 		{"upPubDedup", state.upPubDedup},
 	}
 }
@@ -90,16 +92,17 @@ func TestBorrowedFSOwnLivenessEvidenceRequiresEveryNamedLeg(t *testing.T) {
 		t.Fatalf("missing() must name absent legs individually, got %q", got)
 	}
 	full := borrowedFSOwnLivenessEvidenceState{
-		borrowedExactOwnPin:          true,
-		sessionUploadNoExtraPin:      true,
-		livenessFailureNoPublication: true,
-		writerFirst:                  true,
-		gcFirst:                      true,
-		lateOwnPinAfterZeroProof:     true,
-		upPubDedup:                   true,
+		borrowedExactOwnPin:            true,
+		sessionUploadNoExtraPin:        true,
+		livenessFailureNoPublication:   true,
+		writerFirst:                    true,
+		gcFirst:                        true,
+		lateOwnPinAfterZeroProof:       true,
+		gcFullyRetiredBeforeLateOwnPin: true,
+		upPubDedup:                     true,
 	}
-	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 7 {
-		t.Fatalf("all 7 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))
+	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 8 {
+		t.Fatalf("all 8 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))
 	}
 	twice := partial
 	twice.borrowedExactOwnPin = true

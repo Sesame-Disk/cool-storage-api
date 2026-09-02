@@ -560,7 +560,7 @@ services:
       # apart under any key the Go code invents.
       - SESAMEFS_REQUIRE_R26_EVIDENCE=1
       - SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1
-      # BorrowedFS W1 own-liveness through HEAD. Seven named legs, in-process
+      # BorrowedFS W1 own-liveness through HEAD. Eight named legs, in-process
       # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
       - SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1
       # The supported frontend nginx, so the D6 slow-client drill runs through
@@ -606,7 +606,7 @@ services:
       # apart under any key the Go code invents.
       - SESAMEFS_REQUIRE_R26_EVIDENCE=1
       - SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1
-      # BorrowedFS W1 own-liveness through HEAD. Seven named legs, in-process
+      # BorrowedFS W1 own-liveness through HEAD. Eight named legs, in-process
       # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
       - SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1
     depends_on:

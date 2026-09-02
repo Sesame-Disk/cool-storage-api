@@ -964,7 +964,7 @@ binary. Perl is installed in `Dockerfile.gotest`. Run:
 docker compose --profile test run --rm --build gotest bash scripts/x1-nonoverlap-mutation-validation.sh
 ```
 
-BorrowedFS W1 own-liveness evidence is a separate seven-leg gate. The original
+BorrowedFS W1 own-liveness evidence is a separate eight-leg gate. The original
 HEAD characterization remains a historical report in
 `docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`; W1's production behavior is covered
 by `internal/integration/borrowedfs_own_liveness_test.go`. It does not inflate

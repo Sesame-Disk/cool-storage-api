@@ -8,12 +8,27 @@ follows. X1 closure architecture:
 
 **Current W1 status (2026-09-02):** `CreateFileFromBlocks` now upgrades each
 distinct BorrowedFS block to its own `up:<session>` provisional reference before
-claiming the session, then validates the BorrowedFS delete fence immediately
-before the library HEAD CAS. If liveness or the fence check fails, the request
-stops before HEAD and `fs:` promotion. The seven-leg product evidence gate is
-`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is separate from the
-historical characterization below. R31 remains open, X1 remains OPEN, and
-`GC_ENABLED=false` remains the fleet-wide deployment rule.
+claiming the session, then re-validates the exact observed physical placement
+immediately before the library HEAD CAS via `ValidateBlockRepairAuthority`
+(`BlockAuthorityStrong` / SERIAL). If liveness or that authority check fails,
+the request stops before HEAD and `fs:` promotion. The eight-leg product
+evidence gate is `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is
+separate from the historical characterization below. R31 remains open, X1
+remains OPEN, and `GC_ENABLED=false` remains the fleet-wide deployment rule.
+
+**W1 fix (2026-09-02):** a review found that the original fence-only check
+(`BlockDeleteFenceActive`) cannot see the terminal state where GC has ALREADY
+fully retired a block between this commit's earlier verification and the
+pre-HEAD check: once `FinalizeBlockDelete` has removed the canonical row and
+the orphan has settled (`DeleteS3Orphan`), there is no `gc_state='deleting'`
+row and no orphan row left to report a fence, yet the placement this commit
+observed no longer exists. The pre-HEAD check now re-validates the exact
+observed `(storage_class, storage_key)` via `ValidateBlockRepairAuthority`
+instead of a bare fence check; that outcome's `Changed` case (canonical row
+absent, or now naming a different placement) catches this window, and its
+`Blocked` case is a strict superset of the old fence check. Proven red without
+the fix / green with it on real Cassandra+MinIO by the
+`gcFullyRetiredBeforeLateOwnPin` leg below.
 
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
@@ -152,14 +167,25 @@ Terminal state of this document must be exactly one of:
 - `PROMISING_WITH_PREREQUISITE`
 - `REJECT`
 
-**Current verdict: PROMISING**
+**Current verdict: PROMISING_WITH_PREREQUISITE**
 
-The historical characterization baseline showed `CreateFileFromBlocks`
-BorrowedFS publication unguarded through HEAD. Its harness showed that an own
-`up:<session>` pin can revoke zero-proof and that a beforeHead fence can abort
-HEAD, including after post-cut `pub:` and after a late pin that does not revoke
-D. That harness is **not production protocol**. W1 now productizes those
-properties through the seven-leg gate named above; R31 still owns the
-`up -> pub -> HEAD -> fs` continuity interval.
+Current `CreateFileFromBlocks` BorrowedFS publication is still unguarded through
+HEAD: that is the last dangerous point X1 D2 left unmeasured. The harness shows
+that an own `up:<session>` pin can revoke zero-proof and that a beforeHead fence
+can abort HEAD, including after post-cut `pub:` and after a late pin that does
+not revoke D. That harness is **not production protocol**. A later PR must
+choose a production continuity protocol that keeps the +0 hot-path
+authority-read contract.
 
 X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wide.
+
+**W1 productization (2026-09-02):** this document's own historical verdict and
+measured rows above are frozen, per the note at the top of this file, and are
+NOT rewritten by what follows. The prerequisite this verdict named -- a
+production continuity protocol that keeps the +0 hot-path contract -- was
+productized by W1: own `up:<session>` before claim, then an exact-placement
+re-validation immediately before HEAD (see "Current W1 status" and "W1 fix"
+above). The eight-leg `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`
+gate is the current record of that production behavior; this note records
+that the prerequisite was met without rewriting the historical
+`PROMISING_WITH_PREREQUISITE` verdict itself.
