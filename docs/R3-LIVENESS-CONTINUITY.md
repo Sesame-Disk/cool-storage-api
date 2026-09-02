@@ -1,5 +1,9 @@
 # R3 liveness-continuity characterization
 
+**Accepted architecture (2026-09-02):** funnel inventory for writer W2 / R31.
+This file does not close R3. X1 closure architecture:
+[`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+
 **Characterization baseline:** `c0da425a4` (`main` containing #194 and #196)
 **R3a structural-refinement parent:** `9386dad` (#197 merged)
 **Scope:** characterization plus internal provenance refinement; no protocol/readiness/I/O behavior change

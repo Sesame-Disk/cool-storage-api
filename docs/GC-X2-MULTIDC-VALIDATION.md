@@ -8,10 +8,12 @@
 `KNOWN_ISSUES.md`; this document holds the reproduction, the runbook, and the
 findings turned up while implementing the fix.
 
-**Related:** [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (why X2 is separable
-from X1, and the closure options for X1 itself),
-`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2. **X1 has no accepted design**; this fix is
-untouched by that decision either way.
+**Related:** [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)
+(accepted X1 architecture, docs only),
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (why X2 is separable
+from X1; historical options),
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2. **X1 remains OPEN**; this X2 fix is
+untouched by that architecture freeze.
 
 ---
 

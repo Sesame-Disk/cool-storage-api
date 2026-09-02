@@ -757,7 +757,9 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 ## Abandon the generational GC fence (r3) for X1
 
 **Date:** 2026-08-14
-**Status:** Decided — r3 abandoned. **X1 still has no accepted design.**
+**Status:** Decided — r3 abandoned. **X1 remains OPEN.** Accepted architecture
+(2026-09-02) is [`GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md);
+that freeze does not revive r3.
 
 **Decision.** The generational-fence protocol drafted on
 `docs/gc-x1-x2-generation-fence-final` (block generations, generation-bound references,

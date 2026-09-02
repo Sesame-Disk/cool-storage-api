@@ -2476,7 +2476,9 @@ currently carries:
 mechanical change with zero behavioural difference. It was left out of PR #190 to keep that
 PR reviewable. Do it when the next change touches those call sites anyway — the R26 orphan
 half (`P4c-orphan`) is the likely moment, since it revisits the same identity plumbing for
-`gc_s3_orphans`.
+`gc_s3_orphans`. D0 (`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`) schedules that as G1 and
+also requires dropping TTL on pending recovery authority; do not treat the current
+`(org, L)` PK or the 90-day TTL as acceptable post-handoff identity.
 
 ### Related
 A second item from the same review round — an admin DLQ selector said to break on

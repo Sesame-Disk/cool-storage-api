@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0: freeze X1 physical-life handoff architecture
+
+Accepted X1 closure architecture is now
+`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`. Documentation plus contract tests
+only: no worker, schema, storage, or `GC_ENABLED` change. Orphan after a
+confirmed handoff is the durable continuation authority for exact `(P,D)`.
+Strict physical non-overlap and Delete-before-Finalize are no longer the
+end-state. Current production remains Finalize-before-S3, orphan-as-L-fence,
+recovery ref re-check, P4c-orphan `(org,L)` PK, and 90-day TTL. R31 stays
+OPEN. H is not reclassified. R18/R27 pending re-evaluation. 020 stays.
+Activation is A1 after E1. `GC_ENABLED=false`.
+
 ## 2026-08-28 - P4b-2 tombstone blockers: exact certificate, one physical DELETE, SERIAL post-check
 
 Closed the confirmed #194 tombstone holes without redesigning handoff, 019, or 020.

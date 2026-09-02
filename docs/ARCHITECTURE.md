@@ -743,6 +743,11 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 #### Block Liveness — Row-Per-Reference Model
 
+Accepted X1 architecture (docs freeze, not production):
+[GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+The bullets below describe **current / transitional** behavior. `P` is
+`(storage_class, storage_key)`, not a synonym of `storage_key`.
+
 `blocks.ref_count` was removed (2026-05-27). Block liveness is now modeled as rows
 in `block_references`: **a block is alive iff at least one reference row exists**.
 A reference row is `((org_id, block_id), referrer)` where:
@@ -758,16 +763,16 @@ non-LWT; canonical metadata creation and lifecycle state transitions are separat
 - **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or non-creating `RepairBlockMetadataIfCurrent` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`) or an orphan fence exists. Tuple-only registration wrappers are not production entrypoints. A rejected existing-incarnation repair intentionally retains `up:`; its recovery/liveness cost is R18/R27 and remains open.
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise the destination store is resolved **before** any destructive step and `ValidatePhysicalLocator` verifies the exact persisted `storage_key` as a valid legacy-or-minted locator for that block (a mismatch releases the claim and deletes nothing), then `StartBlockDeleteOrphan` persists the canonical `storage_key` → `DELETE blocks` → delete that exact key through the backend selected by the persisted org and canonical storage class. Deletes intentionally do not health-fail over to another class/backend. Claim, release and finalize use conditional transitions; they are not the only block-path Paxos operations.
-- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, resolves the backend from its persisted `(org_id, storage_class)`, and uses `ValidatePhysicalLocator` to verify its exact persisted `storage_key` as a valid legacy-or-minted locator before deleting that exact key from that backend. An empty class/key, a key that is not this org's, an invalid org, a missing canonical row, a read error, or a discovery-token mismatch fails closed, leaves discovery state untouched, and does not advance the recovery cursor past that row when it is encountered in the current sweep. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL. The reload narrows stale-read windows but is not lifecycle exclusion; exact physical identity remains open X1 work.
+- **GC block deletion (current / transitional)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT with exact `(P, attempt)`; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise resolve the store and `ValidatePhysicalLocator` on the claim's persisted locator, then `CommitBlockDeleteOrphanHandoff` (irreversible D on `blocks`), `StartBlockDeleteOrphan`, `FinalizeBlockDelete` (remove the canonical row), then `DeleteBlockByStorageKey` of that exact key. `CommittedOwner` and `RecoverS3Orphans` still re-check global refs. Mere `gc_s3_orphans` existence for `(org, L)` still fences writers. Deletes intentionally do not health-fail over to another class/backend.
+- **S3 orphan recovery**: walks the `_by_day` discovery identity, reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, SERIAL-observes lifecycle 020, re-checks `BlockHasReferencesGlobal`, resolves the backend from the persisted `(org_id, storage_class)`, and uses `ValidatePhysicalLocator` before deleting that exact key. Discovery is identity-only and does not carry P/D. Exact orphan identity remains open P4c-orphan / X1 work. A projection-delete failure after canonical deletion is best-effort and may leave stale discovery behind the configured overlap until TTL.
 
-**Lifecycle**:
+**Lifecycle (current / transitional)**:
 ```
 Upload:        block_references += up:<operation>    (TTL)  + blocks row (metadata)
 Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
 fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
-Block GC:      pre-check none → claim gc_state='deleting' (LWT) → re-verify none → DELETE + S3
-Upload race:   writer sees gc_state='deleting' → backs off → re-creates after GC finishes
+Block GC:      pre-check none → claim → re-verify none → handoff D → orphan → Finalize blocks → S3
+Upload race:   writer sees gc_state='deleting' or orphan(L) → backs off
 ```
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
