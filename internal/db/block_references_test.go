@@ -1557,6 +1557,51 @@ func TestP3MetadataRepairUsesAdvisoryReads(t *testing.T) {
 	}
 }
 
+// TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads pins the actual
+// consistency ValidateBorrowedFSPublicationAuthority issues, not just that its
+// caller (validateBorrowedFSFences in internal/api/v2) picks the right seam
+// function. A regression that flipped the mode argument passed to
+// validateBlockRepairAuthority internally -- BlockAuthorityAdvisory back to
+// BlockAuthorityStrong -- would stay invisible to a caller-side AST contract
+// like TestValidateBorrowedFSFencesStaysOffSerialAuthority; this test fails on
+// that regression directly by observing the mode the underlying reads receive.
+// Its safety comes from the caller's own up:<session> pin already being
+// durable before this runs (see the doc comment), not from read freshness --
+// the same trade TestP3MetadataRepairUsesAdvisoryReads pins for the repair
+// path's early-out.
+func TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads(t *testing.T) {
+	oldRead := readBlockRepairAuthorityFn
+	oldOrphan := blockRepairHasS3OrphanFn
+	t.Cleanup(func() {
+		readBlockRepairAuthorityFn = oldRead
+		blockRepairHasS3OrphanFn = oldOrphan
+	})
+
+	modes := map[BlockAuthorityRead]int{}
+	readBlockRepairAuthorityFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (blockRepairAuthorityRow, bool, error) {
+		modes[mode]++
+		return blockRepairAuthorityRow{}, false, nil
+	}
+	blockRepairHasS3OrphanFn = func(_ *DB, _, _ string, mode BlockAuthorityRead) (bool, error) {
+		modes[mode]++
+		return false, nil
+	}
+
+	outcome, err := (&DB{}).ValidateBorrowedFSPublicationAuthority("org-1", installTestBlockID, BlockPhysicalLocation{
+		StorageClass: "hot",
+		StorageKey:   "blocks/org-1/minted",
+	})
+	if outcome != BlockRepairAuthorityChanged || !errors.Is(err, ErrBlockRepairAuthorityChanged) {
+		t.Fatalf("ValidateBorrowedFSPublicationAuthority() = %v, %v; want Changed for an absent row", outcome, err)
+	}
+	if modes[BlockAuthorityStrong] != 0 {
+		t.Fatalf("BorrowedFS publication authority issued %d SERIAL reads, want 0 on the BorrowedFS dedup hot path", modes[BlockAuthorityStrong])
+	}
+	if modes[BlockAuthorityAdvisory] != 2 {
+		t.Fatalf("BorrowedFS publication authority advisory reads = %d, want 2", modes[BlockAuthorityAdvisory])
+	}
+}
+
 // TestP3FenceReadConsistencyIsLocalQuorum pins the value, not just the fact that
 // fence reads declare one. The whole advisory-read argument is an intersection --
 // an EACH_QUORUM fence commit meets the reader's quorum in every DC -- and it

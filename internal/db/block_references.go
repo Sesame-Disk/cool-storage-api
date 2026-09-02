@@ -779,17 +779,42 @@ func (db *DB) ValidateBlockRepairAuthority(orgID, blockID string, expected Block
 // That is safe here for a DIFFERENT reason than the other Advisory callers'
 // downstream CAS: this call has no downstream mutation on the block to fall
 // back on -- once it says Authorized, HEAD publishes unconditionally. What
-// makes Advisory safe here is ORDERING, not a CAS: the caller has ALREADY
-// durably written its own up:<session> reference (BlockReferenceWriteConsistency
-// = LOCAL_QUORUM) before ever calling this. Either GC's zero-proof read
-// (BlockHasReferencesGlobal, EACH_QUORUM) happens after that pin is durable --
-// in which case it intersects the pin and GC releases rather than commits, so
-// this block can never become fenced by that attempt -- or GC's destructive
-// commit (ClaimBlockDelete / CommitBlockDeleteOrphanHandoff / FinalizeBlockDelete,
-// all EACH_QUORUM+SERIAL) already fully landed before the pin was written, in
-// which case it is a settled write, not one "still in flight", and a
-// LOCAL_QUORUM read reliably observes it (the same intersection argument
-// BlockDeleteFenceActive already relies on for this same pre-HEAD position).
+// makes Advisory safe here is ORDERING plus the shape of the two possible
+// staleness directions, not a CAS. By the time this runs, the caller has
+// ALREADY durably written its own up:<session> reference
+// (BlockReferenceWriteConsistency = LOCAL_QUORUM). Three cases cover every
+// interleaving with GC:
+//
+//  1. GC's zero-proof read (BlockHasReferencesGlobal, EACH_QUORUM) happens
+//     after that pin is durable: it intersects the pin in every DC, so GC
+//     releases the claim instead of committing D. This block can never
+//     become fenced by that attempt, regardless of what this read sees.
+//  2. GC's claim already landed (ClaimBlockDelete, EACH_QUORUM+SERIAL)
+//     before the pin was written, but D has not committed yet: a settled
+//     EACH_QUORUM write is what LOCAL_QUORUM reads are specifically proven
+//     to intersect in every DC (the same argument BlockDeleteFenceActive
+//     already relies on), so this read observes gc_state='deleting' ->
+//     Blocked.
+//  3. GC has already fully retired P1 (D committed, orphan published,
+//     Finalize's row DELETE, and the settled orphan DELETE all durably
+//     applied) before the pin was written. FinalizeBlockDelete and
+//     DeleteS3Orphan do not themselves pin EACH_QUORUM -- they only pin the
+//     LWT's serial phase -- so a lagging replica could in principle still
+//     be missing one of those deletes. That lag can only bias this read
+//     toward the STALE-BUT-STILL-PRESENT state (blocks(L) with
+//     gc_state='deleting', or the orphan row not yet cleared), which
+//     classifies as Blocked; it can never manufacture a false Authorized,
+//     because a replica cannot report a row absent before it has actually
+//     received the tombstone that removed it. The terminal "nothing left to
+//     see" state (Changed: canonical row absent, orphan absent) is
+//     therefore reachable only once every one of GC's deletes has actually,
+//     durably propagated -- at which point the retirement genuinely is
+//     complete everywhere this read can land.
+//
+// A fourth interleaving -- GC's claim was released or taken over before D
+// committed -- does not weaken this: a released/superseded claim can no
+// longer reach the irreversible commit, so it cannot produce a fence this
+// read would need to catch.
 func (db *DB) ValidateBorrowedFSPublicationAuthority(orgID, blockID string, expected BlockPhysicalLocation) (BlockRepairAuthorityOutcome, error) {
 	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected, BlockAuthorityAdvisory)
 	return outcome, err

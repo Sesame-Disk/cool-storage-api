@@ -61,6 +61,11 @@ Status docs no longer say the commit is pending.
 
 ## 2026-09-02 - W1 BorrowedFS own-liveness productization
 
+**Superseded below by later same-day entries above**: the fence check and leg
+count described here were revised twice more this same day (exact-placement
+re-validation, then the LOCAL_QUORUM correction, ending at eight named legs).
+Left as written for session history; see the entries above for current state.
+
 `CreateFileFromBlocks` now establishes an own `up:<session>` provisional
 reference for each distinct BorrowedFS block before claiming the upload session,
 and validates the BorrowedFS delete fence immediately before the library HEAD

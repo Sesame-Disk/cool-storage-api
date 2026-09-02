@@ -206,11 +206,20 @@ X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wi
 
 **W1 productization (2026-09-02):** this document's own historical verdict and
 measured rows above are frozen, per the note at the top of this file, and are
-NOT rewritten by what follows. The prerequisite this verdict named -- a
-production continuity protocol that keeps the +0 hot-path contract -- was
-productized by W1: own `up:<session>` before claim, then an exact-placement
-re-validation immediately before HEAD (see "Current W1 status" and "W1 fix 1"
-/ "W1 fix 2" above). The eight-leg `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`
-gate is the current record of that production behavior; this note records
-that the prerequisite was met without rewriting the historical
+NOT rewritten by what follows. W1 does NOT literally keep this verdict's `+0`
+hot-path authority-read framing for the BorrowedFS path: `CreateFileFromBlocks`
+now writes an own `up:<session>` pin and performs one `LOCAL_QUORUM`
+exact-placement read per distinct BorrowedFS block before HEAD, which is `+2`
+reads relative to that path's pre-W1 behavior, not `+0`. (SessionUpload,
+which never touches this code, remains `+0` -- see the `CreateFileFromBlocks,
+exact session up:` row in `docs/R3-LIVENESS-CONTINUITY.md`.) What W1 satisfies
+instead is the operative criterion `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`
+§15 later adopted for this PR -- writer-first releases GC, GC-first blocks
+HEAD, no liveness gap, and **no accidental hot-path WAN/Paxos explosion** --
+which bounds the added cost to `LOCAL_QUORUM` reads rather than requiring
+literally zero. See "Current W1 status" and "W1 fix 1" / "W1 fix 2" above for
+what was actually built. The eight-leg
+`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1` gate is the current
+record of that production behavior; this note records how the later,
+bounded-cost criterion was met without rewriting the historical
 `PROMISING_WITH_PREREQUISITE` verdict itself.
