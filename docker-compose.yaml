@@ -543,7 +543,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2; ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3; SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 15m ./internal/integration/...
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2; ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3; SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1 SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 15m ./internal/integration/...
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
@@ -560,6 +560,9 @@ services:
       # apart under any key the Go code invents.
       - SESAMEFS_REQUIRE_R26_EVIDENCE=1
       - SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1
+      # BorrowedFS CreateFileFromBlocks through HEAD. Seven named legs, in-process
+      # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
+      - SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1
       # The supported frontend nginx, so the D6 slow-client drill runs through
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.
@@ -586,7 +589,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2 && ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 && SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 15m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
+      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2 && ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 && SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1 SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1 SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1 go test -tags integration -v -count=1 -timeout 15m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_URL_2=http://sesamefs-node-2:8080
@@ -603,6 +606,9 @@ services:
       # apart under any key the Go code invents.
       - SESAMEFS_REQUIRE_R26_EVIDENCE=1
       - SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION=1
+      # BorrowedFS CreateFileFromBlocks through HEAD. Seven named legs, in-process
+      # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
+      - SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1
     depends_on:
       - sesamefs
       - sesamefs-node-2

@@ -141,7 +141,7 @@ orphan + `FinalizeBlockDelete` before physical delete removed `blocks` while K1 
 | candidate / `gc_queue` / `gc_pending_items` | durable recovery root? | F0a: work binding only. F0b1: queue-loss without DLQ did not reenqueue (pending lock). F0b2: behind-cursor candidate was not rediscovered by the real scanner. F2-convergence: leftover `pending=true`, claim `missing` |
 | R18/R27 | safety or liveness? | still OPEN; not closed here |
 | E6 | loss vs duplicate work? | still OPEN; not closed here |
-| R3 | publication TOCTOU | still OPEN; D2 measured unguarded post-cut `pub:` staging. Writer prerequisite is not yet fully specified; continuity through HEAD is not characterized |
+| R3 | publication TOCTOU | still OPEN; D2 measured unguarded post-cut `pub:` staging. Writer prerequisite is not yet fully specified; continuity through HEAD is not characterized. Follow-up: `docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md` |
 
 ## Performance
 
@@ -181,6 +181,8 @@ Prerequisite A — writer quiescence / publication
   Writer prerequisite is not yet fully specified;
   continuity through HEAD requires a follow-up characterization
   before any protocol switch. Subsequent HEAD is not characterized.
+  Follow-up measurement (not a protocol switch):
+  docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md
 
 Prerequisite B — committed-delete recovery
   durable rediscovery after queue loss

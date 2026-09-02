@@ -397,6 +397,8 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
+	fileFromBlocksAfterVerifiedBarrier(repoID)
+
 	// externalBlockIDs is the ordered SHA-1 list written into the file fs_object so
 	// the desktop/mobile Seafile client can parse and download the file. Each SHA-1
 	// is server-derived from blocks.sha1 and validated 40-hex above.

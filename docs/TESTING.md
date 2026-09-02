@@ -964,6 +964,22 @@ binary. Perl is installed in `Dockerfile.gotest`. Run:
 docker compose --profile test run --rm --build gotest bash scripts/x1-nonoverlap-mutation-validation.sh
 ```
 
+BorrowedFS HEAD characterization (`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`)
+is a separate seven-leg gate. It does not inflate X1's 15 legs. Directed run:
+
+```bash
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_REQUIRE_P2_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P3_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4A_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1 \
+  go-integration-test \
+  go test -tags integration -run '^TestBorrowedFSHead|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+```
+
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical

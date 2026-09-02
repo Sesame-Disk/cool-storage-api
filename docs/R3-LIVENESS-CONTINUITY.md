@@ -105,6 +105,12 @@ R3 publication continuity here.
 The table intentionally records `UNKNOWN` where a source walk has not proved a
 temporal premise. This PR does not turn those rows green by assumption.
 
+BorrowedFS through HEAD is now measured separately in
+[R3-BORROWEDFS-HEAD-CHARACTERIZATION.md](R3-BORROWEDFS-HEAD-CHARACTERIZATION.md).
+That follow-up does not close this inventory: `CreateFileFromBlocks` foreign
+`fs:` remains `UNGUARDED` here, and the test-only harness is not production
+protocol.
+
 ## Logical positive block delta
 
 The logical set operation is:
@@ -231,4 +237,7 @@ before this writer stages `pub:` is still open and is not resolved here.
 This structural refinement changes no protocol behavior. A later PR must select
 one provenance category, establish its exact continuity or slow-path protocol,
 and retain both zero-added-CQL-callsite and zero-added-authority-read contracts
-for normal materialize-to-publish traffic.
+for normal materialize-to-publish traffic. HEAD after a BorrowedFS cut is
+characterized in
+[R3-BORROWEDFS-HEAD-CHARACTERIZATION.md](R3-BORROWEDFS-HEAD-CHARACTERIZATION.md);
+that measurement does not close R3.
