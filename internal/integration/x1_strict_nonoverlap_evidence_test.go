@@ -154,6 +154,8 @@ func TestX1CharacterizationBaseIsDocumented(t *testing.T) {
 		"not yet fully specified",
 		"committed-delete recovery",
 		"source/AST contract mutations",
+		"independent physical lives",
+		"deliberately conservative",
 		"PROMISING",
 		"PROMISING_WITH_PREREQUISITE",
 		"REJECT",

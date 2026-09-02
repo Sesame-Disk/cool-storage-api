@@ -149,9 +149,12 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-X1 is open with no closed design. X2 closed 2026-08-14 (implemented 2026-08-13), proven on a real three-DC
-cluster. `gc.enabled: false` remains required on every replica in every DC — it now
-rests on X1 alone.
+X1 is OPEN. The accepted closure architecture is documented
+([GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md));
+it is not implemented and does not enable deletion. X2 closed 2026-08-14
+(implemented 2026-08-13), proven on a real three-DC cluster.
+`gc.enabled: false` remains required on every replica in every DC — activation
+still rests on X1 alone.
 
 **Read X1 as the whole fence-and-physical-identity workstream, not just the stale
 DELETE.** Never-reused physical keys are necessary but not sufficient: a shared
@@ -160,17 +163,20 @@ still deleting under it, and the reuse probe can then hand a writer back the ver
 incarnation being destroyed — which physical-key uniqueness cannot prevent, because no
 new incarnation is created. Closure criteria are in Registry X1.
 
-**Closure options are compared in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md)** (2026-08-14), which replaces the
-abandoned generational-fence ADR. No X1 option is accepted. P1 locator authority
-and the P0/R12 serial-phase prerequisite are implemented foundations, not an X1
-closure. P2/R9/R24 mint/install is closed as of 2026-08-24, including strict
-fresh-minted authority and fail-closed direct same-tuple contradictions; P3/P4 and
-X1 remain open.
+**Closure architecture is frozen in
+[GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)**
+(D0, 2026-09-02): documentation only; X1 remains OPEN; `GC_ENABLED=false`.
+Historical option comparison remains in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) and is **not** the
+active roadmap. P1 locator authority, P0/R12, P2/R9/R24 mint/install, P3 writer
+boundary, and P4a/P4b exact `(P,D)` handoff are implemented foundations, not
+X1 closure. P4c-orphan (exact identity **and** minimum durable discovery
+before G2 may create PREPARED), W1/W2 writer continuity, and G2/G3 handoff
+protocol remain open.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race: an authorized S3 delete can land after a byte-identical re-upload, and a shared claim id lets another worker drop the fence mid-delete | Registry X1 (four closure criteria) · [closure options](./GC-X1-CLOSURE-OPTIONS.md) |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race. Accepted architecture: exact `(P,D)` handoff into orphan as continuation authority; not strict physical non-overlap | Registry X1 · [handoff plan](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) · [historical options](./GC-X1-CLOSURE-OPTIONS.md) |
 | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [X2 runbook](./GC-X2-MULTIDC-VALIDATION.md) |
 
 ## High / Medium — open (audit follow-ups)

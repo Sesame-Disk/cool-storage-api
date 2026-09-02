@@ -2179,9 +2179,12 @@ can publish an `fs_object` that points at already-missing bytes. The race matrix
 this as R3; closing it requires the publication-fence/post-stage validation that is
 already part of the X1 closure work.
 
-Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
-and the A+ safety-baseline recommendation in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
+(D0 freeze, X1 still OPEN):
+[GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+Historical option comparison and race matrix remain in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) and are **not** the
+active roadmap.
 
 ---
 
@@ -2547,11 +2550,13 @@ environment cannot report a false pass.
 every replica in every DC. `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) is now the
 sole runtime activation blocker. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
 the analysis that established X2's independence from X1 is in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). **X1 has no accepted design yet.**
-The generational-fence protocol explored on `docs/gc-x1-x2-generation-fence-final` was
-abandoned 2026-08-14; smaller physical-identity designs are now being evaluated, with no
-option accepted and nothing implemented. The options
-and the evidence for that decision live in the document above.
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). **X1 remains OPEN.**
+The accepted architecture is frozen in
+[GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)
+(D0, 2026-09-02, documentation only). The generational-fence protocol explored
+on `docs/gc-x1-x2-generation-fence-final` was abandoned 2026-08-14. Historical
+option comparison stays in the CLOSURE-OPTIONS file and is not the active
+roadmap. Nothing in D0 enables deletion.
 
 ---
 

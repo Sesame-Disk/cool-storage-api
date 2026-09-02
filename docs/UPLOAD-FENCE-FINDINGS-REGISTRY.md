@@ -1,9 +1,9 @@
 # Upload-Fence Audit — Findings Registry
 
-**Date:** 2026-07-21 · **Last updated:** 2026-08-14
+**Date:** 2026-07-21 · **Last updated:** 2026-09-02
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
-**X1 closure options:** [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) — options, race matrix and the A+ safety-baseline recommendation. No option accepted yet; implementation not started.
+**X1 architecture:** [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) — accepted D0 freeze (docs only; X1 remains OPEN). Historical option comparison and race matrix: [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (not the active roadmap).
 **Index:** [OPEN-WORK-INDEX.md](./OPEN-WORK-INDEX.md) — scoped open-work screen + migration table (not the entire backlog).
 **Status of record:** [KNOWN_ISSUES.md](./KNOWN_ISSUES.md). This file owns reasoning and evidence; Open/Closed tables below are a **dated snapshot of the upload-fence series**, not a second live status tracker. When status changes, update `KNOWN_ISSUES.md` and add a dated note here if needed.
 **Series progress: the code series is complete.** PR-1 merged as

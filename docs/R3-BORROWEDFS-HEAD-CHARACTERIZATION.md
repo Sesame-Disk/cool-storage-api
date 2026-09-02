@@ -1,5 +1,10 @@
 # R3 BorrowedFS HEAD characterization
 
+**Accepted architecture (2026-09-02):** this is experimental evidence for
+writer W1, **not production protocol**. Productive publication barriers remain
+nops. X1 closure architecture:
+[`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
 **Scope:** characterization only. Integration-only publication barriers and a

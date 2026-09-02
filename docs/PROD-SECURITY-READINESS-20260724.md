@@ -342,8 +342,11 @@ conditions.
 > **Superseded 2026-08-14 for the GC half.** X2
 > (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) closed on that date, proven on a real
 > three-DC cluster. **X1 alone** now blocks enabling destructive GC, and
-> `docker-compose.prod.yml` pins `GC_ENABLED=false` explicitly. X1 has no accepted
-> design; options are compared in
+> `docker-compose.prod.yml` pins `GC_ENABLED=false` explicitly. X1 remains the
+> sole GC-activation blocker. **Superseded 2026-09-02 for the design-status
+> clause:** architecture is frozen in
+> [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)
+> (docs only; X1 still OPEN). Historical options remain in
 > [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). B1 and B5 are unaffected.
 
 **A taxonomy wrinkle worth naming rather than silently fixing.** The summary

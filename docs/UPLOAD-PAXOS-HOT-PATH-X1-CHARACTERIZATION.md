@@ -467,7 +467,9 @@ existing hashes, and requested library placement no longer has authority.
 The generation terms below describe a candidate physical-identity and install
 protocol only. They do **not** revive the abandoned r3 generational GC fence:
 that decision remains recorded in [`DECISIONS.md`](./DECISIONS.md#abandon-the-generational-gc-fence-r3-for-x1),
-and X1 still has no accepted design.
+and X1 remains OPEN. The accepted closure architecture (docs freeze) is
+[`GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)
+and does not revive r3.
 
 Once the class domain is fixed, a deterministic incarnation key remains a
 possible way to remove random-writer arbitration:

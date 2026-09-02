@@ -980,6 +980,16 @@ docker compose --profile test run --rm --build \
   go test -tags integration -run '^TestBorrowedFSHead|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
+X1 physical-life handoff plan (`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`) is a
+docs freeze (D0). It does not change runtime. Contract tests in
+`internal/gc/x1_physical_life_handoff_plan_test.go` pin CURRENT vs DECIDED and
+the still-open P4c-orphan / TTL / fence facts:
+
+```bash
+docker compose --profile test run --rm --build gotest \
+  go test ./internal/gc -count=1 -run 'TestX1PhysicalLifeHandoff'
+```
+
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical

@@ -8,6 +8,59 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: G1 is the PREPARED recovery root; G5 hardens later
+
+G2 must not create durable PREPARED until G1 provides a restart-findable
+discovery root. `RecoverS3Orphans` today walks `_by_day`, not canonical
+orphans; crash between those writes plus no TTL can fence L forever until
+G4. G5 remains scheduling hardening, not that first root.
+
+## 2026-09-02 - D0 follow-up: PREPARED not-owner must converge
+
+`not-owner` after Abort is not “keep PREPARED forever”. Classify exact D1:
+committed → promote; already released or superseded by D2 → settle that
+PREPARED; ambiguous → fail closed. Crash after a won abort (Case A) and
+stale takeover (Case B) must converge without TTL.
+
+## 2026-09-02 - D0 follow-up: PREPARED abort CAS vs Commit; W2 at D committed
+
+PREPARED abort must CAS-revoke exact D's commit capability on `blocks`
+before deleting the orphan; SERIAL observe-then-delete races with
+`CommitBlockDeleteOrphanHandoff`. W2's irreversible writer frontier is
+`D committed`, not the zero-proof that only starts the handoff.
+
+## 2026-09-02 - D0 follow-up: freeze consistency (G3/G4, states, satellites)
+
+Corrected remaining freeze contradictions: section 6 no longer lets P2 install
+immediately after retiring `blocks`; `PHYSICAL_COMPLETE` never authorizes
+another DELETE; PREPARED abort is SERIAL exact-domain and fail-closed;
+minted lives are `K1 != K2`; D0 does not deny H's same-key resurrection.
+`CURRENT_WORK.md` P3/P4a snapshots no longer present R14b OPEN / strict A+ as
+current. `DECISIONS.md`, `KNOWN_ISSUES.md`, the findings registry, and
+`GC-X1-CLOSURE-OPTIONS.md` name the handoff plan as the accepted architecture
+and stop saying there is no accepted X1 design.
+
+## 2026-09-02 - D0 follow-up: G3/G4 split, #199 history, writer-fence contract
+
+Corrected the frozen architecture: G3 Finalize frees `blocks(L)` but writers
+remain fenced by `orphan(Pold)`; G4 is the fence removal and the
+`blocks=P2` + `orphan=P1` demonstration. #199 characterized a conservative
+strategy after #185 independent lives; it did not depend on reusable physical
+identity. Writer-fence contract test AST-pins each named path to its
+`gc_s3_orphans` helper.
+
+## 2026-09-02 - D0: freeze X1 physical-life handoff architecture
+
+Accepted X1 closure architecture is now
+`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`. Documentation plus contract tests
+only: no worker, schema, storage, or `GC_ENABLED` change. Orphan after a
+confirmed handoff is the durable continuation authority for exact `(P,D)`.
+Strict physical non-overlap and Delete-before-Finalize are no longer the
+end-state. Current production remains Finalize-before-S3, orphan-as-L-fence,
+recovery ref re-check, P4c-orphan `(org,L)` PK, and 90-day TTL. R31 stays
+OPEN. H is not reclassified. R18/R27 pending re-evaluation. 020 stays.
+Activation is A1 after E1. `GC_ENABLED=false`.
+
 ## 2026-08-28 - P4b-2 tombstone blockers: exact certificate, one physical DELETE, SERIAL post-check
 
 Closed the confirmed #194 tombstone holes without redesigning handoff, 019, or 020.
