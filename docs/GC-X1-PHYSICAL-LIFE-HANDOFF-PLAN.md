@@ -114,12 +114,15 @@ Since P2/#185:
 
 ```text
 P = (storage_class, storage_key)
+physical(P1) != physical(P2)
 P1 != P2
-normally K1 != K2
+K1 != K2
 ```
 
-A new physical life does not revive the previous one's identity. That changes
-the roles of `blocks`, `block_references`, and `gc_s3_orphans`.
+Fresh minted lives have unequivocal physical separation. Do not hedge this as
+`normally K1 != K2`. A new physical life does not revive the previous one's
+identity. That changes the roles of `blocks`, `block_references`, and
+`gc_s3_orphans`.
 
 ---
 
@@ -254,12 +257,14 @@ closed. `ValidatePhysicalLocator` binds the persisted key before DELETE.
 Fresh installs mint a new physical identity:
 
 ```text
+physical(P1) != physical(P2)
 P1 != P2
 K1 != K2
 ```
 
-Canonical install is single-use. #184 is the structural exact-key store
-prerequisite. #185 is the mint/install closure (P2/R9/R24).
+This is required for minted lives, not typical. Canonical install is
+single-use. #184 is the structural exact-key store prerequisite. #185 is the
+mint/install closure (P2/R9/R24).
 
 ### Repair does not freely recreate a condemned P — P3/#187
 
@@ -351,15 +356,16 @@ GC proves it may condemn P1
         ↓
 durable handoff P1 → orphan(P1,D1)
         ↓
-blocks(P1) may be retired
+blocks(P1) may be retired          (G3; writers still fenced by orphan(P1))
         ↓
         ├──────── GC continues DeleteExact(K1)
         │
-        └──────── a new writer may create P2/K2
+        └──────── G4: writers may create P2/K2
 ```
 
-Therefore physical cleanup of P1 and canonical life P2 **may overlap**.
-That is safe only because `P1 != P2` and every old destructive operation
+Therefore physical cleanup of P1 and canonical life P2 **may overlap** after
+G4 removes the orphan-as-L writer fence. G3 only vacates `blocks`. That
+overlap is safe only because `P1 != P2` and every old destructive operation
 remains bound exactly to P1.
 
 ---
@@ -492,7 +498,22 @@ orphan PREPARED
 blocks not yet committed
 ```
 
-recovery may prove D never committed and settle/remove PREPARED. No data loss.
+recovery may abort PREPARED only by proving D never committed. That proof is
+architecture of safety, not a G2 implementation detail:
+
+```text
+observe D in the SERIAL exact domain of that lifecycle
+(exact P, D / claim identity, handoff — the same row
+CommitBlockDeleteHandoff writes)
+
+D committed           → promote PREPARED → COMMITTED; never abort
+D never committed     → abort: settle/remove PREPARED; no S3; no invented D
+ambiguous/unavailable → keep PREPARED; fail closed; retry the observation
+```
+
+An ordinary or stale read of `blocks` is not this proof. SERIAL/unavailable
+must not be treated as “D never committed”. Until G4, a stranded PREPARED
+orphan still fences writers on L.
 
 ### D — Commit D on `blocks`
 
@@ -517,7 +538,9 @@ only after proving exactly:
 blocks(L)=P1, D1, handoff=true
 ```
 
-An ambiguous answer settles before continuing.
+in the same SERIAL exact domain as C. An ambiguous or unavailable
+observation keeps PREPARED and fails closed. Do not invent COMMITTED, and
+do not abort, from that observation.
 
 Crash:
 
@@ -766,17 +789,33 @@ Do not freeze production names yet. Freeze equivalents of:
 
 ```text
 PREPARED
-COMMITTED
+COMMITTED            (includes DELETE_UNCERTAIN: still COMMITTED)
 PHYSICAL_COMPLETE
 SETTLED
 ```
 
 | State | Meaning |
 |-------|---------|
-| `PREPARED` | no S3 authority |
-| `COMMITTED` | D transferred; authorizes only `DeleteExact(P)` of that exact P |
-| `PHYSICAL_COMPLETE` | physical DELETE confirmed; no further destructive op except explicit settlement of a previously classified ambiguous physical response |
+| `PREPARED` | no S3 authority; abort only via SERIAL exact-domain proof that D never committed |
+| `COMMITTED` | D transferred; authorizes only `DeleteExact(P)` of that exact P. Ambiguous or unknown DELETE stays here (`DELETE_UNCERTAIN`) and retries `DeleteExact`. |
+| `PHYSICAL_COMPLETE` | physical DELETE confirmed (success or known-absent). Never DELETE again. Only settlement to `SETTLED`. |
 | `SETTLED` | lifecycle finished; canonical recovery may be deleted explicitly |
+
+```text
+COMMITTED
+  → DELETE ambiguous/unknown → remain COMMITTED / DELETE_UNCERTAIN
+  → success or known-absent  → PHYSICAL_COMPLETE
+
+PHYSICAL_COMPLETE
+  → never more DELETE
+  → only settlement
+```
+
+`DELETE_UNCERTAIN` is not a fifth production name. It is COMMITTED still
+authorized to `DeleteExact`. Promoting to `PHYSICAL_COMPLETE` and then
+issuing another destructive op for a previously ambiguous response is
+forbidden: if the DELETE was not known, the lifecycle was never
+`PHYSICAL_COMPLETE`.
 
 `CURRENT` phases (`pending_s3`, `pending_mapping_cleanup`) are transitional
 names and must not be copied into the new protocol as if they were PREPARED /
@@ -910,10 +949,12 @@ same L, same timestamps, distinct P/D still distinct rows
 
 ### G2 — PREPARED → COMMITTED handoff
 
-Write-ahead orphan. Do not retire `blocks` before COMMITTED.
+Write-ahead orphan. Do not retire `blocks` before COMMITTED. Implements the
+frozen PREPARED classifier in C; it does not invent a weaker abort.
 
 Crash matrix: after PREPARED; during D; after D before COMMITTED; ambiguous
-COMMITTED. Each state recoverable without inventing destructive authority.
+COMMITTED observation. Each state recoverable without inventing destructive
+authority. Ambiguous or unavailable D observation never aborts PREPARED.
 
 ### G3 — Canonical retirement after committed handoff
 
@@ -934,7 +975,9 @@ Physical delete of P1 is authorized by orphan. It may still be attempted
 inline, but semantically it belongs to recovery:
 
 ```text
-DeleteExact(K1) → PHYSICAL_COMPLETE → SETTLED
+DeleteExact(K1)
+  ambiguous/unknown → remain COMMITTED / DELETE_UNCERTAIN; retry DeleteExact
+  success or known-absent → PHYSICAL_COMPLETE → SETTLED
 ```
 
 A crash after Finalize is not dangerous because orphan COMMITTED already
@@ -1012,7 +1055,12 @@ P2 currently live
 ```
 
 because `P1 != P2`. Old GC knows only P1/K1. New writer depends only on P2/K2.
-This coexistence is the G4 end-state, not a G3 result. There is no physical ABA.
+This coexistence is the G4 end-state, not a G3 result.
+
+There is no **cross-life** destructive or canonical ABA between P1 and P2:
+`D1` cannot name `K2`, and `P2` cannot occupy `P1`'s identity. Same-key
+resurrection of `K1` after DELETE (`DELETE K1 → late PUT K1`) is H, which
+remains `OPEN`. D0 does not claim that physical reappearance is impossible.
 
 ---
 
@@ -1036,7 +1084,7 @@ historical life is suspect.
 | Claim | Status |
 |-------|--------|
 | `P=(storage_class, storage_key)` | `PROVEN` |
-| minted `P1 != P2` | `PROVEN` (#185) |
+| minted `P1 != P2` / `K1 != K2` | `PROVEN` (#185) |
 | reversible claim ≠ committed D | `PROVEN` (#189–#194) |
 | exact P/D destructive authority | `PROVEN` (#189–#194) |
 | work-item identity includes P | `PROVEN` (#190) |
@@ -1092,7 +1140,11 @@ Do not merge this docs PR unless:
 13. this PR has no runtime code, schema, or config;
 14. `GC_ENABLED=false`;
 15. activation is explicitly outside X1 closure;
-16. G3 does not claim productive P2 install; G4 owns `blocks=P2` + `orphan=P1`.
+16. G3 does not claim productive P2 install; G4 owns `blocks=P2` + `orphan=P1`;
+17. `PHYSICAL_COMPLETE` never authorizes another DELETE;
+18. PREPARED abort requires SERIAL exact-domain proof that D never committed; ambiguous/unavailable keeps PREPARED and fails closed;
+19. D0 does not claim “no physical ABA”; H stays OPEN;
+20. minted lives are `K1 != K2`, not `normally K1 != K2`.
 
 The contract test `TestX1PhysicalLifeHandoffPlanIsDocumented` pins these
 invariants against this file and against current `processBlock` /

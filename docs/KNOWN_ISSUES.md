@@ -2179,9 +2179,12 @@ can publish an `fs_object` that points at already-missing bytes. The race matrix
 this as R3; closing it requires the publication-fence/post-stage validation that is
 already part of the X1 closure work.
 
-Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1; closure options, race matrix
-and the A+ safety-baseline recommendation in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (no option is accepted yet).
+Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
+(D0 freeze, X1 still OPEN):
+[GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+Historical option comparison and race matrix remain in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) and are **not** the
+active roadmap.
 
 ---
 

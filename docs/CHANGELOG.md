@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: freeze consistency (G3/G4, states, satellites)
+
+Corrected remaining freeze contradictions: section 6 no longer lets P2 install
+immediately after retiring `blocks`; `PHYSICAL_COMPLETE` never authorizes
+another DELETE; PREPARED abort is SERIAL exact-domain and fail-closed;
+minted lives are `K1 != K2`; D0 does not deny H's same-key resurrection.
+`CURRENT_WORK.md` P3/P4a snapshots no longer present R14b OPEN / strict A+ as
+current. `DECISIONS.md`, `KNOWN_ISSUES.md`, the findings registry, and
+`GC-X1-CLOSURE-OPTIONS.md` name the handoff plan as the accepted architecture
+and stop saying there is no accepted X1 design.
+
 ## 2026-09-02 - D0 follow-up: G3/G4 split, #199 history, writer-fence contract
 
 Corrected the frozen architecture: G3 Finalize frees `blocks(L)` but writers

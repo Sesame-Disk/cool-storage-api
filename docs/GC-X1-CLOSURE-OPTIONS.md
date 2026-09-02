@@ -1,7 +1,7 @@
 # X1 — Closure Options for the Physical-Delete ABA
 
-**Active roadmap (2026-09-02):** this file is historical option comparison.
-The accepted X1 architecture is
+**Historical (2026-09-02):** this file is option comparison, **not** the
+active roadmap. The accepted X1 architecture is
 [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
 No option below (A+/B/strict non-overlap, Delete-before-Finalize as the
 end-state, orphan as a mutex on L) is the implementation plan. Evidence rows
@@ -9,9 +9,9 @@ stay as written; they are not the D0 status ledger. X1 remains OPEN.
 `GC_ENABLED=false`.
 
 **Status:** Analysis and option comparison. **No X1 option in this file is
-accepted as the active roadmap.** This is not an ADR. P1's locator-authority
-foundation is implemented separately; it does not close X1 or authorize
-destructive GC.
+the active roadmap.** The accepted design lives in the handoff plan. This is
+not an ADR. P1's locator-authority foundation is implemented separately; it
+does not close X1 or authorize destructive GC.
 
 **P3 implementation note (2026-08-25):** The current X1/P3 branch implements the
 R10/R13/R17 writer boundary for existing incarnations. Existing physical PUTs

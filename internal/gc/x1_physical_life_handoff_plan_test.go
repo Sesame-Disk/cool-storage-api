@@ -72,6 +72,11 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"independent physical lives",
 		"writers stay fenced until G4",
 		"G4 owns `blocks=P2` + `orphan=P1`",
+		"SERIAL exact domain",
+		"keep PREPARED; fail closed",
+		"Never DELETE again",
+		"no **cross-life** destructive",
+		"physical(P1) != physical(P2)",
 	}
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {
@@ -115,6 +120,24 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		t.Fatal("DECIDED protocol must say it is not current processBlock")
 	}
 
+	if strings.Contains(text, "There is no physical ABA") {
+		t.Fatal("H remains OPEN; D0 must not deny all physical reappearance")
+	}
+
+	section6 := sectionBetween(t, text, "## 6. Central architectural decision", "## 7. The critical point of X1 is the handoff")
+	if strings.Contains(section6, "└──────── a new writer may create P2/K2") {
+		t.Fatal("section 6 must not present P2 install as an immediate sibling of retiring blocks; that is G4")
+	}
+	for _, requiredS6 := range []string{
+		"G3; writers still fenced by orphan(P1)",
+		"G4: writers may create P2/K2",
+		"G4 removes the orphan-as-L writer fence",
+	} {
+		if !strings.Contains(section6, requiredS6) {
+			t.Fatalf("section 6 must name %q", requiredS6)
+		}
+	}
+
 	if strings.Contains(text, "while physical identity was still reusable") {
 		t.Fatal("#199 already used independent lives after #185; D0 must not explain strict non-overlap as leftover reusable physical identity")
 	}
@@ -151,6 +174,61 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 	} {
 		if !strings.Contains(g4, requiredG4) {
 			t.Fatalf("G4 must name %q", requiredG4)
+		}
+	}
+}
+
+func TestX1PhysicalLifeHandoffSatelliteDocsNameTheFreeze(t *testing.T) {
+	docs := []struct {
+		rel       []string
+		required  []string
+		forbidden []string
+	}{
+		{
+			rel: []string{"docs", "DECISIONS.md"},
+			required: []string{
+				"GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md",
+				"source of record for the accepted X1 architecture",
+			},
+			forbidden: []string{"analysis, **not** an accepted design: no option is chosen"},
+		},
+		{
+			rel:       []string{"docs", "KNOWN_ISSUES.md"},
+			required:  []string{"GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md"},
+			forbidden: []string{"no option is accepted yet"},
+		},
+		{
+			rel: []string{"docs", "UPLOAD-FENCE-FINDINGS-REGISTRY.md"},
+			required: []string{
+				"GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md",
+				"not the active roadmap",
+			},
+			forbidden: []string{"No option accepted yet"},
+		},
+		{
+			rel: []string{"docs", "GC-X1-CLOSURE-OPTIONS.md"},
+			required: []string{
+				"GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md",
+				"**Historical (2026-09-02):**",
+			},
+			forbidden: []string{"**Active roadmap (2026-09-02):**"},
+		},
+	}
+	for _, d := range docs {
+		raw, err := os.ReadFile(x1SourcePath(d.rel...))
+		if err != nil {
+			t.Fatalf("read %s: %v", filepath.Join(d.rel...), err)
+		}
+		text := string(raw)
+		for _, needle := range d.required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("%s is missing %q", filepath.Join(d.rel...), needle)
+			}
+		}
+		for _, needle := range d.forbidden {
+			if strings.Contains(text, needle) {
+				t.Fatalf("%s still claims %q after the D0 freeze", filepath.Join(d.rel...), needle)
+			}
 		}
 	}
 }
