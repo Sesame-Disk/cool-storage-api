@@ -450,6 +450,12 @@ Crash notes that are true of **current** code:
   working set, and the 90-day TTL can then destroy the durable record
   (`ISSUE-GC-REFERENCED-ORPHAN-LIFECYCLE-01`). Storage leak, not live-data
   delete. This is why pending recovery authority must not TTL out.
+- Recovery does **not** scan canonical `gc_s3_orphans`. It walks
+  `gc_s3_orphans_by_day` from a persisted UTC-day cursor (`RecoverS3Orphans`).
+  A canonical row whose `_by_day` publish never happened is invisible to
+  restart. `StartBlockDeleteOrphanProjectionUnconfirmed` already names that
+  window. CURRENT still has TTL, so the writer fence eventually lifts. G2
+  PREPARED without TTL must not inherit that hole.
 
 `PREPARED` is **not** current production protocol.
 
@@ -806,7 +812,9 @@ before inventing another global generation.
 Migration 020 already clusters by `claim_id` on `gc_block_delete_lifecycles`:
 D1 and D2 of the same L occupy different tombstone rows. That does **not**
 close P4c-orphan; the recovery table GC actually resumes from is still
-`(org, L)`.
+`(org, L)`. G1 also includes the minimum durable discovery root required
+before G2 may create PREPARED (see §18 and G1 in §25). The identity
+schema alone is not that root.
 
 ---
 
@@ -823,7 +831,9 @@ physical lifecycles.
 
 `DECIDED`: discovery may be non-authoritative, but it must not be ambiguous.
 The projection, or its replacement, must locate exact `(P, D)` of the
-lifecycle it enumerated.
+lifecycle it enumerated. It must also be a restart-findable root: a
+canonical PREPARED/COMMITTED whose discovery publish never happened must
+still be found (G1, before G2). Queue/pending/cursor are not that root.
 
 ---
 
@@ -942,9 +952,11 @@ the orphan was retiring. In the final model that is false. After handoff,
 R18/R27 stay `PENDING RE-EVALUATION` until writer continuity and handoff are
 implemented.
 
-What remains mandatory: every COMMITTED orphan must be rediscoverable and
-retryable until it converges. That is absorbed by the new recovery machinery
-(G5), not by the old R18(a) postpone-and-reproject design.
+What remains mandatory: every outstanding PREPARED or COMMITTED orphan must
+be rediscoverable and retryable until it converges. The **minimum recovery
+root** is G1 (before G2 may create PREPARED). G5 hardens scheduling after
+that root exists. Queue/pending/behind-cursor candidate are not this root
+(`PROVEN` #199 F0b1/F0b2).
 
 ---
 
@@ -1010,12 +1022,38 @@ Do not treat zero-proof itself as irreversible condemnation.
 
 Only after W2 may post-D refs stop being a contradiction/veto.
 
-### G1 — P4c-orphan exact physical lifecycle identity
+### G1 — P4c-orphan exact identity + minimum durable discovery
 
-GC/schema only. Make `gc_s3_orphans` and `gc_s3_orphans_by_day` distinguish
-exact `(P, D)`. Remove P1/P2 collision. Do not change writer policy or delete
-order yet. Remove destructive TTL from pending authority, or ship the
-definitive schema without that TTL.
+GC/schema only. Do not change writer policy or delete order yet.
+
+Must ship together, **before G2 creates PREPARED in production**:
+
+```text
+exact (P,D) on canonical orphan
+exact (P,D) on discovery
+no TTL for pending authority / pending discovery
+canonical PREPARED/COMMITTED cannot exist without a durable
+way to find it after crash
+```
+
+`CURRENT`: `RecoverS3Orphans` finds work only by walking
+`gc_s3_orphans_by_day`. Canonical `gc_s3_orphans` is not scanned. Crash
+between canonical INSERT and `_by_day` publish:
+
+```text
+gc_s3_orphans:        PREPARED(P1,D1) exists
+gc_s3_orphans_by_day: empty
+restart:              recovery never sees it
+```
+
+Until G4 that orphan still fences writers on L. The new design also
+forbids TTL as cleanup. Queue, pending, and behind-cursor candidates are
+not a substitute (`PROVEN` #199 F0b1/F0b2).
+
+Frozen property (mechanism is G1's to choose: atomic-ish publish, repair
+scanner, canonical partition, second index, …):
+
+> once PREPARED exists, restart can eventually find it.
 
 Real Cassandra tests:
 
@@ -1024,22 +1062,26 @@ P1/D1 + P2/D2 coexist
 settle P1 leaves P2 untouched
 stale projection P1 cannot clear P2
 same L, same timestamps, distinct P/D still distinct rows
+canonical PREPARED without _by_day is still found after restart
 ```
 
 ### G2 — PREPARED → COMMITTED handoff
 
-Write-ahead orphan. Do not retire `blocks` before COMMITTED. Implements the
-frozen PREPARED abort and **not-owner classifier** in C. Abort CAS and
-Commit D compete on the same `blocks` partition. SERIAL observation while
-D1 is still owner must not remove PREPARED. After Abort returns not-owner,
-SERIAL-classify exact D1 and converge (promote, or settle that PREPARED).
+**Requires G1.** G2 must not land durable PREPARED without G1's recovery
+root. Write-ahead orphan. Do not retire `blocks` before COMMITTED.
+Implements the frozen PREPARED abort and **not-owner classifier** in C.
+Abort CAS and Commit D compete on the same `blocks` partition. SERIAL
+observation while D1 is still owner must not remove PREPARED. After Abort
+returns not-owner, SERIAL-classify exact D1 and converge (promote, or
+settle that PREPARED).
 
 Crash matrix: after PREPARED; abort-vs-commit race; abort applied then crash
 before PREPARED delete (Case A); stale takeover while PREPARED(D1) (Case B);
-during D; after D before COMMITTED; ambiguous COMMITTED observation. Each
-state recoverable without inventing destructive authority. Ambiguous abort
-CAS never deletes PREPARED. A stranded PREPARED(D1) whose D1 cannot commit
-must not depend on TTL to disappear.
+during D; after D before COMMITTED; ambiguous COMMITTED observation;
+canonical PREPARED whose discovery publish has not happened (must still be
+found — G1). Each state recoverable without inventing destructive
+authority. Ambiguous abort CAS never deletes PREPARED. A stranded
+PREPARED(D1) whose D1 cannot commit must not depend on TTL to disappear.
 
 ### G3 — Canonical retirement after committed handoff
 
@@ -1089,14 +1131,23 @@ writers until this PR.
 
 ### G5 — Recovery scheduling hardening
 
-`orphan COMMITTED` must not depend on `gc_queue`, `gc_pending_items`, the
-scanner cursor, or unbounded TTL to survive.
+Not the first time restart can find PREPARED or COMMITTED. That property is
+G1, required before G2.
 
-`gc_s3_orphans_by_day` or its replacement must be durable, repairable
-discovery. Crash/restart always finds `COMMITTED` and `PHYSICAL_COMPLETE` not
-yet settled until finished.
+G5 hardens scheduling and operational convergence on top of that root:
 
-This absorbs the real F0b/F2 liveness problem.
+```text
+cursor repair
+projection repair
+lost scheduling
+scanner starvation
+pending/queue independence
+operational convergence
+```
+
+`orphan COMMITTED` must still not depend on `gc_queue`, `gc_pending_items`,
+the scanner cursor, or unbounded TTL to *survive*. G5 may still absorb
+remaining F0b/F2 operational liveness after the G1 root exists.
 
 ### E1 — X1 final evidence / reclassification
 
@@ -1184,7 +1235,9 @@ historical life is suspect.
 | R18/R27 | `PENDING RE-EVALUATION` |
 | orphan as post-handoff DELETE authority | `DECIDED` |
 | exact-P/D orphan identity | `DECIDED / OPEN` implementation (G1) |
-| PREPARED → COMMITTED handoff | `DECIDED / OPEN` implementation (G2) |
+| durable PREPARED discovery | `DECIDED` / G1; required before G2 |
+| PREPARED → COMMITTED handoff | `DECIDED / OPEN` implementation (G2; requires G1) |
+| recovery scheduling hardening | `DECIDED / OPEN` implementation (G5; not the first recovery root) |
 | P1 cleanup may overlap P2 life | `DECIDED` / G4 |
 | late refs cannot revoke committed D | `DECIDED` / depends W2 |
 | orphan removed from writer path | `DECIDED` / G4 after W1+W2+G3 |
@@ -1231,7 +1284,8 @@ Do not merge this docs PR unless:
 19. W2's irreversible frontier is `D committed`, not zero-proof;
 20. D0 does not claim “no physical ABA”; H stays OPEN;
 21. minted lives are `K1 != K2`, not `normally K1 != K2`;
-22. PREPARED `not-owner` is classified (promote vs settle exact D1 vs fail closed); it is not “keep forever”.
+22. PREPARED `not-owner` is classified (promote vs settle exact D1 vs fail closed); it is not “keep forever”;
+23. G2 requires G1 durable PREPARED discovery; G5 is scheduling hardening, not that first recovery root.
 
 The contract test `TestX1PhysicalLifeHandoffPlanIsDocumented` pins these
 invariants against this file and against current `processBlock` /

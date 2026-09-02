@@ -8,6 +8,13 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: G1 is the PREPARED recovery root; G5 hardens later
+
+G2 must not create durable PREPARED until G1 provides a restart-findable
+discovery root. `RecoverS3Orphans` today walks `_by_day`, not canonical
+orphans; crash between those writes plus no TTL can fence L forever until
+G4. G5 remains scheduling hardening, not that first root.
+
 ## 2026-09-02 - D0 follow-up: PREPARED not-owner must converge
 
 `not-owner` after Abort is not “keep PREPARED forever”. Classify exact D1:

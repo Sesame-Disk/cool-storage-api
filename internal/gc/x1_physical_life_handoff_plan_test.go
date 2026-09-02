@@ -77,6 +77,7 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"IF exact owner",
 		"once D(P1) is committed",
 		"not-owner` is classified",
+		"G2 requires G1 durable PREPARED discovery",
 		"Never DELETE again",
 		"no **cross-life** destructive",
 		"physical(P1) != physical(P2)",
@@ -205,12 +206,38 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		t.Fatal("PREPARED abort must not delete PREPARED from a SERIAL non-commit observation")
 	}
 
-	w2 := sectionBetween(t, text, "### W2 — Full publication continuity / R31", "### G1 — P4c-orphan exact physical lifecycle identity")
+	w2 := sectionBetween(t, text, "### W2 — Full publication continuity / R31", "### G1 — P4c-orphan exact identity + minimum durable discovery")
 	if !strings.Contains(w2, "once D(P1) is committed") {
 		t.Fatal("W2 merge criterion must be D committed")
 	}
 	if !strings.Contains(w2, "abort before D") {
 		t.Fatal("W2 must keep abort-before-D as a valid sequence that leaves P1 usable")
+	}
+
+	g1 := sectionBetween(t, text, "### G1 — P4c-orphan exact identity + minimum durable discovery", "### G2 — PREPARED → COMMITTED handoff")
+	for _, requiredG1 := range []string{
+		"before G2 creates PREPARED in production",
+		"once PREPARED exists, restart can eventually find it",
+		"RecoverS3Orphans",
+		"gc_s3_orphans_by_day",
+		"canonical PREPARED without _by_day is still found after restart",
+	} {
+		if !strings.Contains(g1, requiredG1) {
+			t.Fatalf("G1 must name %q", requiredG1)
+		}
+	}
+
+	g2 := sectionBetween(t, text, "### G2 — PREPARED → COMMITTED handoff", "### G3 — Canonical retirement after committed handoff")
+	if !strings.Contains(g2, "**Requires G1.**") {
+		t.Fatal("G2 must require G1 durable discovery before landing PREPARED")
+	}
+
+	g5 := sectionBetween(t, text, "### G5 — Recovery scheduling hardening", "### E1 — X1 final evidence / reclassification")
+	if !strings.Contains(g5, "Not the first time restart can find PREPARED") {
+		t.Fatal("G5 must not be the first PREPARED recovery root")
+	}
+	if strings.Contains(g5, "Crash/restart always finds") {
+		t.Fatal("G5 must not introduce first-time crash/restart findability; that is G1")
 	}
 }
 
