@@ -112,10 +112,12 @@ temporal premise. This PR does not turn those rows green by assumption.
 BorrowedFS through HEAD was first measured as an unguarded characterization in
 [R3-BORROWEDFS-HEAD-CHARACTERIZATION.md](R3-BORROWEDFS-HEAD-CHARACTERIZATION.md).
 W1 now productizes that handshake: the writer records own `up:<session>` for
-each distinct BorrowedFS block, validates the GC fence immediately before HEAD,
-and aborts before HEAD/fs promotion when the fence is active. W1 does not close
-the broader `up -> pub -> HEAD -> fs` crash/reconciliation interval tracked by
-R31/W2.
+each distinct BorrowedFS block, then re-validates the exact observed physical
+placement immediately before HEAD (`db.ValidateBorrowedFSPublicationAuthority`
+-- not a bare fence check, since a fence-only check cannot see a block GC has
+already fully retired), and aborts before HEAD/fs promotion when that check
+rejects the placement. W1 does not close the broader `up -> pub -> HEAD -> fs`
+crash/reconciliation interval tracked by R31/W2.
 
 ## Logical positive block delta
 

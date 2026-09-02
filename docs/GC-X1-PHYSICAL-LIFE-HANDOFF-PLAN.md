@@ -334,8 +334,9 @@ zero-proof first
 
 This is experimental evidence, **not production protocol**. Productive hooks
 are nops (`//go:build !integration`). W1 productizes the handshake in
-`CreateFileFromBlocks` (own `up:` before claim; fence immediately before HEAD).
-The hooks remain test-only.
+`CreateFileFromBlocks` (own `up:` before claim; exact-placement authority
+re-validation, not a bare fence, immediately before HEAD -- see W1 fix 1/2
+below). The hooks remain test-only.
 
 ---
 
@@ -1025,11 +1026,15 @@ rule out. The pre-HEAD check now calls the new
 exact-placement classification but reads at `BlockAuthorityAdvisory`
 (LOCAL_QUORUM). Safety here comes from ordering, not a downstream CAS: the
 caller has already durably written its own `up:<session>` pin before this
-runs, so a GC zero-proof after that pin sees it and releases, while a GC
-commit before that pin is a settled `EACH_QUORUM`+SERIAL write that
-LOCAL_QUORUM reliably observes -- the same argument `BlockDeleteFenceActive`
-already relied on at this exact pre-HEAD position. Re-proven green with the
-same leg; guarded by `TestValidateBorrowedFSFencesStaysOffSerialAuthority`.
+runs. That function's own doc comment is the source of record for the full
+four-case interleaving proof (writer-pin-first; GC claim landed but D not yet
+committed; GC fully retired P1 before the pin, where replication lag can only
+bias the read toward the conservative `Blocked` answer, never fabricate
+`Authorized`; and a released/superseded GC claim) -- summarized here only to
+avoid duplicating and drifting from it. Re-proven green with the same leg;
+guarded by `TestValidateBorrowedFSFencesStaysOffSerialAuthority` (caller picks
+the right function) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
+(that function issues Advisory, not Strong, reads).
 
 ### W2 — Full publication continuity / R31
 

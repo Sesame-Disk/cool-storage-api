@@ -8,6 +8,53 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 follow-up: fix the LOCAL_QUORUM safety proof's own wording
+
+Third review pass found no correctness blocker, but several places where the
+prose describing why `BlockAuthorityAdvisory` is safe for
+`db.ValidateBorrowedFSPublicationAuthority` was itself imprecise enough to
+mislead a future reader:
+
+- The doc comment said a `LOCAL_QUORUM` write (the `up:<session>` pin)
+  "intersects... in every DC" when read by an `EACH_QUORUM` zero-proof. A
+  `LOCAL_QUORUM` write is only guaranteed durable in the writer's own DC;
+  what actually makes this safe is that `EACH_QUORUM`'s per-DC component in
+  that same DC intersects it, and a `LIMIT 1` existence read only needs one
+  contacted replica to hold the row. Rewritten to match the precise
+  phrasing `BlockReferenceWriteConsistency`'s own doc comment already uses.
+- The two-case sketch (pin-first / GC-commit-first) skipped a real,
+  already-tested interleaving: GC's claim landing (confirmed `EACH_QUORUM`
+  visible before GC even treats it as `Acquired`) before the pin, with `D`
+  still uncommitted. Rewritten as the full four-case proof (writer-pin-first;
+  claim-before-pin-D-pending; GC-fully-retired-before-pin; released-or-superseded
+  claim), now living in exactly one place --
+  `db.ValidateBorrowedFSPublicationAuthority`'s doc comment -- with every
+  other doc pointing at it instead of carrying its own copy, so the argument
+  cannot drift out of sync with itself across files again.
+- The "GC fully retired" case claimed the terminal `Changed` state is
+  reachable "only once every one of GC's deletes has durably propagated" --
+  stronger than true (a `LOCAL_QUORUM` read only needs its own queried
+  replicas to have the tombstone, not every replica everywhere) and stronger
+  than needed for the proof. Replaced with the actual invariant: replication
+  lag on `FinalizeBlockDelete`'s or `DeleteS3Orphan`'s DELETE can only bias
+  this read toward the conservative `Blocked` answer, never fabricate a
+  false `Authorized`.
+- Corrected an undercount of the per-block cost: `AddProvisionalBlockReferenceWithExpiry`
+  is a tracker-deadline read plus a logged batch write, not a bare "pin
+  write"; combined with the two-read exact-placement check, describing it as
+  loosely "+2" understated the actual work. Described qualitatively instead
+  of with a number likely to go stale.
+- Corrected remaining "fence immediately before HEAD" phrasing describing
+  CURRENT `CreateFileFromBlocks` behavior (as opposed to historical #200 or
+  first-cut W1 text, which correctly keep "fence" as what they described at
+  the time) to "exact-placement authority validation".
+
+No runtime code changed in this pass -- `db.ValidateBorrowedFSPublicationAuthority`
+still reads at `BlockAuthorityAdvisory`, `validateBorrowedFSFences` still calls
+it, and both existing guard tests
+(`TestValidateBorrowedFSFencesStaysOffSerialAuthority`,
+`TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`) still pass.
+
 ## 2026-09-02 - W1 follow-up: drop the per-block SERIAL read on the dedup hot path
 
 Second review of the previous fix (below) found it reused

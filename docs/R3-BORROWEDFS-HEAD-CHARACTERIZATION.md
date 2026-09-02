@@ -44,16 +44,18 @@ pre-HEAD check now calls the new `db.ValidateBorrowedFSPublicationAuthority`,
 which shares `ValidateBlockRepairAuthority`'s exact-placement classification
 but reads at `BlockAuthorityAdvisory` (LOCAL_QUORUM). That is safe here for a
 different reason than the repair boundary's downstream CAS: this call's
-caller has ALREADY durably written its own `up:<session>` pin before it runs,
-so either GC's `EACH_QUORUM` zero-proof read happens after that pin is
-durable (and intersects it, so GC releases instead of committing D), or GC's
-`EACH_QUORUM`+SERIAL destructive commit already fully landed before the pin
-was written (a settled write, not one "in flight", which `BlockAuthorityAdvisory`
-reliably observes -- the same intersection argument `BlockDeleteFenceActive`
-already relies on at this exact pre-HEAD position). Re-proven green on real
-Cassandra+MinIO with the same `gcFullyRetiredBeforeLateOwnPin` leg after the
-change, and guarded going forward by
-`TestValidateBorrowedFSFencesStaysOffSerialAuthority`.
+caller has ALREADY durably written its own `up:<session>` pin before it runs.
+`db.ValidateBorrowedFSPublicationAuthority`'s own doc comment is the source of
+record for the full proof, covering every interleaving with GC (writer-pin-first;
+GC claim landed but D not yet committed; GC fully retired P1 before the pin,
+where replication lag can only bias the read toward the conservative `Blocked`
+answer and never fabricate `Authorized`; and a released/superseded GC claim) --
+summarized here only to avoid a second, driftable copy of it. Re-proven green
+on real Cassandra+MinIO with the same `gcFullyRetiredBeforeLateOwnPin` leg
+after the change, and guarded going forward by
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority` (caller picks the right
+function) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
+(that function issues Advisory, not Strong, reads).
 
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
@@ -101,9 +103,10 @@ block size.
 
 This section describes production **as of #200, before W1**. It is not current
 `CreateFileFromBlocks`. W1's production path is: own `up:<session>` after verify
-and before claim, then a BorrowedFS fence immediately before HEAD. The barrier
-functions below remain empty nops in production builds; W1's fence is a
-separate call, not inside those hooks.
+and before claim, then an exact-placement authority re-validation (not a bare
+fence -- see "Current W1 status" and "W1 fix 1" / "W1 fix 2" above) immediately
+before HEAD. The barrier functions below remain empty nops in production
+builds; W1's check is a separate call, not inside those hooks.
 
 Production `fileFromBlocksAfterVerifiedBarrier` / `AfterStagedBarrier` /
 `BeforeHeadBarrier` are empty functions in
@@ -208,11 +211,13 @@ X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wi
 measured rows above are frozen, per the note at the top of this file, and are
 NOT rewritten by what follows. W1 does NOT literally keep this verdict's `+0`
 hot-path authority-read framing for the BorrowedFS path: `CreateFileFromBlocks`
-now writes an own `up:<session>` pin and performs one `LOCAL_QUORUM`
-exact-placement read per distinct BorrowedFS block before HEAD, which is `+2`
-reads relative to that path's pre-W1 behavior, not `+0`. (SessionUpload,
-which never touches this code, remains `+0` -- see the `CreateFileFromBlocks,
-exact session up:` row in `docs/R3-LIVENESS-CONTINUITY.md`.) What W1 satisfies
+now writes an own `up:<session>` pin (`AddProvisionalBlockReferenceWithExpiry`
+-- a tracker-deadline read plus a logged batch write) and performs a bounded
+two-read `LOCAL_QUORUM` exact-placement check (`blocks` then the orphan row,
+via `db.ValidateBorrowedFSPublicationAuthority`) per distinct BorrowedFS
+block before HEAD -- real added work, not `+0`. (SessionUpload, which never
+touches this code, remains `+0` -- see the `CreateFileFromBlocks, exact
+session up:` row in `docs/R3-LIVENESS-CONTINUITY.md`.) What W1 satisfies
 instead is the operative criterion `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`
 §15 later adopted for this PR -- writer-first releases GC, GC-first blocks
 HEAD, no liveness gap, and **no accidental hot-path WAN/Paxos explosion** --
