@@ -516,29 +516,68 @@ unsafe (forbidden):
   ⇒ blocks = D1 committed, orphan PREPARED gone
 
 required:
-  Abort/Release exact P1,D1
-  IF exact owner
-  AND handoff = null
+  PREPARED(D1)
 
-  released
-    → D1 can no longer commit
-    → then remove PREPARED
-    → P1 remains canonical; writers may use it
+  D1 still exact owner AND handoff = null
+    → Abort/Release exact P1,D1
+      IF exact owner AND handoff = null
+      (competes with Commit D; only one wins)
 
-  committed / not-owner / ambiguous
-    → keep PREPARED
-    → re-observe / promote / fail closed
+      released
+        → D1 can no longer commit
+        → then remove PREPARED(D1)
+        → P1 remains canonical; writers may use it
+
+      committed (handoff true for exact D1)
+        → keep PREPARED → promote COMMITTED
+
+      ambiguous
+        → keep PREPARED → fail closed
+
+      not-owner
+        → do not treat this as a single outcome
+        → SERIAL-classify exact D1 on blocks
+          (CURRENT ReleaseBlockClaim collapses every
+          not-applied CAS to NotOwner; G2 must not)
+
+            D1 committed (exact owner + handoff true)
+              → promote PREPARED(D1) → COMMITTED
+
+            D1 irrevocably lost commit capability
+            (already released / no claim, or superseded by D2)
+              → settle/remove PREPARED(D1) only
+              → do not destroy a later D2 row
+
+            ambiguous/unavailable
+              → keep PREPARED → fail closed
 ```
 
-`Commit D` and `Abort D` compete in the same Paxos domain; only one can
-win. CURRENT `CommitBlockDeleteOrphanHandoff` applies only while the exact
-`(P,D)` still owns the row and `gc_orphan_handoff` is unset.
-`ReleaseBlockClaim` clears that ownership only under the same
-`handoff = null` guard. DECIDED abort uses that competition; it does not
-invent a weaker path.
+`not-owner` covers at least two valid recoveries. Both must converge;
+pending PREPARED must not rely on TTL, and until G4 it still fences L.
 
-SERIAL/unavailable must not be treated as abort. Until G4, a stranded
-PREPARED orphan still fences writers on L.
+```text
+Case A — abort won, crash before deleting PREPARED
+  Abort/Release D1 APPLIED
+  → crash
+  → retry Abort D1 → NotOwner
+  → D1 not owner, handoff still null
+  → settle/remove PREPARED(D1)
+
+Case B — stale takeover
+  PREPARED(D1), D1 dies
+  → D2 takes ownership (handoff still null)
+  → Abort D1 → NotOwner
+  → D1 superseded, cannot commit
+  → settle/remove PREPARED(D1); leave D2
+```
+
+Do not substitute “PREPARED prevents stale takeover”. Even then Case A
+remains. Takeover while PREPARED exists is classified, not forbidden, in
+D0; G2 may narrow it only without losing Case A.
+
+SERIAL observation that D is not yet committed, **while D1 is still exact
+owner**, must not remove PREPARED. That is the Commit race. SERIAL
+classify after Abort returned not-owner is how crash recovery converges.
 
 ### D — Commit D on `blocks`
 
@@ -822,7 +861,7 @@ SETTLED
 
 | State | Meaning |
 |-------|---------|
-| `PREPARED` | no S3 authority; abort only by CAS-revoking that exact D's commit capability (`IF exact owner AND handoff = null`), then removing PREPARED |
+| `PREPARED` | no S3 authority; abort by CAS against exact D, then remove. `not-owner` is classified: committed → promote; lost commit capability / superseded → settle that exact PREPARED; ambiguous → keep and fail closed |
 | `COMMITTED` | D transferred; authorizes only `DeleteExact(P)` of that exact P. Ambiguous or unknown DELETE stays here (`DELETE_UNCERTAIN`) and retries `DeleteExact`. |
 | `PHYSICAL_COMPLETE` | physical DELETE confirmed (success or known-absent). Never DELETE again. Only settlement to `SETTLED`. |
 | `SETTLED` | lifecycle finished; canonical recovery may be deleted explicitly |
@@ -990,12 +1029,17 @@ same L, same timestamps, distinct P/D still distinct rows
 ### G2 — PREPARED → COMMITTED handoff
 
 Write-ahead orphan. Do not retire `blocks` before COMMITTED. Implements the
-frozen PREPARED abort in C: abort CAS and Commit D compete on the same
-`blocks` partition. SERIAL observation alone must not remove PREPARED.
+frozen PREPARED abort and **not-owner classifier** in C. Abort CAS and
+Commit D compete on the same `blocks` partition. SERIAL observation while
+D1 is still owner must not remove PREPARED. After Abort returns not-owner,
+SERIAL-classify exact D1 and converge (promote, or settle that PREPARED).
 
-Crash matrix: after PREPARED; abort-vs-commit race; during D; after D before
-COMMITTED; ambiguous COMMITTED observation. Each state recoverable without
-inventing destructive authority. Ambiguous abort CAS never deletes PREPARED.
+Crash matrix: after PREPARED; abort-vs-commit race; abort applied then crash
+before PREPARED delete (Case A); stale takeover while PREPARED(D1) (Case B);
+during D; after D before COMMITTED; ambiguous COMMITTED observation. Each
+state recoverable without inventing destructive authority. Ambiguous abort
+CAS never deletes PREPARED. A stranded PREPARED(D1) whose D1 cannot commit
+must not depend on TTL to disappear.
 
 ### G3 — Canonical retirement after committed handoff
 
@@ -1183,10 +1227,11 @@ Do not merge this docs PR unless:
 15. activation is explicitly outside X1 closure;
 16. G3 does not claim productive P2 install; G4 owns `blocks=P2` + `orphan=P1`;
 17. `PHYSICAL_COMPLETE` never authorizes another DELETE;
-18. PREPARED abort CAS-revokes exact D's commit capability before removing PREPARED; SERIAL-only observe-then-delete is forbidden;
+18. PREPARED abort CAS-revokes exact D's commit capability before removing PREPARED; SERIAL-only observe-then-delete while D1 is still owner is forbidden;
 19. W2's irreversible frontier is `D committed`, not zero-proof;
 20. D0 does not claim “no physical ABA”; H stays OPEN;
-21. minted lives are `K1 != K2`, not `normally K1 != K2`.
+21. minted lives are `K1 != K2`, not `normally K1 != K2`;
+22. PREPARED `not-owner` is classified (promote vs settle exact D1 vs fail closed); it is not “keep forever”.
 
 The contract test `TestX1PhysicalLifeHandoffPlanIsDocumented` pins these
 invariants against this file and against current `processBlock` /

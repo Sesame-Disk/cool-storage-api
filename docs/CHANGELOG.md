@@ -8,6 +8,13 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: PREPARED not-owner must converge
+
+`not-owner` after Abort is not “keep PREPARED forever”. Classify exact D1:
+committed → promote; already released or superseded by D2 → settle that
+PREPARED; ambiguous → fail closed. Crash after a won abort (Case A) and
+stale takeover (Case B) must converge without TTL.
+
 ## 2026-09-02 - D0 follow-up: PREPARED abort CAS vs Commit; W2 at D committed
 
 PREPARED abort must CAS-revoke exact D's commit capability on `blocks`

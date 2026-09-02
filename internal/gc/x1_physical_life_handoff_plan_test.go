@@ -76,6 +76,7 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"Abort/Release exact P1,D1",
 		"IF exact owner",
 		"once D(P1) is committed",
+		"not-owner` is classified",
 		"Never DELETE again",
 		"no **cross-life** destructive",
 		"physical(P1) != physical(P2)",
@@ -187,11 +188,18 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"Abort/Release exact P1,D1",
 		"AND handoff = null",
 		"D1 can no longer commit",
-		"SERIAL observation that D is not yet committed does **not**",
+		"SERIAL observation that D is not yet committed",
+		"irrevocably lost commit capability",
+		"Case A — abort won, crash before deleting PREPARED",
+		"Case B — stale takeover",
+		"do not destroy a later D2 row",
 	} {
 		if !strings.Contains(prepared, requiredAbort) {
 			t.Fatalf("PREPARED abort must name %q", requiredAbort)
 		}
+	}
+	if strings.Contains(prepared, "committed / not-owner / ambiguous") {
+		t.Fatal("PREPARED not-owner must be classified, not kept as a single bucket")
 	}
 	if strings.Contains(prepared, "D never committed     → abort: settle/remove PREPARED") {
 		t.Fatal("PREPARED abort must not delete PREPARED from a SERIAL non-commit observation")

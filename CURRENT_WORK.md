@@ -194,7 +194,9 @@ after E1. `GC_ENABLED=false`.
 **D0 follow-up (2026-09-02):** G3 vacates `blocks` while writers stay fenced until
 G4. `PHYSICAL_COMPLETE` is confirmed DELETE only (ambiguous stays COMMITTED).
 PREPARED abort CAS-revokes exact D's commit capability before removing the
-orphan; a SERIAL non-commit observation is not enough. W2's irreversible
+orphan; a SERIAL non-commit observation while D1 still owns must not delete
+it. After Abort returns not-owner, classify exact D1 (promote, settle that
+PREPARED, or fail closed) so Case A/B converge without TTL. W2's irreversible
 frontier is `D committed`, not zero-proof. Minted lives are `K1 != K2`. D0
 does not claim “no physical ABA”; H stays OPEN.
 
