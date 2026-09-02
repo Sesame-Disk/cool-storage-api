@@ -42,7 +42,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		var attempt gcpkg.BlockDeleteAuthority
 		var sawPub bool
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.dropForeignFS(t)
 				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "head-after-cut"))
@@ -74,7 +74,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 
 	t.Run("currentPubRevokesZeroProof", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() { fx.dropForeignFS(t) },
 			func() {
 				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
@@ -105,7 +105,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 	t.Run("currentPubAfterZeroProof", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		var attempt gcpkg.BlockDeleteAuthority
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.dropForeignFS(t)
 				attempt = x1Attempt(fx.target, "pub-after-zero")
@@ -139,7 +139,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 
 	t.Run("harnessWriterWins", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.pinSessionUpload(t)
 				fx.dropForeignFS(t)
@@ -155,7 +155,17 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 				}
 			},
 			func() {},
-			func() error { return nil },
+			func() error {
+				fx.assertOwnPinVisible(t, store, "harnessWriterWins: pin must remain visible at beforeHead")
+				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
+				if err != nil {
+					t.Fatalf("harnessWriterWins: BlockDeleteFenceActive: %v", err)
+				}
+				if fenced {
+					t.Fatal("harnessWriterWins: expected no active fence before HEAD")
+				}
+				return nil
+			},
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusOK {
@@ -165,7 +175,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 		if !x1HasFSReferrer(t, database, fx.orgUUID, fx.blockID) {
 			t.Fatal("harnessWriterWins: expected fs: after promote")
 		}
-		t.Log("harnessWriterWins: own up:<session> pin before zero-proof revoked the authorizing read; HEAD+fs: landed. Harness is not production protocol.")
+		t.Log("harnessWriterWins: own up:<session> pin before zero-proof revoked the authorizing read and remained visible at beforeHead with no fence; HEAD+fs: landed. Harness is not production protocol.")
 		borrowedFSHeadEvidence.harnessWriterWins = true
 	})
 
@@ -173,7 +183,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		var attempt gcpkg.BlockDeleteAuthority
 		var headCalled bool
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.dropForeignFS(t)
 				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "harness-cut"))
@@ -208,7 +218,7 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		var attempt gcpkg.BlockDeleteAuthority
 		var sawPub bool
-		borrowedFSInstallBarriers(t,
+		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.dropForeignFS(t)
 				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "harness-late-pub"))
@@ -241,6 +251,57 @@ func TestBorrowedFSHeadCharacterization(t *testing.T) {
 		fx.assertDUnrevoked(t, attempt)
 		t.Log("harnessLatePubStillFenced: post-cut pub: landed; fence still aborted HEAD. Harness is not production protocol.")
 		borrowedFSHeadEvidence.harnessLatePubStillFenced = true
+	})
+
+	t.Run("harnessLatePinStillFenced", func(t *testing.T) {
+		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
+		var attempt gcpkg.BlockDeleteAuthority
+		var sawPub bool
+		borrowedFSInstallBarriers(t, fx,
+			func() {
+				fx.dropForeignFS(t)
+				attempt = x1Attempt(fx.target, "harness-late-pin")
+				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
+				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
+				if err != nil || hasRefs {
+					t.Fatalf("harnessLatePinStillFenced: zero-proof = %v %v", hasRefs, err)
+				}
+				fx.pinSessionUpload(t)
+				fx.assertOwnPinVisible(t, store, "harnessLatePinStillFenced: late up:<session> after zero-proof must land")
+				handoff, err := store.CommitBlockDeleteOrphanHandoff(fx.orgUUID, fx.blockID, attempt)
+				if err != nil || (handoff.Outcome != gcpkg.BlockDeleteHandoffCommitted && handoff.Outcome != gcpkg.BlockDeleteHandoffAlreadyCommitted) {
+					t.Fatalf("harnessLatePinStillFenced: handoff after late pin = %s %v", handoff.Outcome, err)
+				}
+			},
+			func() {
+				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
+					t.Fatal("harnessLatePinStillFenced: expected pub: after stage")
+				}
+				sawPub = true
+			},
+			func() error {
+				fx.assertOwnPinVisible(t, store, "harnessLatePinStillFenced: late pin must remain visible at beforeHead")
+				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
+				if err != nil {
+					t.Fatalf("harnessLatePinStillFenced: BlockDeleteFenceActive: %v", err)
+				}
+				if !fenced {
+					t.Fatal("harnessLatePinStillFenced: expected active fence despite late pin")
+				}
+				return v2pkg.ErrBlockDeleteInProgress
+			},
+		)
+		rec := fx.commit(t)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("harnessLatePinStillFenced: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
+		}
+		if !sawPub {
+			t.Fatal("harnessLatePinStillFenced: afterStaged did not observe pub:")
+		}
+		fx.assertHeadUnchanged(t)
+		fx.assertDUnrevoked(t, attempt)
+		t.Log("harnessLatePinStillFenced: late up:<session> after zero-proof did not revoke D; fence still aborted HEAD. Harness is not production protocol.")
+		borrowedFSHeadEvidence.harnessLatePinStillFenced = true
 	})
 
 	gate.observed = borrowedFSHeadEvidence.complete()
@@ -356,9 +417,9 @@ func borrowedFSSeedPhysical(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, c
 	return blockID, sha1ID, key
 }
 
-func borrowedFSInstallBarriers(t *testing.T, afterVerified, afterStaged func(), beforeHead func() error) {
+func borrowedFSInstallBarriers(t *testing.T, fx *borrowedFSHeadFixture, afterVerified, afterStaged func(), beforeHead func() error) {
 	t.Helper()
-	t.Cleanup(v2pkg.SetFileFromBlocksPublicationBarriersForTest(afterVerified, afterStaged, beforeHead))
+	t.Cleanup(v2pkg.SetFileFromBlocksPublicationBarriersForTest(fx.repoID, afterVerified, afterStaged, beforeHead))
 }
 
 func (fx *borrowedFSHeadFixture) dropForeignFS(t *testing.T) {
@@ -376,6 +437,18 @@ func (fx *borrowedFSHeadFixture) pinSessionUpload(t *testing.T) {
 		fx.orgID, fx.blockID, referrer, fx.repoID, fx.storageClass, expiresAt,
 	); err != nil {
 		t.Fatalf("pin up:<session>: %v", err)
+	}
+}
+
+func (fx *borrowedFSHeadFixture) assertOwnPinVisible(t *testing.T, store *gcpkg.CassandraStore, msg string) {
+	t.Helper()
+	hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
+	if err != nil || !hasRefs {
+		t.Fatalf("%s: BlockHasReferencesGlobal visible=%v err=%v", msg, hasRefs, err)
+	}
+	exists, err := store.BlockReferenceExists(fx.orgUUID, fx.blockID, dbpkg.BlockReferrerForUpload(fx.sessionID))
+	if err != nil || !exists {
+		t.Fatalf("%s: up:<session> exists=%v err=%v", msg, exists, err)
 	}
 }
 

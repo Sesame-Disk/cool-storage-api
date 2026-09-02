@@ -965,7 +965,7 @@ docker compose --profile test run --rm --build gotest bash scripts/x1-nonoverlap
 ```
 
 BorrowedFS HEAD characterization (`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`)
-is a separate six-leg gate. It does not inflate X1's 15 legs. Directed run:
+is a separate seven-leg gate. It does not inflate X1's 15 legs. Directed run:
 
 ```bash
 docker compose --profile test run --rm --build \
@@ -977,7 +977,7 @@ docker compose --profile test run --rm --build \
   -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
   -e SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1 \
   go-integration-test \
-  go test -tags integration -run '^TestBorrowedFSHead' -v -count=1 -timeout 15m ./internal/integration
+  go test -tags integration -run '^TestBorrowedFSHead|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
 ### P4b orphan publication evidence

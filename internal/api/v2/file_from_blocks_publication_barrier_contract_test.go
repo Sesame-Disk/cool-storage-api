@@ -10,49 +10,86 @@ import (
 )
 
 func TestFileFromBlocksPublicationBarriersDefaultNop(t *testing.T) {
-	fileFromBlocksAfterVerifiedBarrier()
-	fileFromBlocksAfterStagedBarrier()
-	if err := fileFromBlocksBeforeHeadBarrier(); err != nil {
+	fileFromBlocksAfterVerifiedBarrier("repo")
+	fileFromBlocksAfterStagedBarrier("repo")
+	if err := fileFromBlocksBeforeHeadBarrier("repo"); err != nil {
 		t.Fatalf("default beforeHead barrier = %v, want nil", err)
 	}
 }
 
-func TestSetFileFromBlocksPublicationBarriersForTestRestores(t *testing.T) {
-	called := false
-	restore := SetFileFromBlocksPublicationBarriersForTest(func() { called = true }, nil, nil)
-	fileFromBlocksAfterVerifiedBarrier()
-	if !called {
-		t.Fatal("installed afterVerified barrier was not invoked")
+func TestFileFromBlocksPublicationBarriersProdAreEmpty(t *testing.T) {
+	path := r3SourcePath("internal", "api", "v2", "file_from_blocks_publication_barriers.go")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read production barriers: %v", err)
 	}
-	restore()
-	called = false
-	fileFromBlocksAfterVerifiedBarrier()
-	if called {
-		t.Fatal("afterVerified barrier leaked after restore")
+	text := string(raw)
+	if !strings.Contains(text, "//go:build !integration") {
+		t.Fatal("R3 BARRIER: production barrier file must be //go:build !integration")
 	}
-}
-
-func TestFileFromBlocksPublicationBarriersAreNopFuncLits(t *testing.T) {
-	_, file := parseV2ProductionFile(t, "file_from_blocks.go")
-	for _, name := range []string{
-		"fileFromBlocksAfterVerifiedFn",
-		"fileFromBlocksAfterStagedFn",
-		"fileFromBlocksBeforeHeadFn",
+	for _, forbidden := range []string{
+		"sync.Mutex",
+		"SetFileFromBlocksPublicationBarriersForTest",
+		"BlockDeleteFenceActive",
+		"ProbeBlockReuse",
 	} {
-		lit := fileFromBlocksBarrierFuncLit(t, file, name)
-		ast.Inspect(lit, func(node ast.Node) bool {
-			switch value := node.(type) {
-			case *ast.CallExpr:
-				t.Fatalf("R3 BARRIER: default %s must be a nop FuncLit; found call %s", name, r3CallName(value))
-			case *ast.Ident:
-				switch value.Name {
-				case "BlockDeleteFenceActive", "ProbeBlockReuse", "BlockHasReferencesGlobal",
-					"Query", "Session", "AddBlockReference", "AddProvisionalBlockReferenceWithExpiry":
-					t.Fatalf("R3 BARRIER: default %s must not mention %s", name, value.Name)
-				}
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("R3 BARRIER: production barriers must not contain %s", forbidden)
+		}
+	}
+	_, file := parseV2ProductionFile(t, "file_from_blocks_publication_barriers.go")
+	for _, name := range []string{
+		"fileFromBlocksAfterVerifiedBarrier",
+		"fileFromBlocksAfterStagedBarrier",
+		"fileFromBlocksBeforeHeadBarrier",
+	} {
+		fn := productionFunc(t, file, name)
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if _, ok := node.(*ast.CallExpr); ok {
+				t.Fatalf("R3 BARRIER: production %s must be an empty nop", name)
 			}
 			return true
 		})
+	}
+}
+
+func TestFileFromBlocksPublicationBarriersIntegrationIsTagged(t *testing.T) {
+	prod := r3SourcePath("internal", "api", "v2", "file_from_blocks.go")
+	files := r3SourcePath("internal", "api", "v2", "files.go")
+	for _, path := range []string{prod, files} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		text := string(raw)
+		for _, forbidden := range []string{
+			"SetFileFromBlocksPublicationBarriersForTest",
+			"fileFromBlocksBarrierMu",
+			"fileFromBlocksAfterVerifiedFn",
+		} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("R3 BARRIER: production %s must not contain %s", path, forbidden)
+			}
+		}
+	}
+
+	path := r3SourcePath("internal", "api", "v2", "file_from_blocks_publication_barriers_integration.go")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read integration barriers: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "//go:build integration") {
+		t.Fatal("R3 BARRIER: integration barriers must be //go:build integration")
+	}
+	for _, required := range []string{
+		"SetFileFromBlocksPublicationBarriersForTest",
+		"sync.Mutex",
+		"hooks.repoID != repoID",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("R3 BARRIER: integration barriers missing %q", required)
+		}
 	}
 }
 
@@ -66,6 +103,7 @@ func TestFileFromBlocksAfterVerifiedBarrierIsBetweenVerifyAndClaim(t *testing.T)
 		t.Fatal("R3 BARRIER: fileFromBlocksAfterVerifiedBarrier must run after verify and before ClaimBlockUploadSessionForCommit")
 	}
 	assertFnDoesNotCall(t, fn, "CreateFileFromBlocks", "BlockDeleteFenceActive", "ProbeBlockReuse")
+	assertBarrierArgIsRepoID(t, fn, "CreateFileFromBlocks", "fileFromBlocksAfterVerifiedBarrier")
 }
 
 func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
@@ -79,6 +117,8 @@ func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
 		t.Fatal("R3 BARRIER: afterStaged must follow stagePendingPublishedFiles and beforeHead must sit immediately before UpdateLibraryHeadFromSnapshot")
 	}
 	assertFnDoesNotCall(t, fn, "finalizeStoredUploadMetadataOnce", "BlockDeleteFenceActive", "ProbeBlockReuse")
+	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksAfterStagedBarrier")
+	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
 }
 
 func TestBorrowedFSHeadCharacterizationNamesArePinned(t *testing.T) {
@@ -95,10 +135,20 @@ func TestBorrowedFSHeadCharacterizationNamesArePinned(t *testing.T) {
 		"harnessWriterWins",
 		"harnessCutAfterClassify",
 		"harnessLatePubStillFenced",
+		"harnessLatePinStillFenced",
 	} {
 		needle := `t.Run("` + name + `"`
 		if !strings.Contains(text, needle) {
 			t.Fatalf("BorrowedFS HEAD characterization is missing named leg %s", name)
+		}
+	}
+	for _, needle := range []string{
+		"pin must remain visible at beforeHead",
+		"expected no active fence before HEAD",
+		"late up:<session> after zero-proof",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("BorrowedFS HEAD handshake characterization is missing %q", needle)
 		}
 	}
 	if strings.Contains(text, "worker.go") {
@@ -117,34 +167,15 @@ func parseV2ProductionFile(t *testing.T, name string) (*token.FileSet, *ast.File
 	return fset, parsed
 }
 
-func fileFromBlocksBarrierFuncLit(t *testing.T, file *ast.File, name string) *ast.FuncLit {
+func productionFunc(t *testing.T, file *ast.File, name string) *ast.FuncDecl {
 	t.Helper()
 	for _, decl := range file.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range gen.Specs {
-			values, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-			for i, ident := range values.Names {
-				if ident.Name != name {
-					continue
-				}
-				if i >= len(values.Values) {
-					t.Fatalf("R3 BARRIER: %s has no initializer", name)
-				}
-				lit, ok := values.Values[i].(*ast.FuncLit)
-				if !ok {
-					t.Fatalf("R3 BARRIER: %s must be initialized with a FuncLit, got %T", name, values.Values[i])
-				}
-				return lit
-			}
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == name {
+			return fn
 		}
 	}
-	t.Fatalf("R3 BARRIER: %s not found", name)
+	t.Fatalf("R3 BARRIER: function %s not found", name)
 	return nil
 }
 
@@ -163,5 +194,25 @@ func assertFnDoesNotCall(t *testing.T, fn *ast.FuncDecl, scope string, forbidden
 		if len(calls[name]) > 0 {
 			t.Fatalf("R3 BARRIER: %s must not call %s; fence/probe stay out of the productive publication path", scope, name)
 		}
+	}
+}
+
+func assertBarrierArgIsRepoID(t *testing.T, fn *ast.FuncDecl, scope, name string) {
+	t.Helper()
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || r3CallName(call) != name || len(call.Args) != 1 {
+			return true
+		}
+		ident, ok := call.Args[0].(*ast.Ident)
+		if !ok || ident.Name != "repoID" {
+			t.Fatalf("R3 BARRIER: %s %s must pass repoID so hooks stay fixture-scoped", scope, name)
+		}
+		found = true
+		return true
+	})
+	if !found {
+		t.Fatalf("R3 BARRIER: %s must call %s(repoID)", scope, name)
 	}
 }

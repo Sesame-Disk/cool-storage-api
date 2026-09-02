@@ -3757,7 +3757,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 		return "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", newCommitID, err)
 	}
-	fileFromBlocksAfterStagedBarrier()
+	fileFromBlocksAfterStagedBarrier(repoID)
 	if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); err != nil {
 		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
 		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
@@ -3777,7 +3777,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		)
 	}
 
-	if err := fileFromBlocksBeforeHeadBarrier(); err != nil {
+	if err := fileFromBlocksBeforeHeadBarrier(repoID); err != nil {
 		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
 		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
 		return "", 0, 0, errors.Join(err, cleanupErr, clearErr)

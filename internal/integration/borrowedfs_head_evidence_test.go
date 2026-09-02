@@ -22,6 +22,7 @@ type borrowedFSHeadEvidenceState struct {
 	harnessWriterWins          bool
 	harnessCutAfterClassify    bool
 	harnessLatePubStillFenced  bool
+	harnessLatePinStillFenced  bool
 }
 
 func (state borrowedFSHeadEvidenceState) namedLegs() []struct {
@@ -38,6 +39,7 @@ func (state borrowedFSHeadEvidenceState) namedLegs() []struct {
 		{"harnessWriterWins", state.harnessWriterWins},
 		{"harnessCutAfterClassify", state.harnessCutAfterClassify},
 		{"harnessLatePubStillFenced", state.harnessLatePubStillFenced},
+		{"harnessLatePinStillFenced", state.harnessLatePinStillFenced},
 	}
 }
 
@@ -51,7 +53,7 @@ func (state borrowedFSHeadEvidenceState) complete() bool {
 }
 
 func (state borrowedFSHeadEvidenceState) missing() []string {
-	missing := make([]string, 0, 6)
+	missing := make([]string, 0, 7)
 	for _, leg := range state.namedLegs() {
 		if !leg.seen {
 			missing = append(missing, leg.name)
@@ -85,7 +87,7 @@ func TestBorrowedFSHeadEvidenceRequiresEveryNamedLeg(t *testing.T) {
 	if partial.complete() {
 		t.Fatal("partial BorrowedFS HEAD evidence must not satisfy the package gate")
 	}
-	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "currentPubRevokesZeroProof") || !strings.Contains(got, "harnessLatePubStillFenced") {
+	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "currentPubRevokesZeroProof") || !strings.Contains(got, "harnessLatePubStillFenced") || !strings.Contains(got, "harnessLatePinStillFenced") {
 		t.Fatalf("missing() must name absent legs individually, got %q", got)
 	}
 	full := borrowedFSHeadEvidenceState{
@@ -95,9 +97,10 @@ func TestBorrowedFSHeadEvidenceRequiresEveryNamedLeg(t *testing.T) {
 		harnessWriterWins:          true,
 		harnessCutAfterClassify:    true,
 		harnessLatePubStillFenced:  true,
+		harnessLatePinStillFenced:  true,
 	}
-	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 6 {
-		t.Fatalf("all 6 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))
+	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 7 {
+		t.Fatalf("all 7 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))
 	}
 	twice := full
 	twice.currentHeadAfterCut = true
@@ -123,6 +126,8 @@ func TestBorrowedFSHeadCharacterizationIsDocumented(t *testing.T) {
 		"harnessWriterWins",
 		"harnessCutAfterClassify",
 		"harnessLatePubStillFenced",
+		"harnessLatePinStillFenced",
+		"integration-only",
 		"last dangerous point",
 		"not production protocol",
 		"BorrowedFS",

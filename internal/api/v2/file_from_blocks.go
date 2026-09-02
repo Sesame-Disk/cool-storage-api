@@ -41,65 +41,6 @@ const (
 
 const blockVerifyConcurrency = 20
 
-// Publication barriers are nop in production. Integration tests replace them to
-// inject GC between BorrowedFS classification, pub: staging, and HEAD without
-// adding authority reads to the productive path.
-var (
-	fileFromBlocksBarrierMu        sync.Mutex
-	fileFromBlocksAfterVerifiedFn  = func() {}
-	fileFromBlocksAfterStagedFn    = func() {}
-	fileFromBlocksBeforeHeadFn     = func() error { return nil }
-)
-
-// SetFileFromBlocksPublicationBarriersForTest installs process-local publication
-// barriers for in-process CreateFileFromBlocks characterization. The returned
-// restore function must run from t.Cleanup. HTTP commits in other processes are
-// unaffected.
-func SetFileFromBlocksPublicationBarriersForTest(afterVerified, afterStaged func(), beforeHead func() error) func() {
-	fileFromBlocksBarrierMu.Lock()
-	previousVerified := fileFromBlocksAfterVerifiedFn
-	previousStaged := fileFromBlocksAfterStagedFn
-	previousHead := fileFromBlocksBeforeHeadFn
-	if afterVerified != nil {
-		fileFromBlocksAfterVerifiedFn = afterVerified
-	}
-	if afterStaged != nil {
-		fileFromBlocksAfterStagedFn = afterStaged
-	}
-	if beforeHead != nil {
-		fileFromBlocksBeforeHeadFn = beforeHead
-	}
-	fileFromBlocksBarrierMu.Unlock()
-	return func() {
-		fileFromBlocksBarrierMu.Lock()
-		fileFromBlocksAfterVerifiedFn = previousVerified
-		fileFromBlocksAfterStagedFn = previousStaged
-		fileFromBlocksBeforeHeadFn = previousHead
-		fileFromBlocksBarrierMu.Unlock()
-	}
-}
-
-func fileFromBlocksAfterVerifiedBarrier() {
-	fileFromBlocksBarrierMu.Lock()
-	fn := fileFromBlocksAfterVerifiedFn
-	fileFromBlocksBarrierMu.Unlock()
-	fn()
-}
-
-func fileFromBlocksAfterStagedBarrier() {
-	fileFromBlocksBarrierMu.Lock()
-	fn := fileFromBlocksAfterStagedFn
-	fileFromBlocksBarrierMu.Unlock()
-	fn()
-}
-
-func fileFromBlocksBeforeHeadBarrier() error {
-	fileFromBlocksBarrierMu.Lock()
-	fn := fileFromBlocksBeforeHeadFn
-	fileFromBlocksBarrierMu.Unlock()
-	return fn()
-}
-
 const (
 	blockUploadCommitInProgressCode               = "commit_in_progress"
 	blockUploadCommittedDifferentFileConflictCode = "session_committed_different_file"
@@ -456,7 +397,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
-	fileFromBlocksAfterVerifiedBarrier()
+	fileFromBlocksAfterVerifiedBarrier(repoID)
 
 	// externalBlockIDs is the ordered SHA-1 list written into the file fs_object so
 	// the desktop/mobile Seafile client can parse and download the file. Each SHA-1
