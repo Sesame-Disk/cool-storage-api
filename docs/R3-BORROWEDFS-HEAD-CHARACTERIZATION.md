@@ -1,9 +1,61 @@
-# R3 BorrowedFS HEAD characterization
+# R3 BorrowedFS HEAD characterization (historical)
 
-**Accepted architecture (2026-09-02):** this is experimental evidence for
-writer W1, **not production protocol**. Productive publication barriers remain
-nops. X1 closure architecture:
+**Historical snapshot:** this document preserves the experimental evidence for
+writer W1, **not production protocol**, from the characterization parent below.
+Its measured rows and verdict are not rewritten by the productization that
+follows. X1 closure architecture:
 [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+
+**Current W1 status (2026-09-02):** `CreateFileFromBlocks` now upgrades each
+distinct BorrowedFS block to its own `up:<session>` provisional reference before
+claiming the session, then re-validates the exact observed physical placement
+immediately before the library HEAD CAS via
+`db.ValidateBorrowedFSPublicationAuthority` (`BlockAuthorityAdvisory` /
+LOCAL_QUORUM — not the SERIAL repair boundary; see the second W1 fix below). If
+liveness or that authority check fails, the request stops before HEAD and
+`fs:` promotion. The eight-leg product evidence gate is
+`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is separate from the
+historical characterization below. R31 remains open, X1 remains OPEN, and
+`GC_ENABLED=false` remains the fleet-wide deployment rule.
+
+**W1 fix 1 (2026-09-02):** a review found that the original fence-only check
+(`BlockDeleteFenceActive`) cannot see the terminal state where GC has ALREADY
+fully retired a block between this commit's earlier verification and the
+pre-HEAD check: once `FinalizeBlockDelete` has removed the canonical row and
+the orphan has settled (`DeleteS3Orphan`), there is no `gc_state='deleting'`
+row and no orphan row left to report a fence, yet the placement this commit
+observed no longer exists. The pre-HEAD check now re-validates the exact
+observed `(storage_class, storage_key)`; that outcome's `Changed` case
+(canonical row absent, or now naming a different placement) catches this
+window, and its `Blocked` case is a strict superset of the old fence check.
+Proven red without the fix / green with it on real Cassandra+MinIO by the
+`gcFullyRetiredBeforeLateOwnPin` leg below.
+
+**W1 fix 2 (2026-09-02):** fix 1's first cut re-validated exact placement via
+the existing `ValidateBlockRepairAuthority`, which reads at
+`BlockAuthorityStrong` (SERIAL) -- a per-call global Paxos round trip that
+[`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md`](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+documents as reserved for the cold pre-PUT repair boundary and deliberately
+kept off the dedup path (`TestP3SerialReadsStayOffTheDedupPath`). A large
+deduplicated commit referencing hundreds/thousands of distinct BorrowedFS
+blocks would have paid that many Paxos round trips before HEAD -- exactly the
+"accidental hot-path WAN/Paxos explosion" the W1 merge criteria rule out. The
+pre-HEAD check now calls the new `db.ValidateBorrowedFSPublicationAuthority`,
+which shares `ValidateBlockRepairAuthority`'s exact-placement classification
+but reads at `BlockAuthorityAdvisory` (LOCAL_QUORUM). That is safe here for a
+different reason than the repair boundary's downstream CAS: this call's
+caller has ALREADY durably written its own `up:<session>` pin before it runs.
+`db.ValidateBorrowedFSPublicationAuthority`'s own doc comment is the source of
+record for the full proof, covering every interleaving with GC (writer-pin-first;
+GC claim landed but D not yet committed; GC fully retired P1 before the pin,
+where replication lag can only bias the read toward the conservative `Blocked`
+answer and never fabricate `Authorized`; and a released/superseded GC claim) --
+summarized here only to avoid a second, driftable copy of it. Re-proven green
+on real Cassandra+MinIO with the same `gcFullyRetiredBeforeLateOwnPin` leg
+after the change, and guarded going forward by
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority` (caller picks the right
+function) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
+(that function issues Advisory, not Strong, reads).
 
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
@@ -13,7 +65,8 @@ F0b/F2, no orphan/020, no `GC_ENABLED` change.
 **Production/fleet status:** X1 remains OPEN. R3 remains OPEN. Destructive GC remains
 disabled for deployment (`GC_ENABLED=false` fleet-wide).
 
-The real Cassandra+MinIO evidence gate is `SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1`.
+The historical real Cassandra+MinIO evidence gate was
+`SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1`.
 `TestMain` requires all **7 named legs** after `m.Run()`. Completeness is `missing()` by
 name, never a counter. A missing stack or a skip cannot report green when the gate is armed.
 
@@ -46,13 +99,21 @@ see them. The fixture therefore:
 A single small file is valid as the only/final block versus the 8MiB session
 block size.
 
-## Productive seams (integration-only hooks, +0 protocol)
+## Historical (#200) productive seams (integration-only hooks, +0 protocol)
+
+This section describes production **as of #200, before W1**. It is not current
+`CreateFileFromBlocks`. W1's production path is: own `up:<session>` after verify
+and before claim, then an exact-placement authority re-validation (not a bare
+fence -- see "Current W1 status" and "W1 fix 1" / "W1 fix 2" above) immediately
+before HEAD. The barrier functions below remain empty nops in production
+builds; W1's check is a separate call, not inside those hooks.
 
 Production `fileFromBlocksAfterVerifiedBarrier` / `AfterStagedBarrier` /
 `BeforeHeadBarrier` are empty functions in
 `file_from_blocks_publication_barriers.go` (`//go:build !integration`): no
 mutex, no callback table, no setter. The Docker `sesamefs` image is a normal
-build, so `UploadFile` sharing `finalizeStoredUploadMetadataOnce` stays a nop.
+build, so `UploadFile` sharing `finalizeStoredUploadMetadataOnce` stays a nop
+at those barrier sites.
 
 Integration builds replace that file with
 `file_from_blocks_publication_barriers_integration.go`. The setter exists only
@@ -145,3 +206,25 @@ choose a production continuity protocol that keeps the +0 hot-path
 authority-read contract.
 
 X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wide.
+
+**W1 productization (2026-09-02):** this document's own historical verdict and
+measured rows above are frozen, per the note at the top of this file, and are
+NOT rewritten by what follows. W1 does NOT literally keep this verdict's `+0`
+hot-path authority-read framing for the BorrowedFS path: `CreateFileFromBlocks`
+now writes an own `up:<session>` pin (`AddProvisionalBlockReferenceWithExpiry`
+-- a tracker-deadline read plus a logged batch write) and performs a bounded
+two-read `LOCAL_QUORUM` exact-placement check (`blocks` then the orphan row,
+via `db.ValidateBorrowedFSPublicationAuthority`) per distinct BorrowedFS
+block before HEAD -- real added work, not `+0`. (SessionUpload, which never
+touches this code, remains `+0` -- see the `CreateFileFromBlocks, exact
+session up:` row in `docs/R3-LIVENESS-CONTINUITY.md`.) What W1 satisfies
+instead is the operative criterion `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`
+§15 later adopted for this PR -- writer-first releases GC, GC-first blocks
+HEAD, no liveness gap, and **no accidental hot-path WAN/Paxos explosion** --
+which bounds the added cost to `LOCAL_QUORUM` reads rather than requiring
+literally zero. See "Current W1 status" and "W1 fix 1" / "W1 fix 2" above for
+what was actually built. The eight-leg
+`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1` gate is the current
+record of that production behavior; this note records how the later,
+bounded-cost criterion was met without rewriting the historical
+`PROMISING_WITH_PREREQUISITE` verdict itself.

@@ -769,6 +769,68 @@ func (db *DB) ValidateBlockRepairAuthority(orgID, blockID string, expected Block
 	return outcome, err
 }
 
+// ValidateBorrowedFSPublicationAuthority re-validates that blocks(L) still
+// names the exact physical placement `expected` immediately before a
+// BorrowedFS writer may publish HEAD. It shares BlockRepairAuthorityOutcome's
+// classification (Authorized / Blocked / Changed / Permanent / Unknown) with
+// ValidateBlockRepairAuthority, but reads at BlockAuthorityAdvisory
+// (LOCAL_QUORUM), not BlockAuthorityStrong (SERIAL).
+//
+// That is safe here for a DIFFERENT reason than the other Advisory callers'
+// downstream CAS: this call has no downstream mutation on the block to fall
+// back on -- once it says Authorized, HEAD publishes unconditionally. What
+// makes Advisory safe here is ORDERING plus the shape of the two possible
+// staleness directions, not a CAS. By the time this runs, the caller has
+// ALREADY durably written its own up:<session> reference
+// (BlockReferenceWriteConsistency = LOCAL_QUORUM: acknowledged by a quorum of
+// replicas in the writer's own datacenter; propagation to other DCs is not
+// guaranteed by the time the write returns). Four cases cover every
+// interleaving with GC:
+//
+//  1. GC's zero-proof read (BlockHasReferencesGlobal, EACH_QUORUM) happens
+//     after that pin is durable. EACH_QUORUM queries a quorum of replicas in
+//     EVERY datacenter, including the writer's own -- so its component in
+//     the writer's DC necessarily intersects the LOCAL_QUORUM that
+//     acknowledged the pin there (the same argument BlockReferenceWriteConsistency's
+//     doc comment makes for the general case), and a LIMIT-1 existence read
+//     only needs one contacted replica, in any one of those per-DC
+//     components, to hold the row. GC therefore observes the reference and
+//     releases the claim instead of committing D. This block can never
+//     become fenced by that attempt, regardless of what this read sees.
+//  2. GC's claim already landed (ClaimBlockDelete, EACH_QUORUM+SERIAL)
+//     before the pin was written, but D has not committed yet. GC does not
+//     even treat its own claim as Acquired until it has independently
+//     confirmed that exact claim visible at EACH_QUORUM (P4a claim
+//     visibility; see confirmSettledBlockClaimVisibility /
+//     maybeConfirmCommittedOwnerEachQuorum in internal/gc), so by the time
+//     zero-proof can run at all, gc_state='deleting' is already a settled
+//     EACH_QUORUM-visible write -- the same kind of write case 1 shows a
+//     LOCAL_QUORUM read reliably intersects. This read therefore observes
+//     gc_state='deleting' -> Blocked.
+//  3. GC has already fully retired P1 (D committed, orphan published,
+//     Finalize's row DELETE, and the settled orphan DELETE all applied)
+//     before the pin was written. FinalizeBlockDelete and DeleteS3Orphan do
+//     not themselves pin EACH_QUORUM -- only the LWT's serial phase -- so
+//     this read's specific replicas may or may not have received either
+//     delete yet; that is a per-replica question, not an every-DC one, and
+//     this function makes no claim about global propagation. What matters is
+//     the direction of the two possible outcomes: if this read's replicas
+//     have NOT yet received a given delete, they still hold the prior
+//     committed state (blocks(L) with gc_state='deleting', or the orphan row
+//     not yet cleared) -> Blocked. If they HAVE received it, that delete is
+//     one this read's own replicas actually applied, not a hypothetical
+//     future one -> Changed once both deletes are visible there. Neither
+//     direction can manufacture a false Authorized for the observed P1: a
+//     replica cannot report a row absent before it has itself received the
+//     tombstone that removed it.
+//  4. GC's claim was released or taken over before D committed: a
+//     released/superseded claim can no longer reach the irreversible commit,
+//     so it cannot later produce a fence this read would need to catch.
+func (db *DB) ValidateBorrowedFSPublicationAuthority(orgID, blockID string, expected BlockPhysicalLocation) (BlockRepairAuthorityOutcome, error) {
+	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected, BlockAuthorityAdvisory)
+	return outcome, err
+}
+
 func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation, mode BlockAuthorityRead) (blockRepairAuthorityRow, BlockRepairAuthorityOutcome, error) {
 	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
 		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block id %q is not a canonical lower-case SHA-256", blockID)

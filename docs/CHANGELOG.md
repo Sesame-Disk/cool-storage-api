@@ -8,6 +8,121 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 follow-up: fix the LOCAL_QUORUM safety proof's own wording
+
+Third review pass found no correctness blocker, but several places where the
+prose describing why `BlockAuthorityAdvisory` is safe for
+`db.ValidateBorrowedFSPublicationAuthority` was itself imprecise enough to
+mislead a future reader:
+
+- The doc comment said a `LOCAL_QUORUM` write (the `up:<session>` pin)
+  "intersects... in every DC" when read by an `EACH_QUORUM` zero-proof. A
+  `LOCAL_QUORUM` write is only guaranteed durable in the writer's own DC;
+  what actually makes this safe is that `EACH_QUORUM`'s per-DC component in
+  that same DC intersects it, and a `LIMIT 1` existence read only needs one
+  contacted replica to hold the row. Rewritten to match the precise
+  phrasing `BlockReferenceWriteConsistency`'s own doc comment already uses.
+- The two-case sketch (pin-first / GC-commit-first) skipped a real,
+  already-tested interleaving: GC's claim landing (confirmed `EACH_QUORUM`
+  visible before GC even treats it as `Acquired`) before the pin, with `D`
+  still uncommitted. Rewritten as the full four-case proof (writer-pin-first;
+  claim-before-pin-D-pending; GC-fully-retired-before-pin; released-or-superseded
+  claim), now living in exactly one place --
+  `db.ValidateBorrowedFSPublicationAuthority`'s doc comment -- with every
+  other doc pointing at it instead of carrying its own copy, so the argument
+  cannot drift out of sync with itself across files again.
+- The "GC fully retired" case claimed the terminal `Changed` state is
+  reachable "only once every one of GC's deletes has durably propagated" --
+  stronger than true (a `LOCAL_QUORUM` read only needs its own queried
+  replicas to have the tombstone, not every replica everywhere) and stronger
+  than needed for the proof. Replaced with the actual invariant: replication
+  lag on `FinalizeBlockDelete`'s or `DeleteS3Orphan`'s DELETE can only bias
+  this read toward the conservative `Blocked` answer, never fabricate a
+  false `Authorized`.
+- Corrected an undercount of the per-block cost: `AddProvisionalBlockReferenceWithExpiry`
+  is a tracker-deadline read plus a logged batch write, not a bare "pin
+  write"; combined with the two-read exact-placement check, describing it as
+  loosely "+2" understated the actual work. Described qualitatively instead
+  of with a number likely to go stale.
+- Corrected remaining "fence immediately before HEAD" phrasing describing
+  CURRENT `CreateFileFromBlocks` behavior (as opposed to historical #200 or
+  first-cut W1 text, which correctly keep "fence" as what they described at
+  the time) to "exact-placement authority validation".
+
+No runtime code changed in this pass -- `db.ValidateBorrowedFSPublicationAuthority`
+still reads at `BlockAuthorityAdvisory`, `validateBorrowedFSFences` still calls
+it, and both existing guard tests
+(`TestValidateBorrowedFSFencesStaysOffSerialAuthority`,
+`TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`) still pass.
+
+## 2026-09-02 - W1 follow-up: drop the per-block SERIAL read on the dedup hot path
+
+Second review of the previous fix (below) found it reused
+`ValidateBlockRepairAuthority`, which reads at `BlockAuthorityStrong`
+(SERIAL) -- a global Paxos round trip that
+`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md` documents as reserved for
+the cold pre-PUT repair boundary and deliberately kept off the dedup path
+(`TestP3SerialReadsStayOffTheDedupPath`). Calling it once per BorrowedFS block
+immediately before HEAD would turn a large deduplicated commit into
+hundreds/thousands of global Paxos round trips, contradicting the W1 merge
+criterion against an "accidental hot-path WAN/Paxos explosion." Added
+`db.ValidateBorrowedFSPublicationAuthority`, which shares the same
+exact-placement classification (`Authorized`/`Blocked`/`Changed`/`Permanent`)
+but reads at `BlockAuthorityAdvisory` (LOCAL_QUORUM); safety comes from the
+caller having already durably written its own `up:<session>` pin before this
+runs, not from a downstream CAS -- the same ordering argument
+`BlockDeleteFenceActive` already relied on at this exact pre-HEAD position.
+Re-proven green on real Cassandra+MinIO with the same
+`gcFullyRetiredBeforeLateOwnPin` leg, and guarded going forward by the new
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority`. Also confirmed the PR's
+GitHub `mergeable`/`mergeStateStatus` is currently clean, contradicting a
+review claim to the contrary; the PR description text is still stale
+("delete fence" / "seven-leg gate") and needs a manual update.
+
+## 2026-09-02 - W1 fix: exact-placement re-validation before HEAD (review finding)
+
+Review of the W1 PR found that its pre-HEAD `BlockDeleteFenceActive` check
+cannot see the terminal state where GC has ALREADY fully retired a BorrowedFS
+block (`FinalizeBlockDelete` + settled `DeleteS3Orphan`) between this commit's
+earlier verification and the pre-HEAD check: with no `gc_state='deleting'` row
+and no orphan row left, the fence reports false even though the placement this
+commit observed is gone. `validateBorrowedFSFences` now re-validates the exact
+observed `(storage_class, storage_key)` via `ValidateBlockRepairAuthority`
+(`BlockAuthorityStrong` / SERIAL) instead of a bare fence check, closing the
+gap while remaining a strict superset of the old check. Reproduced red without
+the fix and green with it on real Cassandra+MinIO
+(`gcFullyRetiredBeforeLateOwnPin`, the new eighth named leg). Also fixed:
+`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`'s historical `#200` verdict had
+been silently rewritten from `PROMISING_WITH_PREREQUISITE` to `PROMISING`,
+contradicting the document's own "not rewritten" freeze note; restored the
+historical verdict and recorded the W1 productization as a separate note.
+Also fixed a pre-existing, unrelated data race in
+`TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks` (concurrent map
+write in the test's own mock, not production code).
+
+## 2026-09-02 - W1 PR closeout: historical seams, fence-abort `pub:` cleanup
+
+Marked the #200 productive-seams diagram as historical (before W1). GC-first
+and late-pin legs now require that a staged `pub:` is gone after the 409.
+Status docs no longer say the commit is pending.
+
+## 2026-09-02 - W1 BorrowedFS own-liveness productization
+
+**Superseded below by later same-day entries above**: the fence check and leg
+count described here were revised twice more this same day (exact-placement
+re-validation, then the LOCAL_QUORUM correction, ending at eight named legs).
+Left as written for session history; see the entries above for current state.
+
+`CreateFileFromBlocks` now establishes an own `up:<session>` provisional
+reference for each distinct BorrowedFS block before claiming the upload session,
+and validates the BorrowedFS delete fence immediately before the library HEAD
+CAS. Liveness/fence failures stop publication before HEAD and `fs:` promotion.
+The seven-leg real Cassandra+MinIO evidence gate, full unit suite, full
+integration suite, race test, vet, production build, API scripts and OIDC
+scripts pass. R31/W2 and X1 remain open; `GC_ENABLED=false` remains required.
+
+---
+
 ## 2026-09-02 - D0 follow-up: G1 is the PREPARED recovery root; G5 hardens later
 
 G2 must not create durable PREPARED until G1 provides a restart-findable

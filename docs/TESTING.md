@@ -964,8 +964,11 @@ binary. Perl is installed in `Dockerfile.gotest`. Run:
 docker compose --profile test run --rm --build gotest bash scripts/x1-nonoverlap-mutation-validation.sh
 ```
 
-BorrowedFS HEAD characterization (`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`)
-is a separate seven-leg gate. It does not inflate X1's 15 legs. Directed run:
+BorrowedFS W1 own-liveness evidence is a separate eight-leg gate. The original
+HEAD characterization remains a historical report in
+`docs/R3-BORROWEDFS-HEAD-CHARACTERIZATION.md`; W1's production behavior is covered
+by `internal/integration/borrowedfs_own_liveness_test.go`. It does not inflate
+X1's 15 legs. Directed run:
 
 ```bash
 docker compose --profile test run --rm --build \
@@ -975,9 +978,9 @@ docker compose --profile test run --rm --build \
   -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
   -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
   -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
-  -e SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1 \
+  -e SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1 \
   go-integration-test \
-  go test -tags integration -run '^TestBorrowedFSHead|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+  go test -tags integration -run '^TestBorrowedFSOwnLiveness|^TestBorrowedFSHeadCharacterizationIsDocumented$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
 X1 physical-life handoff plan (`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`) is a

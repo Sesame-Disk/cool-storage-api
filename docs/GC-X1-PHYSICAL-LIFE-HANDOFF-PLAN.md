@@ -333,7 +333,10 @@ zero-proof first
 ```
 
 This is experimental evidence, **not production protocol**. Productive hooks
-are nops (`//go:build !integration`). Writer productization is W1.
+are nops (`//go:build !integration`). W1 productizes the handshake in
+`CreateFileFromBlocks` (own `up:` before claim; exact-placement authority
+re-validation, not a bare fence, immediately before HEAD -- see W1 fix 1/2
+below). The hooks remain test-only.
 
 ---
 
@@ -994,6 +997,44 @@ Docs freeze. No runtime.
 ### W1 — BorrowedFS own-liveness
 
 Productize #200. No GC/orphan schema.
+
+**Current status (2026-09-02):** implemented in this PR. `CreateFileFromBlocks`
+establishes `up:<session>` for each distinct BorrowedFS block before session
+claim and re-validates the exact observed physical placement immediately
+before HEAD (after `pub:` may already be staged — the #200 handshake, not the
+§14 full-writer ideal). Fence abort must drop that `pub:`. R31/W2 and X1
+remain open; keep `GC_ENABLED=false` fleet-wide.
+
+**W1 fix 1 (2026-09-02):** a bare `BlockDeleteFenceActive` check cannot see the
+terminal state where GC has already fully retired a block (Finalize + settled
+orphan): no `gc_state='deleting'` row and no orphan row are left to report a
+fence, yet the placement this commit observed is gone. The pre-HEAD check now
+re-validates the exact observed `(storage_class, storage_key)`, whose
+`Blocked`/`Changed` outcomes are a strict superset of the old fence check.
+Proven red without the fix and green with it on real Cassandra+MinIO by the
+`gcFullyRetiredBeforeLateOwnPin` leg.
+
+**W1 fix 2 (2026-09-02):** fix 1's first cut reused `ValidateBlockRepairAuthority`,
+which reads at `BlockAuthorityStrong` (SERIAL) -- reserved by
+`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md` for the cold pre-PUT
+repair boundary and kept off the dedup path
+(`TestP3SerialReadsStayOffTheDedupPath`). Calling it once per BorrowedFS block
+would pay one global Paxos round trip per block on this dedup hot path,
+exactly the "accidental hot-path WAN/Paxos explosion" the W1 merge criteria
+rule out. The pre-HEAD check now calls the new
+`db.ValidateBorrowedFSPublicationAuthority`, which shares the same
+exact-placement classification but reads at `BlockAuthorityAdvisory`
+(LOCAL_QUORUM). Safety here comes from ordering, not a downstream CAS: the
+caller has already durably written its own `up:<session>` pin before this
+runs. That function's own doc comment is the source of record for the full
+four-case interleaving proof (writer-pin-first; GC claim landed but D not yet
+committed; GC fully retired P1 before the pin, where replication lag can only
+bias the read toward the conservative `Blocked` answer, never fabricate
+`Authorized`; and a released/superseded GC claim) -- summarized here only to
+avoid duplicating and drifting from it. Re-proven green with the same leg;
+guarded by `TestValidateBorrowedFSFencesStaysOffSerialAuthority` (caller picks
+the right function) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
+(that function issues Advisory, not Strong, reads).
 
 ### W2 — Full publication continuity / R31
 

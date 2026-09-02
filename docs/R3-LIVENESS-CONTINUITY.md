@@ -93,9 +93,9 @@ reached.
 | Sync retry from another pod within the same provisional TTL | Same durable deterministic `up:` | Original PutBlock performed it | Retry stages a new attempt-local `pub:` | Cross-pod is not itself a gap; remaining TTL and association with this commit are unproven at HEAD | sync retry/finalize call chain | `CONDITIONAL` |
 | Sync commit whose block had no associated PutBlock | None proven for this commit | None attributable | Staging may resolve IDs and write `pub:` | The commit graph does not prove that this writer ever held pre-publication liveness | `RecvFS`, commit delta builder and staging | `UNKNOWN` |
 | `recv-fs-before-put` | FS object may arrive before bytes/metadata; no own upload pin yet | No materialization fence at RecvFS | Publication and later PutBlock are separate protocol events | Exact ordering between commit publication, mapping resolution, and later PutBlock needs a focused protocol trace; endpoint success alone is not liveness proof | `RecvFS`; `TestSyncRecvFSBeforePutBlockPublishesDownloadableFile` | `UNKNOWN` |
-| `CreateFileFromBlocks`, exact session `up:` | Session-owned `up:`, aligned nominally to 48h | Commit performs reuse/ownership checks | `pub:` is staged later | Pin can approach expiry between verification and `pub:`; no minimum remaining TTL is required | `classifyBlockForCommit`, `classifyBlockOwnership`, session commit | `CONDITIONAL` |
-| `CreateFileFromBlocks`, foreign `fs:` reuse | Foreign permanent ref | Probe/ownership check is before own `pub:` | Later attempt `pub:` | `foreign fs observed -> foreign fs removed -> GC claim -> refs=0 -> writer pub` | ownership accepts `fs:`; publication is a later step | `UNGUARDED` |
-| Dedup via foreign `fs:` where the publication path establishes no own `up:` | Foreign `fs:` | Pre-publication observation only | Later own `pub:` | Same last-foreign-ref interleaving as above; this excludes funnels such as `UploadFile` that register an own pin after reuse | `CreateFileFromBlocks` ownership path, block reference model and GC fs-object cascade | `UNGUARDED` |
+| `CreateFileFromBlocks`, exact session `up:` | Session-owned `up:`, aligned nominally to 48h | No additional BorrowedFS fence/pin path | `pub:` is staged later | The existing session liveness path remains unchanged; publication continuity after `pub:` is still an R31 concern | `classifyBlockForCommit`, `classifyBlockOwnership`, session commit | `CONDITIONAL`; W1 preserves the +0 path |
+| `CreateFileFromBlocks`, foreign `fs:` reuse | Foreign permanent ref, upgraded to own `up:<session>` before session claim | Bounded exact-placement re-validation (`db.ValidateBorrowedFSPublicationAuthority`, `BlockAuthorityAdvisory`/LOCAL_QUORUM -- safety comes from the own pin already being durable, not from a downstream CAS) immediately before HEAD | `stagePendingPublishedFiles` writes `pub:` after the own pin | `foreign fs observed -> own up -> foreign fs removed -> GC claim`: EACH_QUORUM sees `up`; if D is already committed, or if GC has already fully retired the placement (Finalize + settled orphan, which a bare fence check cannot see), the pre-HEAD check returns `ErrBlockDeleteInProgress` and HEAD does not occur | W1 eight-leg real Cassandra+MinIO evidence and unit contracts | `CONDITIONAL`; W1 proven through HEAD, R31 remains |
+| Dedup via foreign `fs:` with W1 own liveness | Own `up:<session>` is established once per distinct borrowed SHA-256 | Same bounded final exact-placement check, only for BorrowedFS | Later attempt-local `pub:` | Retries reuse the same `up:<session>` key; foreign `pub:` never supplies initial liveness | `CreateFileFromBlocks` provenance handoff and W1 integration evidence | `CONDITIONAL`; no liveness gap through HEAD |
 | Cross-repo copy/move | Source-repo `fs:` borrowed by destination writer | No destination-owned post-pin fence | Destination `pub:` | Concurrent source deletion/retention GC can remove the borrowed ref; no cross-repo lease is demonstrated | `copyFSObjectToLibraryForPublish`, `processSingleItem` | `UNKNOWN` |
 | Repair after HEAD is visible | Existing `pub:` plus durable pending publication record, when present | Not a pre-HEAD materialization decision | Promotes permanent `fs:` | This is R31 convergence, not evidence that the original pre-HEAD R3 interval was continuous | pending published files and sync repair paths | `CONDITIONAL` / separate R31 concern |
 
@@ -109,11 +109,15 @@ R3 publication continuity here.
 The table intentionally records `UNKNOWN` where a source walk has not proved a
 temporal premise. This PR does not turn those rows green by assumption.
 
-BorrowedFS through HEAD is now measured separately in
+BorrowedFS through HEAD was first measured as an unguarded characterization in
 [R3-BORROWEDFS-HEAD-CHARACTERIZATION.md](R3-BORROWEDFS-HEAD-CHARACTERIZATION.md).
-That follow-up does not close this inventory: `CreateFileFromBlocks` foreign
-`fs:` remains `UNGUARDED` here, and the test-only harness is not production
-protocol.
+W1 now productizes that handshake: the writer records own `up:<session>` for
+each distinct BorrowedFS block, then re-validates the exact observed physical
+placement immediately before HEAD (`db.ValidateBorrowedFSPublicationAuthority`
+-- not a bare fence check, since a fence-only check cannot see a block GC has
+already fully retired), and aborts before HEAD/fs promotion when that check
+rejects the placement. W1 does not close the broader `up -> pub -> HEAD -> fs`
+crash/reconciliation interval tracked by R31/W2.
 
 ## Logical positive block delta
 

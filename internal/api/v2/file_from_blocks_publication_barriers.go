@@ -6,6 +6,8 @@ package v2
 // Integration builds replace this file with file_from_blocks_publication_barriers_integration.go.
 func fileFromBlocksAfterVerifiedBarrier(string) {}
 
+func fileFromBlocksAfterBorrowedLivenessBarrier(string) {}
+
 func fileFromBlocksAfterStagedBarrier(string) {}
 
 func fileFromBlocksBeforeHeadBarrier(string) error { return nil }
