@@ -3,6 +3,10 @@
 **Accepted architecture (2026-09-02):** this document is characterization
 evidence, not the closure plan. The candidate “keep P1 canonical until
 `DeleteExact(K1)`, then Finalize” is **not** the accepted D0 architecture.
+#199 already used independent physical lives (`P1`/`P2`, `K1`/`K2`; #185 had
+merged). It characterized a **deliberately conservative** keep-`blocks(P1)`
+strategy anyway. D0 supersedes that strategy because durable exact handoff
+keeps authority on P1 without leaving `blocks(P1)` canonical through cleanup.
 Orphan after a confirmed handoff **is** the accepted post-`blocks` delete
 authority; that supersedes Prerequisite B’s “orphan/020 as discovery, not
 delete authority” as a target. Measured results below are unchanged

@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -67,6 +68,10 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"orphan PREPARED",
 		"orphan COMMITTED owns retirement of P1",
 		"P1 cleanup may overlap P2 life",
+		"deliberately conservative strategy",
+		"independent physical lives",
+		"writers stay fenced until G4",
+		"G4 owns `blocks=P2` + `orphan=P1`",
 	}
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {
@@ -100,7 +105,7 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		}
 	}
 
-	decidedSection := sectionBetween(t, text, "## 10. DECIDED handoff protocol", "## 11. P2 may be born immediately after Finalize")
+	decidedSection := sectionBetween(t, text, "## 10. DECIDED handoff protocol", "## 11. Finalize frees `blocks(L)`; writers stay fenced until G4")
 	for _, requiredDecided := range []string{"PREPARED", "COMMITTED", "CommitBlockDeleteHandoff"} {
 		if !strings.Contains(decidedSection, requiredDecided) {
 			t.Fatalf("DECIDED protocol section must name %q", requiredDecided)
@@ -108,6 +113,45 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 	}
 	if !strings.Contains(decidedSection, "Not current `processBlock`") {
 		t.Fatal("DECIDED protocol must say it is not current processBlock")
+	}
+
+	if strings.Contains(text, "while physical identity was still reusable") {
+		t.Fatal("#199 already used independent lives after #185; D0 must not explain strict non-overlap as leftover reusable physical identity")
+	}
+	if strings.Contains(text, "## 11. P2 may be born immediately after Finalize") {
+		t.Fatal("section 11 must not treat Finalize as writer permission to install P2")
+	}
+
+	g3 := sectionBetween(t, text, "### G3 — Canonical retirement after committed handoff", "### G4 — Remove orphan from writer fencing; detach post-D refs")
+	for _, forbidden := range []string{
+		"After Finalize, P2 may install",
+		"This PR must demonstrate `blocks=P2`",
+	} {
+		if strings.Contains(g3, forbidden) {
+			t.Fatalf("G3 must not claim writer permission or the coexistence demonstration: %q", forbidden)
+		}
+	}
+	for _, requiredG3 := range []string{
+		"blocks(L)` is architecturally free",
+		"Writers are still blocked",
+		"not productive until G4",
+	} {
+		if !strings.Contains(g3, requiredG3) {
+			t.Fatalf("G3 must name %q", requiredG3)
+		}
+	}
+
+	g4 := sectionBetween(t, text, "### G4 — Remove orphan from writer fencing; detach post-D refs", "### G5 — Recovery scheduling hardening")
+	for _, requiredG4 := range []string{
+		"This PR must demonstrate `blocks=P2` + `orphan=P1` is a valid state",
+		"ProbeBlockReuse",
+		"BlockDeleteFenceActive",
+		"ValidateBlockRepairAuthority",
+		"Only after W1+W2+G3",
+	} {
+		if !strings.Contains(g4, requiredG4) {
+			t.Fatalf("G4 must name %q", requiredG4)
+		}
 	}
 }
 
@@ -183,23 +227,175 @@ func TestX1PhysicalLifeHandoffCurrentOrphanIdentityAndTTL(t *testing.T) {
 }
 
 func TestX1PhysicalLifeHandoffCurrentWriterStillFencesOnOrphan(t *testing.T) {
-	path := filepath.Join("..", "db", "block_references.go")
-	raw, err := os.ReadFile(path)
+	_, file := x1ParseFile(t, "internal", "db", "block_references.go")
+	const orphanSelect = "SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?"
+	const probeHelper = "probeBlockReuseHasS3OrphanFn"
+	const fenceHelper = "blockDeleteFenceHasS3OrphanFn"
+	const repairHelper = "blockRepairHasS3OrphanFn"
+
+	x1RequireOrphanFenceOnProbeBlockReuse(t, x1Func(t, file, "ProbeBlockReuse"), probeHelper)
+
+	fence := x1Func(t, file, "BlockDeleteFenceActive")
+	orphanCall := x1FirstCallIn(t, fence.Body, "BlockDeleteFenceActive", fenceHelper)
+	ast.Inspect(fence.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || ret.Pos() >= orphanCall {
+			return true
+		}
+		if x1ReturnFalseNil(ret) {
+			t.Fatal("BlockDeleteFenceActive must not return false,nil before consulting the orphan fence; a rowless read is not an early no-fence")
+		}
+		return true
+	})
+
+	_ = x1FirstCallIn(t, x1Func(t, file, "ValidateBlockRepairAuthority").Body, "ValidateBlockRepairAuthority", "validateBlockRepairAuthority")
+	_ = x1FirstCallIn(t, x1Func(t, file, "validateBlockRepairAuthority").Body, "validateBlockRepairAuthority", repairHelper)
+	_ = x1FirstCallIn(t, x1Func(t, file, "RepairBlockMetadataIfCurrent").Body, "RepairBlockMetadataIfCurrent", "validateBlockRepairAuthority")
+	_ = x1FirstCallIn(t, x1Func(t, file, "RepairReleasedBlockStub").Body, "RepairReleasedBlockStub", probeHelper)
+
+	for _, name := range []string{probeHelper, fenceHelper, repairHelper} {
+		lit := x1AssignedFuncLit(t, file, name)
+		if !x1NodeContainsString(lit, orphanSelect) {
+			t.Fatalf("%s must SELECT gc_s3_orphans by (org_id, block_id); D0 must not claim G4 already landed", name)
+		}
+	}
+
+	raw, err := os.ReadFile(x1SourcePath("internal", "db", "block_references.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(raw)
-	for _, fn := range []string{"ProbeBlockReuse", "BlockDeleteFenceActive", "ValidateBlockRepairAuthority"} {
-		if !strings.Contains(text, "func (db *DB) "+fn+"(") {
-			t.Fatalf("%s not found in block_references.go", fn)
-		}
-	}
-	if !strings.Contains(text, "SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?") {
-		t.Fatal("CURRENT writer fence still keys gc_s3_orphans by (org_id, block_id); D0 must not claim G4 already landed")
-	}
-	if !strings.Contains(text, "pending gc_s3_orphans row as an active fence") {
+	if !strings.Contains(string(raw), "pending gc_s3_orphans row as an active fence") {
 		t.Fatal("BlockDeleteFenceActive must still document the transitional orphan-as-fence role")
 	}
+}
+
+func x1RequireOrphanFenceOnProbeBlockReuse(t *testing.T, fn *ast.FuncDecl, helper string) {
+	t.Helper()
+	var sawNotFound, sawStub bool
+	pastStub := false
+	liveCalls := 0
+	for _, stmt := range fn.Body.List {
+		ifstmt, ok := stmt.(*ast.IfStmt)
+		switch {
+		case ok && x1UnaryNotIdent(ifstmt.Cond, "found"):
+			if x1CountCalls(ifstmt.Body, helper) < 1 {
+				t.Fatal("rowless ProbeBlockReuse must call probeBlockReuseHasS3OrphanFn")
+			}
+			sawNotFound = true
+		case ok && x1IsCreatedAtNil(ifstmt.Cond):
+			if x1CountCalls(ifstmt.Body, helper) < 1 {
+				t.Fatal("stub ProbeBlockReuse must call probeBlockReuseHasS3OrphanFn")
+			}
+			sawStub = true
+			pastStub = true
+		case pastStub:
+			liveCalls += x1CountCalls(stmt, helper)
+		}
+	}
+	if !sawNotFound || !sawStub {
+		t.Fatal("ProbeBlockReuse must keep distinct rowless and stub branches, each consulting the orphan fence")
+	}
+	if liveCalls < 1 {
+		t.Fatal("canonical ProbeBlockReuse path must call probeBlockReuseHasS3OrphanFn; D0 must not claim G4 already landed")
+	}
+}
+
+func x1AssignedFuncLit(t *testing.T, file *ast.File, name string) *ast.FuncLit {
+	t.Helper()
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, ident := range vs.Names {
+				if ident.Name != name {
+					continue
+				}
+				if i >= len(vs.Values) {
+					t.Fatalf("%s has no initializer", name)
+				}
+				lit, ok := vs.Values[i].(*ast.FuncLit)
+				if !ok {
+					t.Fatalf("%s is not a function literal", name)
+				}
+				return lit
+			}
+		}
+	}
+	t.Fatalf("%s not found", name)
+	return nil
+}
+
+func x1CountCalls(node ast.Node, name string) int {
+	if node == nil {
+		return 0
+	}
+	n := 0
+	ast.Inspect(node, func(x ast.Node) bool {
+		call, ok := x.(*ast.CallExpr)
+		if ok && x1CallName(call) == name {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+func x1NodeContainsString(node ast.Node, needle string) bool {
+	found := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		if strings.Contains(lit.Value, needle) {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+func x1ReturnFalseNil(ret *ast.ReturnStmt) bool {
+	if len(ret.Results) != 2 {
+		return false
+	}
+	a, okA := ret.Results[0].(*ast.Ident)
+	b, okB := ret.Results[1].(*ast.Ident)
+	return okA && okB && a.Name == "false" && b.Name == "nil"
+}
+
+func x1UnaryNotIdent(cond ast.Expr, name string) bool {
+	u, ok := cond.(*ast.UnaryExpr)
+	if !ok || u.Op != token.NOT {
+		return false
+	}
+	id, ok := u.X.(*ast.Ident)
+	return ok && id.Name == name
+}
+
+func x1IsCreatedAtNil(cond ast.Expr) bool {
+	bin, ok := cond.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.EQL {
+		return false
+	}
+	return (x1SelectorNamed(bin.X, "CreatedAt") && x1IdentNamed(bin.Y, "nil")) ||
+		(x1SelectorNamed(bin.Y, "CreatedAt") && x1IdentNamed(bin.X, "nil"))
+}
+
+func x1SelectorNamed(expr ast.Expr, name string) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == name
+}
+
+func x1IdentNamed(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == name
 }
 
 func sectionBetween(t *testing.T, text, start, end string) string {

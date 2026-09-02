@@ -179,11 +179,13 @@ Committed/AlreadyCommitted. P4b-1's write-once script stays
 is not closed here). `GC_ENABLED=false`.
 
 **D0 update (2026-09-02):** #199 (strict non-overlap characterization) and #200
-(BorrowedFS HEAD characterization) are merged as evidence-only PRs. The accepted
-closure architecture is now physical-life handoff: orphan becomes durable DELETE
-authority for exact `(P,D)` *after* a confirmed handoff, `blocks(P1)` may retire
-before `DeleteExact(K1)`, and P2 may overlap P1 cleanup because `P1 != P2`.
-Source of record: [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+(BorrowedFS HEAD characterization) are merged as evidence-only PRs. #199 already
+reasoned with independent physical lives after #185; it characterized a
+conservative keep-`blocks(P1)`-until-delete strategy, which D0 supersedes
+because durable exact handoff keeps authority on P1 without leaving `blocks(P1)`
+canonical through cleanup. G3 Finalize vacates `blocks(L)` while `orphan(Pold)`
+still fences writers; productive `blocks=P2` + `orphan=P1` is G4. Source of
+record: [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
 **Still CURRENT/TRANSITIONAL:** orphan `(org,L)` writer fence, Finalize-before-S3,
 recovery ref re-check, P4c-orphan PK, 90-day orphan TTL. R31 OPEN. H not
 reclassified. R18/R27 pending re-evaluation. 020 stays. Activation remains A1

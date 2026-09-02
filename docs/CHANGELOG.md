@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: G3/G4 split, #199 history, writer-fence contract
+
+Corrected the frozen architecture: G3 Finalize frees `blocks(L)` but writers
+remain fenced by `orphan(Pold)`; G4 is the fence removal and the
+`blocks=P2` + `orphan=P1` demonstration. #199 characterized a conservative
+strategy after #185 independent lives; it did not depend on reusable physical
+identity. Writer-fence contract test AST-pins each named path to its
+`gc_s3_orphans` helper.
+
 ## 2026-09-02 - D0: freeze X1 physical-life handoff architecture
 
 Accepted X1 closure architecture is now

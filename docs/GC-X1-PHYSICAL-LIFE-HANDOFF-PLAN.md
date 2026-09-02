@@ -45,8 +45,15 @@ Do not quote a `#199` candidate harness step as production.
 until `DeleteExact(K1)` finishes, and only then may Finalize remove the
 canonical row.
 
-That question was the right conservative reading **while physical identity was
-still reusable**. It is the wrong end-state once P2/#185 made lives independent.
+#199 already reasoned with independent physical lives. #185 (minted
+single-use incarnations; `P1`/`P2`, `K1`/`K2`) had merged before that
+characterization. The candidate was a **deliberately conservative strategy
+even with those independent lives**: keep `blocks(P1)` canonical until
+physical retirement.
+
+#201 supersedes that strategy because a durable exact handoff
+(`orphan COMMITTED(P1,D1)`) keeps authority over P1 without leaving
+`blocks(P1)` as the canonical row through cleanup.
 
 #199's candidate harness used:
 
@@ -207,8 +214,9 @@ authority that was in `blocks`.
 existence of a `gc_s3_orphans` row for `(org, L)` makes
 `ProbeBlockReuse` return `BlockedByGC`, `BlockDeleteFenceActive` return true,
 and `ValidateBlockRepairAuthority` return `Blocked`. That is why orphan was
-used as a mutex on L. The accepted architecture ends that use after W1+W2+G3
-(see G4).
+used as a mutex on L. G4 removes that use, and only after W1+W2+G3. Until
+G4, Finalize may vacate `blocks(L)` while writers remain fenced by the
+orphan.
 
 ---
 
@@ -281,6 +289,9 @@ The orphan half remains open: `P4c-orphan` (`CURRENT / TRANSITIONAL` and
 `gc_claimed_at` are payload, not identity. Two lives of one L still collide.
 
 ### #199 — characterization, not protocol
+
+Conservative protocol characterization **after** independent physical lives
+already existed. It was not forced by reusable `K`.
 
 Demonstrated:
 
@@ -530,31 +541,35 @@ the physical delete. `blocks` is no longer required for P1.
 
 ---
 
-## 11. P2 may be born immediately after Finalize
+## 11. Finalize frees `blocks(L)`; writers stay fenced until G4
 
-Once `blocks(L)` is absent, a new writer may:
+G3 after `orphan COMMITTED(P1,D1)`:
 
 ```text
-mint P2/K2
-→ install blocks(L)=P2
+FinalizeBlockDelete(P1,D1)
 ```
 
-even while `orphan(P1,D1,COMMITTED)` exists, because `P1 != P2` and `K1 != K2`.
+From that point `blocks(L)` is no longer required for P1. The canonical slot
+is vacant. That is **not** writer permission to mint and install P2.
 
-This state is explicitly valid (`DECIDED`):
+`CURRENT / TRANSITIONAL`: `InstallBlockMetadata` is still a plain
+`INSERT IF NOT EXISTS` and does not consult `gc_s3_orphans`. The writer fence
+is the **read** (`ProbeBlockReuse` / `BlockDeleteFenceActive` /
+`ValidateBlockRepairAuthority`). Any `gc_s3_orphans` row for `(org, L)` still
+blocks those paths. While that fence remains, a well-formed writer cannot
+productively install P2.
+
+The accepted productive state
 
 ```text
 blocks(L)=P2/K2
 gc_s3_orphans contains P1/K1/D1
 ```
 
-Not a dangerous overlap. It is the benefit of unique physical lives.
-
-`CURRENT / TRANSITIONAL`: `InstallBlockMetadata` is still a plain
-`INSERT IF NOT EXISTS` and does not consult `gc_s3_orphans`. The writer fence
-is the **read** (`ProbeBlockReuse` / `BlockDeleteFenceActive`), so a well-formed
-current lifecycle still blocks P2 while the orphan row for L exists. G4 is what
-removes that mutex.
+is `DECIDED`, and it is **G4's** demonstration, not G3's. G4 is also what
+removes the orphan-as-L mutex. W2 is a hard gate for that overlap (late
+publication must not recreate dependence on condemned P1). W2 is **not** a
+gate for G3 Finalize: until G4, `orphan(Pold)` still fences writers.
 
 ---
 
@@ -908,15 +923,22 @@ COMMITTED. Each state recoverable without inventing destructive authority.
 orphan COMMITTED(P1,D1) → Finalize blocks(P1,D1)
 ```
 
-After Finalize, P2 may install. Physical delete of P1 is authorized by orphan.
-It may still be attempted inline, but semantically it belongs to recovery:
+After Finalize, `blocks(L)` is architecturally free: P1 is no longer
+canonical, and `orphan COMMITTED(P1,D1)` is the complete durable authority
+to finish P1. Writers are still blocked if `orphan(P1)` remains an L-fence.
+
+Do **not** treat `blocks=P2` + `orphan=P1` as a G3 result. That coexistence
+is not productive until G4 removes the writer fence.
+
+Physical delete of P1 is authorized by orphan. It may still be attempted
+inline, but semantically it belongs to recovery:
 
 ```text
 DeleteExact(K1) → PHYSICAL_COMPLETE → SETTLED
 ```
 
 A crash after Finalize is not dangerous because orphan COMMITTED already
-exists. This PR must demonstrate `blocks=P2` + `orphan=P1` is a valid state.
+exists.
 
 ### G4 — Remove orphan from writer fencing; detach post-D refs
 
@@ -926,9 +948,16 @@ Change `ProbeBlockReuse`, `BlockDeleteFenceActive`, and
 `ValidateBlockRepairAuthority` so mere `orphan(Pold)` does not block the
 current/new P. The writer consults canonical `blocks(L)` and its state.
 
+Then a writer can productively install P2 while P1 cleanup continues.
+This PR must demonstrate `blocks=P2` + `orphan=P1` is a valid state.
+
 COMMITTED recovery: late `refs(L)` no longer cancel or postpone D1. Recovery
 of P1 does not re-check global refs for DELETE permission. Its authority is
 the exact certificate received at handoff.
+
+W2 is required before that overlap is safe against late publication. G3
+Finalize does not wait for this fence removal; the orphan fence covers
+writers until this PR.
 
 ### G5 — Recovery scheduling hardening
 
@@ -983,7 +1012,7 @@ P2 currently live
 ```
 
 because `P1 != P2`. Old GC knows only P1/K1. New writer depends only on P2/K2.
-There is no physical ABA.
+This coexistence is the G4 end-state, not a G3 result. There is no physical ABA.
 
 ---
 
@@ -1023,9 +1052,9 @@ historical life is suspect.
 | orphan as post-handoff DELETE authority | `DECIDED` |
 | exact-P/D orphan identity | `DECIDED / OPEN` implementation (G1) |
 | PREPARED → COMMITTED handoff | `DECIDED / OPEN` implementation (G2) |
-| P1 cleanup may overlap P2 life | `DECIDED` |
+| P1 cleanup may overlap P2 life | `DECIDED` / G4 |
 | late refs cannot revoke committed D | `DECIDED` / depends W2 |
-| orphan removed from writer path | `DECIDED` / depends G3+W2 |
+| orphan removed from writer path | `DECIDED` / G4 after W1+W2+G3 |
 | X1 | `OPEN` |
 | GC activation | **out of X1 closure** (A1) |
 
@@ -1062,11 +1091,13 @@ Do not merge this docs PR unless:
 12. 020 remains;
 13. this PR has no runtime code, schema, or config;
 14. `GC_ENABLED=false`;
-15. activation is explicitly outside X1 closure.
+15. activation is explicitly outside X1 closure;
+16. G3 does not claim productive P2 install; G4 owns `blocks=P2` + `orphan=P1`.
 
 The contract test `TestX1PhysicalLifeHandoffPlanIsDocumented` pins these
 invariants against this file and against current `processBlock` /
-`RecoverS3Orphans` / schema.
+`RecoverS3Orphans` / schema. `TestX1PhysicalLifeHandoffCurrentWriterStillFencesOnOrphan`
+pins each named writer path to its `gc_s3_orphans` helper.
 
 ---
 
@@ -1088,9 +1119,11 @@ D committed
        ↓
 orphan COMMITTED owns retirement of P1
        ↓
-blocks P1 removed
+blocks P1 removed   (G3; writers still fenced by orphan(P1))
        ↓
-P2 may become canonical
+G4 removes orphan from the writer fence
+       ↓
+P2 may become canonical while orphan(P1) continues DeleteExact(K1)
 ```
 
 From there `orphan P1 → DeleteExact(K1)` and `blocks P2 → K2` proceed
