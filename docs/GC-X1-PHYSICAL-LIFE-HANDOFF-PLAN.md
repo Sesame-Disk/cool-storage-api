@@ -995,6 +995,14 @@ Docs freeze. No runtime.
 
 Productize #200. No GC/orphan schema.
 
+**Current status (2026-09-02):** W1 is implemented on the
+`fix/w1-borrowedfs-own-liveness` branch. `CreateFileFromBlocks` establishes
+`up:<session>` for each distinct BorrowedFS block before session claim and
+checks the BorrowedFS delete fence immediately before HEAD. The seven-leg real
+Cassandra+MinIO gate passes, as do the full unit and integration suites. Final
+diff audit and commit remain pending. R31/W2 and X1 remain open; keep
+`GC_ENABLED=false` fleet-wide.
+
 ### W2 — Full publication continuity / R31
 
 Audit every `CONDITIONAL` / `UNKNOWN` funnel in

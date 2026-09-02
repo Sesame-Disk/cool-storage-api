@@ -170,9 +170,10 @@ Historical option comparison remains in
 [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) and is **not** the
 active roadmap. P1 locator authority, P0/R12, P2/R9/R24 mint/install, P3 writer
 boundary, and P4a/P4b exact `(P,D)` handoff are implemented foundations, not
-X1 closure. P4c-orphan (exact identity **and** minimum durable discovery
-before G2 may create PREPARED), W1/W2 writer continuity, and G2/G3 handoff
-protocol remain open.
+X1 closure. W1 BorrowedFS own-liveness through HEAD is implemented and real
+evidence-backed; W2/R31 still covers full writer continuity. P4c-orphan (exact
+identity **and** minimum durable discovery before G2 may create PREPARED), and
+G2/G3 handoff protocol remain open.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|

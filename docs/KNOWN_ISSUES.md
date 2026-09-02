@@ -2179,6 +2179,13 @@ can publish an `fs_object` that points at already-missing bytes. The race matrix
 this as R3; closing it requires the publication-fence/post-stage validation that is
 already part of the X1 closure work.
 
+W1 now closes the BorrowedFS `CreateFileFromBlocks` segment through the HEAD
+CAS: the writer establishes its own `up:<session>` liveness for each distinct
+borrowed block and validates the delete fence before HEAD. The seven-leg real
+Cassandra+MinIO evidence gate is green. This does not close the broader issue:
+R31/W2 still covers `up -> pub -> HEAD -> fs` crash continuity, and other writer
+funnels remain outside W1.
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).

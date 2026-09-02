@@ -3509,7 +3509,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, []string{fileID}, fileSize, replace)
+	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, []string{fileID}, fileSize, replace, nil)
 	if err != nil {
 		// Failed publication leaves the provisional up: reference to Cassandra
 		// TTL and Phase 0 instead of deleting from block_references.
@@ -3618,7 +3618,7 @@ func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename s
 	return storageDeltaBytes, storageDeltaFiles, nil
 }
 
-func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool) (string, int64, int64, error) {
+func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool, borrowedBlocks []borrowedFSCommitBlock) (string, int64, int64, error) {
 	fsHelper := NewFSHelper(h.db)
 	startedAt := time.Now()
 	attemptsUsed := 0
@@ -3632,7 +3632,7 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
 		attemptsUsed = attempt
-		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, blockIDs, fileSize, replace)
+		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, blockIDs, fileSize, replace, borrowedBlocks)
 		if err == nil {
 			result = "success"
 			return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
@@ -3659,7 +3659,7 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 	return "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
-func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool) (string, int64, int64, error) {
+func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename string, blockIDs []string, fileSize int64, replace bool, borrowedBlocks []borrowedFSCommitBlock) (string, int64, int64, error) {
 	// Capture HEAD and root FS ID in one consistent snapshot so the CAS
 	// compare at publish time uses the exact same HEAD the tree was built from.
 	parentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, parentDir)
@@ -3778,6 +3778,11 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	if err := fileFromBlocksBeforeHeadBarrier(repoID); err != nil {
+		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
+		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
+		return "", 0, 0, errors.Join(err, cleanupErr, clearErr)
+	}
+	if err := h.validateBorrowedFSFences(orgID, borrowedBlocks); err != nil {
 		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
 		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
 		return "", 0, 0, errors.Join(err, cleanupErr, clearErr)

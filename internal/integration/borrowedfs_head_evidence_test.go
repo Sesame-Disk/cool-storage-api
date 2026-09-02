@@ -3,29 +3,28 @@
 package integration
 
 import (
-	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-const borrowedFSHeadCharacterizationEnv = "SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION"
+const borrowedFSOwnLivenessEnv = "SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE"
 
-// borrowedFSHeadEvidenceState records each characterization leg by name.
-// Completeness is the conjunction of these fields, never a counter: marking one
-// leg twice cannot hide another. TestMain inspects missing() after m.Run().
-type borrowedFSHeadEvidenceState struct {
-	currentHeadAfterCut        bool
-	currentPubRevokesZeroProof bool
-	currentPubAfterZeroProof   bool
-	harnessWriterWins          bool
-	harnessCutAfterClassify    bool
-	harnessLatePubStillFenced  bool
-	harnessLatePinStillFenced  bool
+// borrowedFSOwnLivenessEvidenceState records each W1 leg by name. Completeness
+// is the conjunction of these fields, never a counter: marking one leg twice
+// cannot hide another.
+type borrowedFSOwnLivenessEvidenceState struct {
+	borrowedExactOwnPin          bool
+	sessionUploadNoExtraPin      bool
+	livenessFailureNoPublication bool
+	writerFirst                  bool
+	gcFirst                      bool
+	lateOwnPinAfterZeroProof     bool
+	upPubDedup                   bool
 }
 
-func (state borrowedFSHeadEvidenceState) namedLegs() []struct {
+func (state borrowedFSOwnLivenessEvidenceState) namedLegs() []struct {
 	name string
 	seen bool
 } {
@@ -33,17 +32,17 @@ func (state borrowedFSHeadEvidenceState) namedLegs() []struct {
 		name string
 		seen bool
 	}{
-		{"currentHeadAfterCut", state.currentHeadAfterCut},
-		{"currentPubRevokesZeroProof", state.currentPubRevokesZeroProof},
-		{"currentPubAfterZeroProof", state.currentPubAfterZeroProof},
-		{"harnessWriterWins", state.harnessWriterWins},
-		{"harnessCutAfterClassify", state.harnessCutAfterClassify},
-		{"harnessLatePubStillFenced", state.harnessLatePubStillFenced},
-		{"harnessLatePinStillFenced", state.harnessLatePinStillFenced},
+		{"borrowedExactOwnPin", state.borrowedExactOwnPin},
+		{"sessionUploadNoExtraPin", state.sessionUploadNoExtraPin},
+		{"livenessFailureNoPublication", state.livenessFailureNoPublication},
+		{"writerFirst", state.writerFirst},
+		{"gcFirst", state.gcFirst},
+		{"lateOwnPinAfterZeroProof", state.lateOwnPinAfterZeroProof},
+		{"upPubDedup", state.upPubDedup},
 	}
 }
 
-func (state borrowedFSHeadEvidenceState) complete() bool {
+func (state borrowedFSOwnLivenessEvidenceState) complete() bool {
 	for _, leg := range state.namedLegs() {
 		if !leg.seen {
 			return false
@@ -52,8 +51,8 @@ func (state borrowedFSHeadEvidenceState) complete() bool {
 	return true
 }
 
-func (state borrowedFSHeadEvidenceState) missing() []string {
-	missing := make([]string, 0, 7)
+func (state borrowedFSOwnLivenessEvidenceState) missing() []string {
+	missing := make([]string, 0, len(state.namedLegs()))
 	for _, leg := range state.namedLegs() {
 		if !leg.seen {
 			missing = append(missing, leg.name)
@@ -62,49 +61,49 @@ func (state borrowedFSHeadEvidenceState) missing() []string {
 	return missing
 }
 
-var borrowedFSHeadEvidence borrowedFSHeadEvidenceState
+var borrowedFSOwnLivenessEvidence borrowedFSOwnLivenessEvidenceState
 
-type borrowedFSHeadEvidenceGate struct{ observed bool }
+type borrowedFSOwnLivenessEvidenceGate struct{ observed bool }
 
-func borrowedFSRequireHeadEvidence(t *testing.T) *borrowedFSHeadEvidenceGate {
+func borrowedFSRequireOwnLivenessEvidence(t *testing.T) *borrowedFSOwnLivenessEvidenceGate {
 	t.Helper()
-	gate := &borrowedFSHeadEvidenceGate{}
-	if os.Getenv(borrowedFSHeadCharacterizationEnv) != "1" {
+	gate := &borrowedFSOwnLivenessEvidenceGate{}
+	if os.Getenv(borrowedFSOwnLivenessEnv) != "1" {
 		return gate
 	}
 	t.Cleanup(func() {
 		if t.Skipped() {
-			t.Errorf("%s=1 requires real Cassandra+MinIO BorrowedFS HEAD evidence, but the test skipped", borrowedFSHeadCharacterizationEnv)
+			t.Errorf("%s=1 requires real Cassandra+MinIO BorrowedFS own-liveness evidence, but the test skipped", borrowedFSOwnLivenessEnv)
 		} else if !t.Failed() && !gate.observed {
-			t.Errorf("%s=1 incomplete BorrowedFS HEAD evidence; missing=%s", borrowedFSHeadCharacterizationEnv, strings.Join(borrowedFSHeadEvidence.missing(), ","))
+			t.Errorf("%s=1 incomplete BorrowedFS own-liveness evidence; missing=%s", borrowedFSOwnLivenessEnv, strings.Join(borrowedFSOwnLivenessEvidence.missing(), ","))
 		}
 	})
 	return gate
 }
 
-func TestBorrowedFSHeadEvidenceRequiresEveryNamedLeg(t *testing.T) {
-	partial := borrowedFSHeadEvidenceState{currentHeadAfterCut: true, harnessWriterWins: true}
+func TestBorrowedFSOwnLivenessEvidenceRequiresEveryNamedLeg(t *testing.T) {
+	partial := borrowedFSOwnLivenessEvidenceState{borrowedExactOwnPin: true, writerFirst: true}
 	if partial.complete() {
-		t.Fatal("partial BorrowedFS HEAD evidence must not satisfy the package gate")
+		t.Fatal("partial BorrowedFS own-liveness evidence must not satisfy the package gate")
 	}
-	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "currentPubRevokesZeroProof") || !strings.Contains(got, "harnessLatePubStillFenced") || !strings.Contains(got, "harnessLatePinStillFenced") {
+	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "sessionUploadNoExtraPin") || !strings.Contains(got, "lateOwnPinAfterZeroProof") || !strings.Contains(got, "upPubDedup") {
 		t.Fatalf("missing() must name absent legs individually, got %q", got)
 	}
-	full := borrowedFSHeadEvidenceState{
-		currentHeadAfterCut:        true,
-		currentPubRevokesZeroProof: true,
-		currentPubAfterZeroProof:   true,
-		harnessWriterWins:          true,
-		harnessCutAfterClassify:    true,
-		harnessLatePubStillFenced:  true,
-		harnessLatePinStillFenced:  true,
+	full := borrowedFSOwnLivenessEvidenceState{
+		borrowedExactOwnPin:          true,
+		sessionUploadNoExtraPin:      true,
+		livenessFailureNoPublication: true,
+		writerFirst:                  true,
+		gcFirst:                      true,
+		lateOwnPinAfterZeroProof:     true,
+		upPubDedup:                   true,
 	}
 	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 7 {
 		t.Fatalf("all 7 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))
 	}
-	twice := full
-	twice.currentHeadAfterCut = true
-	if !twice.complete() {
+	twice := partial
+	twice.borrowedExactOwnPin = true
+	if twice.complete() {
 		t.Fatal("marking one leg twice must not hide a different required leg")
 	}
 }
@@ -119,7 +118,6 @@ func TestBorrowedFSHeadCharacterizationIsDocumented(t *testing.T) {
 		"X1 remains OPEN",
 		"R3 remains OPEN",
 		"GC_ENABLED=false",
-		fmt.Sprintf("`%s=1`", borrowedFSHeadCharacterizationEnv),
 		"currentHeadAfterCut",
 		"currentPubRevokesZeroProof",
 		"currentPubAfterZeroProof",

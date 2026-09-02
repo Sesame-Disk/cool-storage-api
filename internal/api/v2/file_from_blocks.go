@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -28,9 +29,8 @@ const (
 )
 
 // blockCommitLivenessProvenance records which reference keeps a reusable block
-// alive for this commit. It is intentionally distinct from the current ready
-// policy: an fs: prefix is accepted today but is borrowed liveness for the
-// purposes of the next R3 step.
+// alive for this commit. BorrowedFS is accepted only after the commit creates
+// its own provisional up:<session> liveness and validates the final GC fence.
 type blockCommitLivenessProvenance uint8
 
 const (
@@ -38,6 +38,16 @@ const (
 	blockCommitLivenessSessionUpload
 	blockCommitLivenessBorrowedFS
 )
+
+// borrowedFSCommitBlock carries the canonical physical placement observed by
+// ProbeBlockReuse for a BorrowedFS block. The storage key is retained as
+// provenance for the verification-to-publication handoff; the liveness row
+// itself remains block-scoped, as required by the reference model.
+type borrowedFSCommitBlock struct {
+	blockID      string
+	storageClass string
+	storageKey   string
+}
 
 const blockVerifyConcurrency = 20
 
@@ -375,7 +385,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// blocks.sha1 (which UploadBlock wrote from the block's real bytes) via
 	// ProbeBlockReuse. The client no longer sends a SHA-1: the server owns it.
 	verifyStart := time.Now()
-	statuses, sha1ByHash256, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
+	statuses, sha1ByHash256, borrowedBlocksByHash, err := h.verifyManifestBlocks(c.Request.Context(), orgID, referrer, uniqueHashes, sizeByHash, existsMap)
 	if err != nil {
 		metrics.BlockUploadVerifyErrorsTotal.WithLabelValues("classify").Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify blocks"})
@@ -397,7 +407,16 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 		return
 	}
 
+	// This test-only observation point deliberately remains before the own pin:
+	// the integration race can therefore model GC winning before a late writer
+	// liveness write. Production is a no-op under !integration.
 	fileFromBlocksAfterVerifiedBarrier(repoID)
+	borrowedBlocks := orderedBorrowedFSCommitBlocks(uniqueHashes, statuses, borrowedBlocksByHash)
+	if err := h.ensureBorrowedFSOwnLiveness(c.Request.Context(), orgID, repoID, session.SessionID, borrowedBlocks); err != nil {
+		writeCreateFileError(c, err)
+		return
+	}
+	fileFromBlocksAfterBorrowedLivenessBarrier(repoID)
 
 	// externalBlockIDs is the ordered SHA-1 list written into the file fs_object so
 	// the desktop/mobile Seafile client can parse and download the file. Each SHA-1
@@ -459,7 +478,7 @@ func (h *FileHandler) CreateFileFromBlocks(c *gin.Context) {
 	// docs/WEB-BLOCK-UPLOAD.md); either direction resolves through the mappings
 	// UploadBlock already wrote from verified bytes (no mapping is minted here).
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(
-		orgID, userID, repoID, req.ParentDir, req.Filename, externalBlockIDs, req.Size, req.Replace)
+		orgID, userID, repoID, req.ParentDir, req.Filename, externalBlockIDs, req.Size, req.Replace, borrowedBlocks)
 	if err != nil {
 		// Release the claim so the client can retry this exact commit.
 		if relErr := h.db.ReleaseBlockUploadSessionCommit(session.SessionID); relErr != nil {
@@ -579,9 +598,10 @@ func observeBlockVerification(start time.Time, uniqueHashes []string, statuses m
 // readiness with bounded concurrency (a large manifest is thousands of blocks,
 // so a sequential probe-per-block would be thousands of serial round-trips).
 // Returns a hard error only on infrastructure failure (caller should 500).
-func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, map[string]string, error) {
+func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer string, uniqueHashes []string, sizeByHash map[string]int64, existsMap map[string]bool) (map[string]int, map[string]string, map[string]borrowedFSCommitBlock, error) {
 	result := make(map[string]int, len(uniqueHashes))
 	sha1ByHash := make(map[string]string, len(uniqueHashes))
+	borrowedBlocks := make(map[string]borrowedFSCommitBlock)
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, blockVerifyConcurrency)
@@ -594,21 +614,126 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			status, sha1, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
+			status, sha1, provenance, location, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
 			if err != nil {
 				return err
 			}
 			mu.Lock()
 			result[hash] = status
 			sha1ByHash[hash] = sha1
+			if status == blockStatusReady && provenance == blockCommitLivenessBorrowedFS {
+				borrowedBlocks[hash] = borrowedFSCommitBlock{
+					blockID:      hash,
+					storageClass: location.StorageClass,
+					storageKey:   location.StorageKey,
+				}
+			}
 			mu.Unlock()
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return result, sha1ByHash, nil
+	return result, sha1ByHash, borrowedBlocks, nil
+}
+
+// orderedBorrowedFSCommitBlocks turns the distinct manifest order into the
+// exact set of borrowed blocks that needs an own pin. Repeated manifest entries
+// therefore produce one liveness write, not one write per file occurrence.
+func orderedBorrowedFSCommitBlocks(uniqueHashes []string, statuses map[string]int, borrowedByHash map[string]borrowedFSCommitBlock) []borrowedFSCommitBlock {
+	borrowed := make([]borrowedFSCommitBlock, 0, len(borrowedByHash))
+	for _, hash := range uniqueHashes {
+		if statuses[hash] != blockStatusReady {
+			continue
+		}
+		if block, ok := borrowedByHash[hash]; ok {
+			borrowed = append(borrowed, block)
+		}
+	}
+	return borrowed
+}
+
+// ensureBorrowedFSOwnLiveness makes the writer's liveness explicit before it
+// can stage publication. The referrer is the session's existing up:<session>
+// identity, so a retry overwrites the same Cassandra key instead of creating a
+// second semantic pin. A single expiry is shared by this commit's borrowed
+// blocks and the writes remain bounded/concurrent like verification.
+func (h *FileHandler) ensureBorrowedFSOwnLiveness(ctx context.Context, orgID, libraryID, sessionID string, blocks []borrowedFSCommitBlock) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	referrer := db.BlockReferrerForUpload(sessionID)
+	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
+	fsHelper := NewFSHelper(h.db)
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, blockVerifyConcurrency)
+	seen := make(map[string]struct{}, len(blocks))
+	uniqueBlocks := make([]borrowedFSCommitBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if _, ok := seen[block.blockID]; ok {
+			continue
+		}
+		seen[block.blockID] = struct{}{}
+		uniqueBlocks = append(uniqueBlocks, block)
+	}
+	for _, block := range uniqueBlocks {
+		if strings.TrimSpace(block.storageClass) == "" || strings.TrimSpace(block.storageKey) != block.storageKey || block.storageKey == "" {
+			return fmt.Errorf("%w: incomplete canonical BorrowedFS placement for %s", db.ErrBlockMetadataPermanent, block.blockID)
+		}
+		block := block
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			defer func() { <-sem }()
+			if err := registerUploadedBlockAddProvisionalRefFn(fsHelper, orgID, block.blockID, referrer, libraryID, block.storageClass, expiresAt); err != nil {
+				if errors.Is(err, db.ErrBlockMetadataPermanent) {
+					return fmt.Errorf("add BorrowedFS own liveness for %s: %w", block.blockID, err)
+				}
+				return fmt.Errorf("%w: add BorrowedFS own liveness for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// validateBorrowedFSFences is the final writer-side check. It deliberately
+// reads only the BorrowedFS subset and runs immediately before HEAD CAS; the
+// GC-side destructive proof remains BlockHasReferencesGlobal at EACH_QUORUM.
+func (h *FileHandler) validateBorrowedFSFences(orgID string, blocks []borrowedFSCommitBlock) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	fsHelper := NewFSHelper(h.db)
+	g, gctx := errgroup.WithContext(context.Background())
+	sem := make(chan struct{}, blockVerifyConcurrency)
+	for _, block := range blocks {
+		block := block
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			defer func() { <-sem }()
+			fenced, err := registerUploadedBlockFenceActiveFn(fsHelper, orgID, block.blockID)
+			if err != nil {
+				return fmt.Errorf("%w: validate BorrowedFS delete fence for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
+			}
+			if fenced {
+				return fmt.Errorf("%w: BorrowedFS block %s is fenced by GC", ErrBlockDeleteInProgress, block.blockID)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // summarizeBlockVerification translates the raw per-distinct-block verification
@@ -660,26 +785,29 @@ func summarizeBlockVerification(start time.Time, blocks []fileFromBlocksBlock, u
 // classifyBlockForCommit decides whether one block is commit-ready (R1/R8/R11):
 // live (ProbeBlockReuse == Reusable), physically present, at the declared size,
 // and backed by a currently accepted liveness provenance.
-func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, string, error) {
+func (h *FileHandler) classifyBlockForCommit(orgID, referrer, hash string, declaredSize int64, exists bool) (int, string, blockCommitLivenessProvenance, db.BlockPhysicalLocation, error) {
 	probe, err := h.db.ProbeBlockReuse(orgID, hash)
 	if err != nil {
-		return 0, "", err
+		return 0, "", blockCommitLivenessNone, db.BlockPhysicalLocation{}, err
 	}
 	sha1 := strings.TrimSpace(probe.Sha1)
 	if probe.Decision != db.BlockReuseReusable || !exists {
-		return blockStatusNeedsUpload, sha1, nil
+		return blockStatusNeedsUpload, sha1, blockCommitLivenessNone, db.BlockPhysicalLocation{}, nil
 	}
 	if int64(probe.SizeBytes) != declaredSize {
-		return blockStatusSizeMismatch, sha1, nil
+		return blockStatusSizeMismatch, sha1, blockCommitLivenessNone, db.BlockPhysicalLocation{}, nil
 	}
 	provenance, err := classifyBlockOwnership(h.db, orgID, referrer, hash)
 	if err != nil {
-		return 0, "", err
+		return 0, "", blockCommitLivenessNone, db.BlockPhysicalLocation{}, err
 	}
 	if blockCommitProvenanceCurrentlyReady(provenance) {
-		return blockStatusReady, sha1, nil
+		return blockStatusReady, sha1, provenance, db.BlockPhysicalLocation{
+			StorageClass: probe.StorageClass,
+			StorageKey:   probe.StorageKey,
+		}, nil
 	}
-	return blockStatusNeedsUpload, sha1, nil
+	return blockStatusNeedsUpload, sha1, blockCommitLivenessNone, db.BlockPhysicalLocation{}, nil
 }
 
 // classifyBlockReferrerProvenance classifies the reference provenance for one
@@ -702,9 +830,9 @@ func classifyBlockReferrerProvenance(referrers []string, sessionReferrer string)
 	return blockCommitLivenessNone
 }
 
-// blockCommitProvenanceCurrentlyReady preserves the existing commit/check
-// policy. BorrowedFS remains accepted deliberately; a later R3 PR will change
-// only that provenance's policy after its deduplication cost is audited.
+// blockCommitProvenanceCurrentlyReady preserves the existing admission policy.
+// BorrowedFS remains accepted because CreateFileFromBlocks immediately upgrades
+// it to own liveness before claiming the session.
 func blockCommitProvenanceCurrentlyReady(provenance blockCommitLivenessProvenance) bool {
 	return provenance == blockCommitLivenessSessionUpload ||
 		provenance == blockCommitLivenessBorrowedFS

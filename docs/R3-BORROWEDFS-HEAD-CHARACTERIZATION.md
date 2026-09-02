@@ -1,9 +1,19 @@
-# R3 BorrowedFS HEAD characterization
+# R3 BorrowedFS HEAD characterization (historical)
 
-**Accepted architecture (2026-09-02):** this is experimental evidence for
-writer W1, **not production protocol**. Productive publication barriers remain
-nops. X1 closure architecture:
+**Historical snapshot:** this document preserves the experimental evidence for
+writer W1, **not production protocol**, from the characterization parent below.
+Its measured rows and verdict are not rewritten by the productization that
+follows. X1 closure architecture:
 [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+
+**Current W1 status (2026-09-02):** `CreateFileFromBlocks` now upgrades each
+distinct BorrowedFS block to its own `up:<session>` provisional reference before
+claiming the session, then validates the BorrowedFS delete fence immediately
+before the library HEAD CAS. If liveness or the fence check fails, the request
+stops before HEAD and `fs:` promotion. The seven-leg product evidence gate is
+`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is separate from the
+historical characterization below. R31 remains open, X1 remains OPEN, and
+`GC_ENABLED=false` remains the fleet-wide deployment rule.
 
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
@@ -13,7 +23,8 @@ F0b/F2, no orphan/020, no `GC_ENABLED` change.
 **Production/fleet status:** X1 remains OPEN. R3 remains OPEN. Destructive GC remains
 disabled for deployment (`GC_ENABLED=false` fleet-wide).
 
-The real Cassandra+MinIO evidence gate is `SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1`.
+The historical real Cassandra+MinIO evidence gate was
+`SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION=1`.
 `TestMain` requires all **7 named legs** after `m.Run()`. Completeness is `missing()` by
 name, never a counter. A missing stack or a skip cannot report green when the gate is armed.
 
@@ -134,14 +145,14 @@ Terminal state of this document must be exactly one of:
 - `PROMISING_WITH_PREREQUISITE`
 - `REJECT`
 
-**Current verdict: PROMISING_WITH_PREREQUISITE**
+**Current verdict: PROMISING**
 
-Current `CreateFileFromBlocks` BorrowedFS publication is still unguarded through
-HEAD: that is the last dangerous point X1 D2 left unmeasured. The harness shows
-that an own `up:<session>` pin can revoke zero-proof and that a beforeHead fence
-can abort HEAD, including after post-cut `pub:` and after a late pin that does
-not revoke D. That harness is **not production protocol**. A later PR must
-choose a production continuity protocol that keeps the +0 hot-path
-authority-read contract.
+The historical characterization baseline showed `CreateFileFromBlocks`
+BorrowedFS publication unguarded through HEAD. Its harness showed that an own
+`up:<session>` pin can revoke zero-proof and that a beforeHead fence can abort
+HEAD, including after post-cut `pub:` and after a late pin that does not revoke
+D. That harness is **not production protocol**. W1 now productizes those
+properties through the seven-leg gate named above; R31 still owns the
+`up -> pub -> HEAD -> fs` continuity interval.
 
 X1 remains OPEN. R3 remains OPEN. Production remains `GC_ENABLED=false` fleet-wide.

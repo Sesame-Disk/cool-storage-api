@@ -289,9 +289,10 @@ CREATE TABLE IF NOT EXISTS blocks (
 -- is reserved for the GC worker's final claim before deleting from S3.
 --   referrer = "fs:<library_id>:<fs_id>"   permanent: an fs_object containing the block
 --   referrer = "up:<operation_id>"         provisional: an in-flight upload. The
---                                          live ref is released explicitly on success;
---                                          abandoned uploads are recovered via
---                                          gc_provisional_block_refs* expiry tables.
+--                                          live ref remains until its TTL, including
+--                                          after success; abandoned uploads are bounded
+--                                          and discovered via gc_provisional_block_refs*
+--                                          expiry tables.
 -- Per-(org, block) partition mirrors `blocks`, so a block's reference rows and its
 -- metadata never contend with another block's traffic.
 CREATE TABLE IF NOT EXISTS block_references (

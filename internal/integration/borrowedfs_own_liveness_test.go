@@ -25,287 +25,218 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestBorrowedFSHeadCharacterization drives in-process CreateFileFromBlocks
-// through real HEAD+promote. Current legs measure today's unguarded publication
-// after a BorrowedFS cut. Harness legs inject a test-only own pin and a
-// beforeHead fence; they are not production protocol.
-func TestBorrowedFSHeadCharacterization(t *testing.T) {
+// TestBorrowedFSOwnLiveness drives in-process CreateFileFromBlocks through the
+// production BorrowedFS own-liveness and final-fence path with real Cassandra
+// and MinIO. The publication barriers only pause the request at deterministic
+// points; they do not implement the protocol.
+func TestBorrowedFSOwnLiveness(t *testing.T) {
 	requireCassandra(t)
-	gate := borrowedFSRequireHeadEvidence(t)
+	gate := borrowedFSRequireOwnLivenessEvidence(t)
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
 	storageClass := x1StorageClass(t)
 	handler := newBorrowedFSHeadHandler(t, database, storageClass)
 	gin.SetMode(gin.TestMode)
 
-	t.Run("currentHeadAfterCut", func(t *testing.T) {
+	t.Run("borrowedExactOwnPin", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		var attempt gcpkg.BlockDeleteAuthority
-		var sawPub bool
 		borrowedFSInstallBarriers(t, fx,
-			func() {
-				fx.dropForeignFS(t)
-				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "head-after-cut"))
-			},
-			func() {
-				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
-					t.Fatal("currentHeadAfterCut: expected pub: after stage")
-				}
-				sawPub = true
-			},
+			func() {},
+			func() { fx.assertOwnPinVisible(t, store, "borrowedExactOwnPin") },
+			func() {},
 			func() error { return nil },
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("currentHeadAfterCut: commit status=%d body=%s", rec.Code, rec.Body.String())
-		}
-		if !sawPub {
-			t.Fatal("currentHeadAfterCut: afterStaged did not observe pub:")
+			t.Fatalf("borrowedExactOwnPin: commit status=%d body=%s", rec.Code, rec.Body.String())
 		}
 		fx.assertHeadAdvanced(t)
 		if !x1HasFSReferrer(t, database, fx.orgUUID, fx.blockID) {
-			t.Fatal("currentHeadAfterCut: expected fs: after promote")
+			t.Fatal("borrowedExactOwnPin: expected fs: after promote")
 		}
-		fx.assertDUnrevoked(t, attempt)
-		fx.assertNewRequestBlockedByGC(t)
-		t.Log("currentHeadAfterCut UNGUARDED: HEAD+promote landed after the cut; D unrevoked; new-request BlockedByGC. This is the last dangerous point on the current BorrowedFS path.")
-		borrowedFSHeadEvidence.currentHeadAfterCut = true
+		borrowedFSOwnLivenessEvidence.borrowedExactOwnPin = true
 	})
 
-	t.Run("currentPubRevokesZeroProof", func(t *testing.T) {
+	t.Run("sessionUploadNoExtraPin", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
+		fx.pinSessionUpload(t)
+		before := borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:")
 		borrowedFSInstallBarriers(t, fx,
-			func() { fx.dropForeignFS(t) },
+			func() {},
 			func() {
-				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
-					t.Fatal("currentPubRevokesZeroProof: expected pub: after stage")
-				}
-				attempt := x1Attempt(fx.target, "pub-revokes")
-				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
-				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
-				if err != nil || !hasRefs {
-					t.Fatalf("currentPubRevokesZeroProof: EACH_QUORUM missed pub: visible=%v err=%v", hasRefs, err)
-				}
-				released, err := store.ReleaseBlockClaim(fx.orgUUID, fx.blockID, attempt)
-				if err != nil || released != gcpkg.BlockReleaseReleased {
-					t.Fatalf("currentPubRevokesZeroProof: release = %s, %v", released, err)
+				after := borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:")
+				if after != before {
+					t.Fatalf("sessionUploadNoExtraPin: up: count changed from %d to %d", before, after)
 				}
 			},
+			func() {},
 			func() error { return nil },
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("currentPubRevokesZeroProof: commit status=%d body=%s", rec.Code, rec.Body.String())
+			t.Fatalf("sessionUploadNoExtraPin: commit status=%d body=%s", rec.Code, rec.Body.String())
 		}
-		fx.assertHeadAdvanced(t)
-		t.Log("currentPubRevokesZeroProof: pub: is EACH_QUORUM-visible and revokes a post-stage zero-proof; HEAD proceeds")
-		borrowedFSHeadEvidence.currentPubRevokesZeroProof = true
+		borrowedFSOwnLivenessEvidence.sessionUploadNoExtraPin = true
 	})
 
-	t.Run("currentPubAfterZeroProof", func(t *testing.T) {
+	t.Run("livenessFailureNoPublication", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		var attempt gcpkg.BlockDeleteAuthority
-		borrowedFSInstallBarriers(t, fx,
-			func() {
-				fx.dropForeignFS(t)
-				attempt = x1Attempt(fx.target, "pub-after-zero")
-				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
-				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
-				if err != nil || hasRefs {
-					t.Fatalf("currentPubAfterZeroProof: zero-proof = %v %v", hasRefs, err)
-				}
-			},
-			func() {
-				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
-					t.Fatal("currentPubAfterZeroProof: expected pub: after zero-proof")
-				}
-				handoff, err := store.CommitBlockDeleteOrphanHandoff(fx.orgUUID, fx.blockID, attempt)
-				if err != nil || (handoff.Outcome != gcpkg.BlockDeleteHandoffCommitted && handoff.Outcome != gcpkg.BlockDeleteHandoffAlreadyCommitted) {
-					t.Fatalf("currentPubAfterZeroProof: handoff after late pub: = %s %v", handoff.Outcome, err)
-				}
-			},
-			func() error { return nil },
-		)
+		restore := v2pkg.SetFileFromBlocksOwnLivenessFailureForTest(fmt.Errorf("injected liveness failure"))
+		t.Cleanup(restore)
 		rec := fx.commit(t)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("currentPubAfterZeroProof: commit status=%d body=%s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("livenessFailureNoPublication: commit status=%d body=%s", rec.Code, rec.Body.String())
 		}
-		fx.assertHeadAdvanced(t)
-		fx.assertDUnrevoked(t, attempt)
-		fx.assertNewRequestBlockedByGC(t)
-		t.Log("currentPubAfterZeroProof C2 analog: pub: after zero-proof does not revoke D; handoff still commits; current HEAD still proceeds")
-		borrowedFSHeadEvidence.currentPubAfterZeroProof = true
+		fx.assertHeadUnchanged(t)
+		if fx.hasOwnFSReferrer(t) {
+			t.Fatal("livenessFailureNoPublication: unexpected fs: after own-liveness failure")
+		}
+		borrowedFSOwnLivenessEvidence.livenessFailureNoPublication = true
 	})
 
-	t.Run("harnessWriterWins", func(t *testing.T) {
+	t.Run("writerFirst", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		borrowedFSInstallBarriers(t, fx,
+			func() {},
 			func() {
-				fx.pinSessionUpload(t)
 				fx.dropForeignFS(t)
-				attempt := x1Attempt(fx.target, "harness-writer")
+				attempt := x1Attempt(fx.target, "writer-first")
 				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
 				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
 				if err != nil || !hasRefs {
-					t.Fatalf("harnessWriterWins: EACH_QUORUM missed up:<session> visible=%v err=%v", hasRefs, err)
+					t.Fatalf("writerFirst: EACH_QUORUM missed up:<session> visible=%v err=%v", hasRefs, err)
 				}
 				released, err := store.ReleaseBlockClaim(fx.orgUUID, fx.blockID, attempt)
 				if err != nil || released != gcpkg.BlockReleaseReleased {
-					t.Fatalf("harnessWriterWins: release = %s, %v", released, err)
+					t.Fatalf("writerFirst: release = %s, %v", released, err)
 				}
 			},
 			func() {},
 			func() error {
-				fx.assertOwnPinVisible(t, store, "harnessWriterWins: pin must remain visible at beforeHead")
+				fx.assertOwnPinVisible(t, store, "writerFirst: pin must remain visible at beforeHead")
 				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
 				if err != nil {
-					t.Fatalf("harnessWriterWins: BlockDeleteFenceActive: %v", err)
+					t.Fatalf("writerFirst: BlockDeleteFenceActive: %v", err)
 				}
 				if fenced {
-					t.Fatal("harnessWriterWins: expected no active fence before HEAD")
+					t.Fatal("writerFirst: expected no active fence before HEAD")
 				}
 				return nil
 			},
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("harnessWriterWins: commit status=%d body=%s", rec.Code, rec.Body.String())
+			t.Fatalf("writerFirst: commit status=%d body=%s", rec.Code, rec.Body.String())
 		}
 		fx.assertHeadAdvanced(t)
 		if !x1HasFSReferrer(t, database, fx.orgUUID, fx.blockID) {
-			t.Fatal("harnessWriterWins: expected fs: after promote")
+			t.Fatal("writerFirst: expected fs: after promote")
 		}
-		t.Log("harnessWriterWins: own up:<session> pin before zero-proof revoked the authorizing read and remained visible at beforeHead with no fence; HEAD+fs: landed. Harness is not production protocol.")
-		borrowedFSHeadEvidence.harnessWriterWins = true
+		borrowedFSOwnLivenessEvidence.writerFirst = true
 	})
 
-	t.Run("harnessCutAfterClassify", func(t *testing.T) {
+	t.Run("gcFirst", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		var attempt gcpkg.BlockDeleteAuthority
-		var headCalled bool
 		borrowedFSInstallBarriers(t, fx,
 			func() {
 				fx.dropForeignFS(t)
-				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "harness-cut"))
+				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "gc-first"))
+			},
+			func() { fx.assertOwnPinVisible(t, store, "gcFirst: late own pin must land") },
+			func() {},
+			func() error {
+				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
+				if err != nil {
+					t.Fatalf("gcFirst: BlockDeleteFenceActive: %v", err)
+				}
+				if !fenced {
+					t.Fatal("gcFirst: expected active fence before HEAD")
+				}
+				return nil
+			},
+		)
+		rec := fx.commit(t)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("gcFirst: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
+		}
+		fx.assertHeadUnchanged(t)
+		fx.assertDUnrevoked(t, attempt)
+		if fx.hasOwnFSReferrer(t) {
+			t.Fatal("gcFirst: unexpected fs: after fenced publication")
+		}
+		borrowedFSOwnLivenessEvidence.gcFirst = true
+	})
+
+	t.Run("lateOwnPinAfterZeroProof", func(t *testing.T) {
+		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
+		var attempt gcpkg.BlockDeleteAuthority
+		borrowedFSInstallBarriers(t, fx,
+			func() {
+				fx.dropForeignFS(t)
+				attempt = x1Attempt(fx.target, "late-own-pin")
+				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
+				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
+				if err != nil || hasRefs {
+					t.Fatalf("lateOwnPinAfterZeroProof: zero-proof = %v %v", hasRefs, err)
+				}
+			},
+			func() {
+				fx.assertOwnPinVisible(t, store, "lateOwnPinAfterZeroProof: late up:<session> must land")
+				handoff, err := store.CommitBlockDeleteOrphanHandoff(fx.orgUUID, fx.blockID, attempt)
+				if err != nil || (handoff.Outcome != gcpkg.BlockDeleteHandoffCommitted && handoff.Outcome != gcpkg.BlockDeleteHandoffAlreadyCommitted) {
+					t.Fatalf("lateOwnPinAfterZeroProof: handoff after late pin = %s %v", handoff.Outcome, err)
+				}
 			},
 			func() {},
 			func() error {
 				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
 				if err != nil {
-					t.Fatalf("harnessCutAfterClassify: BlockDeleteFenceActive: %v", err)
+					t.Fatalf("lateOwnPinAfterZeroProof: BlockDeleteFenceActive: %v", err)
 				}
 				if !fenced {
-					t.Fatal("harnessCutAfterClassify: expected active fence before HEAD")
+					t.Fatal("lateOwnPinAfterZeroProof: expected active fence despite late own pin")
 				}
-				headCalled = true
-				return v2pkg.ErrBlockDeleteInProgress
+				return nil
 			},
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusConflict {
-			t.Fatalf("harnessCutAfterClassify: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
-		}
-		if !headCalled {
-			t.Fatal("harnessCutAfterClassify: beforeHead fence was not reached")
+			t.Fatalf("lateOwnPinAfterZeroProof: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
 		}
 		fx.assertHeadUnchanged(t)
 		fx.assertDUnrevoked(t, attempt)
-		t.Log("harnessCutAfterClassify: D2 interleaving then beforeHead fence aborted HEAD. Harness is not production protocol.")
-		borrowedFSHeadEvidence.harnessCutAfterClassify = true
+		borrowedFSOwnLivenessEvidence.lateOwnPinAfterZeroProof = true
 	})
 
-	t.Run("harnessLatePubStillFenced", func(t *testing.T) {
+	t.Run("upPubDedup", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		var attempt gcpkg.BlockDeleteAuthority
-		var sawPub bool
 		borrowedFSInstallBarriers(t, fx,
+			func() {},
+			func() {},
 			func() {
-				fx.dropForeignFS(t)
-				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "harness-late-pub"))
-			},
-			func() {
-				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
-					t.Fatal("harnessLatePubStillFenced: post-cut pub: must still land")
+				if borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:") != 1 || borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "pub:") != 1 {
+					t.Fatalf("upPubDedup: expected exactly one up: and one pub: before HEAD")
 				}
-				sawPub = true
 			},
-			func() error {
-				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
-				if err != nil {
-					t.Fatalf("harnessLatePubStillFenced: BlockDeleteFenceActive: %v", err)
-				}
-				if !fenced {
-					t.Fatal("harnessLatePubStillFenced: expected active fence despite pub:")
-				}
-				return v2pkg.ErrBlockDeleteInProgress
-			},
+			func() error { return nil },
 		)
 		rec := fx.commit(t)
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("harnessLatePubStillFenced: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("upPubDedup: commit status=%d body=%s; want 200", rec.Code, rec.Body.String())
 		}
-		if !sawPub {
-			t.Fatal("harnessLatePubStillFenced: afterStaged did not observe post-cut pub:")
+		retry := fx.commit(t)
+		if retry.Code != http.StatusOK {
+			t.Fatalf("upPubDedup: retry status=%d body=%s", retry.Code, retry.Body.String())
 		}
-		fx.assertHeadUnchanged(t)
-		fx.assertDUnrevoked(t, attempt)
-		t.Log("harnessLatePubStillFenced: post-cut pub: landed; fence still aborted HEAD. Harness is not production protocol.")
-		borrowedFSHeadEvidence.harnessLatePubStillFenced = true
+		if borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:") != 1 || !fx.hasOwnFSReferrer(t) || borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "fs:"+fx.repoID+":") != 1 {
+			t.Fatalf("upPubDedup: retry duplicated liveness references")
+		}
+		borrowedFSOwnLivenessEvidence.upPubDedup = true
 	})
 
-	t.Run("harnessLatePinStillFenced", func(t *testing.T) {
-		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
-		var attempt gcpkg.BlockDeleteAuthority
-		var sawPub bool
-		borrowedFSInstallBarriers(t, fx,
-			func() {
-				fx.dropForeignFS(t)
-				attempt = x1Attempt(fx.target, "harness-late-pin")
-				x1ClaimAcquired(t, store, fx.orgUUID, fx.blockID, attempt)
-				hasRefs, err := store.BlockHasReferencesGlobal(fx.orgUUID, fx.blockID)
-				if err != nil || hasRefs {
-					t.Fatalf("harnessLatePinStillFenced: zero-proof = %v %v", hasRefs, err)
-				}
-				fx.pinSessionUpload(t)
-				fx.assertOwnPinVisible(t, store, "harnessLatePinStillFenced: late up:<session> after zero-proof must land")
-				handoff, err := store.CommitBlockDeleteOrphanHandoff(fx.orgUUID, fx.blockID, attempt)
-				if err != nil || (handoff.Outcome != gcpkg.BlockDeleteHandoffCommitted && handoff.Outcome != gcpkg.BlockDeleteHandoffAlreadyCommitted) {
-					t.Fatalf("harnessLatePinStillFenced: handoff after late pin = %s %v", handoff.Outcome, err)
-				}
-			},
-			func() {
-				if !borrowedFSHasPrefix(t, database, fx.orgID, fx.blockID, "pub:") {
-					t.Fatal("harnessLatePinStillFenced: expected pub: after stage")
-				}
-				sawPub = true
-			},
-			func() error {
-				fx.assertOwnPinVisible(t, store, "harnessLatePinStillFenced: late pin must remain visible at beforeHead")
-				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
-				if err != nil {
-					t.Fatalf("harnessLatePinStillFenced: BlockDeleteFenceActive: %v", err)
-				}
-				if !fenced {
-					t.Fatal("harnessLatePinStillFenced: expected active fence despite late pin")
-				}
-				return v2pkg.ErrBlockDeleteInProgress
-			},
-		)
-		rec := fx.commit(t)
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("harnessLatePinStillFenced: commit status=%d body=%s; want 409", rec.Code, rec.Body.String())
-		}
-		if !sawPub {
-			t.Fatal("harnessLatePinStillFenced: afterStaged did not observe pub:")
-		}
-		fx.assertHeadUnchanged(t)
-		fx.assertDUnrevoked(t, attempt)
-		t.Log("harnessLatePinStillFenced: late up:<session> after zero-proof did not revoke D; fence still aborted HEAD. Harness is not production protocol.")
-		borrowedFSHeadEvidence.harnessLatePinStillFenced = true
-	})
-
-	gate.observed = borrowedFSHeadEvidence.complete()
-	t.Logf("BORROWEDFS_HEAD_CHARACTERIZATION_EVIDENCE missing=%v complete=%t", borrowedFSHeadEvidence.missing(), borrowedFSHeadEvidence.complete())
+	gate.observed = borrowedFSOwnLivenessEvidence.complete()
+	t.Logf("BORROWEDFS_OWN_LIVENESS_EVIDENCE missing=%v complete=%t", borrowedFSOwnLivenessEvidence.missing(), borrowedFSOwnLivenessEvidence.complete())
 }
 
 type borrowedFSHeadFixture struct {
@@ -417,9 +348,9 @@ func borrowedFSSeedPhysical(t *testing.T, database *dbpkg.DB, orgID uuid.UUID, c
 	return blockID, sha1ID, key
 }
 
-func borrowedFSInstallBarriers(t *testing.T, fx *borrowedFSHeadFixture, afterVerified, afterStaged func(), beforeHead func() error) {
+func borrowedFSInstallBarriers(t *testing.T, fx *borrowedFSHeadFixture, afterVerified, afterBorrowedPin, afterStaged func(), beforeHead func() error) {
 	t.Helper()
-	t.Cleanup(v2pkg.SetFileFromBlocksPublicationBarriersForTest(fx.repoID, afterVerified, afterStaged, beforeHead))
+	t.Cleanup(v2pkg.SetFileFromBlocksPublicationBarriersForTest(fx.repoID, afterVerified, afterBorrowedPin, afterStaged, beforeHead))
 }
 
 func (fx *borrowedFSHeadFixture) dropForeignFS(t *testing.T) {
@@ -494,19 +425,16 @@ func (fx *borrowedFSHeadFixture) assertHeadUnchanged(t *testing.T) {
 	}
 }
 
+func (fx *borrowedFSHeadFixture) hasOwnFSReferrer(t *testing.T) bool {
+	t.Helper()
+	return borrowedFSCountPrefix(t, fx.database, fx.orgID, fx.blockID, "fs:"+fx.repoID+":") > 0
+}
+
 func (fx *borrowedFSHeadFixture) assertDUnrevoked(t *testing.T, attempt gcpkg.BlockDeleteAuthority) {
 	t.Helper()
 	state, claimID, handoff, _, _ := x1ReadCommittedRow(t, fx.database, fx.orgUUID, fx.blockID)
 	if state != "deleting" || !handoff || claimID != attempt.ClaimID {
 		t.Fatalf("D revoked: state=%s handoff=%v claim=%s want deleting/true/%s", state, handoff, claimID, attempt.ClaimID)
-	}
-}
-
-func (fx *borrowedFSHeadFixture) assertNewRequestBlockedByGC(t *testing.T) {
-	t.Helper()
-	probe, err := fx.database.ProbeBlockReuse(fx.orgID, fx.blockID)
-	if err != nil || probe.Decision != dbpkg.BlockReuseBlockedByGC {
-		t.Fatalf("new-request probe = %+v %v; want BlockedByGC", probe, err)
 	}
 }
 
@@ -522,16 +450,21 @@ func borrowedFSReadHead(t *testing.T, database *dbpkg.DB, orgID, repoID string) 
 	return head
 }
 
-func borrowedFSHasPrefix(t *testing.T, database *dbpkg.DB, orgID, blockID, prefix string) bool {
+func borrowedFSCountPrefix(t *testing.T, database *dbpkg.DB, orgID, blockID, prefix string) int {
 	t.Helper()
 	referrers, err := database.ListBlockReferrers(orgID, blockID)
 	if err != nil {
 		t.Fatalf("ListBlockReferrers: %v", err)
 	}
+	count := 0
 	for _, referrer := range referrers {
 		if strings.HasPrefix(referrer, prefix) {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
+}
+
+func borrowedFSHasPrefix(t *testing.T, database *dbpkg.DB, orgID, blockID, prefix string) bool {
+	return borrowedFSCountPrefix(t, database, orgID, blockID, prefix) > 0
 }

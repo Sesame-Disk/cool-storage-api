@@ -6,7 +6,7 @@ import "testing"
 
 func TestSetFileFromBlocksPublicationBarriersForTestRestoresAndScopes(t *testing.T) {
 	called := 0
-	restore := SetFileFromBlocksPublicationBarriersForTest("repo-a", func() { called++ }, nil, nil)
+	restore := SetFileFromBlocksPublicationBarriersForTest("repo-a", func() { called++ }, nil, nil, nil)
 	fileFromBlocksAfterVerifiedBarrier("repo-b")
 	if called != 0 {
 		t.Fatal("foreign repoID must not run the installed afterVerified barrier")

@@ -11,6 +11,7 @@ import (
 
 func TestFileFromBlocksPublicationBarriersDefaultNop(t *testing.T) {
 	fileFromBlocksAfterVerifiedBarrier("repo")
+	fileFromBlocksAfterBorrowedLivenessBarrier("repo")
 	fileFromBlocksAfterStagedBarrier("repo")
 	if err := fileFromBlocksBeforeHeadBarrier("repo"); err != nil {
 		t.Fatalf("default beforeHead barrier = %v, want nil", err)
@@ -40,6 +41,7 @@ func TestFileFromBlocksPublicationBarriersProdAreEmpty(t *testing.T) {
 	_, file := parseV2ProductionFile(t, "file_from_blocks_publication_barriers.go")
 	for _, name := range []string{
 		"fileFromBlocksAfterVerifiedBarrier",
+		"fileFromBlocksAfterBorrowedLivenessBarrier",
 		"fileFromBlocksAfterStagedBarrier",
 		"fileFromBlocksBeforeHeadBarrier",
 	} {
@@ -98,9 +100,11 @@ func TestFileFromBlocksAfterVerifiedBarrierIsBetweenVerifyAndClaim(t *testing.T)
 	calls := r3CallPositions(fn)
 	verify := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "summarizeBlockVerification")
 	barrier := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "fileFromBlocksAfterVerifiedBarrier")
+	borrowedPin := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "ensureBorrowedFSOwnLiveness")
+	borrowedPinBarrier := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "fileFromBlocksAfterBorrowedLivenessBarrier")
 	claim := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "ClaimBlockUploadSessionForCommit")
-	if !(verify < barrier && barrier < claim) {
-		t.Fatal("R3 BARRIER: fileFromBlocksAfterVerifiedBarrier must run after verify and before ClaimBlockUploadSessionForCommit")
+	if !(verify < barrier && barrier < borrowedPin && borrowedPin < borrowedPinBarrier && borrowedPinBarrier < claim) {
+		t.Fatal("R3 BARRIER: BorrowedFS own liveness must run after verification and before ClaimBlockUploadSessionForCommit")
 	}
 	assertFnDoesNotCall(t, fn, "CreateFileFromBlocks", "BlockDeleteFenceActive", "ProbeBlockReuse")
 	assertBarrierArgIsRepoID(t, fn, "CreateFileFromBlocks", "fileFromBlocksAfterVerifiedBarrier")
@@ -112,30 +116,31 @@ func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
 	stage := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "stagePendingPublishedFiles")
 	afterStaged := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "fileFromBlocksAfterStagedBarrier")
 	beforeHead := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
+	borrowedFence := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "validateBorrowedFSFences")
 	head := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "UpdateLibraryHeadFromSnapshot")
-	if !(stage < afterStaged && afterStaged < beforeHead && beforeHead < head) {
-		t.Fatal("R3 BARRIER: afterStaged must follow stagePendingPublishedFiles and beforeHead must sit immediately before UpdateLibraryHeadFromSnapshot")
+	if !(stage < afterStaged && afterStaged < beforeHead && beforeHead < borrowedFence && borrowedFence < head) {
+		t.Fatal("R3 BARRIER: BorrowedFS fence validation must follow beforeHead and precede UpdateLibraryHeadFromSnapshot")
 	}
 	assertFnDoesNotCall(t, fn, "finalizeStoredUploadMetadataOnce", "BlockDeleteFenceActive", "ProbeBlockReuse")
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksAfterStagedBarrier")
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
 }
 
-func TestBorrowedFSHeadCharacterizationNamesArePinned(t *testing.T) {
-	path := r3SourcePath("internal", "integration", "borrowedfs_head_characterization_test.go")
+func TestBorrowedFSOwnLivenessNamesArePinned(t *testing.T) {
+	path := r3SourcePath("internal", "integration", "borrowedfs_own_liveness_test.go")
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read BorrowedFS HEAD characterization test: %v", err)
+		t.Fatalf("read BorrowedFS own-liveness test: %v", err)
 	}
 	text := string(raw)
 	for _, name := range []string{
-		"currentHeadAfterCut",
-		"currentPubRevokesZeroProof",
-		"currentPubAfterZeroProof",
-		"harnessWriterWins",
-		"harnessCutAfterClassify",
-		"harnessLatePubStillFenced",
-		"harnessLatePinStillFenced",
+		"borrowedExactOwnPin",
+		"sessionUploadNoExtraPin",
+		"livenessFailureNoPublication",
+		"writerFirst",
+		"gcFirst",
+		"lateOwnPinAfterZeroProof",
+		"upPubDedup",
 	} {
 		needle := `t.Run("` + name + `"`
 		if !strings.Contains(text, needle) {
@@ -143,9 +148,9 @@ func TestBorrowedFSHeadCharacterizationNamesArePinned(t *testing.T) {
 		}
 	}
 	for _, needle := range []string{
-		"pin must remain visible at beforeHead",
-		"expected no active fence before HEAD",
-		"late up:<session> after zero-proof",
+		"production BorrowedFS own-liveness",
+		"SetFileFromBlocksOwnLivenessFailureForTest",
+		"late up:<session> must land",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("BorrowedFS HEAD handshake characterization is missing %q", needle)

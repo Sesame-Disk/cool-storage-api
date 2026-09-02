@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 BorrowedFS own-liveness productization
+
+`CreateFileFromBlocks` now establishes an own `up:<session>` provisional
+reference for each distinct BorrowedFS block before claiming the upload session,
+and validates the BorrowedFS delete fence immediately before the library HEAD
+CAS. Liveness/fence failures stop publication before HEAD and `fs:` promotion.
+The seven-leg real Cassandra+MinIO evidence gate, full unit suite, full
+integration suite, race test, vet, production build, API scripts and OIDC
+scripts pass. R31/W2 and X1 remain open; `GC_ENABLED=false` remains required.
+
+---
+
 ## 2026-09-02 - D0 follow-up: G1 is the PREPARED recovery root; G5 hardens later
 
 G2 must not create durable PREPARED until G1 provides a restart-findable

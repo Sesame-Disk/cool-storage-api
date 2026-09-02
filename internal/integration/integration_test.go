@@ -53,7 +53,7 @@ func TestMain(m *testing.M) {
 		os.Getenv("SESAMEFS_REQUIRE_P4B_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R3_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION") == "1" ||
-		os.Getenv("SESAMEFS_REQUIRE_BORROWEDFS_HEAD_CHARACTERIZATION") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R26_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
@@ -112,8 +112,8 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
-	if os.Getenv(borrowedFSHeadCharacterizationEnv) == "1" && !borrowedFSHeadEvidence.complete() {
-		fmt.Printf("%s=1 requires all named BorrowedFS HEAD legs; missing=%s (check -run filters)\n", borrowedFSHeadCharacterizationEnv, strings.Join(borrowedFSHeadEvidence.missing(), ","))
+	if os.Getenv(borrowedFSOwnLivenessEnv) == "1" && !borrowedFSOwnLivenessEvidence.complete() {
+		fmt.Printf("%s=1 requires all named BorrowedFS own-liveness legs; missing=%s (check -run filters)\n", borrowedFSOwnLivenessEnv, strings.Join(borrowedFSOwnLivenessEvidence.missing(), ","))
 		if code == 0 {
 			code = 1
 		}
