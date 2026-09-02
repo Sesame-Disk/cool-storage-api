@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
 **Last Updated**: 2026-09-02
-**Session**: W1 BorrowedFS own-liveness productization after the D0 X1 handoff freeze. #200 remains historical evidence; W1's seven-leg real Cassandra+MinIO gate and full integration suite pass. Final audit passed; commit follows. R31 and X1 remain OPEN. GC_ENABLED=false
+**Session**: W1 BorrowedFS own-liveness productization after the D0 X1 handoff freeze. #200 remains historical evidence; W1 productizes own `up:<session>` before claim and the BorrowedFS fence immediately before HEAD. R31 and X1 remain OPEN. GC_ENABLED=false
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking

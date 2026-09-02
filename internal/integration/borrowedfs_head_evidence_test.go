@@ -130,6 +130,8 @@ func TestBorrowedFSHeadCharacterizationIsDocumented(t *testing.T) {
 		"not production protocol",
 		"BorrowedFS",
 		"up:<session>",
+		"Historical (#200) productive seams",
+		"before W1",
 	}
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {

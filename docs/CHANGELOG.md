@@ -8,6 +8,12 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 PR closeout: historical seams, fence-abort `pub:` cleanup
+
+Marked the #200 productive-seams diagram as historical (before W1). GC-first
+and late-pin legs now require that a staged `pub:` is gone after the 409.
+Status docs no longer say the commit is pending.
+
 ## 2026-09-02 - W1 BorrowedFS own-liveness productization
 
 `CreateFileFromBlocks` now establishes an own `up:<session>` provisional

@@ -144,7 +144,7 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 				attempt = x1CommitHandoffAfterZeroRefs(t, store, fx.orgUUID, fx.blockID, x1Attempt(fx.target, "gc-first"))
 			},
 			func() { fx.assertOwnPinVisible(t, store, "gcFirst: late own pin must land") },
-			func() {},
+			func() { fx.assertPubCount(t, 1, "gcFirst: pub: must be staged before HEAD") },
 			func() error {
 				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
 				if err != nil {
@@ -165,6 +165,7 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 		if fx.hasOwnFSReferrer(t) {
 			t.Fatal("gcFirst: unexpected fs: after fenced publication")
 		}
+		fx.assertPubCount(t, 0, "gcFirst: fence abort must drop staged pub:")
 		borrowedFSOwnLivenessEvidence.gcFirst = true
 	})
 
@@ -188,7 +189,7 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 					t.Fatalf("lateOwnPinAfterZeroProof: handoff after late pin = %s %v", handoff.Outcome, err)
 				}
 			},
-			func() {},
+			func() { fx.assertPubCount(t, 1, "lateOwnPinAfterZeroProof: pub: must be staged before HEAD") },
 			func() error {
 				fenced, err := database.BlockDeleteFenceActive(fx.orgID, fx.blockID)
 				if err != nil {
@@ -206,6 +207,10 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 		}
 		fx.assertHeadUnchanged(t)
 		fx.assertDUnrevoked(t, attempt)
+		if fx.hasOwnFSReferrer(t) {
+			t.Fatal("lateOwnPinAfterZeroProof: unexpected fs: after fenced publication")
+		}
+		fx.assertPubCount(t, 0, "lateOwnPinAfterZeroProof: fence abort must drop staged pub:")
 		borrowedFSOwnLivenessEvidence.lateOwnPinAfterZeroProof = true
 	})
 
@@ -428,6 +433,14 @@ func (fx *borrowedFSHeadFixture) assertHeadUnchanged(t *testing.T) {
 func (fx *borrowedFSHeadFixture) hasOwnFSReferrer(t *testing.T) bool {
 	t.Helper()
 	return borrowedFSCountPrefix(t, fx.database, fx.orgID, fx.blockID, "fs:"+fx.repoID+":") > 0
+}
+
+func (fx *borrowedFSHeadFixture) assertPubCount(t *testing.T, want int, msg string) {
+	t.Helper()
+	got := borrowedFSCountPrefix(t, fx.database, fx.orgID, fx.blockID, "pub:")
+	if got != want {
+		t.Fatalf("%s: pub: count=%d, want %d", msg, got, want)
+	}
 }
 
 func (fx *borrowedFSHeadFixture) assertDUnrevoked(t *testing.T, attempt gcpkg.BlockDeleteAuthority) {

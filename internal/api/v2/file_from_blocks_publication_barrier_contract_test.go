@@ -151,6 +151,7 @@ func TestBorrowedFSOwnLivenessNamesArePinned(t *testing.T) {
 		"production BorrowedFS own-liveness",
 		"SetFileFromBlocksOwnLivenessFailureForTest",
 		"late up:<session> must land",
+		"fence abort must drop staged pub:",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("BorrowedFS HEAD handshake characterization is missing %q", needle)

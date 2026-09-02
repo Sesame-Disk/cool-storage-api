@@ -333,7 +333,9 @@ zero-proof first
 ```
 
 This is experimental evidence, **not production protocol**. Productive hooks
-are nops (`//go:build !integration`). Writer productization is W1.
+are nops (`//go:build !integration`). W1 productizes the handshake in
+`CreateFileFromBlocks` (own `up:` before claim; fence immediately before HEAD).
+The hooks remain test-only.
 
 ---
 
@@ -995,12 +997,11 @@ Docs freeze. No runtime.
 
 Productize #200. No GC/orphan schema.
 
-**Current status (2026-09-02):** W1 is implemented on the
-`fix/w1-borrowedfs-own-liveness` branch. `CreateFileFromBlocks` establishes
-`up:<session>` for each distinct BorrowedFS block before session claim and
-checks the BorrowedFS delete fence immediately before HEAD. The seven-leg real
-Cassandra+MinIO gate passes, as do the full unit and integration suites. Final
-diff audit and commit remain pending. R31/W2 and X1 remain open; keep
+**Current status (2026-09-02):** implemented in this PR. `CreateFileFromBlocks`
+establishes `up:<session>` for each distinct BorrowedFS block before session
+claim and checks the BorrowedFS delete fence immediately before HEAD (after
+`pub:` may already be staged — the #200 handshake, not the §14 full-writer
+ideal). Fence abort must drop that `pub:`. R31/W2 and X1 remain open; keep
 `GC_ENABLED=false` fleet-wide.
 
 ### W2 — Full publication continuity / R31

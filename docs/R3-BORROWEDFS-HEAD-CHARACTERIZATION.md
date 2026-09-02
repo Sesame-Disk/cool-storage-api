@@ -57,13 +57,20 @@ see them. The fixture therefore:
 A single small file is valid as the only/final block versus the 8MiB session
 block size.
 
-## Productive seams (integration-only hooks, +0 protocol)
+## Historical (#200) productive seams (integration-only hooks, +0 protocol)
+
+This section describes production **as of #200, before W1**. It is not current
+`CreateFileFromBlocks`. W1's production path is: own `up:<session>` after verify
+and before claim, then a BorrowedFS fence immediately before HEAD. The barrier
+functions below remain empty nops in production builds; W1's fence is a
+separate call, not inside those hooks.
 
 Production `fileFromBlocksAfterVerifiedBarrier` / `AfterStagedBarrier` /
 `BeforeHeadBarrier` are empty functions in
 `file_from_blocks_publication_barriers.go` (`//go:build !integration`): no
 mutex, no callback table, no setter. The Docker `sesamefs` image is a normal
-build, so `UploadFile` sharing `finalizeStoredUploadMetadataOnce` stays a nop.
+build, so `UploadFile` sharing `finalizeStoredUploadMetadataOnce` stays a nop
+at those barrier sites.
 
 Integration builds replace that file with
 `file_from_blocks_publication_barriers_integration.go`. The setter exists only
