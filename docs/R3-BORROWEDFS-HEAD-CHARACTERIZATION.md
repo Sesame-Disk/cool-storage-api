@@ -9,26 +9,51 @@ follows. X1 closure architecture:
 **Current W1 status (2026-09-02):** `CreateFileFromBlocks` now upgrades each
 distinct BorrowedFS block to its own `up:<session>` provisional reference before
 claiming the session, then re-validates the exact observed physical placement
-immediately before the library HEAD CAS via `ValidateBlockRepairAuthority`
-(`BlockAuthorityStrong` / SERIAL). If liveness or that authority check fails,
-the request stops before HEAD and `fs:` promotion. The eight-leg product
-evidence gate is `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is
-separate from the historical characterization below. R31 remains open, X1
-remains OPEN, and `GC_ENABLED=false` remains the fleet-wide deployment rule.
+immediately before the library HEAD CAS via
+`db.ValidateBorrowedFSPublicationAuthority` (`BlockAuthorityAdvisory` /
+LOCAL_QUORUM — not the SERIAL repair boundary; see the second W1 fix below). If
+liveness or that authority check fails, the request stops before HEAD and
+`fs:` promotion. The eight-leg product evidence gate is
+`SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`; it is separate from the
+historical characterization below. R31 remains open, X1 remains OPEN, and
+`GC_ENABLED=false` remains the fleet-wide deployment rule.
 
-**W1 fix (2026-09-02):** a review found that the original fence-only check
+**W1 fix 1 (2026-09-02):** a review found that the original fence-only check
 (`BlockDeleteFenceActive`) cannot see the terminal state where GC has ALREADY
 fully retired a block between this commit's earlier verification and the
 pre-HEAD check: once `FinalizeBlockDelete` has removed the canonical row and
 the orphan has settled (`DeleteS3Orphan`), there is no `gc_state='deleting'`
 row and no orphan row left to report a fence, yet the placement this commit
 observed no longer exists. The pre-HEAD check now re-validates the exact
-observed `(storage_class, storage_key)` via `ValidateBlockRepairAuthority`
-instead of a bare fence check; that outcome's `Changed` case (canonical row
-absent, or now naming a different placement) catches this window, and its
-`Blocked` case is a strict superset of the old fence check. Proven red without
-the fix / green with it on real Cassandra+MinIO by the
+observed `(storage_class, storage_key)`; that outcome's `Changed` case
+(canonical row absent, or now naming a different placement) catches this
+window, and its `Blocked` case is a strict superset of the old fence check.
+Proven red without the fix / green with it on real Cassandra+MinIO by the
 `gcFullyRetiredBeforeLateOwnPin` leg below.
+
+**W1 fix 2 (2026-09-02):** fix 1's first cut re-validated exact placement via
+the existing `ValidateBlockRepairAuthority`, which reads at
+`BlockAuthorityStrong` (SERIAL) -- a per-call global Paxos round trip that
+[`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md`](./UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md)
+documents as reserved for the cold pre-PUT repair boundary and deliberately
+kept off the dedup path (`TestP3SerialReadsStayOffTheDedupPath`). A large
+deduplicated commit referencing hundreds/thousands of distinct BorrowedFS
+blocks would have paid that many Paxos round trips before HEAD -- exactly the
+"accidental hot-path WAN/Paxos explosion" the W1 merge criteria rule out. The
+pre-HEAD check now calls the new `db.ValidateBorrowedFSPublicationAuthority`,
+which shares `ValidateBlockRepairAuthority`'s exact-placement classification
+but reads at `BlockAuthorityAdvisory` (LOCAL_QUORUM). That is safe here for a
+different reason than the repair boundary's downstream CAS: this call's
+caller has ALREADY durably written its own `up:<session>` pin before it runs,
+so either GC's `EACH_QUORUM` zero-proof read happens after that pin is
+durable (and intersects it, so GC releases instead of committing D), or GC's
+`EACH_QUORUM`+SERIAL destructive commit already fully landed before the pin
+was written (a settled write, not one "in flight", which `BlockAuthorityAdvisory`
+reliably observes -- the same intersection argument `BlockDeleteFenceActive`
+already relies on at this exact pre-HEAD position). Re-proven green on real
+Cassandra+MinIO with the same `gcFullyRetiredBeforeLateOwnPin` leg after the
+change, and guarded going forward by
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority`.
 
 **Characterization parent:** `1009e80b2` (`main` containing #199)
 **Branch:** `test/r3-borrowedfs-head-characterization`
@@ -184,8 +209,8 @@ measured rows above are frozen, per the note at the top of this file, and are
 NOT rewritten by what follows. The prerequisite this verdict named -- a
 production continuity protocol that keeps the +0 hot-path contract -- was
 productized by W1: own `up:<session>` before claim, then an exact-placement
-re-validation immediately before HEAD (see "Current W1 status" and "W1 fix"
-above). The eight-leg `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`
+re-validation immediately before HEAD (see "Current W1 status" and "W1 fix 1"
+/ "W1 fix 2" above). The eight-leg `SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1`
 gate is the current record of that production behavior; this note records
 that the prerequisite was met without rewriting the historical
 `PROMISING_WITH_PREREQUISITE` verdict itself.

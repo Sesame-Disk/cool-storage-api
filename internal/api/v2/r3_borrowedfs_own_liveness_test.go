@@ -86,10 +86,10 @@ func TestBorrowedFSOwnLivenessFailureIsRetryable(t *testing.T) {
 }
 
 func TestBorrowedFSFenceRejectsActiveDelete(t *testing.T) {
-	oldAuthority := validateBlockRepairAuthorityFn
-	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
+	oldAuthority := validateBorrowedFSPublicationAuthorityFn
+	t.Cleanup(func() { validateBorrowedFSPublicationAuthorityFn = oldAuthority })
 
-	validateBlockRepairAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+	validateBorrowedFSPublicationAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
 		if blockID != "b1" {
 			t.Fatalf("authority checked block %q, want b1", blockID)
 		}
@@ -105,14 +105,14 @@ func TestBorrowedFSFenceRejectsActiveDelete(t *testing.T) {
 // this handshake was missing: BlockDeleteFenceActive alone reports false once
 // GC has fully retired a block (Finalize + settled orphan), because there is
 // no active claim and no orphan row left to observe -- but the placement this
-// commit observed no longer exists. ValidateBlockRepairAuthority reports that
-// terminal state as BlockRepairAuthorityChanged, and it must reject the commit
-// exactly like an active fence would.
+// commit observed no longer exists. ValidateBorrowedFSPublicationAuthority
+// reports that terminal state as BlockRepairAuthorityChanged, and it must
+// reject the commit exactly like an active fence would.
 func TestBorrowedFSFenceRejectsFullyRetiredPlacement(t *testing.T) {
-	oldAuthority := validateBlockRepairAuthorityFn
-	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
+	oldAuthority := validateBorrowedFSPublicationAuthorityFn
+	t.Cleanup(func() { validateBorrowedFSPublicationAuthorityFn = oldAuthority })
 
-	validateBlockRepairAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+	validateBorrowedFSPublicationAuthorityFn = func(_ *db.DB, _, blockID string, _ db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
 		if blockID != "b1" {
 			t.Fatalf("authority checked block %q, want b1", blockID)
 		}
@@ -125,11 +125,11 @@ func TestBorrowedFSFenceRejectsFullyRetiredPlacement(t *testing.T) {
 }
 
 func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
-	oldAuthority := validateBlockRepairAuthorityFn
-	t.Cleanup(func() { validateBlockRepairAuthorityFn = oldAuthority })
+	oldAuthority := validateBorrowedFSPublicationAuthorityFn
+	t.Cleanup(func() { validateBorrowedFSPublicationAuthorityFn = oldAuthority })
 
 	authorityCalls := 0
-	validateBlockRepairAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+	validateBorrowedFSPublicationAuthorityFn = func(*db.DB, string, string, db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
 		authorityCalls++
 		return db.BlockRepairAuthorityAuthorized, nil
 	}

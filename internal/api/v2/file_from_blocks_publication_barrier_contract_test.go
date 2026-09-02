@@ -126,6 +126,27 @@ func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
 }
 
+// TestValidateBorrowedFSFencesStaysOffSerialAuthority guards the hot-path
+// Paxos budget documented in docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md:
+// ValidateBlockRepairAuthority (BlockAuthorityStrong/SERIAL) is reserved for
+// the cold pre-PUT repair boundary because it has no downstream CAS and no
+// prior own-reference ordering to lean on. validateBorrowedFSFences runs once
+// per BorrowedFS block on the dedup hot path and is protected instead by the
+// caller's own up:<session> pin already being durable, so it must use
+// validateBorrowedFSPublicationAuthorityFn (BlockAuthorityAdvisory/LOCAL_QUORUM).
+// Calling the SERIAL variant here would turn a large deduplicated commit into
+// hundreds/thousands of global Paxos round trips before HEAD.
+func TestValidateBorrowedFSFencesStaysOffSerialAuthority(t *testing.T) {
+	_, fn := r3ParseFunction(t, r3SourcePath("internal", "api", "v2", "file_from_blocks.go"), "validateBorrowedFSFences")
+	calls := r3CallPositions(fn)
+	if len(calls["validateBorrowedFSPublicationAuthorityFn"]) == 0 {
+		t.Fatal("R3 BARRIER: validateBorrowedFSFences must call validateBorrowedFSPublicationAuthorityFn (LOCAL_QUORUM)")
+	}
+	if len(calls["validateBlockRepairAuthorityFn"]) > 0 {
+		t.Fatal("R3 BARRIER: validateBorrowedFSFences must not call validateBlockRepairAuthorityFn (SERIAL) -- that pays a global Paxos round trip per BorrowedFS block on the dedup hot path; use validateBorrowedFSPublicationAuthorityFn instead")
+	}
+}
+
 func TestBorrowedFSOwnLivenessNamesArePinned(t *testing.T) {
 	path := r3SourcePath("internal", "integration", "borrowedfs_own_liveness_test.go")
 	raw, err := os.ReadFile(path)

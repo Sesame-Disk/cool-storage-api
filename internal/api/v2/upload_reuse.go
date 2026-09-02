@@ -82,6 +82,20 @@ var validateBlockRepairAuthorityFn = func(database *db.DB, orgID, blockID string
 	return database.ValidateBlockRepairAuthority(orgID, blockID, expected)
 }
 
+// validateBorrowedFSPublicationAuthorityFn is the pre-HEAD BorrowedFS gate.
+// Deliberately a distinct seam from validateBlockRepairAuthorityFn above: that
+// one is the pre-PUT repair boundary and always pays SERIAL because it has no
+// downstream CAS to fall back on and no prior own-reference ordering to lean
+// on either. This one is safe at LOCAL_QUORUM because the caller has already
+// durably written its own up:<session> pin before calling it -- see
+// db.ValidateBorrowedFSPublicationAuthority's doc comment for the full
+// argument. Do not point this at ValidateBlockRepairAuthority: that would pay
+// a Paxos round trip per BorrowedFS block on the dedup hot path for a property
+// LOCAL_QUORUM already gives here.
+var validateBorrowedFSPublicationAuthorityFn = func(database *db.DB, orgID, blockID string, expected db.BlockPhysicalLocation) (db.BlockRepairAuthorityOutcome, error) {
+	return database.ValidateBorrowedFSPublicationAuthority(orgID, blockID, expected)
+}
+
 type blockMaterializationPutFn func(context.Context, *storage.BlockStore, string, []byte) (string, error)
 
 // PutBlockMaterializationTarget is the only authority boundary for a physical

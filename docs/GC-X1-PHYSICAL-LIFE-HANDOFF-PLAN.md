@@ -1004,14 +1004,32 @@ before HEAD (after `pub:` may already be staged — the #200 handshake, not the
 §14 full-writer ideal). Fence abort must drop that `pub:`. R31/W2 and X1
 remain open; keep `GC_ENABLED=false` fleet-wide.
 
-**W1 fix (2026-09-02):** a bare `BlockDeleteFenceActive` check cannot see the
+**W1 fix 1 (2026-09-02):** a bare `BlockDeleteFenceActive` check cannot see the
 terminal state where GC has already fully retired a block (Finalize + settled
 orphan): no `gc_state='deleting'` row and no orphan row are left to report a
 fence, yet the placement this commit observed is gone. The pre-HEAD check now
-re-validates the exact observed `(storage_class, storage_key)` via
-`ValidateBlockRepairAuthority` instead, whose `Blocked`/`Changed` outcomes are
-a strict superset of the old fence check. Proven red without the fix and green
-with it on real Cassandra+MinIO by the `gcFullyRetiredBeforeLateOwnPin` leg.
+re-validates the exact observed `(storage_class, storage_key)`, whose
+`Blocked`/`Changed` outcomes are a strict superset of the old fence check.
+Proven red without the fix and green with it on real Cassandra+MinIO by the
+`gcFullyRetiredBeforeLateOwnPin` leg.
+
+**W1 fix 2 (2026-09-02):** fix 1's first cut reused `ValidateBlockRepairAuthority`,
+which reads at `BlockAuthorityStrong` (SERIAL) -- reserved by
+`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md` for the cold pre-PUT
+repair boundary and kept off the dedup path
+(`TestP3SerialReadsStayOffTheDedupPath`). Calling it once per BorrowedFS block
+would pay one global Paxos round trip per block on this dedup hot path,
+exactly the "accidental hot-path WAN/Paxos explosion" the W1 merge criteria
+rule out. The pre-HEAD check now calls the new
+`db.ValidateBorrowedFSPublicationAuthority`, which shares the same
+exact-placement classification but reads at `BlockAuthorityAdvisory`
+(LOCAL_QUORUM). Safety here comes from ordering, not a downstream CAS: the
+caller has already durably written its own `up:<session>` pin before this
+runs, so a GC zero-proof after that pin sees it and releases, while a GC
+commit before that pin is a settled `EACH_QUORUM`+SERIAL write that
+LOCAL_QUORUM reliably observes -- the same argument `BlockDeleteFenceActive`
+already relied on at this exact pre-HEAD position. Re-proven green with the
+same leg; guarded by `TestValidateBorrowedFSFencesStaysOffSerialAuthority`.
 
 ### W2 — Full publication continuity / R31
 

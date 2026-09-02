@@ -715,11 +715,19 @@ func (h *FileHandler) ensureBorrowedFSOwnLiveness(ctx context.Context, orgID, li
 // settled (DeleteS3Orphan), there is no gc_state='deleting' row and no
 // orphan row left to report a fence, yet the exact physical placement this
 // commit is about to publish against no longer exists. Re-validating the
-// exact observed (storage_class, storage_key) via ValidateBlockRepairAuthority
-// (BlockAuthorityStrong / SERIAL) closes that gap: BlockRepairAuthorityBlocked
+// exact observed (storage_class, storage_key) via
+// ValidateBorrowedFSPublicationAuthority closes that gap: its Blocked outcome
 // reports an active claim or a pending orphan (a strict superset of the old
-// fence-only check), and BlockRepairAuthorityChanged additionally reports a
-// canonical row that is now absent or now names a different placement.
+// fence-only check), and its Changed outcome additionally reports a canonical
+// row that is now absent or now names a different placement.
+//
+// This reads at LOCAL_QUORUM (BlockAuthorityAdvisory), not SERIAL: unlike the
+// pre-PUT repair boundary (ValidateBlockRepairAuthority), safety here does not
+// come from a downstream CAS -- it comes from the caller having already
+// durably written its own up:<session> pin before this runs. See
+// db.ValidateBorrowedFSPublicationAuthority for the full argument. Paying a
+// Paxos round trip per BorrowedFS block on this dedup hot path would buy
+// nothing that ordering does not already give.
 func (h *FileHandler) validateBorrowedFSFences(orgID string, blocks []borrowedFSCommitBlock) error {
 	if len(blocks) == 0 {
 		return nil
@@ -735,7 +743,7 @@ func (h *FileHandler) validateBorrowedFSFences(orgID string, blocks []borrowedFS
 				return gctx.Err()
 			}
 			defer func() { <-sem }()
-			outcome, err := validateBlockRepairAuthorityFn(h.db, orgID, block.blockID, db.BlockPhysicalLocation{
+			outcome, err := validateBorrowedFSPublicationAuthorityFn(h.db, orgID, block.blockID, db.BlockPhysicalLocation{
 				StorageClass: block.storageClass,
 				StorageKey:   block.storageKey,
 			})

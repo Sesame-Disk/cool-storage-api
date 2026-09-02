@@ -8,6 +8,30 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W1 follow-up: drop the per-block SERIAL read on the dedup hot path
+
+Second review of the previous fix (below) found it reused
+`ValidateBlockRepairAuthority`, which reads at `BlockAuthorityStrong`
+(SERIAL) -- a global Paxos round trip that
+`docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md` documents as reserved for
+the cold pre-PUT repair boundary and deliberately kept off the dedup path
+(`TestP3SerialReadsStayOffTheDedupPath`). Calling it once per BorrowedFS block
+immediately before HEAD would turn a large deduplicated commit into
+hundreds/thousands of global Paxos round trips, contradicting the W1 merge
+criterion against an "accidental hot-path WAN/Paxos explosion." Added
+`db.ValidateBorrowedFSPublicationAuthority`, which shares the same
+exact-placement classification (`Authorized`/`Blocked`/`Changed`/`Permanent`)
+but reads at `BlockAuthorityAdvisory` (LOCAL_QUORUM); safety comes from the
+caller having already durably written its own `up:<session>` pin before this
+runs, not from a downstream CAS -- the same ordering argument
+`BlockDeleteFenceActive` already relied on at this exact pre-HEAD position.
+Re-proven green on real Cassandra+MinIO with the same
+`gcFullyRetiredBeforeLateOwnPin` leg, and guarded going forward by the new
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority`. Also confirmed the PR's
+GitHub `mergeable`/`mergeStateStatus` is currently clean, contradicting a
+review claim to the contrary; the PR description text is still stale
+("delete fence" / "seven-leg gate") and needs a manual update.
+
 ## 2026-09-02 - W1 fix: exact-placement re-validation before HEAD (review finding)
 
 Review of the W1 PR found that its pre-HEAD `BlockDeleteFenceActive` check

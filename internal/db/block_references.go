@@ -769,6 +769,32 @@ func (db *DB) ValidateBlockRepairAuthority(orgID, blockID string, expected Block
 	return outcome, err
 }
 
+// ValidateBorrowedFSPublicationAuthority re-validates that blocks(L) still
+// names the exact physical placement `expected` immediately before a
+// BorrowedFS writer may publish HEAD. It shares BlockRepairAuthorityOutcome's
+// classification (Authorized / Blocked / Changed / Permanent / Unknown) with
+// ValidateBlockRepairAuthority, but reads at BlockAuthorityAdvisory
+// (LOCAL_QUORUM), not BlockAuthorityStrong (SERIAL).
+//
+// That is safe here for a DIFFERENT reason than the other Advisory callers'
+// downstream CAS: this call has no downstream mutation on the block to fall
+// back on -- once it says Authorized, HEAD publishes unconditionally. What
+// makes Advisory safe here is ORDERING, not a CAS: the caller has ALREADY
+// durably written its own up:<session> reference (BlockReferenceWriteConsistency
+// = LOCAL_QUORUM) before ever calling this. Either GC's zero-proof read
+// (BlockHasReferencesGlobal, EACH_QUORUM) happens after that pin is durable --
+// in which case it intersects the pin and GC releases rather than commits, so
+// this block can never become fenced by that attempt -- or GC's destructive
+// commit (ClaimBlockDelete / CommitBlockDeleteOrphanHandoff / FinalizeBlockDelete,
+// all EACH_QUORUM+SERIAL) already fully landed before the pin was written, in
+// which case it is a settled write, not one "still in flight", and a
+// LOCAL_QUORUM read reliably observes it (the same intersection argument
+// BlockDeleteFenceActive already relies on for this same pre-HEAD position).
+func (db *DB) ValidateBorrowedFSPublicationAuthority(orgID, blockID string, expected BlockPhysicalLocation) (BlockRepairAuthorityOutcome, error) {
+	_, outcome, err := db.validateBlockRepairAuthority(orgID, blockID, expected, BlockAuthorityAdvisory)
+	return outcome, err
+}
+
 func (db *DB) validateBlockRepairAuthority(orgID, blockID string, expected BlockPhysicalLocation, mode BlockAuthorityRead) (blockRepairAuthorityRow, BlockRepairAuthorityOutcome, error) {
 	if blockID != NormalizeBlockID(blockID) || !IsSHA256BlockID(blockID) {
 		return blockRepairAuthorityRow{}, BlockRepairAuthorityPermanent, blockRepairPermanentError("block id %q is not a canonical lower-case SHA-256", blockID)
