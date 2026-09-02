@@ -73,7 +73,9 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		"writers stay fenced until G4",
 		"G4 owns `blocks=P2` + `orphan=P1`",
 		"SERIAL exact domain",
-		"keep PREPARED; fail closed",
+		"Abort/Release exact P1,D1",
+		"IF exact owner",
+		"once D(P1) is committed",
 		"Never DELETE again",
 		"no **cross-life** destructive",
 		"physical(P1) != physical(P2)",
@@ -175,6 +177,32 @@ func TestX1PhysicalLifeHandoffPlanIsDocumented(t *testing.T) {
 		if !strings.Contains(g4, requiredG4) {
 			t.Fatalf("G4 must name %q", requiredG4)
 		}
+	}
+
+	if strings.Contains(text, "after a valid destructive zero-proof, no legitimate writer") {
+		t.Fatal("W2 must not treat zero-proof as irreversible condemnation")
+	}
+	prepared := sectionBetween(t, text, "### C — Write recovery PREPARED", "### D — Commit D on `blocks`")
+	for _, requiredAbort := range []string{
+		"Abort/Release exact P1,D1",
+		"AND handoff = null",
+		"D1 can no longer commit",
+		"SERIAL observation that D is not yet committed does **not**",
+	} {
+		if !strings.Contains(prepared, requiredAbort) {
+			t.Fatalf("PREPARED abort must name %q", requiredAbort)
+		}
+	}
+	if strings.Contains(prepared, "D never committed     → abort: settle/remove PREPARED") {
+		t.Fatal("PREPARED abort must not delete PREPARED from a SERIAL non-commit observation")
+	}
+
+	w2 := sectionBetween(t, text, "### W2 — Full publication continuity / R31", "### G1 — P4c-orphan exact physical lifecycle identity")
+	if !strings.Contains(w2, "once D(P1) is committed") {
+		t.Fatal("W2 merge criterion must be D committed")
+	}
+	if !strings.Contains(w2, "abort before D") {
+		t.Fatal("W2 must keep abort-before-D as a valid sequence that leaves P1 usable")
 	}
 }
 

@@ -476,7 +476,10 @@ BlockHasReferencesGlobal(L) @ EACH_QUORUM
 `refs > 0` → release the claim.
 `refs = 0` → this attempt may start the handoff.
 
-This is the liveness proof that authorizes the destructive decision.
+This is the liveness proof that authorizes **starting** the handoff. It is
+not irreversible condemnation. PREPARED still has no S3 authority. D is
+committed only by the later CAS on `blocks`. A later abort before that CAS
+must leave P1 canonical and usable.
 
 ### C — Write recovery PREPARED
 
@@ -498,22 +501,44 @@ orphan PREPARED
 blocks not yet committed
 ```
 
-recovery may abort PREPARED only by proving D never committed. That proof is
-architecture of safety, not a G2 implementation detail:
+recovery may abort PREPARED only by first **revoking that exact D's ability
+to commit** on the same `blocks` partition that `CommitBlockDeleteHandoff`
+writes. A SERIAL observation that D is not yet committed does **not**
+suffice: it does not stop the owner from committing afterwards.
 
 ```text
-observe D in the SERIAL exact domain of that lifecycle
-(exact P, D / claim identity, handoff — the same row
-CommitBlockDeleteHandoff writes)
+PREPARED exists
 
-D committed           → promote PREPARED → COMMITTED; never abort
-D never committed     → abort: settle/remove PREPARED; no S3; no invented D
-ambiguous/unavailable → keep PREPARED; fail closed; retry the observation
+unsafe (forbidden):
+  SERIAL observe D not committed
+  → worker Commit D(P1,D1) applies
+  → recovery DELETE PREPARED
+  ⇒ blocks = D1 committed, orphan PREPARED gone
+
+required:
+  Abort/Release exact P1,D1
+  IF exact owner
+  AND handoff = null
+
+  released
+    → D1 can no longer commit
+    → then remove PREPARED
+    → P1 remains canonical; writers may use it
+
+  committed / not-owner / ambiguous
+    → keep PREPARED
+    → re-observe / promote / fail closed
 ```
 
-An ordinary or stale read of `blocks` is not this proof. SERIAL/unavailable
-must not be treated as “D never committed”. Until G4, a stranded PREPARED
-orphan still fences writers on L.
+`Commit D` and `Abort D` compete in the same Paxos domain; only one can
+win. CURRENT `CommitBlockDeleteOrphanHandoff` applies only while the exact
+`(P,D)` still owns the row and `gc_orphan_handoff` is unset.
+`ReleaseBlockClaim` clears that ownership only under the same
+`handoff = null` guard. DECIDED abort uses that competition; it does not
+invent a weaker path.
+
+SERIAL/unavailable must not be treated as abort. Until G4, a stranded
+PREPARED orphan still fences writers on L.
 
 ### D — Commit D on `blocks`
 
@@ -538,9 +563,10 @@ only after proving exactly:
 blocks(L)=P1, D1, handoff=true
 ```
 
-in the same SERIAL exact domain as C. An ambiguous or unavailable
-observation keeps PREPARED and fails closed. Do not invent COMMITTED, and
-do not abort, from that observation.
+in the same SERIAL exact domain as the `blocks` row. An ambiguous or
+unavailable observation keeps PREPARED and fails closed. Do not invent
+COMMITTED, and do not abort, from that observation. Abort remains the CAS
+in C, not a SERIAL read.
 
 Crash:
 
@@ -682,7 +708,7 @@ BorrowedFS → own up: → fence → publication
 ```
 
 Writer wins: `up` visible → GC EACH_QUORUM observes ref → release.
-GC wins: zero-proof / D first → writer sees fence → abort P1.
+GC wins: fence visible (claim or committed D) → writer aborts its P1 work.
 
 A late writer retries. A new materialization uses the then-canonical life or
 mints P2.
@@ -796,7 +822,7 @@ SETTLED
 
 | State | Meaning |
 |-------|---------|
-| `PREPARED` | no S3 authority; abort only via SERIAL exact-domain proof that D never committed |
+| `PREPARED` | no S3 authority; abort only by CAS-revoking that exact D's commit capability (`IF exact owner AND handoff = null`), then removing PREPARED |
 | `COMMITTED` | D transferred; authorizes only `DeleteExact(P)` of that exact P. Ambiguous or unknown DELETE stays here (`DELETE_UNCERTAIN`) and retries `DeleteExact`. |
 | `PHYSICAL_COMPLETE` | physical DELETE confirmed (success or known-absent). Never DELETE again. Only settlement to `SETTLED`. |
 | `SETTLED` | lifecycle finished; canonical recovery may be deleted explicitly |
@@ -926,8 +952,22 @@ HEAD, and crash after a possibly-applied HEAD.
 
 Absolute merge criterion:
 
-> after a valid destructive zero-proof, no legitimate writer can later create
-> an `fs:` that depends on the condemned P1.
+> once D(P1) is committed, no legitimate writer may later publish durable
+> liveness that depends on P1.
+
+Zero-proof only authorizes starting the handoff. This sequence must remain
+valid:
+
+```text
+zero-proof
+→ PREPARED
+→ abort before D
+→ claim released
+→ P1 still canonical
+→ a writer later uses P1 legitimately
+```
+
+Do not treat zero-proof itself as irreversible condemnation.
 
 Only after W2 may post-D refs stop being a contradiction/veto.
 
@@ -950,11 +990,12 @@ same L, same timestamps, distinct P/D still distinct rows
 ### G2 — PREPARED → COMMITTED handoff
 
 Write-ahead orphan. Do not retire `blocks` before COMMITTED. Implements the
-frozen PREPARED classifier in C; it does not invent a weaker abort.
+frozen PREPARED abort in C: abort CAS and Commit D compete on the same
+`blocks` partition. SERIAL observation alone must not remove PREPARED.
 
-Crash matrix: after PREPARED; during D; after D before COMMITTED; ambiguous
-COMMITTED observation. Each state recoverable without inventing destructive
-authority. Ambiguous or unavailable D observation never aborts PREPARED.
+Crash matrix: after PREPARED; abort-vs-commit race; during D; after D before
+COMMITTED; ambiguous COMMITTED observation. Each state recoverable without
+inventing destructive authority. Ambiguous abort CAS never deletes PREPARED.
 
 ### G3 — Canonical retirement after committed handoff
 
@@ -1142,9 +1183,10 @@ Do not merge this docs PR unless:
 15. activation is explicitly outside X1 closure;
 16. G3 does not claim productive P2 install; G4 owns `blocks=P2` + `orphan=P1`;
 17. `PHYSICAL_COMPLETE` never authorizes another DELETE;
-18. PREPARED abort requires SERIAL exact-domain proof that D never committed; ambiguous/unavailable keeps PREPARED and fails closed;
-19. D0 does not claim “no physical ABA”; H stays OPEN;
-20. minted lives are `K1 != K2`, not `normally K1 != K2`.
+18. PREPARED abort CAS-revokes exact D's commit capability before removing PREPARED; SERIAL-only observe-then-delete is forbidden;
+19. W2's irreversible frontier is `D committed`, not zero-proof;
+20. D0 does not claim “no physical ABA”; H stays OPEN;
+21. minted lives are `K1 != K2`, not `normally K1 != K2`.
 
 The contract test `TestX1PhysicalLifeHandoffPlanIsDocumented` pins these
 invariants against this file and against current `processBlock` /

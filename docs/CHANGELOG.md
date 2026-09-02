@@ -8,6 +8,13 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - D0 follow-up: PREPARED abort CAS vs Commit; W2 at D committed
+
+PREPARED abort must CAS-revoke exact D's commit capability on `blocks`
+before deleting the orphan; SERIAL observe-then-delete races with
+`CommitBlockDeleteOrphanHandoff`. W2's irreversible writer frontier is
+`D committed`, not the zero-proof that only starts the handoff.
+
 ## 2026-09-02 - D0 follow-up: freeze consistency (G3/G4, states, satellites)
 
 Corrected remaining freeze contradictions: section 6 no longer lets P2 install

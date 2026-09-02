@@ -193,10 +193,10 @@ after E1. `GC_ENABLED=false`.
 
 **D0 follow-up (2026-09-02):** G3 vacates `blocks` while writers stay fenced until
 G4. `PHYSICAL_COMPLETE` is confirmed DELETE only (ambiguous stays COMMITTED).
-PREPARED abort is SERIAL exact-domain, fail-closed on ambiguity. Minted lives
-are `K1 != K2`, not “normally”. D0 does not claim “no physical ABA”; H stays
-OPEN. Quick Context P3/P4a snapshots no longer present R14b OPEN / strict A+
-as current. Satellite docs point at the freeze, not “no accepted design”.
+PREPARED abort CAS-revokes exact D's commit capability before removing the
+orphan; a SERIAL non-commit observation is not enough. W2's irreversible
+frontier is `D committed`, not zero-proof. Minted lives are `K1 != K2`. D0
+does not claim “no physical ABA”; H stays OPEN.
 
 ### Inter-session Update (2026-05-21)
 
