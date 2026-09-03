@@ -216,7 +216,9 @@ func TestSessionUploadOwnLiveness(t *testing.T) {
 					t.Fatal("sessionUploadGcFullyRetiredBeforeRenewal: BlockDeleteFenceActive must be false once GC has fully retired the block")
 				}
 			},
-			func() { fx.assertPubCount(t, 1, "sessionUploadGcFullyRetiredBeforeRenewal: pub: must be staged before HEAD") },
+			func() {
+				fx.assertPubCount(t, 1, "sessionUploadGcFullyRetiredBeforeRenewal: pub: must be staged before HEAD")
+			},
 			func() error { return nil },
 		)
 		rec := fx.commit(t)

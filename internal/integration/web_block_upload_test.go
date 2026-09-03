@@ -338,9 +338,17 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		t.Fatalf("read renewed durable projection: %v", err)
 	}
 
-	// Successful publication creates permanent fs: liveness, releases only the
-	// session admission slot, and deliberately leaves the up: row, canonical
-	// tracker, durable projection, and staged ledger to their TTL policies.
+	// Successful publication creates permanent fs: liveness and releases the
+	// session admission slot and staged ledger row. Since W2 (SessionUpload
+	// liveness parity, ensureCommitBlockOwnLiveness in internal/api/v2/file_from_blocks.go),
+	// the commit path ALSO renews this SessionUpload block's own up:<session>
+	// reference/tracker/projection one more time -- the same pin/renew step
+	// BorrowedFS blocks already got in W1 (PR #202) -- closing the "TTL alone
+	// is not a proof" gap for a commit that stalls between the block's last
+	// renewal and its own HEAD CAS. So the pre-commit deadline
+	// (renewedExpiresAt, set by the re-upload above) is expected to move
+	// again, not survive untouched.
+	preCommitExpiresAt := renewedExpiresAt
 	sessionBeforeCommit, ok, err := database.GetBlockUploadSession(session)
 	if err != nil || !ok {
 		t.Fatalf("read session before commit: ok=%v err=%v", ok, err)
@@ -357,14 +365,40 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	commit.Body.Close()
 
 	if err := database.Session().Query(
+		`SELECT expires_at, TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&renewedExpiresAt, &renewedTrackerTTL); err != nil {
+		t.Fatalf("read post-commit canonical tracker: %v", err)
+	}
+	if renewedTrackerTTL <= 0 {
+		t.Fatalf("successful commit eagerly removed canonical tracker: ttl=%d", renewedTrackerTTL)
+	}
+	if renewedExpiresAt.UTC().Equal(preCommitExpiresAt.UTC()) {
+		t.Fatalf("commit did not renew the deadline off %v; W2's commit-time renewal was never exercised", preCommitExpiresAt.UTC())
+	}
+	if err := database.Session().Query(
 		`SELECT TTL(library_id) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
 		defaultOrgID, blockID, uploadReferrer).Scan(&renewedRefTTL); err != nil || renewedRefTTL <= 0 {
 		t.Fatalf("successful commit eagerly removed provisional reference: ttl=%d err=%v", renewedRefTTL, err)
 	}
-	if err := database.Session().Query(
-		`SELECT TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		defaultOrgID, blockID, uploadReferrer).Scan(&renewedTrackerTTL); err != nil || renewedTrackerTTL <= 0 {
-		t.Fatalf("successful commit eagerly removed canonical tracker: ttl=%d err=%v", renewedTrackerTTL, err)
+	if renewedRefTTL < dbpkg.ProvisionalBlockReferenceTTLSeconds-10 {
+		t.Fatalf("post-commit reference TTL = %d, want a freshly renewed ~%ds horizon", renewedRefTTL, dbpkg.ProvisionalBlockReferenceTTLSeconds)
+	}
+	// The commit-time renewal must retract the projection it superseded, the
+	// same way the re-upload renewal above did -- otherwise Phase 0 would
+	// walk a stale entry with no canonical tracker behind it.
+	var stalePreCommitProjection time.Time
+	err = database.Session().Query(
+		`SELECT expires_at FROM gc_provisional_block_refs_by_day
+		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(preCommitExpiresAt),
+		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
+		preCommitExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+	).Scan(&stalePreCommitProjection)
+	if err == nil {
+		t.Fatalf("commit-time renewal left the pre-commit projection at %v in place", preCommitExpiresAt.UTC())
+	}
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("check pre-commit projection retracted: %v", err)
 	}
 	if err := database.Session().Query(
 		`SELECT expires_at FROM gc_provisional_block_refs_by_day
@@ -373,7 +407,7 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
 		renewedExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
 	).Scan(&renewedProjection); err != nil {
-		t.Fatalf("successful commit eagerly removed durable projection: %v", err)
+		t.Fatalf("commit-time renewal did not leave a durable projection behind: %v", err)
 	}
 	sessionAfterCommit, ok, err := database.GetBlockUploadSession(session)
 	if err != nil || !ok || !sessionAfterCommit.Committed {
