@@ -420,20 +420,31 @@ func TestR3PublicationHotPathTypedReceiversAndCQLBudget(t *testing.T) {
 		{pkg: module + "/internal/db", name: "AddPublishAttemptReferences"}:     2,
 		{pkg: module + "/internal/db", name: "StagePublishAttemptReferences"}:   3,
 		{pkg: module + "/internal/db", name: "PromotePublishAttemptReferences"}: 1,
-		// 17 -> 18 (W2 final audit, 2026-09-02): stagePendingPublishedFiles's
+		// 17 -> 18 -> 17 (W2 final audit, 2026-09-02/03): stagePendingPublishedFiles's
 		// createFileFSObjectRow error path reaches cleanupPendingPublishedFileOwnerAttempt
 		// -> publishedBlockReferenceRepairCommitReachableFn ->
-		// publishedBlockReferenceRepairHeadCommitFn, which now calls the new
-		// FSHelper.getCanonicalHeadCommitSerial (2 dedicated queries: the
-		// libraries_by_id org lookup, then a SERIAL read of libraries) instead
-		// of the shared GetHeadCommitID/resolveLiveLibraryStateByIDFn chain
-		// (already visited via other reachable paths, so it contributed no
-		// marginal count here). Deliberate: that reachability check drives an
-		// IRREVERSIBLE cleanup decision and a plain LOCAL_QUORUM read of HEAD
-		// can be stale across DCs (see getCanonicalHeadCommitSerial's doc
-		// comment); pinning the whole shared helper to SERIAL instead would
-		// have forced every other caller of GetHeadCommitID onto SERIAL too.
-		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   18,
+		// publishedBlockReferenceRepairHeadCommitFn, which calls
+		// FSHelper.getCanonicalHeadCommitSerial. It first went 17->18 when
+		// that function was added with 2 dedicated queries (a libraries_by_id
+		// org lookup, then a SERIAL read of libraries) in place of the shared
+		// GetHeadCommitID/resolveLiveLibraryStateByIDFn chain (already visited
+		// via other reachable paths, so it contributed no marginal count).
+		// A follow-up audit found the libraries_by_id hop itself was a
+		// liability -- a library's hard-delete cascade
+		// (library_delete_helpers.go) deletes that row in the same batch as
+		// libraries, so resolving it here made a permanently, legitimately
+		// hard-deleted library's leftover repair row retry forever instead of
+		// converging -- and every caller already has orgID durably
+		// (publishedBlockReferenceRepair.OrgID / pendingPublishedFile.cleanupOrgID),
+		// so getCanonicalHeadCommitSerial now takes it directly and only
+		// issues the single SERIAL query, landing back at 17. Both changes
+		// are deliberate: this reachability check drives an IRREVERSIBLE
+		// cleanup decision, and a plain LOCAL_QUORUM read of HEAD (or of an
+		// org-resolution mapping used only to get to it) can be stale across
+		// DCs -- see getCanonicalHeadCommitSerial's doc comment. Pinning the
+		// whole shared GetHeadCommitID helper to SERIAL instead would have
+		// forced every other caller onto SERIAL too.
+		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   17,
 		{pkg: module + "/internal/api/v2", name: "promotePendingPublishedFiles"}: 5,
 		{pkg: module + "/internal/api", name: "stageSyncCommitBlockDelta"}:       8,
 		{pkg: module + "/internal/api", name: "finalizeSyncCommitBlockDelta"}:    5,

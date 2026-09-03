@@ -111,12 +111,17 @@ var loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ow
 // GetHeadCommitID uses elsewhere: this value drives an irreversible cleanup
 // decision (deleting a commit row and its pub: references) and must not be
 // stale relative to an ambiguous CAS that already committed in another DC.
-var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+// Takes orgID directly (every caller already has it durably) rather than
+// resolving it through libraries_by_id, so a genuinely hard-deleted library
+// (whose libraries_by_id row is deleted in the same batch as libraries --
+// library_delete_helpers.go) converges to "gone, safe to clean up" via a
+// plain gocql.ErrNotFound instead of retrying forever.
+var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("database not available")
 	}
 	fsHelper := NewFSHelper(database)
-	return fsHelper.getCanonicalHeadCommitSerial(repoID)
+	return fsHelper.getCanonicalHeadCommitSerial(orgID, repoID)
 }
 
 // publishedBlockReferenceRepairCommitParentFn reads at EACH_QUORUM, not the
@@ -145,8 +150,8 @@ var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, 
 	return parentCommitID, nil
 }
 
-var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repoID)
+var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
+	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, orgID, repoID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -374,15 +379,15 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 	if attemptID == "" {
 		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup attempt metadata", fsID)
 	}
-	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, repoID, attemptID)
+	orgID := strings.TrimSpace(pending.cleanupOrgID)
+	if orgID == "" {
+		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup org_id", fsID)
+	}
+	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, orgID, repoID, attemptID)
 	if err != nil {
 		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, fsID, err)
 	}
 	if reachable {
-		orgID := strings.TrimSpace(pending.cleanupOrgID)
-		if orgID == "" {
-			return fmt.Errorf("reachable pending publish owner for fs_object %s is missing cleanup org_id", fsID)
-		}
 		promotePending, err := loadPublishedBlockReferenceRepairPendingFileFn(database, repoID, fsID)
 		if err != nil {
 			return fmt.Errorf("load reachable published fs_object %s for commit %s: %w", fsID, attemptID, err)
@@ -652,7 +657,7 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 	if len(repair.StagedBlockIDs) == 0 {
 		return fmt.Errorf("queued publish repair for fs_object %s has no staged block IDs", repair.FSID)
 	}
-	commitReachable, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.RepoID, repair.CommitID)
+	commitReachable, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.OrgID, repair.RepoID, repair.CommitID)
 	if err != nil {
 		return err
 	}

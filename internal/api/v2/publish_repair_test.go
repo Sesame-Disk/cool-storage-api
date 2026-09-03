@@ -505,10 +505,10 @@ func TestCleanupPendingPublishedFileOwnerAttempt_PromotesReachableCommitBeforeCl
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		reachabilityChecks++
-		if repoID != "repo-1" || commitID != "commit-1" {
-			t.Fatalf("reachability args = %s/%s, want repo-1/commit-1", repoID, commitID)
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("reachability args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
 		}
 		return true, nil
 	}
@@ -593,7 +593,7 @@ func TestCleanupPendingPublishedFileOwnerAttempt_FailsClosedWithoutAttemptMetada
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		reachabilityChecks++
 		return false, nil
 	}
@@ -642,7 +642,7 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 		deletePublishedBlockReferenceRepairFn = oldDelete
 	})
 
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		return true, nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
@@ -711,10 +711,10 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		return false, nil
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "head-2", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
@@ -785,7 +785,7 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 	})
 
 	t.Run("reachableThroughRealParentChain", func(t *testing.T) {
-		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 			return "commit-3", nil
 		}
 		parents := map[string]string{
@@ -800,7 +800,7 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 			}
 			return parent, nil
 		}
-		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "repo-1", "commit-1")
+		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 		if err != nil {
 			t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil", err)
 		}
@@ -810,7 +810,7 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 	})
 
 	t.Run("missingParentRowMidWalkFailsClosed", func(t *testing.T) {
-		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 			return "commit-2", nil
 		}
 		publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
@@ -821,7 +821,7 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 			// serving this read, NOT a genuine root commit.
 			return "", gocql.ErrNotFound
 		}
-		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "repo-1", "commit-1")
+		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 		if err == nil {
 			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() error = nil, want a hard failure: a missing parent row mid-walk must not resolve to a confident answer")
 		}
@@ -852,13 +852,13 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		return false, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		t.Fatal("head lookup should not run while pre-CAS lease is active")
 		return "", nil
 	}
@@ -920,13 +920,13 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtP
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
 		return false, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "parent-1", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
