@@ -2190,6 +2190,20 @@ The eight-leg real Cassandra+MinIO evidence gate is green. This does not
 close the broader issue: R31/W2 still covers `up -> pub -> HEAD -> fs` crash
 continuity, and other writer funnels remain outside W1.
 
+W2's first slice extends the same `CreateFileFromBlocks` segment to
+SessionUpload-provenance blocks: their existing `up:<session>` reference is
+renewed (not newly created) before session claim, and the same pre-HEAD
+`db.ValidateBorrowedFSPublicationAuthority` check now covers them too (a
+separate six-leg `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`
+gate, kept apart from W1's BorrowedFS-scoped one). New integration evidence
+also confirms the pre-existing publish-repair sweep
+(`internal/api/v2/publish_repair.go`) correctly reconciles this funnel's
+ambiguous-HEAD-CAS outcomes in both directions. R31/W2 remains open for
+every other writer funnel, and the `resolveLibraryHeadUpdateError`
+confirmed-lost case not yet sharing `ErrLibraryHeadConflict`'s immediate
+retry/cleanup is a known, separately-tracked gap (relies on the repair sweep
+instead, which is safe but slower).
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).

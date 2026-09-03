@@ -8,6 +8,45 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W2 first slice: SessionUpload liveness parity in CreateFileFromBlocks
+
+After PR #202 (W1, BorrowedFS-only) merged to `main`, generalized the same
+own-liveness/exact-placement mechanism to SessionUpload-provenance blocks in
+`CreateFileFromBlocks`. `ensureBorrowedFSOwnLiveness`/`validateBorrowedFSFences`
+are renamed to `ensureCommitBlockOwnLiveness`/`validateCommitBlockPublicationFences`
+and now run over every distinct ready block regardless of provenance (backed
+by a generalized `commitBlockPlacement` struct, replacing `borrowedFSCommitBlock`);
+`classifyBlockForCommit` already resolved the canonical placement for every
+block, so this needed no new read. A SessionUpload block already carries its
+own `up:<session>` reference from `/blocks/upload` time; the pre-claim step
+now renews (not creates) it, closing the "TTL alone is not a proof" gap
+`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md` §14 named for this funnel. The
+pre-HEAD exact-placement check's position and consistency level (LOCAL_QUORUM)
+are unchanged -- moving it earlier, to run before `pub:` is staged, was
+considered and rejected: there was only ever one check, not two, and moving
+it earlier would reopen the exact race window W1 closed for the interval
+between the moved check and the real HEAD CAS. New integration evidence:
+`internal/integration/sessionupload_own_liveness_test.go` (six named legs --
+`renewalVisibleBeforeHead`, `renewalExtendsNearExpiredTTL`, `writerFirst`,
+`gcFirst`, `gcFullyRetiredBeforeRenewal`, `renewalRetryIsIdempotent` --
+gated by a new, separate `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`,
+kept apart from W1's pinned BorrowedFS-scoped gate). Also added two
+inert (zero production behavior change) test-only seams on `UpdateLibraryHead`
+(`SetLibraryHeadAmbiguousCASForTest`, `SetLibraryHeadConfirmVisibleForTest`)
+and `internal/integration/createfilefromblocks_ambiguous_head_test.go`,
+proving the PRE-EXISTING `published_block_reference_repairs` repair/sweep
+already converges this funnel's ambiguous-HEAD-CAS outcomes in both
+directions -- no new recovery machinery was built. The
+`resolveLibraryHeadUpdateError` confirmed-lost case not sharing
+`ErrLibraryHeadConflict`'s immediate cleanup is a known, real asymmetry, left
+as a separately-tracked follow-up since it is shared infrastructure also used
+by SeafHTTP/OnlyOffice/batch_operations/trash. This closes one slice of W2,
+not W2 itself: every other `CONDITIONAL`/`UNKNOWN` funnel in
+`docs/R3-LIVENESS-CONTINUITY.md` remains open. R31 and X1 remain OPEN;
+`GC_ENABLED=false` remains required.
+
+---
+
 ## 2026-09-02 - W1 follow-up: fix the LOCAL_QUORUM safety proof's own wording
 
 Third review pass found no correctness blocker, but several places where the

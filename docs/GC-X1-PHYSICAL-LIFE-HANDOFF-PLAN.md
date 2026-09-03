@@ -1032,9 +1032,44 @@ committed; GC fully retired P1 before the pin, where replication lag can only
 bias the read toward the conservative `Blocked` answer, never fabricate
 `Authorized`; and a released/superseded GC claim) -- summarized here only to
 avoid duplicating and drifting from it. Re-proven green with the same leg;
-guarded by `TestValidateBorrowedFSFencesStaysOffSerialAuthority` (caller picks
-the right function) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
+guarded by `TestValidateCommitBlockPublicationFencesStaysOffSerialAuthority`
+(caller picks the right function; renamed from
+`TestValidateBorrowedFSFencesStaysOffSerialAuthority` when the check below was
+generalized) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
 (that function issues Advisory, not Strong, reads).
+
+**W2 first slice -- SessionUpload parity in `CreateFileFromBlocks`
+(2026-09-02):** `ensureCommitBlockOwnLiveness` (renamed from
+`ensureBorrowedFSOwnLiveness`) and `validateCommitBlockPublicationFences`
+(renamed from `validateBorrowedFSFences`) now run over every distinct ready
+block in a `CreateFileFromBlocks` commit, not just BorrowedFS ones. A
+SessionUpload block already carries its own `up:<session>` reference from
+`/blocks/upload` time; this step *renews* (not creates) that same reference
+before session claim -- an idempotent overwrite of the same Cassandra key, per
+`db.AddProvisionalBlockReferenceWithExpiry` -- closing exactly the "TTL alone
+is not a proof" gap §14 names for this funnel. The pre-HEAD check's position
+is unchanged (immediately before `UpdateLibraryHeadFromSnapshot`, after
+`pub:`/the commit row already exist): moving it earlier, on the theory that
+`pub:` then makes it redundant, was considered and rejected -- there was only
+ever one check, not two, and moving it earlier would reopen the exact window
+(`stagePendingPublishedFiles` -> `queuePendingPublishedFileRepairs` ->
+`insertCommit`) W1 closed. New evidence:
+`internal/integration/sessionupload_own_liveness_test.go` (six named legs,
+`SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`, kept as a separate
+gate from W1's eight-leg one since that struct's field list is pinned and
+W1/BorrowedFS-scoped). Separately, new test-only seams on `UpdateLibraryHead`
+(`SetLibraryHeadAmbiguousCASForTest` / `SetLibraryHeadConfirmVisibleForTest`,
+zero production behavior change) drive the ambiguous-HEAD-CAS branch inside a
+real `CreateFileFromBlocks` call and confirm the PRE-EXISTING
+`published_block_reference_repairs` repair/sweep mechanism already converges
+both directions for this funnel
+(`internal/integration/createfilefromblocks_ambiguous_head_test.go`). This is
+a **slice** of W2, not its closure: every other `CONDITIONAL`/`UNKNOWN` funnel
+below remains open, `GC_ENABLED=false`, X1 remains OPEN, and the
+`resolveLibraryHeadUpdateError` confirmed-lost/`ErrLibraryHeadConflict`
+asymmetry (§16) is documented but deliberately not fixed here -- it is shared
+infrastructure also used by SeafHTTP/OnlyOffice/batch_operations/trash, which
+this PR has no dedicated evidence for.
 
 ### W2 — Full publication continuity / R31
 
