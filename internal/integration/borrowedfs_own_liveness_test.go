@@ -57,16 +57,35 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 		borrowedFSOwnLivenessEvidence.borrowedExactOwnPin = true
 	})
 
-	t.Run("sessionUploadNoExtraPin", func(t *testing.T) {
+	// sessionUploadSingleOwnRefIdentity: pinSessionUpload gives fx.blockID its
+	// own up:<session> reference. classifyBlockReferrerProvenance gives the
+	// session's exact up: precedence over any foreign fs:, so this block is
+	// SessionUpload-provenanced for this commit. Before W2
+	// (ensureCommitBlockOwnLiveness, internal/api/v2/file_from_blocks.go),
+	// the then-BorrowedFS-only own-liveness step never touched a
+	// SessionUpload block at all, so an unchanged up: row COUNT was proof of
+	// zero writes. W2 renews (not creates) this same up:<session> identity on
+	// every commit, so the count alone no longer distinguishes "untouched"
+	// from "renewed in place" -- see
+	// TestSessionUploadOwnLiveness/sessionUploadRenewalExtendsNearExpiredTTL
+	// (sessionupload_own_liveness_test.go) for the deadline actually moving.
+	// What still holds, and what this leg checks now, is IDENTITY: the
+	// renewal is an idempotent overwrite of the same Cassandra key, so the
+	// row count for this block never grows past 1 no matter how many times
+	// the own-liveness step runs.
+	t.Run("sessionUploadSingleOwnRefIdentity", func(t *testing.T) {
 		fx := newBorrowedFSHeadFixture(t, database, handler, storageClass)
 		fx.pinSessionUpload(t)
 		before := borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:")
+		if before != 1 {
+			t.Fatalf("sessionUploadSingleOwnRefIdentity: expected exactly one up: row before commit, got %d", before)
+		}
 		borrowedFSInstallBarriers(t, fx,
 			func() {},
 			func() {
 				after := borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:")
 				if after != before {
-					t.Fatalf("sessionUploadNoExtraPin: up: count changed from %d to %d", before, after)
+					t.Fatalf("sessionUploadSingleOwnRefIdentity: own-liveness must overwrite the same up:<session> identity, not add a second one (count %d -> %d)", before, after)
 				}
 			},
 			func() {},
@@ -74,9 +93,9 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 		)
 		rec := fx.commit(t)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("sessionUploadNoExtraPin: commit status=%d body=%s", rec.Code, rec.Body.String())
+			t.Fatalf("sessionUploadSingleOwnRefIdentity: commit status=%d body=%s", rec.Code, rec.Body.String())
 		}
-		borrowedFSOwnLivenessEvidence.sessionUploadNoExtraPin = true
+		borrowedFSOwnLivenessEvidence.sessionUploadSingleOwnRefIdentity = true
 	})
 
 	t.Run("livenessFailureNoPublication", func(t *testing.T) {

@@ -158,7 +158,7 @@ func TestBorrowedFSOwnLivenessNamesArePinned(t *testing.T) {
 	text := string(raw)
 	for _, name := range []string{
 		"borrowedExactOwnPin",
-		"sessionUploadNoExtraPin",
+		"sessionUploadSingleOwnRefIdentity",
 		"livenessFailureNoPublication",
 		"writerFirst",
 		"gcFirst",

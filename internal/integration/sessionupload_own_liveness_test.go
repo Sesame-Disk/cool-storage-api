@@ -233,16 +233,74 @@ func TestSessionUploadOwnLiveness(t *testing.T) {
 		sessionUploadOwnLivenessEvidence.gcFullyRetiredBeforeRenewal = true
 	})
 
+	// sessionUploadRenewalRetryIsIdempotent forces a REAL second renewal, not a
+	// replay of a completed session. A retry with the identical manifest digest
+	// short-circuits at CreateFileFromBlocks' R7 idempotent-replay guard
+	// (file_from_blocks.go, "if session.Committed") before ever reaching
+	// ensureCommitBlockOwnLiveness again -- so two back-to-back fx.commit(t)
+	// calls alone would only prove session-replay idempotency. Instead, inject
+	// a failure at the beforeHead barrier on the FIRST attempt: finalize's error
+	// path calls db.ReleaseBlockUploadSessionCommit (files.go), which reverts
+	// session.Committed to false, so the SECOND fx.commit(t) genuinely re-runs
+	// the whole pipeline, including a second real renewal of the same
+	// up:<session> identity.
 	t.Run("sessionUploadRenewalRetryIsIdempotent", func(t *testing.T) {
 		fx := newSessionUploadHeadFixture(t, database, handler)
-		rec := fx.commit(t)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: commit status=%d body=%s", rec.Code, rec.Body.String())
+
+		var beforeFirstAttempt time.Time
+		if err := database.Session().Query(
+			`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+			fx.orgID, fx.blockID, fx.sessionRef).Scan(&beforeFirstAttempt); err != nil {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: read pre-attempt deadline: %v", err)
 		}
+
+		injectFailure := true
+		borrowedFSInstallBarriers(t, fx.borrowedFSHeadFixture,
+			func() {},
+			func() {},
+			func() {},
+			func() error {
+				if injectFailure {
+					injectFailure = false
+					return fmt.Errorf("sessionUploadRenewalRetryIsIdempotent: injected pre-HEAD failure to force a genuine retry")
+				}
+				return nil
+			},
+		)
+
+		rec := fx.commit(t)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: first attempt status=%d body=%s; want 500 (injected pre-HEAD failure)", rec.Code, rec.Body.String())
+		}
+		fx.assertHeadUnchanged(t)
+
+		var afterFirstAttempt time.Time
+		if err := database.Session().Query(
+			`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+			fx.orgID, fx.blockID, fx.sessionRef).Scan(&afterFirstAttempt); err != nil {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: read post-first-attempt deadline: %v", err)
+		}
+		if !afterFirstAttempt.After(beforeFirstAttempt) {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: first attempt's renewal never ran (deadline stayed at %v)", beforeFirstAttempt.UTC())
+		}
+
+		time.Sleep(50 * time.Millisecond)
 		retry := fx.commit(t)
 		if retry.Code != http.StatusOK {
 			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: retry status=%d body=%s", retry.Code, retry.Body.String())
 		}
+		fx.assertHeadAdvanced(t)
+
+		var afterRetry time.Time
+		if err := database.Session().Query(
+			`SELECT expires_at FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+			fx.orgID, fx.blockID, fx.sessionRef).Scan(&afterRetry); err != nil {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: read post-retry deadline: %v", err)
+		}
+		if !afterRetry.After(afterFirstAttempt) {
+			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: retry's renewal never ran; deadline stayed at %v after a real second attempt", afterFirstAttempt.UTC())
+		}
+
 		if borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "up:") != 1 || !fx.hasOwnFSReferrer(t) || borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "fs:"+fx.repoID+":") != 1 {
 			t.Fatalf("sessionUploadRenewalRetryIsIdempotent: retry duplicated liveness references")
 		}
