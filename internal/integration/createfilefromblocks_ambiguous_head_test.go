@@ -211,6 +211,75 @@ func createFileFromBlocksAmbiguousHeadAssertPromotes(t *testing.T, database *dbp
 	}
 }
 
+// TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep proves the
+// libraryHeadCommitStillExistsFn defense added during the W2 final audit
+// (fs_helpers.go): the durable publish-repair sweep queues its repair row
+// BEFORE this commit is even inserted, with a fixed pre-CAS lease. If this
+// writer's own completion -- insertCommit, block-authority validation,
+// CalculateLibraryStats (an unbounded recursive tree walk) -- takes longer
+// than that lease, the sweep can correctly conclude the commit looked
+// unreachable, wait out the lease, and irreversibly delete the commit row and
+// its pub: references, believing the attempt abandoned when it was merely
+// slow. Without a re-check immediately before the CAS, this writer's CAS
+// would still succeed (it only verifies head_commit_id, nothing about the
+// commit row it publishes), leaving libraries.head_commit_id pointing at a
+// commit row that does not exist. This test does not orchestrate a real
+// timing race (that would be flaky); it uses the same beforeHead barrier
+// every other test in this package uses to model a specific interleaving --
+// here, deleting the commit row exactly where the sweep's cleanup would have,
+// immediately before HEAD is attempted.
+func TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	storageClass := x1StorageClass(t)
+	handler := newBorrowedFSHeadHandler(t, database, storageClass)
+	fx := newSessionUploadHeadFixture(t, database, handler)
+
+	var reclaimedCommitID string
+	borrowedFSInstallBarriers(t, fx.borrowedFSHeadFixture,
+		func() {},
+		func() {},
+		func() {},
+		func() error {
+			iter := database.Session().Query(`SELECT commit_id FROM commits WHERE library_id = ?`, fx.repoID).Iter()
+			var commitID string
+			for iter.Scan(&commitID) {
+				if commitID != fx.headBefore {
+					reclaimedCommitID = commitID
+					break
+				}
+			}
+			if err := iter.Close(); err != nil {
+				t.Fatalf("list commits before reclaiming: %v", err)
+			}
+			if reclaimedCommitID == "" {
+				t.Fatal("expected a newly staged commit distinct from headBefore")
+			}
+			// Models the durable publish-repair sweep's cleanup having already
+			// run: CleanupFailedPublishArtifacts deletes exactly this row.
+			if err := database.Session().Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, fx.repoID, reclaimedCommitID).Exec(); err != nil {
+				t.Fatalf("simulate sweep deleting the commit row: %v", err)
+			}
+			return nil
+		},
+	)
+
+	rec := fx.commit(t)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("commit status=%d body=%s; want 500 (the commit row was reclaimed immediately before HEAD)", rec.Code, rec.Body.String())
+	}
+	fx.assertHeadUnchanged(t)
+	if fx.hasOwnFSReferrer(t) {
+		t.Fatal("expected fs: NOT promoted -- the HEAD CAS must never have been attempted against a reclaimed commit")
+	}
+
+	var stillMissing string
+	err := database.Session().Query(`SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?`, fx.repoID, reclaimedCommitID).Scan(&stillMissing)
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("expected the reclaimed commit row to remain absent, got err=%v", err)
+	}
+}
+
 // createFileFromBlocksAmbiguousHeadPubCommitID reads the commit id straight
 // off the block's own staged pub:<commit> referrer, so the test never needs
 // to duplicate CreateFileFromBlocks' internal commit-id construction.

@@ -35,6 +35,14 @@ var ErrLibraryHeadConflict = errors.New("library HEAD was modified concurrently"
 // CAS error. Callers must not roll back promoted blocks on this error.
 var ErrLibraryHeadPublicationUnknown = errors.New("library HEAD publication outcome is unknown")
 
+// ErrLibraryHeadCommitReclaimed indicates the commit row this HEAD publish
+// targets no longer exists immediately before the CAS -- most likely because
+// the durable publish-repair sweep (publish_repair.go) decided, after its
+// pre-CAS lease expired, that this commit was abandoned and deleted it. This
+// is a definite failure, not ambiguous: the writer must not proceed to CAS
+// against a commit row that is already gone.
+var ErrLibraryHeadCommitReclaimed = errors.New("commit no longer exists immediately before HEAD CAS")
+
 // ErrStorageQuotaExceeded indicates the caller's storage quota would be exceeded.
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
@@ -205,7 +213,9 @@ func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error)
 
 // getCanonicalHeadCommitSerial resolves a library's current HEAD like
 // getCanonicalHeadCommit, but via a SERIAL (Paxos-linearizable) read of the
-// libraries row instead of the session's ordinary LOCAL_QUORUM. Used only by
+// libraries row instead of the session's ordinary LOCAL_QUORUM, and keyed
+// directly by the caller's own (orgID, repoID) rather than resolving repoID
+// through libraries_by_id first. Used only by
 // publishedBlockReferenceRepairHeadCommitFn (publish_repair.go): that caller
 // decides whether to IRREVERSIBLY delete a commit row and its pub: block
 // references, and a plain LOCAL_QUORUM read can return a stale pre-CAS HEAD
@@ -213,34 +223,29 @@ func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error)
 // ambiguous CAS -- the write half of that same LWT is an ordinary
 // LOCAL_QUORUM write and only reaches other DCs via asynchronous replication.
 // This is the same LOCAL_QUORUM-write/LOCAL_QUORUM-read non-intersection gap
-// X2 closed for block_references (docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md); a
-// SERIAL read linearizes this value against the library HEAD Paxos domain, so
-// under the shipped SERIAL default it is correct regardless of which DC
+// X2 closed for block_references (docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md).
+// Taking orgID as a parameter isn't just an optimization: every caller
+// already durably has it (publishedBlockReferenceRepair.OrgID,
+// pendingPublishedFile.cleanupOrgID), and a library's hard-delete cascade
+// (library_delete_helpers.go) deletes libraries_by_id in the SAME batch as
+// libraries -- so resolving orgID through that mapping here would make a
+// genuinely, permanently hard-deleted library's leftover repair row retry
+// forever with a "row not found" error instead of ever converging to the
+// correct "library gone, safe to clean up" verdict a SERIAL read of
+// libraries itself (gocql.ErrNotFound) already gives the caller for free.
+// A SERIAL read linearizes this value against the library HEAD Paxos domain,
+// so under the shipped SERIAL default it is correct regardless of which DC
 // serves the read -- that says nothing about the plain (non-Paxos) commits
 // rows a caller may walk afterward; see publishedBlockReferenceRepairCommitParentFn's
-// own EACH_QUORUM pin for that half. The repair sweep is a cold background
-// recovery path, not a hot path, so paying the extra Paxos round trip here is
-// an easy trade.
-func (h *FSHelper) getCanonicalHeadCommitSerial(repoID string) (string, error) {
-	var orgID string
-	if err := h.db.Session().Query(`
-		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&orgID); err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			// Deliberately NOT propagated as gocql.ErrNotFound: the caller
-			// (publishedBlockReferenceRepairCommitReachableFn) treats THAT
-			// sentinel as "the library is confidently gone, nothing is
-			// reachable" -- correct for a genuinely hard-deleted library, but
-			// this lookup is a plain LOCAL_QUORUM read of an otherwise
-			// permanent, create-time-only mapping, and by the same reasoning
-			// as the ancestry walk below, "not found on this replica set"
-			// must not be silently promoted to "does not exist" for a
-			// decision this destructive.
-			return "", fmt.Errorf("resolve org for library %s: row not found", repoID)
-		}
-		return "", err
-	}
-
+// own EACH_QUORUM pin for that half. Both callers -- the periodic sweep
+// (runPublishedBlockReferenceRepairSweep) and cleanupPendingPublishedFileOwnerAttempt's
+// synchronous error-cleanup branch off a failed createFileFSObjectRow, itself
+// reachable from stagePendingPublishedFiles on the live request path -- are
+// cold recovery/error-cleanup paths, outside the normal successful
+// publication hot path; the extra Paxos round trip's cost is deliberately
+// accepted here, not free, but it is off the path every ordinary commit
+// takes.
+func (h *FSHelper) getCanonicalHeadCommitSerial(orgID, repoID string) (string, error) {
 	var headCommitID string
 	var deletedAt time.Time
 	err := h.db.Session().Query(`
@@ -701,6 +706,38 @@ var libraryHeadConfirmVisibleFn = func(h *FSHelper, orgID, repoID, commitID stri
 	return h.confirmLibraryHeadCommitVisible(orgID, repoID, commitID)
 }
 
+// libraryHeadCommitStillExistsFn re-verifies the commit row immediately
+// before the HEAD CAS. UpdateLibraryHead already reads this same row at its
+// very start (to get rootFSID for CalculateLibraryStats), but CalculateLibraryStats
+// itself is an unbounded recursive walk of the new tree -- for a large or deep
+// library it can run far longer than a few seconds. The durable publish-repair
+// sweep (publish_repair.go) queues its repair row BEFORE this commit is even
+// inserted, with a fixed pre-CAS lease (publishedBlockReferenceRepairPreCASLease):
+// if this writer's OWN completion -- insertCommit, block-authority validation,
+// CalculateLibraryStats, then this CAS -- takes longer than that lease, the
+// sweep can correctly conclude the commit is not yet reachable, correctly wait
+// out the lease, and then irreversibly delete the commit row and its pub:
+// references, believing the attempt abandoned when it is merely slow. Without
+// this check, this writer's CAS would still succeed afterward (the CAS only
+// verifies head_commit_id, nothing about the commit row it publishes),
+// leaving libraries.head_commit_id pointing at a commit row that does not
+// exist -- breaking every future write to the library. Moving this
+// verification to immediately before the CAS cannot eliminate that race
+// (Cassandra has no atomic condition spanning both the commits and libraries
+// tables), but it shrinks the window from "however long stats calculation and
+// block validation take" down to this query's own round trip. Reads at
+// EACH_QUORUM, not plain session consistency: the sweep's cleanup delete can
+// run in a different DC than this writer, and a LOCAL_QUORUM read in the
+// writer's own DC could still see the (by-then-stale) row if the delete's
+// tombstone has not yet replicated there -- the same reasoning as
+// publishedBlockReferenceRepairCommitParentFn's own EACH_QUORUM pin.
+var libraryHeadCommitStillExistsFn = func(h *FSHelper, repoID, commitID string) error {
+	var exists string
+	return h.db.Session().Query(`
+		SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Consistency(gocql.EachQuorum).Scan(&exists)
+}
+
 func resolveLibraryHeadUpdateError(repoID, commitID string, updateErr error, confirmVisible func() (string, bool, error)) error {
 	wrapped := fmt.Errorf("conditional library head update failed: %w", updateErr)
 	if !isAmbiguousLibraryHeadUpdateError(updateErr) {
@@ -740,6 +777,15 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 		log.Printf("[UpdateLibraryHead] Warning: failed to calculate library stats: %v", err)
 		totalSize = 0
 		fileCount = 0
+	}
+
+	// Re-verify the commit survived whatever CalculateLibraryStats (an
+	// unbounded recursive tree walk) just cost: see libraryHeadCommitStillExistsFn.
+	if err := libraryHeadCommitStillExistsFn(h, repoID, commitID); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("%w: commit %s in library %s", ErrLibraryHeadCommitReclaimed, commitID, repoID)
+		}
+		return fmt.Errorf("failed to re-verify commit %s before HEAD CAS: %w", commitID, err)
 	}
 
 	now := time.Now()
