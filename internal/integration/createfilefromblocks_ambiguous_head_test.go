@@ -142,6 +142,75 @@ func TestCreateFileFromBlocksAmbiguousCASConfirmationUnknown(t *testing.T) {
 	createFileFromBlocksAmbiguousHeadAssertConverges(t, database, fx, commitID, fsID)
 }
 
+// TestCreateFileFromBlocksAmbiguousCASAppliedConfirmationUnknownRepairs is the
+// scenario none of the three legs above cover: the CAS genuinely APPLIES
+// (applyReal=true actually runs it), but the SERIAL confirmation read itself
+// then fails, so UpdateLibraryHead still returns
+// ErrLibraryHeadPublicationUnknown -- the request sees a definite failure even
+// though HEAD has already, for real, advanced to the new commit. This is the
+// one combination that exercises the repair sweep's PROMOTE branch (as
+// opposed to the cleanup branch every other leg here exercises) triggered by
+// a genuine ambiguous CAS in this funnel; the pre-existing
+// TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart
+// proves the same promote branch converges, but never drives it through
+// UpdateLibraryHead's ambiguous-CAS handling at all.
+func TestCreateFileFromBlocksAmbiguousCASAppliedConfirmationUnknownRepairs(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	storageClass := x1StorageClass(t)
+	handler := newBorrowedFSHeadHandler(t, database, storageClass)
+	fx := newSessionUploadHeadFixture(t, database, handler)
+
+	restoreCAS := v2api.SetLibraryHeadAmbiguousCASForTest(true, gocql.RequestErrCASWriteUnknown{})
+	t.Cleanup(restoreCAS)
+	restoreConfirm := v2api.SetLibraryHeadConfirmVisibleForTest(false, "", errors.New("forced confirmation failure"))
+	t.Cleanup(restoreConfirm)
+
+	rec := fx.commit(t)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("commit status=%d body=%s; want 500 (applied-but-unconfirmed is still a definite failure to the caller)", rec.Code, rec.Body.String())
+	}
+	// Unlike ConfirmedLost/ConfirmationUnknown, the CAS genuinely applied:
+	// HEAD really did advance, even though the request that caused it failed.
+	fx.assertHeadAdvanced(t)
+	if fx.hasOwnFSReferrer(t) {
+		t.Fatal("expected fs: NOT promoted inline -- UpdateLibraryHeadFromSnapshot returned an error, so finalizeStoredUploadMetadataOnce never reaches promotePendingPublishedFiles")
+	}
+
+	commitID := createFileFromBlocksAmbiguousHeadPubCommitID(t, database, fx.orgID, fx.blockID)
+	if commitID == "" {
+		t.Fatal("expected a staged pub:<commit> reference to survive the applied-but-unconfirmed outcome")
+	}
+	fsID := createFileFromBlocksAmbiguousHeadFSObjectID(t, []string{fx.sha1ID}, int64(len(fx.content)))
+	createFileFromBlocksAmbiguousHeadAssertPromotes(t, database, fx, commitID, fsID)
+}
+
+// createFileFromBlocksAmbiguousHeadAssertPromotes is the PROMOTE-side
+// counterpart to createFileFromBlocksAmbiguousHeadAssertConverges: here the
+// commit really is reachable from HEAD, so repairPublishedBlockReferenceRepair
+// takes its "commitReachable" branch, which does not consult the lease at
+// all (publishedBlockReferenceRepairShouldDeferCleanup only guards the
+// unreachable/cleanup branch) -- no backdating is needed for this outcome.
+// The generous timeout is the same StartPublishedBlockReferenceRepairer
+// sync.Once accounting documented on createFileFromBlocksAmbiguousHeadAssertConverges.
+func createFileFromBlocksAmbiguousHeadAssertPromotes(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
+	t.Helper()
+	bucket := publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID)
+	if !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) {
+		t.Fatal("expected the repair row queued before HEAD was attempted to survive the applied-but-unconfirmed outcome")
+	}
+
+	v2api.StartPublishedBlockReferenceRepairer(database)
+
+	if !pollUntil(t, 75*time.Second, time.Second, func() bool {
+		return fx.hasOwnFSReferrer(t) &&
+			!publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) &&
+			borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "pub:") == 0
+	}) {
+		t.Fatalf("timed out waiting for the pre-existing repair sweep to promote commit=%s fs=%s", commitID, fsID)
+	}
+}
+
 // createFileFromBlocksAmbiguousHeadPubCommitID reads the commit id straight
 // off the block's own staged pub:<commit> referrer, so the test never needs
 // to duplicate CreateFileFromBlocks' internal commit-id construction.

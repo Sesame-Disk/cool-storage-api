@@ -983,6 +983,24 @@ docker compose --profile test run --rm --build \
   go test -tags integration -run '^TestBorrowedFSOwnLiveness|^TestBorrowedFSHeadCharacterizationIsDocumented$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
+W2 SessionUpload own-liveness evidence is a separate six-leg gate, kept apart
+from the W1 gate above so `TestBorrowedFSOwnLivenessNamesArePinned` (which
+pins that struct's exact field list) never has to change. Covered by
+`internal/integration/sessionupload_own_liveness_test.go`. Directed run:
+
+```bash
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_REQUIRE_P2_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P3_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4A_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1 \
+  go-integration-test \
+  go test -tags integration -run '^TestSessionUploadOwnLiveness|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+```
+
 X1 physical-life handoff plan (`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`) is a
 docs freeze (D0). It does not change runtime. Contract tests in
 `internal/gc/x1_physical_life_handoff_plan_test.go` pin CURRENT vs DECIDED and
