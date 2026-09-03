@@ -2214,6 +2214,26 @@ the sweep. R31/W2 remains open for every other writer funnel, and the
 separately-tracked gap (relies on the repair sweep instead, which is now
 correctly multi-DC-safe but slower).
 
+A later audit found the multi-DC fix above was necessary but not sufficient by
+itself, and that its own follow-up attempt (an EACH_QUORUM re-check of the
+commit row immediately before the HEAD CAS) could not close the gap it was
+filed against either -- shrinking a check-then-act window across two
+Cassandra tables is not the same as closing it. The actual defect was in the
+sweep's cleanup: it deleted a `commits` row based on a cross-process
+inference ("looks unreachable, lease expired") that can be wrong about a
+merely-slow, still-alive writer about to CAS HEAD onto that exact commit.
+Fixed by narrowing the sweep's destructive cleanup
+(`publishedBlockReferenceRepairCleanupFn`, `internal/api/v2/publish_repair.go`)
+to never delete the `commits` row -- only the attempt's staged `pub:`
+reference, which is what actually needs to happen for an ordinary lost
+concurrent-write race to leave its blocks GC-eligible. An orphaned `commits`
+row is inert (nothing walks a library's commits except from a HEAD-reachable
+ancestry chain), the same tradeoff `HardDeleteLibrary` already makes for a
+hard-deleted library's leftover commits. This let the now-provably-unnecessary
+pre-CAS re-check (and the EACH_QUORUM cost it added to every HEAD mutation in
+the system, not only the rare slow-writer path) be removed entirely. See
+docs/CHANGELOG.md "W2 follow-up 4" for the full audit trail.
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).

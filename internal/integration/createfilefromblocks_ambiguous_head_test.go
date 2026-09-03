@@ -211,23 +211,26 @@ func createFileFromBlocksAmbiguousHeadAssertPromotes(t *testing.T, database *dbp
 	}
 }
 
-// TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep proves the
-// libraryHeadCommitStillExistsFn defense added during the W2 final audit
-// (fs_helpers.go): the durable publish-repair sweep queues its repair row
-// BEFORE this commit is even inserted, with a fixed pre-CAS lease. If this
-// writer's own completion -- insertCommit, block-authority validation,
-// CalculateLibraryStats (an unbounded recursive tree walk) -- takes longer
-// than that lease, the sweep can correctly conclude the commit looked
-// unreachable, wait out the lease, and irreversibly delete the commit row and
-// its pub: references, believing the attempt abandoned when it was merely
-// slow. Without a re-check immediately before the CAS, this writer's CAS
-// would still succeed (it only verifies head_commit_id, nothing about the
-// commit row it publishes), leaving libraries.head_commit_id pointing at a
-// commit row that does not exist. This test does not orchestrate a real
-// timing race (that would be flaky); it uses the same beforeHead barrier
-// every other test in this package uses to model a specific interleaving --
-// here, deleting the commit row exactly where the sweep's cleanup would have,
-// immediately before HEAD is attempted.
+// TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep proves
+// UpdateLibraryHead fails closed -- never attempts the HEAD CAS, never
+// advances HEAD -- if the commit row it is about to publish is simply gone by
+// the time it runs. An earlier revision of this function re-verified the
+// commit's existence a second time, immediately before the CAS, specifically
+// to shrink (not close -- see docs/CHANGELOG.md "W2 follow-up 3") the window
+// in which the durable publish-repair sweep (publish_repair.go) could delete
+// a live writer's own commit row out from under it after its pre-CAS lease
+// expired. That re-check was removed ("W2 follow-up 4"): it never closed the
+// race it targeted, cost an EACH_QUORUM round trip on every HEAD mutation,
+// and became unnecessary once the sweep itself stopped deleting commits rows
+// for commits it can only infer, cross-process, are unreachable (see
+// publishedBlockReferenceRepairCleanupFn). This test now documents the
+// remaining, always-true invariant: UpdateLibraryHead's own first read
+// (`SELECT root_fs_id FROM commits ...`, needed for CalculateLibraryStats)
+// already fails if the row is missing, for whatever reason, so a vanished
+// commit row can never reach the CAS. It does not orchestrate a real timing
+// race (that would be flaky); it uses the same beforeHead barrier every other
+// test in this package uses to model a specific interleaving -- here,
+// deleting the commit row immediately before HEAD is attempted.
 func TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep(t *testing.T) {
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
@@ -255,10 +258,13 @@ func TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep(t *testin
 			if reclaimedCommitID == "" {
 				t.Fatal("expected a newly staged commit distinct from headBefore")
 			}
-			// Models the durable publish-repair sweep's cleanup having already
-			// run: CleanupFailedPublishArtifacts deletes exactly this row.
+			// Models the commit row being gone by the time UpdateLibraryHead
+			// runs, whatever the cause -- the sweep no longer does this itself
+			// (see publishedBlockReferenceRepairCleanupFn), so this is a
+			// direct simulation, not a reproduction of current production
+			// behavior.
 			if err := database.Session().Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, fx.repoID, reclaimedCommitID).Exec(); err != nil {
-				t.Fatalf("simulate sweep deleting the commit row: %v", err)
+				t.Fatalf("simulate the commit row being gone: %v", err)
 			}
 			return nil
 		},
@@ -313,6 +319,15 @@ func createFileFromBlocksAmbiguousHeadPubCommitID(t *testing.T, database *dbpkg.
 // sync.Once: whichever test in this binary calls it first gets the immediate
 // sweep, and a test that loses that race must wait for the next periodic tick
 // (publishedBlockReferenceRepairSweepInterval, ~1 minute) instead.
+//
+// This also proves the commit row itself survives (docs/CHANGELOG.md, "W2
+// follow-up 4"): publishedBlockReferenceRepairCleanupFn removes the staged
+// pub: reference and the repair row but deliberately never deletes commits,
+// because this sweep's "unreachable" verdict is a cross-process inference
+// that can be wrong about a merely-slow, still-alive writer, and destroying
+// the row a live writer is about to CAS HEAD onto would corrupt the library
+// permanently. Leaving it in place is safe either way: an orphaned commits
+// row nothing points to is inert.
 func createFileFromBlocksAmbiguousHeadAssertConverges(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
 	t.Helper()
 	bucket := publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID)
@@ -337,5 +352,11 @@ func createFileFromBlocksAmbiguousHeadAssertConverges(t *testing.T, database *db
 	}
 	if fx.hasOwnFSReferrer(t) {
 		t.Fatal("an unreachable commit must never be promoted to fs:")
+	}
+	var stillPresent string
+	if err := database.Session().Query(`
+		SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, fx.repoID, commitID).Scan(&stillPresent); err != nil {
+		t.Fatalf("expected the sweep's cleanup to leave the (now orphaned) commit row in place, got err=%v", err)
 	}
 }

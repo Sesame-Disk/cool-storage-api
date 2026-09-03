@@ -35,14 +35,6 @@ var ErrLibraryHeadConflict = errors.New("library HEAD was modified concurrently"
 // CAS error. Callers must not roll back promoted blocks on this error.
 var ErrLibraryHeadPublicationUnknown = errors.New("library HEAD publication outcome is unknown")
 
-// ErrLibraryHeadCommitReclaimed indicates the commit row this HEAD publish
-// targets no longer exists immediately before the CAS -- most likely because
-// the durable publish-repair sweep (publish_repair.go) decided, after its
-// pre-CAS lease expired, that this commit was abandoned and deleted it. This
-// is a definite failure, not ambiguous: the writer must not proceed to CAS
-// against a commit row that is already gone.
-var ErrLibraryHeadCommitReclaimed = errors.New("commit no longer exists immediately before HEAD CAS")
-
 // ErrStorageQuotaExceeded indicates the caller's storage quota would be exceeded.
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
@@ -706,38 +698,6 @@ var libraryHeadConfirmVisibleFn = func(h *FSHelper, orgID, repoID, commitID stri
 	return h.confirmLibraryHeadCommitVisible(orgID, repoID, commitID)
 }
 
-// libraryHeadCommitStillExistsFn re-verifies the commit row immediately
-// before the HEAD CAS. UpdateLibraryHead already reads this same row at its
-// very start (to get rootFSID for CalculateLibraryStats), but CalculateLibraryStats
-// itself is an unbounded recursive walk of the new tree -- for a large or deep
-// library it can run far longer than a few seconds. The durable publish-repair
-// sweep (publish_repair.go) queues its repair row BEFORE this commit is even
-// inserted, with a fixed pre-CAS lease (publishedBlockReferenceRepairPreCASLease):
-// if this writer's OWN completion -- insertCommit, block-authority validation,
-// CalculateLibraryStats, then this CAS -- takes longer than that lease, the
-// sweep can correctly conclude the commit is not yet reachable, correctly wait
-// out the lease, and then irreversibly delete the commit row and its pub:
-// references, believing the attempt abandoned when it is merely slow. Without
-// this check, this writer's CAS would still succeed afterward (the CAS only
-// verifies head_commit_id, nothing about the commit row it publishes),
-// leaving libraries.head_commit_id pointing at a commit row that does not
-// exist -- breaking every future write to the library. Moving this
-// verification to immediately before the CAS cannot eliminate that race
-// (Cassandra has no atomic condition spanning both the commits and libraries
-// tables), but it shrinks the window from "however long stats calculation and
-// block validation take" down to this query's own round trip. Reads at
-// EACH_QUORUM, not plain session consistency: the sweep's cleanup delete can
-// run in a different DC than this writer, and a LOCAL_QUORUM read in the
-// writer's own DC could still see the (by-then-stale) row if the delete's
-// tombstone has not yet replicated there -- the same reasoning as
-// publishedBlockReferenceRepairCommitParentFn's own EACH_QUORUM pin.
-var libraryHeadCommitStillExistsFn = func(h *FSHelper, repoID, commitID string) error {
-	var exists string
-	return h.db.Session().Query(`
-		SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, commitID).Consistency(gocql.EachQuorum).Scan(&exists)
-}
-
 func resolveLibraryHeadUpdateError(repoID, commitID string, updateErr error, confirmVisible func() (string, bool, error)) error {
 	wrapped := fmt.Errorf("conditional library head update failed: %w", updateErr)
 	if !isAmbiguousLibraryHeadUpdateError(updateErr) {
@@ -779,15 +739,19 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 		fileCount = 0
 	}
 
-	// Re-verify the commit survived whatever CalculateLibraryStats (an
-	// unbounded recursive tree walk) just cost: see libraryHeadCommitStillExistsFn.
-	if err := libraryHeadCommitStillExistsFn(h, repoID, commitID); err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return fmt.Errorf("%w: commit %s in library %s", ErrLibraryHeadCommitReclaimed, commitID, repoID)
-		}
-		return fmt.Errorf("failed to re-verify commit %s before HEAD CAS: %w", commitID, err)
-	}
-
+	// No re-verification of the commit row runs here (a prior revision of this
+	// function added one, immediately before the CAS; it was removed -- see
+	// docs/CHANGELOG.md, "W2 follow-up 4"). It could not have closed the race
+	// it targeted: a check-then-CAS gap across two tables is inherently
+	// non-atomic in Cassandra, so re-reading here only shrank the window
+	// without eliminating it, while adding an EACH_QUORUM round trip -- under
+	// this deployment's 3-DC/RF-1-per-DC topology, a quorum in every DC is
+	// every node -- to every HEAD mutation in the system, not just the rare
+	// slow-writer case it existed for. The actual fix was upstream: the
+	// publish-repair sweep (publish_repair.go, publishedBlockReferenceRepairCleanupFn)
+	// no longer deletes a commit row it merely infers is unreachable, so
+	// nothing can make the row this CAS is about to reference disappear
+	// out from under a live writer between insertCommit and here.
 	now := time.Now()
 	applied, casState, err := libraryHeadCASExecuteFn(h, orgID, repoID, commitID, totalSize, fileCount, now, expectedHead)
 	if err != nil {

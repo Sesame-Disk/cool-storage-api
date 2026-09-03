@@ -181,6 +181,55 @@ func TestCleanupFailedPublishArtifacts_ReturnsCommitDeleteErrorAfterRemovingRefs
 	}
 }
 
+// TestPublishedBlockReferenceRepairCleanupFn_NeverDeletesCommitRow exercises
+// the REAL publishedBlockReferenceRepairCleanupFn (every repairPublishedBlockReferenceRepair
+// test in this file replaces it wholesale, so none of them cover its own
+// body). Its "unreachable" verdict is a cross-process inference from a
+// snapshot read, not a fact the writer that owns the commit has confirmed
+// about itself -- a merely-slow, still-alive writer can be about to CAS HEAD
+// onto this exact commit. Deleting the commits row here would race that CAS
+// and, if it wins, leave libraries.head_commit_id pointing at a missing
+// commit row, corrupting the library permanently (docs/CHANGELOG.md, "W2
+// follow-up 4"). Removing the staged pub: reference carries no such hazard
+// and must still happen -- it is what makes an ordinary lost concurrent-write
+// race's blocks GC-eligible once GC_ENABLED is ever turned on.
+func TestPublishedBlockReferenceRepairCleanupFn_NeverDeletesCommitRow(t *testing.T) {
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	oldRemoveRefs := cleanupFailedPublishRemoveAttemptReferencesFn
+	t.Cleanup(func() {
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveRefs
+	})
+
+	commitDeletes := 0
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		commitDeletes++
+		return nil
+	}
+	removeRefsCalls := 0
+	cleanupFailedPublishRemoveAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		removeRefsCalls++
+		if orgID != "org-1" || attemptID != "commit-1" {
+			t.Fatalf("remove refs args = %s/%s, want org-1/commit-1", orgID, attemptID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "queued-block-1" {
+			t.Fatalf("remove refs blockIDs = %#v, want []string{\"queued-block-1\"}", blockIDs)
+		}
+		return nil
+	}
+
+	err := publishedBlockReferenceRepairCleanupFn(&db.DB{}, "org-1", "repo-1", "commit-1", "fs-1", []string{"queued-block-1"})
+	if err != nil {
+		t.Fatalf("publishedBlockReferenceRepairCleanupFn() error = %v, want nil", err)
+	}
+	if commitDeletes != 0 {
+		t.Fatalf("commitDeletes = %d, want 0: the repair sweep must never delete a commit row it only infers, cross-process, is unreachable", commitDeletes)
+	}
+	if removeRefsCalls != 1 {
+		t.Fatalf("removeRefsCalls = %d, want 1", removeRefsCalls)
+	}
+}
+
 func TestCleanupFailedPublishAttempt_PreservesPendingOwnersWhenArtifactCleanupFails(t *testing.T) {
 	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
 	oldRelease := releasePendingPublishedFileOwnersFn
@@ -829,6 +878,104 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false alongside the error")
 		}
 	})
+}
+
+// TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConverges
+// exercises the REAL publishedBlockReferenceRepairCommitReachableFn for the
+// hard-delete convergence fix (docs/CHANGELOG.md, "W2 follow-up 3", item 2):
+// getCanonicalHeadCommitSerial now takes orgID directly instead of resolving
+// it through libraries_by_id, so a genuinely, permanently hard-deleted
+// library (whose libraries_by_id row is deleted in the SAME batch as
+// libraries -- library_delete_helpers.go) reports plain gocql.ErrNotFound
+// from its SERIAL libraries read. This pins that publishedBlockReferenceRepairHeadCommitFn's
+// ErrNotFound still resolves to a confident (unreachable, no error) verdict
+// here, not an error that would make a leftover repair row retry forever.
+func TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConverges(t *testing.T) {
+	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairHeadCommitFn = oldHead
+	})
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
+		return "", gocql.ErrNotFound
+	}
+	reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+	if err != nil {
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil: a hard-deleted library must converge to a confident (unreachable, no error) verdict, not retry forever", err)
+	}
+	if reachable {
+		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false for a hard-deleted library")
+	}
+}
+
+// TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete
+// proves the full chain end-to-end for the scenario the report recommended
+// pinning explicitly: a hard-deleted library's leftover repair row converges
+// to "cleaned up" in a single sweep pass, not a permanent retry loop. Only
+// publishedBlockReferenceRepairHeadCommitFn is mocked (to simulate the SERIAL
+// libraries read observing a hard-deleted library without a real Cassandra
+// cluster); publishedBlockReferenceRepairCommitReachableFn itself runs for
+// real, unlike every other repairPublishedBlockReferenceRepair test in this
+// file.
+func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t *testing.T) {
+	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
+	oldPromote := publishedBlockReferenceRepairPromoteFn
+	oldCleanup := publishedBlockReferenceRepairCleanupFn
+	oldDelete := deletePublishedBlockReferenceRepairFn
+	oldNow := publishedBlockReferenceRepairNowFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
+		publishedBlockReferenceRepairPromoteFn = oldPromote
+		publishedBlockReferenceRepairCleanupFn = oldCleanup
+		deletePublishedBlockReferenceRepairFn = oldDelete
+		publishedBlockReferenceRepairNowFn = oldNow
+	})
+
+	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
+	publishedBlockReferenceRepairNowFn = func() time.Time { return now }
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
+		return "", gocql.ErrNotFound
+	}
+	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
+		t.Fatal("fs_object lookup should not run for a hard-deleted library's unreachable commit")
+		return nil, nil
+	}
+	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
+		t.Fatal("promote should not run for a hard-deleted library's unreachable commit")
+		return nil
+	}
+	cleanupCalls := 0
+	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
+		cleanupCalls++
+		return nil
+	}
+	deleteCalls := 0
+	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		deleteCalls++
+		return nil
+	}
+
+	repair := publishedBlockReferenceRepair{
+		Bucket:         publishedBlockReferenceRepairBucket("org-1", "repo-1", "commit-1", "fs-1"),
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		CommitID:       "commit-1",
+		FSID:           "fs-1",
+		StagedBlockIDs: []string{"queued-block-1"},
+		CreatedAt:      now.Add(-10 * time.Minute),
+		LeaseExpiresAt: now.Add(-time.Minute),
+	}
+	err := repairPublishedBlockReferenceRepair(nil, repair)
+	if err != nil {
+		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want nil: a hard-deleted library's leftover repair row must converge in one pass, not retry forever", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
+	}
 }
 
 func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhilePreCASLeaseActive(t *testing.T) {

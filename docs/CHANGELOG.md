@@ -8,7 +8,81 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-03 - W2 follow-up 4: close the HEAD-CAS/lease race at its root, not its window
+
+A seventh-pass audit of "W2 follow-up 3" below found its own P1 fix
+insufficient by its own admission: the entry itself says "this cannot
+eliminate the race," which is disqualifying for a fix filed as closing a
+correctness gap. That entry is marked superseded rather than rewritten, per
+this file's append-only convention. This entry replaces the mitigation with
+one that actually closes the danger, and removes the mitigation's own cost.
+
+1. **P1, root-caused:** the real defect was never in `UpdateLibraryHead`'s
+   timing -- it was that the durable publish-repair sweep
+   (`publishedBlockReferenceRepairCleanupFn`, `internal/api/v2/publish_repair.go`)
+   destructively deleted a `commits` row based on a **cross-process
+   inference** ("this commit looks unreachable from HEAD and its lease has
+   expired") rather than a fact the owning writer confirmed about itself. A
+   writer that is merely slow -- an unbounded `CalculateLibraryStats` tree
+   walk, a paused goroutine, GC pressure -- can still be alive and about to
+   CAS HEAD onto that exact commit. No re-check immediately before the CAS
+   can close that gap, because Cassandra has no atomic condition spanning the
+   `commits` and `libraries` tables; re-checking closer to the CAS only
+   shrinks the window, which is exactly what the superseded entry did and
+   exactly why it could not claim the gap closed. Fixed at the source
+   instead: `publishedBlockReferenceRepairCleanupFn` no longer deletes the
+   `commits` row at all (it still removes the attempt's staged `pub:`
+   reference and the repair row, which is what makes an ordinary lost
+   concurrent-write race's blocks GC-eligible once `GC_ENABLED` is ever
+   turned on -- unaffected). With the sweep no longer capable of deleting a
+   commit row a live writer might still CAS onto, `libraryHeadCommitStillExistsFn`
+   (the EACH_QUORUM pre-CAS re-check added in "W2 follow-up 3") and
+   `ErrLibraryHeadCommitReclaimed` are both removed as provably dead defenses
+   -- nothing left in the system can make a commit row disappear between
+   `insertCommit` and this writer's own HEAD CAS on realistic timescales
+   (`HardDeleteLibrary`, `internal/gc/store_cassandra.go`, does not delete
+   `commits` rows either, and is gated behind its own hard-delete lock plus a
+   30-day soft-delete grace period regardless). This also removes the
+   EACH_QUORUM round trip "W2 follow-up 3" added to **every** HEAD mutation in
+   the system, not just the rare slow-writer case it existed for -- under this
+   deployment's 3-DC / RF-1-per-DC topology, EACH_QUORUM is a quorum in every
+   DC, i.e. every node, so a single node or DC outage would have degraded
+   every file/folder write, not merely the repair sweep's own error path. An
+   orphaned `commits` row left behind by the sweep's now-narrower cleanup
+   costs a little storage and is otherwise inert: nothing walks a library's
+   commits except from a HEAD-reachable ancestry chain, so a row nothing
+   points to is dead weight, not a correctness hazard -- the same tradeoff
+   `HardDeleteLibrary` already accepts today. `TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep`
+   is retargeted to document the invariant that actually holds (`UpdateLibraryHead`'s
+   own first read already fails closed if the commit row is simply gone, for
+   any reason) instead of a mechanism that no longer exists;
+   `createFileFromBlocksAmbiguousHeadAssertConverges` now also asserts the
+   commit row survives the sweep's real cleanup; new unit coverage
+   (`TestPublishedBlockReferenceRepairCleanupFn_NeverDeletesCommitRow`) pins
+   `publishedBlockReferenceRepairCleanupFn`'s real body directly, since every
+   `repairPublishedBlockReferenceRepair` test replaces that function wholesale
+   and none of them exercised it.
+2. Added explicit regression coverage for the hard-delete convergence fix
+   ("W2 follow-up 3", item 2) that nothing previously pinned end-to-end:
+   `TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConverges`
+   and `TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete`
+   drive the real `publishedBlockReferenceRepairCommitReachableFn` (only its
+   HEAD read is mocked, to model a hard-deleted library's SERIAL
+   `gocql.ErrNotFound` without a real Cassandra cluster) and prove a
+   hard-deleted library's leftover repair row converges to "cleaned up" in
+   one sweep pass, not a permanent retry loop.
+
+---
+
 ## 2026-09-03 - W2 follow-up 3: HEAD-CAS/lease race, hard-delete convergence, directed-run contamination
+
+**Item 1's fix is superseded by "W2 follow-up 4" above.** It shipped
+`libraryHeadCommitStillExistsFn`/`ErrLibraryHeadCommitReclaimed`, described in
+its own text as unable to eliminate the race it was filed against -- a fix
+that admits it does not fix is not done. "W2 follow-up 4" closes the race at
+its actual source (the sweep's cleanup) and removes both symbols along with
+the EACH_QUORUM cost this item added to every HEAD mutation. Items 2-4 below
+remain accurate and are unaffected.
 
 A sixth-pass audit (again independently re-verified against the code, not
 accepted at face value) found two further correctness gaps in the

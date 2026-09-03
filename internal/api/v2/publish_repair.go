@@ -264,8 +264,34 @@ var publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoI
 	return helper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pending})
 }
 
+// publishedBlockReferenceRepairCleanupFn deliberately passes "" as
+// CleanupFailedPublishArtifacts' commitID (the row it would delete from
+// commits), never commitID itself: unlike the synchronous same-writer
+// cleanup paths (CleanupFailedPublishAttempt, called from files.go/
+// batch_operations.go/onlyoffice.go when a writer aborts its OWN in-flight
+// attempt before ever reaching HEAD CAS), this sweep's "unreachable" verdict
+// is an inference from a snapshot read taken by a DIFFERENT process, not a
+// fact the owning writer has confirmed about itself. A writer that is merely
+// slow -- an unbounded CalculateLibraryStats tree walk, a paused goroutine,
+// GC pressure -- can still be alive and about to CAS HEAD onto this exact
+// commit after this sweep pass observed it as unreachable and past its
+// lease. Deleting the commits row here races that CAS: if it wins, HEAD ends
+// up pointing at a commit row that no longer exists, breaking every future
+// write to the library, permanently and unrecoverably (see docs/CHANGELOG.md,
+// "W2 follow-up 4", and KNOWN_ISSUES.md ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01).
+// Removing the staged pub: reference has no such hazard -- it only affects
+// this attempt's own block liveness pin, and when the commit genuinely never
+// becomes HEAD (an ordinary lost concurrent-write race, the overwhelmingly
+// common reason this branch runs at all) it is exactly the cleanup the sweep
+// exists to perform, keeping abandoned blocks GC-eligible once GC_ENABLED is
+// ever turned on. An orphaned commits row left behind here costs a little
+// storage and is otherwise inert: nothing walks a library's commits except
+// from a HEAD-reachable ancestry chain (onlyOfficeCommitReachable), so a row
+// nothing points to is dead weight, not a correctness hazard -- the same
+// tradeoff HardDeleteLibrary already accepts (internal/gc/store_cassandra.go
+// never deletes commits rows for a hard-deleted library either).
 var publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
-	return CleanupFailedPublishArtifacts(database, orgID, repoID, commitID, commitID, []string{fsID}, blockIDs)
+	return CleanupFailedPublishArtifacts(database, orgID, repoID, commitID, "", []string{fsID}, blockIDs)
 }
 
 func CleanupFailedPublishArtifacts(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
