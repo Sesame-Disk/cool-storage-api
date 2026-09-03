@@ -82,8 +82,11 @@ func TestCreateFileFromBlocksAmbiguousCASConfirmedApplied(t *testing.T) {
 // CleanupFailedPublishAttempt immediately, so pub:/the commit row/the
 // already-queued repair row are left standing. That fix is deliberately out
 // of scope here; what this test proves is that the PRE-EXISTING repair sweep
-// still converges this funnel's own queued row to "cleaned up" once it
-// classifies the commit as unreachable from HEAD.
+// correctly RETAINS this funnel's own queued row rather than destroying it
+// (docs/CHANGELOG.md, "W2 follow-up 5"): the library is still alive (this
+// outcome only proves a DIFFERENT commit won, not that the library is gone),
+// so an "unreachable" verdict here must not authorize cleanup no matter how
+// long the pre-CAS lease has been expired.
 func TestCreateFileFromBlocksAmbiguousCASConfirmedLost(t *testing.T) {
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
@@ -107,7 +110,7 @@ func TestCreateFileFromBlocksAmbiguousCASConfirmedLost(t *testing.T) {
 		t.Fatal("expected a staged pub:<commit> reference to survive the confirmed-lost outcome")
 	}
 	fsID := createFileFromBlocksAmbiguousHeadFSObjectID(t, []string{fx.sha1ID}, int64(len(fx.content)))
-	createFileFromBlocksAmbiguousHeadAssertConverges(t, database, fx, commitID, fsID)
+	createFileFromBlocksAmbiguousHeadAssertRetained(t, database, fx, commitID, fsID)
 }
 
 // TestCreateFileFromBlocksAmbiguousCASConfirmationUnknown is the same
@@ -115,7 +118,9 @@ func TestCreateFileFromBlocksAmbiguousCASConfirmedLost(t *testing.T) {
 // itself fails (ErrLibraryHeadPublicationUnknown), not a confirmed loss. The
 // underlying real state is identical (the CAS never applied), so the repair
 // sweep's own reachability check must resolve it the same way via a
-// different code path.
+// different code path -- and, since this outcome does not even prove which
+// commit won (only that this one might have lost), retaining rather than
+// destroying is even more clearly correct here than for ConfirmedLost.
 func TestCreateFileFromBlocksAmbiguousCASConfirmationUnknown(t *testing.T) {
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
@@ -139,7 +144,7 @@ func TestCreateFileFromBlocksAmbiguousCASConfirmationUnknown(t *testing.T) {
 		t.Fatal("expected a staged pub:<commit> reference to survive the confirmation-unknown outcome")
 	}
 	fsID := createFileFromBlocksAmbiguousHeadFSObjectID(t, []string{fx.sha1ID}, int64(len(fx.content)))
-	createFileFromBlocksAmbiguousHeadAssertConverges(t, database, fx, commitID, fsID)
+	createFileFromBlocksAmbiguousHeadAssertRetained(t, database, fx, commitID, fsID)
 }
 
 // TestCreateFileFromBlocksAmbiguousCASAppliedConfirmationUnknownRepairs is the
@@ -186,13 +191,13 @@ func TestCreateFileFromBlocksAmbiguousCASAppliedConfirmationUnknownRepairs(t *te
 }
 
 // createFileFromBlocksAmbiguousHeadAssertPromotes is the PROMOTE-side
-// counterpart to createFileFromBlocksAmbiguousHeadAssertConverges: here the
+// counterpart to createFileFromBlocksAmbiguousHeadAssertRetained: here the
 // commit really is reachable from HEAD, so repairPublishedBlockReferenceRepair
 // takes its "commitReachable" branch, which does not consult the lease at
 // all (publishedBlockReferenceRepairShouldDeferCleanup only guards the
-// unreachable/cleanup branch) -- no backdating is needed for this outcome.
+// libraryGone/cleanup branch) -- no backdating is needed for this outcome.
 // The generous timeout is the same StartPublishedBlockReferenceRepairer
-// sync.Once accounting documented on createFileFromBlocksAmbiguousHeadAssertConverges.
+// sync.Once accounting documented on createFileFromBlocksAmbiguousHeadAssertRetained.
 func createFileFromBlocksAmbiguousHeadAssertPromotes(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
 	t.Helper()
 	bucket := publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID)
@@ -304,31 +309,45 @@ func createFileFromBlocksAmbiguousHeadPubCommitID(t *testing.T, database *dbpkg.
 	return ""
 }
 
-// createFileFromBlocksAmbiguousHeadAssertConverges backdates the repair row
-// the production path already queued (before HEAD was ever attempted) past
-// its pre-CAS lease, starts the pre-existing sweep worker, and polls for
-// convergence to "cleaned up". Unlike
+// createFileFromBlocksAmbiguousHeadAssertRetained backdates the repair row
+// the production path already queued (before HEAD was ever attempted) FAR
+// past its pre-CAS lease, starts the pre-existing sweep worker, gives it a
+// real chance to run, and then asserts the repair row, the staged pub:
+// reference, and the commit row all SURVIVE -- fs: is never promoted either.
+//
+// Renamed from "...AssertConverges" (docs/CHANGELOG.md, "W2 follow-up 5"):
+// an ambiguous CAS that resolves to confirmed-lost or confirmation-unknown
+// proves this writer's OWN commit did not (or may not have) become HEAD, but
+// it does NOT prove the library is gone -- HEAD is still some other, live
+// commit. repairPublishedBlockReferenceRepair's cleanup branch now requires
+// libraryGone, not merely "unreachable + lease expired": a lease elapsing is
+// a timeout, not proof this writer's process is dead or has given up, and a
+// merely-slow writer (or one still working through its own confirmation
+// logic) could still be about to reuse this exact pub:/repair state. The
+// old assertion (convergence to "cleaned up") was itself the residual gap
+// the audit flagged: it destroyed the one durable backstop
+// (published_block_reference_repairs) a crashed writer's promotion retry
+// would have needed, based on nothing but elapsed time. Retaining forever
+// (until a real terminal-authority signal exists -- R31/W2, still open) is
+// the safe direction: it costs a leaked pub: reference and repair row, never
+// a corrupted publish.
+//
+// Timeout accounting matches the pre-existing pattern here: unlike
 // TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart
 // (which backdates created_at but sets a FUTURE lease_expires_at, because
-// promotion of a reachable commit does not consult the lease at all), the
-// "not reachable" cleanup path this test exercises explicitly defers while
-// publishedBlockReferenceRepairShouldDeferCleanup sees an unexpired lease
-// (publish_repair.go) -- so lease_expires_at must ALSO already be in the past,
-// or the sweep intentionally waits out the lease before doing anything. The
-// generous timeout accounts for StartPublishedBlockReferenceRepairer's
-// sync.Once: whichever test in this binary calls it first gets the immediate
-// sweep, and a test that loses that race must wait for the next periodic tick
-// (publishedBlockReferenceRepairSweepInterval, ~1 minute) instead.
-//
-// This also proves the commit row itself survives (docs/CHANGELOG.md, "W2
-// follow-up 4"): publishedBlockReferenceRepairCleanupFn removes the staged
-// pub: reference and the repair row but deliberately never deletes commits,
-// because this sweep's "unreachable" verdict is a cross-process inference
-// that can be wrong about a merely-slow, still-alive writer, and destroying
-// the row a live writer is about to CAS HEAD onto would corrupt the library
-// permanently. Leaving it in place is safe either way: an orphaned commits
-// row nothing points to is inert.
-func createFileFromBlocksAmbiguousHeadAssertConverges(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
+// promotion of a reachable commit does not consult the lease at all), this
+// backdates lease_expires_at deep into the past specifically so
+// publishedBlockReferenceRepairShouldDeferCleanup could never explain
+// inaction on its own -- if anything still gets cleaned up here, it is
+// because of the libraryGone fix, not a leftover lease grace window. The
+// generous window accounts for StartPublishedBlockReferenceRepairer's
+// sync.Once: whichever test in this binary calls it first gets the
+// immediate sweep, and a test that loses that race must wait for the next
+// periodic tick (publishedBlockReferenceRepairSweepInterval, ~1 minute)
+// instead -- so this deliberately waits out a full cycle (rather than
+// polling for a positive condition, since nothing should change) before
+// asserting the retained state.
+func createFileFromBlocksAmbiguousHeadAssertRetained(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
 	t.Helper()
 	bucket := publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID)
 	if !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) {
@@ -338,17 +357,23 @@ func createFileFromBlocksAmbiguousHeadAssertConverges(t *testing.T, database *db
 		UPDATE published_block_reference_repairs
 		SET created_at = ?, lease_expires_at = ?
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, time.Now().UTC().Add(-2*time.Minute), time.Now().UTC().Add(-time.Minute), bucket, fx.orgID, fx.repoID, commitID, fsID).Exec(); err != nil {
+	`, time.Now().UTC().Add(-72*time.Hour), time.Now().UTC().Add(-72*time.Hour), bucket, fx.orgID, fx.repoID, commitID, fsID).Exec(); err != nil {
 		t.Fatalf("backdate queued repair row: %v", err)
 	}
 
 	v2api.StartPublishedBlockReferenceRepairer(database)
 
-	if !pollUntil(t, 75*time.Second, time.Second, func() bool {
-		return !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) &&
+	if pollUntil(t, 75*time.Second, time.Second, func() bool {
+		return !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) ||
 			borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "pub:") == 0
 	}) {
-		t.Fatalf("timed out waiting for the pre-existing repair sweep to clean up commit=%s fs=%s", commitID, fsID)
+		t.Fatalf("the repair sweep destroyed pub:/the repair row for commit=%s fs=%s despite the library being alive -- a lease timeout must never authorize this", commitID, fsID)
+	}
+	if !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) {
+		t.Fatal("expected the durable repair row to survive indefinitely for a live-unreachable commit")
+	}
+	if borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "pub:") == 0 {
+		t.Fatal("expected the staged pub: reference to survive indefinitely for a live-unreachable commit")
 	}
 	if fx.hasOwnFSReferrer(t) {
 		t.Fatal("an unreachable commit must never be promoted to fs:")
@@ -357,6 +382,6 @@ func createFileFromBlocksAmbiguousHeadAssertConverges(t *testing.T, database *db
 	if err := database.Session().Query(`
 		SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, fx.repoID, commitID).Scan(&stillPresent); err != nil {
-		t.Fatalf("expected the sweep's cleanup to leave the (now orphaned) commit row in place, got err=%v", err)
+		t.Fatalf("expected the commit row to remain in place (it was never reachable from HEAD, but was also never authorized for cleanup), got err=%v", err)
 	}
 }

@@ -150,15 +150,24 @@ var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, 
 	return parentCommitID, nil
 }
 
-var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
+// publishedBlockReferenceRepairCommitReachableFn resolves three distinct
+// verdicts, not a plain bool: reachable (promote), confirmed libraryGone
+// (safe to clean up -- the library itself is structurally gone, so nothing
+// can ever CAS its HEAD again), or neither (the commit is not currently
+// reachable from a LIVE library's HEAD, which proves nothing about whether
+// the writer that owns it is still going to CAS onto it). Only the first two
+// verdicts authorize repairPublishedBlockReferenceRepair to act; the third
+// must retain the repair row and pub: reference indefinitely -- see that
+// function's own comment, and docs/CHANGELOG.md "W2 follow-up 5".
+var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (reachable bool, libraryGone bool, err error) {
 	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, orgID, repoID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
+			return false, true, nil
 		}
-		return false, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
+		return false, false, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
 	}
-	return onlyOfficeCommitReachable(commitID, headCommitID, func(currentCommitID string) (string, error) {
+	reachable, err = onlyOfficeCommitReachable(commitID, headCommitID, func(currentCommitID string) (string, error) {
 		parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repoID, currentCommitID)
 		if err != nil {
 			// Deliberately NOT swallowing ErrNotFound into ("", nil) here.
@@ -178,6 +187,7 @@ var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID
 		}
 		return parentCommitID, nil
 	})
+	return reachable, false, err
 }
 
 var loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
@@ -266,30 +276,26 @@ var publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoI
 
 // publishedBlockReferenceRepairCleanupFn deliberately passes "" as
 // CleanupFailedPublishArtifacts' commitID (the row it would delete from
-// commits), never commitID itself: unlike the synchronous same-writer
-// cleanup paths (CleanupFailedPublishAttempt, called from files.go/
-// batch_operations.go/onlyoffice.go when a writer aborts its OWN in-flight
-// attempt before ever reaching HEAD CAS), this sweep's "unreachable" verdict
-// is an inference from a snapshot read taken by a DIFFERENT process, not a
-// fact the owning writer has confirmed about itself. A writer that is merely
-// slow -- an unbounded CalculateLibraryStats tree walk, a paused goroutine,
-// GC pressure -- can still be alive and about to CAS HEAD onto this exact
-// commit after this sweep pass observed it as unreachable and past its
-// lease. Deleting the commits row here races that CAS: if it wins, HEAD ends
-// up pointing at a commit row that no longer exists, breaking every future
-// write to the library, permanently and unrecoverably (see docs/CHANGELOG.md,
-// "W2 follow-up 4", and KNOWN_ISSUES.md ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01).
-// Removing the staged pub: reference has no such hazard -- it only affects
-// this attempt's own block liveness pin, and when the commit genuinely never
-// becomes HEAD (an ordinary lost concurrent-write race, the overwhelmingly
-// common reason this branch runs at all) it is exactly the cleanup the sweep
-// exists to perform, keeping abandoned blocks GC-eligible once GC_ENABLED is
-// ever turned on. An orphaned commits row left behind here costs a little
-// storage and is otherwise inert: nothing walks a library's commits except
-// from a HEAD-reachable ancestry chain (onlyOfficeCommitReachable), so a row
-// nothing points to is dead weight, not a correctness hazard -- the same
-// tradeoff HardDeleteLibrary already accepts (internal/gc/store_cassandra.go
-// never deletes commits rows for a hard-deleted library either).
+// commits), never commitID itself, even though its only caller
+// (repairPublishedBlockReferenceRepair) now reaches this function ONLY after
+// independently confirming the library itself is structurally gone
+// (libraryGone==true from publishedBlockReferenceRepairCommitReachableFn --
+// see that function's and the caller's own comments, "W2 follow-up 5") --
+// never merely because this commit looked unreachable from a live library's
+// HEAD. Both destructive actions here (removing the staged pub: reference,
+// and -- were commitID passed through -- deleting the commits row) are safe
+// specifically because of that: with the library confirmed gone, no writer
+// can ever CAS its HEAD again, so nothing can race this cleanup. The
+// commits-row omission is kept anyway, as a second independent safeguard
+// against a future caller reaching this function on a weaker verdict by
+// mistake (see docs/CHANGELOG.md, "W2 follow-up 4" and "W2 follow-up 5", and
+// KNOWN_ISSUES.md ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01): an orphaned
+// commits row left behind here costs a little storage and is otherwise
+// inert (nothing walks a library's commits except from a HEAD-reachable
+// ancestry chain, onlyOfficeCommitReachable), the same tradeoff
+// HardDeleteLibrary already accepts (internal/gc/store_cassandra.go never
+// deletes commits rows for a hard-deleted library either) -- so declining to
+// delete it here is free insurance, not a behavior anything depends on.
 var publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
 	return CleanupFailedPublishArtifacts(database, orgID, repoID, commitID, "", []string{fsID}, blockIDs)
 }
@@ -409,7 +415,7 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 	if orgID == "" {
 		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup org_id", fsID)
 	}
-	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, orgID, repoID, attemptID)
+	reachable, libraryGone, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, orgID, repoID, attemptID)
 	if err != nil {
 		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, fsID, err)
 	}
@@ -429,12 +435,33 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 		}
 		return clearPendingPublishedFileOwnerFn(database, repoID, pending)
 	}
+	if !libraryGone {
+		// Unreachable from the current live HEAD, but the library itself is
+		// not confirmed gone: same reasoning as repairPublishedBlockReferenceRepair
+		// below -- an owner record's age alone (even the 24h staleness this
+		// sweep requires) proves nothing about whether the writer that
+		// created it can still complete its own HEAD CAS. Leave it for a
+		// future sweep pass rather than release/destroy on an inference.
+		return nil
+	}
 	if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
 		return err
 	}
 	return releasePendingPublishedFileOwner(database, repoID, pending)
 }
 
+// cleanupPendingPublishedFileAttemptArtifacts is only reached once
+// cleanupPendingPublishedFileOwnerAttempt has confirmed libraryGone==true, so
+// unlike publishedBlockReferenceRepairCleanupFn's caller it never runs
+// against a library that might still have a live writer. It still never
+// passes attemptID as the commitID to delete, though: matching
+// publishedBlockReferenceRepairCleanupFn keeps a single rule for every
+// inferred (not same-process, self-directed) cleanup path in this file --
+// "never delete commits" -- rather than two paths that agree only some of
+// the time. An orphaned commits row is inert either way (nothing walks it
+// except from a HEAD-reachable ancestry chain), and HardDeleteLibrary
+// (internal/gc/store_cassandra.go) does not delete commits rows for a
+// hard-deleted library either.
 func cleanupPendingPublishedFileAttemptArtifacts(database *db.DB, repoID string, pending *pendingPublishedFile) error {
 	if database == nil || pending == nil {
 		return nil
@@ -449,7 +476,7 @@ func cleanupPendingPublishedFileAttemptArtifacts(database *db.DB, repoID string,
 	if len(blockIDs) > 0 && orgID == "" {
 		return fmt.Errorf("cleanup metadata for fs_object %s is missing org_id", fsID)
 	}
-	if err := CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, attemptID, []string{fsID}, blockIDs); err != nil {
+	if err := CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, "", []string{fsID}, blockIDs); err != nil {
 		return fmt.Errorf("cleanup failed publish artifacts for fs_object %s attempt %s: %w", fsID, attemptID, err)
 	}
 	return nil
@@ -683,11 +710,12 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 	if len(repair.StagedBlockIDs) == 0 {
 		return fmt.Errorf("queued publish repair for fs_object %s has no staged block IDs", repair.FSID)
 	}
-	commitReachable, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.OrgID, repair.RepoID, repair.CommitID)
+	commitReachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.OrgID, repair.RepoID, repair.CommitID)
 	if err != nil {
 		return err
 	}
-	if commitReachable {
+	switch {
+	case commitReachable:
 		pending, err := loadPublishedBlockReferenceRepairPendingFileFn(database, repair.RepoID, repair.FSID)
 		if err != nil {
 			return err
@@ -697,7 +725,22 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 		if err := publishedBlockReferenceRepairPromoteFn(helper, repair.OrgID, repair.RepoID, repair.CommitID, pending); err != nil {
 			return fmt.Errorf("promote published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
-	} else {
+	case !libraryGone:
+		// Unreachable from the current live HEAD, but the library itself is
+		// not confirmed gone: a writer that is merely slow (an unbounded
+		// CalculateLibraryStats walk, a paused goroutine, GC pressure) can
+		// still be alive and about to CAS HEAD onto this exact commit, and an
+		// ambiguous-CAS outcome this writer could not safely self-resolve can
+		// look identical to an abandoned attempt from a snapshot read. The
+		// lease elapsing proves neither has happened -- a timeout is not a
+		// revocation of the writer's ability to publish. Retain pub:/this
+		// repair row indefinitely rather than guess; only a structurally
+		// confirmed-terminal library (libraryGone) or a reachable commit
+		// authorizes acting on this row. See docs/CHANGELOG.md, "W2
+		// follow-up 5" -- R31/W2 tracks building a real terminal-authority
+		// signal so this can converge without leaking.
+		return nil
+	default: // libraryGone
 		if publishedBlockReferenceRepairShouldDeferCleanup(repair) {
 			return nil
 		}

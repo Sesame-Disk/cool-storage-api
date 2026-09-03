@@ -749,9 +749,19 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 	// every node -- to every HEAD mutation in the system, not just the rare
 	// slow-writer case it existed for. The actual fix was upstream: the
 	// publish-repair sweep (publish_repair.go, publishedBlockReferenceRepairCleanupFn)
-	// no longer deletes a commit row it merely infers is unreachable, so
-	// nothing can make the row this CAS is about to reference disappear
-	// out from under a live writer between insertCommit and here.
+	// no longer deletes a commit row -- nor removes its pub: reference or
+	// durable repair row -- from a merely-inferred "unreachable" verdict; see
+	// "W2 follow-up 5". The precise invariant is not "nothing can ever delete
+	// a commits row" (GC's own library hard-delete cascade,
+	// internal/gc/worker.go processCommit -> store.DeleteCommit, still can):
+	// it is that no actor able to coexist with a writer of a still-publishable
+	// library can remove that writer's commit without first structurally
+	// revoking the writer's ability to CAS HEAD. GC's cascade is fenced behind
+	// its own hard-delete lock (fenceGuard, re-checked immediately before the
+	// delete) and only runs after a library has already been hard-deleted --
+	// itself gated by a 30-day soft-delete grace period, far longer than any
+	// live writer's completion time -- so it is excluded on that basis, not
+	// because "nothing else can delete commits."
 	now := time.Now()
 	applied, casState, err := libraryHeadCASExecuteFn(h, orgID, repoID, commitID, totalSize, fileCount, now, expectedHead)
 	if err != nil {

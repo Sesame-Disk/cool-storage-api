@@ -554,12 +554,12 @@ func TestCleanupPendingPublishedFileOwnerAttempt_PromotesReachableCommitBeforeCl
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
 		reachabilityChecks++
 		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
 			t.Fatalf("reachability args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
 		}
-		return true, nil
+		return true, false, nil
 	}
 	loaded := 0
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
@@ -642,9 +642,9 @@ func TestCleanupPendingPublishedFileOwnerAttempt_FailsClosedWithoutAttemptMetada
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
 		reachabilityChecks++
-		return false, nil
+		return false, false, nil
 	}
 	clearedOwners := 0
 	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
@@ -677,6 +677,110 @@ func TestCleanupPendingPublishedFileOwnerAttempt_FailsClosedWithoutAttemptMetada
 	}
 }
 
+// TestCleanupPendingPublishedFileOwnerAttempt_CleansUpAfterGoneLibrary covers
+// the ONLY case that may still release/destroy a pending owner's artifacts:
+// unreachable AND the library confirmed gone.
+func TestCleanupPendingPublishedFileOwnerAttempt_CleansUpAfterGoneLibrary(t *testing.T) {
+	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	oldRemoveAttemptRefs := cleanupFailedPublishRemoveAttemptReferencesFn
+	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	t.Cleanup(func() {
+		cleanupPendingPublishedFileAttemptCommitReachableFn = oldReachable
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveAttemptRefs
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+	})
+
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, true, nil
+	}
+	commitDeletes := 0
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		commitDeletes++
+		return nil
+	}
+	removeRefsCalls := 0
+	cleanupFailedPublishRemoveAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		removeRefsCalls++
+		return nil
+	}
+	releasedOwners := 0
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		releasedOwners++
+		return nil
+	}
+
+	err := cleanupPendingPublishedFileOwnerAttempt(&db.DB{}, "repo-1", &pendingPublishedFile{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC),
+		cleanupOrgID:     "org-1",
+		cleanupAttemptID: "commit-1",
+		internalBlockIDs: []string{"block-int-1"},
+	})
+	if err != nil {
+		t.Fatalf("cleanupPendingPublishedFileOwnerAttempt() error = %v, want nil", err)
+	}
+	if commitDeletes != 0 {
+		t.Fatalf("commitDeletes = %d, want 0: this inferred cleanup must never delete a commits row (see publishedBlockReferenceRepairCleanupFn's comment for the shared rule)", commitDeletes)
+	}
+	if removeRefsCalls != 1 {
+		t.Fatalf("removeRefsCalls = %d, want 1", removeRefsCalls)
+	}
+	if releasedOwners != 1 {
+		t.Fatalf("releasedOwners = %d, want 1", releasedOwners)
+	}
+}
+
+// TestCleanupPendingPublishedFileOwnerAttempt_RetainsLiveUnreachableCommit is
+// the pending-owner-sweep counterpart of
+// TestRepairPublishedFSObjectBlockReferenceRepair_RetainsLiveUnreachableCommit:
+// unreachable but the library is not confirmed gone must never release or
+// destroy this owner's artifacts, no matter how stale (this sweep already
+// only considers owners at least pendingPublishedFSObjectOwnerStaleAfter, 24h,
+// old -- staleness is not revocation either).
+func TestCleanupPendingPublishedFileOwnerAttempt_RetainsLiveUnreachableCommit(t *testing.T) {
+	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	oldRemoveAttemptRefs := cleanupFailedPublishRemoveAttemptReferencesFn
+	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	t.Cleanup(func() {
+		cleanupPendingPublishedFileAttemptCommitReachableFn = oldReachable
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveAttemptRefs
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+	})
+
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, false, nil
+	}
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		t.Fatal("commit cleanup must not run for a live-unreachable commit")
+		return nil
+	}
+	cleanupFailedPublishRemoveAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatal("pub: ref removal must not run for a live-unreachable commit -- the writer may still need it")
+		return nil
+	}
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		t.Fatal("the pending owner row must survive: releasing it here would let a later sweep silently skip a still-live attempt")
+		return nil
+	}
+
+	err := cleanupPendingPublishedFileOwnerAttempt(&db.DB{}, "repo-1", &pendingPublishedFile{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC),
+		cleanupOrgID:     "org-1",
+		cleanupAttemptID: "commit-1",
+		internalBlockIDs: []string{"block-int-1"},
+	})
+	if err != nil {
+		t.Fatalf("cleanupPendingPublishedFileOwnerAttempt() error = %v, want nil (retain-and-defer, not an error)", err)
+	}
+}
+
 func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
@@ -691,8 +795,8 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 		deletePublishedBlockReferenceRepairFn = oldDelete
 	})
 
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
-		return true, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return true, false, nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
 		return &pendingPublishedFile{fsID: fsID, externalBlockIDs: []string{"fs-block-1"}}, nil
@@ -736,7 +840,14 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *testing.T) {
+// TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommitFromGoneLibrary
+// covers the ONLY case that may still authorize destructive cleanup: the
+// commit is not reachable from HEAD AND the library itself is confirmed gone
+// (libraryGone=true), so no writer can ever CAS its HEAD again. Renamed from
+// "..._CleansUnreachableCommit" (docs/CHANGELOG.md, "W2 follow-up 5"):
+// unreachable alone is no longer sufficient -- see the sibling test
+// _RetainsLiveUnreachableCommit for the case that must NOT clean up.
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommitFromGoneLibrary(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -760,8 +871,8 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, true, nil
 	}
 	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "head-2", nil
@@ -816,6 +927,73 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	}
 }
 
+// TestRepairPublishedFSObjectBlockReferenceRepair_RetainsLiveUnreachableCommit
+// is the test the audit explicitly required: a commit that is unreachable
+// from HEAD, with its lease long expired, but whose library is NOT confirmed
+// gone (libraryGone=false) must never be cleaned up, no matter how long the
+// lease has been expired. This is the actual race the lease could not close:
+// a writer merely slow in CalculateLibraryStats (or one that hit an
+// ambiguous CAS it cannot safely self-resolve) looks identical, from a
+// snapshot read, to an abandoned attempt. A timeout is not proof of
+// revocation. See docs/CHANGELOG.md, "W2 follow-up 5".
+func TestRepairPublishedFSObjectBlockReferenceRepair_RetainsLiveUnreachableCommit(t *testing.T) {
+	oldReachable := publishedBlockReferenceRepairCommitReachableFn
+	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
+	oldPromote := publishedBlockReferenceRepairPromoteFn
+	oldCleanup := publishedBlockReferenceRepairCleanupFn
+	oldDelete := deletePublishedBlockReferenceRepairFn
+	oldNow := publishedBlockReferenceRepairNowFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairCommitReachableFn = oldReachable
+		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
+		publishedBlockReferenceRepairPromoteFn = oldPromote
+		publishedBlockReferenceRepairCleanupFn = oldCleanup
+		deletePublishedBlockReferenceRepairFn = oldDelete
+		publishedBlockReferenceRepairNowFn = oldNow
+	})
+
+	// An extreme, deliberately implausible age: even a lease expired for days
+	// must not authorize destruction on its own.
+	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
+	publishedBlockReferenceRepairNowFn = func() time.Time {
+		return now
+	}
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, false, nil
+	}
+	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
+		t.Fatal("fs_object lookup should not run for a live-unreachable commit")
+		return nil, nil
+	}
+	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
+		t.Fatal("promote should not run for a live-unreachable commit")
+		return nil
+	}
+	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
+		t.Fatal("cleanup must NOT run for an unreachable commit whose library is not confirmed gone -- a timeout is not a revocation")
+		return nil
+	}
+	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		t.Fatal("the durable repair row must survive: it is the only durable backstop left for a writer that has not yet (or ambiguously) completed its own HEAD CAS")
+		return nil
+	}
+
+	repair := publishedBlockReferenceRepair{
+		Bucket:         publishedBlockReferenceRepairBucket("org-1", "repo-1", "commit-1", "fs-1"),
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		CommitID:       "commit-1",
+		FSID:           "fs-1",
+		StagedBlockIDs: []string{"queued-block-1"},
+		CreatedAt:      now.Add(-72 * time.Hour),
+		LeaseExpiresAt: now.Add(-72 * time.Hour),
+	}
+	err := repairPublishedBlockReferenceRepair(nil, repair)
+	if err != nil {
+		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want nil (retain-and-defer, not an error)", err)
+	}
+}
+
 // TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk exercises
 // the REAL publishedBlockReferenceRepairCommitReachableFn (every other test
 // in this file replaces it wholesale, so none of them cover its own ancestry
@@ -849,12 +1027,15 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 			}
 			return parent, nil
 		}
-		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+		reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 		if err != nil {
 			t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil", err)
 		}
 		if !reachable {
 			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = false, want true: commit-1 is a real ancestor of HEAD commit-3")
+		}
+		if libraryGone {
+			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() libraryGone = true, want false: HEAD resolved normally")
 		}
 	})
 
@@ -870,12 +1051,15 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 			// serving this read, NOT a genuine root commit.
 			return "", gocql.ErrNotFound
 		}
-		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+		reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 		if err == nil {
 			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() error = nil, want a hard failure: a missing parent row mid-walk must not resolve to a confident answer")
 		}
 		if reachable {
 			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false alongside the error")
+		}
+		if libraryGone {
+			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() libraryGone = true, want false: this error is an ancestry-walk failure, not a hard-deleted library")
 		}
 	})
 }
@@ -898,12 +1082,15 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConver
 	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "", gocql.ErrNotFound
 	}
-	reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+	reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 	if err != nil {
 		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil: a hard-deleted library must converge to a confident (unreachable, no error) verdict, not retry forever", err)
 	}
 	if reachable {
 		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false for a hard-deleted library")
+	}
+	if !libraryGone {
+		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() libraryGone = false, want true: gocql.ErrNotFound on the HEAD read means the library itself is gone, not merely that this commit is unreachable")
 	}
 }
 
@@ -978,7 +1165,14 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t 
 	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhilePreCASLeaseActive(t *testing.T) {
+// TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhilePreCASLeaseActive
+// covers the lease defer's only remaining role after "W2 follow-up 5": once
+// the library is confirmed gone (libraryGone=true), the lease still grants a
+// short grace period before this sweep acts, so a repair row is not reaped
+// the instant it is queued. It no longer gates the (much larger)
+// live-unreachable case -- see _RetainsLiveUnreachableCommit, which must
+// never clean up regardless of lease age.
+func TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhilePreCASLeaseActive(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -999,8 +1193,8 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, true, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
@@ -1046,7 +1240,10 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtParentHead(t *testing.T) {
+// TestRepairPublishedFSObjectBlockReferenceRepair_CleansGoneLibraryAfterExpiredPreCASLease
+// pins that a gone library's repair row, once its (now largely vestigial but
+// still-applied) lease grace period has elapsed, converges to cleanup.
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansGoneLibraryAfterExpiredPreCASLease(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -1067,8 +1264,8 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtP
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (bool, bool, error) {
+		return false, true, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now

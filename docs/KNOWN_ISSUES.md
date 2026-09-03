@@ -2234,6 +2234,30 @@ pre-CAS re-check (and the EACH_QUORUM cost it added to every HEAD mutation in
 the system, not only the rare slow-writer path) be removed entirely. See
 docs/CHANGELOG.md "W2 follow-up 4" for the full audit trail.
 
+A further audit ("W2 follow-up 5") found that fix still left the SAME
+lease-expiry inference authorizing two other destructive actions the
+`commits`-row fix did not touch: removing the staged `pub:` reference and
+deleting the durable repair row itself, for a commit merely unreachable from
+a still-LIVE library's HEAD. Both matter -- the durable repair row is the
+only backstop a crashed writer's in-request promotion retry would have had,
+and `pub:` is the block's only liveness between HEAD publishing a commit and
+that commit's blocks getting their permanent `fs:` reference, so destroying
+either prematurely reopens the `up -> pub -> HEAD -> fs` discontinuity R31/W2
+exists to close, just one layer below where the `commits`-row version of it
+was. Fixed by giving the sweep's reachability check three verdicts instead of
+a bool -- reachable, confirmed `libraryGone` (structurally, via `gocql.ErrNotFound`
+on the SERIAL `libraries` read -- the only fact that safely authorizes
+cleanup), or "live-unreachable" (retain `pub:`/the repair row indefinitely,
+regardless of lease age). The identical shape of gap existed in the parallel
+24-hour pending-owner sweep (`cleanupPendingPublishedFileOwnerAttempt`) and
+is fixed the same way. This means the `resolveLibraryHeadUpdateError`
+confirmed-lost/`ErrLibraryHeadConflict` asymmetry noted above now has a
+real, accepted cost while it remains open: that outcome's `pub:`/repair row
+leak until a real terminal-authority signal exists, rather than converging
+on a timeout as before -- leaking is the safe direction; converging on a
+timeout was the bug. See docs/CHANGELOG.md "W2 follow-up 5" for the full
+audit trail.
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).

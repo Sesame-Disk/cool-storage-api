@@ -8,7 +8,89 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-03 - W2 follow-up 5: the lease still isn't a revocation -- stop letting it authorize any cleanup for a live library
+
+An eighth-pass audit of "W2 follow-up 4" below found its fix real but
+incomplete: it stopped the repair sweep from deleting a `commits` row, but
+left the SAME lease-expiry inference authorizing two other destructive
+actions -- removing the staged `pub:` reference and deleting the durable
+`published_block_reference_repairs` row -- for a commit that is merely
+unreachable from a still-LIVE library's HEAD. Both are load-bearing:
+
+1. **P1:** a writer that is slow (an unbounded `CalculateLibraryStats` walk,
+   a paused goroutine, GC pressure) or mid-ambiguous-CAS (unable to safely
+   self-resolve; see item 2) is indistinguishable, from the sweep's snapshot
+   read, from an abandoned attempt. If the sweep removes `pub:C1` and deletes
+   the durable repair row while this writer is still alive, and the writer's
+   own HEAD CAS then succeeds, HEAD legitimately publishes a commit whose
+   blocks have lost BOTH the durable repair row that would have retried a
+   failed in-request promotion AND the `pub:` reference that was their
+   interim liveness -- leaving only the block's `up:<session>` pin (48h TTL)
+   between the block and GC reclaiming it out from under an already-published
+   file, once `GC_ENABLED` is ever turned on. This is exactly the
+   `up -> pub -> HEAD -> fs` discontinuity R31/W2 exists to close, reopened
+   one layer below the fix that closed the `commits`-row version of it. Fixed
+   by giving `publishedBlockReferenceRepairCommitReachableFn` a third
+   verdict, not a plain bool: `reachable` (promote), confirmed `libraryGone`
+   (the library itself is structurally gone -- `gocql.ErrNotFound` on the
+   SERIAL `libraries` read -- so no writer can ever CAS its HEAD again, the
+   only fact that safely authorizes cleanup), or neither ("live-unreachable":
+   retain `pub:`/the repair row indefinitely, no matter how long the lease
+   has been expired). `cleanupPendingPublishedFileOwnerAttempt`'s parallel
+   24-hour-stale sweep (`runPendingPublishedFSObjectOwnerSweep`) had the
+   identical shape of gap -- a bigger, safer margin (24h vs. 5min), but the
+   same "timeout, not revocation" flaw -- and is fixed the same way; its own
+   destructive path (`cleanupPendingPublishedFileAttemptArtifacts`) is also
+   brought in line with the "never delete `commits` from an inferred cleanup"
+   rule "W2 follow-up 4" established, rather than leaving two paths that
+   agreed only some of the time. New unit coverage pins both retained-not-
+   destroyed cases directly
+   (`TestRepairPublishedFSObjectBlockReferenceRepair_RetainsLiveUnreachableCommit`,
+   `TestCleanupPendingPublishedFileOwnerAttempt_RetainsLiveUnreachableCommit`),
+   and the pre-existing ambiguous-HEAD-CAS integration tests
+   (`TestCreateFileFromBlocksAmbiguousCASConfirmedLost`,
+   `...ConfirmationUnknown`) are retargeted from asserting eventual
+   convergence-to-cleanup to asserting the repair row, `pub:`, and the commit
+   row all survive a real sweep pass with a lease backdated 72 hours --
+   convergence-to-cleanup was itself the bug.
+2. This intentionally reopens, rather than papering over, the tradeoff
+   `resolveLibraryHeadUpdateError`'s "confirmed lost" case already documents
+   as a known, deliberately out-of-scope asymmetry
+   (`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md` §16): unlike an ordinary
+   `ErrLibraryHeadConflict`, a confirmed-lost ambiguous CAS does not
+   self-clean, so it must now rely on this sweep -- and this sweep can no
+   longer clean up a live-library case at all. The corrected, safe behavior
+   is that this outcome's `pub:`/repair row now leak until a real
+   terminal-authority signal exists (R31/W2, still open), not that they
+   converge on a timeout. Making `resolveLibraryHeadUpdateError`'s
+   confirmed-lost case self-clean the same way `ErrLibraryHeadConflict`
+   already does (both are the SAME fact -- a SERIAL read proving HEAD is
+   provably, permanently a different commit) would close this without
+   leaking, and is architecturally sound, but touches shared infrastructure
+   used by SeafHTTP/CreateFile/UploadFile/batch_operations/OnlyOffice/trash,
+   several of which classify `ErrLibraryHeadConflict` into their own HTTP
+   status codes and client-retry contracts. That is real scope, not a
+   one-line change, and remains deliberately out of scope here for the same
+   reason §16 gave originally: no dedicated evidence yet for every funnel it
+   would touch.
+
+Net effect: this sweep may now ONLY act (promote or clean up) when it has
+either proven a commit reachable, or proven -- structurally, not by
+timeout -- that the library that would have to reachable it is gone. Every
+other case leaks a `pub:` reference and a repair row rather than risking
+destroying either while a writer might still need them. `TIMEOUT != REVOCATION`
+now holds for every destructive action in this file, not only the one most
+visibly tied to HEAD corruption.
+
+---
+
 ## 2026-09-03 - W2 follow-up 4: close the HEAD-CAS/lease race at its root, not its window
+
+**Partially superseded by "W2 follow-up 5" above.** The `commits`-row fix
+(item 1) stands. But `publishedBlockReferenceRepairCleanupFn`'s comment
+below still claimed the lease-expiry inference was safe to act on for
+`pub:`/the repair row -- it was not, for the identical reason the `commits`
+deletion was not; "W2 follow-up 5" closes that remaining half.
 
 A seventh-pass audit of "W2 follow-up 3" below found its own P1 fix
 insufficient by its own admission: the entry itself says "this cannot
