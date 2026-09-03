@@ -100,11 +100,11 @@ func TestFileFromBlocksAfterVerifiedBarrierIsBetweenVerifyAndClaim(t *testing.T)
 	calls := r3CallPositions(fn)
 	verify := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "summarizeBlockVerification")
 	barrier := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "fileFromBlocksAfterVerifiedBarrier")
-	borrowedPin := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "ensureBorrowedFSOwnLiveness")
-	borrowedPinBarrier := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "fileFromBlocksAfterBorrowedLivenessBarrier")
+	ownLiveness := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "ensureCommitBlockOwnLiveness")
+	ownLivenessBarrier := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "fileFromBlocksAfterBorrowedLivenessBarrier")
 	claim := barrierFirstCallPos(t, calls, "CreateFileFromBlocks", "ClaimBlockUploadSessionForCommit")
-	if !(verify < barrier && barrier < borrowedPin && borrowedPin < borrowedPinBarrier && borrowedPinBarrier < claim) {
-		t.Fatal("R3 BARRIER: BorrowedFS own liveness must run after verification and before ClaimBlockUploadSessionForCommit")
+	if !(verify < barrier && barrier < ownLiveness && ownLiveness < ownLivenessBarrier && ownLivenessBarrier < claim) {
+		t.Fatal("R3 BARRIER: commit-block own liveness must run after verification and before ClaimBlockUploadSessionForCommit")
 	}
 	assertFnDoesNotCall(t, fn, "CreateFileFromBlocks", "BlockDeleteFenceActive", "ProbeBlockReuse")
 	assertBarrierArgIsRepoID(t, fn, "CreateFileFromBlocks", "fileFromBlocksAfterVerifiedBarrier")
@@ -116,34 +116,36 @@ func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
 	stage := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "stagePendingPublishedFiles")
 	afterStaged := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "fileFromBlocksAfterStagedBarrier")
 	beforeHead := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
-	borrowedFence := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "validateBorrowedFSFences")
+	publicationFences := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "validateCommitBlockPublicationFences")
 	head := barrierFirstCallPos(t, calls, "finalizeStoredUploadMetadataOnce", "UpdateLibraryHeadFromSnapshot")
-	if !(stage < afterStaged && afterStaged < beforeHead && beforeHead < borrowedFence && borrowedFence < head) {
-		t.Fatal("R3 BARRIER: BorrowedFS fence validation must follow beforeHead and precede UpdateLibraryHeadFromSnapshot")
+	if !(stage < afterStaged && afterStaged < beforeHead && beforeHead < publicationFences && publicationFences < head) {
+		t.Fatal("R3 BARRIER: commit-block publication-fence validation must follow beforeHead and precede UpdateLibraryHeadFromSnapshot")
 	}
 	assertFnDoesNotCall(t, fn, "finalizeStoredUploadMetadataOnce", "BlockDeleteFenceActive", "ProbeBlockReuse")
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksAfterStagedBarrier")
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
 }
 
-// TestValidateBorrowedFSFencesStaysOffSerialAuthority guards the hot-path
-// Paxos budget documented in docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md:
-// ValidateBlockRepairAuthority (BlockAuthorityStrong/SERIAL) is reserved for
-// the cold pre-PUT repair boundary because it has no downstream CAS and no
-// prior own-reference ordering to lean on. validateBorrowedFSFences runs once
-// per BorrowedFS block on the dedup hot path and is protected instead by the
-// caller's own up:<session> pin already being durable, so it must use
-// validateBorrowedFSPublicationAuthorityFn (BlockAuthorityAdvisory/LOCAL_QUORUM).
-// Calling the SERIAL variant here would turn a large deduplicated commit into
-// hundreds/thousands of global Paxos round trips before HEAD.
-func TestValidateBorrowedFSFencesStaysOffSerialAuthority(t *testing.T) {
-	_, fn := r3ParseFunction(t, r3SourcePath("internal", "api", "v2", "file_from_blocks.go"), "validateBorrowedFSFences")
+// TestValidateCommitBlockPublicationFencesStaysOffSerialAuthority guards the
+// hot-path Paxos budget documented in
+// docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md: ValidateBlockRepairAuthority
+// (BlockAuthorityStrong/SERIAL) is reserved for the cold pre-PUT repair
+// boundary because it has no downstream CAS and no prior own-reference
+// ordering to lean on. validateCommitBlockPublicationFences runs once per
+// distinct ready block (SessionUpload and BorrowedFS alike) on the dedup hot
+// path and is protected instead by the caller's own up:<session> pin/renewal
+// already being durable, so it must use validateBorrowedFSPublicationAuthorityFn
+// (BlockAuthorityAdvisory/LOCAL_QUORUM). Calling the SERIAL variant here would
+// turn a large commit into hundreds/thousands of global Paxos round trips
+// before HEAD.
+func TestValidateCommitBlockPublicationFencesStaysOffSerialAuthority(t *testing.T) {
+	_, fn := r3ParseFunction(t, r3SourcePath("internal", "api", "v2", "file_from_blocks.go"), "validateCommitBlockPublicationFences")
 	calls := r3CallPositions(fn)
 	if len(calls["validateBorrowedFSPublicationAuthorityFn"]) == 0 {
-		t.Fatal("R3 BARRIER: validateBorrowedFSFences must call validateBorrowedFSPublicationAuthorityFn (LOCAL_QUORUM)")
+		t.Fatal("R3 BARRIER: validateCommitBlockPublicationFences must call validateBorrowedFSPublicationAuthorityFn (LOCAL_QUORUM)")
 	}
 	if len(calls["validateBlockRepairAuthorityFn"]) > 0 {
-		t.Fatal("R3 BARRIER: validateBorrowedFSFences must not call validateBlockRepairAuthorityFn (SERIAL) -- that pays a global Paxos round trip per BorrowedFS block on the dedup hot path; use validateBorrowedFSPublicationAuthorityFn instead")
+		t.Fatal("R3 BARRIER: validateCommitBlockPublicationFences must not call validateBlockRepairAuthorityFn (SERIAL) -- that pays a global Paxos round trip per block on the dedup hot path; use validateBorrowedFSPublicationAuthorityFn instead")
 	}
 }
 

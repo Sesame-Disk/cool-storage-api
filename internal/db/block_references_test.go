@@ -1559,11 +1559,11 @@ func TestP3MetadataRepairUsesAdvisoryReads(t *testing.T) {
 
 // TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads pins the actual
 // consistency ValidateBorrowedFSPublicationAuthority issues, not just that its
-// caller (validateBorrowedFSFences in internal/api/v2) picks the right seam
-// function. A regression that flipped the mode argument passed to
+// caller (validateCommitBlockPublicationFences in internal/api/v2) picks the
+// right seam function. A regression that flipped the mode argument passed to
 // validateBlockRepairAuthority internally -- BlockAuthorityAdvisory back to
 // BlockAuthorityStrong -- would stay invisible to a caller-side AST contract
-// like TestValidateBorrowedFSFencesStaysOffSerialAuthority; this test fails on
+// like TestValidateCommitBlockPublicationFencesStaysOffSerialAuthority; this test fails on
 // that regression directly by observing the mode the underlying reads receive.
 // Its safety comes from the caller's own up:<session> pin already being
 // durable before this runs (see the doc comment), not from read freshness --
