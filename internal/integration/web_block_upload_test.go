@@ -343,9 +343,11 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 	// liveness parity, ensureCommitBlockOwnLiveness in internal/api/v2/file_from_blocks.go),
 	// the commit path ALSO renews this SessionUpload block's own up:<session>
 	// reference/tracker/projection one more time -- the same pin/renew step
-	// BorrowedFS blocks already got in W1 (PR #202) -- closing the "TTL alone
-	// is not a proof" gap for a commit that stalls between the block's last
-	// renewal and its own HEAD CAS. So the pre-commit deadline
+	// BorrowedFS blocks already got in W1 (PR #202) -- narrowing (not closing)
+	// the "TTL alone is not a proof" gap for a commit that stalls between the
+	// block's last renewal and its own HEAD CAS: safety through HEAD still
+	// comes from the pre-HEAD exact-placement rejection, not from this
+	// renewal preventing every possible lapse. So the pre-commit deadline
 	// (renewedExpiresAt, set by the re-upload above) is expected to move
 	// again, not survive untouched.
 	preCommitExpiresAt := renewedExpiresAt

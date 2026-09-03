@@ -8,6 +8,51 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-03 - W2 follow-up 2: repair ancestry-walk consistency and residual wording
+
+A fifth-pass audit of the SERIAL HEAD-read fix below (again independently
+verified, not accepted at face value) found the fix was necessary but not
+sufficient: it only strengthened the HEAD half of the repair sweep's
+reachability certificate, leaving the commit-ancestry walk underneath it
+exposed to the same class of gap.
+
+1. **P1, continuation of the multi-DC repair-reachability gap:** after
+   `publishedBlockReferenceRepairHeadCommitFn` correctly resolves HEAD via
+   SERIAL, `publishedBlockReferenceRepairCommitReachableFn` walks the
+   ancestor chain down from HEAD by reading each commit's `parent_id` off the
+   ordinary `commits` table (`onlyOfficeCommitReachable`,
+   `publishedBlockReferenceRepairCommitParentFn`) at plain LOCAL_QUORUM, and
+   treated a missing row (`gocql.ErrNotFound`) as "this ancestor has no
+   parent" -- indistinguishable from a genuine root commit. In a multi-DC
+   deployment, a commit row that has not yet replicated to the DC serving the
+   sweep would truncate the walk early and falsely report an actually-reachable
+   commit as unreachable, authorizing the same irreversible cleanup the SERIAL
+   HEAD fix was meant to prevent. Fixed: `publishedBlockReferenceRepairCommitParentFn`
+   now reads at EACH_QUORUM (commits are ordinary immutable inserts, not the
+   LWT value SERIAL linearizes, so EACH_QUORUM -- a quorum in every DC,
+   guaranteed to intersect the write's own home DC -- is the right level, not
+   SERIAL), and a missing row mid-walk now propagates as a hard failure
+   (repair kept, retried next sweep) instead of resolving to an empty parent.
+   Also closed the same class of gap one level up: `getCanonicalHeadCommitSerial`'s
+   own `libraries_by_id` org-resolution lookup (plain consistency, ahead of
+   its SERIAL `libraries` read) no longer lets a missing row there be mistaken
+   for "library confidently deleted." Pinned by
+   `TestPublishedBlockReferenceRepairCommitParentFnPinsEachQuorumConsistency`
+   and a new `TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk`
+   unit test exercising the real function end-to-end (every other existing
+   test replaced it wholesale, so none of them covered its own walk logic).
+2. Five residual mentions of the superseded "renews (not creates)" / "closing
+   the TTL alone is not a proof gap" wording survived the previous audit round
+   in `CURRENT_WORK.md`, `docs/KNOWN_ISSUES.md`,
+   `internal/integration/sessionupload_own_liveness_test.go`'s top comment,
+   and `internal/integration/web_block_upload_test.go`. Corrected to match
+   the wording already fixed in `docs/R3-LIVENESS-CONTINUITY.md` and
+   `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`. The original W2 CHANGELOG entry
+   below is marked superseded rather than rewritten, per this file's
+   append-only convention.
+
+---
+
 ## 2026-09-02 - W2 follow-up: repair reachability consistency and evidence-gate fixes
 
 A final audit before merge (independently verified line-by-line, not accepted
@@ -81,6 +126,13 @@ already explicitly accepted in the original entry below; a load test at
 ---
 
 ## 2026-09-02 - W2 first slice: SessionUpload liveness parity in CreateFileFromBlocks
+
+**Wording superseded by the two follow-up entries above** ("renews (not
+creates)" and "closing the 'TTL alone is not a proof' gap" were corrected to
+"upserts -- renews when present, recreates when lapsed" and "narrows, does
+not close"; the multi-DC repair-reachability fix was added after this entry
+was written). Kept as-is below for the historical record of what this commit
+actually changed.
 
 After PR #202 (W1, BorrowedFS-only) merged to `main`, generalized the same
 own-liveness/exact-placement mechanism to SessionUpload-provenance blocks in

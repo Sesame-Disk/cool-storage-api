@@ -17,10 +17,11 @@ import (
 )
 
 // TestSessionUploadOwnLiveness is the W2 SessionUpload-parity counterpart to
-// TestBorrowedFSOwnLiveness: CreateFileFromBlocks now renews (not creates) a
-// SessionUpload block's existing up:<session> reference and re-validates its
-// exact physical placement immediately before HEAD, exactly like it already
-// does for BorrowedFS blocks. Unlike the BorrowedFS fixture, the block here
+// TestBorrowedFSOwnLiveness: CreateFileFromBlocks now upserts a SessionUpload
+// block's existing up:<session> reference -- renewing it when present,
+// recreating it when it already lapsed -- and re-validates its exact physical
+// placement immediately before HEAD, exactly like it already does for
+// BorrowedFS blocks. Unlike the BorrowedFS fixture, the block here
 // is seeded through a REAL /blocks/upload call (not a direct DB seed), so it
 // naturally carries the up:<session> reference RegisterUploadedBlockTarget
 // already writes at upload time -- there is no foreign fs: to borrow.

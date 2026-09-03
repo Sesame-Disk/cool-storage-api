@@ -2192,17 +2192,27 @@ continuity, and other writer funnels remain outside W1.
 
 W2's first slice extends the same `CreateFileFromBlocks` segment to
 SessionUpload-provenance blocks: their existing `up:<session>` reference is
-renewed (not newly created) before session claim, and the same pre-HEAD
+upserted before session claim -- renewed when present, recreated when it
+already lapsed (a slow client past TTL, or GC having released it after an
+earlier zero-proof) -- and the same pre-HEAD
 `db.ValidateBorrowedFSPublicationAuthority` check now covers them too (a
 separate six-leg `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`
 gate, kept apart from W1's BorrowedFS-scoped one). New integration evidence
 also confirms the pre-existing publish-repair sweep
 (`internal/api/v2/publish_repair.go`) correctly reconciles this funnel's
-ambiguous-HEAD-CAS outcomes in both directions. R31/W2 remains open for
-every other writer funnel, and the `resolveLibraryHeadUpdateError`
-confirmed-lost case not yet sharing `ErrLibraryHeadConflict`'s immediate
-retry/cleanup is a known, separately-tracked gap (relies on the repair sweep
-instead, which is safe but slower).
+ambiguous-HEAD-CAS outcomes in both directions -- and a final audit found and
+fixed a real multi-DC gap in that sweep's own reachability determination: both
+its HEAD read (`FSHelper.getCanonicalHeadCommitSerial`, now SERIAL) and its
+commit-ancestry walk (`publishedBlockReferenceRepairCommitParentFn`, now
+EACH_QUORUM, with a missing row mid-walk treated as unknown rather than as a
+root) previously read at plain LOCAL_QUORUM, which in a multi-DC deployment
+could authorize deleting a commit row and its `pub:` references for a commit
+that was genuinely reachable from HEAD, just not yet visible to the DC serving
+the sweep. R31/W2 remains open for every other writer funnel, and the
+`resolveLibraryHeadUpdateError` confirmed-lost case not yet sharing
+`ErrLibraryHeadConflict`'s immediate retry/cleanup is a known,
+separately-tracked gap (relies on the repair sweep instead, which is now
+correctly multi-DC-safe but slower).
 
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
