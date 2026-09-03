@@ -674,17 +674,24 @@ func orderedCommitBlockPlacements(uniqueHashes []string, statuses map[string]int
 // ensureCommitBlockOwnLiveness makes the writer's liveness explicit, for
 // every distinct ready block in this commit, before it can stage
 // publication. For a BorrowedFS block this creates a new up:<session> pin
-// (unchanged from W1). For a SessionUpload block this RENEWS the TTL on the
-// up:<session> reference RegisterUploadedBlockTarget already wrote at
-// /blocks/upload time -- same referrer key
-// (db.BlockReferrerForUpload(sessionID)), so this is an idempotent overwrite,
-// not a second pin; see db.AddProvisionalBlockReferenceWithExpiry. This
-// closes the "TTL alone is not a proof" gap
-// docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md §14 names for SessionUpload: a
-// slow-enough finalize could otherwise let the original pin expire before
-// pub: ever gets staged. The referrer is the session's existing up:<session>
-// identity either way, so a retry overwrites the same Cassandra key instead
-// of creating a second semantic pin. A single expiry is shared by this
+// (unchanged from W1). For a SessionUpload block this upserts the SAME
+// up:<session> identity RegisterUploadedBlockTarget wrote at /blocks/upload
+// time (db.BlockReferrerForUpload(sessionID)) via
+// db.AddProvisionalBlockReferenceWithExpiry, which is a plain upsert with no
+// existence check: it RENEWS the deadline when that reference is still
+// present, and RECREATES it when the original has already lapsed (TTL expiry
+// on a slow client, or GC having released it after a zero-proof read saw
+// nothing -- both real, both exercised by
+// TestSessionUploadOwnLiveness/sessionUploadGcFirst and
+// .../sessionUploadGcFullyRetiredBeforeRenewal). Either way this is an
+// idempotent overwrite of one Cassandra key, never a second semantic pin, and
+// recreating it here does NOT by itself revoke any delete GC already
+// committed against the block's prior placement -- that safety comes from
+// validateCommitBlockPublicationFences re-validating the exact placement
+// immediately before HEAD, not from this write. This narrows the "TTL alone
+// is not a proof" gap docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md §14 names for
+// SessionUpload: a slow-enough finalize could otherwise let the original pin
+// expire before pub: ever gets staged. A single expiry is shared by this
 // commit's blocks and the writes remain bounded/concurrent like
 // verification.
 func (h *FileHandler) ensureCommitBlockOwnLiveness(ctx context.Context, orgID, libraryID, sessionID string, blocks []commitBlockPlacement) error {

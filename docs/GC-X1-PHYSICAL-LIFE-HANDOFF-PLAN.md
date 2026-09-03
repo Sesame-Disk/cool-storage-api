@@ -1044,16 +1044,32 @@ generalized) and `TestValidateBorrowedFSPublicationAuthorityUsesAdvisoryReads`
 (renamed from `validateBorrowedFSFences`) now run over every distinct ready
 block in a `CreateFileFromBlocks` commit, not just BorrowedFS ones. A
 SessionUpload block already carries its own `up:<session>` reference from
-`/blocks/upload` time; this step *renews* (not creates) that same reference
-before session claim -- an idempotent overwrite of the same Cassandra key, per
-`db.AddProvisionalBlockReferenceWithExpiry` -- closing exactly the "TTL alone
-is not a proof" gap §14 names for this funnel. The pre-HEAD check's position
-is unchanged (immediately before `UpdateLibraryHeadFromSnapshot`, after
-`pub:`/the commit row already exist): moving it earlier, on the theory that
-`pub:` then makes it redundant, was considered and rejected -- there was only
-ever one check, not two, and moving it earlier would reopen the exact window
+`/blocks/upload` time; this step upserts that same reference before session
+claim via `db.AddProvisionalBlockReferenceWithExpiry` -- an idempotent
+overwrite of one Cassandra key either way, but concretely it *renews* the
+deadline when the reference is still present and *recreates* it when the
+original has already lapsed (slow client past TTL, or GC having released it
+after an earlier zero-proof). This narrows, but does not close, the "TTL
+alone is not a proof" gap §14 names: recreating the pin after a lapse does
+not retroactively prove continuous liveness held the whole time, and does not
+by itself revoke any delete GC already committed against the block's prior
+placement. What actually makes this safe through HEAD is the SAME thing that
+made W1 safe -- `validateCommitBlockPublicationFences` re-validating the
+exact observed placement immediately before HEAD, so a post-D placement is
+rejected instead of published, gap or no gap. That is the #200 handshake, not
+the §14 full-writer ideal (line 1004 above): continuous `up: -> pub:` overlap
+is not proven and remains an R31 property.
+The pre-HEAD check's position is unchanged (immediately before
+`UpdateLibraryHeadFromSnapshot`, after `pub:`/the commit row already exist):
+moving it earlier, on the theory that `pub:` then makes it redundant, was
+considered and rejected -- there was only ever one check, not two, and moving
+it earlier while deleting it here would reopen the exact window
 (`stagePendingPublishedFiles` -> `queuePendingPublishedFileRepairs` ->
-`insertCommit`) W1 closed. New evidence:
+`insertCommit`) W1 closed. A pre-`pub:` check is not unsound in principle --
+it would need up: to structurally guarantee protection all the way through to
+pub: being durable, and a finite TTL refresh alone does not prove that
+handoff; today's design does not depend on proving it, because the late check
+already provides safety through HEAD regardless. New evidence:
 `internal/integration/sessionupload_own_liveness_test.go` (six named legs,
 `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`, kept as a separate
 gate from W1's eight-leg one since that struct's field list is pinned and

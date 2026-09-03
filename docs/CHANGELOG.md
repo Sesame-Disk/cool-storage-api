@@ -8,6 +8,78 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-02 - W2 follow-up: repair reachability consistency and evidence-gate fixes
+
+A final audit before merge (independently verified line-by-line, not accepted
+at face value) confirmed eight real issues in the W2 slice below, all fixed
+here:
+
+1. **P1, pre-existing (not introduced by W2):** the durable publish-repair
+   sweep's reachability check (`publishedBlockReferenceRepairCommitReachableFn`,
+   `internal/api/v2/publish_repair.go`, running unconditionally in production
+   since `b97f1be4b`, long before W2) read HEAD via the ordinary LOCAL_QUORUM
+   path (`GetHeadCommitID`), not SERIAL. In a multi-DC deployment this can
+   return a stale pre-CAS HEAD when the sweep runs in a different DC than the
+   one that committed an ambiguous CAS -- the same LOCAL_QUORUM-write/
+   LOCAL_QUORUM-read non-intersection class of gap X2 already closed for
+   `block_references` (`docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md`). Since this
+   check drives an *irreversible* decision (delete a commit row and its
+   `pub:` references via `CleanupFailedPublishArtifacts`), a stale read could
+   destroy artifacts for a commit that is genuinely HEAD elsewhere, leaving
+   `libraries.head_commit_id` pointing at a commit row that no longer exists
+   -- breaking every future write to that library. Fixed by adding
+   `FSHelper.getCanonicalHeadCommitSerial` (SERIAL read, background sweep so
+   the extra Paxos round trip is free) and pointing
+   `publishedBlockReferenceRepairHeadCommitFn` at it; pinned by
+   `TestGetCanonicalHeadCommitSerialPinsSerialConsistency`.
+2. The three ambiguous-HEAD-CAS integration tests never covered "CAS
+   genuinely applied, then the SERIAL confirmation read itself fails" --
+   the one combination that exercises the repair sweep's *promote* branch
+   (as opposed to its cleanup branch) from a real ambiguous CAS. Added
+   `TestCreateFileFromBlocksAmbiguousCASAppliedConfirmationUnknownRepairs`.
+3. `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1` was wired into
+   `TestMain` but never into the canonical `docker-compose.yaml`
+   `go-integration-test`/`go-all-test` runners or `docs/TESTING.md`, unlike
+   W1's gate -- a future regression to one of the six legs would not have
+   failed the standard run. Wired in.
+4. `sessionUploadRenewalRetryIsIdempotent` retried the SAME already-committed
+   session/manifest digest, which the R7 idempotent-replay guard
+   (`file_from_blocks.go`, `if session.Committed`) short-circuits *before*
+   `ensureCommitBlockOwnLiveness` ever runs -- so it proved session-replay
+   idempotency, not renewal-retry idempotency. Redesigned to force a real
+   failure between two genuine renewals of the same identity via the existing
+   barrier seam.
+5. W1's `sessionUploadNoExtraPin` leg measured `up:` row *count* before/after;
+   W2's renewal is an upsert of the same identity, so the count is unchanged
+   whether or not real work happened, making the leg a silent false-green
+   for the property it was named for. Renamed to
+   `sessionUploadSingleOwnRefIdentity` and re-scoped to the invariant that
+   still holds: identity, not absence of writes.
+6. `docs/R3-LIVENESS-CONTINUITY.md` row 96 claimed the "TTL alone is not a
+   proof" gap was **closed** for this funnel -- stronger, and inconsistent
+   with rows 97-98's more careful "proven through HEAD" framing for the
+   identical protocol shape. Corrected: renewal narrows but does not close
+   that gap; safety through HEAD comes from the pre-HEAD rejection, not from
+   liveness never lapsing.
+7. `ensureCommitBlockOwnLiveness`'s doc comment claimed SessionUpload
+   liveness is always *renewed*. `db.AddProvisionalBlockReferenceWithExpiry`
+   is a plain upsert with no existence check: when GC has already released a
+   lapsed reference (exercised by the `gcFirst`/`gcFullyRetiredBeforeRenewal`
+   legs), this *recreates* it instead. Corrected in the comment and in
+   `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`.
+8. The plan's rejection of a pre-`pub:` exact-placement check reasoned only
+   from window size. Refined: a pre-`pub:` check is not unsound in principle,
+   it would just need `up:` to structurally guarantee protection through to
+   `pub:` being durable -- a finite TTL refresh does not prove that handoff,
+   which is why today's design does not depend on proving it.
+
+A ninth point (the O(N) per-block cost of extending own-liveness/exact-P to
+every SessionUpload block, not just BorrowedFS) was confirmed accurate but is
+already explicitly accepted in the original entry below; a load test at
+1k-10k blocks/manifest is a reasonable follow-up, not a blocker.
+
+---
+
 ## 2026-09-02 - W2 first slice: SessionUpload liveness parity in CreateFileFromBlocks
 
 After PR #202 (W1, BorrowedFS-only) merged to `main`, generalized the same
