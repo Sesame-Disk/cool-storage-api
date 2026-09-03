@@ -626,6 +626,29 @@ func (h *FSHelper) confirmLibraryHeadCommitVisible(orgID, repoID, commitID strin
 	return currentHead, currentHead == commitID, nil
 }
 
+// libraryHeadCASExecuteFn executes the library HEAD CAS write. Overridable
+// only for deterministic integration testing of
+// isAmbiguousLibraryHeadUpdateError/resolveLibraryHeadUpdateError (see
+// SetLibraryHeadAmbiguousCASForTest in the integration build); production
+// always runs exactly this query.
+var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, totalSize, fileCount int64, now time.Time, expectedHead string) (bool, map[string]interface{}, error) {
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+		IF head_commit_id = ?
+	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+	return applied, casState, err
+}
+
+// libraryHeadConfirmVisibleFn resolves the ambiguous-CAS SERIAL confirmation
+// read. Overridable only for deterministic integration testing (see
+// SetLibraryHeadConfirmVisibleForTest in the integration build); production
+// always runs h.confirmLibraryHeadCommitVisible.
+var libraryHeadConfirmVisibleFn = func(h *FSHelper, orgID, repoID, commitID string) (string, bool, error) {
+	return h.confirmLibraryHeadCommitVisible(orgID, repoID, commitID)
+}
+
 func resolveLibraryHeadUpdateError(repoID, commitID string, updateErr error, confirmVisible func() (string, bool, error)) error {
 	wrapped := fmt.Errorf("conditional library head update failed: %w", updateErr)
 	if !isAmbiguousLibraryHeadUpdateError(updateErr) {
@@ -668,15 +691,10 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 	}
 
 	now := time.Now()
-	casState := map[string]interface{}{}
-	applied, err := h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-		IF head_commit_id = ?
-	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+	applied, casState, err := libraryHeadCASExecuteFn(h, orgID, repoID, commitID, totalSize, fileCount, now, expectedHead)
 	if err != nil {
 		return resolveLibraryHeadUpdateError(repoID, commitID, err, func() (string, bool, error) {
-			return h.confirmLibraryHeadCommitVisible(orgID, repoID, commitID)
+			return libraryHeadConfirmVisibleFn(h, orgID, repoID, commitID)
 		})
 	}
 	if !applied {

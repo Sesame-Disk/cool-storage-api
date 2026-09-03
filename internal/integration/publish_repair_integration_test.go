@@ -89,7 +89,14 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 
 	v2api.StartPublishedBlockReferenceRepairer(database)
 
-	if !pollUntil(t, 10*time.Second, 100*time.Millisecond, func() bool {
+	// StartPublishedBlockReferenceRepairer's initial sweep is sync.Once-gated
+	// process-wide: whichever test in this binary calls it FIRST gets that
+	// immediate pass, and every other caller -- including this test, once
+	// internal/integration/createfilefromblocks_ambiguous_head_test.go also
+	// started calling this same function -- must wait for the next periodic
+	// tick (publishedBlockReferenceRepairSweepInterval, ~1 minute) instead.
+	// 10s only ever worked because this used to be the only caller.
+	if !pollUntil(t, 75*time.Second, time.Second, func() bool {
 		referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
 		return publishRepairIntegrationHasReferrer(referrers, fsReferrer) &&
 			!publishRepairIntegrationHasReferrer(referrers, pubReferrer) &&
