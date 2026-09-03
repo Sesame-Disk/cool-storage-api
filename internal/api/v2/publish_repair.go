@@ -119,6 +119,18 @@ var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID str
 	return fsHelper.getCanonicalHeadCommitSerial(repoID)
 }
 
+// publishedBlockReferenceRepairCommitParentFn reads at EACH_QUORUM, not the
+// ordinary session consistency (LOCAL_QUORUM) commits are written at: this
+// ancestry walk backs the same irreversible cleanup decision
+// getCanonicalHeadCommitSerial's SERIAL HEAD read protects, and a plain
+// LOCAL_QUORUM read of a DIFFERENT DC than the one that inserted a given
+// commit row can miss it entirely during replication lag -- the same
+// LOCAL_QUORUM-write/LOCAL_QUORUM-read non-intersection gap X2 closed for
+// block_references. Because the write's own home DC already has the row at
+// its own local quorum, an EACH_QUORUM read (a quorum in EVERY DC) is
+// guaranteed to intersect it regardless of which DC serves the read, without
+// needing SERIAL: commits are ordinary immutable inserts, not the LWT value
+// being linearized.
 var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("database not available")
@@ -126,7 +138,7 @@ var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, 
 	var parentCommitID string
 	err := database.Session().Query(`
 		SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, commitID).Scan(&parentCommitID)
+	`, repoID, commitID).Consistency(gocql.EachQuorum).Scan(&parentCommitID)
 	if err != nil {
 		return "", err
 	}
@@ -144,9 +156,19 @@ var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoI
 	return onlyOfficeCommitReachable(commitID, headCommitID, func(currentCommitID string) (string, error) {
 		parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repoID, currentCommitID)
 		if err != nil {
-			if errors.Is(err, gocql.ErrNotFound) {
-				return "", nil
-			}
+			// Deliberately NOT swallowing ErrNotFound into ("", nil) here.
+			// onlyOfficeCommitReachable treats an empty parent as the
+			// legitimate end of a chain (a real root commit, whose own row
+			// EXISTS with parent_id=""). This walk only ever visits commit
+			// IDs an earlier authority (HEAD, or another commit's own
+			// parent_id) already told us belong to the chain, so "row not
+			// found here" means "cannot prove this ancestor's parent," never
+			// "this ancestor has no parent" -- conflating the two would let
+			// a commit row that simply has not replicated to this DC yet
+			// masquerade as a root and truncate the walk, producing the same
+			// false-unreachable verdict this whole check exists to prevent.
+			// Propagating the error instead makes repairPublishedBlockReferenceRepair
+			// keep the repair row and retry on the next sweep.
 			return "", fmt.Errorf("lookup parent for commit %s: %w", currentCommitID, err)
 		}
 		return parentCommitID, nil

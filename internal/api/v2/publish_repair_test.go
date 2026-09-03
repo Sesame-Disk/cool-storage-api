@@ -767,6 +767,70 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	}
 }
 
+// TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk exercises
+// the REAL publishedBlockReferenceRepairCommitReachableFn (every other test
+// in this file replaces it wholesale, so none of them cover its own ancestry
+// walk). Found missing during the W2 final audit: a commit row that a
+// repair-sweep read cannot find mid-walk must never be silently treated as
+// "this ancestor has no parent" (a legitimate root), because that is exactly
+// what a commit row that simply has not yet replicated to this DC looks
+// like -- and this function's caller uses a false "not reachable" verdict to
+// authorize deleting a commit row and its pub: references.
+func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.T) {
+	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldParent := publishedBlockReferenceRepairCommitParentFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		publishedBlockReferenceRepairCommitParentFn = oldParent
+	})
+
+	t.Run("reachableThroughRealParentChain", func(t *testing.T) {
+		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+			return "commit-3", nil
+		}
+		parents := map[string]string{
+			"commit-3": "commit-2",
+			"commit-2": "commit-1",
+			"commit-1": "",
+		}
+		publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
+			parent, ok := parents[commitID]
+			if !ok {
+				t.Fatalf("unexpected parent lookup for %s", commitID)
+			}
+			return parent, nil
+		}
+		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "repo-1", "commit-1")
+		if err != nil {
+			t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil", err)
+		}
+		if !reachable {
+			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = false, want true: commit-1 is a real ancestor of HEAD commit-3")
+		}
+	})
+
+	t.Run("missingParentRowMidWalkFailsClosed", func(t *testing.T) {
+		publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+			return "commit-2", nil
+		}
+		publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
+			if commitID != "commit-2" {
+				t.Fatalf("unexpected parent lookup for %s", commitID)
+			}
+			// Models a commit-2 row that has not yet replicated to the DC
+			// serving this read, NOT a genuine root commit.
+			return "", gocql.ErrNotFound
+		}
+		reachable, err := publishedBlockReferenceRepairCommitReachableFn(nil, "repo-1", "commit-1")
+		if err == nil {
+			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() error = nil, want a hard failure: a missing parent row mid-walk must not resolve to a confident answer")
+		}
+		if reachable {
+			t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false alongside the error")
+		}
+	})
+}
+
 func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhilePreCASLeaseActive(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn

@@ -214,15 +214,30 @@ func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error)
 // LOCAL_QUORUM write and only reaches other DCs via asynchronous replication.
 // This is the same LOCAL_QUORUM-write/LOCAL_QUORUM-read non-intersection gap
 // X2 closed for block_references (docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md); a
-// SERIAL read forces completion of any in-flight Paxos round first, so under
-// the shipped SERIAL default it observes the true HEAD regardless of which DC
-// serves the read. The repair sweep is a background process, not a hot path,
-// so the extra Paxos round trip costs nothing that matters.
+// SERIAL read linearizes this value against the library HEAD Paxos domain, so
+// under the shipped SERIAL default it is correct regardless of which DC
+// serves the read -- that says nothing about the plain (non-Paxos) commits
+// rows a caller may walk afterward; see publishedBlockReferenceRepairCommitParentFn's
+// own EACH_QUORUM pin for that half. The repair sweep is a cold background
+// recovery path, not a hot path, so paying the extra Paxos round trip here is
+// an easy trade.
 func (h *FSHelper) getCanonicalHeadCommitSerial(repoID string) (string, error) {
 	var orgID string
 	if err := h.db.Session().Query(`
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
 	`, repoID).Scan(&orgID); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			// Deliberately NOT propagated as gocql.ErrNotFound: the caller
+			// (publishedBlockReferenceRepairCommitReachableFn) treats THAT
+			// sentinel as "the library is confidently gone, nothing is
+			// reachable" -- correct for a genuinely hard-deleted library, but
+			// this lookup is a plain LOCAL_QUORUM read of an otherwise
+			// permanent, create-time-only mapping, and by the same reasoning
+			// as the ancestry walk below, "not found on this replica set"
+			// must not be silently promoted to "does not exist" for a
+			// decision this destructive.
+			return "", fmt.Errorf("resolve org for library %s: row not found", repoID)
+		}
 		return "", err
 	}
 
