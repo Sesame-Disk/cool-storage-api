@@ -203,6 +203,43 @@ func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error)
 	return libraryState.OrgID, libraryState.HeadCommitID, nil
 }
 
+// getCanonicalHeadCommitSerial resolves a library's current HEAD like
+// getCanonicalHeadCommit, but via a SERIAL (Paxos-linearizable) read of the
+// libraries row instead of the session's ordinary LOCAL_QUORUM. Used only by
+// publishedBlockReferenceRepairHeadCommitFn (publish_repair.go): that caller
+// decides whether to IRREVERSIBLY delete a commit row and its pub: block
+// references, and a plain LOCAL_QUORUM read can return a stale pre-CAS HEAD
+// when the sweep runs in a different DC than the one that committed an
+// ambiguous CAS -- the write half of that same LWT is an ordinary
+// LOCAL_QUORUM write and only reaches other DCs via asynchronous replication.
+// This is the same LOCAL_QUORUM-write/LOCAL_QUORUM-read non-intersection gap
+// X2 closed for block_references (docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md); a
+// SERIAL read forces completion of any in-flight Paxos round first, so under
+// the shipped SERIAL default it observes the true HEAD regardless of which DC
+// serves the read. The repair sweep is a background process, not a hot path,
+// so the extra Paxos round trip costs nothing that matters.
+func (h *FSHelper) getCanonicalHeadCommitSerial(repoID string) (string, error) {
+	var orgID string
+	if err := h.db.Session().Query(`
+		SELECT org_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&orgID); err != nil {
+		return "", err
+	}
+
+	var headCommitID string
+	var deletedAt time.Time
+	err := h.db.Session().Query(`
+		SELECT head_commit_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Consistency(gocql.Serial).Scan(&headCommitID, &deletedAt)
+	if err != nil {
+		return "", err
+	}
+	if !deletedAt.IsZero() {
+		return "", db.ErrLibraryDeleted
+	}
+	return headCommitID, nil
+}
+
 // GetLibraryHeadSnapshot resolves the canonical HEAD once and returns the root
 // tree that callers should use for stale-sensitive metadata mutations.
 func (h *FSHelper) GetLibraryHeadSnapshot(repoID string) (*LibraryHeadSnapshot, error) {

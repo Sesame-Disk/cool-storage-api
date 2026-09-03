@@ -106,12 +106,17 @@ var loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ow
 	return database.LoadPendingPublishedFSObjectOwner(repoID, fsID, ownerID)
 }
 
+// publishedBlockReferenceRepairHeadCommitFn resolves HEAD via a SERIAL read
+// (see FSHelper.getCanonicalHeadCommitSerial), not the ordinary LOCAL_QUORUM
+// GetHeadCommitID uses elsewhere: this value drives an irreversible cleanup
+// decision (deleting a commit row and its pub: references) and must not be
+// stale relative to an ambiguous CAS that already committed in another DC.
 var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("database not available")
 	}
 	fsHelper := NewFSHelper(database)
-	return fsHelper.GetHeadCommitID(repoID)
+	return fsHelper.getCanonicalHeadCommitSerial(repoID)
 }
 
 var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
