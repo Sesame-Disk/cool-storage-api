@@ -8,6 +8,76 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-03 - W2 follow-up 3: HEAD-CAS/lease race, hard-delete convergence, directed-run contamination
+
+A sixth-pass audit (again independently re-verified against the code, not
+accepted at face value) found two further correctness gaps in the
+publish-repair path plus two documentation/test-infra defects:
+
+1. **P1, most severe found in this whole series:** the durable
+   publish-repair sweep's pre-CAS lease (`publishedBlockReferenceRepairPreCASLease`,
+   5 minutes) is a timeout, not a structural revocation. `UpdateLibraryHead`
+   reads the commit row, calls `CalculateLibraryStats` (an UNBOUNDED
+   recursive walk of the new tree), and only then attempts the HEAD CAS --
+   which checks `head_commit_id`, nothing about the commit row it publishes.
+   If a writer's own completion (insertCommit, block-authority validation,
+   the stats walk, the CAS) takes longer than the lease, the sweep can
+   correctly -- given only the information it has -- conclude the commit is
+   abandoned and irreversibly delete it and its `pub:` references, while the
+   writer is still alive and about to CAS HEAD onto a now-nonexistent commit.
+   The CAS would still succeed (nothing stops it), leaving
+   `libraries.head_commit_id` pointing at a missing commit row and breaking
+   every future write to that library. Fixed with `libraryHeadCommitStillExistsFn`:
+   an EACH_QUORUM re-verification of the commit row immediately before the
+   CAS (not merely at the top of `UpdateLibraryHead`, before the unbounded
+   stats walk), returning the new `ErrLibraryHeadCommitReclaimed` on failure.
+   This cannot eliminate the race (Cassandra has no atomic condition spanning
+   the `commits` and `libraries` tables), but shrinks the window from
+   "however long stats calculation and block validation take" down to one
+   query's round trip. Proven by
+   `TestCreateFileFromBlocksRejectsHeadCASAfterCommitReclaimedBySweep`, which
+   models the interleaving via the existing `beforeHead` barrier (deleting
+   the commit row exactly where the sweep's cleanup would) rather than
+   chasing a real, flaky timing race.
+2. **P1:** the SERIAL-HEAD fix's own `getCanonicalHeadCommitSerial` resolved
+   `orgID` via a `libraries_by_id` lookup at plain consistency. A library's
+   hard-delete cascade (`library_delete_helpers.go`) deletes `libraries_by_id`
+   in the SAME batch as `libraries` -- and the previous round's fix
+   deliberately stopped treating a missing `libraries_by_id` row as
+   confident absence (to close the multi-DC staleness gap), which meant a
+   genuinely, permanently hard-deleted library's leftover repair row would
+   now retry forever instead of ever converging. Fixed by eliminating the
+   lookup entirely: every caller already durably has `orgID`
+   (`publishedBlockReferenceRepair.OrgID`, `pendingPublishedFile.cleanupOrgID`),
+   so `getCanonicalHeadCommitSerial` now takes it directly and reads
+   `libraries` (SERIAL) by primary key -- a hard-deleted library now
+   correctly, immediately reports `gocql.ErrNotFound`, resolving both the
+   original theoretical staleness concern and the non-convergence bug with a
+   simpler function (one query, not two). Required a signature change
+   threaded through `publishedBlockReferenceRepairHeadCommitFn` and
+   `publishedBlockReferenceRepairCommitReachableFn`; the R3 publication
+   hot-path CQL budget for `stagePendingPublishedFiles` moved 17->18->17
+   accordingly (documented in place).
+3. `docs/TESTING.md`'s W1-only and W2-only directed-run examples each set
+   only their own gate's env var, leaving the OTHER gate at its
+   `docker-compose.yaml` default of `1`. Since `TestMain`'s post-run
+   completeness check runs unconditionally regardless of `-run`, either
+   directed run would fail with "requires all named ... legs" even though
+   every test it selected passed. Fixed by having each example explicitly
+   unset the other gate, with a note explaining why both must always be
+   listed together going forward.
+4. A residual "renews (not creates)" mention survived in
+   `borrowedfs_own_liveness_test.go`'s `sessionUploadSingleOwnRefIdentity`
+   comment; corrected to "upserts." Also reworded `getCanonicalHeadCommitSerial`'s
+   "cold background recovery path" characterization: `cleanupPendingPublishedFileOwnerAttempt`
+   reaches it synchronously from a live-request error-cleanup branch
+   (`stagePendingPublishedFiles` -> `createFileFSObjectRow` failure), not
+   only from the periodic sweep -- both are cold/error paths outside the
+   normal successful-publication hot path, which is the property that
+   actually matters, not "background."
+
+---
+
 ## 2026-09-03 - W2 follow-up 2: repair ancestry-walk consistency and residual wording
 
 A fifth-pass audit of the SERIAL HEAD-read fix below (again independently

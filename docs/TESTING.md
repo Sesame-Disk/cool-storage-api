@@ -979,9 +979,19 @@ docker compose --profile test run --rm --build \
   -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
   -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
   -e SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1 \
+  -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE= \
   go-integration-test \
   go test -tags integration -run '^TestBorrowedFSOwnLiveness|^TestBorrowedFSHeadCharacterizationIsDocumented$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
+
+Both gates' env vars are permanently set to `1` in `docker-compose.yaml`'s
+`go-integration-test`/`go-all-test` services (see below), so a directed run
+selecting only one gate's tests MUST explicitly unset the OTHER gate's var
+above -- `TestMain`'s post-run completeness check (integration_test.go) runs
+unconditionally regardless of `-run`, and fails the whole binary if a gate's
+var is `1` but its evidence was never populated because its test was filtered
+out. Forgetting this makes an otherwise-passing directed run fail with
+"requires all named ... legs; missing=...".
 
 W2 SessionUpload own-liveness evidence is a separate six-leg gate, kept apart
 from the W1 gate above so `TestBorrowedFSOwnLivenessNamesArePinned` (which
@@ -996,6 +1006,7 @@ docker compose --profile test run --rm --build \
   -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
   -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
   -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE= \
   -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1 \
   go-integration-test \
   go test -tags integration -run '^TestSessionUploadOwnLiveness|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration

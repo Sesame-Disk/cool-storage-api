@@ -64,9 +64,9 @@ func TestBorrowedFSOwnLiveness(t *testing.T) {
 	// (ensureCommitBlockOwnLiveness, internal/api/v2/file_from_blocks.go),
 	// the then-BorrowedFS-only own-liveness step never touched a
 	// SessionUpload block at all, so an unchanged up: row COUNT was proof of
-	// zero writes. W2 renews (not creates) this same up:<session> identity on
-	// every commit, so the count alone no longer distinguishes "untouched"
-	// from "renewed in place" -- see
+	// zero writes. W2 upserts this same up:<session> identity on every commit
+	// (renewing it when present, recreating it when it already lapsed), so
+	// the count alone no longer distinguishes "untouched" from "touched" -- see
 	// TestSessionUploadOwnLiveness/sessionUploadRenewalExtendsNearExpiredTTL
 	// (sessionupload_own_liveness_test.go) for the deadline actually moving.
 	// What still holds, and what this leg checks now, is IDENTITY: the
