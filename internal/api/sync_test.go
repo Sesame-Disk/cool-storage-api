@@ -364,10 +364,10 @@ func TestSyncLibraryHeadCASStateIsTerminal(t *testing.T) {
 	}{
 		{"terminal", map[string]interface{}{"publication_state": db.LibraryPublicationStateTerminal}, true},
 		{"active", map[string]interface{}{"publication_state": db.LibraryPublicationStateActive}, false},
-		{"legacyNullValue", map[string]interface{}{"publication_state": nil}, false},
-		{"missingKey", map[string]interface{}{"head_commit_id": "commit-1"}, false},
-		{"emptyString", map[string]interface{}{"publication_state": ""}, false},
-		{"nonStringValue", map[string]interface{}{"publication_state": 42}, false},
+		{"nullValue", map[string]interface{}{"publication_state": nil}, true},
+		{"missingKey", map[string]interface{}{"head_commit_id": "commit-1"}, true},
+		{"emptyString", map[string]interface{}{"publication_state": ""}, true},
+		{"nonStringValue", map[string]interface{}{"publication_state": 42}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

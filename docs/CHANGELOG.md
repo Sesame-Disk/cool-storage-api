@@ -8,6 +8,67 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a pre-merge closure round 4: the read-side had the same tolerance left in it
+
+Round 3 removed legacy-NULL tolerance from every CAS *writer*, but a review
+found four *read* paths still silently treated a NULL/invalid
+`publication_state` as if it were ACTIVE -- the same policy violation round 3
+set out to close, just on the other side of the read/write line.
+
+- **`db.ReadLibraryStateContext`** (used by `library_delete_helpers.go`, and
+  transitively by `ReadLiveLibraryState`/`ResolveLiveLibraryStateByID`, which
+  gate `internal/middleware/permissions.go` and `internal/db/block_representation.go`)
+  coerced `NULL`/empty straight to `ACTIVE`. Now requires the observed value
+  to be exactly `ACTIVE` or `TERMINAL`; anything else is a hard read error.
+  `ReadLiveLibraryStateContext`'s existing TERMINAL check needed no change --
+  it can now assume its input is always one of the two valid states.
+- **`FSHelper.getCanonicalHeadCommitSerial`** (publish-repair's cold HEAD
+  read) only validated `publication_state` when it was present and non-empty,
+  silently skipping validation and returning the HEAD as if the library were
+  ACTIVE otherwise.
+- **`FSHelper.confirmLibraryHeadCommitVisible`** (the ambiguous-CAS SERIAL
+  confirmation read) only validated when `publicationState != nil`, so a NULL
+  read was accepted as a valid confirmation.
+- **`libraryHeadCASStateIsTerminal` / `syncLibraryHeadCASStateIsTerminal`**
+  (classify a rejected ordinary HEAD CAS as retryable vs. not) returned
+  `false` (ordinary, retryable conflict) for NULL/missing/malformed
+  `publication_state`, when a row can only become absent by first transiting
+  `ACTIVE -> TERMINAL` -- so a hard-deleted library's rejected CAS was
+  misclassified as an ordinary lost race and could burn retry budget against
+  a library that will never accept a HEAD CAS again. Simplified both to a
+  single rule: `ACTIVE` is the only retryable value; everything else --
+  `TERMINAL`, NULL, missing, or malformed -- is non-retryable. Updated the
+  existing unit tests' expectations (`legacyNullValue`/`emptyString`/etc.,
+  previously all `want false`) to match; renamed `legacyNullValue` to
+  `nullValue` since there is no more "legacy" framing to name it after.
+- Corrected the remaining current-state "legacy-NULL compatibility" claims in
+  `docs/DATABASE-GUIDE.md`, `docs/KNOWN_ISSUES.md`, and
+  `docs/R3-LIVENESS-CONTINUITY.md` (historical entries describing what a past
+  fix included at the time are left as history, not rewritten).
+- **Migration 021's own `.cql` comments are now corrected too** (round 3 had
+  deliberately left them stale to avoid a checksum conflict against this
+  session's already-migrated dev Cassandra). Between rounds 3 and 4, that dev
+  Cassandra's data volume was independently lost (a full Docker Desktop
+  restart), which reset the underlying constraint this decision depended on:
+  with no applied-migration record left to conflict with, the file was safe
+  to edit. Re-verified the whole suite against the freshly bootstrapped,
+  migrated-from-scratch keyspace afterward.
+- Corrected an imprecise claim from round 3's own entry (flagged by review):
+  "`publication_state = null` in a rejected CAS is unambiguous proof the
+  partition is absent" overstated what the invariant actually guarantees --
+  a present-but-malformed row can also read NULL, exactly what this round's
+  new coverage constructs to prove rejection. The precise property does not
+  need to distinguish the two: under the clean-deploy invariant, no valid row
+  is ever NULL, so whether the row is absent or merely malformed is
+  irrelevant, because both fail closed identically.
+
+Verified: `go build`/`go vet` clean (default and `-tags integration`); full
+`go-all-test` and `internal/api`/`internal/api/v2` `-tags integration` suites
+green in Docker against a freshly bootstrapped, migrated-from-scratch
+Cassandra (see commit for exact counts).
+
+---
+
 ## 2026-09-04 - W2a pre-merge closure round 3: remove legacy-NULL compatibility entirely
 
 A direct question during review cut through rounds 1-2's biggest source of
@@ -23,13 +84,14 @@ existed to distinguish from an absent (hard-deleted) partition **cannot ever
 occur** in this deployment's real lifecycle.
 
 Removing it does not just delete dead code -- it eliminates the entire class
-of bug rounds 1-2 spent multiple passes closing. Without a second CAS
-attempt, `publication_state = null` in a rejected CAS is unambiguous proof
-the partition is absent (there is no other value it could hold): the first
-and only CAS simply fails, with no retry and therefore no window for a
-concurrent hard-delete to be misread as "legacy." The TOCTOU round 2 closed
-with `owner_id != null` is not hardened here; it no longer has anything to
-guard, because the retry it protected no longer exists.
+of bug rounds 1-2 spent multiple passes closing. A rejected CAS observing
+`publication_state = null` never grants authority, and under the clean-deploy
+invariant no valid row is ever NULL -- whether the row is absent or merely
+malformed is irrelevant, because both fail closed identically: the first and
+only CAS simply fails, with no retry and therefore no window for a concurrent
+hard-delete to be misread as "legacy." The TOCTOU round 2 closed with
+`owner_id != null` is not hardened here; it no longer has anything to guard,
+because the retry it protected no longer exists.
 
 - **The four HEAD-writer functions each go from two CAS attempts to one.**
   `createInitialCommit`, `InitializeLibraryFS`, `executeLibraryHeadCAS`

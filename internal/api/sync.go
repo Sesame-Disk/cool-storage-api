@@ -3495,17 +3495,23 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 }
 
 // syncLibraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS
-// observed publication_state = TERMINAL rather than an ordinary lost
-// head_commit_id race. A terminal library will never accept a HEAD CAS from
-// any writer again, so this must not be classified as the retryable
-// ErrHeadConflict a live conflict is -- see updateLibraryHeadWithStats.
+// should be treated as non-retryable. ACTIVE is the only value that means
+// "an ordinary writer is competing for this same HEAD, retrying may win" --
+// every other observed value is non-retryable: TERMINAL means the authority
+// is permanently revoked, and NULL/missing/malformed means the partition is
+// absent or the row is invalid, since a valid row is created ACTIVE and can
+// only become absent by first transiting ACTIVE -> TERMINAL
+// (RevokeLibraryPublication always commits that before a hard-delete
+// physically removes the row). Retrying cannot help in any of those cases,
+// so this must not be classified as the retryable ErrHeadConflict a live
+// conflict is -- see updateLibraryHeadWithStats.
 func syncLibraryHeadCASStateIsTerminal(casState map[string]interface{}) bool {
 	state, ok := casState["publication_state"]
 	if !ok || state == nil {
-		return false
+		return true
 	}
 	value, ok := state.(string)
-	return ok && value == db.LibraryPublicationStateTerminal
+	return !ok || value != db.LibraryPublicationStateActive
 }
 
 func (h *SyncHandler) executeLibraryHeadCAS(orgID, repoID, commitID string, totalSize, fileCount int64, now time.Time, expectedHead string) (bool, map[string]interface{}, error) {

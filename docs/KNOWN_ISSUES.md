@@ -69,7 +69,7 @@ is right about why.
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21); P2/R9/R24 closed 2026-08-24 | Canonical reads, HEAD/existence, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and support both legacy deterministic and minted incarnation locators. Every exact-key `BlockStore` operation rejects a key outside its configured prefix plus canonical org ID, and authority sites use `ValidatePhysicalLocator` rather than re-deriving equality. Arbitrary locator formats remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
-| **Library HEAD Publish Has No Serial-Domain Contract** | ✅ Fixed (2026-09-03) | Both conditional HEAD publishes now explicitly pin `SerialConsistency(gocql.Serial)`, including the legacy-`NULL` compatibility branch. Initial-library authority statements use the same global SERIAL domain. See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below for the historical finding. |
+| **Library HEAD Publish Has No Serial-Domain Contract** | ✅ Fixed (2026-09-03) | Both conditional HEAD publishes now explicitly pin `SerialConsistency(gocql.Serial)`. Initial-library authority statements use the same global SERIAL domain. (The legacy-`NULL` compatibility branch this fix originally also pinned was removed entirely in "W2a pre-merge closure round 3" — see `docs/CHANGELOG.md`.) See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below for the historical finding. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
@@ -1419,9 +1419,12 @@ IF head_commit_id = ?
 ```
 
 The fix calls `SerialConsistency(gocql.Serial)` on both publish queries and on
-the conditional initialization statements. The legacy-`NULL` compatibility
-path is pinned as well, so publication authority remains in one global SERIAL
-domain regardless of `database.serial_consistency`.
+the conditional initialization statements, so publication authority remains in
+one global SERIAL domain regardless of `database.serial_consistency`. (At the
+time of this fix the conditional initialization statements also included a
+legacy-`NULL` compatibility retry; "W2a pre-merge closure round 3" later
+removed that retry entirely, since this codebase supports no pre-existing
+dataset.)
 
 Under `LOCAL_SERIAL` with multi-region replication, the unfixed compare-and-set
 could be serialized within one DC only. Two DCs could each read the same

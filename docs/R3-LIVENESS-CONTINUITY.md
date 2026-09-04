@@ -185,9 +185,10 @@ orphan authority read and no per-block authority read. The structural budget for
 `stagePendingPublishedFiles` is 18 callsites rather than the previous 17 because
 its reachable missing-library repair path performs the durable
 `library_publication_revocations` witness lookup. That is not a per-block
-authority read and not the legacy-`NULL` `publication_state` CAS fallback;
-migrated live rows take only the guarded `ACTIVE` CAS. This budget entry is not a
-runtime claim of one extra request per block.
+authority read. (There is no legacy-`NULL` `publication_state` CAS fallback to
+distinguish it from either -- "W2a pre-merge closure round 3" removed that
+retry entirely; every live row takes only the guarded `ACTIVE` CAS.) This
+budget entry is not a runtime claim of one extra request per block.
 
 `TestR3PublicationKnownFanoutIsSinglePass` supplies the narrow multiplicity
 contract the static budget cannot provide: it freezes the authorized staging

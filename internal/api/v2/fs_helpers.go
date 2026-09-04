@@ -219,14 +219,20 @@ func (h *FSHelper) getCanonicalHeadCommitSerial(orgID, repoID string) (string, e
 	if err != nil {
 		return "", err
 	}
-	if publicationState != nil && *publicationState != "" {
-		switch *publicationState {
-		case db.LibraryPublicationStateTerminal:
-			return "", db.ErrLibraryPublicationTerminal
-		case db.LibraryPublicationStateActive:
-		default:
-			return "", fmt.Errorf("unknown library publication state %q", *publicationState)
+	// Clean-deploy invariant (docs/CHANGELOG.md "W2a pre-merge closure round
+	// 3"): every libraries row is created with publication_state already
+	// ACTIVE, so NULL/empty here is an invalid row, not a legacy one to skip
+	// validating -- fail closed the same as an unrecognized value.
+	switch {
+	case publicationState != nil && *publicationState == db.LibraryPublicationStateActive:
+	case publicationState != nil && *publicationState == db.LibraryPublicationStateTerminal:
+		return "", db.ErrLibraryPublicationTerminal
+	default:
+		value := ""
+		if publicationState != nil {
+			value = *publicationState
 		}
+		return "", fmt.Errorf("library publication state is %q, want ACTIVE or TERMINAL", value)
 	}
 	if !deletedAt.IsZero() {
 		return "", db.ErrLibraryDeleted
@@ -655,16 +661,22 @@ func (h *FSHelper) confirmLibraryHeadCommitVisible(orgID, repoID, commitID strin
 	if err != nil {
 		return "", false, err
 	}
-	if publicationState != nil {
-		switch *publicationState {
-		case db.LibraryPublicationStateActive:
-		case db.LibraryPublicationStateTerminal:
-			return currentHead, false, db.ErrLibraryPublicationTerminal
-		default:
-			return currentHead, false, fmt.Errorf("unknown library publication state %q", *publicationState)
+	// Clean-deploy invariant (docs/CHANGELOG.md "W2a pre-merge closure round
+	// 3"): every libraries row is created with publication_state already
+	// ACTIVE, so NULL here is an invalid row, not a legacy one to treat as a
+	// valid confirmation -- fail closed the same as an unrecognized value.
+	switch {
+	case publicationState != nil && *publicationState == db.LibraryPublicationStateActive:
+		return currentHead, currentHead == commitID, nil
+	case publicationState != nil && *publicationState == db.LibraryPublicationStateTerminal:
+		return currentHead, false, db.ErrLibraryPublicationTerminal
+	default:
+		value := ""
+		if publicationState != nil {
+			value = *publicationState
 		}
+		return currentHead, false, fmt.Errorf("library publication state is %q, want ACTIVE or TERMINAL", value)
 	}
-	return currentHead, currentHead == commitID, nil
 }
 
 // libraryHeadCASExecuteFn executes the library HEAD CAS write. Overridable
@@ -683,18 +695,24 @@ var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, 
 	return applied, casState, err
 }
 
-// libraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS observed
-// publication_state = TERMINAL, as opposed to an ordinary lost head_commit_id
-// race. Distinguishing the two matters: a terminal library will never accept
-// another HEAD CAS from any writer, ever, so callers must not classify it as
-// ErrLibraryHeadConflict (retryable) the way a live conflict is.
+// libraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS should be
+// treated as non-retryable. ACTIVE is the only value that means "an ordinary
+// writer is competing for this same HEAD, retrying may win" -- every other
+// observed value is non-retryable: TERMINAL means the authority is
+// permanently revoked, and NULL/missing/malformed means the partition is
+// absent or the row is invalid, since a valid row is created ACTIVE and can
+// only become absent by first transiting ACTIVE -> TERMINAL
+// (RevokeLibraryPublication always commits that before a hard-delete
+// physically removes the row). Retrying cannot help in any of those cases,
+// so callers must not classify them as ErrLibraryHeadConflict (retryable)
+// the way a live conflict is.
 func libraryHeadCASStateIsTerminal(casState map[string]interface{}) bool {
 	state, ok := casState["publication_state"]
 	if !ok || state == nil {
-		return false
+		return true
 	}
 	value, ok := state.(string)
-	return ok && value == db.LibraryPublicationStateTerminal
+	return !ok || value != db.LibraryPublicationStateActive
 }
 
 // libraryHeadConfirmVisibleFn resolves the ambiguous-CAS SERIAL confirmation

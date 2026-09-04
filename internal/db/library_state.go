@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -64,10 +65,22 @@ func ReadLibraryStateContext(ctx context.Context, session *gocql.Session, orgID,
 	); err != nil {
 		return LibraryState{}, err
 	}
-	if publicationState == nil || *publicationState == "" {
+	// Clean-deploy invariant (docs/CHANGELOG.md "W2a pre-merge closure round
+	// 3"): every libraries row is created with publication_state already
+	// ACTIVE, so any other observed value -- NULL, empty, or unrecognized --
+	// is an invalid row, not a legacy one to tolerate. Fail closed rather than
+	// silently treating it as ACTIVE.
+	switch {
+	case publicationState != nil && *publicationState == LibraryPublicationStateActive:
 		state.PublicationState = LibraryPublicationStateActive
-	} else {
-		state.PublicationState = *publicationState
+	case publicationState != nil && *publicationState == LibraryPublicationStateTerminal:
+		state.PublicationState = LibraryPublicationStateTerminal
+	default:
+		value := ""
+		if publicationState != nil {
+			value = *publicationState
+		}
+		return LibraryState{}, fmt.Errorf("library publication state is %q, want ACTIVE or TERMINAL", value)
 	}
 
 	if !deletedAt.IsZero() {

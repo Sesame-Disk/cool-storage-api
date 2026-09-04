@@ -4,14 +4,19 @@
 -- writers may advance HEAD only while publication_state is ACTIVE, and a
 -- hard-delete first commits ACTIVE -> TERMINAL before removing the row.
 --
--- Existing rows have NULL until they are touched by a writer or hard-delete.
--- Runtime CAS code treats NULL as legacy ACTIVE and materializes ACTIVE on its
--- first successful HEAD mutation/revocation, so this migration needs no table
--- scan or unsafe bulk rewrite. That NULL is ambiguous by itself -- Cassandra
--- returns the same NULL for a genuine untouched legacy row and for a
--- partition that does not exist at all -- so any caller that would grant
--- ACTIVE authority on it must first check library_publication_revocations;
--- see db.LibraryPublicationCASStateIsLegacyNull and db.IsLibraryPublicationRevoked.
+-- publication_state is mandatory application state, not an optional column
+-- with a legacy fallback: every production INSERT INTO libraries sets it to
+-- ACTIVE explicitly at creation. A row observed with any other value --
+-- NULL, empty, or unrecognized -- is invalid and every caller (initial HEAD
+-- writers, ordinary HEAD writers, restore, revoke, and the plain readers in
+-- internal/db/library_state.go) fails closed on it rather than treating it
+-- as ACTIVE. This codebase supports no pre-existing dataset of any kind: this
+-- is a clean deploy from an empty keyspace, this migration ships as part of
+-- the initial schema baseline before any real row is ever created, and this
+-- policy holds until X1 closes and a doc explicitly says otherwise (see
+-- CURRENT_WORK.md "Policy"). See docs/CHANGELOG.md "W2a pre-merge closure
+-- round 3" for the fix that removed the legacy-NULL compatibility retry this
+-- migration originally shipped alongside.
 --
 -- The revocation table is a durable witness for the period after the canonical
 -- libraries row is physically deleted. It is intentionally never deleted and
@@ -21,12 +26,9 @@
 -- its own small partition instead of every hard-delete an org ever performs
 -- accumulating in one ever-growing per-org partition.
 --
--- Deployment: this release must roll out atomically. A writer that predates
--- this migration CASes HEAD on `IF head_commit_id = ?` alone and does not
--- know about publication_state, so it can still advance HEAD after a
--- publication_state = TERMINAL hard-delete has committed. Do not run old and
--- new binaries concurrently against the same libraries rows once hard-delete
--- terminal authority is in use.
+-- Deployment: this release must roll out atomically, the same as every other
+-- migration in this pre-production codebase -- there is no existing writer
+-- fleet to stage a mixed-version rollout against.
 
 ALTER TABLE libraries
     ADD IF NOT EXISTS publication_state TEXT;
