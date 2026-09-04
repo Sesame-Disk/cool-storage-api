@@ -982,11 +982,25 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
+	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library soft-delete lock for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library soft-delete lock for %s", libraryID)
+	}
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("soft-delete library: %w", err)
 	}
 
 	// Read the live lib-scope counter and subtract from aggregate scopes.
+	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library soft-delete accounting for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library soft-delete lock before accounting for %s", libraryID)
+	}
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, false)
 	return nil
 }
@@ -1022,13 +1036,15 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// the original soft-deleted canonical row (present, deleted_at != null). If the canonical
 	// row is gone, permanent deletion / orphan purge already started — never resurrect it. A
 	// present-but-active row (deleted_at == null) is not in trash. The admin projection is a
-	// read model and does not prove canonical presence, so it cannot gate this.
+	// read model and does not prove canonical presence, so it cannot gate this. The canonical
+	// lifecycle read is EACH_QUORUM because the fence lives in a different partition and does
+	// not make a completed soft-delete visible to a LOCAL_QUORUM reader in another DC.
 	var canonicalDeletedAt time.Time
 	var publicationState *string
 	err = db.Session().Query(`
 		SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
-	).Scan(&canonicalDeletedAt, &publicationState)
+	).Consistency(gocql.EachQuorum).Scan(&canonicalDeletedAt, &publicationState)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return fmt.Errorf("library is pending permanent deletion")
 	} else if err != nil {
@@ -1077,6 +1093,13 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// conditional batch cannot span the canonical row and read-model tables.
 	restoreCounters := false
 	if !canonicalDeletedAt.IsZero() {
+		owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("fence library restore lock before authority transition: %w", err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library restore lock before authority transition")
+		}
 		restoreApplied, err := db.Session().Query(`
 			UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
 			WHERE org_id = ? AND library_id = ?
@@ -1109,12 +1132,26 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// Re-add the library's storage to aggregates after the canonical row and
 	// deleted marker have been restored.
 	if restoreCounters {
+		owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("fence library restore accounting for %s: %w", libraryID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library restore lock before accounting for %s", libraryID)
+		}
 		traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
 	}
 	// Keep the durable marker until every derived mutation above has completed.
 	// If this final delete is lost, the next restore attempt sees the ACTIVE row
 	// plus the marker, retries only the idempotent derived writes, and does not
 	// apply the synchronous counter increment a second time.
+	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library restore marker cleanup for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library restore lock before marker cleanup for %s", libraryID)
+	}
 	if err := db.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID).
 		Consistency(gocql.EachQuorum).Exec(); err != nil {
 		return fmt.Errorf("remove restored library marker: %w", err)

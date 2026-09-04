@@ -3920,6 +3920,13 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 }
 
 func (m *MockStore) SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy, leaseToken uuid.UUID) error {
+	owned, err := m.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return fmt.Errorf("lost library lifecycle fence for soft delete %s", libraryID)
+	}
 	return m.SoftDeleteLibrary(orgID, libraryID, deletedBy)
 }
 func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {

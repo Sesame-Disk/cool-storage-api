@@ -206,7 +206,11 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    soft-delete path; an org cascade passes its already-held library lease to
    avoid re-entrant acquisition. If a worker crashes, a later worker can take
    over after the heartbeat becomes stale; active contention is postponed
-   without consuming retry budget.
+   without consuming retry budget. Restore reads the canonical lifecycle row
+   at `EACH_QUORUM` as well: the fence is a different partition and cannot make
+   a preceding soft-delete visible to a reader in another DC. API writers renew
+   ownership immediately before each mutating boundary, and the mock preserves
+   the same token check.
 6. **Scanner safety nets are partial** — phases recover discoverable candidates/markers and
    run on startup + every 24h. P6a (transient-error fail-open) is fixed, so a transient
    existence read no longer misclassifies a live library; P6b execution-time canonical

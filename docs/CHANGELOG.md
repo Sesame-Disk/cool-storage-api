@@ -8,10 +8,11 @@ Session-by-session development history for SesameFS.
 
 ---
 
-## 2026-09-04 - W2a audit consolidation: lifecycle fence and contract hardening
+## 2026-09-04 - W2a audit consolidation: lifecycle fence and cross-DC visibility
 
 The consolidated PR #203 audit confirmed the important soft-delete/restore
-correctness race and the surrounding documentation and guard drift.
+correctness race and then found a second cross-DC visibility edge at the
+restore handoff.
 
 - Reused the tokenized library lock as a shared lifecycle fence for API
   soft-delete, GC soft-delete, restore, and hard-delete. The org cascade uses
@@ -22,6 +23,12 @@ correctness race and the surrounding documentation and guard drift.
 - Pinned every generic lease LWT (acquire, stale takeover, renew, and release)
   to `EACH_QUORUM` plus global `SERIAL`; added a source guard so this 3DC
   contract cannot silently fall back to a profile's `LOCAL_SERIAL` default.
+- Pinned restore's canonical `libraries` lifecycle read to `EACH_QUORUM`.
+  The lifecycle fence is a different partition, so acquiring it does not make
+  a preceding `LOCAL_QUORUM` soft-delete visible to a reader in another DC.
+  Restore and API soft-delete now renew the lease immediately before each
+  mutating boundary. Added a guard tying the `EACH_QUORUM` assertion to the
+  canonical Query call itself, plus a MockStore wrong-token regression.
 - Hardened both HEAD-writer AST guards to recognize formatted and qualified
   CQL, require an exact publication_state = ? predicate in the IF clause, and
   require that bind to be ACTIVE. Added permanent mutation controls. Added a

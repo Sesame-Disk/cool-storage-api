@@ -147,6 +147,29 @@ func TestMockStore_SoftDeleteLibrary_MissingLibraryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMockStore_SoftDeleteLibraryUnderLease_RequiresOwnerToken(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libID := uuid.New()
+	ownerToken := uuid.New()
+	wrongToken := uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+
+	acquired, err := store.AcquireLibraryHardDeleteLock(libID, ownerToken)
+	if err != nil || !acquired {
+		t.Fatalf("AcquireLibraryHardDeleteLock = acquired:%v err:%v, want acquired", acquired, err)
+	}
+	if err := store.SoftDeleteLibraryUnderLease(orgID, libID, uuid.Nil, wrongToken); err == nil {
+		t.Fatal("SoftDeleteLibraryUnderLease with the wrong token returned nil")
+	}
+	if !store.libraries[libID].DeletedAt.IsZero() {
+		t.Fatal("wrong-token soft delete mutated the canonical mock library")
+	}
+	if _, ok := store.deletedLibraries[libID]; ok {
+		t.Fatal("wrong-token soft delete created a deleted library marker")
+	}
+}
+
 // TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes verifies the raw
 // single-row EnqueueItem path — which cannot carry a block representation — fails
 // closed for the item types that require one, so a caller cannot bypass the

@@ -35,10 +35,14 @@ hard-delete lease is now the shared library lifecycle fence for API/GC
 soft-delete, restore, and hard-delete. The org cascade passes its held library
 token into the fenced soft-delete path to avoid re-entrant acquisition. A
 real-Cassandra regression proves a competing writer cannot consume the marker
-or change the canonical row. The report's stale P4a mutation was also corrected
-to target the current settlement branch. The generic lease LWTs are also
-explicitly pinned to EACH_QUORUM plus global SERIAL for the production 3DC
-topology. X1 remains OPEN and GC_ENABLED=false.
+or change the canonical row. A follow-up cross-DC review also found that the
+fence partition did not make the canonical soft-delete visible to a restore in
+another DC; restore now reads canonical lifecycle state at EACH_QUORUM and
+renews ownership before every mutating boundary. MockStore validates the
+under-lease token, and source guards pin the canonical read contract. The
+report's stale P4a mutation was also corrected to target the current settlement
+branch. The generic lease LWTs are explicitly pinned to EACH_QUORUM plus global
+SERIAL for the production 3DC topology. X1 remains OPEN and GC_ENABLED=false.
 ## 🚀 NEW SESSION? START HERE
 
 **PROJECT STATUS**: ~85-90% production ready (see `docs/IMPLEMENTATION_STATUS.md`)

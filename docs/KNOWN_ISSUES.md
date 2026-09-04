@@ -21,7 +21,11 @@ could be the normal soft-delete batch in flight, not only a restore whose
 canonical CAS had already committed. The shared library lifecycle fence now
 serializes API soft-delete, GC soft-delete, restore, and hard-delete. The
 real-Cassandra regression keeps the fence owned and proves all three writer
-families reject without consuming either row. The X1 closure remains open.
+families reject without consuming either row. A follow-up cross-DC review
+found that the fence partition did not make the canonical row visible to a
+restore in another DC; restore now reads that lifecycle state at EACH_QUORUM
+and renews ownership before mutating boundaries. The MockStore also validates
+under-lease tokens. The X1 closure remains open.
 
 ## Issue Summary by Priority
 
