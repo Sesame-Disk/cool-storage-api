@@ -1030,15 +1030,19 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		// marker/read-model batch failed. Treat the durable marker as a restore
 		// intent and retry only the derived-state finalization below.
 	}
-	if publicationState != nil && *publicationState != "" {
-		switch *publicationState {
-		case dbpkg.LibraryPublicationStateActive:
-			// Legacy NULL is also treated as ACTIVE by the state readers below.
-		case dbpkg.LibraryPublicationStateTerminal:
+	// This is a clean-deploy codebase (docs/CHANGELOG.md "W2a pre-merge closure
+	// round 3"): every libraries row is created with publication_state already
+	// ACTIVE, so a non-ACTIVE value here is never a legacy row to tolerate --
+	// it is either TERMINAL (hard-delete won the race) or an unexpected state.
+	if publicationState == nil || *publicationState != dbpkg.LibraryPublicationStateActive {
+		if publicationState != nil && *publicationState == dbpkg.LibraryPublicationStateTerminal {
 			return dbpkg.ErrLibraryPublicationTerminal
-		default:
-			return fmt.Errorf("unknown library publication state %q", *publicationState)
 		}
+		state := ""
+		if publicationState != nil {
+			state = *publicationState
+		}
+		return fmt.Errorf("library publication state is %q, want ACTIVE", state)
 	}
 
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
@@ -1052,22 +1056,12 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// conditional batch cannot span the canonical row and read-model tables.
 	restoreCounters := false
 	if !canonicalDeletedAt.IsZero() {
-		var restoreApplied bool
-		if publicationState == nil || *publicationState == "" {
-			restoreApplied, err = db.Session().Query(`
-				UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
-				WHERE org_id = ? AND library_id = ?
-				IF deleted_at = ? AND publication_state = null`,
-				now, dbpkg.LibraryPublicationStateActive, orgID, libraryID, canonicalDeletedAt,
-			).SerialConsistency(gocql.Serial).MapScanCAS(map[string]interface{}{})
-		} else {
-			restoreApplied, err = db.Session().Query(`
-				UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
-				WHERE org_id = ? AND library_id = ?
-				IF deleted_at = ? AND publication_state = ?`,
-				now, dbpkg.LibraryPublicationStateActive, orgID, libraryID, canonicalDeletedAt, dbpkg.LibraryPublicationStateActive,
-			).SerialConsistency(gocql.Serial).MapScanCAS(map[string]interface{}{})
-		}
+		restoreApplied, err := db.Session().Query(`
+			UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
+			WHERE org_id = ? AND library_id = ?
+			IF deleted_at = ? AND publication_state = ?`,
+			now, dbpkg.LibraryPublicationStateActive, orgID, libraryID, canonicalDeletedAt, dbpkg.LibraryPublicationStateActive,
+		).SerialConsistency(gocql.Serial).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			return fmt.Errorf("restore library authority transition: %w", err)
 		}

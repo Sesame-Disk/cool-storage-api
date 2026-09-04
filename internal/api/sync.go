@@ -1121,39 +1121,6 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 	if err != nil {
 		return "", fmt.Errorf("failed to update library head: %w", err)
 	}
-	if !applied && db.LibraryPublicationCASStateIsLegacyNull(casState) {
-		// Rows created before migration 021 have NULL publication_state; promote
-		// that legacy value to ACTIVE in the same guarded Paxos domain, mirroring
-		// v2's FSHelper.InitializeLibraryFS. A NULL here is ambiguous -- Cassandra
-		// returns the same NULL for a genuine untouched pre-021 row and for a
-		// partition that does not exist at all, which is exactly what a
-		// hard-deleted library looks like once its row is physically removed.
-		// The durable revocation witness is consulted first as a cheap early
-		// exit, but it is NOT what makes the retry below safe: a hard-delete
-		// that revokes and removes the row strictly after this read (and before
-		// the retry CAS) would leave the witness unseen here. Safety instead
-		// comes from owner_id in the retry CAS's own IF clause: owner_id is set
-		// at row creation and never cleared, so it reads back NULL only when the
-		// partition is genuinely absent -- distinguishing that case from a real
-		// untouched legacy row atomically, in the same LWT, with no window for a
-		// concurrent hard-delete to land in between.
-		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
-		if revokeErr != nil {
-			return "", fmt.Errorf("failed to update library head: check publication revocation: %w", revokeErr)
-		}
-		if !revoked {
-			casState = map[string]interface{}{}
-			applied, err = h.db.Session().Query(`
-				UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
-				WHERE org_id = ? AND library_id = ?
-				IF owner_id != null AND head_commit_id = null AND publication_state = null
-			`, commitID, commitID, int64(0), int64(0), now, db.LibraryPublicationStateActive, orgID, repoID).
-				SerialConsistency(gocql.Serial).MapScanCAS(casState)
-			if err != nil {
-				return "", fmt.Errorf("failed to update legacy library head: %w", err)
-			}
-		}
-	}
 	if !applied {
 		initErr := fmt.Errorf("failed to update library head: publication authority is not ACTIVE or the library is already initialized")
 		if cleanupErr := deleteInitialCommitArtifacts(h.db.Session(), repoID, commitID); cleanupErr != nil {
@@ -3527,15 +3494,6 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 	}
 }
 
-func syncLibraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
-	state, ok := casState["publication_state"]
-	if !ok || state == nil {
-		return true
-	}
-	value, ok := state.(string)
-	return ok && value == ""
-}
-
 // syncLibraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS
 // observed publication_state = TERMINAL rather than an ordinary lost
 // head_commit_id race. A terminal library will never accept a HEAD CAS from
@@ -3557,20 +3515,6 @@ func (h *SyncHandler) executeLibraryHeadCAS(orgID, repoID, commitID string, tota
 		WHERE org_id = ? AND library_id = ?
 		IF head_commit_id = ? AND publication_state = ?
 	`, commitID, now, totalSize, fileCount, db.LibraryPublicationStateActive, orgID, repoID, expectedHead, db.LibraryPublicationStateActive).
-		SerialConsistency(gocql.Serial).MapScanCAS(casState)
-	if err != nil || applied || !syncLibraryHeadCASStateIsLegacyNull(casState) {
-		return applied, casState, err
-	}
-
-	// Rows from before migration 021 have NULL publication_state. Treat that
-	// legacy value as ACTIVE, but still settle the transition in the same CAS
-	// domain before publishing the new HEAD.
-	casState = map[string]interface{}{}
-	applied, err = h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, updated_at = ?, size_bytes = ?, file_count = ?, publication_state = ?
-		WHERE org_id = ? AND library_id = ?
-		IF head_commit_id = ? AND publication_state = null
-	`, commitID, now, totalSize, fileCount, db.LibraryPublicationStateActive, orgID, repoID, expectedHead).
 		SerialConsistency(gocql.Serial).MapScanCAS(casState)
 	return applied, casState, err
 }

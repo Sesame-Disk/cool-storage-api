@@ -17,53 +17,20 @@ const (
 // visible but its authority to publish HEAD has been permanently revoked.
 var ErrLibraryPublicationTerminal = errors.New("library publication authority is terminal")
 
-// LibraryPublicationCASStateIsLegacyNull reports whether a rejected
-// publication_state-guarded LWT observed a NULL value there. Cassandra
-// returns that same NULL both for a genuine pre-migration-021 row that has
-// never been touched and for a partition that does not exist at all (the
-// columns in an IF clause read as NULL against an absent row too), so this
-// function alone cannot tell "untouched legacy row" from "hard-deleted
-// library". A caller that would grant ACTIVE authority on this signal should
-// consult IsLibraryPublicationRevoked first as a cheap early exit, but that
-// check is NOT sufficient by itself: it is a separate round trip against a
-// different table, so a hard-delete landing strictly between the witness read
-// and the retry CAS would go unseen. The retry CAS's own IF clause MUST also
-// include a real, non-null, never-cleared column (e.g. libraries.owner_id) as
-// an existence check, so the row's absence is detected atomically, in the
-// same LWT as the retry -- with no window for a concurrent hard-delete to
-// land in between.
-func LibraryPublicationCASStateIsLegacyNull(casState map[string]interface{}) bool {
-	state, ok := casState["publication_state"]
-	if !ok || state == nil {
-		return true
-	}
-	value, ok := state.(string)
-	return ok && value == ""
-}
-
-func readPublicationStateFromCAS(state map[string]interface{}) (value string, legacyNull bool) {
+func readPublicationStateFromCAS(state map[string]interface{}) string {
 	raw, ok := state["publication_state"]
 	if !ok || raw == nil {
-		return "", true
+		return ""
 	}
-	value, ok = raw.(string)
+	value, ok := raw.(string)
 	if !ok {
-		return fmt.Sprint(raw), false
+		return fmt.Sprint(raw)
 	}
-	return value, value == ""
+	return value
 }
 
-func revokeLibraryPublicationState(session *gocql.Session, orgID, libraryID string, legacyNull bool) (bool, map[string]interface{}, error) {
+func revokeLibraryPublicationState(session *gocql.Session, orgID, libraryID string) (bool, map[string]interface{}, error) {
 	casState := map[string]interface{}{}
-	if legacyNull {
-		applied, err := session.Query(`
-			UPDATE libraries SET publication_state = ?
-			WHERE org_id = ? AND library_id = ?
-			IF publication_state = null
-		`, LibraryPublicationStateTerminal, orgID, libraryID).
-			SerialConsistency(gocql.Serial).MapScanCAS(casState)
-		return applied, casState, err
-	}
 	applied, err := session.Query(`
 		UPDATE libraries SET publication_state = ?
 		WHERE org_id = ? AND library_id = ?
@@ -116,13 +83,24 @@ func confirmLibraryPublicationTerminal(session *gocql.Session, orgID, libraryID 
 	if err != nil {
 		return errors.Join(originalErr, fmt.Errorf("confirm terminal library publication state: %w", err))
 	}
-	state, _ := readPublicationStateFromCAS(casState)
+	state := readPublicationStateFromCAS(casState)
 	return fmt.Errorf("%w: observed publication state %q", originalErr, state)
 }
 
 // RevokeLibraryPublication commits the terminal publication authority before
 // a library hard-delete. It is idempotent and settles an ambiguous LWT before
 // allowing the caller to remove the canonical row.
+//
+// This is a clean-deploy codebase (docs/CHANGELOG.md "W2a pre-merge closure
+// round 3"): every libraries row is created with publication_state already
+// set to ACTIVE (all production INSERT INTO libraries call sites set it
+// explicitly), and this migration ships as part of the initial schema
+// baseline rather than being rolled out against a live fleet with existing
+// rows. There is no legacy row whose publication_state predates this column,
+// so an observed NULL here is unambiguous: it means the canonical row is
+// absent, not that it is an old row to promote. Callers are expected to have
+// already confirmed the row exists (under a hard-delete lease or a
+// just-prior read) before calling this.
 func RevokeLibraryPublication(session *gocql.Session, orgID, libraryID string) error {
 	if session == nil {
 		return fmt.Errorf("database session not available")
@@ -133,29 +111,17 @@ func RevokeLibraryPublication(session *gocql.Session, orgID, libraryID string) e
 		return nil
 	}
 
-	applied, casState, err := revokeLibraryPublicationState(session, orgID, libraryID, false)
+	applied, casState, err := revokeLibraryPublicationState(session, orgID, libraryID)
 	if err != nil {
 		return confirmLibraryPublicationTerminal(session, orgID, libraryID, err)
 	}
 	if !applied {
-		state, legacyNull := readPublicationStateFromCAS(casState)
-		switch {
-		case state == LibraryPublicationStateTerminal:
-			// Another hard-delete attempt won the same serial domain.
-		case legacyNull:
-			applied, casState, err = revokeLibraryPublicationState(session, orgID, libraryID, true)
-			if err != nil {
-				return confirmLibraryPublicationTerminal(session, orgID, libraryID, err)
-			}
-			if !applied {
-				state, _ = readPublicationStateFromCAS(casState)
-				if state != LibraryPublicationStateTerminal {
-					return fmt.Errorf("library publication state is %q, want ACTIVE or TERMINAL", state)
-				}
-			}
-		default:
+		state := readPublicationStateFromCAS(casState)
+		if state != LibraryPublicationStateTerminal {
 			return fmt.Errorf("library publication state is %q, want ACTIVE or TERMINAL", state)
 		}
+		// Already TERMINAL: another hard-delete attempt won the same serial
+		// domain. Idempotent, fall through to (re)write the witness.
 	}
 
 	if err := writeLibraryPublicationRevocation(session, orgID, libraryID); err != nil {

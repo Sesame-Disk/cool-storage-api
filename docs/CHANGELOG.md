@@ -8,6 +8,157 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a pre-merge closure round 3: remove legacy-NULL compatibility entirely
+
+A direct question during review cut through rounds 1-2's biggest source of
+complexity: is this codebase actually supporting pre-existing data from
+before migration 021? It is not. **SesameFS has no legacy dataset, has never
+shipped, and this is a clean deploy from an empty keyspace.** Migration 021
+ships as part of the initial schema baseline, before any real row is ever
+created, not rolled out incrementally against a live fleet. All 6 production
+`INSERT INTO libraries` call sites already set `publication_state = ACTIVE`
+explicitly (verified in round 2's closure). So the "genuine untouched
+pre-021 row with NULL `publication_state`" scenario the legacy-NULL retry
+existed to distinguish from an absent (hard-deleted) partition **cannot ever
+occur** in this deployment's real lifecycle.
+
+Removing it does not just delete dead code -- it eliminates the entire class
+of bug rounds 1-2 spent multiple passes closing. Without a second CAS
+attempt, `publication_state = null` in a rejected CAS is unambiguous proof
+the partition is absent (there is no other value it could hold): the first
+and only CAS simply fails, with no retry and therefore no window for a
+concurrent hard-delete to be misread as "legacy." The TOCTOU round 2 closed
+with `owner_id != null` is not hardened here; it no longer has anything to
+guard, because the retry it protected no longer exists.
+
+- **The four HEAD-writer functions each go from two CAS attempts to one.**
+  `createInitialCommit`, `InitializeLibraryFS`, `executeLibraryHeadCAS`
+  (`syncLibraryHeadCASStateIsLegacyNull` removed alongside it), and
+  `libraryHeadCASExecuteFn` all drop their legacy-NULL retry block --
+  `IsLibraryPublicationRevoked` pre-check, `owner_id != null` retry CAS, and
+  all -- keeping only the primary `IF ... AND publication_state = ACTIVE`
+  CAS. `db.LibraryPublicationCASStateIsLegacyNull` is deleted; nothing
+  references it. `IsLibraryPublicationRevoked` and the witness table
+  themselves are unaffected -- publish-repair's own retention logic (a
+  wholly separate concern) still uses them.
+- **`RevokeLibraryPublication` and `revokeLibraryPublicationState` drop the
+  `legacyNull bool` branch entirely.** One CAS (`IF publication_state =
+  ACTIVE`); a rejection that isn't already `TERMINAL` is now always an
+  error, not a second attempt. `readPublicationStateFromCAS` simplifies to a
+  single return value (the `legacyNull` bool it used to report has no
+  remaining caller).
+- **`restoreDeletedLibrary` drops its parallel legacy branch**
+  (`publicationState == nil || *publicationState == ""` selected a
+  `publication_state = null`-conditioned CAS instead of the ACTIVE-
+  conditioned one). A non-ACTIVE `publication_state` read on the
+  precondition check is now always rejected (with a distinct error for
+  `TERMINAL`), never silently treated as an implicit ACTIVE.
+- **The AST source guard's pinned writer count drops from 4 to 2 per
+  package** (`internal/api`, `internal/api/v2`) -- one CAS per function now,
+  and the guard caught this itself: it failed loudly on the stale count
+  the moment the retry blocks were deleted, exactly as designed.
+- **Integration test rewrites**, all in the direction of removing legacy
+  tolerance rather than adding it: `*_AcceptsGenuineLegacyNullRow` in both
+  `internal/api` and `internal/api/v2` is inverted to
+  `*_RejectsNullPublicationState`, proving a NULL-`publication_state` row
+  is now refused outright. `*_RejectsResurrectionOfRevokedAbsentLibrary` and
+  `*_RejectsRetryOnGenuinelyAbsentLibraryRow` /
+  `*_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck` (round 2's TOCTOU
+  reproduction, now testing a code path that no longer exists) collapse
+  into one `*_RejectsGenuinelyAbsentLibraryRow` per package, since the
+  witness's presence or absence no longer has any bearing on these
+  functions at all. `TestLibraryPublicationTerminalAuthorityBlocksHEADAndSurvivesHardDelete`
+  no longer corrupts a row to NULL `publication_state` to exercise a
+  "migration compatibility path" that no longer exists.
+  `TestRevokeLibraryPublicationLegacyFallbackRejectsGenuinelyAbsentLibrary`
+  (round 2's optional hardening test) is renamed
+  `...RejectsGenuinelyAbsentLibrary`, same assertion, simpler reasoning.
+  `internal/db/library_publication_test.go` (the sole test of the now-deleted
+  `LibraryPublicationCASStateIsLegacyNull`) is deleted outright.
+- **`docs/TECHNICAL-DEBT.md` §19.e's RESOLVED note updated** to drop the
+  now-inaccurate mention of a legacy-NULL retry.
+
+**Deliberately not touched:** migration 021's own `.cql` file. Its comments
+still describe the legacy-NULL compatibility story this entry removes from
+the Go code, which is now stale prose -- but the migration is already
+applied in this session's dev Cassandra, and `internal/db/migrator.go`
+checksums every applied migration file byte-for-byte; editing so much as a
+comment here would fail that check on the next server start against this
+same dev keyspace. The authoritative behavior lives in the Go code (updated
+and tested above) and this changelog entry, not in the migration file's
+prose.
+
+Verified: `go build`/`go vet` clean (default and `-tags integration`); full
+`go-all-test` and `internal/api`/`internal/api/v2` `-tags integration`
+suites green in Docker against real Cassandra/MinIO (see commit for exact
+counts).
+
+---
+
+## 2026-09-04 - W2a pre-merge closure round 2: the source guard itself had a gap
+
+A fourth, cross-checked review (four independent audit passes converging on
+the same finding) found the pre-merge closure guard below shipped with a real
+detection gap, plus confirmed one more closure item and one genuinely optional
+hardening.
+
+1. **The new AST guard checked for `publication_state` anywhere in the whole
+   statement, not specifically inside the `IF` clause.** Every current writer
+   also has `publication_state` in its `SET` list (`SET head_commit_id = ?,
+   publication_state = ?`), so a mutation that removed `AND publication_state
+   = ?` from the `IF` clause while leaving the `SET` untouched -- exactly
+   deleting the fence that matters -- would still show green. A related
+   completeness gap: the guard only recognized the writer's call chain inside
+   an `AssignStmt`/`ExprStmt`; a future writer whose chain is the operand of a
+   bare `return` would not be found at all. Rewrote `checkHeadCommitIDWriters`
+   in both `internal/api` and `internal/api/v2` to (a) locate the `.Query(...)`
+   `CallExpr` directly via `go/ast`, independent of its enclosing statement
+   shape, so a `return session.Query(...)....` chain is found the same as an
+   assignment; (b) extract only the CQL string literal and check for
+   `publication_state` strictly after the `IF` keyword, not anywhere in the
+   statement; (c) require an `IF` clause to exist at all (an unconditional
+   write is a strictly worse regression than a missing condition, and was
+   previously undetected too); (d) require `.SerialConsistency(gocql.Serial)`
+   chained by AST identity directly onto that exact `Query` call, not merely
+   present as text somewhere nearby. Added four permanent mutation tests per
+   package (`TestHeadCommitIDGuardAcceptsCompliantWriter`,
+   `...CatchesMissingPublicationStateInIFClause`,
+   `...CatchesMissingSerialConsistency`, `...CatchesUnconditionalWrite`) that
+   parse a small in-memory Go source snippet and assert the detector goes red
+   on each specific mutation and green on the compliant control -- including a
+   `return`-shaped writer, proving the AST-identity fix actually closes the
+   completeness gap. The real guard against production files still finds
+   exactly 4 writers per package with 0 violations.
+2. **`TECHNICAL-DEBT.md` §19.e marked RESOLVED.** It described the two
+   initial-commit paths as performing an *unconditional* `UPDATE libraries SET
+   head_commit_id`, correct only because "the library has no concurrent
+   writers at first-touch." W2a made both conditional, `ACTIVE`/`TERMINAL`-
+   gated LWTs that explicitly support concurrent initializers -- the premise
+   no longer holds. §19.f (the separate, still-accepted canonical-CAS/
+   derived-projection crash window) is untouched.
+3. **Optional hardening, included since it was a few lines plus a test:**
+   `revokeLibraryPublicationState`'s legacy-NULL branch CASed on `IF
+   publication_state = null` alone. Cassandra returns that same NULL for an
+   absent partition as for a genuine untouched pre-021 row, so
+   `RevokeLibraryPublication` invoked (incorrectly) against a `library_id`
+   with no canonical row would have materialized a stub row containing only
+   `publication_state = TERMINAL` instead of failing. Not a currently
+   reachable bug -- every production caller (both hard-delete paths,
+   `rollbackNewLibrary`) already confirms the row exists first -- but the
+   function is exported with no such guarantee in its own signature. Fixed by
+   adding `owner_id != null`, the same existence sentinel the initializer
+   legacy-NULL retry uses, making `RevokeLibraryPublication` fail instead of
+   fabricating state if ever misused. New integration coverage
+   (`TestRevokeLibraryPublicationLegacyFallbackRejectsGenuinelyAbsentLibrary`)
+   asserts the rejection and that no stub row or revocation witness is
+   written; the existing `TestLibraryPublicationTerminalAuthorityBlocksHEADAndSurvivesHardDelete`
+   (which already exercises this same branch against a genuinely *present*
+   legacy-NULL row) continues to pass unchanged.
+
+No other production code paths changed in this entry.
+
+---
+
 ## 2026-09-04 - W2a pre-merge closure: source guard, owner_id invariant, doc cleanup
 
 A third review (after confirming P0=0/P1=0 on round 2 below, including an

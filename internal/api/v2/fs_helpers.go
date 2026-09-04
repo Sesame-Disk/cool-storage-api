@@ -680,23 +680,6 @@ var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, 
 		IF head_commit_id = ? AND publication_state = ?
 	`, commitID, totalSize, fileCount, now, db.LibraryPublicationStateActive, orgID, repoID, expectedHead, db.LibraryPublicationStateActive).
 		SerialConsistency(gocql.Serial).MapScanCAS(casState)
-	if err != nil || applied {
-		return applied, casState, err
-	}
-
-	// Rows created before migration 021 have NULL publication_state. Promote
-	// that legacy value to ACTIVE in the same guarded Paxos domain; this path is
-	// only taken for persisted pre-migration rows and never for normal writes.
-	if !db.LibraryPublicationCASStateIsLegacyNull(casState) {
-		return applied, casState, nil
-	}
-	casState = map[string]interface{}{}
-	applied, err = h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
-		WHERE org_id = ? AND library_id = ?
-		IF head_commit_id = ? AND publication_state = null
-	`, commitID, totalSize, fileCount, now, db.LibraryPublicationStateActive, orgID, repoID, expectedHead).
-		SerialConsistency(gocql.Serial).MapScanCAS(casState)
 	return applied, casState, err
 }
 
@@ -988,36 +971,6 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 		SerialConsistency(gocql.Serial).MapScanCAS(casState)
 	if err != nil {
 		return fmt.Errorf("failed to initialize library fs state: %w", err)
-	}
-	if !applied && db.LibraryPublicationCASStateIsLegacyNull(casState) {
-		// A NULL publication_state here is ambiguous: Cassandra returns the same
-		// NULL for a genuine untouched pre-021 row and for a partition that does
-		// not exist at all -- which is exactly what a hard-deleted library looks
-		// like once its canonical row is physically removed. The durable
-		// revocation witness is consulted first as a cheap early exit, but it is
-		// NOT what makes the retry below safe: a hard-delete that revokes and
-		// removes the row strictly after this read (and before the retry CAS)
-		// would leave the witness unseen here. Safety instead comes from
-		// owner_id in the retry CAS's own IF clause: owner_id is set at row
-		// creation and never cleared, so it reads back NULL only when the
-		// partition is genuinely absent -- distinguishing that case from a real
-		// untouched legacy row atomically, in the same LWT, with no window for a
-		// concurrent hard-delete to land in between.
-		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
-		if revokeErr != nil {
-			return fmt.Errorf("failed to initialize library fs state: check publication revocation: %w", revokeErr)
-		}
-		if !revoked {
-			casState = map[string]interface{}{}
-			applied, err = h.db.Session().Query(`
-				UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
-				IF owner_id != null AND head_commit_id = null AND publication_state = null
-			`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID).
-				SerialConsistency(gocql.Serial).MapScanCAS(casState)
-			if err != nil {
-				return fmt.Errorf("failed to initialize legacy library fs state: %w", err)
-			}
-		}
 	}
 	if !applied {
 		initErr := fmt.Errorf("failed to initialize library fs state: publication authority is not ACTIVE or the library is already initialized")

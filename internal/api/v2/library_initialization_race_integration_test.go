@@ -89,74 +89,48 @@ func TestInitializeLibraryFS_LoserCleanupPreservesWinnersSharedRoot(t *testing.T
 	}
 }
 
-// TestInitializeLibraryFS_RejectsResurrectionOfRevokedAbsentLibrary covers the
-// second blocker: a NULL publication_state in a rejected CAS is ambiguous
-// between "genuine untouched pre-021 row" and "absent partition", and
-// Cassandra itself cannot distinguish them. A library whose canonical row was
-// already hard-deleted (row absent, durable revocation witness present) must
-// not be resurrected as ACTIVE by a stale initializer racing behind the
-// delete.
-func TestInitializeLibraryFS_RejectsResurrectionOfRevokedAbsentLibrary(t *testing.T) {
+// TestInitializeLibraryFS_RejectsGenuinelyAbsentLibraryRow proves the primary
+// (only) CAS can never resurrect a library_id with no canonical row:
+// `IF head_commit_id = null AND publication_state = ACTIVE` reads
+// publication_state as NULL against an absent partition, which never equals
+// 'ACTIVE', so the CAS is rejected and nothing is materialized. This holds
+// regardless of whether a durable revocation witness happens to exist for
+// that library_id -- InitializeLibraryFS does not consult the witness table
+// at all; only GC/repair's own retention logic does.
+func TestInitializeLibraryFS_RejectsGenuinelyAbsentLibraryRow(t *testing.T) {
 	db := restoreGuardDBForTest(t)
 	session := db.Session()
 	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
 
-	// Simulate the post-hard-delete state directly: canonical row absent,
-	// durable revocation witness present. Seeding this via
-	// dbpkg.RevokeLibraryPublication would not reproduce it: that helper's own
-	// legacy-NULL retry upserts a bare TERMINAL tombstone row for a library ID
-	// that does not otherwise exist, which is a different (already-covered)
-	// state -- see TestInitializeLibraryFS_RejectsTerminalPublicationAuthority.
-	if err := session.Query(`
-		INSERT INTO library_publication_revocations (org_id, library_id, revoked_at)
-		VALUES (?, ?, ?)`, orgID.String(), libraryID.String(), time.Now().UTC()).
-		Consistency(gocql.EachQuorum).Exec(); err != nil {
-		t.Fatalf("seed revocation witness for absent library: %v", err)
-	}
 	t.Cleanup(func() {
 		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ?`, libraryID.String()).Exec()
 		_ = session.Query(`DELETE FROM commits WHERE library_id = ?`, libraryID.String()).Exec()
-		_ = session.Query(`DELETE FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
 		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
 	})
 
-	if err := NewFSHelper(db).InitializeLibraryFS(orgID.String(), libraryID.String(), ownerID.String(), "initialize-resurrection-guard"); err == nil {
-		t.Fatal("initialization must not resurrect a revoked, hard-deleted library")
+	if err := NewFSHelper(db).InitializeLibraryFS(orgID.String(), libraryID.String(), ownerID.String(), "initialize-absent-row-guard"); err == nil {
+		t.Fatal("initialization must not materialize a library row that was never created")
 	}
 
 	var storedLibraryID string
 	err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String()).Scan(&storedLibraryID)
 	if !errors.Is(err, gocql.ErrNotFound) {
-		t.Fatalf("canonical library row must remain absent after a rejected resurrection attempt: err=%v row=%q", err, storedLibraryID)
-	}
-	if revoked, err := dbpkg.IsLibraryPublicationRevoked(session, orgID.String(), libraryID.String()); err != nil {
-		t.Fatalf("read revocation witness: %v", err)
-	} else if !revoked {
-		t.Fatal("revocation witness must remain after a rejected resurrection attempt")
-	}
-	var stagedCommitID string
-	commitErr := session.Query(`SELECT commit_id FROM commits WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedCommitID)
-	if !errors.Is(commitErr, gocql.ErrNotFound) {
-		t.Fatalf("rejected resurrection attempt left a staged commit: commitErr=%v commitID=%q", commitErr, stagedCommitID)
+		t.Fatalf("canonical library row must remain absent after a rejected initialization: err=%v row=%q", err, storedLibraryID)
 	}
 }
 
-// TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck
-// closes the TOCTOU gap in the resurrection guard: IsLibraryPublicationRevoked
-// and the legacy retry CAS are two separate round trips, not one atomic
-// operation, so a hard-delete that revokes and removes the canonical row
-// strictly between them would observe revoked=false yet still face an absent
-// row once the retry CAS runs -- the witness check alone cannot close that
-// window because it lives in a different table. InitializeLibraryFS reads the
-// library's admin projection row before it ever reaches this CAS, which makes
-// it impossible to black-box a library that vanishes mid-call without adding
-// a dedicated test seam to production code; this test instead drives the
-// exact sequence the retry performs -- a witness check that is genuinely
-// stale by the time the retry CAS below executes -- against the literal query
-// InitializeLibraryFS issues. Before the owner_id guard, this retry CAS would
-// apply against the absent partition and resurrect it.
-func TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck(t *testing.T) {
+// TestInitializeLibraryFS_RejectsNullPublicationState is the deliberate
+// inverse of what this codebase supported before the W2a pre-merge closure
+// removed legacy-NULL compatibility (docs/CHANGELOG.md "W2a pre-merge closure
+// round 3"): this is a clean-deploy codebase with no pre-existing dataset, so
+// there is no genuine row whose publication_state predates that column, and a
+// row observed with NULL publication_state must be rejected outright rather
+// than silently promoted to ACTIVE. Seeds a row the same way a hypothetical
+// legacy row would look (present, publication_state never set) purely to
+// prove InitializeLibraryFS refuses it -- not to claim this state is expected
+// to occur in practice.
+func TestInitializeLibraryFS_RejectsNullPublicationState(t *testing.T) {
 	db := restoreGuardDBForTest(t)
 	session := db.Session()
 	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
@@ -165,77 +139,9 @@ func TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck(t 
 	if err := session.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
-		orgID.String(), libraryID.String(), ownerID.String(), "initialize-toctou-guard",
+		orgID.String(), libraryID.String(), ownerID.String(), "initialize-null-publication-state",
 		now, now).Exec(); err != nil {
-		t.Fatalf("seed legacy (pre-021) library: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = session.Query(`DELETE FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
-		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
-	})
-
-	// The witness check runs while the row is still a genuine, present legacy
-	// row: it correctly observes not-revoked, exactly as InitializeLibraryFS's
-	// own check would at this point.
-	revoked, err := dbpkg.IsLibraryPublicationRevoked(session, orgID.String(), libraryID.String())
-	if err != nil {
-		t.Fatalf("check publication revocation: %v", err)
-	}
-	if revoked {
-		t.Fatal("witness must not be present before the simulated concurrent hard-delete")
-	}
-
-	// Simulate a concurrent hard-delete landing strictly after the witness
-	// check above returned false: revoke authority (writes the durable
-	// witness) and remove the canonical row, exactly as gc.HardDeleteLibrary
-	// does.
-	if err := dbpkg.RevokeLibraryPublication(session, orgID.String(), libraryID.String()); err != nil {
-		t.Fatalf("simulate concurrent revoke: %v", err)
-	}
-	if err := session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec(); err != nil {
-		t.Fatalf("simulate concurrent hard-delete: %v", err)
-	}
-
-	// Now run the exact retry CAS InitializeLibraryFS issues once its (stale)
-	// witness check has already returned false.
-	casState := map[string]interface{}{}
-	applied, err := session.Query(`
-		UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
-		IF owner_id != null AND head_commit_id = null AND publication_state = null
-	`, "deadbeef", dbpkg.LibraryPublicationStateActive, orgID.String(), libraryID.String()).
-		SerialConsistency(gocql.Serial).MapScanCAS(casState)
-	if err != nil {
-		t.Fatalf("retry CAS: %v", err)
-	}
-	if applied {
-		t.Fatal("retry CAS must not resurrect a library removed by a concurrent hard-delete that landed after the witness check")
-	}
-
-	var storedLibraryID string
-	err = session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`,
-		orgID.String(), libraryID.String()).Scan(&storedLibraryID)
-	if !errors.Is(err, gocql.ErrNotFound) {
-		t.Fatalf("canonical library row must remain absent: err=%v row=%q", err, storedLibraryID)
-	}
-}
-
-// TestInitializeLibraryFS_AcceptsGenuineLegacyNullRow is the control case for
-// the previous test: a library row that genuinely predates migration 021
-// (publication_state IS NULL, row present, no revocation witness) must still
-// be initializable through the legacy compatibility retry. Closing the
-// resurrection hole must not also break real legacy compatibility.
-func TestInitializeLibraryFS_AcceptsGenuineLegacyNullRow(t *testing.T) {
-	db := restoreGuardDBForTest(t)
-	session := db.Session()
-	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
-	now := time.Now().UTC().Truncate(time.Millisecond)
-
-	if err := session.Query(`
-		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		orgID.String(), libraryID.String(), ownerID.String(), "initialize-legacy-null",
-		now, now).Exec(); err != nil {
-		t.Fatalf("seed legacy (pre-021) library: %v", err)
+		t.Fatalf("seed library with unset publication_state: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ?`, libraryID.String()).Exec()
@@ -247,25 +153,22 @@ func TestInitializeLibraryFS_AcceptsGenuineLegacyNullRow(t *testing.T) {
 	var publicationState *string
 	if err := session.Query(`SELECT publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String()).Scan(&publicationState); err != nil {
-		t.Fatalf("read seeded legacy library: %v", err)
+		t.Fatalf("read seeded library: %v", err)
 	}
 	if publicationState != nil {
 		t.Fatalf("seeded library publication_state = %q, want NULL", *publicationState)
 	}
 
-	if err := NewFSHelper(db).InitializeLibraryFS(orgID.String(), libraryID.String(), ownerID.String(), "initialize-legacy-null"); err != nil {
-		t.Fatalf("legacy NULL row must still initialize via the compatibility retry: %v", err)
+	if err := NewFSHelper(db).InitializeLibraryFS(orgID.String(), libraryID.String(), ownerID.String(), "initialize-null-publication-state"); err == nil {
+		t.Fatal("initialization must reject a library row with NULL publication_state, not promote it to ACTIVE")
 	}
 
-	var headCommitID, gotState string
-	if err := session.Query(`SELECT head_commit_id, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
-		orgID.String(), libraryID.String()).Scan(&headCommitID, &gotState); err != nil {
-		t.Fatalf("read initialized legacy library: %v", err)
+	var headCommitID string
+	if err := session.Query(`SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&headCommitID); err != nil {
+		t.Fatalf("read library after rejected initialization: %v", err)
 	}
-	if headCommitID == "" {
-		t.Fatal("head_commit_id must be set after successful legacy initialization")
-	}
-	if gotState != dbpkg.LibraryPublicationStateActive {
-		t.Fatalf("publication_state = %q, want ACTIVE", gotState)
+	if headCommitID != "" {
+		t.Fatalf("head_commit_id = %q, want empty after a rejected initialization", headCommitID)
 	}
 }

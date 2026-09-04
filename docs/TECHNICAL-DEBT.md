@@ -1633,15 +1633,30 @@ Either:
 - Drop the parameter and rely on the docstring contract.
 - Or rename to make the gate explicit (`UpdateLibraryHeadFromSnapshotIfExpected(snapshot, repoID, commitID, expectedHead)`) and force callers to pick a value.
 
-### 19.e. Initial-Commit Paths Bypass CAS Without an Inline Comment
+### 19.e. RESOLVED: Initial-Commit Paths Bypass CAS Without an Inline Comment
 
-Two paths perform unconditional `UPDATE libraries SET head_commit_id = ...`:
-- `internal/api/sync.go` — initial commit during sync repo creation.
-- `internal/api/v2/fs_helpers.go` — `InitializeLibraryFS` for v2 library bootstrap.
-
-Both are correct (the library has no concurrent writers at first-touch), but they look identical to the legacy non-CAS behavior the rest of the file has been migrated away from. A future contributor reviewing for "missing CAS" could "fix" these and break the bootstrap throughput.
-
-Add a single-line comment at both sites explaining `bootstrap-only path; no concurrent writers possible`.
+> Historical note: this section described `createInitialCommit`
+> (`internal/api/sync.go`) and `InitializeLibraryFS`
+> (`internal/api/v2/fs_helpers.go`) as performing an *unconditional*
+> `UPDATE libraries SET head_commit_id = ...`, correct only because "the
+> library has no concurrent writers at first-touch," and asked for a
+> one-line comment to stop a future contributor from "fixing" the missing
+> CAS.
+>
+> That premise no longer holds. W2a (`docs/CHANGELOG.md` "W2a: terminal
+> publication authority" and its follow-ups) made both paths participate in
+> the global `ACTIVE`/`TERMINAL` SERIAL publication-authority domain: both
+> now perform a single conditional LWT (`IF head_commit_id = null AND
+> publication_state = ACTIVE`), explicitly support concurrent initializers
+> of the same library (the loser's exact-key cleanup and the shared
+> content-addressed root are both handled), and are pinned by a source
+> contract
+> (`TestNoLibrariesHeadCommitIDWriterBypassesPublicationAuthority` in both
+> packages) that fails the build if either ever regresses to an
+> unconditional write. Initial HEAD publication now participates in the
+> global ACTIVE/TERMINAL SERIAL publication-authority domain like every
+> other HEAD writer -- there is no remaining "no concurrent writers" bypass
+> to comment.
 
 ### 19.f. Crash Window Between CAS Commit and `syncLibraryHeadDerivedState`
 

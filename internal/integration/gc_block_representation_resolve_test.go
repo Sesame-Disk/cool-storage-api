@@ -308,12 +308,13 @@ func TestGC_DeletedLibraryRepresentation_CascadeLifecycle_RealCassandra(t *testi
 		INSERT INTO libraries (
 			org_id, library_id, owner_id, name, description, encrypted, enc_version,
 			root_commit_id, head_commit_id, storage_class, size_bytes, file_count,
-			deleted_at, deleted_by, created_at, updated_at, block_representation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			deleted_at, deleted_by, created_at, updated_at, block_representation_id,
+			publication_state
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		orgID.String(), libraryID.String(), ownerID.String(), "gc-cascade-test", "",
 		true, 2, commitID, commitID, "hot", int64(0), int64(1), deletedAt,
-		ownerID.String(), now, now, representationID,
+		ownerID.String(), now, now, representationID, dbpkg.LibraryPublicationStateActive,
 	).Exec(); err != nil {
 		t.Fatalf("seed libraries: %v", err)
 	}
