@@ -8,6 +8,96 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a follow-up: shared-root loser cleanup and stale-initializer resurrection
+
+A four-report consolidated audit of the W2a PR (below) converged on one
+blocker with unanimous consensus plus two related initializer-parity gaps,
+all confined to the two initial-HEAD-publish call sites
+(`FSHelper.InitializeLibraryFS` in `internal/api/v2/fs_helpers.go`,
+`SyncHandler.createInitialCommit` in `internal/api/sync.go`); none in the
+`ACTIVE`/`TERMINAL` authority core the same audit re-confirmed closed.
+
+1. **Shared-root loser cleanup (P1, 4/4 auditors).** The empty-root
+   `fs_objects` row is content-addressed (SHA-1 of `"1\n[]"`), so every
+   initializer of the *same* library computes the identical `fs_id`. The
+   rejected-CAS cleanup (`deleteInitialLibraryFSArtifacts`,
+   `deleteInitialCommitArtifacts`) deleted that row along with the loser's own
+   commit; a second initializer that lost the HEAD CAS race could therefore
+   delete the exact root a first, already-published commit depends on. Fixed
+   by narrowing both cleanup helpers to an exact-key delete of the loser's
+   commit only -- the root is never touched. A true loser's orphaned root is
+   inert: it is reclaimed with the rest of the library's `fs_objects`
+   partition on hard-delete, or simply reused verbatim by whichever
+   initializer eventually wins. New integration coverage
+   (`TestCreateInitialCommit_LoserCleanupPreservesWinnersSharedRoot`,
+   `TestInitializeLibraryFS_LoserCleanupPreservesWinnersSharedRoot`)
+   deterministically reproduces the race with two sequential calls against the
+   same library -- the second call's CAS is guaranteed to lose once the first
+   has published, so no goroutine timing is needed -- and asserts the winner's
+   commit, root, and HEAD all survive while exactly the loser's commit is gone.
+2. **Stale-initializer resurrection of a hard-deleted library (P1, 2/4
+   auditors).** Both call sites retry their HEAD CAS once more on a rejected
+   first attempt, treating an observed NULL `publication_state` as a
+   pre-migration-021 legacy row and materializing `ACTIVE`. That NULL is
+   ambiguous: Cassandra's LWT returns the identical NULL for a genuine
+   untouched legacy row and for a partition that does not exist at all -- the
+   exact shape of a library whose canonical row a hard-delete already removed.
+   Unguarded, a stale initializer racing behind a hard-delete could resurrect
+   a terminally revoked library as `ACTIVE`, contradicting the durable
+   revocation witness migration 021 introduced specifically to make that
+   impossible. Fixed by gating the legacy retry on
+   `db.IsLibraryPublicationRevoked` -- the same durable witness
+   `publishedBlockReferenceRepairTerminalFn` already consults for the
+   analogous repair-path ambiguity: a NULL observed while the witness is
+   present is treated as revoked, not legacy, and the retry is skipped, so the
+   caller falls through to its existing rejection/cleanup path instead of
+   granting authority. New integration coverage
+   (`TestCreateInitialCommit_RejectsResurrectionOfRevokedAbsentLibrary`,
+   `TestInitializeLibraryFS_RejectsResurrectionOfRevokedAbsentLibrary`) seeds
+   exactly that state -- witness present, canonical row genuinely absent, not
+   merely `TERMINAL` -- and asserts the row stays absent, the witness survives,
+   and no commit is left staged. A companion control test per call site
+   (`*_AcceptsGenuineLegacyNullRow`) proves closing this hole did not also
+   break real legacy compatibility: a library row that predates migration 021
+   (present, `publication_state IS NULL`, no witness) still initializes.
+3. **`createInitialCommit` had no legacy-NULL retry at all (P1, 1/4
+   auditors)**, unlike `InitializeLibraryFS` -- an inconsistency migration
+   021's own compatibility contract did not anticipate, and which the new
+   control test above would have caught for that call site alone. Fixed by
+   giving it the same witness-gated retry as `InitializeLibraryFS`, sharing the
+   classification logic via a new exported `db.LibraryPublicationCASStateIsLegacyNull`
+   (`internal/db/library_publication.go`) instead of duplicating the
+   ambiguous-NULL check in both packages.
+
+The durable witness table's partition key was also widened, in migration 021
+itself (unmerged and unshipped, so edited in place rather than superseded by a
+new migration): `library_publication_revocations` moved from
+`PRIMARY KEY ((org_id), library_id)` to `PRIMARY KEY ((org_id, library_id))`
+(P2, 4/4 auditors). The original key put every revoked library an org ever
+hard-deletes in one Cassandra partition, growing without bound for the life of
+the org; the new key gives each revoked library its own small partition. Every
+existing read/write already filtered on both columns, so the change is a
+schema-only fix with no query-shape changes. Not itself a correctness fix for
+running deployments -- there are none yet on this migration.
+
+**Deployment note added, not a code fix:** a writer that predates migration
+021 CASes HEAD on `IF head_commit_id = ?` alone and does not know about
+`publication_state`, so it can still advance HEAD after a `TERMINAL`
+hard-delete has committed. This release must roll out atomically. SesameFS is
+pre-production with no existing writer fleet to stage a mixed-version rollout
+against, so this is a forward-looking rollout contract, not a gap this PR
+needed to close in code.
+
+Not changed: `buildCommitID`/`createInitialCommit`'s use of
+`time.Now().UnixNano()` rather than a UUID/nonce for commit-attempt identity.
+One auditor flagged it as hardening; with the shared-root fix above, the loser
+no longer deletes anything the winner depends on, so a same-nanosecond
+collision (already astronomically unlikely across two independent processes)
+would at worst cause one initializer's definite-rejection cleanup to target
+the wrong of two identical-content commit rows -- never data loss.
+
+---
+
 ## 2026-09-03 - W2a: terminal publication authority and deterministic repair evidence
 
 The final audit findings are addressed without using `SERIAL ErrNotFound` as a
@@ -41,7 +131,8 @@ canonical ACTIVE transition when the durable trash marker still exists but the
 derived batch was incomplete, and skips the non-idempotent synchronous counter
 increment on that retry. Creation rollback terminalizes authority before
 removing canonical rows and leaves commits/fs_objects for fenced orphan cleanup;
-only a definite initial-CAS rejection deletes the exact staged keys. A SERIAL
+only a definite initial-CAS rejection deletes the exact staged commit key (see
+"W2a follow-up" below for why the root key must not also be deleted). A SERIAL
 confirmation of an ambiguous HEAD CAS also refuses to call a TERMINAL row a
 successful publication.
 

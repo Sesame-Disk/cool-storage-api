@@ -359,11 +359,19 @@ func TestInitializeLibraryFS_RejectsTerminalPublicationAuthority(t *testing.T) {
 	if headCommitID != "" || publicationState != dbpkg.LibraryPublicationStateTerminal {
 		t.Fatalf("terminal library changed after rejected initialization: head=%q publication_state=%q", headCommitID, publicationState)
 	}
-	var stagedFSID, stagedCommitID string
-	fsErr := session.Query(`SELECT fs_id FROM fs_objects WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedFSID)
+	// The commit must be cleaned up, but the content-addressed empty-root
+	// fs_object must NOT be: it is identical for every initializer of this
+	// library, so a concurrent winner could reference the exact row a rejected
+	// cleanup would otherwise delete out from under it. See
+	// deleteInitialLibraryFSArtifacts.
+	var stagedCommitID string
 	commitErr := session.Query(`SELECT commit_id FROM commits WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedCommitID)
-	if !errors.Is(fsErr, gocql.ErrNotFound) || !errors.Is(commitErr, gocql.ErrNotFound) {
-		t.Fatalf("rejected initialization left staged artifacts: fsErr=%v fsID=%q commitErr=%v commitID=%q", fsErr, stagedFSID, commitErr, stagedCommitID)
+	if !errors.Is(commitErr, gocql.ErrNotFound) {
+		t.Fatalf("rejected initialization left a staged commit: commitErr=%v commitID=%q", commitErr, stagedCommitID)
+	}
+	var stagedFSID string
+	if err := session.Query(`SELECT fs_id FROM fs_objects WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedFSID); err != nil {
+		t.Fatalf("rejected initialization must preserve the shared content-addressed root fs_object: %v", err)
 	}
 }
 

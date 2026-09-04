@@ -687,7 +687,7 @@ var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, 
 	// Rows created before migration 021 have NULL publication_state. Promote
 	// that legacy value to ACTIVE in the same guarded Paxos domain; this path is
 	// only taken for persisted pre-migration rows and never for normal writes.
-	if !libraryHeadCASStateIsLegacyNull(casState) {
+	if !db.LibraryPublicationCASStateIsLegacyNull(casState) {
 		return applied, casState, nil
 	}
 	casState = map[string]interface{}{}
@@ -698,15 +698,6 @@ var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, 
 	`, commitID, totalSize, fileCount, now, db.LibraryPublicationStateActive, orgID, repoID, expectedHead).
 		SerialConsistency(gocql.Serial).MapScanCAS(casState)
 	return applied, casState, err
-}
-
-func libraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
-	state, ok := casState["publication_state"]
-	if !ok || state == nil {
-		return true
-	}
-	value, ok := state.(string)
-	return ok && value == ""
 }
 
 // libraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS observed
@@ -987,20 +978,33 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 	if err != nil {
 		return fmt.Errorf("failed to initialize library fs state: %w", err)
 	}
-	if !applied && libraryHeadCASStateIsLegacyNull(casState) {
-		casState = map[string]interface{}{}
-		applied, err = h.db.Session().Query(`
-			UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
-			IF head_commit_id = null AND publication_state = null
-		`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID).
-			SerialConsistency(gocql.Serial).MapScanCAS(casState)
-		if err != nil {
-			return fmt.Errorf("failed to initialize legacy library fs state: %w", err)
+	if !applied && db.LibraryPublicationCASStateIsLegacyNull(casState) {
+		// A NULL publication_state here is ambiguous: Cassandra returns the same
+		// NULL for a genuine untouched pre-021 row and for a partition that does
+		// not exist at all -- which is exactly what a hard-deleted library looks
+		// like once its canonical row is physically removed. Only the durable
+		// revocation witness distinguishes them; without this check, a stale
+		// initializer racing a hard-delete could resurrect a terminally revoked
+		// library as ACTIVE.
+		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
+		if revokeErr != nil {
+			return fmt.Errorf("failed to initialize library fs state: check publication revocation: %w", revokeErr)
+		}
+		if !revoked {
+			casState = map[string]interface{}{}
+			applied, err = h.db.Session().Query(`
+				UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
+				IF head_commit_id = null AND publication_state = null
+			`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID).
+				SerialConsistency(gocql.Serial).MapScanCAS(casState)
+			if err != nil {
+				return fmt.Errorf("failed to initialize legacy library fs state: %w", err)
+			}
 		}
 	}
 	if !applied {
 		initErr := fmt.Errorf("failed to initialize library fs state: publication authority is not ACTIVE or the library is already initialized")
-		if cleanupErr := deleteInitialLibraryFSArtifacts(h.db.Session(), repoID, rootFSID, headCommitID); cleanupErr != nil {
+		if cleanupErr := deleteInitialLibraryFSArtifacts(h.db.Session(), repoID, headCommitID); cleanupErr != nil {
 			return errors.Join(initErr, fmt.Errorf("cleanup rejected initial library fs artifacts: %w", cleanupErr))
 		}
 		return initErr

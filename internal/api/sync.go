@@ -1110,9 +1110,36 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 	if err != nil {
 		return "", fmt.Errorf("failed to update library head: %w", err)
 	}
+	if !applied && db.LibraryPublicationCASStateIsLegacyNull(casState) {
+		// Rows created before migration 021 have NULL publication_state; promote
+		// that legacy value to ACTIVE in the same guarded Paxos domain, mirroring
+		// v2's FSHelper.InitializeLibraryFS. A NULL here is ambiguous -- Cassandra
+		// returns the same NULL for a genuine untouched pre-021 row and for a
+		// partition that does not exist at all, which is exactly what a
+		// hard-deleted library looks like once its row is physically removed --
+		// so the durable revocation witness must be consulted first. Without it,
+		// a stale initializer racing a hard-delete could resurrect a terminally
+		// revoked library as ACTIVE.
+		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
+		if revokeErr != nil {
+			return "", fmt.Errorf("failed to update library head: check publication revocation: %w", revokeErr)
+		}
+		if !revoked {
+			casState = map[string]interface{}{}
+			applied, err = h.db.Session().Query(`
+				UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
+				WHERE org_id = ? AND library_id = ?
+				IF head_commit_id = null AND publication_state = null
+			`, commitID, commitID, int64(0), int64(0), now, db.LibraryPublicationStateActive, orgID, repoID).
+				SerialConsistency(gocql.Serial).MapScanCAS(casState)
+			if err != nil {
+				return "", fmt.Errorf("failed to update legacy library head: %w", err)
+			}
+		}
+	}
 	if !applied {
 		initErr := fmt.Errorf("failed to update library head: publication authority is not ACTIVE or the library is already initialized")
-		if cleanupErr := deleteInitialCommitArtifacts(h.db.Session(), repoID, rootID, commitID); cleanupErr != nil {
+		if cleanupErr := deleteInitialCommitArtifacts(h.db.Session(), repoID, commitID); cleanupErr != nil {
 			return "", errors.Join(initErr, fmt.Errorf("cleanup rejected initial commit artifacts: %w", cleanupErr))
 		}
 		return "", initErr
@@ -1130,14 +1157,21 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 	return commitID, nil
 }
 
-// deleteInitialCommitArtifacts removes only the root and commit staged by one
+// deleteInitialCommitArtifacts removes only the commit staged by one
 // initializer after a definite CAS rejection. Ambiguous CAS outcomes do not
 // call this helper because the commit may already have become reachable.
-func deleteInitialCommitArtifacts(session *gocql.Session, libraryID, rootFSID, commitID string) error {
-	batch := session.Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, rootFSID)
-	batch.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID)
-	return batch.Exec()
+//
+// It must NOT delete the root fs_object. The empty-root content ("1\n[]") is
+// content-addressed, so every concurrent initializer of this same library
+// computes the identical fs_id -- a winner's committed tree can reference the
+// exact row this loser staged. Deleting it here would corrupt the winner's
+// tree even though the winner's own commit and HEAD CAS already succeeded.
+// The orphaned root left behind when there truly is no winner is harmless: it
+// is reclaimed with the rest of this library's fs_objects partition if the
+// library is ever hard-deleted, and otherwise is simply reused verbatim by
+// whichever initializer eventually wins.
+func deleteInitialCommitArtifacts(session *gocql.Session, libraryID, commitID string) error {
+	return session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID).Exec()
 }
 
 // sha1Hex returns the SHA1 hash of a string as hex (40 chars, Seafile compatible)

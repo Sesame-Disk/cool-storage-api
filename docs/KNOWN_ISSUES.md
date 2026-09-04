@@ -2257,9 +2257,56 @@ whose canonical ACTIVE transition already committed can retry its marker and
 projection finalization without reapplying the non-idempotent counter increment;
 creation rollback revokes publication before deleting canonical rows and never
 bulk-deletes staged or published commits/fs_objects; and a definite initial-head
-CAS rejection removes only that initializer's exact root/commit keys. Ambiguous
+CAS rejection removes only that initializer's exact commit key. Ambiguous
 initial writes retain their artifacts for repair. An ambiguous HEAD confirmation
 that observes `TERMINAL` is not reported as a successful publication.
+
+A four-report consolidated audit of the W2a PR found three further gaps, all in
+the two initial-HEAD-publish call sites (`FSHelper.InitializeLibraryFS`,
+`SyncHandler.createInitialCommit`), none in the `ACTIVE`/`TERMINAL` authority
+core itself:
+
+- **Shared-root loser cleanup.** The empty-root `fs_objects` row is
+  content-addressed (SHA-1 of `"1\n[]"`), so every initializer of the *same*
+  library computes the identical `fs_id`. The rejected-CAS cleanup used to
+  delete that row along with the loser's own commit; a second initializer that
+  lost the race could therefore delete the exact root a first, already-published
+  commit depends on. Fixed by narrowing cleanup to the loser's commit key only
+  (the paragraph above) -- the orphaned root a true loser leaves behind is inert
+  and reclaimed with the rest of the library's `fs_objects` partition on
+  hard-delete, or simply reused verbatim by whichever initializer wins.
+- **Stale-initializer resurrection of a hard-deleted library.** Both call
+  sites retry their HEAD CAS once more, treating an observed NULL
+  `publication_state` as a pre-021 legacy row and materializing `ACTIVE`. That
+  NULL is ambiguous: Cassandra's LWT returns the same NULL for a genuine
+  untouched legacy row and for a partition that does not exist at all -- the
+  exact shape of a library whose canonical row hard-delete already removed.
+  Without an extra check, a stale initializer racing behind a hard-delete could
+  resurrect a terminally revoked library as `ACTIVE`. Fixed by gating the
+  legacy retry on `db.IsLibraryPublicationRevoked` (the same durable witness
+  repair already consults): a NULL observed while the witness is present is
+  treated as revoked, not legacy, and the retry is skipped.
+- **`createInitialCommit` had no legacy-NULL retry at all**, unlike
+  `InitializeLibraryFS` -- an inconsistency migration 021's own compatibility
+  contract did not anticipate. Fixed by giving it the same witness-gated retry,
+  so a genuine pre-021 row is initializable through either call site and a
+  hard-deleted one is resurrectable through neither.
+
+The durable witness table's partition key was also widened from `((org_id),
+library_id)` to `((org_id, library_id))` before this migration shipped anywhere:
+the original key put every revoked library in an org in one Cassandra partition,
+growing without bound for the life of the org, where the new key gives each
+revoked library its own small partition. This is not itself a load-bearing
+authority fix.
+
+**Deployment note (mixed-version rollout).** A writer that predates migration
+021 CASes HEAD on `IF head_commit_id = ?` alone; it does not know about
+`publication_state` and can still advance HEAD after a `TERMINAL` hard-delete
+has committed. This release must roll out atomically -- do not run pre-W2a and
+W2a binaries concurrently against the same `libraries` rows once hard-delete
+terminal authority is in use. SesameFS is pre-production with no existing
+writer fleet to stage against, so this is a rollout contract for the future,
+not a currently exercised gap.
 
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):

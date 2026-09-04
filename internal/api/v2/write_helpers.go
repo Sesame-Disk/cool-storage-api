@@ -1107,15 +1107,22 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	return nil
 }
 
-// deleteInitialLibraryFSArtifacts removes only the objects created by one
+// deleteInitialLibraryFSArtifacts removes only the commit staged by one
 // initializer after a definite CAS rejection. It is intentionally exact-key
 // cleanup: an ambiguous CAS outcome must retain all artifacts until the normal
 // orphan/repair machinery can establish their reachability.
-func deleteInitialLibraryFSArtifacts(session *gocql.Session, libraryID, rootFSID, commitID string) error {
-	batch := session.Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, rootFSID)
-	batch.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID)
-	return batch.Exec()
+//
+// It must NOT delete the root fs_object. The empty-root content ("1\n[]") is
+// content-addressed, so every concurrent initializer of this same library
+// computes the identical fs_id -- a winner's committed tree can reference the
+// exact row this loser staged. Deleting it here would corrupt the winner's
+// tree even though the winner's own commit and HEAD CAS already succeeded.
+// The orphaned root left behind when there truly is no winner is harmless: it
+// is reclaimed with the rest of this library's fs_objects partition if the
+// library is ever hard-deleted, and otherwise is simply reused verbatim by
+// whichever initializer eventually wins.
+func deleteInitialLibraryFSArtifacts(session *gocql.Session, libraryID, commitID string) error {
+	return session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID).Exec()
 }
 
 // orgQuotas holds an organization's quota limits.

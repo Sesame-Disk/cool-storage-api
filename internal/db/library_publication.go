@@ -17,6 +17,25 @@ const (
 // visible but its authority to publish HEAD has been permanently revoked.
 var ErrLibraryPublicationTerminal = errors.New("library publication authority is terminal")
 
+// LibraryPublicationCASStateIsLegacyNull reports whether a rejected
+// publication_state-guarded LWT observed a NULL value there. Cassandra
+// returns that same NULL both for a genuine pre-migration-021 row that has
+// never been touched and for a partition that does not exist at all (the
+// columns in an IF clause read as NULL against an absent row too), so this
+// function alone cannot tell "untouched legacy row" from "hard-deleted
+// library". A caller that would grant ACTIVE authority on this signal MUST
+// first consult IsLibraryPublicationRevoked: if the durable witness is
+// present, the row is absent because it was terminally revoked, not because
+// it predates migration 021, and retrying as legacy would resurrect it.
+func LibraryPublicationCASStateIsLegacyNull(casState map[string]interface{}) bool {
+	state, ok := casState["publication_state"]
+	if !ok || state == nil {
+		return true
+	}
+	value, ok := state.(string)
+	return ok && value == ""
+}
+
 func readPublicationStateFromCAS(state map[string]interface{}) (value string, legacyNull bool) {
 	raw, ok := state["publication_state"]
 	if !ok || raw == nil {
