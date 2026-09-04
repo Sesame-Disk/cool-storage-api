@@ -1077,9 +1077,21 @@ W1/BorrowedFS-scoped). Separately, new test-only seams on `UpdateLibraryHead`
 (`SetLibraryHeadAmbiguousCASForTest` / `SetLibraryHeadConfirmVisibleForTest`,
 zero production behavior change) drive the ambiguous-HEAD-CAS branch inside a
 real `CreateFileFromBlocks` call and confirm the PRE-EXISTING
-`published_block_reference_repairs` repair/sweep mechanism already converges
-both directions for this funnel
-(`internal/integration/createfilefromblocks_ambiguous_head_test.go`). This is
+`published_block_reference_repairs` repair/sweep mechanism resolves both
+outcomes for this funnel
+(`internal/integration/createfilefromblocks_ambiguous_head_test.go`).
+**Update (2026-09-04, post-freeze):** "converges both directions" described
+the sweep's shape at this doc's `17f487c5d` snapshot -- a binary
+reachable/unreachable classification. Later commits on this branch
+(`71ecfcefc`, `8c69a2347`, `0832caeb2`) replaced that with three verdicts:
+reachable → promote; confirmed terminal via the durable
+`library_publication_revocations` witness → clean up; everything else
+(live-unreachable, soft-deleted, unknown, or a read failure) → retain `pub:`
+and the repair row indefinitely, not clean up. "Converges" is no longer
+accurate for that third outcome -- it deliberately does not converge to a
+terminal action until the library is confirmed reachable again or genuinely,
+durably terminal. See `docs/CHANGELOG.md` "W2a" for the authoritative current
+model. This is
 a **slice** of W2, not its closure: every other `CONDITIONAL`/`UNKNOWN` funnel
 below remains open, `GC_ENABLED=false`, X1 remains OPEN, and the
 `resolveLibraryHeadUpdateError` confirmed-lost/`ErrLibraryHeadConflict`

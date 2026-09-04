@@ -8,6 +8,62 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a pre-merge closure: source guard, owner_id invariant, doc cleanup
+
+A third review (after confirming P0=0/P1=0 on round 2 below, including an
+independent code-level re-verification of soft-delete/restore/hard-delete
+semantics) found no further runtime blocker, but flagged three P2 closure
+items before merge. All three are hardening/documentation, not new bug fixes.
+
+1. **Source guard freezing the HEAD-writer authority invariant.** Nothing
+   previously stopped a *future* writer from adding a new
+   `UPDATE libraries SET head_commit_id = ...` call site that forgets the
+   `publication_state` gate or `SerialConsistency(gocql.Serial)` -- the
+   existing `r3_*`/`R3 SOURCE CONTRACT` AST tests in this codebase all pin
+   specific, already-known function names, none scan for an arbitrary new
+   one. Added `TestNoLibrariesHeadCommitIDWriterBypassesPublicationAuthority`
+   to both `internal/api` and `internal/api/v2`: it parses every non-test
+   `.go` file in the package, finds every statement whose CQL literal is
+   `UPDATE libraries SET ...` touching `head_commit_id`, and fails the build
+   unless that same statement's text contains `publication_state` and
+   `.SerialConsistency(gocql.Serial)`. Also pins the exact writer count (4 per
+   package today) so a new writer -- compliant or not -- is a visible,
+   must-review diff instead of a silent pass-through. Verified the detector
+   fires by temporarily breaking the substring match during development (a
+   `go/printer`-reformatted call chain moves the leading `.` of a chained
+   method onto the end of the previous line, which the first draft of this
+   check did not account for) before landing the corrected version.
+2. **`owner_id` existence-sentinel invariant, verified and documented.** The
+   round-2 fix relies on `libraries.owner_id` reading back NULL if and only if
+   the partition is absent. Cassandra cannot declare a column `NOT NULL`, so
+   this is a code-level invariant, not a schema-enforced one. Audited every
+   production writer of `libraries.owner_id`: all 6 `INSERT INTO libraries`
+   call sites and all 3 ownership-transfer call sites source it from a
+   validated, already-resolved user ID (a lookup failure returns 404 before
+   ever reaching the write); none can bind an empty/null value without a hard
+   Cassandra bind error first. SesameFS is pre-production with no legacy
+   dataset to preserve (see `feedback_no_legacy_data_compat` policy), and the
+   dev keyspace was confirmed to hold zero `libraries` rows at audit time --
+   there is no existing data this invariant needs to be reconciled against.
+   `db.LibraryPublicationCASStateIsLegacyNull`'s doc comment already states
+   this invariant; no code change needed beyond the audit itself.
+3. **Stale doc language corrected.** `docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`
+   (frozen 2026-09-02, before this branch's later commits) said the repair
+   sweep "converges both directions" for the SessionUpload funnel -- true of
+   its binary reachable/unreachable shape at that snapshot, no longer true
+   after `71ecfcefc`/`8c69a2347`/`0832caeb2` replaced it with three verdicts,
+   one of which (live-unreachable) deliberately retains state indefinitely
+   instead of converging. Added a dated update note pointing at the current
+   model instead of rewriting the frozen snapshot. The PR body had the
+   identical imprecision in its own words, independently introduced while
+   summarizing round 1 -- corrected there too.
+
+No production code paths changed in this entry; `internal/api/head_commit_id_authority_guard_test.go`
+and `internal/api/v2/head_commit_id_authority_guard_test.go` are new test-only
+files.
+
+---
+
 ## 2026-09-04 - W2a follow-up round 2: retry CAS is now the atomic existence check, commit id is now nonce-based
 
 A second review of the round-1 fix below found the round-1 resurrection guard
