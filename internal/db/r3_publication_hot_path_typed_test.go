@@ -420,31 +420,14 @@ func TestR3PublicationHotPathTypedReceiversAndCQLBudget(t *testing.T) {
 		{pkg: module + "/internal/db", name: "AddPublishAttemptReferences"}:     2,
 		{pkg: module + "/internal/db", name: "StagePublishAttemptReferences"}:   3,
 		{pkg: module + "/internal/db", name: "PromotePublishAttemptReferences"}: 1,
-		// 17 -> 18 -> 17 (W2 final audit, 2026-09-02/03): stagePendingPublishedFiles's
-		// createFileFSObjectRow error path reaches cleanupPendingPublishedFileOwnerAttempt
-		// -> publishedBlockReferenceRepairCommitReachableFn ->
-		// publishedBlockReferenceRepairHeadCommitFn, which calls
-		// FSHelper.getCanonicalHeadCommitSerial. It first went 17->18 when
-		// that function was added with 2 dedicated queries (a libraries_by_id
-		// org lookup, then a SERIAL read of libraries) in place of the shared
-		// GetHeadCommitID/resolveLiveLibraryStateByIDFn chain (already visited
-		// via other reachable paths, so it contributed no marginal count).
-		// A follow-up audit found the libraries_by_id hop itself was a
-		// liability -- a library's hard-delete cascade
-		// (library_delete_helpers.go) deletes that row in the same batch as
-		// libraries, so resolving it here made a permanently, legitimately
-		// hard-deleted library's leftover repair row retry forever instead of
-		// converging -- and every caller already has orgID durably
-		// (publishedBlockReferenceRepair.OrgID / pendingPublishedFile.cleanupOrgID),
-		// so getCanonicalHeadCommitSerial now takes it directly and only
-		// issues the single SERIAL query, landing back at 17. Both changes
-		// are deliberate: this reachability check drives an IRREVERSIBLE
-		// cleanup decision, and a plain LOCAL_QUORUM read of HEAD (or of an
-		// org-resolution mapping used only to get to it) can be stale across
-		// DCs -- see getCanonicalHeadCommitSerial's doc comment. Pinning the
-		// whole shared GetHeadCommitID helper to SERIAL instead would have
-		// forced every other caller onto SERIAL too.
-		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   17,
+		// 17 -> 18 (W2 terminal publication authority): stagePendingPublishedFiles's
+		// cleanup path now checks the durable publication-revocation witness when
+		// the canonical libraries row is absent. That additional reachable CQL
+		// callsite is a missing-library witness lookup, not a per-block authority
+		// read and not the legacy-NULL HEAD-CAS fallback. Migrated live rows take
+		// the guarded ACTIVE CAS; the witness lookup is only on the missing-row
+		// repair branch.
+		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   18,
 		{pkg: module + "/internal/api/v2", name: "promotePendingPublishedFiles"}: 5,
 		{pkg: module + "/internal/api", name: "stageSyncCommitBlockDelta"}:       8,
 		{pkg: module + "/internal/api", name: "finalizeSyncCommitBlockDelta"}:    5,

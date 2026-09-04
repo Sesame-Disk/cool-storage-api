@@ -366,6 +366,11 @@ func TestLibraryProjectionRegression_GCHardDeleteCleansCanonicalTrashProjectionW
 		return adminTrashContainsRepo(t, superadminClient, repoID, defaultAdminEmail)
 	})
 
+	// The canonical row is removed below to model a crash/retry boundary. Seed
+	// the durable terminal witness first; row absence alone is not authority.
+	if err := dbpkg.RevokeLibraryPublication(session, defaultOrgID, repoID); err != nil {
+		t.Fatalf("failed to persist terminal publication witness: %v", err)
+	}
 	removeLibraryBaseRowsForFallbackTest(t, session, repoID)
 
 	repoUUID, err := uuid.Parse(repoID)

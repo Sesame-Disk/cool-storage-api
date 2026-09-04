@@ -1085,9 +1085,9 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 		return "", fmt.Errorf("failed to create root fs object: %w", err)
 	}
 
-	// Create initial commit
-	// Commit ID is a hash of the content - use deterministic ID for initial (40 chars like SHA-1)
-	commitID := sha1Hex(fmt.Sprintf("%s-%s-%d", repoID, rootID, now.Unix()))
+	// Create initial commit. Include nanosecond time so concurrent initializers
+	// cannot accidentally share an id and make exact loser cleanup unsafe.
+	commitID := sha1Hex(fmt.Sprintf("%s-%s-%d", repoID, rootID, now.UnixNano()))
 
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
@@ -1097,21 +1097,47 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 		return "", fmt.Errorf("failed to create initial commit: %w", err)
 	}
 
-	// Update library's head_commit_id with stats recalculation
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
+	// Update library's head_commit_id with stats recalculation. Cassandra does
+	// not allow a conditional batch to span the libraries and libraries_by_id
+	// tables, so the authority mutation is a standalone global-SERIAL LWT.
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
 		WHERE org_id = ? AND library_id = ?
-	`, commitID, commitID, int64(0), int64(0), now, orgID, repoID)
+		IF head_commit_id = null AND publication_state = ?
+	`, commitID, commitID, int64(0), int64(0), now, db.LibraryPublicationStateActive, orgID, repoID, db.LibraryPublicationStateActive).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil {
+		return "", fmt.Errorf("failed to update library head: %w", err)
+	}
+	if !applied {
+		initErr := fmt.Errorf("failed to update library head: publication authority is not ACTIVE or the library is already initialized")
+		if cleanupErr := deleteInitialCommitArtifacts(h.db.Session(), repoID, rootID, commitID); cleanupErr != nil {
+			return "", errors.Join(initErr, fmt.Errorf("cleanup rejected initial commit artifacts: %w", cleanupErr))
+		}
+		return "", initErr
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries_by_id SET head_commit_id = ?
 		WHERE library_id = ?
 	`, commitID, repoID)
 	if err := batch.Exec(); err != nil {
-		return "", fmt.Errorf("failed to update library head: %w", err)
+		return "", fmt.Errorf("failed to update library head projection: %w", err)
 	}
 
 	return commitID, nil
+}
+
+// deleteInitialCommitArtifacts removes only the root and commit staged by one
+// initializer after a definite CAS rejection. Ambiguous CAS outcomes do not
+// call this helper because the commit may already have become reachable.
+func deleteInitialCommitArtifacts(session *gocql.Session, libraryID, rootFSID, commitID string) error {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, rootFSID)
+	batch.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID)
+	return batch.Exec()
 }
 
 // sha1Hex returns the SHA1 hash of a string as hex (40 chars, Seafile compatible)
@@ -3450,6 +3476,40 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 	}
 }
 
+func syncLibraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
+	state, ok := casState["publication_state"]
+	if !ok || state == nil {
+		return true
+	}
+	value, ok := state.(string)
+	return ok && value == ""
+}
+
+func (h *SyncHandler) executeLibraryHeadCAS(orgID, repoID, commitID string, totalSize, fileCount int64, now time.Time, expectedHead string) (bool, map[string]interface{}, error) {
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, updated_at = ?, size_bytes = ?, file_count = ?, publication_state = ?
+		WHERE org_id = ? AND library_id = ?
+		IF head_commit_id = ? AND publication_state = ?
+	`, commitID, now, totalSize, fileCount, db.LibraryPublicationStateActive, orgID, repoID, expectedHead, db.LibraryPublicationStateActive).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil || applied || !syncLibraryHeadCASStateIsLegacyNull(casState) {
+		return applied, casState, err
+	}
+
+	// Rows from before migration 021 have NULL publication_state. Treat that
+	// legacy value as ACTIVE, but still settle the transition in the same CAS
+	// domain before publishing the new HEAD.
+	casState = map[string]interface{}{}
+	applied, err = h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, updated_at = ?, size_bytes = ?, file_count = ?, publication_state = ?
+		WHERE org_id = ? AND library_id = ?
+		IF head_commit_id = ? AND publication_state = null
+	`, commitID, now, totalSize, fileCount, db.LibraryPublicationStateActive, orgID, repoID, expectedHead).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	return applied, casState, err
+}
+
 // updateLibraryHeadWithStats advances the canonical head plus canonical stats in
 // one conditional update, applies the matching storage-counter delta, then
 // synchronizes the derived projection rows. The baseline for the counter delta
@@ -3469,12 +3529,7 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 	if err != nil {
 		return err
 	}
-	casState := map[string]interface{}{}
-	applied, err := h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, updated_at = ?, size_bytes = ?, file_count = ?
-		WHERE org_id = ? AND library_id = ?
-		IF head_commit_id = ?
-	`, commitID, now, totalSize, fileCount, orgID, repoID, expectedHead).MapScanCAS(casState)
+	applied, casState, err := h.executeLibraryHeadCAS(orgID, repoID, commitID, totalSize, fileCount, now, expectedHead)
 	if err != nil {
 		return fmt.Errorf("%w: conditional head update failed: %w", errSyncHeadCASUncertain, err)
 	}

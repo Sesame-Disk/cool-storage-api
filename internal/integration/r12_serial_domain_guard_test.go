@@ -1622,14 +1622,20 @@ func TestR12AllowedBatchCASStatementsStayOutOfScope(t *testing.T) {
 						return true
 					}
 					selector, ok := call.Fun.(*ast.SelectorExpr)
-					if !ok || !r12IsCQLEntryPoint(selector.Sel.Name, len(call.Args)) {
+					if !ok {
+						return true
+					}
+					batchReceiver, batchReceiverOK := selector.X.(*ast.Ident)
+					if !batchReceiverOK || batchReceiver.Name != "batch" {
+						return true
+					}
+					if selector.Sel.Name != "Query" {
+						if r12IsCQLEntryPoint(selector.Sel.Name, len(call.Args)) {
+							t.Errorf("%s: allowlisted batch %s adds a statement with %s at %s; the allowance is justified by the Batch.Query rule alone", path, symbol, selector.Sel.Name, fset.Position(call.Pos()))
+						}
 						return true
 					}
 					statements++
-					if selector.Sel.Name != "Query" {
-						t.Errorf("%s: allowlisted batch %s adds a statement with %s at %s; the allowance is justified by the Batch.Query rule alone", path, symbol, selector.Sel.Name, fset.Position(call.Pos()))
-						return true
-					}
 					literal, ok := call.Args[0].(*ast.BasicLit)
 					if !ok || literal.Kind != token.STRING {
 						t.Errorf("%s: allowlisted batch %s has a non-literal statement at %s; the allowance cannot prove it stays out of the R12 target set", path, symbol, fset.Position(call.Pos()))

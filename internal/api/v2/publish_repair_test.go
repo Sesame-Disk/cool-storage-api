@@ -1065,32 +1065,78 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_AncestryWalk(t *testing.
 }
 
 // TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConverges
-// exercises the REAL publishedBlockReferenceRepairCommitReachableFn for the
-// hard-delete convergence fix (docs/CHANGELOG.md, "W2 follow-up 3", item 2):
-// getCanonicalHeadCommitSerial now takes orgID directly instead of resolving
-// it through libraries_by_id, so a genuinely, permanently hard-deleted
-// library (whose libraries_by_id row is deleted in the SAME batch as
-// libraries -- library_delete_helpers.go) reports plain gocql.ErrNotFound
-// from its SERIAL libraries read. This pins that publishedBlockReferenceRepairHeadCommitFn's
-// ErrNotFound still resolves to a confident (unreachable, no error) verdict
-// here, not an error that would make a leftover repair row retry forever.
+// exercises the real reachability classifier with an explicit terminal
+// revocation witness. A missing libraries row alone is deliberately not enough
+// to authorize cleanup.
 func TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConverges(t *testing.T) {
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldTerminal := publishedBlockReferenceRepairTerminalFn
 	t.Cleanup(func() {
 		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		publishedBlockReferenceRepairTerminalFn = oldTerminal
 	})
 	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "", gocql.ErrNotFound
 	}
+	publishedBlockReferenceRepairTerminalFn = func(database *db.DB, orgID, repoID string) (bool, error) {
+		return true, nil
+	}
 	reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
 	if err != nil {
-		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil: a hard-deleted library must converge to a confident (unreachable, no error) verdict, not retry forever", err)
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil: terminal revocation must converge to a confident verdict", err)
 	}
 	if reachable {
 		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() = true, want false for a hard-deleted library")
 	}
 	if !libraryGone {
-		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() libraryGone = false, want true: gocql.ErrNotFound on the HEAD read means the library itself is gone, not merely that this commit is unreachable")
+		t.Fatal("publishedBlockReferenceRepairCommitReachableFn() libraryGone = false, want true: the durable terminal witness must authorize cleanup")
+	}
+}
+
+func TestPublishedBlockReferenceRepairCommitReachableFn_MissingLibraryWithoutRevocationRetains(t *testing.T) {
+	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldTerminal := publishedBlockReferenceRepairTerminalFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		publishedBlockReferenceRepairTerminalFn = oldTerminal
+	})
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
+		return "", gocql.ErrNotFound
+	}
+	publishedBlockReferenceRepairTerminalFn = func(database *db.DB, orgID, repoID string) (bool, error) {
+		return false, nil
+	}
+
+	reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+	if err != nil {
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil retention verdict", err)
+	}
+	if reachable || libraryGone {
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() = reachable=%v libraryGone=%v, want false/false when absence has no terminal witness", reachable, libraryGone)
+	}
+}
+
+func TestPublishedBlockReferenceRepairCommitReachableFn_SoftDeletedLibraryRetains(t *testing.T) {
+	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldTerminal := publishedBlockReferenceRepairTerminalFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		publishedBlockReferenceRepairTerminalFn = oldTerminal
+	})
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
+		return "", db.ErrLibraryDeleted
+	}
+	publishedBlockReferenceRepairTerminalFn = func(database *db.DB, orgID, repoID string) (bool, error) {
+		t.Fatal("soft deletion must not be treated as terminal revocation")
+		return false, nil
+	}
+
+	reachable, libraryGone, err := publishedBlockReferenceRepairCommitReachableFn(nil, "org-1", "repo-1", "commit-1")
+	if err != nil {
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() error = %v, want nil retention verdict", err)
+	}
+	if reachable || libraryGone {
+		t.Fatalf("publishedBlockReferenceRepairCommitReachableFn() = reachable=%v libraryGone=%v, want false/false for soft deletion", reachable, libraryGone)
 	}
 }
 
@@ -1105,6 +1151,7 @@ func TestPublishedBlockReferenceRepairCommitReachableFn_HardDeletedLibraryConver
 // file.
 func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t *testing.T) {
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
+	oldTerminal := publishedBlockReferenceRepairTerminalFn
 	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
 	oldPromote := publishedBlockReferenceRepairPromoteFn
 	oldCleanup := publishedBlockReferenceRepairCleanupFn
@@ -1112,6 +1159,7 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t 
 	oldNow := publishedBlockReferenceRepairNowFn
 	t.Cleanup(func() {
 		publishedBlockReferenceRepairHeadCommitFn = oldHead
+		publishedBlockReferenceRepairTerminalFn = oldTerminal
 		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
 		publishedBlockReferenceRepairPromoteFn = oldPromote
 		publishedBlockReferenceRepairCleanupFn = oldCleanup
@@ -1123,6 +1171,9 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t 
 	publishedBlockReferenceRepairNowFn = func() time.Time { return now }
 	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "", gocql.ErrNotFound
+	}
+	publishedBlockReferenceRepairTerminalFn = func(database *db.DB, orgID, repoID string) (bool, error) {
+		return true, nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
 		t.Fatal("fs_object lookup should not run for a hard-deleted library's unreachable commit")
@@ -1165,14 +1216,11 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_ConvergesAfterHardDelete(t 
 	}
 }
 
-// TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhilePreCASLeaseActive
-// covers the lease defer's only remaining role after "W2 follow-up 5": once
-// the library is confirmed gone (libraryGone=true), the lease still grants a
-// short grace period before this sweep acts, so a repair row is not reaped
-// the instant it is queued. It no longer gates the (much larger)
-// live-unreachable case -- see _RetainsLiveUnreachableCommit, which must
-// never clean up regardless of lease age.
-func TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhilePreCASLeaseActive(t *testing.T) {
+// TestRepairPublishedFSObjectBlockReferenceRepair_CleansTerminalLibraryEvenWithLegacyLeaseActive
+// pins that the legacy lease metadata is not a cleanup authority. Once terminal
+// publication authority is confirmed, cleanup is safe immediately; only the
+// sweep's normal created_at eligibility filter remains.
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansTerminalLibraryEvenWithLegacyLeaseActive(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -1215,12 +1263,14 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhi
 		t.Fatal("promote should not run for deferred unreachable commit")
 		return nil
 	}
+	cleanupCalls := 0
 	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
-		t.Fatal("cleanup should not run while head still matches queued commit parent")
+		cleanupCalls++
 		return nil
 	}
+	deleteCalls := 0
 	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
-		t.Fatal("delete should not run while cleanup is deferred")
+		deleteCalls++
 		return nil
 	}
 
@@ -1238,12 +1288,14 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersGoneLibraryCleanupWhi
 	if err != nil {
 		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want nil", err)
 	}
+	if cleanupCalls != 1 || deleteCalls != 1 {
+		t.Fatalf("terminal cleanup calls = %d/%d, want 1/1", cleanupCalls, deleteCalls)
+	}
 }
 
-// TestRepairPublishedFSObjectBlockReferenceRepair_CleansGoneLibraryAfterExpiredPreCASLease
-// pins that a gone library's repair row, once its (now largely vestigial but
-// still-applied) lease grace period has elapsed, converges to cleanup.
-func TestRepairPublishedFSObjectBlockReferenceRepair_CleansGoneLibraryAfterExpiredPreCASLease(t *testing.T) {
+// TestRepairPublishedFSObjectBlockReferenceRepair_CleansTerminalLibrary
+// pins cleanup after terminal authority, independent of legacy lease age.
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansTerminalLibrary(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn

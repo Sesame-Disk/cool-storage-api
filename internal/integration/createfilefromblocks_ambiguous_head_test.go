@@ -311,9 +311,9 @@ func createFileFromBlocksAmbiguousHeadPubCommitID(t *testing.T, database *dbpkg.
 
 // createFileFromBlocksAmbiguousHeadAssertRetained backdates the repair row
 // the production path already queued (before HEAD was ever attempted) FAR
-// past its pre-CAS lease, starts the pre-existing sweep worker, gives it a
-// real chance to run, and then asserts the repair row, the staged pub:
-// reference, and the commit row all SURVIVE -- fs: is never promoted either.
+// past its legacy lease metadata, runs one complete repair sweep
+// synchronously, and then asserts the repair row, the staged pub: reference,
+// and the commit row all SURVIVE -- fs: is never promoted either.
 //
 // Renamed from "...AssertConverges" (docs/CHANGELOG.md, "W2 follow-up 5"):
 // an ambiguous CAS that resolves to confirmed-lost or confirmation-unknown
@@ -332,21 +332,9 @@ func createFileFromBlocksAmbiguousHeadPubCommitID(t *testing.T, database *dbpkg.
 // the safe direction: it costs a leaked pub: reference and repair row, never
 // a corrupted publish.
 //
-// Timeout accounting matches the pre-existing pattern here: unlike
-// TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart
-// (which backdates created_at but sets a FUTURE lease_expires_at, because
-// promotion of a reachable commit does not consult the lease at all), this
-// backdates lease_expires_at deep into the past specifically so
-// publishedBlockReferenceRepairShouldDeferCleanup could never explain
-// inaction on its own -- if anything still gets cleaned up here, it is
-// because of the libraryGone fix, not a leftover lease grace window. The
-// generous window accounts for StartPublishedBlockReferenceRepairer's
-// sync.Once: whichever test in this binary calls it first gets the
-// immediate sweep, and a test that loses that race must wait for the next
-// periodic tick (publishedBlockReferenceRepairSweepInterval, ~1 minute)
-// instead -- so this deliberately waits out a full cycle (rather than
-// polling for a positive condition, since nothing should change) before
-// asserting the retained state.
+// The one-shot seam is intentionally used instead of StartPublishedBlockReferenceRepairer:
+// a wall-clock wait cannot prove that the target bucket was processed, while
+// the synchronous full sweep makes the retention assertion positive evidence.
 func createFileFromBlocksAmbiguousHeadAssertRetained(t *testing.T, database *dbpkg.DB, fx *sessionUploadHeadFixture, commitID, fsID string) {
 	t.Helper()
 	bucket := publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID)
@@ -361,13 +349,8 @@ func createFileFromBlocksAmbiguousHeadAssertRetained(t *testing.T, database *dbp
 		t.Fatalf("backdate queued repair row: %v", err)
 	}
 
-	v2api.StartPublishedBlockReferenceRepairer(database)
-
-	if pollUntil(t, 75*time.Second, time.Second, func() bool {
-		return !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) ||
-			borrowedFSCountPrefix(t, database, fx.orgID, fx.blockID, "pub:") == 0
-	}) {
-		t.Fatalf("the repair sweep destroyed pub:/the repair row for commit=%s fs=%s despite the library being alive -- a lease timeout must never authorize this", commitID, fsID)
+	if err := v2api.RunPublishedBlockReferenceRepairSweepForTest(database); err != nil {
+		t.Fatalf("retention repair sweep failed for commit=%s fs=%s: %v", commitID, fsID, err)
 	}
 	if !publishRepairIntegrationRepairRowExists(t, bucket, fx.orgID, fx.repoID, commitID, fsID) {
 		t.Fatal("expected the durable repair row to survive indefinitely for a live-unreachable commit")

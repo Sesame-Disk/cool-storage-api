@@ -870,6 +870,25 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 }
 
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, projectionRow dbpkg.AdminLibraryProjectionRow) error {
+	// Rollback is used both before and after filesystem initialization. The
+	// initialization CAS may have succeeded even when a later projection/share
+	// operation failed, so a blind canonical delete could remove the authority
+	// for a commit that is already publishable. Revoke that authority in the
+	// global-SERIAL domain before removing canonical rows. If the state cannot be
+	// read or revoked, fail closed and leave all data for repair.
+	var canonicalLibraryID string
+	err := db.Session().Query(`
+		SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, projectionRow.OrgID, projectionRow.LibraryID).Scan(&canonicalLibraryID)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("read library publication authority for rollback: %w", err)
+	}
+	if err == nil {
+		if err := dbpkg.RevokeLibraryPublication(db.Session(), projectionRow.OrgID, projectionRow.LibraryID); err != nil {
+			return fmt.Errorf("revoke library publication authority for rollback: %w", err)
+		}
+	}
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, projectionRow.OrgID, projectionRow.LibraryID)
 	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, projectionRow.OrgID, projectionRow.LibraryID)
@@ -884,12 +903,11 @@ func rollbackNewLibrary(db interface{ Session() *gocql.Session }, projectionRow 
 	batch.Query(`
 		DELETE FROM libraries_by_id WHERE library_id = ?
 	`, projectionRow.LibraryID)
-	batch.Query(`
-		DELETE FROM fs_objects WHERE library_id = ?
-	`, projectionRow.LibraryID)
-	batch.Query(`
-		DELETE FROM commits WHERE library_id = ?
-	`, projectionRow.LibraryID)
+	// Never bulk-delete fs_objects/commits here. A successful initialization
+	// can have made the initial commit reachable before this rollback is called,
+	// and a failed initialization can have an ambiguous write outcome. Keeping
+	// these rows lets the orphan/terminal cleanup path make the destructive
+	// decision with its normal fences instead of losing a published commit.
 	return batch.Exec()
 }
 
@@ -986,17 +1004,41 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// present-but-active row (deleted_at == null) is not in trash. The admin projection is a
 	// read model and does not prove canonical presence, so it cannot gate this.
 	var canonicalDeletedAt time.Time
+	var publicationState *string
 	err = db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`,
+		SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
-	).Scan(&canonicalDeletedAt)
+	).Scan(&canonicalDeletedAt, &publicationState)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return fmt.Errorf("library is pending permanent deletion")
 	} else if err != nil {
 		return fmt.Errorf("read canonical library for restore: %w", err)
 	}
+	var markerDeletedAt time.Time
+	markerErr := db.Session().Query(`
+		SELECT deleted_at FROM deleted_libraries WHERE library_id = ?
+	`, libraryID).Consistency(gocql.EachQuorum).Scan(&markerDeletedAt)
+	markerPresent := markerErr == nil
+	if markerErr != nil && !errors.Is(markerErr, gocql.ErrNotFound) {
+		return fmt.Errorf("read deleted library marker for restore: %w", markerErr)
+	}
 	if canonicalDeletedAt.IsZero() {
-		return fmt.Errorf("library is not in trash")
+		if !markerPresent {
+			return fmt.Errorf("library is not in trash")
+		}
+		// The canonical ACTIVE transition may already have committed while the
+		// marker/read-model batch failed. Treat the durable marker as a restore
+		// intent and retry only the derived-state finalization below.
+	}
+	if publicationState != nil && *publicationState != "" {
+		switch *publicationState {
+		case dbpkg.LibraryPublicationStateActive:
+			// Legacy NULL is also treated as ACTIVE by the state readers below.
+		case dbpkg.LibraryPublicationStateTerminal:
+			return dbpkg.ErrLibraryPublicationTerminal
+		default:
+			return fmt.Errorf("unknown library publication state %q", *publicationState)
+		}
 	}
 
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
@@ -1006,18 +1048,36 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	nextRow := previousRow
 	nextRow.UpdatedAt = now
 	nextRow.DeletedAt = nil
+	// The canonical restore transition is the only conditional mutation. A
+	// conditional batch cannot span the canonical row and read-model tables.
+	restoreCounters := false
+	if !canonicalDeletedAt.IsZero() {
+		var restoreApplied bool
+		if publicationState == nil || *publicationState == "" {
+			restoreApplied, err = db.Session().Query(`
+				UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
+				WHERE org_id = ? AND library_id = ?
+				IF deleted_at = ? AND publication_state = null`,
+				now, dbpkg.LibraryPublicationStateActive, orgID, libraryID, canonicalDeletedAt,
+			).SerialConsistency(gocql.Serial).MapScanCAS(map[string]interface{}{})
+		} else {
+			restoreApplied, err = db.Session().Query(`
+				UPDATE libraries SET deleted_at = null, deleted_by = null, updated_at = ?, publication_state = ?
+				WHERE org_id = ? AND library_id = ?
+				IF deleted_at = ? AND publication_state = ?`,
+				now, dbpkg.LibraryPublicationStateActive, orgID, libraryID, canonicalDeletedAt, dbpkg.LibraryPublicationStateActive,
+			).SerialConsistency(gocql.Serial).MapScanCAS(map[string]interface{}{})
+		}
+		if err != nil {
+			return fmt.Errorf("restore library authority transition: %w", err)
+		}
+		if !restoreApplied {
+			return fmt.Errorf("restore library: canonical publication authority or deleted_at changed")
+		}
+		restoreCounters = true
+	}
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries SET updated_at = ?
-		WHERE org_id = ? AND library_id = ?`,
-		now, orgID, libraryID,
-	)
-	batch.Query(`
-		DELETE deleted_at, deleted_by FROM libraries
-		WHERE org_id = ? AND library_id = ?`,
-		orgID, libraryID,
-	)
-	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
@@ -1033,8 +1093,29 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 
 	// Re-add the library's storage to aggregates after the canonical row and
 	// deleted marker have been restored.
-	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
+	if restoreCounters {
+		traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
+	}
+	// Keep the durable marker until every derived mutation above has completed.
+	// If this final delete is lost, the next restore attempt sees the ACTIVE row
+	// plus the marker, retries only the idempotent derived writes, and does not
+	// apply the synchronous counter increment a second time.
+	if err := db.Session().Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID).
+		Consistency(gocql.EachQuorum).Exec(); err != nil {
+		return fmt.Errorf("remove restored library marker: %w", err)
+	}
 	return nil
+}
+
+// deleteInitialLibraryFSArtifacts removes only the objects created by one
+// initializer after a definite CAS rejection. It is intentionally exact-key
+// cleanup: an ambiguous CAS outcome must retain all artifacts until the normal
+// orphan/repair machinery can establish their reachability.
+func deleteInitialLibraryFSArtifacts(session *gocql.Session, libraryID, rootFSID, commitID string) error {
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, rootFSID)
+	batch.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID, commitID)
+	return batch.Exec()
 }
 
 // orgQuotas holds an organization's quota limits.

@@ -87,23 +87,14 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 		t.Fatal("queued publish repair row missing before worker start")
 	}
 
-	v2api.StartPublishedBlockReferenceRepairer(database)
-
-	// StartPublishedBlockReferenceRepairer's initial sweep is sync.Once-gated
-	// process-wide: whichever test in this binary calls it FIRST gets that
-	// immediate pass, and every other caller -- including this test, once
-	// internal/integration/createfilefromblocks_ambiguous_head_test.go also
-	// started calling this same function -- must wait for the next periodic
-	// tick (publishedBlockReferenceRepairSweepInterval, ~1 minute) instead.
-	// 10s only ever worked because this used to be the only caller.
-	if !pollUntil(t, 75*time.Second, time.Second, func() bool {
-		referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
-		return publishRepairIntegrationHasReferrer(referrers, fsReferrer) &&
-			!publishRepairIntegrationHasReferrer(referrers, pubReferrer) &&
-			!publishRepairIntegrationRepairRowExists(t, bucket, state.orgID, repoID, state.headCommitID, state.fsID)
-	}) {
-		referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
-		t.Fatalf("timed out waiting for durable publish replay; referrers=%v rowExists=%v", referrers, publishRepairIntegrationRepairRowExists(t, bucket, state.orgID, repoID, state.headCommitID, state.fsID))
+	if err := v2api.RunPublishedBlockReferenceRepairSweepForTest(database); err != nil {
+		t.Fatalf("durable publish replay sweep failed: %v", err)
+	}
+	referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
+	if !publishRepairIntegrationHasReferrer(referrers, fsReferrer) ||
+		publishRepairIntegrationHasReferrer(referrers, pubReferrer) ||
+		publishRepairIntegrationRepairRowExists(t, bucket, state.orgID, repoID, state.headCommitID, state.fsID) {
+		t.Fatalf("durable publish replay did not converge; referrers=%v rowExists=%v", referrers, publishRepairIntegrationRepairRowExists(t, bucket, state.orgID, repoID, state.headCommitID, state.fsID))
 	}
 }
 

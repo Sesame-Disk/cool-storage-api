@@ -13,6 +13,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -128,6 +129,241 @@ func TestRestoreDeletedLibrary_RejectsWhenCanonicalRowActive(t *testing.T) {
 	}
 	if !deletedAt.IsZero() {
 		t.Fatal("active library must stay active (deleted_at null) after a rejected restore")
+	}
+}
+
+// If the canonical ACTIVE transition committed but the marker/read-model batch
+// did not, a retry must finish the restore instead of returning "not in trash"
+// or applying aggregate counters a second time.
+func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	createdAt := time.Now().UTC().Add(-4 * time.Hour).Truncate(time.Millisecond)
+	updatedAt := createdAt.Add(time.Hour)
+	deletedAt := createdAt.Add(2 * time.Hour)
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-pending-finalization", false, "hot", int64(0), int64(0), createdAt, updatedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed active library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`, libraryID.String(), orgID.String(), deletedAt, "hot").Exec(); err != nil {
+		t.Fatalf("seed pending restore marker: %v", err)
+	}
+	projectionRow := dbpkg.AdminLibraryProjectionRow{
+		OrgID: orgID.String(), LibraryID: libraryID.String(), OwnerID: ownerID.String(),
+		Name: "restore-pending-finalization", StorageClass: "hot", CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		cleanup := session.Batch(gocql.LoggedBatch)
+		dbpkg.AddDeleteAdminLibraryReadModelQuery(cleanup, projectionRow)
+		cleanup.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.PlatformStorageScope())
+		cleanup.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.OrganizationStorageScope(orgID.String()))
+		cleanup.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String()))
+		_ = cleanup.Exec()
+	})
+
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err != nil {
+		t.Fatalf("restore retry should finalize the pending transition: %v", err)
+	}
+	var canonicalDeletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Scan(&canonicalDeletedAt); err != nil {
+		t.Fatalf("read restored canonical library: %v", err)
+	}
+	if !canonicalDeletedAt.IsZero() {
+		t.Fatalf("canonical library remains deleted after retry: %s", canonicalDeletedAt)
+	}
+	var markerID string
+	markerErr := session.Query(`SELECT library_id FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&markerID)
+	if !errors.Is(markerErr, gocql.ErrNotFound) {
+		t.Fatalf("pending restore marker remains after retry: err=%v marker=%q", markerErr, markerID)
+	}
+}
+
+// Rollback can run after the initial HEAD CAS succeeded (for example when a
+// subsequent share write failed). It must revoke publication before deleting
+// canonical rows and must leave the published commit for fenced orphan GC.
+func TestRollbackNewLibrary_RevokesAuthorityAndRetainsPublishedCommit(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	createdAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	updatedAt := createdAt.Add(time.Hour)
+	commitID := uuid.New().String()
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at, head_commit_id, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "rollback-authority", false, "hot", int64(0), int64(0), createdAt, updatedAt, commitID, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed published library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		libraryID.String(), commitID, "", "rollback-root", ownerID.String(), "rollback test commit", updatedAt).Exec(); err != nil {
+		t.Fatalf("seed published commit: %v", err)
+	}
+	projectionRow := dbpkg.AdminLibraryProjectionRow{
+		OrgID: orgID.String(), LibraryID: libraryID.String(), OwnerID: ownerID.String(),
+		Name: "rollback-authority", StorageClass: "hot", CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID.String(), commitID).Exec()
+		_ = session.Query(`DELETE FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Exec()
+		cleanup := session.Batch(gocql.LoggedBatch)
+		dbpkg.AddDeleteAdminLibraryReadModelQuery(cleanup, projectionRow)
+		_ = cleanup.Exec()
+	})
+
+	if err := rollbackNewLibrary(db, projectionRow); err != nil {
+		t.Fatalf("rollbackNewLibrary: %v", err)
+	}
+	var gotCommit string
+	if err := session.Query(`SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?`, libraryID.String(), commitID).Scan(&gotCommit); err != nil {
+		t.Fatalf("published commit must remain after rollback: %v", err)
+	}
+	var revokedID string
+	if err := session.Query(`SELECT library_id FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Consistency(gocql.EachQuorum).Scan(&revokedID); err != nil {
+		t.Fatalf("rollback must leave durable publication revocation: %v", err)
+	}
+	var libraryRow string
+	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Scan(&libraryRow); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("canonical library must be removed after rollback: err=%v row=%q", err, libraryRow)
+	}
+}
+
+// Once hard-delete commits ACTIVE -> TERMINAL, restore must not clear deleted_at
+// even while the canonical row remains visible before the physical row delete.
+func TestRestoreDeletedLibrary_RejectsWhenPublicationAuthorityTerminal(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, deleted_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-guard-terminal",
+		now.Add(-4*time.Hour), now, deletedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed terminal-transition library: %v", err)
+	}
+	casState := map[string]interface{}{}
+	applied, err := session.Query(`
+		UPDATE libraries SET publication_state = ?
+		WHERE org_id = ? AND library_id = ?
+		IF publication_state = ?`,
+		dbpkg.LibraryPublicationStateTerminal, orgID.String(), libraryID.String(), dbpkg.LibraryPublicationStateActive).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil {
+		t.Fatalf("commit terminal publication authority: %v", err)
+	}
+	if !applied {
+		t.Fatalf("expected ACTIVE -> TERMINAL transition, CAS state=%v", casState)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); !errors.Is(err, dbpkg.ErrLibraryPublicationTerminal) {
+		t.Fatalf("restore must reject terminal publication authority, got %v", err)
+	}
+
+	var canonicalDeletedAt time.Time
+	var publicationState string
+	if err := session.Query(`SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&canonicalDeletedAt, &publicationState); err != nil {
+		t.Fatalf("read terminal library after rejected restore: %v", err)
+	}
+	if !canonicalDeletedAt.Equal(deletedAt) || publicationState != dbpkg.LibraryPublicationStateTerminal {
+		t.Fatalf("terminal library changed after rejected restore: deleted_at=%s publication_state=%q", canonicalDeletedAt, publicationState)
+	}
+}
+
+func TestRestoreDeletedLibrary_RejectsUnknownPublicationAuthority(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, deleted_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-guard-unknown",
+		now.Add(-4*time.Hour), now, deletedAt, "FUTURE_STATE").Exec(); err != nil {
+		t.Fatalf("seed unknown-state library: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err == nil {
+		t.Fatal("restore must reject an unknown publication authority")
+	}
+
+	var canonicalDeletedAt time.Time
+	var publicationState string
+	if err := session.Query(`SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&canonicalDeletedAt, &publicationState); err != nil {
+		t.Fatalf("read unknown-state library after rejected restore: %v", err)
+	}
+	if !canonicalDeletedAt.Equal(deletedAt) || publicationState != "FUTURE_STATE" {
+		t.Fatalf("unknown-state library changed after rejected restore: deleted_at=%s publication_state=%q", canonicalDeletedAt, publicationState)
+	}
+}
+
+// InitializeLibraryFS must not publish or reactivate a library whose terminal
+// publication authority was already committed by hard-delete.
+func TestInitializeLibraryFS_RejectsTerminalPublicationAuthority(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "initialize-guard-terminal",
+		now.Add(-4*time.Hour), now, dbpkg.LibraryPublicationStateTerminal).Exec(); err != nil {
+		t.Fatalf("seed terminal library for initialization: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM commits WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	err := NewFSHelper(db).InitializeLibraryFS(orgID.String(), libraryID.String(), ownerID.String(), "initialize-guard-terminal")
+	if err == nil {
+		t.Fatal("initialization must reject terminal publication authority")
+	}
+
+	var headCommitID string
+	var publicationState string
+	if err := session.Query(`SELECT head_commit_id, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&headCommitID, &publicationState); err != nil {
+		t.Fatalf("read terminal library after rejected initialization: %v", err)
+	}
+	if headCommitID != "" || publicationState != dbpkg.LibraryPublicationStateTerminal {
+		t.Fatalf("terminal library changed after rejected initialization: head=%q publication_state=%q", headCommitID, publicationState)
+	}
+	var stagedFSID, stagedCommitID string
+	fsErr := session.Query(`SELECT fs_id FROM fs_objects WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedFSID)
+	commitErr := session.Query(`SELECT commit_id FROM commits WHERE library_id = ? LIMIT 1`, libraryID.String()).Scan(&stagedCommitID)
+	if !errors.Is(fsErr, gocql.ErrNotFound) || !errors.Is(commitErr, gocql.ErrNotFound) {
+		t.Fatalf("rejected initialization left staged artifacts: fsErr=%v fsID=%q commitErr=%v commitID=%q", fsErr, stagedFSID, commitErr, stagedCommitID)
 	}
 }
 

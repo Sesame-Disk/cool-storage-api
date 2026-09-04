@@ -5624,6 +5624,12 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 
 func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	session := s.db.Session()
+	// Revoke the publication authority in the libraries row's SERIAL domain
+	// before deleting that row. The durable witness lets publish-repair prove
+	// terminality after the canonical row is gone.
+	if err := db.RevokeLibraryPublication(session, orgID.String(), libraryID.String()); err != nil {
+		return fmt.Errorf("revoke library publication authority for %s/%s: %w", orgID, libraryID, err)
+	}
 	batch := session.Batch(gocql.LoggedBatch)
 	if err := db.AddDeleteAdminLibraryReadModelQueries(session, batch, orgID.String(), libraryID.String()); err != nil {
 		return err

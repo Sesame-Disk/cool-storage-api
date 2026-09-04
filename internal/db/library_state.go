@@ -25,6 +25,7 @@ type LibraryState struct {
 	HeadCommitID          string
 	StorageClass          string
 	DeletedAt             *time.Time
+	PublicationState      string
 }
 
 // ReadLibraryState loads the canonical libraries row for a known org/library
@@ -46,8 +47,9 @@ func ReadLibraryStateContext(ctx context.Context, session *gocql.Session, orgID,
 	}
 
 	var deletedAt time.Time
+	var publicationState *string
 	if err := session.Query(`
-		SELECT owner_id, name, encrypted, block_representation_id, head_commit_id, storage_class, deleted_at
+		SELECT owner_id, name, encrypted, block_representation_id, head_commit_id, storage_class, deleted_at, publication_state
 		FROM libraries
 		WHERE org_id = ? AND library_id = ?
 	`, orgID, libraryID).WithContext(ctx).Scan(
@@ -58,8 +60,14 @@ func ReadLibraryStateContext(ctx context.Context, session *gocql.Session, orgID,
 		&state.HeadCommitID,
 		&state.StorageClass,
 		&deletedAt,
+		&publicationState,
 	); err != nil {
 		return LibraryState{}, err
+	}
+	if publicationState == nil || *publicationState == "" {
+		state.PublicationState = LibraryPublicationStateActive
+	} else {
+		state.PublicationState = *publicationState
 	}
 
 	if !deletedAt.IsZero() {
@@ -84,6 +92,9 @@ func ReadLiveLibraryStateContext(ctx context.Context, session *gocql.Session, or
 	}
 	if state.DeletedAt != nil {
 		return LibraryState{}, ErrLibraryDeleted
+	}
+	if state.PublicationState == LibraryPublicationStateTerminal {
+		return LibraryState{}, ErrLibraryPublicationTerminal
 	}
 	return state, nil
 }

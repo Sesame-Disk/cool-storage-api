@@ -203,48 +203,30 @@ func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error)
 	return libraryState.OrgID, libraryState.HeadCommitID, nil
 }
 
-// getCanonicalHeadCommitSerial resolves a library's current HEAD like
-// getCanonicalHeadCommit, but via a SERIAL (Paxos-linearizable) read of the
-// libraries row instead of the session's ordinary LOCAL_QUORUM, and keyed
-// directly by the caller's own (orgID, repoID) rather than resolving repoID
-// through libraries_by_id first. Used only by
-// publishedBlockReferenceRepairHeadCommitFn (publish_repair.go): that caller
-// decides whether to IRREVERSIBLY delete a commit row and its pub: block
-// references, and a plain LOCAL_QUORUM read can return a stale pre-CAS HEAD
-// when the sweep runs in a different DC than the one that committed an
-// ambiguous CAS -- the write half of that same LWT is an ordinary
-// LOCAL_QUORUM write and only reaches other DCs via asynchronous replication.
-// This is the same LOCAL_QUORUM-write/LOCAL_QUORUM-read non-intersection gap
-// X2 closed for block_references (docs/UPLOAD-FENCE-FINDINGS-REGISTRY.md).
-// Taking orgID as a parameter isn't just an optimization: every caller
-// already durably has it (publishedBlockReferenceRepair.OrgID,
-// pendingPublishedFile.cleanupOrgID), and a library's hard-delete cascade
-// (library_delete_helpers.go) deletes libraries_by_id in the SAME batch as
-// libraries -- so resolving orgID through that mapping here would make a
-// genuinely, permanently hard-deleted library's leftover repair row retry
-// forever with a "row not found" error instead of ever converging to the
-// correct "library gone, safe to clean up" verdict a SERIAL read of
-// libraries itself (gocql.ErrNotFound) already gives the caller for free.
-// A SERIAL read linearizes this value against the library HEAD Paxos domain,
-// so under the shipped SERIAL default it is correct regardless of which DC
-// serves the read -- that says nothing about the plain (non-Paxos) commits
-// rows a caller may walk afterward; see publishedBlockReferenceRepairCommitParentFn's
-// own EACH_QUORUM pin for that half. Both callers -- the periodic sweep
-// (runPublishedBlockReferenceRepairSweep) and cleanupPendingPublishedFileOwnerAttempt's
-// synchronous error-cleanup branch off a failed createFileFSObjectRow, itself
-// reachable from stagePendingPublishedFiles on the live request path -- are
-// cold recovery/error-cleanup paths, outside the normal successful
-// publication hot path; the extra Paxos round trip's cost is deliberately
-// accepted here, not free, but it is off the path every ordinary commit
-// takes.
+// getCanonicalHeadCommitSerial resolves a library's current HEAD and
+// publication authority in the same global SERIAL domain as the HEAD CAS.
+// Repair uses this only on its cold recovery path: a live HEAD is enough to
+// prove reachability, while TERMINAL is the only in-row authority that allows
+// cleanup. A missing row is intentionally not treated as terminal; callers
+// must consult the durable revocation witness left by hard-delete.
 func (h *FSHelper) getCanonicalHeadCommitSerial(orgID, repoID string) (string, error) {
 	var headCommitID string
 	var deletedAt time.Time
+	var publicationState *string
 	err := h.db.Session().Query(`
-		SELECT head_commit_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Consistency(gocql.Serial).Scan(&headCommitID, &deletedAt)
+		SELECT head_commit_id, deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Consistency(gocql.Serial).Scan(&headCommitID, &deletedAt, &publicationState)
 	if err != nil {
 		return "", err
+	}
+	if publicationState != nil && *publicationState != "" {
+		switch *publicationState {
+		case db.LibraryPublicationStateTerminal:
+			return "", db.ErrLibraryPublicationTerminal
+		case db.LibraryPublicationStateActive:
+		default:
+			return "", fmt.Errorf("unknown library publication state %q", *publicationState)
+		}
 	}
 	if !deletedAt.IsZero() {
 		return "", db.ErrLibraryDeleted
@@ -666,11 +648,21 @@ func isAmbiguousLibraryHeadUpdateError(err error) bool {
 
 func (h *FSHelper) confirmLibraryHeadCommitVisible(orgID, repoID, commitID string) (string, bool, error) {
 	var currentHead string
+	var publicationState *string
 	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Consistency(gocql.Serial).Scan(&currentHead)
+		SELECT head_commit_id, publication_state FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Consistency(gocql.Serial).Scan(&currentHead, &publicationState)
 	if err != nil {
 		return "", false, err
+	}
+	if publicationState != nil {
+		switch *publicationState {
+		case db.LibraryPublicationStateActive:
+		case db.LibraryPublicationStateTerminal:
+			return currentHead, false, db.ErrLibraryPublicationTerminal
+		default:
+			return currentHead, false, fmt.Errorf("unknown library publication state %q", *publicationState)
+		}
 	}
 	return currentHead, currentHead == commitID, nil
 }
@@ -683,11 +675,38 @@ func (h *FSHelper) confirmLibraryHeadCommitVisible(orgID, repoID, commitID strin
 var libraryHeadCASExecuteFn = func(h *FSHelper, orgID, repoID, commitID string, totalSize, fileCount int64, now time.Time, expectedHead string) (bool, map[string]interface{}, error) {
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
+		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
 		WHERE org_id = ? AND library_id = ?
-		IF head_commit_id = ?
-	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+		IF head_commit_id = ? AND publication_state = ?
+	`, commitID, totalSize, fileCount, now, db.LibraryPublicationStateActive, orgID, repoID, expectedHead, db.LibraryPublicationStateActive).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil || applied {
+		return applied, casState, err
+	}
+
+	// Rows created before migration 021 have NULL publication_state. Promote
+	// that legacy value to ACTIVE in the same guarded Paxos domain; this path is
+	// only taken for persisted pre-migration rows and never for normal writes.
+	if !libraryHeadCASStateIsLegacyNull(casState) {
+		return applied, casState, nil
+	}
+	casState = map[string]interface{}{}
+	applied, err = h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
+		WHERE org_id = ? AND library_id = ?
+		IF head_commit_id = ? AND publication_state = null
+	`, commitID, totalSize, fileCount, now, db.LibraryPublicationStateActive, orgID, repoID, expectedHead).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
 	return applied, casState, err
+}
+
+func libraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
+	state, ok := casState["publication_state"]
+	if !ok || state == nil {
+		return true
+	}
+	value, ok := state.(string)
+	return ok && value == ""
 }
 
 // libraryHeadConfirmVisibleFn resolves the ambiguous-CAS SERIAL confirmation
@@ -917,7 +936,8 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 		return fmt.Errorf("failed to read library projection row: %w", err)
 	}
 
-	// 3. Persist root object, initial commit, and head_commit atomically.
+	// 3. Persist root object and initial commit first. Cassandra does not allow
+	// a conditional batch to span the fs_objects/commits/libraries tables.
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
@@ -927,15 +947,49 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, repoID, headCommitID, rootFSID, userID, "Initial commit", now)
-	batch.Query(`
-		UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?
-	`, headCommitID, orgID, repoID)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to initialize library fs objects: %w", err)
+	}
+
+	// The canonical HEAD publication is the authority transition and must be a
+	// standalone global-SERIAL LWT. A stale initializer cannot reactivate a
+	// terminal library.
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
+		IF head_commit_id = null AND publication_state = ?
+	`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID, db.LibraryPublicationStateActive).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil {
+		return fmt.Errorf("failed to initialize library fs state: %w", err)
+	}
+	if !applied && libraryHeadCASStateIsLegacyNull(casState) {
+		casState = map[string]interface{}{}
+		applied, err = h.db.Session().Query(`
+			UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
+			IF head_commit_id = null AND publication_state = null
+		`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID).
+			SerialConsistency(gocql.Serial).MapScanCAS(casState)
+		if err != nil {
+			return fmt.Errorf("failed to initialize legacy library fs state: %w", err)
+		}
+	}
+	if !applied {
+		initErr := fmt.Errorf("failed to initialize library fs state: publication authority is not ACTIVE or the library is already initialized")
+		if cleanupErr := deleteInitialLibraryFSArtifacts(h.db.Session(), repoID, rootFSID, headCommitID); cleanupErr != nil {
+			return errors.Join(initErr, fmt.Errorf("cleanup rejected initial library fs artifacts: %w", cleanupErr))
+		}
+		return initErr
+	}
+
+	// 4. Refresh derived rows after the canonical authority transition.
+	batch = h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
 	`, headCommitID, repoID)
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, nil)
 	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to initialize library fs state: %w", err)
+		return fmt.Errorf("failed to initialize library fs projections: %w", err)
 	}
 
 	return nil

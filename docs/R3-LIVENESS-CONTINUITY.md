@@ -9,6 +9,17 @@ This file does not close R3. X1 closure architecture:
 **Scope:** characterization plus internal provenance refinement; no protocol/readiness/I/O behavior change
 **Status:** X1 remains open. R3 remains OPEN. `GC_ENABLED=false`.
 
+**W2a authority overlay (2026-09-03):** publication authority is now explicit
+and separate from this continuity characterization. `libraries.publication_state`
+uses the same global `SERIAL` domain as HEAD: HEAD CAS operations require
+`ACTIVE`, and hard-delete commits `ACTIVE -> TERMINAL` before removing canonical
+rows. Hard-delete also writes the no-TTL
+`library_publication_revocations` witness at `EACH_QUORUM`, so repair can prove
+terminality after the library row is gone. Absence, lease expiry, timeout, and
+unknown or unavailable state do not authorize cleanup; repair retains `pub:` and
+its durable row until terminal authority is proven. This closes the W2 authority
+gap, not the `up -> pub -> HEAD -> fs` continuity gap tracked by R31.
+
 The real-Cassandra evidence gate is `SESAMEFS_REQUIRE_R3_CHARACTERIZATION=1`.
 The default full integration command of both Docker services sets it only for
 that command. `TestMain` requires all three race legs (writer wins, canonical
@@ -169,6 +180,15 @@ of arbitrary runtime multiplicity. Any intentional new CQL
 therefore requires explicit review and a baseline update. This is a deliberately
 scoped source analyzer, not a claim of universal Go compiler/type analysis.
 
+W2a preserves the normal materialize-to-publish hot path: it adds no canonical
+orphan authority read and no per-block authority read. The structural budget for
+`stagePendingPublishedFiles` is 18 callsites rather than the previous 17 because
+its reachable missing-library repair path performs the durable
+`library_publication_revocations` witness lookup. That is not a per-block
+authority read and not the legacy-`NULL` `publication_state` CAS fallback;
+migrated live rows take only the guarded `ACTIVE` CAS. This budget entry is not a
+runtime claim of one extra request per block.
+
 `TestR3PublicationKnownFanoutIsSinglePass` supplies the narrow multiplicity
 contract the static budget cannot provide: it freezes the authorized staging
 sink in two known loops (`stagePendingPublishedFilesAddReferencesFn` per
@@ -242,7 +262,7 @@ before this writer stages `pub:` is still open and is not resolved here.
 
 ## Outcome and next steps
 
-This structural refinement changes no protocol behavior. A later PR must select
+This structural refinement and the W2a authority overlay do not close R3. A later PR must select
 one provenance category, establish its exact continuity or slow-path protocol,
 and retain both zero-added-CQL-callsite and zero-added-authority-read contracts
 for normal materialize-to-publish traffic. HEAD after a BorrowedFS cut is

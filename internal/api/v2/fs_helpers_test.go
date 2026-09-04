@@ -1346,6 +1346,21 @@ func TestResolveLibraryHeadUpdateErrorTreatsConfirmedVisibleAmbiguousCASAsSucces
 	}
 }
 
+func TestResolveLibraryHeadUpdateErrorDoesNotTreatTerminalConfirmationAsSuccess(t *testing.T) {
+	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.RequestErrCASWriteUnknown{}, func() (string, bool, error) {
+		return "commit-1", false, db.ErrLibraryPublicationTerminal
+	})
+	if err == nil {
+		t.Fatal("terminal confirmation must not resolve an ambiguous CAS as success")
+	}
+	if !errors.Is(err, ErrLibraryHeadPublicationUnknown) {
+		t.Fatalf("error = %v, want ErrLibraryHeadPublicationUnknown", err)
+	}
+	if !errors.Is(err, db.ErrLibraryPublicationTerminal) {
+		t.Fatalf("error = %v, want terminal confirmation cause", err)
+	}
+}
+
 func TestResolveLibraryHeadUpdateErrorReturnsFailureWhenConfirmedNotVisible(t *testing.T) {
 	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.RequestErrCASWriteUnknown{}, func() (string, bool, error) {
 		return "head-old", false, nil

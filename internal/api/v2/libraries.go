@@ -618,17 +618,17 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 			INSERT INTO libraries (
 				org_id, library_id, owner_id, name, description, encrypted,
 				block_representation_id,
-				enc_version, salt, magic, random_key, magic_strong, random_key_strong,
-				storage_class, size_bytes, file_count, version_ttl_days,
-				head_commit_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			enc_version, salt, magic, random_key, magic_strong, random_key_strong,
+			storage_class, size_bytes, file_count, version_ttl_days,
+			head_commit_id, publication_state, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID, newLibID.String(), userID, library.Name,
 			library.Description, library.Encrypted,
 			blockRepresentationID,
 			encParams.EncVersion, encParams.Salt, encParams.Magic, encParams.RandomKey,
 			encParams.MagicStrong, encParams.RandomKeyStrong,
 			library.StorageClass, library.SizeBytes, library.FileCount, library.VersionTTLDays,
-			headCommitID, library.CreatedAt, library.UpdatedAt,
+			headCommitID, db.LibraryPublicationStateActive, library.CreatedAt, library.UpdatedAt,
 		)
 
 		// Dual-write to lookup table
@@ -648,12 +648,12 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 				org_id, library_id, owner_id, name, description, encrypted,
 				block_representation_id,
 				storage_class, size_bytes, file_count, version_ttl_days,
-				head_commit_id, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				head_commit_id, publication_state, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID, newLibID.String(), userID, library.Name,
 			library.Description, library.Encrypted, blockRepresentationID, library.StorageClass,
 			library.SizeBytes, library.FileCount, library.VersionTTLDays,
-			headCommitID, library.CreatedAt, library.UpdatedAt,
+			headCommitID, db.LibraryPublicationStateActive, library.CreatedAt, library.UpdatedAt,
 		)
 
 		// Dual-write to lookup table (unencrypted)

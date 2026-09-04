@@ -37,6 +37,12 @@ var (
 	cleanupLibraryLinksGuardedForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string, beforeMutation func() error) error {
 		return cleanupLibraryLinks(database, orgID, libraryID, beforeMutation)
 	}
+	revokeLibraryPublicationForDeleteFn = func(database *dbpkg.DB, orgID, libraryID string) error {
+		if database == nil {
+			return fmt.Errorf("database not available")
+		}
+		return dbpkg.RevokeLibraryPublication(database.Session(), orgID, libraryID)
+	}
 	readPermanentDeleteLibraryStateFn = func(database *dbpkg.DB, orgID, libraryID string, _ time.Time) (dbpkg.LibraryState, error) {
 		return dbpkg.ReadLibraryState(database.Session(), orgID, libraryID)
 	}
@@ -50,6 +56,9 @@ var (
 		return gcpkg.ReleaseLibraryHardDeleteLockLease(database.Session(), libraryID, leaseToken)
 	}
 	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string, deletedAt time.Time) error {
+		if err := revokeLibraryPublicationForDeleteFn(database, orgID, libraryID); err != nil {
+			return fmt.Errorf("revoke library publication authority for %s/%s: %w", orgID, libraryID, err)
+		}
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(database, batch, orgID, libraryID); err != nil {
 			return errors.Join(errHardDeleteLibraryReadModel, err)

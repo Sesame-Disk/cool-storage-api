@@ -1302,6 +1302,7 @@ Set appropriate consistency levels per operation:
 | GC candidate authority read (`GetBlockGCCandidateExact`) | `SERIAL` (explicit statement pin, `Consistency` not `SerialConsistency`) | A plain SELECT, pinned because its ABSENCE is destructive authority: "no candidate for this exact identity" retires the discovery row and then the queue and pending rows, which are the only durable references to it. Every write to `gc_block_candidates` is an LWT, so an ordinary quorum read can miss an accepted-but-uncommitted row and strand a live candidate |
 | GC block lifecycle (`gc_state` claim/release/finalize and conditional orphan transitions) | `SERIAL` (explicit statement pin) | Guards ownership and irreversible delete transitions; do NOT change production to `LOCAL_SERIAL` |
 | GC block-delete lifecycle tombstone (`gc_block_delete_lifecycles` INSERT / published→terminal UPDATE) | `SERIAL` (explicit statement pin) | Survives `DELETE` of `blocks` and clear of `gc_s3_orphans` so a stale D cannot replay physical delete |
+| Library HEAD publication and initial-library initialization | `SERIAL` (explicit statement pin) | Keeps HEAD advancement and terminal publication authority in one global Paxos domain, including legacy-`NULL` compatibility |
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
 
@@ -1375,9 +1376,10 @@ view:
   the relations it may touch, no `Bind`, no `BatchEntry` and no direct `Entries`
   access. A new batch allowance without a pinned shape fails the gate.
 
-`serial_consistency` remains the level for every **other** LWT, including the
-conditional library-HEAD publish, which has no explicit contract and is
-registered as `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` in `docs/KNOWN_ISSUES.md`.
+`serial_consistency` remains the level for every **other** LWT. Library HEAD
+publishes and conditional initialization are exceptions with an explicit global
+`SERIAL` pin; the historical configuration gap is tracked as closed in
+`ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01`.
 
 The dedicated `config-usa.cluster.yaml` and `config-eu.cluster.yaml` profiles are
 test/development harnesses and intentionally use `LOCAL_SERIAL`; they are not the

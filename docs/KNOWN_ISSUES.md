@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-08-24
+**Last Updated**: 2026-09-03
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -69,7 +69,7 @@ is right about why.
 | **Double S3 RTT Per Block (Exists + PUT)** | ✅ Fixed for hot upload paths (2026-06-15) | S3 HEAD replaced by a Cassandra `ProbeBlockReuse` (reuse / direct-PUT / GC-fence) on six server-side upload funnels. NOT global: legacy `BlockStore` Exists+PUT methods remain for unmigrated callers, and the reuse path keeps a canonical-verify HEAD. Fixed in `perf/p2-cassandra-first-hot-reuse`. See ISSUE-UPLOAD-S3-DOUBLE-RTT-01 below and `docs/UPLOAD-PERFORMANCE-SECURITY-2026-06.md`. |
 | **Manual GC Triggers Not Gated on `GC.Enabled`** | ✅ Fixed (2026-08-22) | `TriggerWorker`/`TriggerScanner` checked neither `Enabled` nor `started`, so the `GC_ENABLED=false` kill switch rested on a disabled service having no consumer goroutine rather than on a check where the decision is made — and `POST /api/v2.1/admin/gc/run` answered `{"started":true}` on nodes where nothing ran. Never a live bypass; hardened before a refactor could make it one. See ISSUE-GC-MANUAL-TRIGGER-NOT-GATED-01 below. |
 | **Read Paths Ignore `storage_key`** | ✅ Fixed by P1 locator authority (2026-08-21); P2/R9/R24 closed 2026-08-24 | Canonical reads, HEAD/existence, reuse/repair, normal GC delete, and orphan recovery consume the persisted exact key and support both legacy deterministic and minted incarnation locators. Every exact-key `BlockStore` operation rejects a key outside its configured prefix plus canonical org ID, and authority sites use `ValidatePhysicalLocator` rather than re-deriving equality. Arbitrary locator formats remain unsupported. See ISSUE-BLOCK-STORAGE-KEY-READS-01 below. |
-| **Library HEAD Publish Has No Serial-Domain Contract** | 🟡 Open — multi-DC only | The two conditional `UPDATE libraries ... IF head_commit_id = ?` publishes inherit the session's configurable `serial_consistency` instead of pinning their Paxos phase, so a deployment set to `LOCAL_SERIAL` serializes HEAD advancement only within one DC. Not reachable on the shipped `SERIAL` default or on a single-DC deployment. Registered when P0/R12 pinned the block/orphan LWTs and deliberately left this one out of scope. See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below. |
+| **Library HEAD Publish Has No Serial-Domain Contract** | ✅ Fixed (2026-09-03) | Both conditional HEAD publishes now explicitly pin `SerialConsistency(gocql.Serial)`, including the legacy-`NULL` compatibility branch. Initial-library authority statements use the same global SERIAL domain. See ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01 below for the historical finding. |
 | **Chunked Upload Chunk State Is Node-Local** | 🔴 See Production Blockers | Canonical status is in the Production Blockers table above (`ISSUE-UPLOAD-CHUNK-MULTINODE-01`). Listed here only as a cross-reference for the upload-debt cluster — do not maintain a second status. |
 
 ### GC Library-Delete Cleanup Audit (2026-07-10, refreshed 2026-07-16 — P10 fixed)
@@ -1400,16 +1400,17 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 
 ---
 
-### ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01: Library HEAD Publish Has No Explicit Serial-Domain Contract
+### ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01: Library HEAD Publish Had No Explicit Serial-Domain Contract
 
-**Status**: 🟡 Open — reachable only on a multi-DC deployment configured with `LOCAL_SERIAL`
-**Severity**: Medium (correctness under a supported configuration); no impact on the shipped `SERIAL` default or on single-DC
+**Status**: ✅ Fixed 2026-09-03
+**Severity**: Medium (historical correctness issue under a supported configuration)
 **Affected**: `updateLibraryHeadWithStats` in `internal/api/sync.go`, `UpdateLibraryHead` in `internal/api/v2/fs_helpers.go`
 **Registered**: 2026-08-24, as the deliberate out-of-scope boundary of P0/R12
 
 #### Problem
 
-Both conditional library-HEAD publishes are lightweight transactions:
+Both conditional library-HEAD publishes are lightweight transactions. Before the
+fix, they inherited the operator-configurable session serial level:
 
 ```sql
 UPDATE libraries SET head_commit_id = ?, ...
@@ -1417,41 +1418,23 @@ WHERE org_id = ? AND library_id = ?
 IF head_commit_id = ?
 ```
 
-Neither calls `SerialConsistency(...)`, so both take the Paxos phase from
-`cluster.SerialConsistency`, which is operator-configurable
-(`database.serial_consistency`). The shipped production default is `SERIAL`, but
-`LOCAL_SERIAL` is a supported value and the cluster test profiles
-(`config-usa.cluster.yaml`, `config-eu.cluster.yaml`) use it.
+The fix calls `SerialConsistency(gocql.Serial)` on both publish queries and on
+the conditional initialization statements. The legacy-`NULL` compatibility
+path is pinned as well, so publication authority remains in one global SERIAL
+domain regardless of `database.serial_consistency`.
 
-Under `LOCAL_SERIAL` with multi-region replication, the compare-and-set is
-serialized within one DC only. Two DCs can each read the same `head_commit_id`
-and each apply their own advancement, so the parent-chain validation that guards
-sync conflict recovery loses its atomicity across DCs — the same class of defect
-P0/R12 fixed for the block and orphan lifecycles. `newCluster` already emits a
-runtime warning for this combination (`internal/db/db.go`), which detects the
-configuration but does not constrain the statement.
+Under `LOCAL_SERIAL` with multi-region replication, the unfixed compare-and-set
+could be serialized within one DC only. Two DCs could each read the same
+`head_commit_id` and apply their own advancement, so parent-chain validation
+could lose its atomicity across DCs. The explicit pins now prevent that
+configuration from weakening the HEAD authority domain.
 
-#### Why it is not in P0/R12
+#### Resolution
 
-R12 covers the conditional mutations in the canonical block/orphan lifecycle, and
-its source gate (`TestR12SerialDomainGuard`) enumerates exactly those three
-relations. Library HEAD is a separate invariant with its own conflict-recovery
-design (`ISSUE-SYNC-HEAD-RECOVERY-01`), and pinning it is a behavior change to the
-sync write path rather than a restatement of an existing contract. It was
-registered rather than silently pinned so the decision stays visible.
-
-#### Fix direction
-
-Decide the contract explicitly, then enforce it the way R12 is enforced:
-
-1. Either pin both statements to `SerialConsistency(gocql.Serial)`, or document
-   that HEAD publish is intentionally DC-local and state what that costs an
-   active-active deployment.
-2. If pinned, extend the source gate to cover `libraries` so the pin cannot be
-   removed silently — the gate's target set is a map, so this is an entry plus an
-   expected-operation key, not a redesign.
-3. Cover it with the same mutation verification: removing or downgrading the pin
-   must fail the gate.
+The two publish queries and the initial-library conditional statements now call
+`SerialConsistency(gocql.Serial)` directly. The HEAD conflict-recovery design
+remains separate from the block/orphan source gate, but its cross-DC serial
+contract is no longer implicit.
 
 #### Related
 
@@ -2257,6 +2240,26 @@ leak until a real terminal-authority signal exists, rather than converging
 on a timeout as before -- leaking is the safe direction; converging on a
 timeout was the bug. See docs/CHANGELOG.md "W2 follow-up 5" for the full
 audit trail.
+
+W2a now supplies the missing terminal authority rather than inferring it from
+absence or elapsed time. HEAD writers require `libraries.publication_state =
+ACTIVE` in the global SERIAL domain; hard-delete first commits `ACTIVE ->
+TERMINAL` and persists a no-TTL `library_publication_revocations` witness at
+`EACH_QUORUM` before removing canonical rows. Repair therefore promotes only a
+reachable commit, retains an unreachable commit while authority is active or
+unknown, and cleans only after terminal authority is proven. The one-shot
+integration sweep seam makes retention evidence deterministic. This closes the
+specific W2 authority gap; continuous `up -> pub -> HEAD -> fs` continuity is
+still R31, and X1 remains OPEN.
+
+The follow-up hardening also avoids three partial-state regressions: a restore
+whose canonical ACTIVE transition already committed can retry its marker and
+projection finalization without reapplying the non-idempotent counter increment;
+creation rollback revokes publication before deleting canonical rows and never
+bulk-deletes staged or published commits/fs_objects; and a definite initial-head
+CAS rejection removes only that initializer's exact root/commit keys. Ambiguous
+initial writes retain their artifacts for repair. An ambiguous HEAD confirmation
+that observes `TERMINAL` is not reported as a successful publication.
 
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):

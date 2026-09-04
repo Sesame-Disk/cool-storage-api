@@ -570,11 +570,11 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 			org_id, library_id, owner_id, name, description, encrypted,
 			block_representation_id,
 			storage_class, size_bytes, file_count, version_ttl_days,
-			head_commit_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			head_commit_id, publication_state, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, ownerOrgID, newLibID.String(), ownerUserID, repoName,
 		"", false, blockRepresentationID, storageClass, int64(0), int64(0), versionTTLDays,
-		headCommitID, now, now,
+		headCommitID, dbpkg.LibraryPublicationStateActive, now, now,
 	)
 	batch.Query(`
 		INSERT INTO libraries_by_id (

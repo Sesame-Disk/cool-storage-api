@@ -946,9 +946,9 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	blockRepresentationID := db.NewLibraryBlockRepresentationID(newLibID, false)
 	batch.Query(`
-		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, block_representation_id, storage_class, size_bytes, file_count, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, newLibID, userID, repoName, false, blockRepresentationID, resolvedStorageClass, int64(0), int64(0), now, now)
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, block_representation_id, storage_class, size_bytes, file_count, publication_state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, newLibID, userID, repoName, false, blockRepresentationID, resolvedStorageClass, int64(0), int64(0), db.LibraryPublicationStateActive, now, now)
 	batch.Query(`
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted, block_representation_id)
 		VALUES (?, ?, ?, ?, ?, ?)

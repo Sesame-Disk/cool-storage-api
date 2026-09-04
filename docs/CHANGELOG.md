@@ -8,6 +8,45 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-03 - W2a: terminal publication authority and deterministic repair evidence
+
+The final audit findings are addressed without using `SERIAL ErrNotFound` as a
+deletion authority. `libraries.publication_state` now belongs to the same global
+SERIAL domain as HEAD: every HEAD CAS requires `ACTIVE`, while both API and GC
+hard-delete paths commit `ACTIVE -> TERMINAL` before deleting canonical rows.
+A no-TTL `library_publication_revocations` witness is written at `EACH_QUORUM`
+before deletion so repair can recognize terminality after `libraries` is gone.
+Missing rows without a durable revocation witness, unknown state and unavailable
+authority remain fail-closed and retain `pub:` plus the durable repair row.
+
+Repair now follows the final classification: reachable promotes, active but
+unreachable retains, terminal authority cleans up, and unknown authority
+retains/retries. The legacy lease remains only as queued metadata and never
+authorizes cleanup. Retention integration evidence uses the integration-only
+`RunPublishedBlockReferenceRepairSweepForTest` one-shot seam and asserts the
+positive post-sweep state. Continuous `up -> pub -> HEAD -> fs` continuity is
+still R31; X1 remains OPEN and `GC_ENABLED=false`.
+
+Initial HEAD creation now uses an ACTIVE-guarded conditional LWT in both the
+sync and v2 paths, and deleted-library restore clears `deleted_at` only through
+an ACTIVE-guarded conditional LWT. Cassandra table-scoping rules keep these LWTs
+separate from the multi-table object/projection batches. TERMINAL and unknown authority are rejected
+before restore effects run. Direct Cassandra integration coverage exercises the
+terminal transition against both initial-writer paths and restore. Before
+enabling terminal hard-delete, deployments must stop or isolate old writer
+versions that still issue the pre-W2a HEAD CAS shape.
+
+The audit hardening is fail-closed at partial boundaries: restore retries a
+canonical ACTIVE transition when the durable trash marker still exists but the
+derived batch was incomplete, and skips the non-idempotent synchronous counter
+increment on that retry. Creation rollback terminalizes authority before
+removing canonical rows and leaves commits/fs_objects for fenced orphan cleanup;
+only a definite initial-CAS rejection deletes the exact staged keys. A SERIAL
+confirmation of an ambiguous HEAD CAS also refuses to call a TERMINAL row a
+successful publication.
+
+---
+
 ## 2026-09-03 - W2 follow-up 5: the lease still isn't a revocation -- stop letting it authorize any cleanup for a live library
 
 An eighth-pass audit of "W2 follow-up 4" below found its fix real but
