@@ -3485,6 +3485,20 @@ func syncLibraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
 	return ok && value == ""
 }
 
+// syncLibraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS
+// observed publication_state = TERMINAL rather than an ordinary lost
+// head_commit_id race. A terminal library will never accept a HEAD CAS from
+// any writer again, so this must not be classified as the retryable
+// ErrHeadConflict a live conflict is -- see updateLibraryHeadWithStats.
+func syncLibraryHeadCASStateIsTerminal(casState map[string]interface{}) bool {
+	state, ok := casState["publication_state"]
+	if !ok || state == nil {
+		return false
+	}
+	value, ok := state.(string)
+	return ok && value == db.LibraryPublicationStateTerminal
+}
+
 func (h *SyncHandler) executeLibraryHeadCAS(orgID, repoID, commitID string, totalSize, fileCount int64, now time.Time, expectedHead string) (bool, map[string]interface{}, error) {
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
@@ -3534,6 +3548,14 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 		return fmt.Errorf("%w: conditional head update failed: %w", errSyncHeadCASUncertain, err)
 	}
 	if !applied {
+		// A terminal library will never accept another HEAD CAS, so this must
+		// not surface as syncHeadConflictError: that type unwraps to
+		// ErrHeadConflict, which the caller's retry loop treats as retryable
+		// and re-attempts up to maxAttempts times against a library that can
+		// never succeed again.
+		if syncLibraryHeadCASStateIsTerminal(casState) {
+			return fmt.Errorf("%w: commit %s in library %s", db.ErrLibraryPublicationTerminal, commitID, repoID)
+		}
 		currentHead, _ := casState["head_commit_id"].(string)
 		return &syncHeadConflictError{expectedHead: expectedHead, currentHead: currentHead}
 	}

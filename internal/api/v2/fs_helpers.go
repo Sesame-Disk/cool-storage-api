@@ -709,6 +709,20 @@ func libraryHeadCASStateIsLegacyNull(casState map[string]interface{}) bool {
 	return ok && value == ""
 }
 
+// libraryHeadCASStateIsTerminal reports whether a rejected HEAD CAS observed
+// publication_state = TERMINAL, as opposed to an ordinary lost head_commit_id
+// race. Distinguishing the two matters: a terminal library will never accept
+// another HEAD CAS from any writer, ever, so callers must not classify it as
+// ErrLibraryHeadConflict (retryable) the way a live conflict is.
+func libraryHeadCASStateIsTerminal(casState map[string]interface{}) bool {
+	state, ok := casState["publication_state"]
+	if !ok || state == nil {
+		return false
+	}
+	value, ok := state.(string)
+	return ok && value == db.LibraryPublicationStateTerminal
+}
+
 // libraryHeadConfirmVisibleFn resolves the ambiguous-CAS SERIAL confirmation
 // read. Overridable only for deterministic integration testing (see
 // SetLibraryHeadConfirmVisibleForTest in the integration build); production
@@ -789,6 +803,16 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 		})
 	}
 	if !applied {
+		// A terminal library will never accept a HEAD CAS from any writer,
+		// ever -- unlike an ordinary lost race, retrying cannot help, and
+		// classifying this as ErrLibraryHeadConflict would make bounded
+		// retry loops (e.g. seafhttp.go's commitUploadedFileMultiBlock)
+		// burn every attempt against a library that is permanently gone,
+		// then surface a "retry the upload" message that is never true
+		// again.
+		if libraryHeadCASStateIsTerminal(casState) {
+			return fmt.Errorf("%w: commit %s in library %s", db.ErrLibraryPublicationTerminal, commitID, repoID)
+		}
 		currentHead, _ := casState["head_commit_id"].(string)
 		return fmt.Errorf("%w: expected %s but found %s", ErrLibraryHeadConflict, expectedHead, currentHead)
 	}

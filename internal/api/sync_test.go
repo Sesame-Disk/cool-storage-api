@@ -348,6 +348,36 @@ func TestResolveBlockStoreForLookupFallsBackThroughManager(t *testing.T) {
 	}
 }
 
+// TestSyncLibraryHeadCASStateIsTerminal pins the classification a rejected
+// sync HEAD CAS uses to decide between the retryable syncHeadConflictError
+// (ErrHeadConflict) and db.ErrLibraryPublicationTerminal (never retryable --
+// see updateLibraryHeadWithStats). A terminal library will never accept
+// another HEAD CAS, so misclassifying it as an ordinary conflict would burn
+// the caller's bounded retry budget against a library that can never
+// succeed, and misclassifying an ordinary conflict as terminal would abandon
+// a live, merely-losing writer without retrying.
+func TestSyncLibraryHeadCASStateIsTerminal(t *testing.T) {
+	tests := []struct {
+		name     string
+		casState map[string]interface{}
+		want     bool
+	}{
+		{"terminal", map[string]interface{}{"publication_state": db.LibraryPublicationStateTerminal}, true},
+		{"active", map[string]interface{}{"publication_state": db.LibraryPublicationStateActive}, false},
+		{"legacyNullValue", map[string]interface{}{"publication_state": nil}, false},
+		{"missingKey", map[string]interface{}{"head_commit_id": "commit-1"}, false},
+		{"emptyString", map[string]interface{}{"publication_state": ""}, false},
+		{"nonStringValue", map[string]interface{}{"publication_state": 42}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := syncLibraryHeadCASStateIsTerminal(tt.casState); got != tt.want {
+				t.Fatalf("syncLibraryHeadCASStateIsTerminal(%#v) = %v, want %v", tt.casState, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSyncHandlerWithoutDB tests sync handlers return appropriate errors without DB
 func TestSyncHandlerWithoutDB(t *testing.T) {
 	r := setupSyncTestRouter()

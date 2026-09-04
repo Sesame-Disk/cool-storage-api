@@ -1361,6 +1361,35 @@ func TestResolveLibraryHeadUpdateErrorDoesNotTreatTerminalConfirmationAsSuccess(
 	}
 }
 
+// TestLibraryHeadCASStateIsTerminal pins the classification a rejected HEAD
+// CAS uses to decide between ErrLibraryHeadConflict (retryable) and
+// db.ErrLibraryPublicationTerminal (never retryable -- see UpdateLibraryHead).
+// Getting this wrong in either direction is a real regression: false-terminal
+// would abandon a live, merely-losing writer without retrying; false-conflict
+// would burn a bounded retry budget against a library that can never accept
+// another HEAD CAS again.
+func TestLibraryHeadCASStateIsTerminal(t *testing.T) {
+	tests := []struct {
+		name     string
+		casState map[string]interface{}
+		want     bool
+	}{
+		{"terminal", map[string]interface{}{"publication_state": db.LibraryPublicationStateTerminal}, true},
+		{"active", map[string]interface{}{"publication_state": db.LibraryPublicationStateActive}, false},
+		{"legacyNullValue", map[string]interface{}{"publication_state": nil}, false},
+		{"missingKey", map[string]interface{}{"head_commit_id": "commit-1"}, false},
+		{"emptyString", map[string]interface{}{"publication_state": ""}, false},
+		{"nonStringValue", map[string]interface{}{"publication_state": 42}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := libraryHeadCASStateIsTerminal(tt.casState); got != tt.want {
+				t.Fatalf("libraryHeadCASStateIsTerminal(%#v) = %v, want %v", tt.casState, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveLibraryHeadUpdateErrorReturnsFailureWhenConfirmedNotVisible(t *testing.T) {
 	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.RequestErrCASWriteUnknown{}, func() (string, bool, error) {
 		return "head-old", false, nil

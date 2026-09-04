@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	v2api "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -60,6 +61,21 @@ func TestLibraryPublicationTerminalAuthorityBlocksHEADAndSurvivesHardDelete(t *t
 	}
 	if applied {
 		t.Fatal("HEAD CAS applied after publication authority became terminal")
+	}
+
+	// The raw CQL above proves the CAS itself is guarded; this proves the
+	// production writer path surfaces that rejection as a distinct,
+	// non-retryable error instead of the ordinary (retryable)
+	// ErrLibraryHeadConflict a live HEAD race returns. Misclassifying it
+	// would make bounded retry loops (e.g. seafhttp.go's
+	// commitUploadedFileMultiBlock) burn every attempt against a library
+	// that will never accept a HEAD CAS again.
+	updateErr := v2api.NewFSHelper(database).UpdateLibraryHead(orgID, repoID, state.HeadCommitID, state.HeadCommitID)
+	if !errors.Is(updateErr, dbpkg.ErrLibraryPublicationTerminal) {
+		t.Fatalf("UpdateLibraryHead() error = %v, want db.ErrLibraryPublicationTerminal", updateErr)
+	}
+	if errors.Is(updateErr, v2api.ErrLibraryHeadConflict) {
+		t.Fatalf("UpdateLibraryHead() error = %v, must not also classify as the retryable ErrLibraryHeadConflict", updateErr)
 	}
 
 	libraryUUID, err := uuid.Parse(repoID)
