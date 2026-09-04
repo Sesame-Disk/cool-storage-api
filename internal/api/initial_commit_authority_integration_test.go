@@ -231,6 +231,42 @@ func TestCreateInitialCommit_RejectsResurrectionOfRevokedAbsentLibrary(t *testin
 	}
 }
 
+// TestCreateInitialCommit_RejectsRetryOnGenuinelyAbsentLibraryRow closes the
+// TOCTOU gap in the resurrection guard: IsLibraryPublicationRevoked and the
+// legacy retry CAS are two separate round trips, not one atomic operation, so
+// a hard-delete that revokes and removes the canonical row strictly between
+// them would observe revoked=false yet still face an absent row at retry
+// time -- the witness check alone cannot close that window because it lives
+// in a different table. This test reproduces the retry CAS's observable state
+// in that window directly: no canonical row and no witness at all (as if the
+// witness check ran and returned false a moment before a concurrent
+// hard-delete both wrote the witness and removed the row). Before the
+// owner_id-guarded retry CAS, Cassandra's IF clause read every column of the
+// absent partition as NULL and materialized a phantom ACTIVE library that was
+// never created through any normal path.
+func TestCreateInitialCommit_RejectsRetryOnGenuinelyAbsentLibraryRow(t *testing.T) {
+	db := initialCommitAuthorityDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM commits WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if _, err := (&SyncHandler{db: db}).createInitialCommit(libraryID.String(), orgID.String(), ownerID.String()); err == nil {
+		t.Fatal("initial commit must not materialize a library row that was never created")
+	}
+
+	var storedLibraryID string
+	err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&storedLibraryID)
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("canonical library row must remain absent after a rejected retry: err=%v row=%q", err, storedLibraryID)
+	}
+}
+
 // TestCreateInitialCommit_AcceptsGenuineLegacyNullRow is the control case for
 // the previous test: a library row that genuinely predates migration 021
 // (publication_state IS NULL, row present, no revocation witness) must still

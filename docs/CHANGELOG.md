@@ -8,6 +8,52 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a follow-up round 2: retry CAS is now the atomic existence check, commit id is now nonce-based
+
+A second review of the round-1 fix below found the round-1 resurrection guard
+was itself incomplete, plus confirmed a second, independent hazard round 1 had
+misjudged as harmless. Both are confined to the same two call sites
+(`FSHelper.InitializeLibraryFS`, `SyncHandler.createInitialCommit`).
+
+1. **The witness check and the retry CAS were not atomic with each other
+   (P1).** `db.IsLibraryPublicationRevoked` (round 1's fix) reads a different
+   table than the retry CAS mutates, in a separate round trip. A hard-delete
+   landing strictly between that read and the retry CAS -- revoking authority
+   and removing the canonical row after the read observed not-revoked, but
+   before the retry CAS ran -- would still let the retry CAS see an absent
+   partition satisfying `IF head_commit_id = null AND publication_state =
+   null`, resurrecting exactly the library round 1 intended to protect. Fixed
+   by adding `owner_id != null` directly to the retry CAS's `IF` clause in
+   both call sites: `owner_id` is set when a library row is created and never
+   cleared afterward, so it reads back NULL if and only if the partition is
+   genuinely absent. The existence check is now evaluated in the same LWT as
+   the retry itself, so no interleaving can land in between; the witness read
+   remains as a cheap early exit but is no longer what makes the retry safe.
+   New coverage (`TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck`
+   in `internal/api/v2`, `TestCreateInitialCommit_RejectsRetryOnGenuinelyAbsentLibraryRow`
+   in `internal/api`) reproduces the retry CAS's exact observable state in that
+   window and asserts it no longer applies.
+2. **Initial commit id previously derived its uniqueness from
+   `time.Now().UnixNano()` (P1).** The round-1 entry below judged a
+   same-nanosecond collision "astronomically unlikely" and inconsequential
+   given the shared-root fix. That reasoning was wrong on its own terms: two
+   concurrent initializers of the *same* library that computed the same
+   commit id would `INSERT` the identical `(library_id, commit_id)` primary
+   key -- an upsert, not two rows -- so after the shared-root fix narrowed
+   cleanup to delete-by-exact-commit-id, a collision would make the loser's
+   "delete only my own commit" cleanup delete the single row the winner had
+   just published as HEAD, corrupting the library. `time.Now().UnixNano()`
+   resolution is also not guaranteed to be 1ns on every platform. Fixed by
+   deriving the id from a random nonce (`uuid.NewString()`) instead of the
+   wall clock, in a new `newInitialCommitID` helper shared by each call site's
+   package. Uniqueness no longer depends on timing at all, so this closes the
+   hazard structurally rather than by making the collision window smaller.
+   New unit coverage (`TestNewInitialCommitIDIsDistinctAcrossCalls` in both
+   `internal/api` and `internal/api/v2`) asserts 1000 consecutive calls with
+   the same `repoID`/library-name inputs never collide.
+
+---
+
 ## 2026-09-04 - W2a follow-up: shared-root loser cleanup and stale-initializer resurrection
 
 A four-report consolidated audit of the W2a PR (below) converged on one
@@ -87,14 +133,6 @@ hard-delete has committed. This release must roll out atomically. SesameFS is
 pre-production with no existing writer fleet to stage a mixed-version rollout
 against, so this is a forward-looking rollout contract, not a gap this PR
 needed to close in code.
-
-Not changed: `buildCommitID`/`createInitialCommit`'s use of
-`time.Now().UnixNano()` rather than a UUID/nonce for commit-attempt identity.
-One auditor flagged it as hardening; with the shared-root fix above, the loser
-no longer deletes anything the winner depends on, so a same-nanosecond
-collision (already astronomically unlikely across two independent processes)
-would at worst cause one initializer's definite-rejection cleanup to target
-the wrong of two identical-content commit rows -- never data loss.
 
 ---
 

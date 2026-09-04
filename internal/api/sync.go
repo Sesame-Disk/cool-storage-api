@@ -1060,6 +1060,18 @@ func (h *SyncHandler) GetHeadCommit(c *gin.Context) {
 	})
 }
 
+// newInitialCommitID derives an initial commit id from a random nonce, not
+// wall-clock time. Concurrent initializers of the same library must never
+// compute the same commit id: the loser's exact-key cleanup
+// (deleteInitialCommitArtifacts) deletes by that id alone, so a shared id
+// would delete the commit row a winner just published. time.Now().UnixNano()
+// alone does not guarantee distinctness -- its resolution is not 1ns on every
+// platform, and two initializers racing the same CAS domain can plausibly
+// observe the same value.
+func newInitialCommitID(repoID, rootID string) string {
+	return sha1Hex(fmt.Sprintf("%s-%s-%s", repoID, rootID, uuid.NewString()))
+}
+
 // createInitialCommit creates the first commit for an empty repository
 func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string, error) {
 	now := time.Now()
@@ -1085,9 +1097,8 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 		return "", fmt.Errorf("failed to create root fs object: %w", err)
 	}
 
-	// Create initial commit. Include nanosecond time so concurrent initializers
-	// cannot accidentally share an id and make exact loser cleanup unsafe.
-	commitID := sha1Hex(fmt.Sprintf("%s-%s-%d", repoID, rootID, now.UnixNano()))
+	// Create initial commit id from a random nonce, not wall-clock time.
+	commitID := newInitialCommitID(repoID, rootID)
 
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
@@ -1116,10 +1127,16 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 		// v2's FSHelper.InitializeLibraryFS. A NULL here is ambiguous -- Cassandra
 		// returns the same NULL for a genuine untouched pre-021 row and for a
 		// partition that does not exist at all, which is exactly what a
-		// hard-deleted library looks like once its row is physically removed --
-		// so the durable revocation witness must be consulted first. Without it,
-		// a stale initializer racing a hard-delete could resurrect a terminally
-		// revoked library as ACTIVE.
+		// hard-deleted library looks like once its row is physically removed.
+		// The durable revocation witness is consulted first as a cheap early
+		// exit, but it is NOT what makes the retry below safe: a hard-delete
+		// that revokes and removes the row strictly after this read (and before
+		// the retry CAS) would leave the witness unseen here. Safety instead
+		// comes from owner_id in the retry CAS's own IF clause: owner_id is set
+		// at row creation and never cleared, so it reads back NULL only when the
+		// partition is genuinely absent -- distinguishing that case from a real
+		// untouched legacy row atomically, in the same LWT, with no window for a
+		// concurrent hard-delete to land in between.
 		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
 		if revokeErr != nil {
 			return "", fmt.Errorf("failed to update library head: check publication revocation: %w", revokeErr)
@@ -1129,7 +1146,7 @@ func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string,
 			applied, err = h.db.Session().Query(`
 				UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?, publication_state = ?
 				WHERE org_id = ? AND library_id = ?
-				IF head_commit_id = null AND publication_state = null
+				IF owner_id != null AND head_commit_id = null AND publication_state = null
 			`, commitID, commitID, int64(0), int64(0), now, db.LibraryPublicationStateActive, orgID, repoID).
 				SerialConsistency(gocql.Serial).MapScanCAS(casState)
 			if err != nil {

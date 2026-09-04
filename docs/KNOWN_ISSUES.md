@@ -2308,6 +2308,35 @@ terminal authority is in use. SesameFS is pre-production with no existing
 writer fleet to stage against, so this is a rollout contract for the future,
 not a currently exercised gap.
 
+A second-round review of the resurrection guard above found the witness check
+itself was not sufficient to close the race it was added for, plus a second,
+independent hazard in the same two call sites:
+
+- **Witness check vs. retry CAS was a TOCTOU, not one atomic operation.**
+  `db.IsLibraryPublicationRevoked` and the legacy retry CAS are two separate
+  round trips against two different tables. A hard-delete that revokes and
+  removes the canonical row strictly *after* the witness read returns
+  not-revoked, but *before* the retry CAS executes, would leave that CAS
+  facing a genuinely absent partition -- which satisfies
+  `IF head_commit_id = null AND publication_state = null` exactly as well as a
+  real untouched legacy row does. Fixed by adding `owner_id != null` to the
+  retry CAS's own `IF` clause in both call sites: `owner_id` is set at row
+  creation and never cleared, so it reads back NULL only when the partition is
+  genuinely absent. This makes the existence check part of the same atomic LWT
+  as the retry itself, closing the window regardless of timing; the witness
+  read stays in place as a cheap early exit, not as the correctness mechanism.
+- **Initial commit id derived its uniqueness from `time.Now().UnixNano()`.**
+  Once loser cleanup was narrowed to an exact-key delete (above), commit
+  identity became load-bearing: two concurrent initializers of the same
+  library that computed the same commit id (an upsert on the shared PK) would
+  let the loser's "delete my own commit" cleanup delete the row the winner
+  just published, because there would be only one row, not two. Nanosecond
+  clock resolution is not guaranteed on every platform, so this was not the
+  purely theoretical risk a prior pass judged it to be. Fixed by deriving the
+  id from a random nonce (`uuid.NewString()`) instead of the wall clock, in
+  `newInitialCommitID` in both call sites -- uniqueness no longer depends on
+  timing at all.
+
 Design analysis: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X1. Accepted architecture
 (D0 freeze, X1 still OPEN):
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).

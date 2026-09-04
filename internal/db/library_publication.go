@@ -23,10 +23,15 @@ var ErrLibraryPublicationTerminal = errors.New("library publication authority is
 // never been touched and for a partition that does not exist at all (the
 // columns in an IF clause read as NULL against an absent row too), so this
 // function alone cannot tell "untouched legacy row" from "hard-deleted
-// library". A caller that would grant ACTIVE authority on this signal MUST
-// first consult IsLibraryPublicationRevoked: if the durable witness is
-// present, the row is absent because it was terminally revoked, not because
-// it predates migration 021, and retrying as legacy would resurrect it.
+// library". A caller that would grant ACTIVE authority on this signal should
+// consult IsLibraryPublicationRevoked first as a cheap early exit, but that
+// check is NOT sufficient by itself: it is a separate round trip against a
+// different table, so a hard-delete landing strictly between the witness read
+// and the retry CAS would go unseen. The retry CAS's own IF clause MUST also
+// include a real, non-null, never-cleared column (e.g. libraries.owner_id) as
+// an existence check, so the row's absence is detected atomically, in the
+// same LWT as the retry -- with no window for a concurrent hard-delete to
+// land in between.
 func LibraryPublicationCASStateIsLegacyNull(casState map[string]interface{}) bool {
 	state, ok := casState["publication_state"]
 	if !ok || state == nil {

@@ -945,6 +945,33 @@ func TestSha1Hex(t *testing.T) {
 	}
 }
 
+// TestNewInitialCommitIDIsDistinctAcrossCalls guards the fix for a real P1:
+// the commit id previously derived its uniqueness from time.Now().UnixNano(),
+// which is not guaranteed distinct across two concurrent initializers of the
+// same library on every platform. Since a rejected initializer's cleanup
+// (deleteInitialCommitArtifacts) deletes by exact commit_id alone, a shared
+// id would let the loser delete the exact commit row the winner just
+// published. Identity now comes from a random nonce, so even repoID and
+// rootID held constant (as they are for two initializers of the same
+// library) must still yield distinct ids on every call, independent of the
+// wall clock.
+func TestNewInitialCommitIDIsDistinctAcrossCalls(t *testing.T) {
+	const repoID = "11111111-1111-1111-1111-111111111111"
+	const rootID = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+
+	seen := make(map[string]bool)
+	for i := 0; i < 1000; i++ {
+		id := newInitialCommitID(repoID, rootID)
+		if len(id) != 40 || !isHexString([]byte(id)) {
+			t.Fatalf("newInitialCommitID(%d) = %q, want 40-char hex", i, id)
+		}
+		if seen[id] {
+			t.Fatalf("newInitialCommitID produced a duplicate id %q for the same repoID/rootID across %d calls", id, i+1)
+		}
+		seen[id] = true
+	}
+}
+
 // TestFSIDListJSONFormat tests that fs-id-list returns JSON array format
 func TestFSIDListJSONFormat(t *testing.T) {
 	// Empty list should be []

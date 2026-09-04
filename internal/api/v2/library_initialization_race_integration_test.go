@@ -142,6 +142,83 @@ func TestInitializeLibraryFS_RejectsResurrectionOfRevokedAbsentLibrary(t *testin
 	}
 }
 
+// TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck
+// closes the TOCTOU gap in the resurrection guard: IsLibraryPublicationRevoked
+// and the legacy retry CAS are two separate round trips, not one atomic
+// operation, so a hard-delete that revokes and removes the canonical row
+// strictly between them would observe revoked=false yet still face an absent
+// row once the retry CAS runs -- the witness check alone cannot close that
+// window because it lives in a different table. InitializeLibraryFS reads the
+// library's admin projection row before it ever reaches this CAS, which makes
+// it impossible to black-box a library that vanishes mid-call without adding
+// a dedicated test seam to production code; this test instead drives the
+// exact sequence the retry performs -- a witness check that is genuinely
+// stale by the time the retry CAS below executes -- against the literal query
+// InitializeLibraryFS issues. Before the owner_id guard, this retry CAS would
+// apply against the absent partition and resurrect it.
+func TestInitializeLibraryFS_LegacyRetryCASRejectsRowRemovedAfterWitnessCheck(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "initialize-toctou-guard",
+		now, now).Exec(); err != nil {
+		t.Fatalf("seed legacy (pre-021) library: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	// The witness check runs while the row is still a genuine, present legacy
+	// row: it correctly observes not-revoked, exactly as InitializeLibraryFS's
+	// own check would at this point.
+	revoked, err := dbpkg.IsLibraryPublicationRevoked(session, orgID.String(), libraryID.String())
+	if err != nil {
+		t.Fatalf("check publication revocation: %v", err)
+	}
+	if revoked {
+		t.Fatal("witness must not be present before the simulated concurrent hard-delete")
+	}
+
+	// Simulate a concurrent hard-delete landing strictly after the witness
+	// check above returned false: revoke authority (writes the durable
+	// witness) and remove the canonical row, exactly as gc.HardDeleteLibrary
+	// does.
+	if err := dbpkg.RevokeLibraryPublication(session, orgID.String(), libraryID.String()); err != nil {
+		t.Fatalf("simulate concurrent revoke: %v", err)
+	}
+	if err := session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec(); err != nil {
+		t.Fatalf("simulate concurrent hard-delete: %v", err)
+	}
+
+	// Now run the exact retry CAS InitializeLibraryFS issues once its (stale)
+	// witness check has already returned false.
+	casState := map[string]interface{}{}
+	applied, err := session.Query(`
+		UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
+		IF owner_id != null AND head_commit_id = null AND publication_state = null
+	`, "deadbeef", dbpkg.LibraryPublicationStateActive, orgID.String(), libraryID.String()).
+		SerialConsistency(gocql.Serial).MapScanCAS(casState)
+	if err != nil {
+		t.Fatalf("retry CAS: %v", err)
+	}
+	if applied {
+		t.Fatal("retry CAS must not resurrect a library removed by a concurrent hard-delete that landed after the witness check")
+	}
+
+	var storedLibraryID string
+	err = session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&storedLibraryID)
+	if !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("canonical library row must remain absent: err=%v row=%q", err, storedLibraryID)
+	}
+}
+
 // TestInitializeLibraryFS_AcceptsGenuineLegacyNullRow is the control case for
 // the previous test: a library row that genuinely predates migration 021
 // (publication_state IS NULL, row present, no revocation witness) must still

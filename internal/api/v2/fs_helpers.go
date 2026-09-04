@@ -930,6 +930,19 @@ func (h *FSHelper) syncLibraryHeadDerivedState(orgID, repoID string) error {
 	return nil
 }
 
+// newInitialCommitID derives an initial commit id from a random nonce, not
+// wall-clock time. Concurrent initializers of the same library must never
+// compute the same commit id: the loser's exact-key cleanup
+// (deleteInitialLibraryFSArtifacts) deletes by that id alone, so a shared id
+// would delete the commit row a winner just published. time.Now().UnixNano()
+// alone does not guarantee distinctness -- its resolution is not 1ns on every
+// platform, and two initializers racing the same CAS domain can plausibly
+// observe the same value.
+func newInitialCommitID(repoID, repoName string) string {
+	commitHash := sha1.Sum([]byte(fmt.Sprintf("%s:%s:%s", repoID, repoName, uuid.NewString())))
+	return hex.EncodeToString(commitHash[:])
+}
+
 // InitializeLibraryFS creates the empty root directory, initial commit, and sets
 // head_commit_id on a newly created library. This MUST be called after inserting
 // the library rows (libraries + libraries_by_id) so that file uploads work.
@@ -943,9 +956,7 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 	rootFSID := hex.EncodeToString(emptyDirHash[:])
 
 	// 2. Generate initial commit ID
-	commitData := fmt.Sprintf("%s:%s:%d", repoID, repoName, now.UnixNano())
-	commitHash := sha1.Sum([]byte(commitData))
-	headCommitID := hex.EncodeToString(commitHash[:])
+	headCommitID := newInitialCommitID(repoID, repoName)
 	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		return fmt.Errorf("failed to read library projection row: %w", err)
@@ -982,10 +993,16 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 		// A NULL publication_state here is ambiguous: Cassandra returns the same
 		// NULL for a genuine untouched pre-021 row and for a partition that does
 		// not exist at all -- which is exactly what a hard-deleted library looks
-		// like once its canonical row is physically removed. Only the durable
-		// revocation witness distinguishes them; without this check, a stale
-		// initializer racing a hard-delete could resurrect a terminally revoked
-		// library as ACTIVE.
+		// like once its canonical row is physically removed. The durable
+		// revocation witness is consulted first as a cheap early exit, but it is
+		// NOT what makes the retry below safe: a hard-delete that revokes and
+		// removes the row strictly after this read (and before the retry CAS)
+		// would leave the witness unseen here. Safety instead comes from
+		// owner_id in the retry CAS's own IF clause: owner_id is set at row
+		// creation and never cleared, so it reads back NULL only when the
+		// partition is genuinely absent -- distinguishing that case from a real
+		// untouched legacy row atomically, in the same LWT, with no window for a
+		// concurrent hard-delete to land in between.
 		revoked, revokeErr := db.IsLibraryPublicationRevoked(h.db.Session(), orgID, repoID)
 		if revokeErr != nil {
 			return fmt.Errorf("failed to initialize library fs state: check publication revocation: %w", revokeErr)
@@ -994,7 +1011,7 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 			casState = map[string]interface{}{}
 			applied, err = h.db.Session().Query(`
 				UPDATE libraries SET head_commit_id = ?, publication_state = ? WHERE org_id = ? AND library_id = ?
-				IF head_commit_id = null AND publication_state = null
+				IF owner_id != null AND head_commit_id = null AND publication_state = null
 			`, headCommitID, db.LibraryPublicationStateActive, orgID, repoID).
 				SerialConsistency(gocql.Serial).MapScanCAS(casState)
 			if err != nil {

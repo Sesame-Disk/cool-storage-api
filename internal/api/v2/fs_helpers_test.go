@@ -2,6 +2,7 @@ package v2
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -23,6 +24,33 @@ type freshInstallRequestError struct {
 func (e freshInstallRequestError) Code() int       { return e.code }
 func (e freshInstallRequestError) Message() string { return "request error" }
 func (e freshInstallRequestError) Error() string   { return e.Message() }
+
+// TestNewInitialCommitIDIsDistinctAcrossCalls guards the fix for a real P1:
+// the initial commit id previously derived its uniqueness from
+// time.Now().UnixNano(), which is not guaranteed distinct across two
+// concurrent initializers of the same library on every platform. Since a
+// rejected initializer's cleanup (deleteInitialLibraryFSArtifacts) deletes by
+// exact commit_id alone, a shared id would let the loser delete the exact
+// commit row the winner just published. Identity now comes from a random
+// nonce, so even repoID and repoName held constant (as they are for two
+// initializers of the same library) must still yield distinct ids on every
+// call, independent of the wall clock.
+func TestNewInitialCommitIDIsDistinctAcrossCalls(t *testing.T) {
+	const repoID = "11111111-1111-1111-1111-111111111111"
+	const repoName = "shared-library-name"
+
+	seen := make(map[string]bool)
+	for i := 0; i < 1000; i++ {
+		id := newInitialCommitID(repoID, repoName)
+		if decoded, err := hex.DecodeString(id); err != nil || len(decoded) != 20 {
+			t.Fatalf("newInitialCommitID(%d) = %q, want 40-char hex: %v", i, id, err)
+		}
+		if seen[id] {
+			t.Fatalf("newInitialCommitID produced a duplicate id %q for the same repoID/repoName across %d calls", id, i+1)
+		}
+		seen[id] = true
+	}
+}
 
 func TestIsTransientFreshInstallPreparationErrorRequestCodes(t *testing.T) {
 	tests := []struct {
