@@ -49,6 +49,93 @@ func headCommitIDGuardQueryLiteralText(call *ast.CallExpr) (text string, ok bool
 	return unquoted, true
 }
 
+func headCommitIDGuardNormalizedCQL(cql string) string {
+	return strings.Join(strings.Fields(strings.ToLower(cql)), " ")
+}
+
+func headCommitIDGuardLibrariesUpdateSet(cql string) (string, bool) {
+	normalized := headCommitIDGuardNormalizedCQL(cql)
+	if !strings.HasPrefix(normalized, "update ") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(normalized, "update ")
+	setLoc := strings.Index(rest, " set ")
+	if setLoc < 0 {
+		return "", false
+	}
+	table := strings.ReplaceAll(strings.TrimSpace(rest[:setLoc]), "\"", "")
+	parts := strings.Split(table, ".")
+	if len(parts) == 0 || parts[len(parts)-1] != "libraries" {
+		return "", false
+	}
+	setStart := setLoc + len(" set ")
+	whereLoc := strings.Index(rest[setStart:], " where ")
+	if whereLoc < 0 {
+		return rest[setStart:], true
+	}
+	return rest[setStart : setStart+whereLoc], true
+}
+
+func headCommitIDGuardSetTouchesHead(setClause string) bool {
+	for _, assignment := range strings.Split(setClause, ",") {
+		lhs, _, ok := strings.Cut(strings.TrimSpace(assignment), "=")
+		if ok && strings.Trim(strings.TrimSpace(lhs), "\"") == "head_commit_id" {
+			return true
+		}
+	}
+	return false
+}
+
+var headCommitIDGuardPublicationActivePredicate = regexp.MustCompile("(?:^|[\\s(])publication_state\\s*=\\s*\\?(?:$|[\\s,)])")
+
+func headCommitIDGuardPlaceholderCount(cql string) int {
+	count := 0
+	var quote rune
+	for _, ch := range cql {
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '?' {
+			count++
+		}
+	}
+	return count
+}
+
+func headCommitIDGuardIsActiveExpr(expr ast.Expr) bool {
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		if value.Kind != token.STRING {
+			return false
+		}
+		text, err := strconv.Unquote(value.Value)
+		return err == nil && strings.EqualFold(strings.TrimSpace(text), "ACTIVE")
+	case *ast.SelectorExpr:
+		return value.Sel.Name == "LibraryPublicationStateActive"
+	default:
+		return false
+	}
+}
+
+func headCommitIDGuardHasActivePublicationBind(cql string, call *ast.CallExpr, ifLoc []int) bool {
+	normalized := headCommitIDGuardNormalizedCQL(cql)
+	match := headCommitIDGuardPublicationActivePredicate.FindStringIndex(normalized[ifLoc[0]:])
+	if match == nil {
+		return false
+	}
+	targetEnd := ifLoc[0] + match[1]
+	bindOrdinal := headCommitIDGuardPlaceholderCount(normalized[:targetEnd])
+	bindIndex := bindOrdinal
+	return bindIndex > 0 && bindIndex < len(call.Args) && headCommitIDGuardIsActiveExpr(call.Args[bindIndex])
+}
+
 // headCommitIDGuardHasChainedSerialConsistency reports whether
 // `.SerialConsistency(gocql.Serial)` is called directly on the result of
 // queryCall (i.e. `queryCall.SerialConsistency(gocql.Serial)...`), found
@@ -118,22 +205,20 @@ func checkHeadCommitIDWriters(fset *token.FileSet, file *ast.File) (violations [
 		if !ok {
 			return true
 		}
-		lowerCQL := strings.ToLower(cql)
-		if !strings.Contains(lowerCQL, "update libraries set") || strings.Contains(lowerCQL, "libraries_by_id") {
-			return true
-		}
-		if !strings.Contains(lowerCQL, "head_commit_id") {
+		normalizedCQL := headCommitIDGuardNormalizedCQL(cql)
+		setClause, isLibrariesUpdate := headCommitIDGuardLibrariesUpdateSet(cql)
+		if !isLibrariesUpdate || !headCommitIDGuardSetTouchesHead(setClause) {
 			return true
 		}
 		found++
 		pos := fset.Position(call.Pos())
 
-		ifLoc := headCommitIDGuardIfKeyword.FindStringIndex(lowerCQL)
+		ifLoc := headCommitIDGuardIfKeyword.FindStringIndex(normalizedCQL)
 		switch {
 		case ifLoc == nil:
 			violations = append(violations, headCommitIDGuardViolation{pos, "writes libraries.head_commit_id with no IF clause at all -- W2a requires every HEAD writer to be a conditional LWT gated on publication_state, not an unconditional write:\n" + cql})
-		case !strings.Contains(lowerCQL[ifLoc[0]:], "publication_state"):
-			violations = append(violations, headCommitIDGuardViolation{pos, "writes libraries.head_commit_id but its IF clause does not condition on publication_state (publication_state appearing only in the SET list does not count) -- a TERMINAL (hard-deleted) library could accept a new HEAD:\n" + cql})
+		case !headCommitIDGuardHasActivePublicationBind(cql, call, ifLoc):
+			violations = append(violations, headCommitIDGuardViolation{pos, "writes libraries.head_commit_id but its IF clause does not condition on publication_state = ? bound to ACTIVE -- a TERMINAL (hard-deleted) library could accept a new HEAD:\n" + cql})
 		}
 		if !headCommitIDGuardHasChainedSerialConsistency(file, call) {
 			violations = append(violations, headCommitIDGuardViolation{pos, "writes libraries.head_commit_id without .SerialConsistency(gocql.Serial) chained directly onto this Query call -- a weaker consistency can observe a stale, pre-CAS publication_state from another DC:\n" + cql})

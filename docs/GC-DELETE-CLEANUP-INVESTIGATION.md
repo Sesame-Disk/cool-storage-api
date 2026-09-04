@@ -404,6 +404,11 @@ re-discovered by scanner Phase 0.
 
 ### Verdict 3 — confirmed production gaps (P1–P10)
 
+The former soft-delete/restore race is closed by the shared library lifecycle
+fence. API soft-delete, GC soft-delete, restore, and both hard-delete paths now
+participate in the same tokenized lease. The org cascade passes its held library
+lease into soft-delete, so this coverage does not introduce a re-entrant acquire.
+
 | # | Verified finding | Sev | Evidence | Issue |
 |---|---|---|---|---|
 | P1 ✅ **FIXED (6A/6B + edge review + org-admin parity)** | Permanent delete hard-deleted the library **without** promptly reclaiming content/counter/tags. **Fixed 2026-07-13/14:** a single shared writer stamps `deleted_libraries.purge_requested_at` (migration 012), so Phase 13 is eligible on its next scan; all wired permanent-delete paths (v2.1 owner + platform + org-admin single/bulk) additionally enqueue the durable `ItemLibraryCascade` immediately (deduplicated against Phase 13) so reclamation starts on the next worker tick rather than after a full `ScanInterval`. The cascade owns content/counter/tags/policy/marker. | High (fixed) | [library_delete_helpers.go](../internal/api/v2/library_delete_helpers.go), [gc.go `EnqueueLibraryCascade`](../internal/gc/gc.go) | `ISSUE-GC-ORG-TRASH-NO-CASCADE-01` |

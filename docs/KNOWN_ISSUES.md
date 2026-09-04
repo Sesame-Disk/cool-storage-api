@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-09-03
+**Last Updated**: 2026-09-04
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -12,6 +12,16 @@ status. If the two disagree, this file is right about status and the audit doc
 is right about why.
 
 ---
+
+## Resolved W2a Audit Record (2026-09-04)
+
+The consolidated PR #203 audit found that an ACTIVE canonical library with a
+durable deleted_libraries marker and deleted_at still NULL was ambiguous: it
+could be the normal soft-delete batch in flight, not only a restore whose
+canonical CAS had already committed. The shared library lifecycle fence now
+serializes API soft-delete, GC soft-delete, restore, and hard-delete. The
+real-Cassandra regression keeps the fence owned and proves all three writer
+families reject without consuming either row. The X1 closure remains open.
 
 ## Issue Summary by Priority
 

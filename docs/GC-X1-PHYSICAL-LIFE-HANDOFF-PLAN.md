@@ -1068,8 +1068,8 @@ it earlier while deleting it here would reopen the exact window
 `insertCommit`) W1 closed. A pre-`pub:` check is not unsound in principle --
 it would need up: to structurally guarantee protection all the way through to
 pub: being durable, and a finite TTL refresh alone does not prove that
-handoff; today's design does not depend on proving it, because the late check
-already provides safety through HEAD regardless. New evidence:
+handoff; the late exact-placement check establishes the characterized pre-HEAD
+safety cut. It does not close full R31 continuity. New evidence:
 `internal/integration/sessionupload_own_liveness_test.go` (six named legs,
 `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1`, kept as a separate
 gate from W1's eight-leg one since that struct's field list is pinned and

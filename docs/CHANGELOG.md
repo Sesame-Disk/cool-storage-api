@@ -8,6 +8,32 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a audit consolidation: lifecycle fence and contract hardening
+
+The consolidated PR #203 audit confirmed the important soft-delete/restore
+correctness race and the surrounding documentation and guard drift.
+
+- Reused the tokenized library lock as a shared lifecycle fence for API
+  soft-delete, GC soft-delete, restore, and hard-delete. The org cascade uses
+  SoftDeleteLibraryUnderLease with its already-held token, avoiding a
+  re-entrant acquire. Added a real-Cassandra regression that holds the fence
+  and proves the competing writers leave the canonical row and delete marker
+  unchanged.
+- Pinned every generic lease LWT (acquire, stale takeover, renew, and release)
+  to `EACH_QUORUM` plus global `SERIAL`; added a source guard so this 3DC
+  contract cannot silently fall back to a profile's `LOCAL_SERIAL` default.
+- Hardened both HEAD-writer AST guards to recognize formatted and qualified
+  CQL, require an exact publication_state = ? predicate in the IF clause, and
+  require that bind to be ACTIVE. Added permanent mutation controls. Added a
+  package guard for all six static production library creators to bind ACTIVE.
+- Corrected the P4a mutation harness: source commit e83f059fb changed the
+  settled-claim branch, while the harness still matched the pre-change
+  return-settled form. The mutation now applies to the current branch and
+  remains expected to turn the targeted test red.
+- Corrected NULL authority wording, documented non-reusable library IDs, and
+  removed the R31 overclaim from the X1 handoff plan. X1 remains OPEN and
+  GC_ENABLED=false.
+
 ## 2026-09-04 - W2a pre-merge closure round 4: the read-side had the same tolerance left in it
 
 Round 3 removed legacy-NULL tolerance from every CAS *writer*, but a review

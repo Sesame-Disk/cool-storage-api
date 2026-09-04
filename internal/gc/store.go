@@ -446,6 +446,10 @@ type GCStore interface {
 	ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error)
 	ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error)
 	SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error
+	// SoftDeleteLibraryUnderLease performs the same mutation while the caller
+	// already owns the library lifecycle fence. It avoids re-entrant acquire
+	// attempts during the org cascade.
+	SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy, leaseToken uuid.UUID) error
 	ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error)
 	DeleteGroupMember(groupID, userID uuid.UUID) error
 	DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error
@@ -463,9 +467,9 @@ type GCStore interface {
 	RenewUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error)
 	ReleaseUserHardDeleteLock(userID, leaseToken uuid.UUID) error
 
-	// AcquireLibraryHardDeleteLock acquires a renewable lease for a library
-	// cascade delete. Returns (true, nil) when the lock is successfully acquired.
-	// restoreDeletedLibrary checks this table to block concurrent restores.
+	// AcquireLibraryHardDeleteLock acquires the shared renewable library
+	// lifecycle fence used by soft-delete, restore, and hard-delete. Returns
+	// (true, nil) when the lock is successfully acquired.
 	AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error)
 	RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error)
 	ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) error

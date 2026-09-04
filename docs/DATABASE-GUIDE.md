@@ -1292,6 +1292,7 @@ Set appropriate consistency levels per operation:
 
 | Operation | Consistency Level | Why |
 |-----------|-------------------|-----|
+| GC lifecycle leases (`gc_*_hard_delete_locks`, including the shared library fence) | `EACH_QUORUM` + `SERIAL` (explicit statement pins) | A lease acquire, stale takeover, renewal, or release must be globally serialized and acknowledged in every DC; a regional outage fails closed instead of allowing two lifecycle writers to proceed |
 | User login | `LOCAL_QUORUM` | Must be consistent |
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
@@ -1306,9 +1307,16 @@ Set appropriate consistency levels per operation:
 | Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
 
+Library identifiers are UUIDs and are non-reusable lifecycle identities:
+deleting a library must never permit a later incarnation to reuse its
+library_id. The libraries_by_id primary key and all lifecycle fences depend on
+that append-only identity contract.
+
 The rows marked **explicit statement pin** do not derive their level from
-`serial_consistency` at all. The four CONDITIONAL ones have called `SerialConsistency(gocql.Serial)` themselves since P0/R12 (2026-08-23), so the level holds even where a
-deployment sets the session to `LOCAL_SERIAL`. That inventory — 10 conditional
+`serial_consistency` at all. Each listed LWT calls
+`SerialConsistency(gocql.Serial)` itself, so the level holds even where a
+deployment sets the session to `LOCAL_SERIAL`; the lifecycle lease helper
+also pins regular `Consistency(gocql.EachQuorum)`. The R12 target inventory — 10 conditional
 `blocks` statements (P4b-2 added `CommitBlockDeleteOrphanHandoff`; the count
 source is `r12ExpectedSerialOperations`), 4 canonical
 `gc_s3_orphans`, 3 `gc_block_candidates`

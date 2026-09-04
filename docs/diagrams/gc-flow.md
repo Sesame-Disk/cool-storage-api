@@ -32,7 +32,7 @@ flowchart TD
     Result -->|success| Complete[Logged batch: delete queue + pending]
     Result -->|transient, retry < 5| Requeue[Logged batch: move queue row; retain pending]
     Result -->|retry cap| DLQ[Logged batch: gc_failed_items + pending]
-    Result -->|hard-delete lock busy| Postpone[Requeue without retry increment]
+    Result -->|library lifecycle fence busy| Postpone[Requeue without retry increment]
 ```
 
 ## 2. Physical block deletion

@@ -930,6 +930,24 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 // operation. Permanent delete (or GC cascade) cleans up the lib-scope row via
 // traffic.DeleteLibraryStorageCounter.
 func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, deletedBy, libraryID string) error {
+	libraryUUID, err := uuid.Parse(libraryID)
+	if err != nil {
+		return fmt.Errorf("invalid library id %q: %w", libraryID, err)
+	}
+	leaseToken := uuid.New()
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("acquire library lifecycle fence: %w", err)
+	}
+	if !acquired {
+		return fmt.Errorf("library lifecycle fence is busy")
+	}
+	defer func() {
+		if err := gcpkg.ReleaseLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken); err != nil {
+			log.Printf("[softDeleteLibrary] failed to release lifecycle fence for %s: %v", libraryID, err)
+		}
+	}()
+
 	now := time.Now().UTC()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
@@ -974,7 +992,9 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 }
 
 // restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
-// the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
+// the library's storage to aggregate counters. Every library lifecycle writer
+// shares the same fence, so restore cannot consume a soft-delete marker while
+// the canonical soft-delete batch is still in flight.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now().UTC()
 	leaseToken := uuid.New()
@@ -1028,7 +1048,8 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		}
 		// The canonical ACTIVE transition may already have committed while the
 		// marker/read-model batch failed. Treat the durable marker as a restore
-		// intent and retry only the derived-state finalization below.
+		// intent and retry only the derived-state finalization below. The shared
+		// lifecycle fence excludes a concurrent soft-delete from this shape.
 	}
 	// This is a clean-deploy codebase (docs/CHANGELOG.md "W2a pre-merge closure
 	// round 3"): every libraries row is created with publication_state already

@@ -1301,9 +1301,9 @@ CREATE TABLE IF NOT EXISTS gc_user_hard_delete_locks (
     lease_token UUID
 ) WITH default_time_to_live = 21600;
 
--- Short-lived lock acquired while a library is being hard-deleted. This blocks
--- a concurrent restore attempt from racing the cascade worker between the
--- stale-check and the final HardDeleteLibrary write.
+-- Short-lived library lifecycle fence for soft-delete, restore, and hard-delete.
+-- This blocks concurrent lifecycle writers from observing a cross-table
+-- intermediate state between the stale-check and their final mutation.
 CREATE TABLE IF NOT EXISTS gc_library_hard_delete_locks (
     library_id  UUID PRIMARY KEY,
     started_at  TIMESTAMP,

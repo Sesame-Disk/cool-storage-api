@@ -77,7 +77,10 @@ func acquireHardDeleteLock(session *gocql.Session, tableName, keyColumn string, 
 	applied, err := session.Query(fmt.Sprintf(`
 		INSERT INTO %s (%s, started_at, heartbeat, lease_token)
 		VALUES (?, ?, ?, ?) IF NOT EXISTS USING TTL %d
-	`, tableName, keyColumn, hardDeleteLockTTLSeconds), keyValue.String(), now, now, leaseToken.String()).MapScanCAS(existing)
+	`, tableName, keyColumn, hardDeleteLockTTLSeconds), keyValue.String(), now, now, leaseToken.String()).
+		Consistency(gocql.EachQuorum).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(existing)
 	if err != nil || applied {
 		return applied, err
 	}
@@ -92,7 +95,10 @@ func acquireHardDeleteLock(session *gocql.Session, tableName, keyColumn string, 
 		UPDATE %s USING TTL %d
 		SET started_at = ?, heartbeat = ?, lease_token = ?
 		WHERE %s = ? IF lease_token = ?
-	`, tableName, hardDeleteLockTTLSeconds, keyColumn), now, now, leaseToken.String(), keyValue.String(), existingToken.String()).MapScanCAS(map[string]interface{}{})
+	`, tableName, hardDeleteLockTTLSeconds, keyColumn), now, now, leaseToken.String(), keyValue.String(), existingToken.String()).
+		Consistency(gocql.EachQuorum).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return false, err
 	}
@@ -104,7 +110,10 @@ func renewHardDeleteLock(session *gocql.Session, tableName, keyColumn string, ke
 		UPDATE %s USING TTL %d
 		SET heartbeat = ?, lease_token = ?
 		WHERE %s = ? IF lease_token = ?
-	`, tableName, hardDeleteLockTTLSeconds, keyColumn), time.Now().UTC(), leaseToken.String(), keyValue.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	`, tableName, hardDeleteLockTTLSeconds, keyColumn), time.Now().UTC(), leaseToken.String(), keyValue.String(), leaseToken.String()).
+		Consistency(gocql.EachQuorum).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return false, err
 	}
@@ -114,7 +123,10 @@ func renewHardDeleteLock(session *gocql.Session, tableName, keyColumn string, ke
 func releaseHardDeleteLock(session *gocql.Session, tableName, keyColumn string, keyValue, leaseToken uuid.UUID) error {
 	applied, err := session.Query(fmt.Sprintf(`
 		DELETE FROM %s WHERE %s = ? IF lease_token = ?
-	`, tableName, keyColumn), keyValue.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	`, tableName, keyColumn), keyValue.String(), leaseToken.String()).
+		Consistency(gocql.EachQuorum).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return err
 	}
@@ -127,20 +139,20 @@ func releaseHardDeleteLock(session *gocql.Session, tableName, keyColumn string, 
 	return nil
 }
 
-// AcquireLibraryHardDeleteLockLease acquires the library hard-delete lock using
-// the same stale-aware CAS semantics as the GC worker.
+// AcquireLibraryHardDeleteLockLease acquires the shared library lifecycle fence
+// using the same stale-aware CAS semantics as the GC worker.
 func AcquireLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) (bool, error) {
 	return acquireHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
 }
 
-// RenewLibraryHardDeleteLockLease fences ownership of the library hard-delete
-// lock and refreshes its TTL.
+// RenewLibraryHardDeleteLockLease fences ownership of the library lifecycle
+// fence and refreshes its TTL.
 func RenewLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) (bool, error) {
 	return renewHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
 }
 
-// ReleaseLibraryHardDeleteLockLease releases the library hard-delete lock only
-// when the same lease token still owns it.
+// ReleaseLibraryHardDeleteLockLease releases the shared library lifecycle fence
+// only when the same lease token still owns it.
 func ReleaseLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) error {
 	return releaseHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
 }
@@ -5192,6 +5204,34 @@ func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.
 }
 
 func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
+	leaseToken := uuid.New()
+	acquired, err := AcquireLibraryHardDeleteLockLease(s.db.Session(), libraryID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("acquire library lifecycle fence for soft delete %s: %w", libraryID, err)
+	}
+	if !acquired {
+		return fmt.Errorf("library lifecycle fence is busy for soft delete %s", libraryID)
+	}
+	defer func() {
+		if err := ReleaseLibraryHardDeleteLockLease(s.db.Session(), libraryID, leaseToken); err != nil {
+			log.Printf("[gc] failed to release library lifecycle fence after soft delete %s: %v", libraryID, err)
+		}
+	}()
+	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy)
+}
+
+func (s *CassandraStore) SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy, leaseToken uuid.UUID) error {
+	owned, err := RenewLibraryHardDeleteLockLease(s.db.Session(), libraryID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library soft delete %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library lifecycle fence for soft delete %s", libraryID)
+	}
+	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy)
+}
+
+func (s *CassandraStore) softDeleteLibraryLocked(orgID, libraryID, deletedBy uuid.UUID) error {
 	previousRow, err := db.ReadAdminLibraryProjectionRow(s.db.Session(), orgID.String(), libraryID.String())
 	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return err

@@ -101,7 +101,7 @@ type MockStore struct {
 	// in-progress user hard-delete locks keyed by userID.
 	userHardDeleteLocks map[uuid.UUID]mockHardDeleteLock
 
-	// in-progress library hard-delete locks keyed by libraryID.
+	// in-progress library lifecycle fences keyed by libraryID.
 	libraryHardDeleteLocks map[uuid.UUID]mockHardDeleteLock
 
 	// share_links keyed by shareToken
@@ -3917,6 +3917,10 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 		m.storageCounterReconciliations[traffic.UserStorageScope(orgID.String(), lib.OwnerID.String())] = &mockStorageCounterReconciliation{Scope: traffic.UserStorageScope(orgID.String(), lib.OwnerID.String()), OrgID: orgID, OwnerID: lib.OwnerID, RequestedAt: time.Now()}
 	}
 	return nil
+}
+
+func (m *MockStore) SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy, leaseToken uuid.UUID) error {
+	return m.SoftDeleteLibrary(orgID, libraryID, deletedBy)
 }
 func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
 	if m.listGroupMembershipsByUserErr != nil {

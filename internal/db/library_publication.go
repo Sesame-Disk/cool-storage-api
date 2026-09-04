@@ -96,10 +96,10 @@ func confirmLibraryPublicationTerminal(session *gocql.Session, orgID, libraryID 
 // set to ACTIVE (all production INSERT INTO libraries call sites set it
 // explicitly), and this migration ships as part of the initial schema
 // baseline rather than being rolled out against a live fleet with existing
-// rows. There is no legacy row whose publication_state predates this column,
-// so an observed NULL here is unambiguous: it means the canonical row is
-// absent, not that it is an old row to promote. Callers are expected to have
-// already confirmed the row exists (under a hard-delete lease or a
+// rows. Under that invariant, NULL cannot represent valid publication
+// authority. It may reflect an absent partition or a malformed present row;
+// both fail closed and are never promoted to ACTIVE. Callers are expected to
+// have already confirmed the row exists (under a hard-delete lease or a
 // just-prior read) before calling this.
 func RevokeLibraryPublication(session *gocql.Session, orgID, libraryID string) error {
 	if session == nil {

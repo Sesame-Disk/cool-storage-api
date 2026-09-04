@@ -224,7 +224,7 @@ m_settlement_read_is_ordinary() {
 }
 
 m_settled_own_claim_skips_each_quorum() {
-  mutate "$STORE" 's{if settled\.Outcome == BlockClaimAcquired \{\s+return s\.confirmSettledBlockClaimVisibility\(orgID, blockID, attempt\)\s+\}\s+return settled, nil}{return settled, nil}'
+  mutate "$STORE" 's{if settled\.Outcome == BlockClaimAcquired \{\s+return s\.confirmSettledBlockClaimVisibility\(orgID, blockID, attempt\)\s+\}}{if settled.Outcome == BlockClaimAcquired { return settled, nil }}'
   expect_red 'TestP4AClaimBlockDeleteConfirmsSettledOwnClaimAtEachQuorum' 'SERIAL own claim must confirm EACH_QUORUM' \
     'SERIAL-settled own claim treated as Acquired without EACH_QUORUM visibility (Paxos accepted, learn failed)'
   restore
@@ -287,8 +287,8 @@ m_fresh_owner_completes_candidate() {
 }
 
 m_destructive_locator_from_readback() {
-  mutate "$WORKER" 's{storageClass := attempt\.Target\.StorageClass(\s+)storageKey := attempt\.Target\.StorageKey}{storageClass := blockInfo.StorageClass$1storageKey := blockInfo.StorageKey}'
-  expect_red 'TestP4ADestructiveStepsUseTheClaimsLocator' 'must take storageClass and storageKey from attempt.Target' \
+  mutate "$WORKER" 's{storageClass := deleteAuthority\.Target\.StorageClass(\s+)storageKey := deleteAuthority\.Target\.StorageKey}{storageClass := blockInfo.StorageClass$1storageKey := blockInfo.StorageKey}'
+  expect_red 'TestP4ADestructiveStepsUseTheClaimsLocator' 'must take storageClass and storageKey from deleteAuthority.Target' \
     'orphan and S3 delete taking their locator from a post-claim re-read (publishes and destroys whichever incarnation that ordinary read happens to show)'
   restore
 }
@@ -375,7 +375,7 @@ m_post_claim_read_error_skips_release() {
 }
 
 m_divergent_read_retries() {
-  mutate "$WORKER" 's{return w\.releaseAndPostponeUnreliableRead\(item, attempt, fmt\.Sprintf\("canonical row reads back as %s but claim authorized %s", observed, attempt\.Target\)\)}{if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {\n\t\t\treturn relErr\n\t\t}\n\t\treturn fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, attempt.Target)}'
+  mutate "$WORKER" 's{return w\.unwindBeforeOrAfterHandoff\(alreadyCommitted, item, deleteAuthority, fmt\.Sprintf\("canonical row reads back as %s but claim authorized %s", observed, deleteAuthority\.Target\)\)}{if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, deleteAuthority); relErr != nil {\n\t\t\treturn relErr\n\t\t}\n\t\treturn fmt.Errorf("block %s: the canonical row reads back as %s but the claim authorized %s; refusing to publish or delete either", item.ItemID, observed, deleteAuthority.Target)}'
   expect_red 'TestP4A_DivergentPostClaimReadHandsTheFenceBackAndPostpones' 'items in the DLQ' \
     'a divergent post-claim canonical read spends retries and moves its recovery candidate to the DLQ'
   restore
@@ -418,7 +418,7 @@ m_verify_unwind_ignores_foreign_owner() {
 # put an item-specific alert counter back in front of the ownership check.
 m_unwind_bypasses_the_wrapper() {
   # ~ delimiters and $1 for the indentation run: the replacement carries unbalanced braces.
-  mutate "$WORKER" 's~return w\.releaseClaimThenFailWithRetry\(item, attempt,(\s+)fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, attempt); relErr != nil {${1}return relErr${1}}${1}return fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
+  mutate "$WORKER" 's~return w\.failBeforeOrAfterHandoff\(alreadyCommitted, item, deleteAuthority,\s+fmt\.Errorf\("block %s has non-canonical storage class %q", item\.ItemID, storageClass\)\)~if _, relErr := w.releaseBlockClaim(item.OrgID, item.ItemID, deleteAuthority); relErr != nil {\n\t\t\treturn relErr\n\t\t}\n\t\treturn fmt.Errorf("block %s has non-canonical storage class %q", item.ItemID, storageClass)~'
   expect_red 'TestP4ANoPostClaimUnwindDiscardsTheReleaseOutcome' 'release outcome discarded at' \
     'a sixth post-claim unwind releases inline and discards the outcome (the exact shape of the defect, reachable again by one call site diverging from its siblings)'
   restore
@@ -454,7 +454,7 @@ m_unreliable_read_discards_foreign_owner() {
 }
 
 m_topology_gate_discards_foreign_owner() {
-  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}(\s+)return failedClosedError\{Reason: "destructive topology gate rejected block at the commit point"~_ = released${1}return failedClosedError{Reason: "destructive topology gate rejected block at the commit point"~s'
+  mutate "$WORKER" 's~if foreign := w\.refuseRetryForForeignClaimOwner\(item\.ItemID, released, err\); foreign != nil \{\s+return foreign\s+\}\s+return failedClosedError\{Reason: "destructive topology gate rejected block before orphan-handoff commit", ItemID: item\.ItemID, Err: err\}~_ = released; return failedClosedError{Reason: "destructive topology gate rejected block before orphan-handoff commit", ItemID: item.ItemID, Err: err}~s'
   expect_red 'TestP4A_ForeignOwnerOnAPostponingUnwindLeavesTheQueueUntouched' 'a late loser mutated the queue' \
     'the commit-point topology gate drops the release outcome (its old justification was that both outcomes postpone, which a durable requeue makes false)'
   restore

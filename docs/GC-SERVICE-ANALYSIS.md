@@ -74,7 +74,7 @@ flowchart TD
         Grace["Grace Period<br/>Default: 1 hour"]
       LWT["Delete Fence<br/>LWT claim + live-ref recheck"]
          Idempotent["Idempotency<br/>block_references rows<br/>+ claim IDs"]
-        Lock["Hard-Delete Locks<br/>Prevents restore race"]
+        Lock["Library Lifecycle Fence<br/>Prevents lifecycle races"]
         Retry["Retry Cap: 5<br/>Then move to DLQ"]
     end
 
@@ -199,11 +199,14 @@ These are deliberate safety mechanisms that are correctly implemented and tested
 4. **Cascade ordering** — Commit → root fs_object → children → blocks. If child enqueue fails,
    the parent is retained/retried. Do not claim universal scanner rediscovery: P7 proves that
    markerless artifact partitions can become invisible.
-5. **Hard-delete locks** — User, library, and org cascades acquire a tokenized,
-   renewable lease plus a second stale-check that blocks the restore race at
-   cascade start and keeps the guard alive for long-running hard deletes. If a
-   worker crashes, a later worker can take over after the heartbeat becomes
-   stale; active lock contention is postponed without consuming retry budget.
+5. **Library lifecycle fence** — Library soft-delete, restore, and hard-delete
+   acquire the same tokenized, renewable lease. Its LWTs pin `EACH_QUORUM` plus
+   global `SERIAL`, so a regional outage fails closed rather than permitting a
+   second lifecycle writer. User and org cascades use the store's fenced
+   soft-delete path; an org cascade passes its already-held library lease to
+   avoid re-entrant acquisition. If a worker crashes, a later worker can take
+   over after the heartbeat becomes stale; active contention is postponed
+   without consuming retry budget.
 6. **Scanner safety nets are partial** — phases recover discoverable candidates/markers and
    run on startup + every 24h. P6a (transient-error fail-open) is fixed, so a transient
    existence read no longer misclassifies a live library; P6b execution-time canonical

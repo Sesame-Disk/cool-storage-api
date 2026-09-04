@@ -425,3 +425,65 @@ func TestRestoreDeletedLibrary_RejectsWhileHardDeleteLeaseOwned(t *testing.T) {
 		t.Fatalf("deleted_at = %s, want %s after rejected restore", canonicalDeletedAt, deletedAt)
 	}
 }
+
+// Soft-delete, restore, and hard-delete must all serialize on the same library
+// lifecycle fence. This is the dangerous shape from the audit: an ACTIVE
+// canonical row with a durable delete marker. While another lifecycle writer
+// owns the fence, none of the writers may consume or alter either row.
+func TestLibraryLifecycleWritersRejectWhileFenceOwned(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	deletedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	leaseToken := uuid.New()
+
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "lifecycle-fence",
+		now.Add(-4*time.Hour), now, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed active library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`,
+		libraryID.String(), orgID.String(), deletedAt, "hot").Exec(); err != nil {
+		t.Fatalf("seed deleted_libraries marker: %v", err)
+	}
+	acquired, err := gcpkg.AcquireLibraryHardDeleteLockLease(session, libraryID, leaseToken)
+	if err != nil {
+		t.Fatalf("AcquireLibraryHardDeleteLockLease: %v", err)
+	}
+	if !acquired {
+		t.Fatal("expected to acquire fresh library lifecycle fence")
+	}
+	t.Cleanup(func() {
+		_ = gcpkg.ReleaseLibraryHardDeleteLockLease(session, libraryID, leaseToken)
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := softDeleteLibrary(db, orgID.String(), ownerID.String(), ownerID.String(), libraryID.String()); err == nil {
+		t.Fatal("API soft-delete must reject while the library lifecycle fence is owned")
+	}
+	if err := gcpkg.NewCassandraStore(db).SoftDeleteLibrary(orgID, libraryID, ownerID); err == nil {
+		t.Fatal("GC soft-delete must reject while the library lifecycle fence is owned")
+	}
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err == nil {
+		t.Fatal("restore must reject while the library lifecycle fence is owned")
+	}
+
+	var canonicalDeletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String()).Scan(&canonicalDeletedAt); err != nil {
+		t.Fatalf("read canonical library after rejected lifecycle writers: %v", err)
+	}
+	if !canonicalDeletedAt.IsZero() {
+		t.Fatalf("active canonical row changed while lifecycle fence was owned: deleted_at=%s", canonicalDeletedAt)
+	}
+	var markerID string
+	if err := session.Query(`SELECT library_id FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&markerID); err != nil {
+		t.Fatalf("delete marker disappeared while lifecycle fence was owned: %v", err)
+	}
+}

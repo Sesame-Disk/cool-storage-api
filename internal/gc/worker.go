@@ -670,6 +670,7 @@ var fsObjectReferenceFenceInterval = 5 * time.Minute
 type hardDeleteLease struct {
 	stopCh  chan struct{}
 	release func() error
+	token   uuid.UUID
 
 	mu         sync.Mutex
 	err        error
@@ -677,10 +678,11 @@ type hardDeleteLease struct {
 	closedChan chan struct{}
 }
 
-func newHardDeleteLease(ctx context.Context, kind, target string, renew func() (bool, error), release func() error) *hardDeleteLease {
+func newHardDeleteLease(ctx context.Context, kind, target string, token uuid.UUID, renew func() (bool, error), release func() error) *hardDeleteLease {
 	lease := &hardDeleteLease{
 		stopCh:     make(chan struct{}),
 		release:    release,
+		token:      token,
 		closedChan: make(chan struct{}),
 	}
 	go func() {
@@ -695,12 +697,16 @@ func newHardDeleteLease(ctx context.Context, kind, target string, renew func() (
 				return
 			case <-ticker.C:
 				applied, err := renew()
+				leaseName := kind + " hard-delete lock"
+				if kind == "library" {
+					leaseName = "library lifecycle fence"
+				}
 				if err != nil {
-					lease.setErr(fmt.Errorf("renew %s hard-delete lock for %s: %w", kind, target, err))
+					lease.setErr(fmt.Errorf("renew %s for %s: %w", leaseName, target, err))
 					return
 				}
 				if !applied {
-					lease.setErr(fmt.Errorf("%s hard-delete lock for %s lost during cascade", kind, target))
+					lease.setErr(fmt.Errorf("%s for %s lost during cascade", leaseName, target))
 					return
 				}
 			}
@@ -2622,7 +2628,7 @@ func (w *Worker) processCommit(item QueueItem) error {
 	}
 
 	// Fence immediately before the destructive delete: re-confirm we still own the
-	// library hard-delete lock so a lease lost to expiry/restore cannot let us drop a
+	// shared library lifecycle fence so a lease lost to expiry/restore cannot let us drop a
 	// live library's commit. Fail closed (item stays queued and re-validates on retry).
 	if err := fenceGuard(); err != nil {
 		return err
@@ -2812,7 +2818,7 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	if !acquired {
 		return hardDeleteInProgressError{Kind: "user", Target: userID.String(), ItemID: item.ItemID}
 	}
-	lease := newHardDeleteLease(ctx, "user", userID.String(), func() (bool, error) {
+	lease := newHardDeleteLease(ctx, "user", userID.String(), leaseToken, func() (bool, error) {
 		return w.store.RenewUserHardDeleteLock(userID, leaseToken)
 	}, func() error {
 		return w.store.ReleaseUserHardDeleteLock(userID, leaseToken)
@@ -3044,12 +3050,12 @@ func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.
 	leaseToken := uuid.New()
 	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", itemID, err)
+		return nil, nil, fmt.Errorf("failed to acquire library lifecycle fence for %s: %w", itemID, err)
 	}
 	if !acquired {
 		return nil, nil, hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: itemID}
 	}
-	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
+	lease := newHardDeleteLease(ctx, "library", libraryID.String(), leaseToken, func() (bool, error) {
 		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
 	}, func() error {
 		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
@@ -3060,7 +3066,7 @@ func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.
 			return fmt.Errorf("failed to fence library cascade for %s: %w", libraryID, err)
 		}
 		if !owned {
-			return fmt.Errorf("lost library hard-delete lock for %s", libraryID)
+			return fmt.Errorf("lost library lifecycle fence for %s", libraryID)
 		}
 		return nil
 	}
@@ -3146,7 +3152,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 	if !acquired {
 		return hardDeleteInProgressError{Kind: "org", Target: orgID.String(), ItemID: item.ItemID}
 	}
-	lease := newHardDeleteLease(ctx, "org", orgID.String(), func() (bool, error) {
+	lease := newHardDeleteLease(ctx, "org", orgID.String(), leaseToken, func() (bool, error) {
 		return w.store.RenewOrgHardDeleteLock(orgID, leaseToken)
 	}, func() error {
 		return w.store.ReleaseOrgHardDeleteLock(orgID, leaseToken)
@@ -3210,7 +3216,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 				if !exists {
 					return nil
 				}
-				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
+				if err := w.store.SoftDeleteLibraryUnderLease(orgID, lib.LibraryID, uuid.Nil, libraryLease.token); err != nil {
 					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
 				}
 				deletedLibraryAt, err = w.store.GetLibraryDeletedAt(lib.LibraryID)
@@ -3527,7 +3533,7 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), func() error
 	leaseToken := uuid.New()
 	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID, leaseToken)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+		return nil, nil, false, fmt.Errorf("failed to acquire library lifecycle fence for child %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}
 	if !acquired {
 		return nil, nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
