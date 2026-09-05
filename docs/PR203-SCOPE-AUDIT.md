@@ -33,7 +33,7 @@ narrow SessionUpload guarantee through the pre-HEAD `CreateFileFromBlocks` cut f
 | P1 | Lease timeout is not revocation for publication/repair | PREEXISTING; characterized during #203 | Yes | None for the SessionUpload block gate; do not infer revocation | [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01); R31/X1 docs | Existing constraint; no code in W2 |
 | P1 | `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry | PREEXISTING; surfaced by #203 | Yes | Broader failed-publish cleanup, not placement evidence | [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#pending-published-fs_object-cleanup-row-per-owner-model); [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) | Existing debt; no error-semantics expansion |
 | P1 | Soft-delete, restore, and hard-delete races | PREEXISTING; analyzed by #203 | Yes | Outside block commit and explicitly excluded | [KNOWN_ISSUES.md](KNOWN_ISSUES.md#issue-lib-deleted-fence-01); PRE-GC/X1 docs | Existing follow-up; no lifecycle code |
-| P1 | Storage-accounting crash/retry convergence | PREEXISTING split-phase accounting, surfaced by #203 | Yes | No effect on placement, liveness, or exact-P | [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#12d-storage-quota-publishcounter-atomicity); [KNOWN_ISSUES.md](KNOWN_ISSUES.md#issue-gc-pub-ref-zero-ref-01) | Existing debt; no accounting/quota changes |
+| P1 | Storage-accounting crash/retry convergence | PREEXISTING split-phase accounting, surfaced by #203 | Yes | No effect on placement, liveness, or exact-P | [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#12d-storage-quota-publishcounter-atomicity) | Existing debt; no accounting/quota changes |
 | P1 | Global reconciliation versus normal HEAD/counter write can apply a stale delta and over/under-count | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
 | P1 | Reconciler T1 can delete T2 when DELETE is scoped only by aggregate scope, without generation/attempt identity | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
 | P1 | Canonical soft-delete CAS can crash before its derived counter batch without a marker or reconciliation discovery path | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
@@ -45,7 +45,7 @@ narrow SessionUpload guarantee through the pre-HEAD `CreateFileFromBlocks` cut f
 | P2 | O(N distinct blocks) renewal and authority reads | DEPENDENCY / #203 review constraint | No | Required bounded cost of the narrow guarantee | `R3-LIVENESS-CONTINUITY.md`; `TESTING.md` | Included; deduplicated by block ID |
 | P2 | Per-block SERIAL/EACH_QUORUM, S3 scans, or global locks | #203 review constraint | No | Would violate the narrow hot-path budget | `R3-LIVENESS-CONTINUITY.md`; `TESTING.md` | Explicitly prohibited; contract test guards SERIAL absence |
 | P2 | Evidence-gate contamination between W1 and W2 | INTRODUCED-BY-203 test/docs defect | No (harness defect) | Could make directed evidence falsely green | `TESTING.md`; `CHANGELOG.md` | Fixed: separate W2 gate and explicit empty unrelated gates |
-| P2 | Global Dockerization of the X2/P3 harness added `.env`, image, network, and backend preconditions outside W2 | INTRODUCED-BY-203 harness scope drift | No (reverted) | None; unrelated multi-DC workflow must remain unchanged | `TESTING.md`; `CHANGELOG.md` | Reverted; keep X2/P3 as its existing separate workflow |
+| P2 | Global Dockerization of the X2/P3 harness added `.env`, image, network, and backend preconditions outside W2 | INTRODUCED-BY-204 initial revision; reverted | No (reverted) | None; unrelated multi-DC workflow must remain unchanged | `TESTING.md`; `CHANGELOG.md` | Reverted from the current PR; keep X2/P3 as its existing separate workflow |
 | P2 | Go-format/test-runner wiring drift in #203 | INTRODUCED-BY-203 test/docs defect | No (harness defect) | No product effect, but invalidates evidence | `TESTING.md`; `CHANGELOG.md` | Fixed and validated in Docker |
 | P2 | R31 `up -> pub -> HEAD -> fs` crash continuity | PREEXISTING roadmap | Yes, open | This funnel stops before post-HEAD crash reconciliation | [R31 handoff](GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md#16-r31-remains-a-blocker-open); [CURRENT_WORK](../CURRENT_WORK.md) | Remains OPEN; follow-up PR |
 | P2 | X1 physical retirement and destructive GC activation | PREEXISTING roadmap | Yes, open | Writer gate does not close physical-delete ABA | [`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`](KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01); [X1 handoff](GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) | Remains OPEN; `GC_ENABLED=false` remains required |
@@ -55,21 +55,19 @@ narrow SessionUpload guarantee through the pre-HEAD `CreateFileFromBlocks` cut f
 The rows above cover every historical commit family on the reference branch:
 
 - `3020f2b28`, `4b08c4bdc`, `df5af4231`, `2cd47fb03`, `6a630c8ef`,
-  `059b5c6e3`, `c09fd6981`, `24e840d77`, and `caa7ebad6` are the lifecycle,
+  `059b5c6e3`, `c09fd6981`, `24e840d77`, and `caa7ebad6` cover the lifecycle,
   legacy-NULL, ownership, soft-delete, restore, hard-delete, and accounting
-  findings in rows 2--12 and 23.
-- The three attempted accounting-design pitfalls are the historical rows immediately
-  after the current storage-accounting row; they are not current main defects.
-
-- `0832caeb2`, `2f319acc5`, `8c69a2347`, `71ecfcefc`, and `fc04b0f07`
-  are the terminal authority, timeout/lease, HEAD-CAS race, and repair lookup
-  findings in rows 1, 10--12, 18--20.
+  findings named above, including the three abandoned accounting-design
+  pitfalls.
+- `0832caeb2`, `2f319acc5`, `8c69a2347`, `71ecfcefc`, and `fc04b0f07` cover
+  terminal authority, timeout/lease, HEAD-CAS race, and repair lookup findings
+  named above.
 - `fcfea7fec`, `f82fb2fe4`, `b527988fe`, `62f6a718`, `5b0bbadde`, and
-  `b26729b6b` are the repair ancestry, applied-CAS, wording, and harness
-  findings in rows 14--17, 26--27.
+  `b26729b6b` cover repair ancestry, applied-CAS, wording, and harness findings
+  named above.
 - `4574c4c3d`, `acc981470`, `708e7ac31`, `46c8b132`, `e74c6f286`, and
-  `c9653b352` are the exact pre-HEAD recheck, SessionUpload parity, retry,
-  scope, documentation, and test-format findings in rows 19, 25--29.
+  `c9653b352` cover the exact pre-HEAD recheck, SessionUpload parity, retry,
+  scope, documentation, and test-format findings named above.
 
 The current PR carries only the rows explicitly marked **Included**. All other
 rows remain documentary constraints or separately scoped work; their presence

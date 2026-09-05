@@ -42,7 +42,7 @@ func TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks(t *testing.T) {
 	}
 }
 
-func TestBorrowedFSOwnLivenessLeavesSessionUploadAtPlusZero(t *testing.T) {
+func TestCommitBlockOwnLivenessEmptySetIsNoOp(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	t.Cleanup(func() { registerUploadedBlockAddProvisionalRefFn = oldAdd })
 
@@ -55,7 +55,7 @@ func TestBorrowedFSOwnLivenessLeavesSessionUploadAtPlusZero(t *testing.T) {
 		t.Fatalf("empty BorrowedFS liveness set: %v", err)
 	}
 	if addCalls != 0 {
-		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d pin calls, want 0", addCalls)
+		t.Fatalf("empty placement set made %d pin calls, want 0", addCalls)
 	}
 }
 
@@ -124,7 +124,7 @@ func TestBorrowedFSFenceRejectsFullyRetiredPlacement(t *testing.T) {
 	}
 }
 
-func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
+func TestCommitBlockPublicationFencesEmptySetIsNoOp(t *testing.T) {
 	oldAuthority := validateBorrowedFSPublicationAuthorityFn
 	t.Cleanup(func() { validateBorrowedFSPublicationAuthorityFn = oldAuthority })
 
@@ -137,6 +137,6 @@ func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
 		t.Fatalf("empty BorrowedFS fence set: %v", err)
 	}
 	if authorityCalls != 0 {
-		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d authority calls, want 0", authorityCalls)
+		t.Fatalf("empty placement set made %d authority calls, want 0", authorityCalls)
 	}
 }
