@@ -58,7 +58,36 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 COMPOSE=(docker compose -f docker-compose.cassandra-3dc.yaml)
 NODES=(na eu asia)
-export X2_DC_HOSTS="dc-na=127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242},dc-eu=127.0.0.1:${CASSANDRA_EU_HOST_PORT:-9243},dc-asia=127.0.0.1:${CASSANDRA_ASIA_HOST_PORT:-9244}"
+
+# The fixture itself is Docker-only. Keep the harness process on the host for
+# docker compose orchestration, but run every Go command in the gotest image so
+# migrations and evidence cannot silently use a host toolchain or host checkout.
+# Mounting the checkout read-only is deliberate: mutation modes edit the host
+# checkout before invoking this runner, so the container sees the mutated source.
+X2_TEST_IMAGE="${X2_TEST_IMAGE:-sesamefs-gotest:latest}"
+X2_TEST_ENV_FILE="${X2_TEST_ENV_FILE:-.env}"
+X2_TEST_NETWORK="${X2_TEST_NETWORK:-host}"
+X2_TEST_HOST="${X2_TEST_HOST:-}"
+if [ -z "$X2_TEST_HOST" ]; then
+  if [ "$X2_TEST_NETWORK" = "host" ]; then
+    X2_TEST_HOST=127.0.0.1
+  else
+    X2_TEST_HOST=host.docker.internal
+  fi
+fi
+if [ -z "${X2_TEST_BACKEND_URL:-}" ]; then
+  if [ "$X2_TEST_NETWORK" = "host" ]; then
+    X2_TEST_BACKEND_URL=http://127.0.0.1:8080
+  else
+    X2_TEST_BACKEND_URL=http://sesamefs:8080
+  fi
+fi
+export X2_DC_HOSTS="dc-na=${X2_TEST_HOST}:${CASSANDRA_NA_HOST_PORT:-9242},dc-eu=${X2_TEST_HOST}:${CASSANDRA_EU_HOST_PORT:-9243},dc-asia=${X2_TEST_HOST}:${CASSANDRA_ASIA_HOST_PORT:-9244}"
+
+TEST_DOCKER_ARGS=(--network "$X2_TEST_NETWORK")
+if [ "$X2_TEST_NETWORK" != "host" ]; then
+  TEST_DOCKER_ARGS+=(--add-host host.docker.internal:host-gateway)
+fi
 
 DO_UP=1
 DO_DOWN=1
@@ -88,8 +117,41 @@ fail() { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
 # `cassandra:9042`, is a docker-internal name that does not resolve from the host, and
 # an unverifiable cleanup fails the whole package however the tests went.
 point_harness_at() {
-  export CASSANDRA_HOSTS="127.0.0.1:$1"
+  export CASSANDRA_HOSTS="${X2_TEST_HOST}:$1"
   export CASSANDRA_LOCAL_DC="$2"
+}
+
+docker_go_with() {
+  local env_args=()
+  while [ "$#" -gt 0 ] && [[ "$1" == *=* ]]; do
+    env_args+=(--env "$1")
+    shift
+  done
+  docker run --rm \
+    "${TEST_DOCKER_ARGS[@]}" \
+    --env-file "$X2_TEST_ENV_FILE" \
+    --env SESAMEFS_URL="$X2_TEST_BACKEND_URL" \
+    --env CASSANDRA_HOSTS="${CASSANDRA_HOSTS:-}" \
+    --env CASSANDRA_LOCAL_DC="${CASSANDRA_LOCAL_DC:-}" \
+    --env CASSANDRA_USERNAME= \
+    --env CASSANDRA_PASSWORD= \
+    --env CASSANDRA_REPLICATION_CLASS="${CASSANDRA_REPLICATION_CLASS:-}" \
+    --env CASSANDRA_REPLICATION_DCS="${CASSANDRA_REPLICATION_DCS:-}" \
+    --env X2_DC_HOSTS="$X2_DC_HOSTS" \
+    --env X2_DIVERGENT_ORG="${X2_DIVERGENT_ORG:-}" \
+    --env X2_DIVERGENT_BLOCK="${X2_DIVERGENT_BLOCK:-}" \
+    --env X2_WRITE_DIVERGENT="${X2_WRITE_DIVERGENT:-}" \
+    --env X2_EXPECT_DC_DOWN="${X2_EXPECT_DC_DOWN:-}" \
+    --env X2_EXPECT_REFERENCE_DC_DOWN="${X2_EXPECT_REFERENCE_DC_DOWN:-}" \
+    --env P3_EXPECT_DC_DOWN="${P3_EXPECT_DC_DOWN:-}" \
+    "${env_args[@]}" \
+    --volume "$PWD:/build:ro" \
+    --workdir /build \
+    "$X2_TEST_IMAGE" go "$@"
+}
+
+docker_go() {
+  docker_go_with "$@"
 }
 
 # Run one leg and require that the test ACTUALLY RAN.
@@ -107,7 +169,7 @@ run_leg() {
   # mutation leg does. This cannot manufacture a green: the PASS-line check below is
   # what decides, and it runs under set -e again.
   set +e
-  out="$(go test -tags integration -count=1 ./internal/integration/ -run "$pattern" -v 2>&1)"
+  out="$(docker_go test -tags integration -count=1 ./internal/integration/ -run "$pattern" -v 2>&1)"
   rc=$?
   set -e
   echo "$out"
@@ -259,7 +321,7 @@ build_divergence() {
   # before the diagnosis below can run, turning "the divergent write failed" into a
   # bare non-zero exit. The PASS check that follows is what decides.
   set +e
-  out="$(X2_WRITE_DIVERGENT=1 go test -tags integration -count=1 ./internal/integration/ \
+  out="$(docker_go_with X2_WRITE_DIVERGENT=1 test -tags integration -count=1 ./internal/integration/ \
     -run TestX2_WriteReferenceForDivergence -v 2>&1)"
   rc=$?
   set -e
@@ -341,13 +403,13 @@ if [ "${DO_MUTATE:-0}" = "1" ]; then
     # here; QUORUM is satisfied by the two blind DCs and answers "no references".
     "${COMPOSE[@]}" stop cassandra-eu
     require_stopped eu "before the mutated read"
-    out="$(X2_EXPECT_REFERENCE_DC_DOWN=1 go test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
+    out="$(docker_go_with X2_EXPECT_REFERENCE_DC_DOWN=1 test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
     rc=$?
     require_stopped eu "for the whole mutated read"
     "${COMPOSE[@]}" start cassandra-eu
     wait_healthy eu
   else
-    out="$(go test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
+    out="$(docker_go test -tags integration -count=1 ./internal/integration/ -run "$MUTATE_LEG" -v 2>&1)"
     rc=$?
   fi
   set -e
@@ -391,10 +453,12 @@ fi
 # full map here makes both creators produce the same keyspace, so the outcome no longer
 # depends on who wins.
 step "2. Apply the schema through the local DC"
-CASSANDRA_HOSTS="127.0.0.1:${CASSANDRA_NA_HOST_PORT:-9242}" CASSANDRA_LOCAL_DC=dc-na \
+docker_go_with \
+  CASSANDRA_HOSTS="${X2_TEST_HOST}:${CASSANDRA_NA_HOST_PORT:-9242}" \
+  CASSANDRA_LOCAL_DC=dc-na \
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy \
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1 \
-  go run ./cmd/sesamefs migrate
+  run ./cmd/sesamefs migrate
 
 # ---------------------------------------------------------------------------
 # P3 writer-fence legs, on the same fixture.
@@ -442,7 +506,7 @@ if [ "${DO_P3:-0}" = "1" ]; then
   require_stopped na "for the whole P3 publication attempt"
 
   set +e
-  p3out="$(P3_EXPECT_DC_DOWN=1 go test -tags integration -count=1 ./internal/integration/ -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v 2>&1)"
+  p3out="$(docker_go_with P3_EXPECT_DC_DOWN=1 test -tags integration -count=1 ./internal/integration/ -run TestP3_FencePublicationFailsClosedWhenADatacenterIsDown -v 2>&1)"
   p3rc=$?
   set -e
   require_stopped na "for the whole P3 publication attempt"

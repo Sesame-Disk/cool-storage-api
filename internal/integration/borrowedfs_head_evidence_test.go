@@ -15,14 +15,14 @@ const borrowedFSOwnLivenessEnv = "SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDE
 // is the conjunction of these fields, never a counter: marking one leg twice
 // cannot hide another.
 type borrowedFSOwnLivenessEvidenceState struct {
-	borrowedExactOwnPin          bool
-	sessionUploadNoExtraPin      bool
-	livenessFailureNoPublication bool
-	writerFirst                  bool
-	gcFirst                      bool
-	lateOwnPinAfterZeroProof     bool
-	gcFullyRetiredBeforeLateOwnPin bool
-	upPubDedup                   bool
+	borrowedExactOwnPin               bool
+	sessionUploadSingleOwnRefIdentity bool
+	livenessFailureNoPublication      bool
+	writerFirst                       bool
+	gcFirst                           bool
+	lateOwnPinAfterZeroProof          bool
+	gcFullyRetiredBeforeLateOwnPin    bool
+	upPubDedup                        bool
 }
 
 func (state borrowedFSOwnLivenessEvidenceState) namedLegs() []struct {
@@ -34,7 +34,7 @@ func (state borrowedFSOwnLivenessEvidenceState) namedLegs() []struct {
 		seen bool
 	}{
 		{"borrowedExactOwnPin", state.borrowedExactOwnPin},
-		{"sessionUploadNoExtraPin", state.sessionUploadNoExtraPin},
+		{"sessionUploadSingleOwnRefIdentity", state.sessionUploadSingleOwnRefIdentity},
 		{"livenessFailureNoPublication", state.livenessFailureNoPublication},
 		{"writerFirst", state.writerFirst},
 		{"gcFirst", state.gcFirst},
@@ -88,18 +88,18 @@ func TestBorrowedFSOwnLivenessEvidenceRequiresEveryNamedLeg(t *testing.T) {
 	if partial.complete() {
 		t.Fatal("partial BorrowedFS own-liveness evidence must not satisfy the package gate")
 	}
-	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "sessionUploadNoExtraPin") || !strings.Contains(got, "lateOwnPinAfterZeroProof") || !strings.Contains(got, "upPubDedup") {
+	if got := strings.Join(partial.missing(), ","); !strings.Contains(got, "sessionUploadSingleOwnRefIdentity") || !strings.Contains(got, "lateOwnPinAfterZeroProof") || !strings.Contains(got, "upPubDedup") {
 		t.Fatalf("missing() must name absent legs individually, got %q", got)
 	}
 	full := borrowedFSOwnLivenessEvidenceState{
-		borrowedExactOwnPin:            true,
-		sessionUploadNoExtraPin:        true,
-		livenessFailureNoPublication:   true,
-		writerFirst:                    true,
-		gcFirst:                        true,
-		lateOwnPinAfterZeroProof:       true,
-		gcFullyRetiredBeforeLateOwnPin: true,
-		upPubDedup:                     true,
+		borrowedExactOwnPin:               true,
+		sessionUploadSingleOwnRefIdentity: true,
+		livenessFailureNoPublication:      true,
+		writerFirst:                       true,
+		gcFirst:                           true,
+		lateOwnPinAfterZeroProof:          true,
+		gcFullyRetiredBeforeLateOwnPin:    true,
+		upPubDedup:                        true,
 	}
 	if !full.complete() || len(full.missing()) != 0 || len(full.namedLegs()) != 8 {
 		t.Fatalf("all 8 named legs should satisfy the package gate; missing=%v legs=%d", full.missing(), len(full.namedLegs()))

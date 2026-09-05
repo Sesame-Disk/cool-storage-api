@@ -6,6 +6,51 @@ Session-by-session development history for SesameFS.
 
 **Note**: For detailed git history, use `git log --oneline --graph`. This file tracks high-level session summaries.
 
+## 2026-09-05 - New W2 slice: SessionUpload own-liveness parity from PR #202
+
+PR #203 is abandoned as an implementation and retained only as historical
+reference. The new branch starts from PR #202's merge commit
+`7c71449d2`; the abandoned branch is neither deleted nor rebuilt.
+
+This slice is deliberately limited to `CreateFileFromBlocks` through the
+pre-HEAD cut:
+
+- Ready distinct blocks now carry provenance, `storage_class`, and
+  `storage_key` in one internal placement type.
+- BorrowedFS and SessionUpload blocks use the same bounded
+  `ensureCommitBlockOwnLiveness` step and the same `up:<session>` identity.
+  The Cassandra upsert renews an existing row or recreates it after expiry; it
+  never creates a second semantic identity.
+- After stage/commit and immediately before HEAD CAS, every ready placement
+  uses `ValidateBorrowedFSPublicationAuthority` through the existing
+  LOCAL_QUORUM advisory seam. The hot path adds no SERIAL/EACH_QUORUM per-block
+  authority, S3 lookup, scan, or global lock.
+- The six real Cassandra/MinIO evidence legs are
+  `renewalVisibleBeforeHead`, `renewalExtendsNearExpiredTTL`,
+  `writerFirst`, `gcFirst`, `gcFullyRetiredBeforeRenewal`, and
+  `renewalRetryIsIdempotent`. The retry forces a failure before HEAD so the
+  second attempt traverses renewal again instead of the committed-session
+  early return.
+
+The complete PR #203 findings matrix and disposition is in
+[`docs/PR203-SCOPE-AUDIT.md`](PR203-SCOPE-AUDIT.md). In particular, timeout/
+lease destructive cleanup, multi-DC repair reachability, ancestry reads,
+library terminal authority, ACTIVE/TERMINAL lifecycle, confirmed-lost cleanup,
+soft-delete/restore/hard-delete races, storage accounting, R31, and X1 remain
+documented follow-ups or historical pitfalls; none is silently added here.
+`GC_ENABLED=false` remains required.
+
+Validation is Docker-only, including the multi-DC harness. The separate
+`SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1` gate is wired into
+the canonical Docker integration and all-test runners; directed runs unset
+unrelated evidence gates explicitly. The focused W2 Docker run passed the six
+real Cassandra/MinIO legs, and the Docker-only multi-DC runner passed both P3
+legs (fail-closed publication with dc-na down and cross-DC writer visibility).
+The existing main development volume was not deleted when its unrelated
+migration-checksum mismatch appeared; the evidence used a fresh isolated
+Docker project.
+
+---
 ---
 
 ## 2026-09-02 - W1 follow-up: fix the LOCAL_QUORUM safety proof's own wording
