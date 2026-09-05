@@ -140,8 +140,10 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 	session := db.Session()
 	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
 	createdAt := time.Now().UTC().Add(-4 * time.Hour).Truncate(time.Millisecond)
-	updatedAt := createdAt.Add(time.Hour)
 	deletedAt := createdAt.Add(2 * time.Hour)
+	// updated_at is newer than the marker because the canonical ACTIVE restore
+	// transition already committed; only derived finalization is pending.
+	updatedAt := deletedAt.Add(time.Hour)
 	if err := session.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at, publication_state)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -183,6 +185,92 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 	markerErr := session.Query(`SELECT library_id FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&markerID)
 	if !errors.Is(markerErr, gocql.ErrNotFound) {
 		t.Fatalf("pending restore marker remains after retry: err=%v marker=%q", markerErr, markerID)
+	}
+}
+
+// A derived marker must not make restore consume a soft-delete that has not
+// reached the canonical row yet. This models the unsafe ordering that the
+// canonical-first soft-delete protocol prevents.
+func TestRestoreDeletedLibrary_RejectsPartialSoftDeleteMarker(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	canonicalUpdatedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	markerDeletedAt := canonicalUpdatedAt.Add(time.Hour)
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-guard-partial-soft-delete",
+		canonicalUpdatedAt.Add(-time.Hour), canonicalUpdatedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed active canonical library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`, libraryID.String(), orgID.String(), markerDeletedAt, "hot").Exec(); err != nil {
+		t.Fatalf("seed partial soft-delete marker: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err == nil {
+		t.Fatal("restore must reject a marker newer than the active canonical row")
+	}
+
+	var gotMarker time.Time
+	if err := session.Query(`SELECT deleted_at FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&gotMarker); err != nil {
+		t.Fatalf("partial soft-delete marker must remain for repair: %v", err)
+	}
+	if !gotMarker.Equal(markerDeletedAt) {
+		t.Fatalf("partial soft-delete marker changed: got %s want %s", gotMarker, markerDeletedAt)
+	}
+	var gotDeletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Scan(&gotDeletedAt); err != nil {
+		t.Fatalf("read canonical library after rejected restore: %v", err)
+	}
+	if !gotDeletedAt.IsZero() {
+		t.Fatalf("canonical active row must remain active: deleted_at=%s", gotDeletedAt)
+	}
+}
+
+// A replayed derived marker must not authorize GC hard-delete after restore has
+// won the canonical lifecycle CAS.
+func TestGCHardDelete_RejectsActiveCanonicalWithPartialMarker(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	canonicalUpdatedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	markerDeletedAt := canonicalUpdatedAt.Add(time.Hour)
+	if err := session.Query(`
+		INSERT INTO libraries (org_id, library_id, owner_id, name, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "gc-hard-delete-partial-marker",
+		canonicalUpdatedAt.Add(-time.Hour), canonicalUpdatedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed active canonical library: %v", err)
+	}
+	if err := session.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`, libraryID.String(), orgID.String(), markerDeletedAt, "hot").Exec(); err != nil {
+		t.Fatalf("seed partial soft-delete marker: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM library_publication_revocations WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+	})
+
+	if err := gcpkg.NewCassandraStore(db).HardDeleteLibrary(orgID, libraryID); err == nil {
+		t.Fatal("GC hard-delete must reject an active canonical row with only a derived marker")
+	}
+	var gotLibraryID string
+	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Scan(&gotLibraryID); err != nil {
+		t.Fatalf("active canonical row was removed after rejected hard delete: %v", err)
+	}
+	var gotMarker time.Time
+	if err := session.Query(`SELECT deleted_at FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&gotMarker); err != nil {
+		t.Fatalf("derived marker was removed after rejected hard delete: %v", err)
 	}
 }
 

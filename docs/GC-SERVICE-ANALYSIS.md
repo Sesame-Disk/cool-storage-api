@@ -210,7 +210,13 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    at `EACH_QUORUM` as well: the fence is a different partition and cannot make
    a preceding soft-delete visible to a reader in another DC. API writers renew
    ownership immediately before each mutating boundary, and the mock preserves
-   the same token check.
+   the same token check. Canonical soft-delete authority is committed first via
+   a settleable global-SERIAL CAS on `libraries.deleted_at`; marker, projection,
+   and reconciliation writes follow as derived LoggedBatch mutations. A batchlog
+   timeout therefore cannot later re-apply the lifecycle transition, and restore
+   fails closed if it sees a marker newer than an active canonical `updated_at`.
+   GC hard-delete rechecks the canonical row and rejects ACTIVE plus
+   `deleted_at=NULL`, so a replayed marker cannot authorize physical cleanup.
 6. **Scanner safety nets are partial** — phases recover discoverable candidates/markers and
    run on startup + every 24h. P6a (transient-error fail-open) is fixed, so a transient
    existence read no longer misclassifies a live library; P6b execution-time canonical

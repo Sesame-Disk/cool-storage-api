@@ -29,6 +29,18 @@ restore handoff.
   Restore and API soft-delete now renew the lease immediately before each
   mutating boundary. Added a guard tying the `EACH_QUORUM` assertion to the
   canonical Query call itself, plus a MockStore wrong-token regression.
+- Closed the remaining LoggedBatch ambiguity in the lifecycle handoff. A
+  Cassandra logged-batch timeout means the batchlog was retained and its
+  mutations may still replay; it cannot be the lifecycle authority. API and GC
+  now settle a global-SERIAL CAS on canonical `libraries.deleted_at` before
+  writing `deleted_libraries`, projections, and reconciliation rows in the
+  derived LoggedBatch. GC renews immediately before the authority CAS, derived
+  batch, and counter accounting. Restore rejects the unsafe partial shape in
+  which a marker is newer than an active canonical `updated_at`, while still
+  retrying a legitimate canonical-restore/pending-finalization shape. Added
+  real-Cassandra coverage for both cases. GC hard-delete now rechecks the
+  canonical row and rejects ACTIVE plus `deleted_at=NULL`, so a stale marker
+  replay cannot authorize destructive deletion after restore.
 - Hardened both HEAD-writer AST guards to recognize formatted and qualified
   CQL, require an exact publication_state = ? predicate in the IF clause, and
   require that bind to be ACTIVE. Added permanent mutation controls. Added a

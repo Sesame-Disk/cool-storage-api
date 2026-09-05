@@ -44,7 +44,7 @@ func restoreCanonicalLifecycleQueryIsEachQuorum(call *ast.CallExpr) bool {
 		return false
 	}
 	text, ok := restoreCanonicalLifecycleQueryText(query)
-	return ok && strings.HasPrefix(text, "select deleted_at, publication_state from libraries where ")
+	return ok && strings.HasPrefix(text, "select deleted_at, updated_at, publication_state from libraries where ")
 }
 
 // Restore's canonical lifecycle decision must use the same cross-DC visibility

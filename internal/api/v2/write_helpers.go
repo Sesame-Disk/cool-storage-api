@@ -969,20 +969,28 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		metrics.LibraryDeleteRepresentationResolutionFailures.WithLabelValues("soft_delete").Inc()
 		log.Printf("[softDeleteLibrary] could not resolve block representation for %s/%s: %v", orgID, libraryID, repErr)
 	}
+	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library soft-delete authority for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library soft-delete lock before authority transition for %s", libraryID)
+	}
+	effectiveDeletedAt, err := dbpkg.SoftDeleteLibraryCanonical(db.Session(), orgID, libraryID, deletedBy, now)
+	if err != nil {
+		return fmt.Errorf("soft-delete library authority: %w", err)
+	}
+	nextRow.UpdatedAt = effectiveDeletedAt
+	nextRow.DeletedAt = &effectiveDeletedAt
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?`,
-		now, deletedBy, now, orgID, libraryID,
-	)
 	batch.Query(`
 		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id)
 		VALUES (?, ?, ?, ?, ?)`,
-		libraryID, orgID, now, previousRow.StorageClass, blockRepresentationID,
+		libraryID, orgID, effectiveDeletedAt, previousRow.StorageClass, blockRepresentationID,
 	)
-	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, effectiveDeletedAt)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
-	owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("fence library soft-delete lock for %s: %w", libraryID, err)
 	}
@@ -1040,11 +1048,12 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// lifecycle read is EACH_QUORUM because the fence lives in a different partition and does
 	// not make a completed soft-delete visible to a LOCAL_QUORUM reader in another DC.
 	var canonicalDeletedAt time.Time
+	var canonicalUpdatedAt time.Time
 	var publicationState *string
 	err = db.Session().Query(`
-		SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
+		SELECT deleted_at, updated_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
-	).Consistency(gocql.EachQuorum).Scan(&canonicalDeletedAt, &publicationState)
+	).Consistency(gocql.EachQuorum).Scan(&canonicalDeletedAt, &canonicalUpdatedAt, &publicationState)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return fmt.Errorf("library is pending permanent deletion")
 	} else if err != nil {
@@ -1061,6 +1070,14 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	if canonicalDeletedAt.IsZero() {
 		if !markerPresent {
 			return fmt.Errorf("library is not in trash")
+		}
+		// A marker newer than the canonical update is the unsafe partial
+		// soft-delete shape: the derived LoggedBatch became visible before its
+		// authoritative CAS. Do not consume that marker as a restore intent.
+		// A legitimate pending restore has already advanced updated_at after
+		// the original soft-delete timestamp, so it remains eligible below.
+		if !canonicalUpdatedAt.After(markerDeletedAt) {
+			return fmt.Errorf("library soft-delete transition is still pending")
 		}
 		// The canonical ACTIVE transition may already have committed while the
 		// marker/read-model batch failed. Treat the durable marker as a restore

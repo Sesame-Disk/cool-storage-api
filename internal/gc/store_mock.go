@@ -1330,7 +1330,7 @@ func (m *MockStore) AddGroupMembership(orgID, userID, groupID uuid.UUID) {
 func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass string, deletedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass}
+	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, BlockRepresentationID: db.PlainBlockRepresentationID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
@@ -3847,6 +3847,9 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if lib, ok := m.libraries[libraryID]; ok && lib.OrgID == orgID && lib.DeletedAt.IsZero() {
+		return fmt.Errorf("refuse hard delete for active canonical library %s/%s with no deleted_at", orgID, libraryID)
+	}
 	m.libraryDestructiveCalls = append(m.libraryDestructiveCalls, "HardDeleteLibrary")
 	delete(m.libraries, libraryID)
 	delete(m.deletedLibraries, libraryID)

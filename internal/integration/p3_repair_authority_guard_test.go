@@ -138,8 +138,12 @@ func TestP3SerialReadsStayOffTheDedupPath(t *testing.T) {
 	}
 	// settleInstalledBlockMetadata is P2's post-install settlement read; apply is
 	// the single funnel through which BlockAuthorityStrong reaches a query.
+	// settleSoftDeleteCanonical is a separate lifecycle CAS settlement read; it
+	// is intentionally global-SERIAL and never sits on the deduplicated block
+	// upload path this guard protects.
 	allowed := map[string]bool{
 		"settleInstalledBlockMetadataFn": true,
+		"settleSoftDeleteCanonical":      true,
 		"apply":                          true,
 	}
 	found := map[string]bool{}

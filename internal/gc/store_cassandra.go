@@ -5217,7 +5217,16 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 			log.Printf("[gc] failed to release library lifecycle fence after soft delete %s: %v", libraryID, err)
 		}
 	}()
-	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy)
+	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy, func() error {
+		owned, err := RenewLibraryHardDeleteLockLease(s.db.Session(), libraryID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("fence library soft delete %s: %w", libraryID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library lifecycle fence for soft delete %s", libraryID)
+		}
+		return nil
+	})
 }
 
 func (s *CassandraStore) SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy, leaseToken uuid.UUID) error {
@@ -5228,10 +5237,19 @@ func (s *CassandraStore) SoftDeleteLibraryUnderLease(orgID, libraryID, deletedBy
 	if !owned {
 		return fmt.Errorf("lost library lifecycle fence for soft delete %s", libraryID)
 	}
-	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy)
+	return s.softDeleteLibraryLocked(orgID, libraryID, deletedBy, func() error {
+		owned, err := RenewLibraryHardDeleteLockLease(s.db.Session(), libraryID, leaseToken)
+		if err != nil {
+			return fmt.Errorf("fence library soft delete %s: %w", libraryID, err)
+		}
+		if !owned {
+			return fmt.Errorf("lost library lifecycle fence for soft delete %s", libraryID)
+		}
+		return nil
+	})
 }
 
-func (s *CassandraStore) softDeleteLibraryLocked(orgID, libraryID, deletedBy uuid.UUID) error {
+func (s *CassandraStore) softDeleteLibraryLocked(orgID, libraryID, deletedBy uuid.UUID, fenceLibrary func() error) error {
 	previousRow, err := db.ReadAdminLibraryProjectionRow(s.db.Session(), orgID.String(), libraryID.String())
 	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return err
@@ -5275,25 +5293,35 @@ func (s *CassandraStore) softDeleteLibraryLocked(orgID, libraryID, deletedBy uui
 	}
 
 	now := time.Now().UTC()
+	if err := fenceLibrary(); err != nil {
+		return err
+	}
+	effectiveDeletedAt, canonicalErr := db.SoftDeleteLibraryCanonical(s.db.Session(), orgID.String(), libraryID.String(), deletedBy.String(), now)
+	if canonicalErr != nil {
+		return fmt.Errorf("soft-delete library authority: %w", canonicalErr)
+	}
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ? WHERE org_id = ? AND library_id = ?
-	`, now, deletedBy.String(), now, orgID.String(), libraryID.String())
-	batch.Query(`
 		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id) VALUES (?, ?, ?, ?, ?)
-	`, libraryID.String(), orgID.String(), now, storageClass, blockRepresentationID)
-	traffic.AddAggregateStorageReconciliationQueries(batch, orgID.String(), ownerID, now)
+	`, libraryID.String(), orgID.String(), effectiveDeletedAt, storageClass, blockRepresentationID)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID.String(), ownerID, effectiveDeletedAt)
 	if err == nil {
 		nextRow := previousRow
-		nextRow.UpdatedAt = now
-		nextRow.DeletedAt = &now
+		nextRow.UpdatedAt = effectiveDeletedAt
+		nextRow.DeletedAt = &effectiveDeletedAt
 		db.AddRefreshAdminLibraryReadModelQueries(batch, nextRow, &previousRow)
+	}
+	if err := fenceLibrary(); err != nil {
+		return err
 	}
 	if err := batch.Exec(); err != nil {
 		return err
 	}
 
 	// Adjust storage counters: subtract library's usage from aggregate scopes.
+	if err := fenceLibrary(); err != nil {
+		return err
+	}
 	if ownerID != "" {
 		traffic.AdjustAggregateStorageCounters(s.db, orgID.String(), ownerID, libraryID.String(), false)
 	}
@@ -5664,6 +5692,22 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 
 func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	session := s.db.Session()
+	// `deleted_libraries` is derived state and may be replayed after a restore
+	// won the canonical CAS. Never let an active canonical row be hard-deleted
+	// merely because a stale marker is visible. TERMINAL rows and a row already
+	// absent after a prior successful hard-delete remain valid retry shapes; the
+	// publication revocation below settles those cases.
+	var canonicalDeletedAt time.Time
+	var publicationState *string
+	canonicalErr := session.Query(`
+		SELECT deleted_at, publication_state FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Consistency(gocql.EachQuorum).Scan(&canonicalDeletedAt, &publicationState)
+	if canonicalErr != nil && !errors.Is(canonicalErr, gocql.ErrNotFound) {
+		return fmt.Errorf("read canonical library before hard delete for %s/%s: %w", orgID, libraryID, canonicalErr)
+	}
+	if canonicalErr == nil && publicationState != nil && *publicationState == db.LibraryPublicationStateActive && canonicalDeletedAt.IsZero() {
+		return fmt.Errorf("refuse hard delete for active canonical library %s/%s with no deleted_at", orgID, libraryID)
+	}
 	// Revoke the publication authority in the libraries row's SERIAL domain
 	// before deleting that row. The durable witness lets publish-repair prove
 	// terminality after the canonical row is gone.

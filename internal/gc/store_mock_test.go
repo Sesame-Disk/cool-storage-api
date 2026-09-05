@@ -170,6 +170,25 @@ func TestMockStore_SoftDeleteLibraryUnderLease_RequiresOwnerToken(t *testing.T) 
 	}
 }
 
+func TestMockStore_HardDeleteLibrary_RejectsActiveCanonicalWithMarker(t *testing.T) {
+	store := NewMockStore()
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibrary(orgID, libID, "hot")
+	store.deletedLibraries[libID] = &mockDeletedLibrary{
+		OrgID: orgID, LibraryID: libID, StorageClass: "hot", DeletedAt: time.Now().UTC().Add(-time.Hour),
+	}
+
+	if err := store.HardDeleteLibrary(orgID, libID); err == nil {
+		t.Fatal("HardDeleteLibrary must reject an active canonical row with only a derived marker")
+	}
+	if _, ok := store.libraries[libID]; !ok {
+		t.Fatal("active canonical library was removed after rejected hard delete")
+	}
+	if _, ok := store.deletedLibraries[libID]; !ok {
+		t.Fatal("derived marker was removed after rejected hard delete")
+	}
+}
+
 // TestMockStore_EnqueueItemRejectsRepresentationRequiredTypes verifies the raw
 // single-row EnqueueItem path — which cannot carry a block representation — fails
 // closed for the item types that require one, so a caller cannot bypass the

@@ -24,8 +24,15 @@ real-Cassandra regression keeps the fence owned and proves all three writer
 families reject without consuming either row. A follow-up cross-DC review
 found that the fence partition did not make the canonical row visible to a
 restore in another DC; restore now reads that lifecycle state at EACH_QUORUM
-and renews ownership before mutating boundaries. The MockStore also validates
-under-lease tokens. The X1 closure remains open.
+and renews ownership before mutating boundaries. A later review confirmed that
+a LoggedBatch timeout can leave the derived batchlog replaying, so API and GC
+now commit `libraries.deleted_at` first through a settleable global-SERIAL CAS;
+the marker, projections, and reconciliation rows are derived afterward. GC
+renews before each authority/batch/accounting boundary, and restore fails
+closed on a marker newer than an active canonical `updated_at`. The MockStore
+and GC hard-delete path also reject an active canonical row when only a derived
+marker is present. The MockStore validates under-lease tokens. The X1 closure
+remains open.
 
 ## Issue Summary by Priority
 
