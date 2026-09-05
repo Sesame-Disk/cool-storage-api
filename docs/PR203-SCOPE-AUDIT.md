@@ -7,14 +7,11 @@ not an implementation source. This register covers its commits, tests, and
 documentation before the new W2 slice.
 
 The rule for this PR is strict: code enters only when omitting it would make the
-narrow SessionUpload guarantee through the pre-HEAD `CreateFileFromBlocks` cut
-false. The `Exists in main?` column is about the baseline above, not about the
-historical reference branch. `INTRODUCED-BY-203` findings are preserved as
-pitfalls or constraints and are not silently reintroduced.
+narrow SessionUpload guarantee through the pre-HEAD `CreateFileFromBlocks` cut false. The `Origin` column distinguishes findings introduced by the abandoned #203 implementation from preexisting behavior that #203 merely discovered or characterized. The `Exists in main?` column is about the baseline above, not about the historical reference branch. `INTRODUCED-BY-203` findings are preserved as pitfalls or constraints and are not silently reintroduced.
 
 | Severity | Scope | Origin | Exists in main? | Impact on narrow guarantee | Documentary destination | Decision |
 |---|---|---|---|---|---|---|
-| P1 | Destructive cleanup selected from timeout or lease expiry | INTRODUCED-BY-203 lifecycle proposal | No | None before HEAD; would turn W2 into GC authority | `CHANGELOG.md`; `GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md` | Historical pitfall; timeout is never destructive authority |
+| P1 | Destructive cleanup selected from timeout or lease expiry | PREEXISTING; discovered/characterized during #203 | Yes | Post-HEAD repair only; no effect on the narrow pre-HEAD guarantee | [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01); R31/X1 docs | Existing follow-up; lease expiry is not destructive authority |
 | P1 | Initial-library HEAD, shared-root initialization, and initial commit nonce | INTRODUCED-BY-203 W2a | No | None for an existing SessionUpload block placement | `CHANGELOG.md`; X1 handoff plan | Historical lifecycle scope; do not import |
 | P1 | Resurrection TOCTOU between initial state and HEAD publication | INTRODUCED-BY-203 W2a | No | None before HEAD for this block-level gate | `CHANGELOG.md`; X1 handoff plan | Historical pitfall; no lifecycle change |
 | P1 | Legacy-NULL publication-state compatibility removal and read tolerance | INTRODUCED-BY-203 W2a | No | None; schema/protocol migration is out of scope | `CHANGELOG.md`; PRE-GC/X1 docs | Historical migration scope; do not import |
@@ -26,17 +23,20 @@ pitfalls or constraints and are not silently reintroduced.
 | P1 | Absence of a library row treated as terminal authority | INTRODUCED-BY-203 W2a | No | None for block placement authority | `CHANGELOG.md`; R31/X1 docs | Historical pitfall; no terminal-authority overlay |
 | P1 | Terminal publication authority in HEAD SERIAL domain | INTRODUCED-BY-203 W2a | No | Not needed for the LOCAL_QUORUM block placement check | `CHANGELOG.md`; X1 handoff plan | PRE-X1 follow-up; no SERIAL HEAD change |
 | P1 | Terminal authority versus ordinary `ErrLibraryHeadConflict` | INTRODUCED-BY-203 W2a | No | Broader HEAD error semantics, after this cut | `CHANGELOG.md`; `OPEN-WORK-INDEX.md` | Historical distinction; do not generalize in W2 |
-| P1 | HEAD reachability across DCs for repair cleanup | PREEXISTING repair path, found by #203 | Yes | Post-HEAD repair only; cannot justify changing this pre-HEAD gate | `KNOWN_ISSUES.md`; `TECHNICAL-DEBT.md` | Existing follow-up; no code in W2 |
-| P1 | Unbounded ancestry reads in repair | PREEXISTING repair path, found by #203 | Yes | No effect before HEAD; changing it is publish-repair scope | `TECHNICAL-DEBT.md` ancestry item | Existing follow-up; no code in W2 |
+| P1 | HEAD reachability across DCs for repair cleanup | PREEXISTING; discovered/characterized during #203 | Yes | Post-HEAD repair only; cannot justify changing this pre-HEAD gate | [ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01); [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#19-multiregion-head-safety-follow-ups-2026-05-18) | Existing follow-up; no code in W2 |
+| P1 | Unbounded ancestry reads in repair | PREEXISTING; discovered/characterized during #203 | Yes | No effect before HEAD; changing it is publish-repair scope | [ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01); [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#19-multiregion-head-safety-follow-ups-2026-05-18) | Existing follow-up; no code in W2 |
 | P1 | Repair HEAD lookup by `orgID` versus `libraries_by_id` | INTRODUCED-BY-203 repair fix | No | Only repair reachability, not block placement | `CHANGELOG.md`; R31 docs | Historical correction; no repair redesign |
 | P1 | Repair ancestry `EACH_QUORUM` and missing-row fail-closed behavior | INTRODUCED-BY-203 repair fix | No | Only applied-CAS repair promotion after HEAD | `CHANGELOG.md`; R31/X1 docs | Historical constraint; no repair code in W2 |
 | P1 | Ambiguous HEAD CAS and applied-CAS/unconfirmed repair promotion | INTRODUCED-BY-203 tests/fixes | No | Post-HEAD convergence only | `CHANGELOG.md`; R31 docs | Historical evidence; no repair promotion in W2 |
 | P1 | Commit re-verification immediately before HEAD CAS | DEPENDENCY from #202, narrowed by #203 | Partial: BorrowedFS exists in main | Directly closes the SessionUpload pre-HEAD interval | `R3-LIVENESS-CONTINUITY.md`; `TESTING.md` | Included, generalized to all ready placements |
-| P1 | HEAD-CAS/lease race at the root | INTRODUCED-BY-203 lifecycle hardening | No | No new lease authority may be required for W2 | `CHANGELOG.md`; X1 handoff plan | Historical pitfall; exact placement is the only W2 gate |
-| P1 | Lease timeout is not revocation for publication/repair | INTRODUCED-BY-203 lifecycle hardening | No | None for the SessionUpload block gate | `CHANGELOG.md`; X1 docs | Historical constraint; do not infer revocation |
-| P1 | `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry | PREEXISTING HEAD infrastructure, surfaced by #203 | Yes | Broader failed-publish cleanup, not placement evidence | `TECHNICAL-DEBT.md`; `OPEN-WORK-INDEX.md` | Existing debt; no error-semantics expansion |
-| P1 | Soft-delete, restore, and hard-delete races | PREEXISTING lifecycle surface, analyzed by #203 | Yes | Outside block commit and explicitly excluded | `KNOWN_ISSUES.md`; PRE-GC/X1 docs | Existing follow-up; no lifecycle code |
-| P1 | Storage-accounting crash/retry convergence | PREEXISTING split-phase accounting, surfaced by #203 | Yes | No effect on placement, liveness, or exact-P | `TECHNICAL-DEBT.md`; `KNOWN_ISSUES.md` | Existing debt; no accounting/quota changes |
+| P1 | HEAD-CAS/lease race at the root | PREEXISTING; characterized during #203 | Yes | Post-HEAD/repair race; no new lease authority is required for W2 | [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01); R31/X1 docs | Existing follow-up; exact placement is the only W2 gate |
+| P1 | Lease timeout is not revocation for publication/repair | PREEXISTING; characterized during #203 | Yes | None for the SessionUpload block gate; do not infer revocation | [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01); R31/X1 docs | Existing constraint; no code in W2 |
+| P1 | `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry | PREEXISTING; surfaced by #203 | Yes | Broader failed-publish cleanup, not placement evidence | [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#pending-published-fs_object-cleanup-row-per-owner-model); [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) | Existing debt; no error-semantics expansion |
+| P1 | Soft-delete, restore, and hard-delete races | PREEXISTING; analyzed by #203 | Yes | Outside block commit and explicitly excluded | [KNOWN_ISSUES.md](KNOWN_ISSUES.md#issue-lib-deleted-fence-01); PRE-GC/X1 docs | Existing follow-up; no lifecycle code |
+| P1 | Storage-accounting crash/retry convergence | PREEXISTING split-phase accounting, surfaced by #203 | Yes | No effect on placement, liveness, or exact-P | [TECHNICAL-DEBT.md](TECHNICAL-DEBT.md#12d-storage-quota-publishcounter-atomicity); [KNOWN_ISSUES.md](KNOWN_ISSUES.md#issue-gc-pub-ref-zero-ref-01) | Existing debt; no accounting/quota changes |
+| P1 | Global reconciliation versus normal HEAD/counter write can apply a stale delta and over/under-count | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
+| P1 | Reconciler T1 can delete T2 when DELETE is scoped only by aggregate scope, without generation/attempt identity | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
+| P1 | Canonical soft-delete CAS can crash before its derived counter batch without a marker or reconciliation discovery path | INTRODUCED-BY-203 attempted accounting design | No (abandoned design) | None; outside W2 | This audit; `CHANGELOG.md` | Historical pitfall; do not reintroduce |
 | P1 | Retry evidence could hit the committed-session early return | INTRODUCED-BY-203 test defect | No (test defect) | Would not prove a second renewal | `CHANGELOG.md`; `TESTING.md` | Fixed: first attempt fails pre-HEAD, releases claim, second attempt renews |
 | P1 | `up:` row count alone cannot prove renewal | INTRODUCED-BY-203 evidence defect | No (evidence defect) | Could false-green identity/liveness evidence | `CHANGELOG.md`; `TESTING.md` | Fixed: one identity plus TTL movement and real retry |
 | P1 | Renewal wording hid recreate-after-expiry | INTRODUCED-BY-203 documentation defect | No (wording defect) | Could hide lapsed-reference behavior | `R3-LIVENESS-CONTINUITY.md`; `CHANGELOG.md` | Fixed: idempotent upsert renews or recreates |
@@ -45,9 +45,10 @@ pitfalls or constraints and are not silently reintroduced.
 | P2 | O(N distinct blocks) renewal and authority reads | DEPENDENCY / #203 review constraint | No | Required bounded cost of the narrow guarantee | `R3-LIVENESS-CONTINUITY.md`; `TESTING.md` | Included; deduplicated by block ID |
 | P2 | Per-block SERIAL/EACH_QUORUM, S3 scans, or global locks | #203 review constraint | No | Would violate the narrow hot-path budget | `R3-LIVENESS-CONTINUITY.md`; `TESTING.md` | Explicitly prohibited; contract test guards SERIAL absence |
 | P2 | Evidence-gate contamination between W1 and W2 | INTRODUCED-BY-203 test/docs defect | No (harness defect) | Could make directed evidence falsely green | `TESTING.md`; `CHANGELOG.md` | Fixed: separate W2 gate and explicit empty unrelated gates |
+| P2 | Global Dockerization of the X2/P3 harness added `.env`, image, network, and backend preconditions outside W2 | INTRODUCED-BY-203 harness scope drift | No (reverted) | None; unrelated multi-DC workflow must remain unchanged | `TESTING.md`; `CHANGELOG.md` | Reverted; keep X2/P3 as its existing separate workflow |
 | P2 | Go-format/test-runner wiring drift in #203 | INTRODUCED-BY-203 test/docs defect | No (harness defect) | No product effect, but invalidates evidence | `TESTING.md`; `CHANGELOG.md` | Fixed and validated in Docker |
-| P2 | R31 `up -> pub -> HEAD -> fs` crash continuity | PREEXISTING roadmap | Yes, open | This funnel stops before post-HEAD crash reconciliation | R31 docs; `CURRENT_WORK.md` | Remains OPEN; follow-up PR |
-| P2 | X1 physical retirement and destructive GC activation | PREEXISTING roadmap | Yes, open | Writer gate does not close physical-delete ABA | X1 docs; PRE-GC activation docs | Remains OPEN; `GC_ENABLED=false` remains required |
+| P2 | R31 `up -> pub -> HEAD -> fs` crash continuity | PREEXISTING roadmap | Yes, open | This funnel stops before post-HEAD crash reconciliation | [R31 handoff](GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md#16-r31-remains-a-blocker-open); [CURRENT_WORK](../CURRENT_WORK.md) | Remains OPEN; follow-up PR |
+| P2 | X1 physical retirement and destructive GC activation | PREEXISTING roadmap | Yes, open | Writer gate does not close physical-delete ABA | [`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`](KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01); [X1 handoff](GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) | Remains OPEN; `GC_ENABLED=false` remains required |
 
 ## Commit, test, and documentation coverage
 
@@ -57,6 +58,9 @@ The rows above cover every historical commit family on the reference branch:
   `059b5c6e3`, `c09fd6981`, `24e840d77`, and `caa7ebad6` are the lifecycle,
   legacy-NULL, ownership, soft-delete, restore, hard-delete, and accounting
   findings in rows 2--12 and 23.
+- The three attempted accounting-design pitfalls are the historical rows immediately
+  after the current storage-accounting row; they are not current main defects.
+
 - `0832caeb2`, `2f319acc5`, `8c69a2347`, `71ecfcefc`, and `fc04b0f07`
   are the terminal authority, timeout/lease, HEAD-CAS race, and repair lookup
   findings in rows 1, 10--12, 18--20.
@@ -80,8 +84,9 @@ gate is separate from W1 and names six required real Cassandra/MinIO legs:
 `gcFirst`, `gcFullyRetiredBeforeRenewal`, and `renewalRetryIsIdempotent`.
 Contract tests pin call order and reject a SERIAL hot-path authority call. All
 directed runs explicitly disable unrelated evidence gates; the canonical Docker
-runners enable the complete set. The multi-DC harness also executes its Go
-runner inside Docker.
+runners enable the complete set. The W2 unit, contract, and six-leg integration
+evidence runs in Docker. The pre-existing X2/P3 multi-DC harness is intentionally
+not part of this PR.
 
 This register is historical audit documentation, not authorization to fold the
 listed follow-ups into this PR. A future PR must choose its own narrow scope and

@@ -852,45 +852,39 @@ docker rm -f dc3run
 docker compose -f docker-compose.cassandra-3dc.yaml down -v
 ```
 
-### Canonical Docker-only harness
+### On a host where Go binaries run normally
 
-The script keeps Compose orchestration on the host, but every migration and Go
-test runs in the sesamefs-gotest container. The checkout is mounted read-only
-so the X2/P3 mutation modes see their temporary source edits without using a
-host Go toolchain.
+The script does all of the above in one command:
 
 ```bash
-# The backend must expose dev-token auth. Use host networking when it is
-# reachable at localhost:8080:
-X2_TEST_NETWORK=host \
-X2_TEST_BACKEND_URL=http://127.0.0.1:8080 \
-./scripts/x2-multidc-validation.sh --p3
-
-# Or use a backend already running in a Docker network. Cassandra 3DC is
-# reached through its published 9242/9243/9244 ports via host.docker.internal:
-X2_TEST_NETWORK=sesamefs-w2fresh_default \
-X2_TEST_BACKEND_URL=http://sesamefs:8080 \
-./scripts/x2-multidc-validation.sh --p3
+./scripts/x2-multidc-validation.sh --keep     # X2 legs, leaves the fixture up
+./scripts/x2-multidc-validation.sh --p3       # P3 legs (skips the X2 legs entirely)
 ```
 
 `--p3` runs the schema step and then the P3 legs, and exits before X2's
 hinted-handoff disable and divergence build. It does NOT inherit X2 fixture state.
 
-The fixture must already be up for `--p3`; start it with
-`docker compose -f docker-compose.cassandra-3dc.yaml up -d` and wait for all
-three health checks/bootstrap first. `--keep` leaves the fixture up, while the
-default full X2 invocation tears down the fixture.
+### Windows / blocked binaries
 
-For the manual `dc3run` route above, two details are easy to get wrong:
+On hosts where an Application Control policy blocks executing freshly built
+binaries, `go run` and `go test` fail from the host with:
 
-- **Two networks.** That manual test container needs
-  `sesamefs-cassandra-3dc_default` to reach the three Cassandra nodes by name,
-  *and* `sesamefs_default` to reach the app, because the integration
-  `TestMain` exits 0 when `SESAMEFS_URL` is
+```
+fork/exec ...\xxx.test.exe: An Application Control policy has blocked this file.
+```
+
+`go build` and `go vet` still work; only *execution* is blocked. The script drives
+`go` from the host, so it cannot be used there. Use the container route in the
+TL;DR above -- that is how the current evidence in
+`docs/GC-X2-MULTIDC-VALIDATION.md` was actually produced.
+
+Two details that are easy to get wrong:
+
+- **Two networks.** The test container needs `sesamefs-cassandra-3dc_default` to
+  reach the three Cassandra nodes by name, *and* `sesamefs_default` to reach the
+  app, because the integration `TestMain` exits 0 when `SESAMEFS_URL` is
   unreachable -- a run that proved nothing would look like a pass. `docker run`
-  takes one network, so attach the second with `docker network connect`. The
-  canonical script instead uses the published 3DC ports through
-  `host.docker.internal` and one selected Docker network.
+  takes one network, so attach the second with `docker network connect`.
 - **Git Bash mangles the env values.** `X2_DC_HOSTS` and
   `CASSANDRA_REPLICATION_DCS` contain colons and are rewritten by MSYS path
   conversion. Prefix the command with `MSYS_NO_PATHCONV=1`, or run it from
@@ -994,6 +988,11 @@ docs freeze (D0). It does not change runtime. Contract tests in
 `internal/gc/x1_physical_life_handoff_plan_test.go` pin CURRENT vs DECIDED and
 the still-open P4c-orphan / TTL / fence facts:
 
+```bash
+docker compose --profile test run --rm --build gotest \
+  go test ./internal/gc -count=1 -run 'TestX1PhysicalLifeHandoff'
+```
+
 SessionUpload W2 evidence is a separate six-leg gate, covered by
 `internal/integration/sessionupload_own_liveness_test.go` and backed by real
 Cassandra/MinIO. The retry leg forces a pre-HEAD failure, releases the session
@@ -1020,18 +1019,10 @@ docker compose --profile test run --rm --build \
   go test -tags integration -run '^TestSessionUploadOwnLiveness|^TestSessionUploadOwnLivenessEvidenceRequiresEveryNamedLeg$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
-Canonical full run: `docker compose --profile test run --rm --build
-go-integration-test` (or `go-all-test`). Both services set the W2 gate and
-the W1/R3/X1 gates explicitly. Multi-DC consistency legs remain Docker-only:
-use `./scripts/x2-multidc-validation.sh --p3` for the repository's real
-three-DC harness; it creates its own Docker test container and does not replace
-the six SessionUpload legs.
-
-
-```bash
-docker compose --profile test run --rm --build gotest \
-  go test ./internal/gc -count=1 -run 'TestX1PhysicalLifeHandoff'
-```
+Canonical full run: `docker compose --profile test run --rm --build go-integration-test`
+(or `go-all-test`). Both services set the W2 gate and the W1/R3/X1 gates
+explicitly. The existing X2/P3 multi-DC harness is a separate workflow and is
+not changed by this PR.
 
 ### P4b orphan publication evidence
 

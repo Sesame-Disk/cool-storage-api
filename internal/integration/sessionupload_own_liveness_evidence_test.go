@@ -13,8 +13,8 @@ const sessionUploadOwnLivenessEnv = "SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS
 // sessionUploadOwnLivenessEvidenceState records each W2 SessionUpload-parity
 // leg by name. Completeness is the conjunction of these fields, never a
 // counter: marking one leg twice cannot hide another. It is separate from
-// borrowedFSOwnLivenessEvidenceState so the W1 gate remains pinned to its
-// original field list.
+// borrowedFSOwnLivenessEvidenceState so W1 retains its own eight-leg gate
+// while W2 has a separate six-leg gate.
 type sessionUploadOwnLivenessEvidenceState struct {
 	renewalVisibleBeforeHead     bool
 	renewalExtendsNearExpiredTTL bool

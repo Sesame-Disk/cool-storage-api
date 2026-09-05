@@ -1147,6 +1147,15 @@ What is still not atomic:
 
 Update 2026-05-21: sync HEAD publish no longer tries to reconcile aggregate storage counters inline on idempotent retries. The request path now keeps post-CAS repair O(1): it repairs the current library-scope counter and derived projection synchronously, queues platform/org/user reconciliation requests into `gc_storage_counter_reconciliation`, and returns a retryable error instead of scanning all libraries from the sync handler. Aggregate repair is deferred to GC scanner phase 11, which now recomputes requested scopes from canonical `libraries.size_bytes` / `file_count` rather than from possibly drifted library counter rows.
 
+Audit note (2026-09-05): the abandoned PR #203 also explored an attempted global
+reconciliation design. That design had three historical pitfalls: a stale reconciliation
+delta could over/under-count against a normal HEAD/counter write; a T1 reconciler
+could delete T2 when the request key lacked generation/attempt identity; and a
+canonical soft-delete CAS could crash before its derived counter batch without a
+marker or discovery path. Those pitfalls are recorded in [PR203-SCOPE-AUDIT.md](PR203-SCOPE-AUDIT.md)
+as INTRODUCED-BY-203 attempted design, not as current main bugs and not as
+authority for this W2.
+
 This is a Cassandra consistency/transaction-shaping debt, not a remaining missing-hook bug like ISSUE-QUOTA-COVERAGE-01.
 
 **Future fix (v2):** Centralize tree-delta publish through one quota-aware primitive. Options include a reservation step before publish, a narrower CAS-backed workflow that couples quota usage and HEAD publication closely enough that concurrent writers cannot both spend the same remaining bytes, or a reconciliation/compensating-job path that can finish the source-removal half of a cross-repo move after the destination publish succeeds. If product keeps success-after-publish for some handlers, add durable repair/reconciliation for missed counter updates instead of relying on log-only drift.

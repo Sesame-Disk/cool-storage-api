@@ -785,7 +785,11 @@ incorrectly.
 
 W2 must close `up → pub → fs`, including ambiguous HEAD / publication
 settlement. R31 closes only with durable reconciliation or an equivalent proof
-that a possibly-accepted publication never loses its definitive liveness.
+that a possibly-accepted publication never loses its definitive liveness. The
+preexisting repair lease/reachability debt is tracked as
+[ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01)
+and [ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01);
+W2 does not change it.
 
 ---
 

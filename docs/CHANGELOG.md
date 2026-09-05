@@ -40,17 +40,26 @@ soft-delete/restore/hard-delete races, storage accounting, R31, and X1 remain
 documented follow-ups or historical pitfalls; none is silently added here.
 `GC_ENABLED=false` remains required.
 
-Validation is Docker-only, including the multi-DC harness. The separate
-`SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1` gate is wired into
+Validation for the W2 unit, contract, and six-leg integration evidence is
+Docker-only. The existing X2/P3 multi-DC harness is separate and unchanged.
+The separate `SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1` gate is wired into
 the canonical Docker integration and all-test runners; directed runs unset
 unrelated evidence gates explicitly. The focused W2 Docker run passed the six
-real Cassandra/MinIO legs, and the Docker-only multi-DC runner passed both P3
-legs (fail-closed publication with dc-na down and cross-DC writer visibility).
+real Cassandra/MinIO legs.
+
+The audit also records three abandoned #203 accounting-design pitfalls: a stale
+reconciliation delta could over/under-count against a normal HEAD/counter write;
+a T1 reconciler could delete T2 without generation/attempt identity; and a
+canonical soft-delete CAS could crash before its derived counter batch without a
+marker or discovery path. These are historical constraints, not current main bugs
+and not scope for W2. The preexisting post-HEAD repair lease/reachability findings
+are tracked as [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01) and
+[ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01).
+
 The existing main development volume was not deleted when its unrelated
 migration-checksum mismatch appeared; the evidence used a fresh isolated
 Docker project.
 
----
 ---
 
 ## 2026-09-02 - W1 follow-up: fix the LOCAL_QUORUM safety proof's own wording

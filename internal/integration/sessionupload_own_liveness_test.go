@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -88,6 +90,16 @@ func TestSessionUploadOwnLiveness(t *testing.T) {
 		if renewedTrackerTTL < dbpkg.ProvisionalBlockReferenceTTLSeconds-10 {
 			t.Fatalf("sessionUploadRenewalExtendsNearExpiredTTL: renewed tracker TTL = %d, want refreshed ~%ds horizon", renewedTrackerTTL, dbpkg.ProvisionalBlockReferenceTTLSeconds)
 		}
+		var renewedReferenceTTL int
+		if err := database.Session().Query(
+			`SELECT TTL(created_at) FROM block_references WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+			fx.orgID, fx.blockID, fx.sessionRef,
+		).Scan(&renewedReferenceTTL); err != nil {
+			t.Fatalf("sessionUploadRenewalExtendsNearExpiredTTL: read renewed up:<session> reference: %v", err)
+		}
+		if renewedReferenceTTL < dbpkg.ProvisionalBlockReferenceTTLSeconds-10 {
+			t.Fatalf("sessionUploadRenewalExtendsNearExpiredTTL: renewed up:<session> TTL = %d, want refreshed ~%ds horizon", renewedReferenceTTL, dbpkg.ProvisionalBlockReferenceTTLSeconds)
+		}
 		var staleProjection time.Time
 		err := database.Session().Query(
 			`SELECT expires_at FROM gc_provisional_block_refs_by_day
@@ -95,8 +107,8 @@ func TestSessionUploadOwnLiveness(t *testing.T) {
 			dbpkg.GCProjectionUTCDate(canonicalExpiresAt), dbpkg.GCDiscoveryBucket(fx.orgID, fx.blockID, fx.sessionRef),
 			canonicalExpiresAt.UTC(), fx.orgID, fx.blockID, fx.sessionRef,
 		).Scan(&staleProjection)
-		if err == nil {
-			t.Fatalf("sessionUploadRenewalExtendsNearExpiredTTL: stale expiry projection survived at %v", canonicalExpiresAt.UTC())
+		if !errors.Is(err, gocql.ErrNotFound) {
+			t.Fatalf("sessionUploadRenewalExtendsNearExpiredTTL: stale expiry projection lookup = %v, want gocql.ErrNotFound", err)
 		}
 		fx.assertHeadAdvanced(t)
 		sessionUploadOwnLivenessEvidence.renewalExtendsNearExpiredTTL = true

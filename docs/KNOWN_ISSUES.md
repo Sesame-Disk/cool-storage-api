@@ -5174,6 +5174,40 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 ---
 
+### ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01: Publish repair treats lease expiry as cleanup authority
+
+**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Severity**: High (P1) — R31 / post-HEAD publication continuity
+**Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair, pending publication cleanup
+
+#### Problem
+
+The pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postpones an unreachable repair while the lease is live and permits cleanup after the lease expires. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
+
+Cleanup selected by elapsed time can therefore remove an attempt commit or reference while definitive HEAD/reconciliation evidence is unavailable. This is post-HEAD behavior and is not part of the W2 pre-HEAD SessionUpload guarantee. Destructive GC remains disabled.
+
+#### Scope / disposition
+
+Preexisting in PR #202/`main`, discovered or characterized while auditing the abandoned PR #203 lifecycle and repair proposals. Track the fix under R31; do not add lifecycle, terminal-authority, or repair changes to the W2 slice.
+
+---
+
+### ISSUE-PUBLISH-REPAIR-REACHABILITY-01: Repair HEAD reachability and ancestry are not bounded authority
+
+**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Severity**: High (P1) — multi-DC/post-HEAD repair correctness and convergence
+**Affected**: publish-repair HEAD lookup and commit ancestry walk
+
+#### Problem
+
+The repair path reads HEAD through its ordinary read path and walks `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain can misclassify whether an applied publication is reachable. This is the same post-HEAD reachability concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
+
+#### Scope / disposition
+
+Preexisting in PR #202/`main`, discovered or characterized during PR #203. Track with R31 and the multiregion HEAD follow-up. No code in W2; any repair change needs its own bounded scope and evidence.
+
+---
+
 ### ISSUE-GC-ENGINE-ROBUSTNESS-01: GC Worker/Scanner Robustness (E1/E2/E4/E5/E6)
 
 **Status**: 🟡 Confirmed, low-severity (2026-07-10)
