@@ -52,6 +52,16 @@ partial-marker boundaries and the legitimate pending-finalization shape. The rep
 was also corrected to target the current settlement branch. The generic lease
 LWTs are explicitly pinned to EACH_QUORUM plus global SERIAL for the production
 3DC topology. X1 remains OPEN and GC_ENABLED=false.
+**W2a storage-accounting follow-up (2026-09-04)**: the final report found that
+replaying a completed restore could miss aggregate credits, while replaying a
+completed soft-delete could subtract them twice. Lifecycle writers now preserve
+the per-library counter but enqueue reconciliation after the canonical CAS and
+synchronously reconcile pending org/user/platform scopes from canonical
+`libraries` state. This makes API and GC retries converge without arithmetic
+assumptions. Real-Cassandra coverage now asserts nonzero restore credits and
+repeated API/GC soft-deletes remain unchanged. X1 remains OPEN and
+`GC_ENABLED=false`.
+
 ## 🚀 NEW SESSION? START HERE
 
 **PROJECT STATUS**: ~85-90% production ready (see `docs/IMPLEMENTATION_STATUS.md`)

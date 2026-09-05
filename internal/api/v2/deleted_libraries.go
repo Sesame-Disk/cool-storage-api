@@ -180,7 +180,7 @@ func (h *DeletedLibraryHandler) RestoreDeletedRepo(c *gin.Context) {
 		return
 	}
 
-	// Restore: clear deleted_at + re-add library storage to aggregate counters.
+	// Restore: clear deleted_at and reconcile aggregate storage from canonical library state.
 	if err := restoreDeletedLibrary(h.db, orgID, ownerID, repoID); err != nil {
 		log.Printf("[RestoreDeletedRepo] Failed to restore library %s: %v", repoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore library"})

@@ -395,6 +395,12 @@ queues `ItemLibraryCascade` after retention. Direct permanent-delete paths now s
 `purge_requested_at` marker and wired paths also issue a best-effort immediate
 `ItemLibraryCascade` enqueue. Phase 13 remains the durable recovery path and cleanup is idempotent.
 
+Aggregate storage accounting is derived from canonical `libraries` rows. API and GC
+soft-delete/restore enqueue reconciliation after their lifecycle batch and reconcile
+pending org/user/platform scopes synchronously, so retries settle to canonical state
+instead of replaying counter deltas. The per-library counter remains until permanent
+delete so restore retains its source of truth.
+
 ### Scenario 5: User/organization cascades
 
 User/org cascades soft-delete/enqueue owned libraries, hold renewable hard-delete leases, and perform

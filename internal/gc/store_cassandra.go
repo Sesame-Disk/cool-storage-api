@@ -4168,13 +4168,21 @@ func (s *CassandraStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]strin
 }
 
 func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
+	return ReconcilePendingStorageCounters(s.db.Session())
+}
+
+// ReconcilePendingStorageCounters recomputes every pending aggregate scope from
+// canonical library state. Lifecycle writers use this entry point synchronously
+// after their canonical transition so retries converge instead of applying a
+// second arithmetic delta.
+func ReconcilePendingStorageCounters(session *gocql.Session) (int, error) {
 	type reconcileRequest struct {
 		Scope   string
 		OrgID   uuid.UUID
 		OwnerID uuid.UUID
 	}
 
-	iter := s.db.Session().Query(`
+	iter := session.Query(`
 		SELECT scope, org_id, owner_id FROM gc_storage_counter_reconciliation
 	`).Iter()
 
@@ -4196,7 +4204,7 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 
 	expected := make(map[string]traffic.StorageSnapshot, len(requests))
 	expectedPlatformByShard := make(map[int]traffic.StorageSnapshot, traffic.CounterShardCount)
-	libIter := s.db.Session().Query(`
+	libIter := session.Query(`
 		SELECT org_id, owner_id, size_bytes, file_count, deleted_at FROM libraries
 	`).Iter()
 
@@ -4246,9 +4254,9 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 	for _, request := range requests {
 		var err error
 		if request.Scope == traffic.PlatformStorageScope() {
-			err = traffic.ReconcileStorageScopeSharded(s.db, request.Scope, expectedPlatformByShard)
+			err = traffic.ReconcileStorageScopeSharded(sessionDB{session}, request.Scope, expectedPlatformByShard)
 		} else {
-			err = traffic.ReconcileStorageScope(s.db, request.Scope, expected[request.Scope])
+			err = traffic.ReconcileStorageScope(sessionDB{session}, request.Scope, expected[request.Scope])
 		}
 		if err != nil {
 			if firstErr == nil {
@@ -4256,7 +4264,7 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 			}
 			continue
 		}
-		if err := s.db.Session().Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, request.Scope).Exec(); err != nil {
+		if err := session.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, request.Scope).Exec(); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("failed to delete reconciled storage scope %s: %w", request.Scope, err)
 			}
@@ -4267,6 +4275,10 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 
 	return reconciled, firstErr
 }
+
+type sessionDB struct{ session *gocql.Session }
+
+func (db sessionDB) Session() *gocql.Session { return db.session }
 
 func isActiveLibraryForStorageReconciliation(deletedAt *time.Time) bool {
 	return deletedAt == nil || deletedAt.IsZero()
@@ -5318,12 +5330,14 @@ func (s *CassandraStore) softDeleteLibraryLocked(orgID, libraryID, deletedBy uui
 		return err
 	}
 
-	// Adjust storage counters: subtract library's usage from aggregate scopes.
+	// Reconcile aggregate scopes from canonical library state. The canonical CAS
+	// is idempotent, so an arithmetic decrement here would double-subtract when a
+	// retry settles an already-completed soft-delete.
 	if err := fenceLibrary(); err != nil {
 		return err
 	}
-	if ownerID != "" {
-		traffic.AdjustAggregateStorageCounters(s.db, orgID.String(), ownerID, libraryID.String(), false)
+	if _, err := ReconcilePendingStorageCounters(s.db.Session()); err != nil {
+		return fmt.Errorf("reconcile storage counters after soft delete: %w", err)
 	}
 	return nil
 }

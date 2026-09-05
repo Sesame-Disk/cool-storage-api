@@ -31,8 +31,11 @@ the marker, projections, and reconciliation rows are derived afterward. GC
 renews before each authority/batch/accounting boundary, and restore fails
 closed on a marker newer than an active canonical `updated_at`. The MockStore
 and GC hard-delete path also reject an active canonical row when only a derived
-marker is present. The MockStore validates under-lease tokens. The X1 closure
-remains open.
+marker is present. The MockStore validates under-lease tokens. The lifecycle accounting follow-up
+also makes API and GC retries reconcile aggregate storage from canonical
+`libraries` state, rather than replaying arithmetic deltas. Nonzero restore
+retry accounting and repeated API/GC soft-delete calls are covered against real
+Cassandra. The X1 closure remains open.
 
 ## Issue Summary by Priority
 
@@ -121,7 +124,7 @@ audit: `docs/GC-DELETE-CLEANUP-INVESTIGATION.md`.
 | **Cascade Deletes Counter Before Hard Delete** | ✅ Fixed (2026-07-11) | `cascadeDeleteLibrary` now hard-deletes the canonical row before removing the per-library storage counter, closing a crash+restore window that could reactivate an under-counted library. The reordering (the real fix) covers both cascade callers; the counter auto-reclaim is wired only into `processLibraryCascade`. See ISSUE-GC-CASCADE-COUNTER-ORDERING-01 below. |
 | **Org Cascade Can Leak an Inert Counter Row** | 🟡 Confirmed gap (Low) | If the per-library counter delete fails/crashes after the hard delete during an **org** cascade, the retry cannot re-find the (now canonical-absent) library to reclaim its counter. The row is inert — aggregates are adjusted at soft-delete and nothing sums `lib:*` counters — so no accounting impact. See ISSUE-GC-ORG-CASCADE-COUNTER-LEAK-01 below. |
 | **Legacy `NULL + false` Orphan Rows Run Unguarded** | ⏸ N/A (greenfield prod) | Orphan queue/DLQ rows written before migration 011 would skip the canonical guard. Not present on a fresh deploy. See ISSUE-GC-LEGACY-ORPHAN-UNGUARDED-01 below. |
-| **Org Cascade Re-Soft-Deletes on Marker Drift** | 🟡 Confirmed, defense-in-depth (Low) | If `libraries.deleted_at` is set but the `deleted_libraries` marker is absent, the org cascade re-runs `SoftDeleteLibrary`, re-stamping `deleted_at` and re-subtracting aggregates (double-decrement, clamped). Unreachable under normal ops (marker + canonical are written/cleared atomically), so a corruption-only hardening. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
+| **Org Cascade Re-Soft-Deletes on Marker Drift** | ✅ Fixed (2026-09-04) | Re-entering the canonical soft-delete path is now idempotent for aggregate storage: API and GC reconcile pending scopes from canonical `libraries` state, so marker drift cannot double-subtract the same library. See ISSUE-GC-ORG-CASCADE-REMARK-01 below. |
 | **Markerless Artifacts Are Undiscoverable** | 🟡 Confirmed gap (Med) | Phase 3/4 discovery only enumerates live/deleted library indexes, not surviving commit/fs_object partitions. Drift/manual-ops edge case; not reproduced on the current live path. See ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01 below. |
 | **Phase 9 Group-Share Discovery Is a Global Scan** | 🟠 Pending (Med) | The immediate fix streams `shares_by_group` in bounded driver pages with cancellation, but Cassandra still scans every partition. Replace with bucketed active-partition discovery. See ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01 below. |
 | **GC Worker/Scanner Robustness (E1/E2/E4/E5/E6)** | 🟡 Confirmed, low-sev | Engine fragility: postpone observability, queue lifecycle arbitration, `dryRun` race vs hard-cutover semantics, pending-projection drift audit, and the S3-orphan per-row claim decision. Block pending leak (E4) fixed for new work (P9). See ISSUE-GC-ENGINE-ROBUSTNESS-01 below. |
@@ -4962,9 +4965,8 @@ HardDeleteLibrary` (inherited from `main`). While the canonical `libraries` row 
 the library is restorable. If the worker crashed after the counter delete but before the hard
 delete, and the lease later went stale/expired, `restoreDeletedLibrary` (stale-aware) could steal
 the lease, observe a present-and-soft-deleted canonical row, and reactivate the library. Its
-`AdjustAggregateStorageCounters(increment=true)` reads the per-library counter first and no-ops
-when it is zero/absent — which it now is — so the org/user/platform aggregates were never
-re-credited: an under-count and potential quota bypass. Library **content** was never at risk: the
+The lifecycle accounting now reconciles aggregate scopes from canonical library state, so a
+restore does not depend on a per-library counter update being present. Library **content** was never at risk: the
 child guard postpones every commit/fs_object while the canonical row exists, so nothing is purged
 in this window.
 
@@ -5016,8 +5018,8 @@ the hard-deleted library, so `reclaimHardDeletedLibraryStorageCounter` — which
 
 #### Why it is Low
 
-The org/user/platform aggregates are adjusted at **soft-delete** time, independently of the lib
-counter (`storage.go`: *"Aggregate scopes were already adjusted by a prior soft-delete"*). No code
+The org/user/platform aggregates are settled at **soft-delete** time from canonical library state,
+independently of the lib counter (`storage.go`: *"Aggregate scopes were already adjusted by a prior soft-delete"*). No code
 path sums or scans `lib:*` counters into an aggregate — the only readers are per-library
 soft-delete/restore/sync, all impossible once the library (and, here, the entire org) is
 hard-deleted. The leaked row is therefore inert: it never revives the library, never affects any
@@ -5075,35 +5077,24 @@ while X1 is open; after it closes, the backlog preflight is an additional gate.
 
 ### ISSUE-GC-ORG-CASCADE-REMARK-01: Org Cascade Re-Soft-Deletes a Library on Marker/Canonical Drift
 
-**Status**: 🟡 Confirmed, defense-in-depth — Low (precondition unreachable under normal ops)
-**Severity**: Low — storage double-decrement (clamped, reconcilable), only under corruption
-**Affected**: `processOrgCascade`
+**Status**: ✅ Fixed (2026-09-04)
+**Severity**: Low — fixed defense-in-depth for marker/canonical drift
+**Affected**: `processOrgCascade`, API soft-delete, GC soft-delete
 
-#### Problem
+#### Resolution
 
-`processOrgCascade` now decides on the `deleted_libraries` marker: marker absent + canonical
-present → `SoftDeleteLibrary`. In a drift state where `libraries.deleted_at = T1` but the marker is
-missing, it re-runs the full soft delete — re-stamping `deleted_at = T2`, changing the delete
-identity, and re-subtracting the library's bytes from the aggregates. Because the per-library
-counter is not cleared by soft delete, the second `AdjustAggregateStorageCounters(false)` reads the
-same bytes and subtracts again (clamped to non-negative). `main` used `lib.DeletedAt` directly and
-did not re-soft-delete, so this is a behavioral change in that state.
+If the canonical row is already soft-deleted but the derived marker is missing,
+re-entering the shared soft-delete path no longer applies a second arithmetic
+decrement. The canonical `libraries.deleted_at` CAS is settleable and the
+pending org/user/platform reconciliation scopes are recomputed from canonical
+library state. The per-library counter remains available for restore, while
+aggregate totals converge to the set of active canonical libraries.
 
-#### Why it is Low
-
-Every path that writes `libraries.deleted_at` also writes the `deleted_libraries` marker in the
-same `LoggedBatch` (`softDeleteLibrary`, GC `SoftDeleteLibrary`), and restore/hard-delete clear both
-atomically. Cassandra logged batches are atomic, so the marker/canonical pair does not drift under
-normal operation; the double-decrement requires genuine corruption.
-
-#### Suggested hardening
-
-Add an `EnsureDeletedLibraryMarker` helper that, when the canonical row is already soft-deleted
-(`deleted_at != null`) but the marker is missing, reconstructs only the `deleted_libraries` row
-from the existing canonical `deleted_at` / storage class / representation, **without** re-running
-counter adjustments. Reserve the full `SoftDeleteLibrary` for a canonical row that is still active.
-
----
+The same reconciliation boundary is used by API and GC soft-delete and by
+restore. A retry after an ambiguous batch outcome therefore repairs derived
+marker/projection state and converges storage accounting without depending on a
+local increment/decrement decision. Real-Cassandra regressions cover nonzero
+restore retry credits and repeated API and GC soft-delete calls.
 
 ### ISSUE-GC-GROUP-SHARE-DISCOVERY-SCAN-01: Phase 9 Uses a Global `shares_by_group` Scan
 

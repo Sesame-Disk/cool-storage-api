@@ -8,6 +8,25 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-09-04 - W2a storage-accounting follow-up: retry convergence
+
+The final consolidated review found two accounting regressions in lifecycle
+retries: restore could commit canonical ACTIVE and then miss its aggregate
+credit, while a repeated soft-delete could subtract the same library twice.
+
+- API and GC soft-delete/restore retain the per-library counter, but their
+  derived reconciliation rows are now synchronously reconciled from canonical
+  `libraries` state after the lifecycle batch. The canonical CAS remains the
+  authority, so an already-settled retry converges instead of applying a
+  second arithmetic delta.
+- Added real-Cassandra coverage for nonzero restore retry accounting and for
+  repeated API and GC soft-delete calls. The tests assert org, user, and
+  platform aggregate totals.
+- X1 remains OPEN and `GC_ENABLED=false`; this follow-up does not alter the
+  destructive-GC activation gate.
+
+---
+
 ## 2026-09-04 - W2a audit consolidation: lifecycle fence and cross-DC visibility
 
 The consolidated PR #203 audit confirmed the important soft-delete/restore

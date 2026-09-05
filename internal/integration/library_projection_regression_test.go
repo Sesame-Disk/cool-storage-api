@@ -335,9 +335,9 @@ func TestLibraryProjectionRegression_GCSoftDeleteFallsBackToBaseLibraryRowWhenPr
 	waitForIntegrationCondition(t, "GC soft-delete fallback to write deleted_libraries marker", func() bool {
 		return deletedLibraryMarkerExistsForTest(t, store, repoID)
 	})
-	waitForIntegrationCondition(t, "GC soft-delete fallback to enqueue user reconciliation", func() bool {
-		return storageReconciliationRequestExistsForTest(t, session, traffic.UserStorageScope(defaultOrgID, ownerID))
-	})
+	if storageReconciliationRequestExistsForTest(t, session, traffic.UserStorageScope(defaultOrgID, ownerID)) {
+		t.Fatalf("GC soft-delete fallback left user reconciliation pending; lifecycle accounting must settle synchronously")
+	}
 
 	var gotStorageClass string
 	if err := session.Query(`SELECT storage_class FROM deleted_libraries WHERE library_id = ?`, repoID).Scan(&gotStorageClass); err != nil {

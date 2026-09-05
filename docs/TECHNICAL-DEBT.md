@@ -1130,7 +1130,7 @@ All traffic across all orgs updates a single partition: `org_id = 00000000-0000-
 
 `IncrementStorageCounters`, `DecrementStorageCounters`, and `ReadStorageUsed` now live in `internal/traffic/storage.go` alongside the shared traffic helpers.
 
-The GC path now reuses the shared implementation via `traffic.AdjustAggregateStorageCounters(...)`, so the old duplication in `internal/gc/store_cassandra.go` has been removed.
+The GC path now uses `gc.ReconcilePendingStorageCounters(...)` to derive aggregate totals from canonical library state, so retries do not replay arithmetic deltas. The old duplication in `internal/gc/store_cassandra.go` has been removed.
 
 ### 12d. Storage Quota Publish/Counter Atomicity
 

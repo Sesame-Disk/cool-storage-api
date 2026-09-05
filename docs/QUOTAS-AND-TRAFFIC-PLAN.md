@@ -415,7 +415,7 @@ Note: Record AFTER successful send. If streaming fails midway, ideally count byt
 - `internal/api/seafhttp.go` — increment on upload
 - `internal/api/sync.go` — increment on PutBlock
 - `internal/api/v2/files.go` — increment on UploadFile, decrement on DeleteFile
-- `internal/api/v2/libraries.go` — decrement on delete library
+- `internal/api/v2/libraries.go` — reconcile aggregate storage after library lifecycle changes
 - `internal/gc/worker.go` — periodic recalculation
 
 ### 5.1 Helpers in traffic/storage.go
@@ -431,7 +431,7 @@ Each performs 4 counter updates: `platform`, `org:<orgID>`, `user:<orgID>:<userI
 
 - **Upload**: after successful commit, apply the visible path delta with `AdjustStorageCountersByDeltaSync(db, orgID, userID, libID, deltaBytes, deltaFiles)`. Replaces use `newSize-oldSize`; autorename/new files use `newSize,+1`.
 - **Delete file**: in `DeleteFile`, `DecrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
-- **Delete library**: on soft-delete (trash), decrement aggregates but preserve lib counter. On hard-delete (GC cascade), clean up lib counter row.
+- **Delete library**: on soft-delete/restore, reconcile aggregate scopes from active canonical `libraries` rows while preserving the lib counter. On hard-delete (GC cascade), clean up the lib counter row.
 
 ### 5.3 Deduplication
 
@@ -805,7 +805,7 @@ Phase 2 (TrafficRecorder core)
 | `internal/api/v2/fileview.go` | Instrument DownloadHistoricFile |
 | `internal/api/v2/libraries.go` | Decrement storage on delete |
 | `internal/api/server.go` | Initialize TrafficRecorder and QuotaChecker |
-| `internal/gc/store_cassandra.go` | SoftDeleteLibrary delegates to traffic.AdjustAggregateStorageCounters |
+| `internal/gc/store_cassandra.go` | SoftDeleteLibrary commits canonical lifecycle state and reconciles aggregate storage from canonical rows |
 | `internal/db/tokens.go` | AccessToken.Source field |
 | `frontend/src/utils/seafile-api.js` | Fix broken URLs, add missing functions |
 
@@ -844,7 +844,7 @@ Phase 2 (TrafficRecorder core)
 | **Phase 2** | TrafficRecorder core | ✅ COMPLETE | `internal/traffic/recorder.go` — semaphore-bounded goroutines, UUID validation, platform aggregate |
 | **Phase 3** | Upload instrumentation | ✅ COMPLETE | HandleUpload, PutBlock, UploadBlock, UploadFile. Token.Source distinguishes link vs web |
 | **Phase 4** | Download instrumentation | ✅ COMPLETE | HandleDownload, HandleZipDownload, GetBlock, DownloadHistoricFile, handleShareLinkDownload |
-| **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore adjusts aggregates |
+| **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore reconcile aggregate scopes from canonical rows |
 | **Phase 6** | Quota enforcement | ✅ COMPLETE for upload/download | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Uploads check visible storage deltas, sync HEAD publication checks the committed tree delta and applies the counter delta before returning, downloads check traffic. Non-upload storage-growing mutations are tracked separately in ISSUE-QUOTA-COVERAGE-01, and split-phase publish/counter atomicity remains technical debt. |
 | **Phase 7** | Statistics API | ✅ COMPLETE | AdminStatisticTraffic, AdminStatisticStorage, OrgStatisticTraffic, OrgStatisticUserTraffic, AdminListOrgTraffic, AdminListUserTraffic — all real data |
 | **Phase 8** | Plan/Quota API | ✅ COMPLETE | PUT org accepts all plan fields, PUT user accepts traffic quotas, GET subscription/account info expose current-period traffic state and resolved plan capabilities |
@@ -859,8 +859,8 @@ Phase 2 (TrafficRecorder core)
 ### Post-implementation fixes (2026-03-25)
 - **Recorder semaphore**: Moved `select` outside goroutine — drops records without spawning goroutines under load
 - **DecrementStorageCounters**: Added early return guard for negative deltaBytes
-- **Library soft-delete storage accounting**: `softDeleteLibrary()` decrements aggregates, `restoreDeletedLibrary()` re-adds them, `DeleteLibraryStorageCounter()` cleans up lib-scope row on permanent delete. GC delegates to shared `traffic` package.
-- **Storage counter consolidation**: Moved `IncrementStorageCounters`, `DecrementStorageCounters`, `ReadStorageUsed`, `AdjustAggregateStorageCounters`, `DeleteLibraryStorageCounter` from `write_helpers.go` to `internal/traffic/storage.go`. Eliminated duplicated `decrementLibraryFromAggregates` in GC.
+- **Library lifecycle storage accounting**: API and GC settle canonical `libraries.deleted_at` first, preserve the lib-scope counter for restore, and reconcile org/user/platform aggregates from canonical library rows after the derived batch. `DeleteLibraryStorageCounter()` cleans up the lib-scope row on permanent delete.
+- **Storage counter consolidation**: Moved the shared storage helpers into `internal/traffic/storage.go` and eliminated duplicated GC arithmetic. Lifecycle soft-delete and restore now use canonical reconciliation; the legacy arithmetic helper remains available only for non-lifecycle callers.
 
 ### Known scalability debt (v2)
 - `COUNT(*)` for `CheckMaxUsers` — full partition scan. Replace with counter in v2. See `TECHNICAL-DEBT.md` § 12a.

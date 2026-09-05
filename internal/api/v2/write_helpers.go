@@ -922,7 +922,7 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 // ── Library soft-delete / restore with storage accounting ─────────────────────
 
 // softDeleteLibrary marks a library as deleted, persists a GC marker, and
-// adjusts storage counters.
+// reconciles aggregate storage counters from canonical library state.
 // This is the canonical soft-delete path — all callers (user, admin, GC) must
 // route through equivalent logic to keep storage accounting consistent.
 //
@@ -1001,7 +1001,10 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		return fmt.Errorf("soft-delete library: %w", err)
 	}
 
-	// Read the live lib-scope counter and subtract from aggregate scopes.
+	// Reconcile aggregate scopes from canonical library state. This is deliberately
+	// not an arithmetic decrement: the canonical CAS is idempotent, so retries
+	// must also converge when the transition was already committed by an earlier
+	// invocation or its outcome was ambiguous.
 	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("fence library soft-delete accounting for %s: %w", libraryID, err)
@@ -1009,12 +1012,14 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	if !owned {
 		return fmt.Errorf("lost library soft-delete lock before accounting for %s", libraryID)
 	}
-	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, false)
+	if _, err := gcpkg.ReconcilePendingStorageCounters(db.Session()); err != nil {
+		return fmt.Errorf("reconcile storage counters after soft-delete: %w", err)
+	}
 	return nil
 }
 
-// restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
-// the library's storage to aggregate counters. Every library lifecycle writer
+// restoreDeletedLibrary clears deleted_at, removes the GC marker, and
+// reconciles aggregate storage from canonical library state. Every library lifecycle writer
 // shares the same fence, so restore cannot consume a soft-delete marker while
 // the canonical soft-delete batch is still in flight.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
@@ -1108,7 +1113,6 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	nextRow.DeletedAt = nil
 	// The canonical restore transition is the only conditional mutation. A
 	// conditional batch cannot span the canonical row and read-model tables.
-	restoreCounters := false
 	if !canonicalDeletedAt.IsZero() {
 		owned, err := gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 		if err != nil {
@@ -1129,7 +1133,6 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		if !restoreApplied {
 			return fmt.Errorf("restore library: canonical publication authority or deleted_at changed")
 		}
-		restoreCounters = true
 	}
 
 	batch := db.Session().Batch(gocql.LoggedBatch)
@@ -1146,22 +1149,24 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		return fmt.Errorf("restore library: %w", err)
 	}
 
-	// Re-add the library's storage to aggregates after the canonical row and
-	// deleted marker have been restored.
-	if restoreCounters {
-		owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
-		if err != nil {
-			return fmt.Errorf("fence library restore accounting for %s: %w", libraryID, err)
-		}
-		if !owned {
-			return fmt.Errorf("lost library restore lock before accounting for %s", libraryID)
-		}
-		traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
+	// Reconcile from canonical state rather than applying a local arithmetic
+	// increment. A retry may observe an already-restored canonical row after a
+	// previous invocation died before accounting; reconciliation repairs that
+	// partial boundary without double-counting a completed restore.
+	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("fence library restore accounting for %s: %w", libraryID, err)
+	}
+	if !owned {
+		return fmt.Errorf("lost library restore lock before accounting for %s", libraryID)
+	}
+	if _, err := gcpkg.ReconcilePendingStorageCounters(db.Session()); err != nil {
+		return fmt.Errorf("reconcile storage counters after restore: %w", err)
 	}
 	// Keep the durable marker until every derived mutation above has completed.
 	// If this final delete is lost, the next restore attempt sees the ACTIVE row
 	// plus the marker, retries only the idempotent derived writes, and does not
-	// apply the synchronous counter increment a second time.
+	// apply a second storage-counter delta.
 	owned, err = gcpkg.RenewLibraryHardDeleteLockLease(db.Session(), libraryUUID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("fence library restore marker cleanup for %s: %w", libraryID, err)

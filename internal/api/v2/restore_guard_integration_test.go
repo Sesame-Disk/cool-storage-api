@@ -147,7 +147,7 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 	if err := session.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at, publication_state)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		orgID.String(), libraryID.String(), ownerID.String(), "restore-pending-finalization", false, "hot", int64(0), int64(0), createdAt, updatedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		orgID.String(), libraryID.String(), ownerID.String(), "restore-pending-finalization", false, "hot", int64(100), int64(2), createdAt, updatedAt, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
 		t.Fatalf("seed active library: %v", err)
 	}
 	if err := session.Query(`
@@ -159,6 +159,15 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 		OrgID: orgID.String(), LibraryID: libraryID.String(), OwnerID: ownerID.String(),
 		Name: "restore-pending-finalization", StorageClass: "hot", CreatedAt: createdAt, UpdatedAt: updatedAt,
 	}
+	if err := traffic.IncrementStorageCountersSync(db, orgID.String(), ownerID.String(), libraryID.String(), 100, 2); err != nil {
+		t.Fatalf("seed library storage counter: %v", err)
+	}
+	if err := traffic.DecrementStorageCountersSync(db, orgID.String(), ownerID.String(), "", 100, 2); err != nil {
+		t.Fatalf("remove seeded aggregate counters: %v", err)
+	}
+	platformBefore := traffic.ReadStorageSnapshot(db, traffic.PlatformStorageScope())
+	orgBefore := traffic.ReadStorageSnapshot(db, traffic.OrganizationStorageScope(orgID.String()))
+	userBefore := traffic.ReadStorageSnapshot(db, traffic.UserStorageScope(orgID.String(), ownerID.String()))
 	t.Cleanup(func() {
 		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
 		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
@@ -169,6 +178,10 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 		cleanup.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.OrganizationStorageScope(orgID.String()))
 		cleanup.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String()))
 		_ = cleanup.Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.PlatformStorageScope(), traffic.CounterShard(orgID.String())).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.OrganizationStorageScope(orgID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.LibraryStorageScope(orgID.String(), libraryID.String()), 0).Exec()
 	})
 
 	if err := restoreDeletedLibrary(db, orgID.String(), ownerID.String(), libraryID.String()); err != nil {
@@ -185,6 +198,148 @@ func TestRestoreDeletedLibrary_RetriesPendingFinalization(t *testing.T) {
 	markerErr := session.Query(`SELECT library_id FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&markerID)
 	if !errors.Is(markerErr, gocql.ErrNotFound) {
 		t.Fatalf("pending restore marker remains after retry: err=%v marker=%q", markerErr, markerID)
+	}
+	wantOrg := traffic.StorageSnapshot{BytesUsed: orgBefore.BytesUsed + 100, FileCount: orgBefore.FileCount + 2}
+	if got := traffic.ReadStorageSnapshot(db, traffic.OrganizationStorageScope(orgID.String())); got != wantOrg {
+		t.Fatalf("organization storage after restore retry = %+v, want %+v", got, wantOrg)
+	}
+	wantUser := traffic.StorageSnapshot{BytesUsed: userBefore.BytesUsed + 100, FileCount: userBefore.FileCount + 2}
+	if got := traffic.ReadStorageSnapshot(db, traffic.UserStorageScope(orgID.String(), ownerID.String())); got != wantUser {
+		t.Fatalf("user storage after restore retry = %+v, want %+v", got, wantUser)
+	}
+	wantPlatform := traffic.StorageSnapshot{BytesUsed: platformBefore.BytesUsed + 100, FileCount: platformBefore.FileCount + 2}
+	if got := traffic.ReadStorageSnapshot(db, traffic.PlatformStorageScope()); got != wantPlatform {
+		t.Fatalf("platform storage after restore retry = %+v, want %+v", got, wantPlatform)
+	}
+}
+
+// Repeating an already-settled GC soft-delete must reconcile to the same
+// canonical aggregate totals instead of subtracting the library twice.
+func TestGCHardDeleteLifecycle_SoftDeleteRetryDoesNotDoubleSubtractStorage(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	if err := session.Query(`INSERT INTO libraries (org_id, library_id, owner_id, name, storage_class, size_bytes, file_count, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "soft-delete-accounting-retry",
+		"hot", int64(100), int64(2), now.Add(-time.Hour), now, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed accounting retry library: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.PlatformStorageScope(), traffic.CounterShard(orgID.String())).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.OrganizationStorageScope(orgID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.LibraryStorageScope(orgID.String(), libraryID.String()), 0).Exec()
+	})
+
+	if err := traffic.IncrementStorageCountersSync(db, orgID.String(), ownerID.String(), libraryID.String(), 100, 2); err != nil {
+		t.Fatalf("seed storage counters: %v", err)
+	}
+	orgScope := traffic.OrganizationStorageScope(orgID.String())
+	userScope := traffic.UserStorageScope(orgID.String(), ownerID.String())
+	wantActive := traffic.StorageSnapshot{BytesUsed: 100, FileCount: 2}
+	if got := traffic.ReadStorageSnapshot(db, orgScope); got != wantActive {
+		t.Fatalf("organization storage before soft-delete = %+v, want %+v", got, wantActive)
+	}
+	if got := traffic.ReadStorageSnapshot(db, userScope); got != wantActive {
+		t.Fatalf("user storage before soft-delete = %+v, want %+v", got, wantActive)
+	}
+
+	store := gcpkg.NewCassandraStore(db)
+	if err := store.SoftDeleteLibrary(orgID, libraryID, ownerID); err != nil {
+		t.Fatalf("first GC soft-delete failed: %v", err)
+	}
+	firstOrg := traffic.ReadStorageSnapshot(db, orgScope)
+	firstUser := traffic.ReadStorageSnapshot(db, userScope)
+	wantDeleted := traffic.StorageSnapshot{}
+	if firstOrg != wantDeleted || firstUser != wantDeleted {
+		t.Fatalf("aggregate storage after first soft-delete = org=%+v user=%+v, want zero", firstOrg, firstUser)
+	}
+
+	if err := store.SoftDeleteLibrary(orgID, libraryID, ownerID); err != nil {
+		t.Fatalf("retry GC soft-delete failed: %v", err)
+	}
+	if got := traffic.ReadStorageSnapshot(db, orgScope); got != firstOrg {
+		t.Fatalf("organization storage after soft-delete retry = %+v, want unchanged %+v", got, firstOrg)
+	}
+	if got := traffic.ReadStorageSnapshot(db, userScope); got != firstUser {
+		t.Fatalf("user storage after soft-delete retry = %+v, want unchanged %+v", got, firstUser)
+	}
+}
+
+// Repeating the API soft-delete must converge on canonical aggregate totals;
+// it must not subtract the same library twice after the first invocation has
+// already committed its canonical transition.
+func TestAPISoftDeleteRetryDoesNotDoubleSubtractStorage(t *testing.T) {
+	db := restoreGuardDBForTest(t)
+	session := db.Session()
+	orgID, libraryID, ownerID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	createdAt := now.Add(-time.Hour)
+
+	if err := session.Query(`INSERT INTO libraries (org_id, library_id, owner_id, name, storage_class, size_bytes, file_count, created_at, updated_at, publication_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		orgID.String(), libraryID.String(), ownerID.String(), "api-soft-delete-accounting-retry",
+		"hot", int64(100), int64(2), createdAt, now, dbpkg.LibraryPublicationStateActive).Exec(); err != nil {
+		t.Fatalf("seed API accounting retry library: %v", err)
+	}
+	t.Cleanup(func() {
+		var deletedAt time.Time
+		_ = session.Query(`SELECT deleted_at FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Scan(&deletedAt)
+		_ = session.Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID.String()).Exec()
+		_ = session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID.String(), libraryID.String()).Exec()
+		cleanup := session.Batch(gocql.LoggedBatch)
+		row := dbpkg.AdminLibraryProjectionRow{
+			OrgID: orgID.String(), LibraryID: libraryID.String(), OwnerID: ownerID.String(),
+			Name: "api-soft-delete-accounting-retry", StorageClass: "hot", CreatedAt: createdAt, UpdatedAt: now,
+		}
+		if !deletedAt.IsZero() {
+			row.DeletedAt = &deletedAt
+		}
+		dbpkg.AddDeleteAdminLibraryReadModelQuery(cleanup, row)
+		_ = cleanup.Exec()
+		_ = session.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.PlatformStorageScope()).Exec()
+		_ = session.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.OrganizationStorageScope(orgID.String())).Exec()
+		_ = session.Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String())).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.PlatformStorageScope(), traffic.CounterShard(orgID.String())).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.OrganizationStorageScope(orgID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.UserStorageScope(orgID.String(), ownerID.String()), 0).Exec()
+		_ = session.Query(`DELETE FROM storage_counters WHERE scope = ? AND shard = ?`, traffic.LibraryStorageScope(orgID.String(), libraryID.String()), 0).Exec()
+	})
+
+	if err := traffic.IncrementStorageCountersSync(db, orgID.String(), ownerID.String(), libraryID.String(), 100, 2); err != nil {
+		t.Fatalf("seed API storage counters: %v", err)
+	}
+	orgScope := traffic.OrganizationStorageScope(orgID.String())
+	userScope := traffic.UserStorageScope(orgID.String(), ownerID.String())
+	wantActive := traffic.StorageSnapshot{BytesUsed: 100, FileCount: 2}
+	if got := traffic.ReadStorageSnapshot(db, orgScope); got != wantActive {
+		t.Fatalf("organization storage before API soft-delete = %+v, want %+v", got, wantActive)
+	}
+
+	if err := softDeleteLibrary(db, orgID.String(), ownerID.String(), ownerID.String(), libraryID.String()); err != nil {
+		t.Fatalf("first API soft-delete failed: %v", err)
+	}
+	firstOrg := traffic.ReadStorageSnapshot(db, orgScope)
+	firstUser := traffic.ReadStorageSnapshot(db, userScope)
+	if firstOrg != (traffic.StorageSnapshot{}) || firstUser != (traffic.StorageSnapshot{}) {
+		t.Fatalf("aggregate storage after first API soft-delete = org=%+v user=%+v, want zero", firstOrg, firstUser)
+	}
+
+	if err := softDeleteLibrary(db, orgID.String(), ownerID.String(), ownerID.String(), libraryID.String()); err != nil {
+		t.Fatalf("retry API soft-delete failed: %v", err)
+	}
+	if got := traffic.ReadStorageSnapshot(db, orgScope); got != firstOrg {
+		t.Fatalf("organization storage after API soft-delete retry = %+v, want unchanged %+v", got, firstOrg)
+	}
+	if got := traffic.ReadStorageSnapshot(db, userScope); got != firstUser {
+		t.Fatalf("user storage after API soft-delete retry = %+v, want unchanged %+v", got, firstUser)
 	}
 }
 
