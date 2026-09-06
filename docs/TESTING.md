@@ -1020,8 +1020,7 @@ docker compose --profile test run --rm --build \
 ```
 
 Canonical full run: `docker compose --profile test run --rm --build go-integration-test`
-(or `go-all-test`). Both services set the W2 gate and the W1/R3/X1 gates
-explicitly. The existing X2/P3 multi-DC harness is a separate workflow and is
+(or `go-all-test`). Both canonical commands set the W2 gate and the W1/R3/X1 gates inline; the service environments leave W2 disabled for directed runs. The existing X2/P3 multi-DC harness is a separate workflow and is
 not changed by this PR.
 
 ### P4b orphan publication evidence

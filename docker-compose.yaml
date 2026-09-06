@@ -566,7 +566,6 @@ services:
       # The supported frontend nginx, so the D6 slow-client drill runs through
       # the real proxy rather than straight at Go. A backend-only test cannot
       # show that the client is the one controlling admission lifetime.
-      - SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1
       - SESAMEFS_PROXY_URL=http://frontend:80
       # Empty by default so the cgroup test really is optional: with a default
       # here it would never skip, and a broad -run TestDownloadAdmission would
@@ -610,7 +609,6 @@ services:
       # BorrowedFS W1 own-liveness through HEAD. Eight named legs, in-process
       # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
       - SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1
-      - SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1
     depends_on:
       - sesamefs
       - sesamefs-node-2

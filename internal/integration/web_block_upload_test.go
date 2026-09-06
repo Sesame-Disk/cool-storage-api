@@ -361,19 +361,20 @@ func TestWebBlockUploadWritesReferenceAndExpiryTogether(t *testing.T) {
 		defaultOrgID, blockID, uploadReferrer).Scan(&renewedRefTTL); err != nil || renewedRefTTL <= 0 {
 		t.Fatalf("successful commit eagerly removed provisional reference: ttl=%d err=%v", renewedRefTTL, err)
 	}
+	var postCommitExpiresAt time.Time
 	if err := database.Session().Query(
-		`SELECT TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
-		defaultOrgID, blockID, uploadReferrer).Scan(&renewedTrackerTTL); err != nil || renewedTrackerTTL <= 0 {
+		`SELECT expires_at, TTL(expires_at) FROM gc_provisional_block_refs WHERE org_id = ? AND block_id = ? AND referrer = ?`,
+		defaultOrgID, blockID, uploadReferrer).Scan(&postCommitExpiresAt, &renewedTrackerTTL); err != nil || renewedTrackerTTL <= 0 {
 		t.Fatalf("successful commit eagerly removed canonical tracker: ttl=%d err=%v", renewedTrackerTTL, err)
 	}
 	if err := database.Session().Query(
 		`SELECT expires_at FROM gc_provisional_block_refs_by_day
-		 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
-		dbpkg.GCProjectionUTCDate(renewedExpiresAt),
+			 WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?`,
+		dbpkg.GCProjectionUTCDate(postCommitExpiresAt),
 		dbpkg.GCDiscoveryBucket(defaultOrgID, blockID, uploadReferrer),
-		renewedExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
+		postCommitExpiresAt.UTC(), defaultOrgID, blockID, uploadReferrer,
 	).Scan(&renewedProjection); err != nil {
-		t.Fatalf("successful commit eagerly removed durable projection: %v", err)
+		t.Fatalf("successful commit eagerly removed current durable projection: %v", err)
 	}
 	sessionAfterCommit, ok, err := database.GetBlockUploadSession(session)
 	if err != nil || !ok || !sessionAfterCommit.Committed {

@@ -52,8 +52,7 @@ reconciliation delta could over/under-count against a normal HEAD/counter write;
 a T1 reconciler could delete T2 without generation/attempt identity; and a
 canonical soft-delete CAS could crash before its derived counter batch without a
 marker or discovery path. These are historical constraints, not current main bugs
-and not scope for W2. The preexisting post-HEAD repair lease/reachability findings
-are tracked as [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01) and
+and not scope for W2. The preexisting repair lease/reachability findings, which can span pre-HEAD lease expiry and ambiguous/applied HEAD outcomes, are tracked as [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01) and
 [ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01).
 
 The existing main development volume was not deleted when its unrelated

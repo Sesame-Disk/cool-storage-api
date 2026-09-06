@@ -1400,6 +1400,31 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 
 ---
 
+### ISSUE-LIBRARY-INITIAL-HEAD-CONCURRENCY-01: Concurrent initial-library HEAD initialization can race
+
+**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Severity**: High (P1) — library initialization correctness
+**Affected**: `SyncHandler.createInitialCommit` in `internal/api/sync.go`, initial `libraries`/`commits`/`fs_objects` writes
+**Registered**: 2026-09-05, during the PR #203/#204 scope audit
+
+#### Problem
+
+The sync HEAD read can observe an empty `head_commit_id` in more than one concurrent request, and each request can then enter `createInitialCommit`. The initializer creates the deterministic empty root, derives the initial commit ID from `repoID`, `rootID`, and `time.Now().Unix()`, inserts the commit, and updates the canonical and lookup HEAD rows through an unconditional `LoggedBatch`. There is no conditional initializer claim or equivalent authority that selects one winner. Same-second requests can also derive the same initial commit ID, while requests in different seconds can create competing initial commits and let the last batch overwrite the visible HEAD.
+
+This is separate from the abandoned PR #203 shared-root loser cleanup: that cleanup never exists in current `main` and remains a historical pitfall only. The issue concerns the preexisting initializer authority in the sync path.
+
+#### Scope / disposition
+
+Track separately from W2, R31 repair, and the library HEAD serial-domain issue. It does not affect the narrow SessionUpload own-liveness/exact-placement guarantee, and W2 must not add lifecycle or initial-library changes.
+
+#### Related
+
+- `ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01` — later HEAD CAS serial-domain contract
+- `internal/api/v2/fs_helpers.go:InitializeLibraryFS` — separate v2 initialization path
+- `docs/PR203-SCOPE-AUDIT.md` — historical classification and disposition
+
+---
+
 ### ISSUE-LIBRARY-HEAD-SERIAL-DOMAIN-01: Library HEAD Publish Has No Explicit Serial-Domain Contract
 
 **Status**: 🟡 Open — reachable only on a multi-DC deployment configured with `LOCAL_SERIAL`
@@ -5177,14 +5202,14 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 ### ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01: Publish repair treats lease expiry as cleanup authority
 
 **Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
-**Severity**: High (P1) — R31 / post-HEAD publication continuity
+**Severity**: High (P1) — R31 publication continuity across pre- and post-HEAD outcomes
 **Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair, pending publication cleanup
 
 #### Problem
 
 The pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postpones an unreachable repair while the lease is live and permits cleanup after the lease expires. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
 
-Cleanup selected by elapsed time can therefore remove an attempt commit or reference while definitive HEAD/reconciliation evidence is unavailable. This is post-HEAD behavior and is not part of the W2 pre-HEAD SessionUpload guarantee. Destructive GC remains disabled.
+Cleanup selected by elapsed time can therefore remove an attempt commit or reference while definitive HEAD/reconciliation evidence is unavailable. The race is reachable before HEAD CAS when a live writer outlives the repair lease, and after an ambiguous or applied HEAD outcome. It is not part of the W2 narrow block-liveness/exact-placement guarantee. Destructive GC remains disabled.
 
 #### Scope / disposition
 
@@ -5195,12 +5220,12 @@ Preexisting in PR #202/`main`, discovered or characterized while auditing the ab
 ### ISSUE-PUBLISH-REPAIR-REACHABILITY-01: Repair HEAD reachability and ancestry are not bounded authority
 
 **Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
-**Severity**: High (P1) — multi-DC/post-HEAD repair correctness and convergence
+**Severity**: High (P1) — multi-DC publication-repair correctness and convergence
 **Affected**: publish-repair HEAD lookup and commit ancestry walk
 
 #### Problem
 
-The repair path reads HEAD through its ordinary read path and walks `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain can misclassify whether an applied publication is reachable. This is the same post-HEAD reachability concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
+The repair path reads HEAD through its ordinary read path and walks `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain can misclassify publication state before HEAD CAS or after an ambiguous/applied HEAD outcome. This is a publication-repair concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
 
 #### Scope / disposition
 

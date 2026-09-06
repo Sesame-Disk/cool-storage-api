@@ -787,7 +787,7 @@ W2 must close `up → pub → fs`, including ambiguous HEAD / publication
 settlement. Full W2/R31 closure still requires durable reconciliation or an
 equivalent proof that a possibly-accepted publication never loses its definitive
 liveness. This PR #204 is only the pre-HEAD W2 slice; it does not change that
-post-HEAD repair debt. The preexisting repair lease/reachability findings are
+publication-repair debt. The preexisting repair lease/reachability findings are
 tracked as
 [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01)
 and [ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01).
