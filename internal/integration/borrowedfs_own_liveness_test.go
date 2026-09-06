@@ -359,6 +359,11 @@ func newBorrowedFSHeadHandler(t *testing.T, database *dbpkg.DB, storageClass str
 func newBorrowedFSHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pkg.FileHandler, storageClass string) *borrowedFSHeadFixture {
 	t.Helper()
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-bfsh-%d", time.Now().UnixNano()))
+	return newBorrowedFSHeadFixtureForRepo(t, database, handler, storageClass, repoID)
+}
+
+func newBorrowedFSHeadFixtureForRepo(t *testing.T, database *dbpkg.DB, handler *v2pkg.FileHandler, storageClass, repoID string) *borrowedFSHeadFixture {
+	t.Helper()
 	content := []byte("borrowedfs-head-" + uuid.NewString())
 	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
 	session, ok, err := database.GetBlockUploadSession(sessionID)
@@ -398,9 +403,21 @@ func newBorrowedFSHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pkg.F
 		t.Fatal("library has empty HEAD before commit")
 	}
 	t.Cleanup(func() {
+		// The fixture owns this content-addressed test block. Remove every
+		// reference it accumulated before dropping the canonical metadata row;
+		// this keeps repeated integration runs from retaining liveness pins.
+		if referrers, err := database.ListBlockReferrers(session.OrgID, blockID); err == nil {
+			for _, referrer := range referrers {
+				_ = database.RemoveBlockReference(session.OrgID, blockID, referrer)
+			}
+		}
 		_ = database.Session().Query(
 			`DELETE FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`,
 			session.OrgID, dbpkg.PlainBlockRepresentationID, sha1ID,
+		).Exec()
+		_ = database.Session().Query(
+			`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`,
+			session.OrgID, blockID,
 		).Exec()
 	})
 	return fx

@@ -750,6 +750,104 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterL
 	}
 }
 
+func TestPublishedBlockReferenceRepairRetryDelayIsCappedAndAgeBased(t *testing.T) {
+	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		createdAt time.Time
+		want      time.Duration
+	}{
+		{name: "young row uses base", createdAt: now.Add(-time.Minute), want: publishedBlockReferenceRepairRetryBase},
+		{name: "older row backs off with age", createdAt: now.Add(-time.Hour), want: time.Hour},
+		{name: "very old row is capped", createdAt: now.Add(-48 * time.Hour), want: publishedBlockReferenceRepairRetryMax},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := publishedBlockReferenceRepairRetryDelay(now, tt.createdAt); got != tt.want {
+				t.Fatalf("retry delay = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunPublishedBlockReferenceRepairSweepUsesAdvisoryRetrySchedule(t *testing.T) {
+	oldNow := publishedBlockReferenceRepairNowFn
+	oldList := listPublishedBlockReferenceRepairsForBucketFn
+	oldReachable := publishedBlockReferenceRepairCommitReachableFn
+	oldSchedule := schedulePublishedBlockReferenceRepairRetryFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairNowFn = oldNow
+		listPublishedBlockReferenceRepairsForBucketFn = oldList
+		publishedBlockReferenceRepairCommitReachableFn = oldReachable
+		schedulePublishedBlockReferenceRepairRetryFn = oldSchedule
+	})
+
+	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
+	publishedBlockReferenceRepairNowFn = func() time.Time { return now }
+	repair := publishedBlockReferenceRepair{
+		Bucket:         0,
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		CommitID:       "commit-1",
+		FSID:           "fs-1",
+		StagedBlockIDs: []string{"block-1"},
+		CreatedAt:      now.Add(-time.Hour),
+		LeaseExpiresAt: now.Add(time.Hour),
+	}
+	listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {
+		if bucket == 0 {
+			return []publishedBlockReferenceRepair{repair}, nil
+		}
+		return nil, nil
+	}
+	reachableCalls := 0
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+		reachableCalls++
+		return publishedBlockReferenceRepairCommitUnknown, nil
+	}
+	scheduled := 0
+	var nextRetryAt time.Time
+	schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, got publishedBlockReferenceRepair, retryAt time.Time) error {
+		scheduled++
+		nextRetryAt = retryAt
+		if got.RepoID != repair.RepoID || got.CommitID != repair.CommitID || got.FSID != repair.FSID {
+			t.Fatalf("scheduled repair = %#v, want %#v", got, repair)
+		}
+		return nil
+	}
+
+	if err := runPublishedBlockReferenceRepairSweep(&db.DB{}); err != nil {
+		t.Fatalf("future advisory lease made sweep fail: %v", err)
+	}
+	if reachableCalls != 0 || scheduled != 0 {
+		t.Fatalf("future advisory retry was used: reachableCalls=%d scheduled=%d", reachableCalls, scheduled)
+	}
+
+	repair.LeaseExpiresAt = now.Add(-time.Second)
+	if err := runPublishedBlockReferenceRepairSweep(&db.DB{}); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("due unknown repair error = %v, want unknown retention error", err)
+	}
+	if reachableCalls != 1 || scheduled != 1 {
+		t.Fatalf("due unknown repair calls = reachable %d scheduled %d, want 1/1", reachableCalls, scheduled)
+	}
+	if !nextRetryAt.After(now) {
+		t.Fatalf("nextRetryAt = %s, want future advisory retry", nextRetryAt)
+	}
+}
+
+func TestShouldRunPendingPublishedFSObjectOwnerSweepUsesFifteenMinuteCadence(t *testing.T) {
+	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
+	if !shouldRunPendingPublishedFSObjectOwnerSweep(time.Time{}, now) {
+		t.Fatal("initial owner sweep must run")
+	}
+	if shouldRunPendingPublishedFSObjectOwnerSweep(now, now.Add(14*time.Minute+59*time.Second)) {
+		t.Fatal("owner sweep ran before its advisory cadence")
+	}
+	if !shouldRunPendingPublishedFSObjectOwnerSweep(now, now.Add(pendingPublishedFSObjectOwnerSweepInterval)) {
+		t.Fatal("owner sweep did not run at its advisory cadence")
+	}
+}
+
 func TestClassifyPublishedBlockReferenceRepairCommitOutcome(t *testing.T) {
 	tests := []struct {
 		name         string

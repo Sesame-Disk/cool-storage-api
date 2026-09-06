@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -146,7 +147,9 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 
 	bucket := publishRepairIntegrationBucket(state.orgID, repoID, state.headCommitID, state.fsID)
 	staleCreatedAt := time.Now().UTC().Add(-time.Minute)
-	leaseExpiresAt := time.Now().UTC().Add(4 * time.Minute)
+	// The worker now treats lease_expires_at as the advisory next-retry time;
+	// make this seeded stale row immediately eligible for the restart replay.
+	leaseExpiresAt := time.Now().UTC().Add(-time.Minute)
 	if err := database.Session().Query(`
 		UPDATE published_block_reference_repairs
 		SET created_at = ?, lease_expires_at = ?
@@ -266,21 +269,77 @@ func TestW2CreateFilePostHeadEvidenceAgainstRealCassandra(t *testing.T) {
 	assertW2StateConverged(t, repoID, "w2-reachable-ancestor.txt", ancestor, ancestor.headCommitID)
 	markW2PostHeadEvidence(t, "reachable_ancestor")
 
-	loser := upload("w2-loser-isolation.txt")
-	fakeCommitID := fmt.Sprintf("w2-cas-loser-%d", time.Now().UnixNano())
-	publishRepairIntegrationSeedQueuedRepair(t, database, repoID, loser, fakeCommitID, time.Now().UTC(), time.Now().UTC().Add(5*time.Minute), false)
-	if err := v2api.CleanupFailedPublishArtifacts(database, loser.orgID, repoID, fakeCommitID, fakeCommitID, []string{loser.fsID}, loser.internalBlockIDs); err != nil {
-		t.Fatalf("synchronous CAS-loser cleanup returned error: %v", err)
+	// Reuse the W2 library already allocated above; the test environment has a
+	// deliberately small active-library limit, and the race needs no new repo.
+	casRepoID := repoID
+	casHandler := newBorrowedFSHeadHandler(t, database, x1StorageClass(t))
+	casA := newBorrowedFSHeadFixtureForRepo(t, database, casHandler, x1StorageClass(t), casRepoID)
+	casB := newBorrowedFSHeadFixtureForRepo(t, database, casHandler, x1StorageClass(t), casRepoID)
+	arrivals := make(chan struct{})
+	release := make(chan struct{})
+	var arrivalMu sync.Mutex
+	arrivalCount := 0
+	borrowedFSInstallBarriers(t, casA, func() {}, func() {}, func() {}, func() error {
+		arrivalMu.Lock()
+		arrivalCount++
+		if arrivalCount == 2 {
+			close(arrivals)
+		}
+		arrivalMu.Unlock()
+		<-release
+		return nil
+	})
+	casResults := make(chan *httptest.ResponseRecorder, 2)
+	go func() { casResults <- casA.commit(t) }()
+	go func() { casResults <- casB.commit(t) }()
+	select {
+	case <-arrivals:
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatalf("real CAS-loser race did not bring both writers to the pre-HEAD barrier")
 	}
-	if err := v2api.ClearPublishedFSObjectBlockReferenceRepair(database, loser.orgID, repoID, fakeCommitID, loser.fsID); err != nil {
-		t.Fatalf("clear synchronous CAS-loser repair row: %v", err)
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case result := <-casResults:
+			if result.Code != 200 {
+				t.Fatalf("real CAS-loser writer %d failed: status=%d body=%s", i+1, result.Code, result.Body.String())
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("real CAS-loser writer %d did not finish", i+1)
+		}
 	}
-	loserRefs := uploadedFileBlockReferrers(t, repoID, "/", "w2-loser-isolation.txt")
-	if !publishRepairIntegrationHasReferrer(loserRefs, dbpkg.BlockReferrerForFSObject(repoID, loser.fsID)) || publishRepairIntegrationHasReferrer(loserRefs, dbpkg.BlockReferrerForPublishAttempt(fakeCommitID)) {
-		t.Fatalf("synchronous CAS-loser cleanup touched the wrong ownership set: %v", loserRefs)
+	casFSIDs := []string{
+		publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", casA.filename),
+		publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", casB.filename),
 	}
-	if publishRepairIntegrationRepairRowExists(t, publishRepairIntegrationBucket(loser.orgID, repoID, fakeCommitID, loser.fsID), loser.orgID, repoID, fakeCommitID, loser.fsID) {
-		t.Fatal("synchronous CAS-loser repair row survived exact cleanup")
+	for _, fixture := range []*borrowedFSHeadFixture{casA, casB} {
+		refs := publishRepairIntegrationBlockReferrers(t, database, fixture.orgID, fixture.blockID)
+		fsID := publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", fixture.filename)
+		if !publishRepairIntegrationHasReferrer(refs, dbpkg.BlockReferrerForFSObject(casRepoID, fsID)) {
+			t.Fatalf("real CAS-loser publication did not retain fs ref for %s: %v", fixture.filename, refs)
+		}
+		for _, ref := range refs {
+			if strings.HasPrefix(ref, "pub:") {
+				t.Fatalf("real CAS-loser cleanup left pub ref for %s: %v", fixture.filename, refs)
+			}
+		}
+	}
+	for bucket := 0; bucket < 32; bucket++ {
+		iter := database.Session().Query(`
+			SELECT fs_id FROM published_block_reference_repairs WHERE bucket = ?
+		`, bucket).Iter()
+		var repairFSID string
+		for iter.Scan(&repairFSID) {
+			for _, fsID := range casFSIDs {
+				if repairFSID == fsID {
+					t.Fatalf("real CAS-loser cleanup left a durable repair row for fs_object %s", fsID)
+				}
+			}
+		}
+		if err := iter.Close(); err != nil {
+			t.Fatalf("scan CAS-loser repair bucket %d: %v", bucket, err)
+		}
 	}
 	markW2PostHeadEvidence(t, "cas_loser_cleanup")
 

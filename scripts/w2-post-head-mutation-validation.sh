@@ -35,7 +35,7 @@ expect_red() {
 
 m_lease_expiry_cleans_unknown() {
   mutate "$REPAIR" 's{default:\s+return fmt\.Errorf\("publication outcome for fs_object %s commit %s is unknown; retain queued repair", repair\.FSID, repair\.CommitID\)}{default:\n\t\treturn nil}'
-  expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry' 'repair row should not be deleted for unknown publication' 'lease expiry cleanup authority'
+  expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry' 'want unknown-publication retention error' 'lease expiry cleanup authority'
   restore
 }
 m_unrelated_head_is_declared_not_published() {

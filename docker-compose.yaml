@@ -572,7 +572,6 @@ services:
       # fail on connection refused whenever the probe service is not running.
       # The documented command passes it explicitly.
       - SESAMEFS_CGROUP_PROBE_URL=${SESAMEFS_CGROUP_PROBE_URL:-}
-      - SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1
     depends_on:
       - sesamefs
       - sesamefs-node-2
@@ -610,7 +609,6 @@ services:
       # BorrowedFS W1 own-liveness through HEAD. Eight named legs, in-process
       # handler + real Cassandra/MinIO. Does not inflate X1's 15 legs.
       - SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE=1
-      - SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1
     depends_on:
       - sesamefs
       - sesamefs-node-2

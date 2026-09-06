@@ -19,7 +19,10 @@ const (
 	publishedBlockReferenceRepairSweepInterval = time.Minute
 	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
 	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
+	publishedBlockReferenceRepairRetryBase     = 5 * time.Minute
+	publishedBlockReferenceRepairRetryMax      = 6 * time.Hour
 	pendingPublishedFSObjectOwnerStaleAfter    = 24 * time.Hour
+	pendingPublishedFSObjectOwnerSweepInterval = 15 * time.Minute
 	pendingPublishedFSObjectOwnerLookbackDays  = db.PendingPublishedFSObjectOwnerTTLSeconds / (24 * 60 * 60)
 )
 
@@ -82,6 +85,21 @@ var deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publish
 		DELETE FROM published_block_reference_repairs
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
 	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
+}
+
+// schedulePublishedBlockReferenceRepairRetryFn updates only the advisory
+// scheduler field. IF EXISTS is intentional: a concurrent settlement may have
+// deleted the row, and retry bookkeeping must never resurrect it.
+var schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
+	if database == nil {
+		return fmt.Errorf("database not available")
+	}
+	return database.Session().Query(`
+		UPDATE published_block_reference_repairs
+		SET lease_expires_at = ?
+		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
+		IF EXISTS
+	`, nextRetryAt, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
 }
 
 var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {
@@ -506,6 +524,21 @@ func newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID string, stag
 	}
 }
 
+// publishedBlockReferenceRepairRetryDelay is deliberately derived from row
+// age rather than an unbounded retry counter. That keeps the existing schema,
+// makes the delay monotonic for a permanently ambiguous row, and caps the
+// expensive SERIAL/EachQuorum ancestry walk at a predictable rate.
+func publishedBlockReferenceRepairRetryDelay(now, createdAt time.Time) time.Duration {
+	delay := now.Sub(createdAt)
+	if delay < publishedBlockReferenceRepairRetryBase {
+		return publishedBlockReferenceRepairRetryBase
+	}
+	if delay > publishedBlockReferenceRepairRetryMax {
+		return publishedBlockReferenceRepairRetryMax
+	}
+	return delay
+}
+
 func shouldQueuePublishedBlockReferenceRepair(fsID string, blockIDs []string) bool {
 	return strings.TrimSpace(fsID) != "" && len(blockIDs) > 0
 }
@@ -706,6 +739,10 @@ func runPendingPublishedFSObjectOwnerSweep(database *db.DB) error {
 	return firstErr
 }
 
+func shouldRunPendingPublishedFSObjectOwnerSweep(lastRun, now time.Time) bool {
+	return lastRun.IsZero() || !now.Before(lastRun.Add(pendingPublishedFSObjectOwnerSweepInterval))
+}
+
 func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID, commitID, fsID string, stagedBlockIDs []string) error {
 	return repairPublishedBlockReferenceRepair(database, newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID, stagedBlockIDs))
 }
@@ -714,7 +751,8 @@ func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
 	if database == nil {
 		return nil
 	}
-	cutoff := publishedBlockReferenceRepairNowFn().Add(-publishedBlockReferenceRepairStaleAfter)
+	now := publishedBlockReferenceRepairNowFn().UTC()
+	cutoff := now.Add(-publishedBlockReferenceRepairStaleAfter)
 	var firstErr error
 	for bucket := 0; bucket < publishedBlockReferenceRepairBuckets; bucket++ {
 		repairs, err := listPublishedBlockReferenceRepairsForBucketFn(database, bucket)
@@ -728,7 +766,16 @@ func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
 			if !repair.CreatedAt.IsZero() && repair.CreatedAt.After(cutoff) {
 				continue
 			}
+			// lease_expires_at is advisory scheduling state only. It is not
+			// consulted by the settlement function and never authorizes cleanup.
+			if !repair.LeaseExpiresAt.IsZero() && repair.LeaseExpiresAt.After(now) {
+				continue
+			}
 			if err := repairPublishedBlockReferenceRepair(database, repair); err != nil {
+				nextRetryAt := now.Add(publishedBlockReferenceRepairRetryDelay(now, repair.CreatedAt))
+				if retryErr := schedulePublishedBlockReferenceRepairRetryFn(database, repair, nextRetryAt); retryErr != nil {
+					err = errors.Join(err, fmt.Errorf("schedule next publish repair retry at %s: %w", nextRetryAt.Format(time.RFC3339), retryErr))
+				}
 				log.Printf("[publish_repair] queued repair failed for repo=%s commit=%s fs_object=%s: %v", repair.RepoID, repair.CommitID, repair.FSID, err)
 				if firstErr == nil {
 					firstErr = err
@@ -745,20 +792,25 @@ func StartPublishedBlockReferenceRepairer(database *db.DB) {
 	}
 	startPublishedBlockReferenceRepairWorkerOnce.Do(func() {
 		schedulePublishedBlockReferenceRepairRunFn(func() {
+			var lastOwnerSweepAt time.Time
+			runOwnerSweep := func() {
+				if err := runPendingPublishedFSObjectOwnerSweep(database); err != nil {
+					log.Printf("[publish_repair] pending fs_object owner sweep failed: %v", err)
+				}
+				lastOwnerSweepAt = pendingPublishedFSObjectOwnerNowFn().UTC()
+			}
 			if err := runPublishedBlockReferenceRepairSweep(database); err != nil {
 				log.Printf("[publish_repair] initial sweep failed: %v", err)
 			}
-			if err := runPendingPublishedFSObjectOwnerSweep(database); err != nil {
-				log.Printf("[publish_repair] initial pending fs_object owner sweep failed: %v", err)
-			}
+			runOwnerSweep()
 			ticker := publishedBlockReferenceRepairTickerFn(publishedBlockReferenceRepairSweepInterval)
 			defer ticker.Stop()
 			for range ticker.C {
 				if err := runPublishedBlockReferenceRepairSweep(database); err != nil {
 					log.Printf("[publish_repair] periodic sweep failed: %v", err)
 				}
-				if err := runPendingPublishedFSObjectOwnerSweep(database); err != nil {
-					log.Printf("[publish_repair] periodic pending fs_object owner sweep failed: %v", err)
+				if shouldRunPendingPublishedFSObjectOwnerSweep(lastOwnerSweepAt, pendingPublishedFSObjectOwnerNowFn().UTC()) {
+					runOwnerSweep()
 				}
 			}
 		})
