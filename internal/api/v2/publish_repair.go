@@ -31,8 +31,24 @@ type publishedBlockReferenceRepair struct {
 	FSID           string
 	StagedBlockIDs []string
 	CreatedAt      time.Time
+	// LeaseExpiresAt remains persisted for scheduling/diagnostics compatibility;
+	// it is never publication authority and never authorizes cleanup.
 	LeaseExpiresAt time.Time
 }
+
+// publishedBlockReferenceRepairCommitOutcome is deliberately tri-state (plus
+// the two actionable states). A false reachability observation is not enough
+// to authorize destructive cleanup: the HEAD read may be incomplete, the
+// commit may be an ancestor of a newer HEAD, or an ambiguous CAS may still be
+// unresolved. Only an explicit positive publication proof or an explicit
+// positive non-publication proof may settle a durable repair row.
+type publishedBlockReferenceRepairCommitOutcome uint8
+
+const (
+	publishedBlockReferenceRepairCommitUnknown publishedBlockReferenceRepairCommitOutcome = iota
+	publishedBlockReferenceRepairCommitReachable
+	publishedBlockReferenceRepairCommitDefinitelyNotPublished
+)
 
 var scheduledPublishedBlockReferenceRepairs sync.Map
 
@@ -106,12 +122,21 @@ var loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ow
 	return database.LoadPendingPublishedFSObjectOwner(repoID, fsID, ownerID)
 }
 
-var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("database not available")
 	}
-	fsHelper := NewFSHelper(database)
-	return fsHelper.GetHeadCommitID(repoID)
+	var headCommitID string
+	err := database.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Consistency(gocql.Serial).Scan(&headCommitID)
+	if err != nil {
+		return "", fmt.Errorf("lookup canonical HEAD for repo %s: %w", repoID, err)
+	}
+	if strings.TrimSpace(headCommitID) == "" {
+		return "", fmt.Errorf("canonical HEAD for repo %s is empty", repoID)
+	}
+	return strings.TrimSpace(headCommitID), nil
 }
 
 var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
@@ -121,27 +146,58 @@ var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, 
 	var parentCommitID string
 	err := database.Session().Query(`
 		SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, commitID).Scan(&parentCommitID)
+	`, repoID, commitID).Consistency(gocql.EachQuorum).Scan(&parentCommitID)
 	if err != nil {
 		return "", err
 	}
 	return parentCommitID, nil
 }
 
-var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repoID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
+func classifyPublishedBlockReferenceRepairCommitOutcome(commitID, headCommitID string, parentLookup func(string) (string, error)) (publishedBlockReferenceRepairCommitOutcome, error) {
+	commitID = strings.TrimSpace(commitID)
+	headCommitID = strings.TrimSpace(headCommitID)
+	if commitID == "" || headCommitID == "" {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("commit and canonical HEAD are required to settle publication")
 	}
-	return onlyOfficeCommitReachable(commitID, headCommitID, func(currentCommitID string) (string, error) {
+
+	reachable, err := onlyOfficeCommitReachable(commitID, headCommitID, parentLookup)
+	if err != nil {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("resolve commit %s reachability: %w", commitID, err)
+	}
+	if reachable {
+		return publishedBlockReferenceRepairCommitReachable, nil
+	}
+
+	// A concurrent winner may have advanced HEAD from the same expected parent.
+	// That is positive evidence that this commit never won the HEAD CAS, but
+	// only when the one observed HEAD is itself reachable from this commit's
+	// immutable parent. An unrelated or incomplete ancestry is UNKNOWN.
+	parentCommitID, err := parentLookup(commitID)
+	if err != nil {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("resolve parent for commit %s: %w", commitID, err)
+	}
+	parentCommitID = strings.TrimSpace(parentCommitID)
+	if parentCommitID == "" {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("commit %s has no parent for non-publication proof", commitID)
+	}
+	parentReachable, err := onlyOfficeCommitReachable(parentCommitID, headCommitID, parentLookup)
+	if err != nil {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("resolve parent %s reachability: %w", parentCommitID, err)
+	}
+	if parentReachable {
+		return publishedBlockReferenceRepairCommitDefinitelyNotPublished, nil
+	}
+	return publishedBlockReferenceRepairCommitUnknown, nil
+}
+
+var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, orgID, repoID)
+	if err != nil {
+		return publishedBlockReferenceRepairCommitUnknown, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
+	}
+	return classifyPublishedBlockReferenceRepairCommitOutcome(commitID, headCommitID, func(currentCommitID string) (string, error) {
 		parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repoID, currentCommitID)
 		if err != nil {
-			if errors.Is(err, gocql.ErrNotFound) {
-				return "", nil
-			}
 			return "", fmt.Errorf("lookup parent for commit %s: %w", currentCommitID, err)
 		}
 		return parentCommitID, nil
@@ -347,15 +403,16 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 	if attemptID == "" {
 		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup attempt metadata", fsID)
 	}
-	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, repoID, attemptID)
+	orgID := strings.TrimSpace(pending.cleanupOrgID)
+	if orgID == "" {
+		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup org_id", fsID)
+	}
+	outcome, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, orgID, repoID, attemptID)
 	if err != nil {
 		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, fsID, err)
 	}
-	if reachable {
-		orgID := strings.TrimSpace(pending.cleanupOrgID)
-		if orgID == "" {
-			return fmt.Errorf("reachable pending publish owner for fs_object %s is missing cleanup org_id", fsID)
-		}
+	switch outcome {
+	case publishedBlockReferenceRepairCommitReachable:
 		promotePending, err := loadPublishedBlockReferenceRepairPendingFileFn(database, repoID, fsID)
 		if err != nil {
 			return fmt.Errorf("load reachable published fs_object %s for commit %s: %w", fsID, attemptID, err)
@@ -370,11 +427,14 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 			return fmt.Errorf("promote reachable published fs_object %s for commit %s: %w", fsID, attemptID, err)
 		}
 		return clearPendingPublishedFileOwnerFn(database, repoID, pending)
+	case publishedBlockReferenceRepairCommitDefinitelyNotPublished:
+		if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
+			return err
+		}
+		return releasePendingPublishedFileOwner(database, repoID, pending)
+	default:
+		return fmt.Errorf("publication outcome for commit %s is unknown; retain pending fs_object owner", attemptID)
 	}
-	if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
-		return err
-	}
-	return releasePendingPublishedFileOwner(database, repoID, pending)
 }
 
 func cleanupPendingPublishedFileAttemptArtifacts(database *db.DB, repoID string, pending *pendingPublishedFile) error {
@@ -464,26 +524,6 @@ func failedPublishFSObjectReachableFromRoot(database *db.DB, repoID, targetFSID,
 		}
 	}
 	return false, nil
-}
-
-// publishedBlockReferenceRepairShouldDeferCleanup defers cleanup while the repair
-// is still inside its lease window, so a commit that has not yet become durable
-// (slow insert, clock skew across instances) is not torn down prematurely. Once
-// the lease expires, an unreachable commit is treated as an abandoned attempt and
-// cleaned up. Reachability itself is decided by the caller via commitReachable.
-func publishedBlockReferenceRepairShouldDeferCleanup(repair publishedBlockReferenceRepair) bool {
-	leaseDeadline := publishedBlockReferenceRepairLeaseDeadline(repair)
-	return !leaseDeadline.IsZero() && publishedBlockReferenceRepairNowFn().Before(leaseDeadline)
-}
-
-func publishedBlockReferenceRepairLeaseDeadline(repair publishedBlockReferenceRepair) time.Time {
-	if !repair.LeaseExpiresAt.IsZero() {
-		return repair.LeaseExpiresAt
-	}
-	if repair.CreatedAt.IsZero() {
-		return time.Time{}
-	}
-	return repair.CreatedAt.Add(publishedBlockReferenceRepairPreCASLease)
 }
 
 func publishedBlockReferenceRepairBucket(orgID, repoID, commitID, fsID string) int {
@@ -625,11 +665,12 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 	if len(repair.StagedBlockIDs) == 0 {
 		return fmt.Errorf("queued publish repair for fs_object %s has no staged block IDs", repair.FSID)
 	}
-	commitReachable, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.RepoID, repair.CommitID)
+	commitOutcome, err := publishedBlockReferenceRepairCommitReachableFn(database, repair.OrgID, repair.RepoID, repair.CommitID)
 	if err != nil {
 		return err
 	}
-	if commitReachable {
+	switch commitOutcome {
+	case publishedBlockReferenceRepairCommitReachable:
 		pending, err := loadPublishedBlockReferenceRepairPendingFileFn(database, repair.RepoID, repair.FSID)
 		if err != nil {
 			return err
@@ -639,13 +680,12 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 		if err := publishedBlockReferenceRepairPromoteFn(helper, repair.OrgID, repair.RepoID, repair.CommitID, pending); err != nil {
 			return fmt.Errorf("promote published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
-	} else {
-		if publishedBlockReferenceRepairShouldDeferCleanup(repair) {
-			return nil
-		}
+	case publishedBlockReferenceRepairCommitDefinitelyNotPublished:
 		if err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs); err != nil {
-			return fmt.Errorf("cleanup unreachable published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
+			return fmt.Errorf("cleanup definitely unpublished fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
+	default:
+		return fmt.Errorf("publication outcome for fs_object %s commit %s is unknown; retain queued repair", repair.FSID, repair.CommitID)
 	}
 	if err := deletePublishedBlockReferenceRepairFn(database, repair); err != nil {
 		return fmt.Errorf("delete queued publish repair for fs_object %s: %w", repair.FSID, err)

@@ -1402,7 +1402,7 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 
 ### ISSUE-LIBRARY-INITIAL-HEAD-CONCURRENCY-01: Concurrent initial-library HEAD initialization can race
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: 🟡 Partially resolved for the `CreateFileFromBlocks` post-HEAD publish-repair slice (2026-09-06); broader R31 remains open
 **Severity**: High (P1) — library initialization correctness
 **Affected**: `SyncHandler.createInitialCommit` in `internal/api/sync.go`, initial `libraries`/`commits`/`fs_objects` writes
 **Registered**: 2026-09-05, during the PR #203/#204 scope audit
@@ -5207,29 +5207,29 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 #### Problem
 
-The pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postpones an unreachable repair while the lease is live and permits cleanup after the lease expires. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
+Historically, the pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postponed an unreachable repair while the lease was live and permitted cleanup after the lease expired. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
 
 Cleanup selected by elapsed time can therefore remove an attempt commit or reference while definitive HEAD/reconciliation evidence is unavailable. The race is reachable before HEAD CAS when a live writer outlives the repair lease, and after an ambiguous or applied HEAD outcome. It is not part of the W2 narrow block-liveness/exact-placement guarantee. Destructive GC remains disabled.
 
 #### Scope / disposition
 
-Preexisting in PR #202/`main`, discovered or characterized while auditing the abandoned PR #203 lifecycle and repair proposals. Track the fix under R31; do not add lifecycle, terminal-authority, or repair changes to the W2 slice.
+This branch fixes the shared published-block-reference repair used by `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN/failed confirmation retains the durable repair; and cleanup requires a positive non-publication result. The real Cassandra/MinIO gate covers normal success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, ancestor reachability, restart replay, and exact loser cleanup. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
 
 ---
 
 ### ISSUE-PUBLISH-REPAIR-REACHABILITY-01: Repair HEAD reachability and ancestry are not bounded authority
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: 🟡 Partially resolved for post-HEAD published-block-reference repair (2026-09-06); broader multi-region/R31 reachability work remains open
 **Severity**: High (P1) — multi-DC publication-repair correctness and convergence
 **Affected**: publish-repair HEAD lookup and commit ancestry walk
 
 #### Problem
 
-The repair path reads HEAD through its ordinary read path and walks `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain can misclassify publication state before HEAD CAS or after an ambiguous/applied HEAD outcome. This is a publication-repair concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
+Historically, the repair path read HEAD through its ordinary read path and walked `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain could misclassify publication state before HEAD CAS or after an ambiguous/applied HEAD outcome. This is a publication-repair concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
 
 #### Scope / disposition
 
-Preexisting in PR #202/`main`, discovered or characterized during PR #203. Track with R31 and the multiregion HEAD follow-up. No code in W2; any repair change needs its own bounded scope and evidence.
+This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable, definitely not published only with positive parent-ancestry evidence, or UNKNOWN; UNKNOWN fails closed and retains the durable row. The bounded Docker evidence is limited to this repair slice. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
 
 ---
 

@@ -2,6 +2,7 @@ package v2
 
 import (
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -505,12 +506,12 @@ func TestCleanupPendingPublishedFileOwnerAttempt_PromotesReachableCommitBeforeCl
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
 		reachabilityChecks++
 		if repoID != "repo-1" || commitID != "commit-1" {
 			t.Fatalf("reachability args = %s/%s, want repo-1/commit-1", repoID, commitID)
 		}
-		return true, nil
+		return publishedBlockReferenceRepairCommitReachable, nil
 	}
 	loaded := 0
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
@@ -593,9 +594,9 @@ func TestCleanupPendingPublishedFileOwnerAttempt_FailsClosedWithoutAttemptMetada
 	})
 
 	reachabilityChecks := 0
-	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
 		reachabilityChecks++
-		return false, nil
+		return publishedBlockReferenceRepairCommitUnknown, nil
 	}
 	clearedOwners := 0
 	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
@@ -642,15 +643,17 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 		deletePublishedBlockReferenceRepairFn = oldDelete
 	})
 
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-		return true, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+		return publishedBlockReferenceRepairCommitReachable, nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
 		return &pendingPublishedFile{fsID: fsID, externalBlockIDs: []string{"fs-block-1"}}, nil
 	}
 	promoteCalls := 0
+	events := make([]string, 0, 2)
 	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
 		promoteCalls++
+		events = append(events, "promote")
 		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
 			t.Fatalf("promote args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
 		}
@@ -669,6 +672,7 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 	deleteCalls := 0
 	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
 		deleteCalls++
+		events = append(events, "delete")
 		if repair.RepoID != "repo-1" || repair.CommitID != "commit-1" || repair.FSID != "fs-1" {
 			t.Fatalf("delete repair = %#v, want repo-1/commit-1/fs-1", repair)
 		}
@@ -685,9 +689,12 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *
 	if deleteCalls != 1 {
 		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
 	}
+	if !reflect.DeepEqual(events, []string{"promote", "delete"}) {
+		t.Fatalf("repair settlement order = %#v, want promote before delete", events)
+	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *testing.T) {
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansDefinitelyNotPublishedCommit(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -711,26 +718,29 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+		return publishedBlockReferenceRepairCommitDefinitelyNotPublished, nil
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "head-2", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
 		return "parent-1", nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
-		t.Fatal("fs_object lookup should not run for unreachable commits")
+		t.Fatal("fs_object lookup should not run for definitely unpublished commits")
 		return nil, nil
 	}
 	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
-		t.Fatal("promote should not run for unreachable commit")
+		t.Fatal("promote should not run for definitely unpublished commit")
 		return nil
 	}
 	cleanupCalls := 0
 	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
 		cleanupCalls++
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup target = %s/%s/%s, want only org-1/repo-1/commit-1", orgID, repoID, commitID)
+		}
 		if fsID != "fs-1" {
 			t.Fatalf("cleanup fsID = %q, want fs-1", fsID)
 		}
@@ -767,7 +777,7 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhilePreCASLeaseActive(t *testing.T) {
+func TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -788,34 +798,34 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 0, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+		return publishedBlockReferenceRepairCommitUnknown, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
-		t.Fatal("head lookup should not run while pre-CAS lease is active")
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
+		t.Fatal("head lookup should not be repeated after the outcome hook returns UNKNOWN")
 		return "", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
-		t.Fatal("parent lookup should not run while pre-CAS lease is active")
+		t.Fatal("parent lookup should not be repeated after the outcome hook returns UNKNOWN")
 		return "", nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
-		t.Fatal("fs_object lookup should not run for deferred unreachable commit")
+		t.Fatal("fs_object lookup should not run for unknown publication")
 		return nil, nil
 	}
 	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
-		t.Fatal("promote should not run for deferred unreachable commit")
+		t.Fatal("promote should not run for unknown publication")
 		return nil
 	}
 	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
-		t.Fatal("cleanup should not run while head still matches queued commit parent")
+		t.Fatal("cleanup should not run for unknown publication after lease expiry")
 		return nil
 	}
 	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
-		t.Fatal("delete should not run while cleanup is deferred")
+		t.Fatal("repair row should not be deleted for unknown publication")
 		return nil
 	}
 
@@ -826,16 +836,16 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 		CommitID:       "commit-1",
 		FSID:           "fs-1",
 		StagedBlockIDs: []string{"queued-block-1"},
-		CreatedAt:      now.Add(-time.Minute),
-		LeaseExpiresAt: now.Add(time.Minute),
+		CreatedAt:      now.Add(-10 * time.Minute),
+		LeaseExpiresAt: now.Add(-time.Minute),
 	}
 	err := repairPublishedBlockReferenceRepair(nil, repair)
-	if err != nil {
-		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want nil", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want unknown-publication retention error", err)
 	}
 }
 
-func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtParentHead(t *testing.T) {
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansDefinitelyNotPublishedConcurrentWinner(t *testing.T) {
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldHead := publishedBlockReferenceRepairHeadCommitFn
 	oldParent := publishedBlockReferenceRepairCommitParentFn
@@ -856,13 +866,13 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtP
 	})
 
 	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
-	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
-		return false, nil
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
+		return publishedBlockReferenceRepairCommitDefinitelyNotPublished, nil
 	}
 	publishedBlockReferenceRepairNowFn = func() time.Time {
 		return now
 	}
-	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
+	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, orgID, repoID string) (string, error) {
 		return "parent-1", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
@@ -912,5 +922,133 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansExpiredPreCASLeaseAtP
 	}
 	if deleteCalls != 1 {
 		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
+	}
+}
+
+func TestClassifyPublishedBlockReferenceRepairCommitOutcome(t *testing.T) {
+	tests := []struct {
+		name         string
+		commitID     string
+		headCommitID string
+		parents      map[string]string
+		want         publishedBlockReferenceRepairCommitOutcome
+		wantErr      bool
+	}{
+		{
+			name:         "head commit is reachable",
+			commitID:     "c3",
+			headCommitID: "c3",
+			parents:      map[string]string{"c3": "c2", "c2": "c1", "c1": ""},
+			want:         publishedBlockReferenceRepairCommitReachable,
+		},
+		{
+			name:         "ancestor is reachable",
+			commitID:     "c1",
+			headCommitID: "c3",
+			parents:      map[string]string{"c3": "c2", "c2": "c1", "c1": ""},
+			want:         publishedBlockReferenceRepairCommitReachable,
+		},
+		{
+			name:         "head stayed at expected parent",
+			commitID:     "c2",
+			headCommitID: "c1",
+			parents:      map[string]string{"c2": "c1", "c1": ""},
+			want:         publishedBlockReferenceRepairCommitDefinitelyNotPublished,
+		},
+		{
+			name:         "concurrent winner descended from expected parent",
+			commitID:     "c2",
+			headCommitID: "winner",
+			parents:      map[string]string{"c2": "c1", "winner": "c1", "c1": ""},
+			want:         publishedBlockReferenceRepairCommitDefinitelyNotPublished,
+		},
+		{
+			name:         "unrelated head is unknown",
+			commitID:     "c2",
+			headCommitID: "other",
+			parents:      map[string]string{"c2": "c1", "other": "other-root", "other-root": ""},
+			want:         publishedBlockReferenceRepairCommitUnknown,
+		},
+		{
+			name:         "incomplete ancestry is unknown",
+			commitID:     "c2",
+			headCommitID: "other",
+			parents:      map[string]string{"c2": "c1"},
+			want:         publishedBlockReferenceRepairCommitUnknown,
+			wantErr:      true,
+		},
+		{
+			name:     "empty head is unknown",
+			commitID: "c2",
+			parents:  map[string]string{"c2": "c1", "c1": ""},
+			want:     publishedBlockReferenceRepairCommitUnknown,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outcome, err := classifyPublishedBlockReferenceRepairCommitOutcome(tt.commitID, tt.headCommitID, func(commitID string) (string, error) {
+				parent, ok := tt.parents[commitID]
+				if !ok {
+					return "", gocql.ErrNotFound
+				}
+				return parent, nil
+			})
+			if outcome != tt.want {
+				t.Fatalf("outcome = %v, want %v", outcome, tt.want)
+			}
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPublishedBlockReferenceRepairAuthorityReadsAreColdAndStrong(t *testing.T) {
+	raw, err := os.ReadFile("publish_repair.go")
+	if err != nil {
+		t.Fatalf("read publish_repair.go: %v", err)
+	}
+	source := string(raw)
+	headStart := strings.Index(source, "var publishedBlockReferenceRepairHeadCommitFn")
+	parentStart := strings.Index(source, "var publishedBlockReferenceRepairCommitParentFn")
+	if headStart < 0 || parentStart <= headStart {
+		t.Fatal("could not locate canonical repair HEAD lookup")
+	}
+	headSource := source[headStart:parentStart]
+	if !strings.Contains(headSource, "FROM libraries WHERE org_id = ? AND library_id = ?") {
+		t.Fatal("repair HEAD lookup must use the canonical org-scoped libraries row")
+	}
+	if !strings.Contains(headSource, ".Consistency(gocql.Serial)") {
+		t.Fatal("repair HEAD lookup must settle the canonical HEAD in the SERIAL domain")
+	}
+	parentEnd := strings.Index(source[parentStart:], "func classifyPublishedBlockReferenceRepairCommitOutcome")
+	if parentEnd < 0 {
+		t.Fatal("could not locate repair parent lookup boundary")
+	}
+	parentSource := source[parentStart : parentStart+parentEnd]
+	if !strings.Contains(parentSource, ".Consistency(gocql.EachQuorum)") {
+		t.Fatal("repair ancestry lookup must use EachQuorum in the cold path")
+	}
+}
+
+func TestPublishedBlockReferenceRepairNeverUsesLeaseExpiryAsCleanupAuthority(t *testing.T) {
+	raw, err := os.ReadFile("publish_repair.go")
+	if err != nil {
+		t.Fatalf("read publish_repair.go: %v", err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func repairPublishedBlockReferenceRepair")
+	end := strings.Index(source[start:], "func runPendingPublishedFSObjectOwnerSweep")
+	if start < 0 || end < 0 {
+		t.Fatal("could not locate queued repair settlement function")
+	}
+	settlementSource := source[start : start+end]
+	if strings.Contains(settlementSource, "LeaseExpiresAt") || strings.Contains(settlementSource, "publishedBlockReferenceRepairPreCASLease") || strings.Contains(settlementSource, "ShouldDeferCleanup") {
+		t.Fatal("lease age must never decide queued repair cleanup")
+	}
+	if !strings.Contains(settlementSource, "publishedBlockReferenceRepairCommitDefinitelyNotPublished") || !strings.Contains(settlementSource, "default:") || !strings.Contains(settlementSource, "retain queued repair") {
+		t.Fatal("queued repair must distinguish positive non-publication from UNKNOWN")
 	}
 }
