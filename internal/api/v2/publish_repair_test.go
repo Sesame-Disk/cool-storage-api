@@ -770,22 +770,14 @@ func TestPublishedBlockReferenceRepairRetryDelayIsCappedAndAgeBased(t *testing.T
 	}
 }
 
-func TestRunPublishedBlockReferenceRepairSweepUsesDueProjectionAndAdvisoryState(t *testing.T) {
+func TestRunPublishedBlockReferenceRepairSweepUsesAdvisoryRetrySchedule(t *testing.T) {
 	oldNow := publishedBlockReferenceRepairNowFn
 	oldList := listPublishedBlockReferenceRepairsForBucketFn
-	oldDueList := listPublishedBlockReferenceRepairScheduleEntriesForSlotFn
-	oldLoad := loadPublishedBlockReferenceRepairForScheduleEntryFn
-	oldState := loadPublishedBlockReferenceRepairScheduleStateFn
-	oldDeleteEntry := deletePublishedBlockReferenceRepairScheduleEntryFn
 	oldReachable := publishedBlockReferenceRepairCommitReachableFn
 	oldSchedule := schedulePublishedBlockReferenceRepairRetryFn
 	t.Cleanup(func() {
 		publishedBlockReferenceRepairNowFn = oldNow
 		listPublishedBlockReferenceRepairsForBucketFn = oldList
-		listPublishedBlockReferenceRepairScheduleEntriesForSlotFn = oldDueList
-		loadPublishedBlockReferenceRepairForScheduleEntryFn = oldLoad
-		loadPublishedBlockReferenceRepairScheduleStateFn = oldState
-		deletePublishedBlockReferenceRepairScheduleEntryFn = oldDeleteEntry
 		publishedBlockReferenceRepairCommitReachableFn = oldReachable
 		schedulePublishedBlockReferenceRepairRetryFn = oldSchedule
 	})
@@ -800,122 +792,46 @@ func TestRunPublishedBlockReferenceRepairSweepUsesDueProjectionAndAdvisoryState(
 		FSID:           "fs-1",
 		StagedBlockIDs: []string{"block-1"},
 		CreatedAt:      now.Add(-time.Hour),
-	}
-	entry := publishedBlockReferenceRepairScheduleEntry{
-		RetrySlot:   publishedBlockReferenceRepairRetrySlotFor(now),
-		Bucket:      0,
-		NextRetryAt: now.Add(-time.Minute),
-		OrgID:       repair.OrgID,
-		RepoID:      repair.RepoID,
-		CommitID:    repair.CommitID,
-		FSID:        repair.FSID,
+		LeaseExpiresAt: now.Add(time.Hour),
 	}
 	listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {
-		t.Fatal("periodic repair sweep must not scan the durable base table")
-		return nil, nil
-	}
-	listPublishedBlockReferenceRepairScheduleEntriesForSlotFn = func(database *db.DB, retrySlot, bucket int, dueAt time.Time) ([]publishedBlockReferenceRepairScheduleEntry, error) {
-		if retrySlot == entry.RetrySlot && bucket == entry.Bucket {
-			return []publishedBlockReferenceRepairScheduleEntry{entry}, nil
+		if bucket == 0 {
+			return []publishedBlockReferenceRepair{repair}, nil
 		}
 		return nil, nil
-	}
-	loadPublishedBlockReferenceRepairForScheduleEntryFn = func(database *db.DB, got publishedBlockReferenceRepairScheduleEntry) (publishedBlockReferenceRepair, error) {
-		return repair, nil
 	}
 	reachableCalls := 0
 	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, orgID, repoID, commitID string) (publishedBlockReferenceRepairCommitOutcome, error) {
 		reachableCalls++
 		return publishedBlockReferenceRepairCommitUnknown, nil
 	}
-	staleEntryDeletes := 0
-	deletePublishedBlockReferenceRepairScheduleEntryFn = func(database *db.DB, got publishedBlockReferenceRepairScheduleEntry) error {
-		staleEntryDeletes++
-		return nil
-	}
-	stateRetryAt := now.Add(time.Hour)
-	loadPublishedBlockReferenceRepairScheduleStateFn = func(database *db.DB, got publishedBlockReferenceRepair) (time.Time, error) {
-		return stateRetryAt, nil
-	}
-	if err := runPublishedBlockReferenceRepairSweep(&db.DB{}); err != nil {
-		t.Fatalf("future scheduler state made sweep fail: %v", err)
-	}
-	if reachableCalls != 0 || staleEntryDeletes != 1 {
-		t.Fatalf("stale scheduler entry was used: reachableCalls=%d deletes=%d", reachableCalls, staleEntryDeletes)
-	}
-
-	stateRetryAt = now.Add(-time.Second)
 	scheduled := 0
 	var nextRetryAt time.Time
 	schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, got publishedBlockReferenceRepair, retryAt time.Time) error {
 		scheduled++
 		nextRetryAt = retryAt
-		if got.RepoID != repair.RepoID || got.CommitID != repair.CommitID || got.FSID != repair.FSID || !got.LeaseExpiresAt.Equal(entry.NextRetryAt) {
-			t.Fatalf("scheduled repair = %#v, want identity and due entry %#v", got, entry)
+		if got.RepoID != repair.RepoID || got.CommitID != repair.CommitID || got.FSID != repair.FSID {
+			t.Fatalf("scheduled repair = %#v, want %#v", got, repair)
 		}
 		return nil
 	}
+
+	if err := runPublishedBlockReferenceRepairSweep(&db.DB{}); err != nil {
+		t.Fatalf("future advisory lease made sweep fail: %v", err)
+	}
+	if reachableCalls != 0 || scheduled != 0 {
+		t.Fatalf("future advisory retry was used: reachableCalls=%d scheduled=%d", reachableCalls, scheduled)
+	}
+
+	repair.LeaseExpiresAt = now.Add(-time.Second)
 	if err := runPublishedBlockReferenceRepairSweep(&db.DB{}); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("due unknown repair error = %v, want unknown retention error", err)
 	}
 	if reachableCalls != 1 || scheduled != 1 {
-		t.Fatalf("due unknown repair calls = %d scheduled=%d, want 1/1", reachableCalls, scheduled)
+		t.Fatalf("due unknown repair calls = reachable %d scheduled %d, want 1/1", reachableCalls, scheduled)
 	}
 	if !nextRetryAt.After(now) {
 		t.Fatalf("nextRetryAt = %s, want future advisory retry", nextRetryAt)
-	}
-}
-
-func TestPublishedBlockReferenceRepairSchedulerUsesOrdinaryProjectionWrites(t *testing.T) {
-	raw, err := os.ReadFile("publish_repair.go")
-	if err != nil {
-		t.Fatalf("read publish_repair.go: %v", err)
-	}
-	source := string(raw)
-	start := strings.Index(source, "var schedulePublishedBlockReferenceRepairRetryFn")
-	end := strings.Index(source[start:], "var listPendingPublishedFSObjectOwnersByDayFn")
-	if start < 0 || end < 0 {
-		t.Fatal("could not locate scheduler contract")
-	}
-	schedulerSource := source[start : start+end]
-	if strings.Contains(schedulerSource, "IF EXISTS") {
-		t.Fatal("retry scheduler must not add Paxos to ordinary retry bookkeeping")
-	}
-	if !strings.Contains(schedulerSource, "published_block_reference_repair_retry_slots") || !strings.Contains(schedulerSource, "published_block_reference_repair_schedule_state") {
-		t.Fatal("retry scheduler must use the due projection and exact-key state")
-	}
-}
-
-func TestEnqueuePublishedBlockReferenceRepairScheduleCleansDueEntryWhenStateWriteFails(t *testing.T) {
-	oldInsert := insertPublishedBlockReferenceRepairScheduleEntryFn
-	oldState := upsertPublishedBlockReferenceRepairScheduleStateFn
-	oldDelete := deletePublishedBlockReferenceRepairScheduleEntryFn
-	t.Cleanup(func() {
-		insertPublishedBlockReferenceRepairScheduleEntryFn = oldInsert
-		upsertPublishedBlockReferenceRepairScheduleStateFn = oldState
-		deletePublishedBlockReferenceRepairScheduleEntryFn = oldDelete
-	})
-
-	stateErr := errors.New("schedule state unavailable")
-	insertCalls, deleteCalls := 0, 0
-	insertPublishedBlockReferenceRepairScheduleEntryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-		insertCalls++
-		return nil
-	}
-	upsertPublishedBlockReferenceRepairScheduleStateFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-		return stateErr
-	}
-	deletePublishedBlockReferenceRepairScheduleEntryFn = func(database *db.DB, entry publishedBlockReferenceRepairScheduleEntry) error {
-		deleteCalls++
-		return nil
-	}
-
-	err := enqueuePublishedBlockReferenceRepairSchedule(&db.DB{}, publishedBlockReferenceRepair{Bucket: 1, OrgID: "org-1", RepoID: "repo-1", CommitID: "commit-1", FSID: "fs-1"}, time.Now().UTC())
-	if !errors.Is(err, stateErr) {
-		t.Fatalf("enqueue error = %v, want state error %v", err, stateErr)
-	}
-	if insertCalls != 1 || deleteCalls != 1 {
-		t.Fatalf("schedule insert/delete calls = %d/%d, want 1/1", insertCalls, deleteCalls)
 	}
 }
 

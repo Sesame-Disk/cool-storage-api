@@ -5213,7 +5213,7 @@ Cleanup selected by elapsed time can therefore remove an attempt commit or refer
 
 #### Scope / disposition
 
-This branch fixes the shared published-block-reference repair used by the upload-link engine and `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and does not actively remove its artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The worker uses a durable five-minute retry-slot projection plus exact-key scheduler state, so it no longer scans every retained UNKNOWN row each minute or performs a retry LWT; a startup bootstrap re-seeds legacy and missed rows. Stale scheduler entries are deleted without publication authority reads, and settlement cleanup removes the scheduler state and current due entry after the durable repair row. The real Cassandra/MinIO gate covers shared-engine success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs. The latest audit's scheduler-cost finding is therefore closed in this PR. The `pub:` reference still has a finite 35-day TTL and no discoverable zero-ref transition; that is the documented R31 follow-up in `ISSUE-GC-PUB-REF-ZERO-REF-01`, not silently closed here. Other publication funnels and the remaining R31 protocol work stay open; this adds only migration 021 for the scheduler projection and does not add lifecycle or terminal-authority state, GC-worker changes, or destructive activation.
+This branch fixes the shared published-block-reference repair used by the upload-link engine and `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and does not actively remove its artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The worker now treats `lease_expires_at` only as an advisory next-retry timestamp with a capped age-based delay, while the stale pending-owner sweep runs at a 15-minute advisory cadence. The real Cassandra/MinIO gate covers shared-engine success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs. The `pub:` reference still has a finite 35-day TTL and no discoverable zero-ref transition; that is the documented R31 follow-up in `ISSUE-GC-PUB-REF-ZERO-REF-01`, not silently closed here. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
 
 ---
 
@@ -5229,7 +5229,38 @@ Historically, the repair path read HEAD through its ordinary read path and walke
 
 #### Scope / disposition
 
-This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable or UNKNOWN; every non-reachable result fails closed, retains the durable row/artifacts, and is retried with bounded advisory backoff through a durable due projection instead of an every-minute base-table scan. The stale pending-owner sweep is likewise rate-limited to a 15-minute advisory cadence. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter, plus a real pre-HEAD race in which repair runs while the writer is paused before HEAD and a real CAS-loser cleanup path. The scheduler-cost finding from the latest audit is closed by migration 021 and the projection contract tests; deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open. The W2 pre-HEAD hot path still makes no repair authority reads.
+This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable or UNKNOWN; every non-reachable result fails closed, retains the durable row/artifacts, and is retried with bounded advisory backoff instead of an every-minute ancestry walk. The stale pending-owner sweep is likewise rate-limited to a 15-minute advisory cadence. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter, plus a real pre-HEAD race in which repair runs while the writer is paused before HEAD and a real CAS-loser cleanup path. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
+
+---
+
+### ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01: UNKNOWN repair discovery is scan-bound
+
+**Status**: Confirmed follow-up - intentionally out of scope for PR #205 (2026-09-06)
+**Severity**: Medium (P2) - R31 performance and convergence at sustained UNKNOWN-row volume
+**Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair worker
+
+#### Problem
+
+The correctness slice keeps UNKNOWN or unavailable publication confirmations in a
+durable repair row and retries them with advisory age-based backoff. The current
+simple worker discovers those rows by reading every repair bucket on each minute
+tick. As retained UNKNOWN rows and bucket churn grow, the repeated base-table
+reads can consume increasing Cassandra work even though each individual repair
+remains fail-closed. A process pause or outage can also defer discovery until the
+next base-table sweep; this is a scalability and convergence-cost issue, not a
+publication-safety hole.
+
+#### Scope / disposition
+
+This issue does not block PR #205, whose contract is post-HEAD publication
+continuity and positive-reachability-only settlement. Do not solve it by weakening
+UNKNOWN retention or cleanup authority. A separate follow-up (provisionally PR
+#206) must characterize rows without a schedule, overdue rows, missed ticks,
+outages, restart, concurrent rescheduling, stale/orphan hints, partition growth,
+tombstones, fairness, and bounded work per tick before selecting a durable
+discovery design. Scheduler state must remain separate from publication authority,
+and scheduler failure may delay work but must not make a durable repair
+undiscoverable indefinitely.
 
 ---
 

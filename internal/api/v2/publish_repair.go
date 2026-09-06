@@ -15,18 +15,15 @@ import (
 )
 
 const (
-	publishedBlockReferenceRepairBuckets             = 32
-	publishedBlockReferenceRepairSweepInterval       = time.Minute
-	publishedBlockReferenceRepairStaleAfter          = 30 * time.Second
-	publishedBlockReferenceRepairPreCASLease         = 5 * time.Minute
-	publishedBlockReferenceRepairRetryBase           = 5 * time.Minute
-	publishedBlockReferenceRepairRetryMax            = 6 * time.Hour
-	publishedBlockReferenceRepairRetrySlot           = 5 * time.Minute
-	publishedBlockReferenceRepairRetryWheelSlots     = 2048
-	publishedBlockReferenceRepairRetrySweepSlotCount = 3
-	pendingPublishedFSObjectOwnerStaleAfter          = 24 * time.Hour
-	pendingPublishedFSObjectOwnerSweepInterval       = 15 * time.Minute
-	pendingPublishedFSObjectOwnerLookbackDays        = db.PendingPublishedFSObjectOwnerTTLSeconds / (24 * 60 * 60)
+	publishedBlockReferenceRepairBuckets       = 32
+	publishedBlockReferenceRepairSweepInterval = time.Minute
+	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
+	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
+	publishedBlockReferenceRepairRetryBase     = 5 * time.Minute
+	publishedBlockReferenceRepairRetryMax      = 6 * time.Hour
+	pendingPublishedFSObjectOwnerStaleAfter    = 24 * time.Hour
+	pendingPublishedFSObjectOwnerSweepInterval = 15 * time.Minute
+	pendingPublishedFSObjectOwnerLookbackDays  = db.PendingPublishedFSObjectOwnerTTLSeconds / (24 * 60 * 60)
 )
 
 type publishedBlockReferenceRepair struct {
@@ -40,19 +37,6 @@ type publishedBlockReferenceRepair struct {
 	// LeaseExpiresAt remains persisted for scheduling/diagnostics compatibility;
 	// it is never publication authority and never authorizes cleanup.
 	LeaseExpiresAt time.Time
-}
-
-// publishedBlockReferenceRepairScheduleEntry is only a scheduler hint. The
-// durable repair row remains the source of staged block IDs and the publication
-// authority classifier remains the only cleanup authority.
-type publishedBlockReferenceRepairScheduleEntry struct {
-	RetrySlot   int
-	Bucket      int
-	NextRetryAt time.Time
-	OrgID       string
-	RepoID      string
-	CommitID    string
-	FSID        string
 }
 
 // publishedBlockReferenceRepairCommitOutcome is deliberately fail-closed.
@@ -87,183 +71,35 @@ var insertPublishedBlockReferenceRepairFn = func(database *db.DB, repair publish
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	if err := database.Session().Query(`
+	return database.Session().Query(`
 		INSERT INTO published_block_reference_repairs (bucket, org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at, lease_expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt, repair.LeaseExpiresAt).Exec(); err != nil {
-		return err
-	}
-	if err := enqueuePublishedBlockReferenceRepairSchedule(database, repair, repair.LeaseExpiresAt); err != nil {
-		return fmt.Errorf("enqueue publish repair schedule: %w", err)
-	}
-	return nil
+	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt, repair.LeaseExpiresAt).Exec()
 }
 
 var deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	if err := database.Session().Query(`
+	return database.Session().Query(`
 		DELETE FROM published_block_reference_repairs
-		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec(); err != nil {
-		return err
-	}
-	if err := clearPublishedBlockReferenceRepairSchedule(database, repair); err != nil {
-		return fmt.Errorf("clear publish repair schedule: %w", err)
-	}
-	return nil
-}
-
-// schedulePublishedBlockReferenceRepairRetryFn updates only scheduler state.
-// It intentionally uses ordinary writes to a separate exact-key state row and
-// a due-time projection: retry bookkeeping never runs Paxos and never mutates
-// the repair row, so it cannot resurrect a settled repair row.
-var schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-	return schedulePublishedBlockReferenceRepairRetry(database, repair, nextRetryAt)
-}
-
-var insertPublishedBlockReferenceRepairScheduleEntryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-	if database == nil {
-		return fmt.Errorf("database not available")
-	}
-	return database.Session().Query(`
-		INSERT INTO published_block_reference_repair_retry_slots
-		(retry_slot, bucket, next_retry_at, org_id, repo_id, commit_id, fs_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, publishedBlockReferenceRepairRetrySlotFor(nextRetryAt), repair.Bucket, nextRetryAt.UTC(), repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
-}
-
-var deletePublishedBlockReferenceRepairScheduleEntryFn = func(database *db.DB, entry publishedBlockReferenceRepairScheduleEntry) error {
-	if database == nil {
-		return fmt.Errorf("database not available")
-	}
-	return database.Session().Query(`
-		DELETE FROM published_block_reference_repair_retry_slots
-		WHERE retry_slot = ? AND bucket = ? AND next_retry_at = ?
-		  AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, entry.RetrySlot, entry.Bucket, entry.NextRetryAt.UTC(), entry.OrgID, entry.RepoID, entry.CommitID, entry.FSID).Exec()
-}
-
-var upsertPublishedBlockReferenceRepairScheduleStateFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-	if database == nil {
-		return fmt.Errorf("database not available")
-	}
-	return database.Session().Query(`
-		INSERT INTO published_block_reference_repair_schedule_state
-		(bucket, org_id, repo_id, commit_id, fs_id, next_retry_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, nextRetryAt.UTC()).Exec()
-}
-
-var loadPublishedBlockReferenceRepairScheduleStateFn = func(database *db.DB, repair publishedBlockReferenceRepair) (time.Time, error) {
-	if database == nil {
-		return time.Time{}, fmt.Errorf("database not available")
-	}
-	var nextRetryAt time.Time
-	err := database.Session().Query(`
-		SELECT next_retry_at
-		FROM published_block_reference_repair_schedule_state
-		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Scan(&nextRetryAt)
-	return nextRetryAt.UTC(), err
-}
-
-var deletePublishedBlockReferenceRepairScheduleStateFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
-	if database == nil {
-		return fmt.Errorf("database not available")
-	}
-	return database.Session().Query(`
-		DELETE FROM published_block_reference_repair_schedule_state
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
 	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
 }
 
-func enqueuePublishedBlockReferenceRepairSchedule(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
+// schedulePublishedBlockReferenceRepairRetryFn updates only the advisory
+// scheduler field. IF EXISTS is intentional: a concurrent settlement may have
+// deleted the row, and retry bookkeeping must never resurrect it.
+var schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	if nextRetryAt.IsZero() {
-		nextRetryAt = publishedBlockReferenceRepairNowFn().UTC()
-	}
-	nextRetryAt = nextRetryAt.UTC()
-	// The due projection is written first. If the process stops before the
-	// exact-key state write, the worker can still recover the base row from this
-	// hint; the reverse ordering could strand a row with no discoverable due key.
-	if err := insertPublishedBlockReferenceRepairScheduleEntryFn(database, repair, nextRetryAt); err != nil {
-		return err
-	}
-	if err := upsertPublishedBlockReferenceRepairScheduleStateFn(database, repair, nextRetryAt); err != nil {
-		// Do not leave an index entry behind when the exact-key state write
-		// fails. A previous schedule, when present, remains untouched and can
-		// continue driving recovery.
-		cleanupErr := deletePublishedBlockReferenceRepairScheduleEntryFn(database, publishedBlockReferenceRepairScheduleEntry{
-			RetrySlot:   publishedBlockReferenceRepairRetrySlotFor(nextRetryAt),
-			Bucket:      repair.Bucket,
-			NextRetryAt: nextRetryAt,
-			OrgID:       repair.OrgID,
-			RepoID:      repair.RepoID,
-			CommitID:    repair.CommitID,
-			FSID:        repair.FSID,
-		})
-		return errors.Join(err, cleanupErr)
-	}
-	return nil
-}
-
-func schedulePublishedBlockReferenceRepairRetry(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
-	if database == nil {
-		return fmt.Errorf("database not available")
-	}
-	if nextRetryAt.IsZero() {
-		nextRetryAt = publishedBlockReferenceRepairNowFn().UTC()
-	}
-	nextRetryAt = nextRetryAt.UTC()
-	if err := enqueuePublishedBlockReferenceRepairSchedule(database, repair, nextRetryAt); err != nil {
-		return err
-	}
-	// Insert-before-delete preserves discoverability across a process crash. A
-	// stale old entry is harmless: the exact-key state below identifies it and
-	// the sweep removes it without attempting publication repair.
-	if !repair.LeaseExpiresAt.IsZero() && !repair.LeaseExpiresAt.UTC().Equal(nextRetryAt) {
-		if err := deletePublishedBlockReferenceRepairScheduleEntryFn(database, publishedBlockReferenceRepairScheduleEntry{
-			RetrySlot:   publishedBlockReferenceRepairRetrySlotFor(repair.LeaseExpiresAt),
-			Bucket:      repair.Bucket,
-			NextRetryAt: repair.LeaseExpiresAt.UTC(),
-			OrgID:       repair.OrgID,
-			RepoID:      repair.RepoID,
-			CommitID:    repair.CommitID,
-			FSID:        repair.FSID,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func clearPublishedBlockReferenceRepairSchedule(database *db.DB, repair publishedBlockReferenceRepair) error {
-	if database == nil {
-		return nil
-	}
-	nextRetryAt, stateErr := loadPublishedBlockReferenceRepairScheduleStateFn(database, repair)
-	if stateErr != nil && !errors.Is(stateErr, gocql.ErrNotFound) {
-		return stateErr
-	}
-	if err := deletePublishedBlockReferenceRepairScheduleStateFn(database, repair); err != nil {
-		return err
-	}
-	if errors.Is(stateErr, gocql.ErrNotFound) || nextRetryAt.IsZero() {
-		return nil
-	}
-	return deletePublishedBlockReferenceRepairScheduleEntryFn(database, publishedBlockReferenceRepairScheduleEntry{
-		RetrySlot:   publishedBlockReferenceRepairRetrySlotFor(nextRetryAt),
-		Bucket:      repair.Bucket,
-		NextRetryAt: nextRetryAt,
-		OrgID:       repair.OrgID,
-		RepoID:      repair.RepoID,
-		CommitID:    repair.CommitID,
-		FSID:        repair.FSID,
-	})
+	return database.Session().Query(`
+		UPDATE published_block_reference_repairs
+		SET lease_expires_at = ?
+		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
+		IF EXISTS
+	`, nextRetryAt, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
 }
 
 var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {
@@ -286,51 +122,6 @@ var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket
 		return nil, err
 	}
 	return repairs, nil
-}
-
-var listPublishedBlockReferenceRepairScheduleEntriesForSlotFn = func(database *db.DB, retrySlot, bucket int, dueAt time.Time) ([]publishedBlockReferenceRepairScheduleEntry, error) {
-	if database == nil {
-		return nil, fmt.Errorf("database not available")
-	}
-	iter := database.Session().Query(`
-		SELECT next_retry_at, org_id, repo_id, commit_id, fs_id
-		FROM published_block_reference_repair_retry_slots
-		WHERE retry_slot = ? AND bucket = ? AND next_retry_at <= ?
-	`, retrySlot, bucket, dueAt.UTC()).Iter()
-	entries := make([]publishedBlockReferenceRepairScheduleEntry, 0)
-	var entry publishedBlockReferenceRepairScheduleEntry
-	for iter.Scan(&entry.NextRetryAt, &entry.OrgID, &entry.RepoID, &entry.CommitID, &entry.FSID) {
-		entry.RetrySlot = retrySlot
-		entry.Bucket = bucket
-		entry.NextRetryAt = entry.NextRetryAt.UTC()
-		entries = append(entries, entry)
-		entry = publishedBlockReferenceRepairScheduleEntry{}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, err
-	}
-	return entries, nil
-}
-
-var loadPublishedBlockReferenceRepairForScheduleEntryFn = func(database *db.DB, entry publishedBlockReferenceRepairScheduleEntry) (publishedBlockReferenceRepair, error) {
-	if database == nil {
-		return publishedBlockReferenceRepair{}, fmt.Errorf("database not available")
-	}
-	var repair publishedBlockReferenceRepair
-	err := database.Session().Query(`
-		SELECT staged_block_ids, created_at, lease_expires_at
-		FROM published_block_reference_repairs
-		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, entry.Bucket, entry.OrgID, entry.RepoID, entry.CommitID, entry.FSID).Scan(&repair.StagedBlockIDs, &repair.CreatedAt, &repair.LeaseExpiresAt)
-	if err != nil {
-		return publishedBlockReferenceRepair{}, err
-	}
-	repair.Bucket = entry.Bucket
-	repair.OrgID = entry.OrgID
-	repair.RepoID = entry.RepoID
-	repair.CommitID = entry.CommitID
-	repair.FSID = entry.FSID
-	return repair, nil
 }
 
 var listPendingPublishedFSObjectOwnersByDayFn = func(database *db.DB, day time.Time, bucket int) ([]db.PendingPublishedFSObjectOwner, error) {
@@ -733,28 +524,6 @@ func newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID string, stag
 	}
 }
 
-func publishedBlockReferenceRepairRetrySlotFor(at time.Time) int {
-	slot := at.UTC().Unix() / int64(publishedBlockReferenceRepairRetrySlot/time.Second)
-	slot %= int64(publishedBlockReferenceRepairRetryWheelSlots)
-	if slot < 0 {
-		slot += int64(publishedBlockReferenceRepairRetryWheelSlots)
-	}
-	return int(slot)
-}
-
-func publishedBlockReferenceRepairRetrySweepSlots(at time.Time) []int {
-	current := publishedBlockReferenceRepairRetrySlotFor(at)
-	slots := make([]int, 0, publishedBlockReferenceRepairRetrySweepSlotCount)
-	for offset := publishedBlockReferenceRepairRetrySweepSlotCount - 1; offset >= 0; offset-- {
-		slot := current - offset
-		if slot < 0 {
-			slot += publishedBlockReferenceRepairRetryWheelSlots
-		}
-		slots = append(slots, slot)
-	}
-	return slots
-}
-
 // publishedBlockReferenceRepairRetryDelay is deliberately derived from row
 // age rather than an unbounded retry counter. That keeps the existing schema,
 // makes the delay monotonic for a permanently ambiguous row, and caps the
@@ -978,138 +747,38 @@ func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID,
 	return repairPublishedBlockReferenceRepair(database, newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID, stagedBlockIDs))
 }
 
-func seedPublishedBlockReferenceRepairSchedule(database *db.DB) error {
-	if database == nil {
-		return nil
-	}
-	now := publishedBlockReferenceRepairNowFn().UTC()
-	var firstErr error
-	for bucket := 0; bucket < publishedBlockReferenceRepairBuckets; bucket++ {
-		repairs, err := listPublishedBlockReferenceRepairsForBucketFn(database, bucket)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("seed queued publish repairs for bucket %d: %w", bucket, err)
-			}
-			continue
-		}
-		for _, repair := range repairs {
-			nextRetryAt := repair.LeaseExpiresAt.UTC()
-			stateRetryAt, stateErr := loadPublishedBlockReferenceRepairScheduleStateFn(database, repair)
-			switch {
-			case stateErr == nil:
-				nextRetryAt = stateRetryAt.UTC()
-				if !nextRetryAt.After(now) {
-					nextRetryAt = now
-				}
-			case errors.Is(stateErr, gocql.ErrNotFound):
-				if nextRetryAt.IsZero() {
-					nextRetryAt = now
-				}
-			default:
-				if firstErr == nil {
-					firstErr = fmt.Errorf("load publish repair schedule state for repo=%s commit=%s fs_object=%s: %w", repair.RepoID, repair.CommitID, repair.FSID, stateErr)
-				}
-				continue
-			}
-			if stateErr == nil {
-				repair.LeaseExpiresAt = stateRetryAt
-			}
-			if err := schedulePublishedBlockReferenceRepairRetryFn(database, repair, nextRetryAt); err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("seed publish repair schedule for repo=%s commit=%s fs_object=%s: %w", repair.RepoID, repair.CommitID, repair.FSID, err)
-				}
-			}
-		}
-	}
-	return firstErr
-}
-
-func deletePublishedBlockReferenceRepairScheduleEntryAndState(database *db.DB, entry publishedBlockReferenceRepairScheduleEntry) error {
-	repair := publishedBlockReferenceRepair{
-		Bucket:   entry.Bucket,
-		OrgID:    entry.OrgID,
-		RepoID:   entry.RepoID,
-		CommitID: entry.CommitID,
-		FSID:     entry.FSID,
-	}
-	var cleanupErr error
-	if err := deletePublishedBlockReferenceRepairScheduleEntryFn(database, entry); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
-	}
-	if err := deletePublishedBlockReferenceRepairScheduleStateFn(database, repair); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
-	}
-	return cleanupErr
-}
-
 func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
 	if database == nil {
 		return nil
 	}
 	now := publishedBlockReferenceRepairNowFn().UTC()
-	return runPublishedBlockReferenceRepairSweepAt(database, now, publishedBlockReferenceRepairRetrySweepSlots(now))
-}
-
-func runPublishedBlockReferenceRepairSweepAt(database *db.DB, now time.Time, retrySlots []int) error {
-	if database == nil {
-		return nil
-	}
 	cutoff := now.Add(-publishedBlockReferenceRepairStaleAfter)
 	var firstErr error
-	for _, retrySlot := range retrySlots {
-		for bucket := 0; bucket < publishedBlockReferenceRepairBuckets; bucket++ {
-			entries, err := listPublishedBlockReferenceRepairScheduleEntriesForSlotFn(database, retrySlot, bucket, now)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("list due publish repairs for retry slot %d bucket %d: %w", retrySlot, bucket, err)
-				}
+	for bucket := 0; bucket < publishedBlockReferenceRepairBuckets; bucket++ {
+		repairs, err := listPublishedBlockReferenceRepairsForBucketFn(database, bucket)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("list queued publish repairs for bucket %d: %w", bucket, err)
+			}
+			continue
+		}
+		for _, repair := range repairs {
+			if !repair.CreatedAt.IsZero() && repair.CreatedAt.After(cutoff) {
 				continue
 			}
-			for _, entry := range entries {
-				if entry.NextRetryAt.After(now) {
-					continue
+			// lease_expires_at is advisory scheduling state only. It is not
+			// consulted by the settlement function and never authorizes cleanup.
+			if !repair.LeaseExpiresAt.IsZero() && repair.LeaseExpiresAt.After(now) {
+				continue
+			}
+			if err := repairPublishedBlockReferenceRepair(database, repair); err != nil {
+				nextRetryAt := now.Add(publishedBlockReferenceRepairRetryDelay(now, repair.CreatedAt))
+				if retryErr := schedulePublishedBlockReferenceRepairRetryFn(database, repair, nextRetryAt); retryErr != nil {
+					err = errors.Join(err, fmt.Errorf("schedule next publish repair retry at %s: %w", nextRetryAt.Format(time.RFC3339), retryErr))
 				}
-				repair, err := loadPublishedBlockReferenceRepairForScheduleEntryFn(database, entry)
-				if errors.Is(err, gocql.ErrNotFound) {
-					if cleanupErr := deletePublishedBlockReferenceRepairScheduleEntryAndState(database, entry); cleanupErr != nil && firstErr == nil {
-						firstErr = fmt.Errorf("cleanup orphaned publish repair schedule repo=%s commit=%s fs_object=%s: %w", entry.RepoID, entry.CommitID, entry.FSID, cleanupErr)
-					}
-					continue
-				}
-				if err != nil {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("load due publish repair repo=%s commit=%s fs_object=%s: %w", entry.RepoID, entry.CommitID, entry.FSID, err)
-					}
-					continue
-				}
-				stateRetryAt, stateErr := loadPublishedBlockReferenceRepairScheduleStateFn(database, repair)
-				if stateErr != nil && !errors.Is(stateErr, gocql.ErrNotFound) {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("load due publish repair scheduler state repo=%s commit=%s fs_object=%s: %w", repair.RepoID, repair.CommitID, repair.FSID, stateErr)
-					}
-					continue
-				}
-				if stateErr == nil && stateRetryAt.After(now) {
-					// This is an old entry left by insert-before-delete. It is
-					// scheduler-only residue and must not trigger an authority read.
-					if cleanupErr := deletePublishedBlockReferenceRepairScheduleEntryFn(database, entry); cleanupErr != nil && firstErr == nil {
-						firstErr = fmt.Errorf("cleanup stale publish repair schedule repo=%s commit=%s fs_object=%s: %w", repair.RepoID, repair.CommitID, repair.FSID, cleanupErr)
-					}
-					continue
-				}
-				repair.LeaseExpiresAt = entry.NextRetryAt
-				if !repair.CreatedAt.IsZero() && repair.CreatedAt.After(cutoff) {
-					continue
-				}
-				if err := repairPublishedBlockReferenceRepair(database, repair); err != nil {
-					nextRetryAt := now.Add(publishedBlockReferenceRepairRetryDelay(now, repair.CreatedAt))
-					if retryErr := schedulePublishedBlockReferenceRepairRetryFn(database, repair, nextRetryAt); retryErr != nil {
-						err = errors.Join(err, fmt.Errorf("schedule next publish repair retry at %s: %w", nextRetryAt.Format(time.RFC3339), retryErr))
-					}
-					log.Printf("[publish_repair] queued repair failed for repo=%s commit=%s fs_object=%s: %v", repair.RepoID, repair.CommitID, repair.FSID, err)
-					if firstErr == nil {
-						firstErr = err
-					}
+				log.Printf("[publish_repair] queued repair failed for repo=%s commit=%s fs_object=%s: %v", repair.RepoID, repair.CommitID, repair.FSID, err)
+				if firstErr == nil {
+					firstErr = err
 				}
 			}
 		}
@@ -1129,9 +798,6 @@ func StartPublishedBlockReferenceRepairer(database *db.DB) {
 					log.Printf("[publish_repair] pending fs_object owner sweep failed: %v", err)
 				}
 				lastOwnerSweepAt = pendingPublishedFSObjectOwnerNowFn().UTC()
-			}
-			if err := seedPublishedBlockReferenceRepairSchedule(database); err != nil {
-				log.Printf("[publish_repair] scheduler bootstrap failed: %v", err)
 			}
 			if err := runPublishedBlockReferenceRepairSweep(database); err != nil {
 				log.Printf("[publish_repair] initial sweep failed: %v", err)

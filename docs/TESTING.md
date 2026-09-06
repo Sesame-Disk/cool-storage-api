@@ -1063,14 +1063,6 @@ W2 evidence combines the shared upload-link engine with a real in-process
 funnel is closed. The existing X2/P3 multi-DC harness is a separate workflow and
 is not changed by this PR.
 
-The post-HEAD retry scheduler is covered by unit and migration contracts. Its
-periodic sweep reads only the due retry-slot projection (current plus two grace
-slots per bucket), never scans the retained repair partitions, and never uses a
-retry LWT. Startup performs the one-time base-table bootstrap needed for legacy
-rows and long-outage recovery. Integration fixtures use the production cleanup
-path so the durable repair row, exact scheduler state, and current due entry are
-all removed.
-
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical

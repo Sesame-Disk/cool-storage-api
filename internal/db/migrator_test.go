@@ -265,17 +265,3 @@ func TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission(t *testing.T) 
 	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD staged_bucket_count INT;")
 	assert.Contains(t, content, "ALTER TABLE block_upload_sessions ADD staged_bucket_cap INT;")
 }
-
-func TestMigration021AddsBoundedPublishedRepairScheduler(t *testing.T) {
-	raw, err := migrationsFS.ReadFile("migrations/021_published_block_reference_repair_scheduler.cql")
-	require.NoError(t, err)
-	content := string(raw)
-
-	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS published_block_reference_repair_retry_slots")
-	assert.Contains(t, content, "PRIMARY KEY ((retry_slot, bucket), next_retry_at, org_id, repo_id, commit_id, fs_id)")
-	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS published_block_reference_repair_schedule_state")
-	assert.Contains(t, content, "PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)")
-	statements := parseCQLStatements(content)
-	assert.NotContains(t, strings.Join(statements, " "), "IF EXISTS")
-	assert.Len(t, statements, 2)
-}

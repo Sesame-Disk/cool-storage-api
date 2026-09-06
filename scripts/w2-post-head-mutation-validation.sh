@@ -39,12 +39,12 @@ m_lease_expiry_cleans_unknown() {
   restore
 }
 m_unrelated_head_is_declared_not_published() {
-  mutate "$REPAIR" 's{\treturn publishedBlockReferenceRepairCommitUnknown, nil\n}{\treturn publishedBlockReferenceRepairCommitReachable, nil\n}'
+  mutate "$REPAIR" 's{\treturn publishedBlockReferenceRepairCommitUnknown, nil\r?\n}{\treturn publishedBlockReferenceRepairCommitReachable, nil\n}'
   expect_red 'TestClassifyPublishedBlockReferenceRepairCommitOutcome' 'outcome = 1, want 0' 'unknown publication classification'
   restore
 }
 m_repair_row_deleted_before_settlement() {
-  mutate "$REPAIR" 's{(\tcommitOutcome, err := publishedBlockReferenceRepairCommitReachableFn\(database, repair\.OrgID, repair\.RepoID, repair\.CommitID\)\n\tif err != nil \{\n\t\treturn err\n\t\}\n)}{$1\t_ = deletePublishedBlockReferenceRepairFn(database, repair)\n}'
+  mutate "$REPAIR" 's{(\tcommitOutcome, err := publishedBlockReferenceRepairCommitReachableFn\(database, repair\.OrgID, repair\.RepoID, repair\.CommitID\)\r?\n\tif err != nil \{\r?\n\t\treturn err\r?\n\t\}\r?\n)}{$1\t_ = deletePublishedBlockReferenceRepairFn(database, repair)\n}'
   expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry' 'repair row should not be deleted for unknown publication' 'repair-row deletion before settlement'
   restore
 }
