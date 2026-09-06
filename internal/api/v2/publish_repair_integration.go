@@ -20,8 +20,6 @@ func SetPublishedBlockReferenceRepairOutcomeForIntegration(outcome string, injec
 	switch strings.ToLower(strings.TrimSpace(outcome)) {
 	case "reachable":
 		outcomeValue = publishedBlockReferenceRepairCommitReachable
-	case "definitely_not_published":
-		outcomeValue = publishedBlockReferenceRepairCommitDefinitelyNotPublished
 	case "unknown":
 		outcomeValue = publishedBlockReferenceRepairCommitUnknown
 	default:
@@ -43,8 +41,6 @@ func PublishedBlockReferenceRepairCommitOutcomeForIntegration(database *db.DB, o
 	switch outcome {
 	case publishedBlockReferenceRepairCommitReachable:
 		return "reachable", err
-	case publishedBlockReferenceRepairCommitDefinitelyNotPublished:
-		return "definitely_not_published", err
 	default:
 		return "unknown", err
 	}

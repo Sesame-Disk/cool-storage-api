@@ -1402,7 +1402,7 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 
 ### ISSUE-LIBRARY-INITIAL-HEAD-CONCURRENCY-01: Concurrent initial-library HEAD initialization can race
 
-**Status**: 🟡 Partially resolved for the `CreateFileFromBlocks` post-HEAD publish-repair slice (2026-09-06); broader R31 remains open
+**Status**: 🔴 Open — independent of the `CreateFileFromBlocks` post-HEAD publish-repair slice; broader R31 remains open
 **Severity**: High (P1) — library initialization correctness
 **Affected**: `SyncHandler.createInitialCommit` in `internal/api/sync.go`, initial `libraries`/`commits`/`fs_objects` writes
 **Registered**: 2026-09-05, during the PR #203/#204 scope audit
@@ -5213,7 +5213,7 @@ Cleanup selected by elapsed time can therefore remove an attempt commit or refer
 
 #### Scope / disposition
 
-This branch fixes the shared published-block-reference repair used by `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN/failed confirmation retains the durable repair; and cleanup requires a positive non-publication result. The real Cassandra/MinIO gate covers normal success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, ancestor reachability, restart replay, and exact loser cleanup. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
+This branch fixes the shared published-block-reference repair used by `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The real Cassandra/MinIO gate covers normal success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, synchronous loser cleanup, and a writer paused before HEAD while repair runs. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
 
 ---
 
@@ -5229,7 +5229,7 @@ Historically, the repair path read HEAD through its ordinary read path and walke
 
 #### Scope / disposition
 
-This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable, definitely not published only with positive parent-ancestry evidence, or UNKNOWN; UNKNOWN fails closed and retains the durable row. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
+This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable or UNKNOWN; every non-reachable result fails closed and retains the durable row and artifacts. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter, plus a real pre-HEAD race in which repair runs while the writer is paused before HEAD. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
 
 ---
 

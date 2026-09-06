@@ -814,15 +814,17 @@ The W2 post-HEAD repair boundary has its own 3-DC leg, separate from X2/P3:
 HEAD, publishes a child HEAD only in `dc-eu` while `dc-na` and `dc-asia`
 are stopped, then runs the production repair classifier from `dc-na` after the
 nodes return. The local `LOCAL_QUORUM` read must remain stale, while the
-classifier must return `reachable` or fail closed as `unknown`, never
-`definitely_not_published`.
+classifier must return `reachable` or fail closed as `unknown`; local
+blindness must never authorize cleanup. The W2 real Cassandra/MinIO evidence
+also pauses a writer before its HEAD CAS, runs repair, and verifies that the
+queued row and `pub:` reference survive until the writer completes.
 
 Run it from the repository root; the script builds and runs its Go test runner
 inside Docker and tears down the 3-DC fixture when complete:
 
-``sh
+```bash
 ./scripts/w2-post-head-multidc-validation.sh
-``
+```
 
 ### TL;DR for an agent picking this up cold
 

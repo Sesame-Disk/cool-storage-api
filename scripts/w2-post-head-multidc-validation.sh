@@ -147,4 +147,4 @@ runner_env dc-na env \
 	go test -tags integration -count=1 ./internal/integration/ -run '^TestW2PostHeadRepairDoesNotMisclassifyRemoteHead3DC$' -v
 
 echo
-echo "W2 3-DC post-HEAD reachability evidence passed: dc-na stayed locally blind while repair did not classify the dc-eu publication as definitely unpublished."
+echo "W2 3-DC post-HEAD reachability evidence passed: dc-na stayed locally blind while repair did not authorize cleanup of the dc-eu publication."

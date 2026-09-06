@@ -34,13 +34,13 @@ expect_red() {
 }
 
 m_lease_expiry_cleans_unknown() {
-  mutate "$REPAIR" 's{default:\s+return fmt\.Errorf\("publication outcome for fs_object %s commit %s is unknown; retain queued repair", repair\.FSID, repair\.CommitID\)}{default:\n\t\tif err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs); err != nil { return err }\n\t\treturn nil}'
-  expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry' 'cleanup should not run for unknown publication after lease expiry' 'lease expiry cleanup authority'
+  mutate "$REPAIR" 's{default:\s+return fmt\.Errorf\("publication outcome for fs_object %s commit %s is unknown; retain queued repair", repair\.FSID, repair\.CommitID\)}{default:\n\t\treturn nil}'
+  expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_RetainsUnknownOutcomeAfterLeaseExpiry' 'repair row should not be deleted for unknown publication' 'lease expiry cleanup authority'
   restore
 }
 m_unrelated_head_is_declared_not_published() {
-  mutate "$REPAIR" 's{\treturn publishedBlockReferenceRepairCommitUnknown, nil\n}{\treturn publishedBlockReferenceRepairCommitDefinitelyNotPublished, nil\n}'
-  expect_red 'TestClassifyPublishedBlockReferenceRepairCommitOutcome' 'unrelated_head_is_unknown' 'unrelated HEAD non-publication classification'
+  mutate "$REPAIR" 's{\treturn publishedBlockReferenceRepairCommitUnknown, nil\n}{\treturn publishedBlockReferenceRepairCommitReachable, nil\n}'
+  expect_red 'TestClassifyPublishedBlockReferenceRepairCommitOutcome' 'outcome = 1, want 0' 'unknown publication classification'
   restore
 }
 m_repair_row_deleted_before_settlement() {
@@ -59,8 +59,8 @@ m_hot_path_pays_serial_per_block() {
   restore
 }
 m_cleanup_uses_the_wrong_attempt_identity() {
-  mutate "$REPAIR" 's{publishedBlockReferenceRepairCleanupFn\(database, repair\.OrgID, repair\.RepoID, repair\.CommitID, repair\.FSID, repair\.StagedBlockIDs\)}{publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.FSID, repair.FSID, repair.StagedBlockIDs)}'
-  expect_red 'TestRepairPublishedFSObjectBlockReferenceRepair_CleansDefinitelyNotPublishedCommit' 'cleanup target' 'wrong loser cleanup identity'
+  mutate "$REPAIR" 's{cleanupFailedPublishRemoveAttemptReferencesFn\(database, orgID, attemptID, blockIDs\)}{cleanupFailedPublishRemoveAttemptReferencesFn(database, orgID, commitID, blockIDs)}'
+  expect_red 'TestCleanupFailedPublishArtifacts_DeletesCommitAndDedupesAttemptRefs' 'remove refs args' 'wrong loser cleanup identity'
   restore
 }
 

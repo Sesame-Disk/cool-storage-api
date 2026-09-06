@@ -151,7 +151,7 @@ func TestW2PostHeadWriteRemoteCommitFor3DC(t *testing.T) {
 
 // TestW2PostHeadRepairDoesNotMisclassifyRemoteHead3DC proves the minimum
 // multi-DC contract for this slice: a local blind read must never turn a
-// commit published in another DC into positive non-publication evidence.
+// commit published in another DC into cleanup-authorizing evidence.
 func TestW2PostHeadRepairDoesNotMisclassifyRemoteHead3DC(t *testing.T) {
 	if os.Getenv(w2PostHeadMultidcEvidenceEnv) != "1" {
 		t.Skipf("%s is not set", w2PostHeadMultidcEvidenceEnv)
@@ -179,11 +179,8 @@ func TestW2PostHeadRepairDoesNotMisclassifyRemoteHead3DC(t *testing.T) {
 	}
 
 	outcome, err := v2api.PublishedBlockReferenceRepairCommitOutcomeForIntegration(database, orgID, repoID, commitID)
-	if outcome == "definitely_not_published" {
-		t.Fatalf("W2 3DC REGRESSION: dc-na local blindness classified a commit published in dc-eu as definitely not published (err=%v)", err)
-	}
 	if outcome != "reachable" && outcome != "unknown" {
-		t.Fatalf("unexpected W2 3DC repair outcome %q (err=%v)", outcome, err)
+		t.Fatalf("unexpected W2 3DC repair outcome %q; local blindness must never authorize cleanup (err=%v)", outcome, err)
 	}
 	if err != nil {
 		t.Logf("W2 3DC safe fail-closed outcome=%s with confirmation error: %v", outcome, err)
