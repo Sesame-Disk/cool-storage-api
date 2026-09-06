@@ -157,12 +157,12 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 	`, staleCreatedAt, leaseExpiresAt, bucket, state.orgID, repoID, state.headCommitID, state.fsID).Exec(); err != nil {
 		t.Fatalf("failed to backdate queued publish repair row: %v", err)
 	}
+	if err := v2api.ReschedulePublishedBlockReferenceRepairForIntegration(database, state.orgID, repoID, state.headCommitID, state.fsID, state.internalBlockIDs, leaseExpiresAt); err != nil {
+		t.Fatalf("failed to backdate queued publish repair schedule: %v", err)
+	}
 
 	t.Cleanup(func() {
-		_ = database.Session().Query(`
-			DELETE FROM published_block_reference_repairs
-			WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		`, bucket, state.orgID, repoID, state.headCommitID, state.fsID).Exec()
+		_ = v2api.ClearPublishedFSObjectBlockReferenceRepair(database, state.orgID, repoID, state.headCommitID, state.fsID)
 		for _, blockID := range state.internalBlockIDs {
 			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
 			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)
@@ -441,11 +441,11 @@ func publishRepairIntegrationSeedQueuedRepair(t *testing.T, database *dbpkg.DB, 
 	`, createdAt, leaseExpiresAt, bucket, state.orgID, repoID, commitID, state.fsID).Exec(); err != nil {
 		t.Fatalf("update W2 repair seed timestamps: %v", err)
 	}
+	if err := v2api.ReschedulePublishedBlockReferenceRepairForIntegration(database, state.orgID, repoID, commitID, state.fsID, state.internalBlockIDs, leaseExpiresAt); err != nil {
+		t.Fatalf("update W2 repair seed schedule: %v", err)
+	}
 	t.Cleanup(func() {
-		_ = database.Session().Query(`
-			DELETE FROM published_block_reference_repairs
-			WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		`, bucket, state.orgID, repoID, commitID, state.fsID).Exec()
+		_ = v2api.ClearPublishedFSObjectBlockReferenceRepair(database, state.orgID, repoID, commitID, state.fsID)
 		for _, blockID := range state.internalBlockIDs {
 			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
 			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)
