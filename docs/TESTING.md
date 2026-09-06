@@ -809,6 +809,21 @@ publish a fence a writer in another DC cannot see).
 A single process cannot observe a consistency level. That is the entire reason this
 fixture exists, and it is why these legs are not part of `go-all-test`.
 
+The W2 post-HEAD repair boundary has its own 3-DC leg, separate from X2/P3:
+`scripts/w2-post-head-multidc-validation.sh`. It seeds a globally visible base
+HEAD, publishes a child HEAD only in `dc-eu` while `dc-na` and `dc-asia`
+are stopped, then runs the production repair classifier from `dc-na` after the
+nodes return. The local `LOCAL_QUORUM` read must remain stale, while the
+classifier must return `reachable` or fail closed as `unknown`, never
+`definitely_not_published`.
+
+Run it from the repository root; the script builds and runs its Go test runner
+inside Docker and tears down the 3-DC fixture when complete:
+
+``sh
+./scripts/w2-post-head-multidc-validation.sh
+``
+
 ### TL;DR for an agent picking this up cold
 
 ```bash

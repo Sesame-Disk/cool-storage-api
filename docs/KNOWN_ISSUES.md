@@ -5229,7 +5229,7 @@ Historically, the repair path read HEAD through its ordinary read path and walke
 
 #### Scope / disposition
 
-This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable, definitely not published only with positive parent-ancestry evidence, or UNKNOWN; UNKNOWN fails closed and retains the durable row. The bounded Docker evidence is limited to this repair slice. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
+This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable, definitely not published only with positive parent-ancestry evidence, or UNKNOWN; UNKNOWN fails closed and retains the durable row. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
 
 ---
 

@@ -34,3 +34,18 @@ func SetPublishedBlockReferenceRepairOutcomeForIntegration(outcome string, injec
 	}
 	return func() { publishedBlockReferenceRepairCommitReachableFn = previous }, nil
 }
+
+// PublishedBlockReferenceRepairCommitOutcomeForIntegration runs the production
+// cold-path classifier without exposing its internal outcome type to integration
+// packages. It is used by the standalone 3-DC evidence leg.
+func PublishedBlockReferenceRepairCommitOutcomeForIntegration(database *db.DB, orgID, repoID, commitID string) (string, error) {
+	outcome, err := publishedBlockReferenceRepairCommitReachableFn(database, orgID, repoID, commitID)
+	switch outcome {
+	case publishedBlockReferenceRepairCommitReachable:
+		return "reachable", err
+	case publishedBlockReferenceRepairCommitDefinitelyNotPublished:
+		return "definitely_not_published", err
+	default:
+		return "unknown", err
+	}
+}

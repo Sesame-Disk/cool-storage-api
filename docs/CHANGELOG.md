@@ -10,7 +10,7 @@ Session-by-session development history for SesameFS.
 
 Starting from main merge `f9494375e9c10e2c8d7f7766314a9d07856db89f`, the durable published-block-reference repair now settles post-HEAD outcomes explicitly. The canonical org-scoped HEAD is read in the SERIAL domain and immutable commit parents in the cold path; positive reachability promotes `pub:` to `fs:`, positive non-publication evidence cleans only the exact attempt, and UNKNOWN or unavailable confirmation retains the repair. Lease expiry is retained only for compatibility/diagnostics and never authorizes cleanup.
 
-The slice adds unit/contract coverage, a real Cassandra/MinIO evidence gate for normal success, applied and ambiguous HEAD outcomes, lease expiry, ancestor reachability, restart replay, and exact loser cleanup, plus deliberate mutation checks. Docker integration and all-test runners require `SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1`. No schema, lifecycle, GC-worker, or destructive-activation change is included; broader W2/R31 and X1 remain open.
+The slice adds unit/contract coverage, a real Cassandra/MinIO evidence gate for normal success, applied and ambiguous HEAD outcomes, lease expiry, ancestor reachability, restart replay, and exact loser cleanup, plus deliberate mutation checks. A separate Docker 3-DC leg proves that local blindness cannot classify a publication made in another datacenter as definitely unpublished. Docker integration and all-test runners require `SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1`. No schema, lifecycle, GC-worker, or destructive-activation change is included; broader W2/R31 and X1 remain open.
 
 ## 2026-09-05 - New W2 slice: SessionUpload own-liveness parity from PR #202
 

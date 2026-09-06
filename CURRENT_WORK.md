@@ -1,5 +1,10 @@
 # Current Work - SesameFS
 
+The W2 post-HEAD slice also has a separate 3-DC reachability leg
+(`scripts/w2-post-head-multidc-validation.sh`); it is independent of the
+existing X2/P3 GC harness and proves that local blindness cannot authorize
+cleanup of a publication made in another datacenter.
+
 **Last Updated**: 2026-09-06
 **Session**: W2 `CreateFileFromBlocks` post-HEAD publication continuity, based on main merge `f9494375e9c10e2c8d7f7766314a9d07856db89f`. This branch is intentionally limited to `finalizeStoredUploadMetadata` through `finalizeStoredUploadMetadataOnce` and the durable published-block-reference repair path. Lease expiry is advisory only; a repair promotes on positive reachability, cleans only on positive non-publication, and retains UNKNOWN/failed confirmation. No lifecycle, publication-state, terminal-witness, delete/restore, storage-accounting, quota, migration, or GC-worker redesign is in this slice. Broader W2/R31 and X1 remain OPEN. `GC_ENABLED=false`.
 
