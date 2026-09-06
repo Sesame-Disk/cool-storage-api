@@ -993,6 +993,36 @@ docker compose --profile test run --rm --build gotest \
   go test ./internal/gc -count=1 -run 'TestX1PhysicalLifeHandoff'
 ```
 
+SessionUpload W2 evidence is a separate six-leg gate, covered by
+`internal/integration/sessionupload_own_liveness_test.go` and backed by real
+Cassandra/MinIO. The retry leg forces a pre-HEAD failure, releases the session
+claim, and commits again; it does not exercise the already-Committed early
+return. The exact-placement legs also cover GC-first and fully-retired-before-
+renewal, proving that recreating `up:` after D does not revoke D and that the
+pre-HEAD check rejects the condemned placement.
+
+Directed W2 run (unset every unrelated gate because `TestMain` checks enabled
+gates after `-run` filtering):
+
+```bash
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_REQUIRE_P2_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P3_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4A_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R3_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE=1 \
+  go-integration-test \
+  go test -tags integration -run '^TestSessionUploadOwnLiveness|^TestSessionUploadOwnLivenessEvidenceRequiresEveryNamedLeg$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+```
+
+Canonical full run: `docker compose --profile test run --rm --build go-integration-test`
+(or `go-all-test`). Both canonical commands set the W2 gate and the W1/R3/X1 gates inline; the service environments leave W2 disabled for directed runs. The existing X2/P3 multi-DC harness is a separate workflow and is
+not changed by this PR.
+
 ### P4b orphan publication evidence
 
 The P4b unit contract covers the write-once LWT, SERIAL settlement, canonical

@@ -20,7 +20,7 @@ func TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks(t *testing.T) {
 		if orgID != "org-1" || libraryID != "repo-1" || referrer != wantReferrer || storageClass != "hot" || expiresAt.Before(time.Now()) {
 			t.Fatalf("unexpected own-liveness arguments: %s/%s/%s/%s/%s", orgID, blockID, referrer, libraryID, storageClass)
 		}
-		// ensureBorrowedFSOwnLiveness fans distinct blocks out across concurrent
+		// ensureCommitBlockOwnLiveness fans distinct blocks out across concurrent
 		// goroutines (errgroup), so this map needs its own lock: Go maps are not
 		// safe for concurrent writes even to disjoint keys.
 		mu.Lock()
@@ -29,20 +29,20 @@ func TestBorrowedFSOwnLivenessPinsExactDistinctBorrowedBlocks(t *testing.T) {
 		return nil
 	}
 
-	blocks := []borrowedFSCommitBlock{
-		{blockID: "b1", storageClass: "hot", storageKey: "k1"},
-		{blockID: "b1", storageClass: "hot", storageKey: "k1"},
-		{blockID: "b2", storageClass: "hot", storageKey: "k2"},
+	blocks := []commitBlockPlacement{
+		{blockID: "b1", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k1"},
+		{blockID: "b1", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k1"},
+		{blockID: "b2", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k2"},
 	}
-	if err := (&FileHandler{}).ensureBorrowedFSOwnLiveness(nil, "org-1", "repo-1", "session-1", blocks); err != nil {
-		t.Fatalf("ensureBorrowedFSOwnLiveness: %v", err)
+	if err := (&FileHandler{}).ensureCommitBlockOwnLiveness(nil, "org-1", "repo-1", "session-1", blocks); err != nil {
+		t.Fatalf("ensureCommitBlockOwnLiveness: %v", err)
 	}
 	if len(calls) != 2 || calls["b1"] != 1 || calls["b2"] != 1 {
 		t.Fatalf("own-liveness calls = %v, want one call for each distinct borrowed block", calls)
 	}
 }
 
-func TestBorrowedFSOwnLivenessLeavesSessionUploadAtPlusZero(t *testing.T) {
+func TestCommitBlockOwnLivenessEmptySetIsNoOp(t *testing.T) {
 	oldAdd := registerUploadedBlockAddProvisionalRefFn
 	t.Cleanup(func() { registerUploadedBlockAddProvisionalRefFn = oldAdd })
 
@@ -51,11 +51,11 @@ func TestBorrowedFSOwnLivenessLeavesSessionUploadAtPlusZero(t *testing.T) {
 		addCalls++
 		return nil
 	}
-	if err := (&FileHandler{}).ensureBorrowedFSOwnLiveness(nil, "org-1", "repo-1", "session-1", nil); err != nil {
+	if err := (&FileHandler{}).ensureCommitBlockOwnLiveness(nil, "org-1", "repo-1", "session-1", nil); err != nil {
 		t.Fatalf("empty BorrowedFS liveness set: %v", err)
 	}
 	if addCalls != 0 {
-		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d pin calls, want 0", addCalls)
+		t.Fatalf("empty placement set made %d pin calls, want 0", addCalls)
 	}
 }
 
@@ -73,11 +73,11 @@ func TestBorrowedFSOwnLivenessFailureIsRetryable(t *testing.T) {
 		refs[blockID+"/"+referrer] = true
 		return nil
 	}
-	block := []borrowedFSCommitBlock{{blockID: "b1", storageClass: "hot", storageKey: "k1"}}
-	if err := (&FileHandler{}).ensureBorrowedFSOwnLiveness(nil, "org-1", "repo-1", "session-1", block); !errors.Is(err, ErrBlockMaterializationTransient) {
+	block := []commitBlockPlacement{{blockID: "b1", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k1"}}
+	if err := (&FileHandler{}).ensureCommitBlockOwnLiveness(nil, "org-1", "repo-1", "session-1", block); !errors.Is(err, ErrBlockMaterializationTransient) {
 		t.Fatalf("first own-liveness attempt error = %v, want transient", err)
 	}
-	if err := (&FileHandler{}).ensureBorrowedFSOwnLiveness(nil, "org-1", "repo-1", "session-1", block); err != nil {
+	if err := (&FileHandler{}).ensureCommitBlockOwnLiveness(nil, "org-1", "repo-1", "session-1", block); err != nil {
 		t.Fatalf("retry own-liveness: %v", err)
 	}
 	if attempts != 2 || len(refs) != 1 {
@@ -95,9 +95,9 @@ func TestBorrowedFSFenceRejectsActiveDelete(t *testing.T) {
 		}
 		return db.BlockRepairAuthorityBlocked, db.ErrBlockRepairBlocked
 	}
-	blocks := []borrowedFSCommitBlock{{blockID: "b1", storageClass: "hot", storageKey: "k1"}}
-	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
-		t.Fatalf("validateBorrowedFSFences error = %v, want ErrBlockDeleteInProgress", err)
+	blocks := []commitBlockPlacement{{blockID: "b1", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k1"}}
+	if err := (&FileHandler{}).validateCommitBlockPublicationFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("validateCommitBlockPublicationFences error = %v, want ErrBlockDeleteInProgress", err)
 	}
 }
 
@@ -118,13 +118,13 @@ func TestBorrowedFSFenceRejectsFullyRetiredPlacement(t *testing.T) {
 		}
 		return db.BlockRepairAuthorityChanged, db.ErrBlockRepairAuthorityChanged
 	}
-	blocks := []borrowedFSCommitBlock{{blockID: "b1", storageClass: "hot", storageKey: "k1"}}
-	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
-		t.Fatalf("validateBorrowedFSFences error = %v, want ErrBlockDeleteInProgress", err)
+	blocks := []commitBlockPlacement{{blockID: "b1", provenance: blockCommitLivenessBorrowedFS, storageClass: "hot", storageKey: "k1"}}
+	if err := (&FileHandler{}).validateCommitBlockPublicationFences("org-1", blocks); !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("validateCommitBlockPublicationFences error = %v, want ErrBlockDeleteInProgress", err)
 	}
 }
 
-func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
+func TestCommitBlockPublicationFencesEmptySetIsNoOp(t *testing.T) {
 	oldAuthority := validateBorrowedFSPublicationAuthorityFn
 	t.Cleanup(func() { validateBorrowedFSPublicationAuthorityFn = oldAuthority })
 
@@ -133,10 +133,10 @@ func TestBorrowedFSFenceLeavesSessionUploadAtPlusZero(t *testing.T) {
 		authorityCalls++
 		return db.BlockRepairAuthorityAuthorized, nil
 	}
-	if err := (&FileHandler{}).validateBorrowedFSFences("org-1", nil); err != nil {
+	if err := (&FileHandler{}).validateCommitBlockPublicationFences("org-1", nil); err != nil {
 		t.Fatalf("empty BorrowedFS fence set: %v", err)
 	}
 	if authorityCalls != 0 {
-		t.Fatalf("SessionUpload-compatible empty BorrowedFS set made %d authority calls, want 0", authorityCalls)
+		t.Fatalf("empty placement set made %d authority calls, want 0", authorityCalls)
 	}
 }

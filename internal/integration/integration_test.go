@@ -54,6 +54,7 @@ func TestMain(m *testing.M) {
 		os.Getenv("SESAMEFS_REQUIRE_R3_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_R26_EVIDENCE") == "1"
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
@@ -114,6 +115,12 @@ func TestMain(m *testing.M) {
 	}
 	if os.Getenv(borrowedFSOwnLivenessEnv) == "1" && !borrowedFSOwnLivenessEvidence.complete() {
 		fmt.Printf("%s=1 requires all named BorrowedFS own-liveness legs; missing=%s (check -run filters)\n", borrowedFSOwnLivenessEnv, strings.Join(borrowedFSOwnLivenessEvidence.missing(), ","))
+		if code == 0 {
+			code = 1
+		}
+	}
+	if os.Getenv(sessionUploadOwnLivenessEnv) == "1" && !sessionUploadOwnLivenessEvidence.complete() {
+		fmt.Printf("%s=1 requires all named SessionUpload own-liveness legs; missing=%s (check -run filters)\n", sessionUploadOwnLivenessEnv, strings.Join(sessionUploadOwnLivenessEvidence.missing(), ","))
 		if code == 0 {
 			code = 1
 		}
