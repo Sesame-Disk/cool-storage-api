@@ -420,7 +420,7 @@ func TestR3PublicationHotPathTypedReceiversAndCQLBudget(t *testing.T) {
 		{pkg: module + "/internal/db", name: "AddPublishAttemptReferences"}:      2,
 		{pkg: module + "/internal/db", name: "StagePublishAttemptReferences"}:    3,
 		{pkg: module + "/internal/db", name: "PromotePublishAttemptReferences"}:  1,
-		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   17,
+		{pkg: module + "/internal/api/v2", name: "stagePendingPublishedFiles"}:   16,
 		{pkg: module + "/internal/api/v2", name: "promotePendingPublishedFiles"}: 5,
 		{pkg: module + "/internal/api", name: "stageSyncCommitBlockDelta"}:       8,
 		{pkg: module + "/internal/api", name: "finalizeSyncCommitBlockDelta"}:    5,

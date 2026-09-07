@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +24,95 @@ type publishRepairIntegrationFileState struct {
 	headCommitID     string
 	fsID             string
 	internalBlockIDs []string
+}
+
+const w2PostHeadEvidenceEnv = "SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE"
+
+type w2PostHeadEvidenceState struct {
+	normalSuccess                bool
+	crashAfterAppliedHead        bool
+	ambiguousCASApplied          bool
+	ambiguousConfirmationUnknown bool
+	leaseExpiryIsNotAuthority    bool
+	casLoserCleanup              bool
+	preHeadRepairRace            bool
+	reachableAncestor            bool
+	restartReplay                bool
+}
+
+var w2PostHeadEvidence w2PostHeadEvidenceState
+
+func (e w2PostHeadEvidenceState) complete() bool {
+	return e.normalSuccess &&
+		e.crashAfterAppliedHead &&
+		e.ambiguousCASApplied &&
+		e.ambiguousConfirmationUnknown &&
+		e.leaseExpiryIsNotAuthority &&
+		e.casLoserCleanup &&
+		e.preHeadRepairRace &&
+		e.reachableAncestor &&
+		e.restartReplay
+}
+
+func (e w2PostHeadEvidenceState) missing() []string {
+	missing := make([]string, 0, 9)
+	if !e.normalSuccess {
+		missing = append(missing, "normal_success")
+	}
+	if !e.crashAfterAppliedHead {
+		missing = append(missing, "crash_after_applied_head")
+	}
+	if !e.ambiguousCASApplied {
+		missing = append(missing, "ambiguous_cas_applied")
+	}
+	if !e.ambiguousConfirmationUnknown {
+		missing = append(missing, "ambiguous_confirmation_unavailable_retains")
+	}
+	if !e.leaseExpiryIsNotAuthority {
+		missing = append(missing, "lease_expiry_is_not_authority")
+	}
+	if !e.casLoserCleanup {
+		missing = append(missing, "cas_loser_cleanup")
+	}
+	if !e.preHeadRepairRace {
+		missing = append(missing, "pre_head_repair_race")
+	}
+	if !e.reachableAncestor {
+		missing = append(missing, "reachable_ancestor")
+	}
+	if !e.restartReplay {
+		missing = append(missing, "restart_replay")
+	}
+	return missing
+}
+
+func markW2PostHeadEvidence(t *testing.T, leg string) {
+	t.Helper()
+	if os.Getenv(w2PostHeadEvidenceEnv) != "1" {
+		return
+	}
+	switch leg {
+	case "normal_success":
+		w2PostHeadEvidence.normalSuccess = true
+	case "crash_after_applied_head":
+		w2PostHeadEvidence.crashAfterAppliedHead = true
+	case "ambiguous_cas_applied":
+		w2PostHeadEvidence.ambiguousCASApplied = true
+	case "ambiguous_confirmation_unavailable_retains":
+		w2PostHeadEvidence.ambiguousConfirmationUnknown = true
+	case "lease_expiry_is_not_authority":
+		w2PostHeadEvidence.leaseExpiryIsNotAuthority = true
+	case "cas_loser_cleanup":
+		w2PostHeadEvidence.casLoserCleanup = true
+	case "pre_head_repair_race":
+		w2PostHeadEvidence.preHeadRepairRace = true
+	case "reachable_ancestor":
+		w2PostHeadEvidence.reachableAncestor = true
+	case "restart_replay":
+		w2PostHeadEvidence.restartReplay = true
+	default:
+		t.Fatalf("unknown W2 evidence leg %q", leg)
+	}
 }
 
 func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart(t *testing.T) {
@@ -55,7 +147,9 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 
 	bucket := publishRepairIntegrationBucket(state.orgID, repoID, state.headCommitID, state.fsID)
 	staleCreatedAt := time.Now().UTC().Add(-time.Minute)
-	leaseExpiresAt := time.Now().UTC().Add(4 * time.Minute)
+	// The worker now treats lease_expires_at as the advisory next-retry time;
+	// make this seeded stale row immediately eligible for the restart replay.
+	leaseExpiresAt := time.Now().UTC().Add(-time.Minute)
 	if err := database.Session().Query(`
 		UPDATE published_block_reference_repairs
 		SET created_at = ?, lease_expires_at = ?
@@ -65,10 +159,9 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 	}
 
 	t.Cleanup(func() {
-		_ = database.Session().Query(`
-			DELETE FROM published_block_reference_repairs
-			WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		`, bucket, state.orgID, repoID, state.headCommitID, state.fsID).Exec()
+		if err := v2api.ClearPublishedFSObjectBlockReferenceRepair(database, state.orgID, repoID, state.headCommitID, state.fsID); err != nil {
+			t.Errorf("cleanup W2 repair row: %v", err)
+		}
 		for _, blockID := range state.internalBlockIDs {
 			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
 			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)
@@ -97,6 +190,332 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 	}) {
 		referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
 		t.Fatalf("timed out waiting for durable publish replay; referrers=%v rowExists=%v", referrers, publishRepairIntegrationRepairRowExists(t, bucket, state.orgID, repoID, state.headCommitID, state.fsID))
+	}
+	markW2PostHeadEvidence(t, "crash_after_applied_head")
+	markW2PostHeadEvidence(t, "restart_replay")
+}
+
+func TestW2CreateFilePostHeadEvidenceAgainstRealCassandra(t *testing.T) {
+	if os.Getenv(w2PostHeadEvidenceEnv) != "1" {
+		t.Skipf("%s is not enabled", w2PostHeadEvidenceEnv)
+	}
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-w2-post-head-%d", time.Now().UnixNano()))
+	upload := func(fileName string) publishRepairIntegrationFileState {
+		uploadURL := getUploadLink(t, adminClient, repoID, "/")
+		uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fmt.Sprintf("W2 post-head evidence %s %d\n", fileName, time.Now().UnixNano()))
+		return publishRepairIntegrationReadFileState(t, repoID, "/", fileName)
+	}
+
+	normal := upload("w2-normal.txt")
+	normalPub := dbpkg.BlockReferrerForPublishAttempt(normal.headCommitID)
+	normalRefs := uploadedFileBlockReferrers(t, repoID, "/", "w2-normal.txt")
+	if !publishRepairIntegrationHasReferrer(normalRefs, dbpkg.BlockReferrerForFSObject(repoID, normal.fsID)) || publishRepairIntegrationHasReferrer(normalRefs, normalPub) {
+		t.Fatalf("normal CreateFileFromBlocks publication did not converge: %v", normalRefs)
+	}
+	markW2PostHeadEvidence(t, "normal_success")
+
+	crash := upload("w2-crash-after-head.txt")
+	publishRepairIntegrationSeedQueuedRepair(t, database, repoID, crash, crash.headCommitID, time.Now().UTC().Add(-time.Minute), time.Now().UTC().Add(4*time.Minute), true)
+	if err := v2api.RepairPublishedFSObjectBlockReferenceRepair(database, crash.orgID, repoID, crash.headCommitID, crash.fsID, crash.internalBlockIDs); err != nil {
+		t.Fatalf("repair after an applied HEAD returned error: %v", err)
+	}
+	assertW2StateConverged(t, repoID, "w2-crash-after-head.txt", crash, crash.headCommitID)
+
+	ambiguousApplied := upload("w2-ambiguous-applied.txt")
+	publishRepairIntegrationSeedQueuedRepair(t, database, repoID, ambiguousApplied, ambiguousApplied.headCommitID, time.Now().UTC(), time.Now().UTC().Add(5*time.Minute), true)
+	restore, err := v2api.SetPublishedBlockReferenceRepairOutcomeForIntegration("reachable", nil)
+	if err != nil {
+		t.Fatalf("install applied ambiguous-CAS evidence hook: %v", err)
+	}
+	restoreOnce := sync.OnceFunc(restore)
+	t.Cleanup(restoreOnce)
+	if err := v2api.RepairPublishedFSObjectBlockReferenceRepair(database, ambiguousApplied.orgID, repoID, ambiguousApplied.headCommitID, ambiguousApplied.fsID, ambiguousApplied.internalBlockIDs); err != nil {
+		t.Fatalf("ambiguous CAS known-applied repair returned error: %v", err)
+	}
+	restoreOnce()
+	assertW2StateConverged(t, repoID, "w2-ambiguous-applied.txt", ambiguousApplied, ambiguousApplied.headCommitID)
+	markW2PostHeadEvidence(t, "ambiguous_cas_applied")
+
+	ambiguousUnknown := upload("w2-ambiguous-unknown.txt")
+	publishRepairIntegrationSeedQueuedRepair(t, database, repoID, ambiguousUnknown, ambiguousUnknown.headCommitID, time.Now().UTC(), time.Now().UTC().Add(-time.Minute), true)
+	restore, err = v2api.SetPublishedBlockReferenceRepairOutcomeForIntegration("unknown", errors.New("confirmation unavailable"))
+	if err != nil {
+		t.Fatalf("install unavailable-confirmation evidence hook: %v", err)
+	}
+	restoreOnce = sync.OnceFunc(restore)
+	t.Cleanup(restoreOnce)
+	err = v2api.RepairPublishedFSObjectBlockReferenceRepair(database, ambiguousUnknown.orgID, repoID, ambiguousUnknown.headCommitID, ambiguousUnknown.fsID, ambiguousUnknown.internalBlockIDs)
+	restoreOnce()
+	if err == nil || !strings.Contains(err.Error(), "confirmation unavailable") {
+		t.Fatalf("ambiguous confirmation should retain repair, error=%v", err)
+	}
+	unknownRefs := uploadedFileBlockReferrers(t, repoID, "/", "w2-ambiguous-unknown.txt")
+	unknownPub := dbpkg.BlockReferrerForPublishAttempt(ambiguousUnknown.headCommitID)
+	if publishRepairIntegrationHasReferrer(unknownRefs, dbpkg.BlockReferrerForFSObject(repoID, ambiguousUnknown.fsID)) || !publishRepairIntegrationHasReferrer(unknownRefs, unknownPub) {
+		t.Fatalf("unknown publication outcome changed refs: %v", unknownRefs)
+	}
+	if !publishRepairIntegrationRepairRowExists(t, publishRepairIntegrationBucket(ambiguousUnknown.orgID, repoID, ambiguousUnknown.headCommitID, ambiguousUnknown.fsID), ambiguousUnknown.orgID, repoID, ambiguousUnknown.headCommitID, ambiguousUnknown.fsID) {
+		t.Fatal("unknown publication outcome deleted the durable repair row")
+	}
+	markW2PostHeadEvidence(t, "ambiguous_confirmation_unavailable_retains")
+	markW2PostHeadEvidence(t, "lease_expiry_is_not_authority")
+
+	ancestor := upload("w2-reachable-ancestor.txt")
+	_ = upload("w2-newer-head.txt")
+	publishRepairIntegrationSeedQueuedRepair(t, database, repoID, ancestor, ancestor.headCommitID, time.Now().UTC(), time.Now().UTC().Add(5*time.Minute), true)
+	if err := v2api.RepairPublishedFSObjectBlockReferenceRepair(database, ancestor.orgID, repoID, ancestor.headCommitID, ancestor.fsID, ancestor.internalBlockIDs); err != nil {
+		t.Fatalf("reachable ancestor repair returned error: %v", err)
+	}
+	assertW2StateConverged(t, repoID, "w2-reachable-ancestor.txt", ancestor, ancestor.headCommitID)
+	markW2PostHeadEvidence(t, "reachable_ancestor")
+
+	// Reuse the W2 library already allocated above; the test environment has a
+	// deliberately small active-library limit, and the race needs no new repo.
+	casRepoID := repoID
+	casHandler := newBorrowedFSHeadHandler(t, database, x1StorageClass(t))
+	casA := newBorrowedFSHeadFixtureForRepo(t, database, casHandler, x1StorageClass(t), casRepoID)
+	casB := newBorrowedFSHeadFixtureForRepo(t, database, casHandler, x1StorageClass(t), casRepoID)
+	arrivals := make(chan struct{})
+	release := make(chan struct{})
+	var arrivalMu sync.Mutex
+	arrivalCount := 0
+	borrowedFSInstallBarriers(t, casA, func() {}, func() {}, func() {}, func() error {
+		arrivalMu.Lock()
+		arrivalCount++
+		if arrivalCount == 2 {
+			close(arrivals)
+		}
+		arrivalMu.Unlock()
+		<-release
+		return nil
+	})
+	casResults := make(chan *httptest.ResponseRecorder, 2)
+	go func() { casResults <- casA.commit(t) }()
+	go func() { casResults <- casB.commit(t) }()
+	select {
+	case <-arrivals:
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatalf("real CAS-loser race did not bring both writers to the pre-HEAD barrier")
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case result := <-casResults:
+			if result.Code != 200 {
+				t.Fatalf("real CAS-loser writer %d failed: status=%d body=%s", i+1, result.Code, result.Body.String())
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("real CAS-loser writer %d did not finish", i+1)
+		}
+	}
+	casFSIDs := []string{
+		publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", casA.filename),
+		publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", casB.filename),
+	}
+	for _, fixture := range []*borrowedFSHeadFixture{casA, casB} {
+		refs := publishRepairIntegrationBlockReferrers(t, database, fixture.orgID, fixture.blockID)
+		fsID := publishRepairIntegrationLookupFileFSID(t, casRepoID, "/", fixture.filename)
+		if !publishRepairIntegrationHasReferrer(refs, dbpkg.BlockReferrerForFSObject(casRepoID, fsID)) {
+			t.Fatalf("real CAS-loser publication did not retain fs ref for %s: %v", fixture.filename, refs)
+		}
+		for _, ref := range refs {
+			if strings.HasPrefix(ref, "pub:") {
+				t.Fatalf("real CAS-loser cleanup left pub ref for %s: %v", fixture.filename, refs)
+			}
+		}
+	}
+	for bucket := 0; bucket < 32; bucket++ {
+		iter := database.Session().Query(`
+			SELECT fs_id FROM published_block_reference_repairs WHERE bucket = ?
+		`, bucket).Iter()
+		var repairFSID string
+		for iter.Scan(&repairFSID) {
+			for _, fsID := range casFSIDs {
+				if repairFSID == fsID {
+					t.Fatalf("real CAS-loser cleanup left a durable repair row for fs_object %s", fsID)
+				}
+			}
+		}
+		if err := iter.Close(); err != nil {
+			t.Fatalf("scan CAS-loser repair bucket %d: %v", bucket, err)
+		}
+	}
+	markW2PostHeadEvidence(t, "cas_loser_cleanup")
+
+	t.Run("repairRetainsPreHeadRace", func(t *testing.T) {
+		handler := newBorrowedFSHeadHandler(t, database, x1StorageClass(t))
+		fx := newBorrowedFSHeadFixture(t, database, handler, x1StorageClass(t))
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseWriter := func() { releaseOnce.Do(func() { close(release) }) }
+		defer releaseWriter()
+		borrowedFSInstallBarriers(t, fx, func() {}, func() {}, func() {}, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+
+		type commitResult struct {
+			code int
+			body string
+		}
+		writerResult := make(chan commitResult, 1)
+		go func() {
+			rec := fx.commit(t)
+			writerResult <- commitResult{code: rec.Code, body: rec.Body.String()}
+		}()
+		select {
+		case <-entered:
+		case result := <-writerResult:
+			t.Fatalf("writer crossed pre-HEAD barrier unexpectedly: status=%d body=%s", result.code, result.body)
+		case <-time.After(20 * time.Second):
+			t.Fatal("writer did not reach the pre-HEAD barrier")
+		}
+
+		commitID, fsID := publishRepairIntegrationFindQueuedRepair(t, database, fx.orgID, fx.repoID, fx.blockID)
+		if commitID == "" || fsID == "" {
+			t.Fatal("pre-HEAD writer did not queue a durable repair row")
+		}
+		err := v2api.RepairPublishedFSObjectBlockReferenceRepair(database, fx.orgID, fx.repoID, commitID, fsID, []string{fx.blockID})
+		if err == nil || !strings.Contains(err.Error(), "unknown") {
+			t.Fatalf("pre-HEAD repair must retain an unresolved publication, error=%v", err)
+		}
+		if !publishRepairIntegrationRepairRowExists(t, publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID), fx.orgID, fx.repoID, commitID, fsID) {
+			t.Fatal("pre-HEAD repair deleted its durable row")
+		}
+		referrers := publishRepairIntegrationBlockReferrers(t, database, fx.orgID, fx.blockID)
+		if !publishRepairIntegrationHasReferrer(referrers, dbpkg.BlockReferrerForPublishAttempt(commitID)) {
+			t.Fatalf("pre-HEAD repair removed pub: before HEAD publication: %v", referrers)
+		}
+		if publishRepairIntegrationHasReferrer(referrers, dbpkg.BlockReferrerForFSObject(fx.repoID, fsID)) {
+			t.Fatalf("pre-HEAD repair promoted fs: before HEAD publication: %v", referrers)
+		}
+
+		releaseWriter()
+		select {
+		case result := <-writerResult:
+			if result.code != 200 {
+				t.Fatalf("writer failed after retained repair: status=%d body=%s", result.code, result.body)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("writer did not finish after pre-HEAD repair retained its artifacts")
+		}
+		fx.assertHeadAdvanced(t)
+		finalRefs := publishRepairIntegrationBlockReferrers(t, database, fx.orgID, fx.blockID)
+		if !publishRepairIntegrationHasReferrer(finalRefs, dbpkg.BlockReferrerForFSObject(fx.repoID, fsID)) || publishRepairIntegrationHasReferrer(finalRefs, dbpkg.BlockReferrerForPublishAttempt(commitID)) {
+			t.Fatalf("pre-HEAD race did not converge after writer completed: %v", finalRefs)
+		}
+		if publishRepairIntegrationRepairRowExists(t, publishRepairIntegrationBucket(fx.orgID, fx.repoID, commitID, fsID), fx.orgID, fx.repoID, commitID, fsID) {
+			t.Fatal("pre-HEAD race left a repair row after the writer settled")
+		}
+		markW2PostHeadEvidence(t, "pre_head_repair_race")
+	})
+}
+
+func publishRepairIntegrationSeedQueuedRepair(t *testing.T, database *dbpkg.DB, repoID string, state publishRepairIntegrationFileState, commitID string, createdAt, leaseExpiresAt time.Time, removeFSRef bool) {
+	t.Helper()
+	fsReferrer := dbpkg.BlockReferrerForFSObject(repoID, state.fsID)
+	pubReferrer := dbpkg.BlockReferrerForPublishAttempt(commitID)
+	for _, blockID := range state.internalBlockIDs {
+		if removeFSRef {
+			if err := database.RemoveBlockReference(state.orgID, blockID, fsReferrer); err != nil {
+				t.Fatalf("remove fs ref before W2 repair seed: %v", err)
+			}
+		} else if err := database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0); err != nil {
+			t.Fatalf("restore winner fs ref before W2 loser seed: %v", err)
+		}
+		if err := database.AddBlockReference(state.orgID, blockID, pubReferrer, repoID, 0); err != nil {
+			t.Fatalf("add pub ref before W2 repair seed: %v", err)
+		}
+	}
+	if err := v2api.QueuePublishedFSObjectBlockReferenceRepair(database, state.orgID, repoID, commitID, state.fsID, state.internalBlockIDs); err != nil {
+		t.Fatalf("queue W2 repair seed: %v", err)
+	}
+	bucket := publishRepairIntegrationBucket(state.orgID, repoID, commitID, state.fsID)
+	if err := database.Session().Query(`
+		UPDATE published_block_reference_repairs
+		SET created_at = ?, lease_expires_at = ?
+		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
+	`, createdAt, leaseExpiresAt, bucket, state.orgID, repoID, commitID, state.fsID).Exec(); err != nil {
+		t.Fatalf("update W2 repair seed timestamps: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := v2api.ClearPublishedFSObjectBlockReferenceRepair(database, state.orgID, repoID, commitID, state.fsID); err != nil {
+			t.Errorf("cleanup W2 repair row: %v", err)
+		}
+		for _, blockID := range state.internalBlockIDs {
+			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
+			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)
+		}
+	})
+}
+
+func publishRepairIntegrationFindQueuedRepair(t *testing.T, database *dbpkg.DB, orgID, repoID, blockID string) (string, string) {
+	t.Helper()
+	for bucket := 0; bucket < 32; bucket++ {
+		iter := database.Session().Query(`
+			SELECT org_id, repo_id, commit_id, fs_id
+			FROM published_block_reference_repairs
+			WHERE bucket = ?
+		`, bucket).Iter()
+		var rowOrgID, rowRepoID, commitID, fsID string
+		for iter.Scan(&rowOrgID, &rowRepoID, &commitID, &fsID) {
+			if rowOrgID != orgID || rowRepoID != repoID {
+				continue
+			}
+			var blockIDs []string
+			if err := database.Session().Query(`
+				SELECT staged_block_ids
+				FROM published_block_reference_repairs
+				WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
+			`, bucket, rowOrgID, rowRepoID, commitID, fsID).Scan(&blockIDs); err != nil {
+				t.Fatalf("load queued repair block ids: %v", err)
+			}
+			for _, candidate := range blockIDs {
+				if candidate == blockID {
+					if err := iter.Close(); err != nil {
+						t.Fatalf("close queued repair iterator: %v", err)
+					}
+					return commitID, fsID
+				}
+			}
+		}
+		if err := iter.Close(); err != nil {
+			t.Fatalf("scan queued repairs for bucket %d: %v", bucket, err)
+		}
+	}
+	return "", ""
+}
+
+func publishRepairIntegrationBlockReferrers(t *testing.T, database *dbpkg.DB, orgID, blockID string) []string {
+	t.Helper()
+	iter := database.Session().Query(`
+		SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Iter()
+	var referrer string
+	var referrers []string
+	for iter.Scan(&referrer) {
+		referrers = append(referrers, referrer)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("list block referrers for %s/%s: %v", orgID, blockID, err)
+	}
+	return referrers
+}
+
+func assertW2StateConverged(t *testing.T, repoID, fileName string, state publishRepairIntegrationFileState, commitID string) {
+	t.Helper()
+	referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
+	if !publishRepairIntegrationHasReferrer(referrers, dbpkg.BlockReferrerForFSObject(repoID, state.fsID)) || publishRepairIntegrationHasReferrer(referrers, dbpkg.BlockReferrerForPublishAttempt(commitID)) {
+		t.Fatalf("W2 settlement did not converge for %s: %v", fileName, referrers)
+	}
+	if publishRepairIntegrationRepairRowExists(t, publishRepairIntegrationBucket(state.orgID, repoID, commitID, state.fsID), state.orgID, repoID, commitID, state.fsID) {
+		t.Fatalf("W2 settlement left a repair row for %s", fileName)
 	}
 }
 

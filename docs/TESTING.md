@@ -809,6 +809,23 @@ publish a fence a writer in another DC cannot see).
 A single process cannot observe a consistency level. That is the entire reason this
 fixture exists, and it is why these legs are not part of `go-all-test`.
 
+The W2 post-HEAD repair boundary has its own 3-DC leg, separate from X2/P3:
+`scripts/w2-post-head-multidc-validation.sh`. It seeds a globally visible base
+HEAD, publishes a child HEAD only in `dc-eu` while `dc-na` and `dc-asia`
+are stopped, then runs the production repair classifier from `dc-na` after the
+nodes return. The local `LOCAL_QUORUM` read must remain stale, while the
+classifier must return `reachable` or fail closed as `unknown`; local
+blindness must never authorize cleanup. The W2 real Cassandra/MinIO evidence
+also pauses a writer before its HEAD CAS, runs repair, and verifies that the
+queued row and `pub:` reference survive until the writer completes.
+
+Run it from the repository root; the script builds and runs its Go test runner
+inside Docker and tears down the 3-DC fixture when complete:
+
+```bash
+./scripts/w2-post-head-multidc-validation.sh
+```
+
 ### TL;DR for an agent picking this up cold
 
 ```bash
@@ -1001,7 +1018,7 @@ return. The exact-placement legs also cover GC-first and fully-retired-before-
 renewal, proving that recreating `up:` after D does not revoke D and that the
 pre-HEAD check rejects the condemned placement.
 
-Directed W2 run (unset every unrelated gate because `TestMain` checks enabled
+Directed SessionUpload run (unset every unrelated gate because `TestMain` checks enabled
 gates after `-run` filtering):
 
 ```bash
@@ -1019,9 +1036,50 @@ docker compose --profile test run --rm --build \
   go test -tags integration -run '^TestSessionUploadOwnLiveness|^TestSessionUploadOwnLivenessEvidenceRequiresEveryNamedLeg$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
+Directed W2 post-HEAD run (the W2 gate is explicit here; all unrelated gates are
+unset):
+
+```bash
+docker compose --profile test run --rm --build \
+  -e SESAMEFS_REQUIRE_P2_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P3_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4A_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_P4B_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R26_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_R3_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_X1_NONOVERLAP_CHARACTERIZATION= \
+  -e SESAMEFS_REQUIRE_BORROWEDFS_OWN_LIVENESS_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE= \
+  -e SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1 \
+  go-integration-test \
+  go test -tags integration -run '^TestW2CreateFilePostHeadEvidenceAgainstRealCassandra$|^TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+```
+
+Repair settlement intentionally remains an ordinary idempotent delete, matching
+the ordinary repair-row insert. Retry backoff is process-local advisory state;
+the unit suite verifies it is stored and that forgetting it on restart is safe.
+There is no retry mutation to race with settlement or to resurrect a deleted row.
+
+W2 source mutation evidence is also Docker-only:
+
+```bash
+docker compose --profile test run --rm --build gotest bash scripts/w2-post-head-mutation-validation.sh
+```
+
+The script currently covers eight mutations and must report 8/8 expected RED.
+The two additional mutations turn the ordinary settlement delete into a
+conditional statement and remove the process-local retry-state store; both must
+be caught by the source/behavior contract guards. This suite does not claim that
+scheduler scaling, R31, or X1 is closed.
+
 Canonical full run: `docker compose --profile test run --rm --build go-integration-test`
-(or `go-all-test`). Both canonical commands set the W2 gate and the W1/R3/X1 gates inline; the service environments leave W2 disabled for directed runs. The existing X2/P3 multi-DC harness is a separate workflow and is
-not changed by this PR.
+(or `go-all-test`). Both canonical commands pass the W2 gate and the W1/R3/X1
+gates inline; the service environments leave W2 disabled for directed runs. The
+W2 evidence combines the shared upload-link engine with a real in-process
+`CreateFileFromBlocks` pre-HEAD/CAS race; it does not claim every publication
+funnel is closed. The existing X2/P3 multi-DC harness is a separate workflow and
+is not changed by this PR. Its local-blindness wording does not by itself claim
+that SERIAL is indispensable.
 
 ### P4b orphan publication evidence
 

@@ -6,6 +6,14 @@ Session-by-session development history for SesameFS.
 
 **Note**: For detailed git history, use `git log --oneline --graph`. This file tracks high-level session summaries.
 
+## 2026-09-06 - W2 CreateFileFromBlocks post-HEAD publication continuity slice
+
+Starting from main merge `f9494375e9c10e2c8d7f7766314a9d07856db89f`, the durable published-block-reference repair now settles post-HEAD outcomes explicitly. The canonical org-scoped HEAD is read in the SERIAL domain and immutable commit parents in the cold path; positive reachability promotes `pub:` to `fs:`, while every non-reachable or unavailable confirmation retains the repair and does not actively remove its artifacts. Lease expiry is retained only for compatibility/diagnostics and advisory retry scheduling; it never authorizes cleanup. Unknown rows use a capped age-based retry delay, and stale pending-owner scans run at a 15-minute advisory cadence.
+
+Repair settlement remains an ordinary idempotent delete, and retry backoff is now process-local advisory state rather than a mutation of the durable repair row. This avoids mixing ordinary repair-row writes with LWT/Paxos and means retry bookkeeping cannot resurrect a settled row; restart may retry a retained row earlier, which is safe under the existing fail-closed classifier. Full-scan and multi-node duplicate-work cost remain a separate #206 follow-up.
+
+The slice adds unit/contract coverage, a real Cassandra/MinIO evidence gate for shared-engine success, applied and ambiguous HEAD outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous CAS-loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs, plus deliberate mutation checks. A separate Docker 3-DC leg proves that local blindness cannot authorize cleanup of a publication made in another datacenter. Docker integration and all-test runners explicitly pass `SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1`; the service environment does not force it during directed runs. The evidence uses both the upload-link shared engine and an in-process `CreateFileFromBlocks` race; it does not claim every publication funnel is closed. The finite `pub:` TTL and the missing discoverable zero-ref transition remain the R31 follow-up. No schema, lifecycle, GC-worker, or destructive-activation change is included; broader W2/R31 and X1 remain open.
+
 ## 2026-09-05 - New W2 slice: SessionUpload own-liveness parity from PR #202
 
 PR #203 is abandoned as an implementation and retained only as historical

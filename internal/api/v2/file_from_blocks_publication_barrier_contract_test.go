@@ -126,6 +126,44 @@ func TestFileFromBlocksStageAndHeadBarriersStayOffAuthority(t *testing.T) {
 	assertBarrierArgIsRepoID(t, fn, "finalizeStoredUploadMetadataOnce", "fileFromBlocksBeforeHeadBarrier")
 }
 
+func TestFinalizeStoredUploadMetadataCleansDefinitiveCASLoserThroughProductionPath(t *testing.T) {
+	_, fn := r3ParseFunction(t, r3SourcePath("internal", "api", "v2", "files.go"), "finalizeStoredUploadMetadataOnce")
+	found := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		ifStmt, ok := node.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		condition, ok := ifStmt.Cond.(*ast.CallExpr)
+		if !ok || r3CallName(condition) != "Is" || len(condition.Args) != 2 {
+			return true
+		}
+		errIdent, ok := condition.Args[0].(*ast.Ident)
+		if !ok || errIdent.Name != "err" {
+			return true
+		}
+		conflictIdent, ok := condition.Args[1].(*ast.Ident)
+		if !ok || conflictIdent.Name != "ErrLibraryHeadConflict" {
+			return true
+		}
+		calls := make(map[string]bool)
+		ast.Inspect(ifStmt.Body, func(child ast.Node) bool {
+			call, ok := child.(*ast.CallExpr)
+			if ok {
+				calls[r3CallName(call)] = true
+			}
+			return true
+		})
+		if calls["CleanupFailedPublishAttempt"] && calls["clearPendingPublishedFileRepairs"] {
+			found = true
+		}
+		return true
+	})
+	if !found {
+		t.Fatal("finalizeStoredUploadMetadataOnce must clean the definitive CAS loser through CleanupFailedPublishAttempt and clear its durable repair row")
+	}
+}
+
 // TestValidateCommitBlockPublicationFencesStaysOffSerialAuthority guards the
 // hot-path Paxos budget documented in
 // docs/UPLOAD-PAXOS-HOT-PATH-X1-CHARACTERIZATION.md: ValidateBlockRepairAuthority

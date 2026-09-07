@@ -1402,7 +1402,7 @@ Note: upload *tokens* are Cassandra-backed and multi-node safe
 
 ### ISSUE-LIBRARY-INITIAL-HEAD-CONCURRENCY-01: Concurrent initial-library HEAD initialization can race
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: 🔴 Open — independent of the `CreateFileFromBlocks` post-HEAD publish-repair slice; broader R31 remains open
 **Severity**: High (P1) — library initialization correctness
 **Affected**: `SyncHandler.createInitialCommit` in `internal/api/sync.go`, initial `libraries`/`commits`/`fs_objects` writes
 **Registered**: 2026-09-05, during the PR #203/#204 scope audit
@@ -5201,35 +5201,99 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 ### ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01: Publish repair treats lease expiry as cleanup authority
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: ✅ Closed for the shared W2 repair authority defect (2026-09-06); broader R31 publication continuity remains open
 **Severity**: High (P1) — R31 publication continuity across pre- and post-HEAD outcomes
 **Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair, pending publication cleanup
 
 #### Problem
 
-The pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postpones an unreachable repair while the lease is live and permits cleanup after the lease expires. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
+Historically, the pre-CAS repair lease (`publishedBlockReferenceRepairPreCASLease`) postponed an unreachable repair while the lease was live and permitted cleanup after the lease expired. Lease expiry only says that the original repair window elapsed; it is not proof that a possibly-applied HEAD CAS did not publish. The same distinction covers the HEAD-CAS/lease race and the `confirmed-lost` versus `ErrLibraryHeadConflict` cleanup asymmetry. Timeout is not revocation.
 
 Cleanup selected by elapsed time can therefore remove an attempt commit or reference while definitive HEAD/reconciliation evidence is unavailable. The race is reachable before HEAD CAS when a live writer outlives the repair lease, and after an ambiguous or applied HEAD outcome. It is not part of the W2 narrow block-liveness/exact-placement guarantee. Destructive GC remains disabled.
 
 #### Scope / disposition
 
-Preexisting in PR #202/`main`, discovered or characterized while auditing the abandoned PR #203 lifecycle and repair proposals. Track the fix under R31; do not add lifecycle, terminal-authority, or repair changes to the W2 slice.
+This branch fixes the shared published-block-reference repair used by the upload-link engine and `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and does not actively remove its artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The durable repair row uses ordinary insert/delete mutations throughout; retry backoff is process-local advisory state, so restart may retry a retained row earlier without entering a mixed LWT lifecycle. The real Cassandra/MinIO gate covers shared-engine success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs. The `pub:` reference still has a finite 35-day TTL and no discoverable zero-ref transition; that is the documented R31 follow-up in `ISSUE-GC-PUB-REF-ZERO-REF-01`, not silently closed here. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
 
 ---
 
 ### ISSUE-PUBLISH-REPAIR-REACHABILITY-01: Repair HEAD reachability and ancestry are not bounded authority
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: 🟡 Partially resolved for post-HEAD published-block-reference repair (2026-09-06); broader multi-region/R31 reachability work remains open
 **Severity**: High (P1) — multi-DC publication-repair correctness and convergence
 **Affected**: publish-repair HEAD lookup and commit ancestry walk
 
 #### Problem
 
-The repair path reads HEAD through its ordinary read path and walks `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain can misclassify publication state before HEAD CAS or after an ambiguous/applied HEAD outcome. This is a publication-repair concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
+Historically, the repair path read HEAD through its ordinary read path and walked `parent_id` ancestry without a bounded, multi-DC authority proof. A stale or locally incomplete HEAD view, an unavailable datacenter, or a deep/malformed ancestry chain could misclassify publication state before HEAD CAS or after an ambiguous/applied HEAD outcome. This is a publication-repair concern identified in the #203 audit; it is not a reason to add SERIAL/EACH_QUORUM calls or ancestry scans to the W2 pre-HEAD hot path.
 
 #### Scope / disposition
 
-Preexisting in PR #202/`main`, discovered or characterized during PR #203. Track with R31 and the multiregion HEAD follow-up. No code in W2; any repair change needs its own bounded scope and evidence.
+This branch gives the post-HEAD repair cold path a canonical org-scoped HEAD read in the SERIAL domain and EachQuorum parent reads. It classifies publication as reachable or UNKNOWN; every non-reachable result fails closed, retains the durable row/artifacts, and is retried with bounded advisory backoff instead of an every-minute ancestry walk. The stale pending-owner sweep is likewise rate-limited to a 15-minute advisory cadence. The bounded Docker evidence includes a separate real 3-DC leg proving that a locally blind view cannot authorize cleanup of a publication made in another datacenter, plus a real pre-HEAD race in which repair runs while the writer is paused before HEAD and a real CAS-loser cleanup path. Deep-ancestry bounds, other repair funnels, and the broader R31/multi-region contract remain open; the W2 pre-HEAD hot path still makes no repair authority reads.
+
+---
+
+### ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01: UNKNOWN repair discovery is scan-bound
+
+**Status**: Confirmed follow-up - intentionally out of scope for PR #205 (2026-09-06)
+**Severity**: Medium (P2) - R31 performance and convergence at sustained UNKNOWN-row volume
+**Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair worker
+
+#### Problem
+
+The correctness slice keeps UNKNOWN or unavailable publication confirmations in a
+durable repair row and retries them with advisory age-based backoff. The current
+simple worker discovers those rows by reading every repair bucket on each minute
+tick. As retained UNKNOWN rows and bucket churn grow, the repeated base-table
+reads can consume increasing Cassandra work even though each individual repair
+remains fail-closed. A process pause or outage can also defer discovery until the
+next base-table sweep; this is a scalability and convergence-cost issue, not a
+publication-safety hole.
+
+Retry backoff is process-local advisory state and never mutates the durable repair
+row, so it adds no Paxos contention. A restart forgets the hint and may cause an
+earlier safe retry. The repair table still has 32 bucket partitions, and multiple
+nodes may duplicate the cold-path work while full scans rediscover UNKNOWN rows;
+that is bounded by fail-closed behavior but remains a discovery/convergence cost.
+
+#### Scope / disposition
+
+This issue does not block PR #205, whose contract is post-HEAD publication
+continuity and positive-reachability-only settlement. Do not solve it by weakening
+UNKNOWN retention or cleanup authority. A separate follow-up (provisionally PR
+#206) must characterize rows without a schedule, overdue rows, missed ticks,
+outages, restart, concurrent rescheduling, stale/orphan hints, partition growth,
+tombstones, multi-node duplicate retry, fairness, and bounded work per tick before
+selecting a durable discovery design. Scheduler state must remain separate from
+publication authority, and scheduler failure may delay work but must not make a
+durable repair undiscoverable indefinitely.
+
+---
+
+### ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01: Definitive CAS-loser cleanup has no durable witness
+
+**Status**: Confirmed follow-up - intentionally out of scope for PR #205 (2026-09-06)
+**Severity**: Medium (P2) - R31 convergence and retention
+**Affected**: definitive library-HEAD CAS loser cleanup and post-restart repair classification
+
+#### Problem
+
+After a request receives a definitive library-HEAD CAS conflict, it normally
+cleans the exact attempt's staged references and repair rows synchronously. A
+crash after the definitive loser result but before that cleanup completes leaves
+no durable known-loser witness. After restart, the repair worker cannot infer the
+loser from a timeout or lease expiry; it correctly classifies the outcome as
+UNKNOWN and retains the repair and artifacts. This is safe but can retain
+references until a future reconciliation authority discovers the known loser.
+
+#### Scope / disposition
+
+This remains an R31 follow-up and does not block PR #205. Do not infer a
+confirmed loser from timeout, lease expiry, or a non-reachable observation. A
+future design needs a durable known-loser witness or an equivalent authority and
+must preserve fail-closed retention when that witness is unavailable. PR #205
+only guarantees request-local cleanup while the definitive loser request remains
+alive.
 
 ---
 
