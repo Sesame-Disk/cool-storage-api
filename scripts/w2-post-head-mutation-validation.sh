@@ -63,18 +63,18 @@ m_cleanup_uses_the_wrong_attempt_identity() {
   expect_red 'TestCleanupFailedPublishArtifacts_DeletesCommitAndDedupesAttemptRefs' 'remove refs args' 'wrong loser cleanup identity'
   restore
 }
-m_settlement_delete_is_ordinary() {
-  mutate "$REPAIR" 's{IF EXISTS}{IF NOT EXISTS}'
-  expect_red 'TestPublishedBlockReferenceRepairSettlementAndRetryUseGlobalSerialLWT' 'settlement delete must remain conditional' 'ordinary settlement delete'
+m_settlement_delete_is_conditional() {
+  mutate "$REPAIR" 's{(WHERE bucket = \? AND org_id = \? AND repo_id = \? AND commit_id = \? AND fs_id = \?\r?\n\s*)(`, repair\.Bucket, repair\.OrgID, repair\.RepoID, repair\.CommitID, repair\.FSID\))}{$1IF EXISTS\n$2}'
+  expect_red 'TestPublishedBlockReferenceRepairSettlementUsesOrdinaryWrites' 'settlement must not enter the repair row' 'conditional settlement delete'
   restore
 }
-m_settlement_delete_loses_serial_pin() {
-  mutate "$REPAIR" 's{SerialConsistency\(gocql\.Serial\)}{Consistency(gocql.Quorum)}'
-  expect_red 'TestPublishedBlockReferenceRepairSettlementAndRetryUseGlobalSerialLWT' 'settlement delete must pin the global SERIAL domain' 'unpinned settlement delete'
+m_retry_backoff_is_persisted_on_repair_row() {
+  mutate "$REPAIR" 's{publishedBlockReferenceRepairNextRetryAt\.Store}{publishedBlockReferenceRepairNextRetryAt.Delete}'
+  expect_red 'TestSchedulePublishedBlockReferenceRepairRetryUsesProcessLocalState' 'too many arguments in call' 'durable retry bookkeeping'
   restore
 }
 
-MUTATIONS=(m_lease_expiry_cleans_unknown m_unrelated_head_is_declared_not_published m_repair_row_deleted_before_settlement m_head_read_is_weak m_hot_path_pays_serial_per_block m_cleanup_uses_the_wrong_attempt_identity m_settlement_delete_is_ordinary m_settlement_delete_loses_serial_pin)
+MUTATIONS=(m_lease_expiry_cleans_unknown m_unrelated_head_is_declared_not_published m_repair_row_deleted_before_settlement m_head_read_is_weak m_hot_path_pays_serial_per_block m_cleanup_uses_the_wrong_attempt_identity m_settlement_delete_is_conditional m_retry_backoff_is_persisted_on_repair_row)
 if [ "${1:-}" = "--list" ]; then printf '%s\n' "${MUTATIONS[@]}"; exit 0; fi
 printf 'Baseline (unmutated) must be green...\n'
 go test ./internal/api/v2 -count=1 >/dev/null 2>&1 || fail 'the unmutated internal/api/v2 suite is already red'

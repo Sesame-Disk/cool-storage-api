@@ -5201,7 +5201,7 @@ Note (mixed, not fully clean): `gc_block_representation_resolve_test.go` intenti
 
 ### ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01: Publish repair treats lease expiry as cleanup authority
 
-**Status**: 🟡 Confirmed follow-up — preexisting on `main`; surfaced and characterized during PR #203
+**Status**: ✅ Closed for the shared W2 repair authority defect (2026-09-06); broader R31 publication continuity remains open
 **Severity**: High (P1) — R31 publication continuity across pre- and post-HEAD outcomes
 **Affected**: `internal/api/v2/publish_repair.go`, published-block-reference repair, pending publication cleanup
 
@@ -5213,7 +5213,7 @@ Cleanup selected by elapsed time can therefore remove an attempt commit or refer
 
 #### Scope / disposition
 
-This branch fixes the shared published-block-reference repair used by the upload-link engine and `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and does not actively remove its artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The worker now treats `lease_expires_at` only as an advisory next-retry timestamp with a capped age-based delay, while the stale pending-owner sweep runs at a 15-minute advisory cadence. The real Cassandra/MinIO gate covers shared-engine success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs. The `pub:` reference still has a finite 35-day TTL and no discoverable zero-ref transition; that is the documented R31 follow-up in `ISSUE-GC-PUB-REF-ZERO-REF-01`, not silently closed here. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
+This branch fixes the shared published-block-reference repair used by the upload-link engine and `CreateFileFromBlocks`: lease expiry is no longer cleanup authority; UNKNOWN, failed, or otherwise non-reachable confirmation retains the durable repair and does not actively remove its artifacts; and definitive CAS losers are cleaned synchronously by the request that received the conflict. The durable repair row uses ordinary insert/delete mutations throughout; retry backoff is process-local advisory state, so restart may retry a retained row earlier without entering a mixed LWT lifecycle. The real Cassandra/MinIO gate covers shared-engine success, crash after applied HEAD, ambiguous applied/unknown outcomes, lease expiry, reachable ancestry, restart replay, a real synchronous loser path, and a writer paused before `CreateFileFromBlocks` HEAD while repair runs. The `pub:` reference still has a finite 35-day TTL and no discoverable zero-ref transition; that is the documented R31 follow-up in `ISSUE-GC-PUB-REF-ZERO-REF-01`, not silently closed here. Other publication funnels and the remaining R31 protocol work stay open; this does not add lifecycle or terminal-authority state, migrations, GC-worker changes, or destructive activation.
 
 ---
 
@@ -5250,13 +5250,11 @@ remains fail-closed. A process pause or outage can also defer discovery until th
 next base-table sweep; this is a scalability and convergence-cost issue, not a
 publication-safety hole.
 
-Retry rescheduling and repair settlement are both conditional writes in the same
-explicit global SERIAL domain. The repair table has 32 bucket partitions, so
-sustained UNKNOWN volume can also create Paxos contention between retry updates,
-settlement deletes, and duplicate retry attempts from multiple nodes. Settlement
-adds one conditional LWT per settled pending publication repair row, not one per
-block; that bounded correctness cost is intentionally accepted here and should
-be reevaluated with scheduler design.
+Retry backoff is process-local advisory state and never mutates the durable repair
+row, so it adds no Paxos contention. A restart forgets the hint and may cause an
+earlier safe retry. The repair table still has 32 bucket partitions, and multiple
+nodes may duplicate the cold-path work while full scans rediscover UNKNOWN rows;
+that is bounded by fail-closed behavior but remains a discovery/convergence cost.
 
 #### Scope / disposition
 
@@ -5265,12 +5263,10 @@ continuity and positive-reachability-only settlement. Do not solve it by weakeni
 UNKNOWN retention or cleanup authority. A separate follow-up (provisionally PR
 #206) must characterize rows without a schedule, overdue rows, missed ticks,
 outages, restart, concurrent rescheduling, stale/orphan hints, partition growth,
-tombstones, retry LWT/Paxos contention, multi-node duplicate retry, fairness, and
-bounded work per tick before selecting a durable discovery design. Scheduler state
-must remain separate from publication authority, and scheduler failure may delay
-work but must not make a durable repair undiscoverable indefinitely. The future
-design should also assess whether it can remove the normal-settlement LWT cost;
-that is not a reason to broaden PR #205.
+tombstones, multi-node duplicate retry, fairness, and bounded work per tick before
+selecting a durable discovery design. Scheduler state must remain separate from
+publication authority, and scheduler failure may delay work but must not make a
+durable repair undiscoverable indefinitely.
 
 ---
 

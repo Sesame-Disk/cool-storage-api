@@ -1052,14 +1052,13 @@ docker compose --profile test run --rm --build \
   -e SESAMEFS_REQUIRE_SESSIONUPLOAD_OWN_LIVENESS_EVIDENCE= \
   -e SESAMEFS_REQUIRE_W2_POST_HEAD_EVIDENCE=1 \
   go-integration-test \
-  go test -tags integration -run '^TestW2CreateFilePostHeadEvidenceAgainstRealCassandra$|^TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart$|^TestW2PublishedRepairSettlementRetryLWTSerialRace$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
+  go test -tags integration -run '^TestW2CreateFilePostHeadEvidenceAgainstRealCassandra$|^TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRestart$|^TestEveryEvidenceGateIsWiredIntoTestMain$' -v -count=1 -timeout 15m ./internal/integration
 ```
 
-The settlement/retry race leg uses two authenticated Cassandra sessions. It
-proves both deterministic serial orders and repeated concurrent starts; after
-each run the repair row must be absent. The production delete and retry update
-are both LWTs pinned to the same global `SERIAL` domain, and an unapplied CAS is
-treated as the idempotent already-settled/settled-while-retrying result.
+Repair settlement intentionally remains an ordinary idempotent delete, matching
+the ordinary repair-row insert. Retry backoff is process-local advisory state;
+the unit suite verifies it is stored and that forgetting it on restart is safe.
+There is no retry mutation to race with settlement or to resurrect a deleted row.
 
 W2 source mutation evidence is also Docker-only:
 
@@ -1068,10 +1067,10 @@ docker compose --profile test run --rm --build gotest bash scripts/w2-post-head-
 ```
 
 The script currently covers eight mutations and must report 8/8 expected RED.
-The two additional mutations turn the settlement delete into a non-conditional
-statement and replace its global SERIAL pin with regular consistency; both must
-be caught by the source contract guard. This suite does not claim that scheduler
-scaling, R31, or X1 is closed.
+The two additional mutations turn the ordinary settlement delete into a
+conditional statement and remove the process-local retry-state store; both must
+be caught by the source/behavior contract guards. This suite does not claim that
+scheduler scaling, R31, or X1 is closed.
 
 Canonical full run: `docker compose --profile test run --rm --build go-integration-test`
 (or `go-all-test`). Both canonical commands pass the W2 gate and the W1/R3/X1
@@ -1080,8 +1079,7 @@ W2 evidence combines the shared upload-link engine with a real in-process
 `CreateFileFromBlocks` pre-HEAD/CAS race; it does not claim every publication
 funnel is closed. The existing X2/P3 multi-DC harness is a separate workflow and
 is not changed by this PR. Its local-blindness wording does not by itself claim
-that SERIAL is indispensable; the repair-row race is covered separately by the
-two-session Cassandra leg above.
+that SERIAL is indispensable.
 
 ### P4b orphan publication evidence
 

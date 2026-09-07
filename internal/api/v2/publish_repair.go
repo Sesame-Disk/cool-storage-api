@@ -53,6 +53,12 @@ const (
 
 var scheduledPublishedBlockReferenceRepairs sync.Map
 
+// Retry backoff is process-local advisory state. The durable repair row is
+// deliberately written and deleted only with ordinary mutations; it is not a
+// Paxos state machine. Losing this hint on restart is safe: the next sweep may
+// retry the durable row earlier, but cleanup authority remains unchanged.
+var publishedBlockReferenceRepairNextRetryAt sync.Map
+
 var startPublishedBlockReferenceRepairWorkerOnce sync.Once
 
 var schedulePublishedBlockReferenceRepairSleepFn = time.Sleep
@@ -71,42 +77,43 @@ var insertPublishedBlockReferenceRepairFn = func(database *db.DB, repair publish
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	return database.Session().Query(`
+	if err := database.Session().Query(`
 		INSERT INTO published_block_reference_repairs (bucket, org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at, lease_expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt, repair.LeaseExpiresAt).Exec()
+	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt, repair.LeaseExpiresAt).Exec(); err != nil {
+		return err
+	}
+	publishedBlockReferenceRepairNextRetryAt.Delete(publishedBlockReferenceRepairRetryKey(repair))
+	return nil
 }
 
 var deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	_, err := database.Session().Query(`
+	if err := database.Session().Query(`
 		DELETE FROM published_block_reference_repairs
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		IF EXISTS
 	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).
-		SerialConsistency(gocql.Serial).
-		MapScanCAS(map[string]interface{}{})
-	return err
+		Exec(); err != nil {
+		return err
+	}
+	publishedBlockReferenceRepairNextRetryAt.Delete(publishedBlockReferenceRepairRetryKey(repair))
+	return nil
 }
 
-// schedulePublishedBlockReferenceRepairRetryFn updates only the advisory
-// scheduler field. IF EXISTS is intentional: a concurrent settlement may have
-// deleted the row, and retry bookkeeping must never resurrect it.
+// schedulePublishedBlockReferenceRepairRetryFn records only process-local
+// advisory backoff. It intentionally does not mutate the durable repair row:
+// restart may forget this hint, and a retry can never resurrect a settled row.
 var schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, repair publishedBlockReferenceRepair, nextRetryAt time.Time) error {
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	_, err := database.Session().Query(`
-		UPDATE published_block_reference_repairs
-		SET lease_expires_at = ?
-		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		IF EXISTS
-	`, nextRetryAt, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).
-		SerialConsistency(gocql.Serial).
-		MapScanCAS(map[string]interface{}{})
-	return err
+	if nextRetryAt.IsZero() {
+		nextRetryAt = publishedBlockReferenceRepairNowFn().UTC()
+	}
+	publishedBlockReferenceRepairNextRetryAt.Store(publishedBlockReferenceRepairRetryKey(repair), nextRetryAt.UTC())
+	return nil
 }
 
 var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {
@@ -534,7 +541,7 @@ func newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID string, stag
 // publishedBlockReferenceRepairRetryDelay is deliberately derived from row
 // age rather than an unbounded retry counter. That keeps the existing schema,
 // makes the delay monotonic for a permanently ambiguous row, and caps the
-// expensive SERIAL/EachQuorum ancestry walk at a predictable rate.
+// expensive ancestry walk at a predictable rate.
 func publishedBlockReferenceRepairRetryDelay(now, createdAt time.Time) time.Duration {
 	delay := now.Sub(createdAt)
 	if delay < publishedBlockReferenceRepairRetryBase {
@@ -567,6 +574,10 @@ func ClearPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID, 
 		return nil
 	}
 	return deletePublishedBlockReferenceRepairFn(database, repair)
+}
+
+func publishedBlockReferenceRepairRetryKey(repair publishedBlockReferenceRepair) string {
+	return strings.TrimSpace(repair.OrgID) + `:` + publishedBlockReferenceRepairKey(repair.RepoID, repair.CommitID, repair.FSID)
 }
 
 func publishedBlockReferenceRepairKey(repoID, commitID, fsID string) string {
@@ -770,6 +781,15 @@ func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
 			continue
 		}
 		for _, repair := range repairs {
+			retryKey := publishedBlockReferenceRepairRetryKey(repair)
+			if nextRetry, ok := publishedBlockReferenceRepairNextRetryAt.Load(retryKey); ok {
+				if retryAt, ok := nextRetry.(time.Time); ok && retryAt.After(now) {
+					continue
+				}
+				if _, ok := nextRetry.(time.Time); !ok {
+					publishedBlockReferenceRepairNextRetryAt.Delete(retryKey)
+				}
+			}
 			if !repair.CreatedAt.IsZero() && repair.CreatedAt.After(cutoff) {
 				continue
 			}

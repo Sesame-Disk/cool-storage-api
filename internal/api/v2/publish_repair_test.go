@@ -956,55 +956,52 @@ func TestPublishedBlockReferenceRepairAuthorityReadsAreColdAndStrong(t *testing.
 	}
 }
 
-func TestPublishedBlockReferenceRepairSettlementAndRetryUseGlobalSerialLWT(t *testing.T) {
+func TestPublishedBlockReferenceRepairSettlementUsesOrdinaryWrites(t *testing.T) {
 	raw, err := os.ReadFile("publish_repair.go")
 	if err != nil {
 		t.Fatalf("read publish_repair.go: %v", err)
 	}
 	source := string(raw)
-	tests := []struct {
-		name      string
-		start     string
-		end       string
-		statement string
-	}{
-		{
-			name:      "settlement delete",
-			start:     "var deletePublishedBlockReferenceRepairFn",
-			end:       "// schedulePublishedBlockReferenceRepairRetryFn",
-			statement: "DELETE FROM published_block_reference_repairs",
-		},
-		{
-			name:      "retry update",
-			start:     "var schedulePublishedBlockReferenceRepairRetryFn",
-			end:       "var listPublishedBlockReferenceRepairsForBucketFn",
-			statement: "UPDATE published_block_reference_repairs",
-		},
+	deleteStart := strings.Index(source, "var deletePublishedBlockReferenceRepairFn")
+	deleteEnd := strings.Index(source, "// schedulePublishedBlockReferenceRepairRetryFn")
+	if deleteStart < 0 || deleteEnd <= deleteStart {
+		t.Fatal("could not locate settlement delete helper")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			start := strings.Index(source, tt.start)
-			end := strings.Index(source, tt.end)
-			if start < 0 || end <= start {
-				t.Fatalf("could not locate %s helper", tt.name)
-			}
-			helperSource := source[start:end]
-			if !strings.Contains(helperSource, tt.statement) {
-				t.Fatalf("%s must target published_block_reference_repairs", tt.name)
-			}
-			if !strings.Contains(helperSource, "IF EXISTS") {
-				t.Fatalf("%s must remain conditional", tt.name)
-			}
-			if !strings.Contains(helperSource, "SerialConsistency(gocql.Serial)") {
-				t.Fatalf("%s must pin the global SERIAL domain", tt.name)
-			}
-			if !strings.Contains(helperSource, "MapScanCAS") {
-				t.Fatalf("%s must consume the conditional result with MapScanCAS", tt.name)
-			}
-			if strings.Contains(helperSource, ".Exec()") {
-				t.Fatalf("%s must not use ordinary Exec for the LWT", tt.name)
-			}
-		})
+	deleteSource := source[deleteStart:deleteEnd]
+	if !strings.Contains(deleteSource, "DELETE FROM published_block_reference_repairs") || !strings.Contains(deleteSource, "Exec()") {
+		t.Fatal("settlement must use an ordinary delete")
+	}
+	if strings.Contains(deleteSource, "IF EXISTS") || strings.Contains(deleteSource, "MapScanCAS") || strings.Contains(deleteSource, "SerialConsistency(gocql.Serial)") {
+		t.Fatal("settlement must not enter the repair row's Paxos protocol")
+	}
+
+	retryStart := strings.Index(source, "var schedulePublishedBlockReferenceRepairRetryFn")
+	retryEnd := strings.Index(source, "var listPublishedBlockReferenceRepairsForBucketFn")
+	if retryStart < 0 || retryEnd <= retryStart {
+		t.Fatal("could not locate retry scheduler helper")
+	}
+	retrySource := source[retryStart:retryEnd]
+	if strings.Contains(retrySource, "published_block_reference_repairs") || strings.Contains(retrySource, "MapScanCAS") || strings.Contains(retrySource, "SerialConsistency(gocql.Serial)") {
+		t.Fatal("retry backoff must not mutate the durable repair row or enter Paxos")
+	}
+	if !strings.Contains(retrySource, "publishedBlockReferenceRepairNextRetryAt.Store") {
+		t.Fatal("retry backoff must remain process-local")
+	}
+}
+
+func TestSchedulePublishedBlockReferenceRepairRetryUsesProcessLocalState(t *testing.T) {
+	repair := publishedBlockReferenceRepair{RepoID: "repo-1", CommitID: "commit-1", FSID: "fs-1"}
+	key := publishedBlockReferenceRepairRetryKey(repair)
+	publishedBlockReferenceRepairNextRetryAt.Delete(key)
+	t.Cleanup(func() { publishedBlockReferenceRepairNextRetryAt.Delete(key) })
+
+	nextRetryAt := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
+	if err := schedulePublishedBlockReferenceRepairRetryFn(&db.DB{}, repair, nextRetryAt); err != nil {
+		t.Fatalf("schedule retry = %v", err)
+	}
+	got, ok := publishedBlockReferenceRepairNextRetryAt.Load(key)
+	if !ok || !got.(time.Time).Equal(nextRetryAt) {
+		t.Fatalf("local retry state = %#v, want %s", got, nextRetryAt)
 	}
 }
 
