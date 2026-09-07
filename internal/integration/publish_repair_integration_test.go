@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	v2api "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 type publishRepairIntegrationFileState struct {
@@ -159,10 +161,9 @@ func TestPublishedBlockReferenceRepairWorker_ReplaysReachableQueuedRepairAfterRe
 	}
 
 	t.Cleanup(func() {
-		_ = database.Session().Query(`
-			DELETE FROM published_block_reference_repairs
-			WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		`, bucket, state.orgID, repoID, state.headCommitID, state.fsID).Exec()
+		if err := v2api.DeletePublishedBlockReferenceRepairForIntegration(database, bucket, state.orgID, repoID, state.headCommitID, state.fsID); err != nil {
+			t.Errorf("cleanup W2 repair row: %v", err)
+		}
 		for _, blockID := range state.internalBlockIDs {
 			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
 			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)
@@ -231,10 +232,12 @@ func TestW2CreateFilePostHeadEvidenceAgainstRealCassandra(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install applied ambiguous-CAS evidence hook: %v", err)
 	}
+	restoreOnce := sync.OnceFunc(restore)
+	t.Cleanup(restoreOnce)
 	if err := v2api.RepairPublishedFSObjectBlockReferenceRepair(database, ambiguousApplied.orgID, repoID, ambiguousApplied.headCommitID, ambiguousApplied.fsID, ambiguousApplied.internalBlockIDs); err != nil {
 		t.Fatalf("ambiguous CAS known-applied repair returned error: %v", err)
 	}
-	restore()
+	restoreOnce()
 	assertW2StateConverged(t, repoID, "w2-ambiguous-applied.txt", ambiguousApplied, ambiguousApplied.headCommitID)
 	markW2PostHeadEvidence(t, "ambiguous_cas_applied")
 
@@ -244,8 +247,10 @@ func TestW2CreateFilePostHeadEvidenceAgainstRealCassandra(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install unavailable-confirmation evidence hook: %v", err)
 	}
+	restoreOnce = sync.OnceFunc(restore)
+	t.Cleanup(restoreOnce)
 	err = v2api.RepairPublishedFSObjectBlockReferenceRepair(database, ambiguousUnknown.orgID, repoID, ambiguousUnknown.headCommitID, ambiguousUnknown.fsID, ambiguousUnknown.internalBlockIDs)
-	restore()
+	restoreOnce()
 	if err == nil || !strings.Contains(err.Error(), "confirmation unavailable") {
 		t.Fatalf("ambiguous confirmation should retain repair, error=%v", err)
 	}
@@ -414,6 +419,136 @@ func TestW2CreateFilePostHeadEvidenceAgainstRealCassandra(t *testing.T) {
 	})
 }
 
+func TestW2PublishedRepairSettlementRetryLWTSerialRace(t *testing.T) {
+	if os.Getenv(w2PostHeadEvidenceEnv) != "1" {
+		t.Skipf("%s is not enabled", w2PostHeadEvidenceEnv)
+	}
+	requireCassandra(t)
+	settlementDB := shareProjectionDBForTest(t)
+	retryDB := publishRepairIntegrationSecondDBForRaceTest(t)
+
+	type repairRow struct {
+		bucket   int
+		orgID    string
+		repoID   string
+		commitID string
+		fsID     string
+	}
+	seed := func(t *testing.T) repairRow {
+		t.Helper()
+		suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+		row := repairRow{
+			orgID:    uuid.NewString(),
+			repoID:   uuid.NewString(),
+			commitID: "w2-lwt-race-commit-" + suffix,
+			fsID:     "w2-lwt-race-fs-" + suffix,
+		}
+		row.bucket = publishRepairIntegrationBucket(row.orgID, row.repoID, row.commitID, row.fsID)
+		now := time.Now().UTC()
+		if err := settlementDB.Session().Query(`
+			INSERT INTO published_block_reference_repairs
+				(bucket, org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at, lease_expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, row.bucket, row.orgID, row.repoID, row.commitID, row.fsID, []string{"w2-lwt-race-block"}, now, now.Add(time.Hour)).Exec(); err != nil {
+			t.Fatalf("seed repair row: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := v2api.DeletePublishedBlockReferenceRepairForIntegration(settlementDB, row.bucket, row.orgID, row.repoID, row.commitID, row.fsID); err != nil {
+				t.Errorf("cleanup repair row %s: %v", row.commitID, err)
+			}
+		})
+		return row
+	}
+	deleteRepair := func(row repairRow) error {
+		return v2api.DeletePublishedBlockReferenceRepairForIntegration(settlementDB, row.bucket, row.orgID, row.repoID, row.commitID, row.fsID)
+	}
+	retryRepair := func(row repairRow) error {
+		return v2api.SchedulePublishedBlockReferenceRepairRetryForIntegration(retryDB, row.bucket, row.orgID, row.repoID, row.commitID, row.fsID, time.Now().UTC().Add(time.Minute))
+	}
+	assertAbsent := func(t *testing.T, row repairRow) {
+		t.Helper()
+		if publishRepairIntegrationRepairRowExists(t, row.bucket, row.orgID, row.repoID, row.commitID, row.fsID) {
+			t.Fatalf("repair row %s survived settlement/retry ordering", row.commitID)
+		}
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		retryFirst bool
+	}{
+		{name: "retry_serializes_before_settlement", retryFirst: true},
+		{name: "settlement_serializes_before_retry", retryFirst: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			row := seed(t)
+			if testCase.retryFirst {
+				if err := retryRepair(row); err != nil {
+					t.Fatalf("retry before settlement: %v", err)
+				}
+				if err := deleteRepair(row); err != nil {
+					t.Fatalf("settlement after retry: %v", err)
+				}
+			} else {
+				if err := deleteRepair(row); err != nil {
+					t.Fatalf("settlement before retry: %v", err)
+				}
+				if err := retryRepair(row); err != nil {
+					t.Fatalf("retry after settlement: %v", err)
+				}
+			}
+			assertAbsent(t, row)
+		})
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		t.Run(fmt.Sprintf("concurrent_%02d", attempt), func(t *testing.T) {
+			row := seed(t)
+			start := make(chan struct{})
+			errs := make(chan error, 2)
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				errs <- retryRepair(row)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				errs <- deleteRepair(row)
+			}()
+			close(start)
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil {
+					t.Fatalf("concurrent settlement/retry: %v", err)
+				}
+			}
+			assertAbsent(t, row)
+		})
+	}
+}
+
+func publishRepairIntegrationSecondDBForRaceTest(t *testing.T) *dbpkg.DB {
+	t.Helper()
+	cfg := config.DatabaseConfig{
+		Hosts:             splitEnvOrDefault("CASSANDRA_HOSTS", "cassandra:9042"),
+		Keyspace:          envOrDefault("CASSANDRA_KEYSPACE", "sesamefs"),
+		Consistency:       envOrDefault("CASSANDRA_CONSISTENCY", "LOCAL_QUORUM"),
+		SerialConsistency: envOrDefault("CASSANDRA_SERIAL_CONSISTENCY", "SERIAL"),
+		LocalDC:           envOrDefault("CASSANDRA_LOCAL_DC", "datacenter1"),
+		Username:          os.Getenv("CASSANDRA_USERNAME"),
+		Password:          os.Getenv("CASSANDRA_PASSWORD"),
+	}
+	database, err := dbpkg.New(cfg)
+	if err != nil {
+		t.Fatalf("open second Cassandra session for repair race: %v", err)
+	}
+	t.Cleanup(database.Close)
+	return database
+}
+
 func publishRepairIntegrationSeedQueuedRepair(t *testing.T, database *dbpkg.DB, repoID string, state publishRepairIntegrationFileState, commitID string, createdAt, leaseExpiresAt time.Time, removeFSRef bool) {
 	t.Helper()
 	fsReferrer := dbpkg.BlockReferrerForFSObject(repoID, state.fsID)
@@ -442,10 +577,9 @@ func publishRepairIntegrationSeedQueuedRepair(t *testing.T, database *dbpkg.DB, 
 		t.Fatalf("update W2 repair seed timestamps: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = database.Session().Query(`
-			DELETE FROM published_block_reference_repairs
-			WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-		`, bucket, state.orgID, repoID, commitID, state.fsID).Exec()
+		if err := v2api.DeletePublishedBlockReferenceRepairForIntegration(database, bucket, state.orgID, repoID, commitID, state.fsID); err != nil {
+			t.Errorf("cleanup W2 repair row: %v", err)
+		}
 		for _, blockID := range state.internalBlockIDs {
 			_ = database.RemoveBlockReference(state.orgID, blockID, pubReferrer)
 			_ = database.AddBlockReference(state.orgID, blockID, fsReferrer, repoID, 0)

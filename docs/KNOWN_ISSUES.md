@@ -5250,6 +5250,14 @@ remains fail-closed. A process pause or outage can also defer discovery until th
 next base-table sweep; this is a scalability and convergence-cost issue, not a
 publication-safety hole.
 
+Retry rescheduling and repair settlement are both conditional writes in the same
+explicit global SERIAL domain. The repair table has 32 bucket partitions, so
+sustained UNKNOWN volume can also create Paxos contention between retry updates,
+settlement deletes, and duplicate retry attempts from multiple nodes. Settlement
+adds one conditional LWT per settled pending publication repair row, not one per
+block; that bounded correctness cost is intentionally accepted here and should
+be reevaluated with scheduler design.
+
 #### Scope / disposition
 
 This issue does not block PR #205, whose contract is post-HEAD publication
@@ -5257,10 +5265,39 @@ continuity and positive-reachability-only settlement. Do not solve it by weakeni
 UNKNOWN retention or cleanup authority. A separate follow-up (provisionally PR
 #206) must characterize rows without a schedule, overdue rows, missed ticks,
 outages, restart, concurrent rescheduling, stale/orphan hints, partition growth,
-tombstones, fairness, and bounded work per tick before selecting a durable
-discovery design. Scheduler state must remain separate from publication authority,
-and scheduler failure may delay work but must not make a durable repair
-undiscoverable indefinitely.
+tombstones, retry LWT/Paxos contention, multi-node duplicate retry, fairness, and
+bounded work per tick before selecting a durable discovery design. Scheduler state
+must remain separate from publication authority, and scheduler failure may delay
+work but must not make a durable repair undiscoverable indefinitely. The future
+design should also assess whether it can remove the normal-settlement LWT cost;
+that is not a reason to broaden PR #205.
+
+---
+
+### ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01: Definitive CAS-loser cleanup has no durable witness
+
+**Status**: Confirmed follow-up - intentionally out of scope for PR #205 (2026-09-06)
+**Severity**: Medium (P2) - R31 convergence and retention
+**Affected**: definitive library-HEAD CAS loser cleanup and post-restart repair classification
+
+#### Problem
+
+After a request receives a definitive library-HEAD CAS conflict, it normally
+cleans the exact attempt's staged references and repair rows synchronously. A
+crash after the definitive loser result but before that cleanup completes leaves
+no durable known-loser witness. After restart, the repair worker cannot infer the
+loser from a timeout or lease expiry; it correctly classifies the outcome as
+UNKNOWN and retains the repair and artifacts. This is safe but can retain
+references until a future reconciliation authority discovers the known loser.
+
+#### Scope / disposition
+
+This remains an R31 follow-up and does not block PR #205. Do not infer a
+confirmed loser from timeout, lease expiry, or a non-reachable observation. A
+future design needs a durable known-loser witness or an equivalent authority and
+must preserve fail-closed retention when that witness is unavailable. PR #205
+only guarantees request-local cleanup while the definitive loser request remains
+alive.
 
 ---
 

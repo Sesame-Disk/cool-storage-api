@@ -81,10 +81,14 @@ var deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publish
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	return database.Session().Query(`
+	_, err := database.Session().Query(`
 		DELETE FROM published_block_reference_repairs
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
+		IF EXISTS
+	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
+	return err
 }
 
 // schedulePublishedBlockReferenceRepairRetryFn updates only the advisory
@@ -94,12 +98,15 @@ var schedulePublishedBlockReferenceRepairRetryFn = func(database *db.DB, repair 
 	if database == nil {
 		return fmt.Errorf("database not available")
 	}
-	return database.Session().Query(`
+	_, err := database.Session().Query(`
 		UPDATE published_block_reference_repairs
 		SET lease_expires_at = ?
 		WHERE bucket = ? AND org_id = ? AND repo_id = ? AND commit_id = ? AND fs_id = ?
 		IF EXISTS
-	`, nextRetryAt, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).Exec()
+	`, nextRetryAt, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID).
+		SerialConsistency(gocql.Serial).
+		MapScanCAS(map[string]interface{}{})
+	return err
 }
 
 var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket int) ([]publishedBlockReferenceRepair, error) {

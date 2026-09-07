@@ -5,6 +5,7 @@ package v2
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
@@ -31,6 +32,30 @@ func SetPublishedBlockReferenceRepairOutcomeForIntegration(outcome string, injec
 		return outcomeValue, injectedErr
 	}
 	return func() { publishedBlockReferenceRepairCommitReachableFn = previous }, nil
+}
+
+// SchedulePublishedBlockReferenceRepairRetryForIntegration exercises the
+// production retry LWT from a real-Cassandra integration test.
+func SchedulePublishedBlockReferenceRepairRetryForIntegration(database *db.DB, bucket int, orgID, repoID, commitID, fsID string, nextRetryAt time.Time) error {
+	return schedulePublishedBlockReferenceRepairRetryFn(database, publishedBlockReferenceRepair{
+		Bucket:   bucket,
+		OrgID:    orgID,
+		RepoID:   repoID,
+		CommitID: commitID,
+		FSID:     fsID,
+	}, nextRetryAt)
+}
+
+// DeletePublishedBlockReferenceRepairForIntegration exercises the production
+// settlement LWT from a real-Cassandra integration test.
+func DeletePublishedBlockReferenceRepairForIntegration(database *db.DB, bucket int, orgID, repoID, commitID, fsID string) error {
+	return deletePublishedBlockReferenceRepairFn(database, publishedBlockReferenceRepair{
+		Bucket:   bucket,
+		OrgID:    orgID,
+		RepoID:   repoID,
+		CommitID: commitID,
+		FSID:     fsID,
+	})
 }
 
 // PublishedBlockReferenceRepairCommitOutcomeForIntegration runs the production

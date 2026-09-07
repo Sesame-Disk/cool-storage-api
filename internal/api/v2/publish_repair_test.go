@@ -956,6 +956,58 @@ func TestPublishedBlockReferenceRepairAuthorityReadsAreColdAndStrong(t *testing.
 	}
 }
 
+func TestPublishedBlockReferenceRepairSettlementAndRetryUseGlobalSerialLWT(t *testing.T) {
+	raw, err := os.ReadFile("publish_repair.go")
+	if err != nil {
+		t.Fatalf("read publish_repair.go: %v", err)
+	}
+	source := string(raw)
+	tests := []struct {
+		name      string
+		start     string
+		end       string
+		statement string
+	}{
+		{
+			name:      "settlement delete",
+			start:     "var deletePublishedBlockReferenceRepairFn",
+			end:       "// schedulePublishedBlockReferenceRepairRetryFn",
+			statement: "DELETE FROM published_block_reference_repairs",
+		},
+		{
+			name:      "retry update",
+			start:     "var schedulePublishedBlockReferenceRepairRetryFn",
+			end:       "var listPublishedBlockReferenceRepairsForBucketFn",
+			statement: "UPDATE published_block_reference_repairs",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start := strings.Index(source, tt.start)
+			end := strings.Index(source, tt.end)
+			if start < 0 || end <= start {
+				t.Fatalf("could not locate %s helper", tt.name)
+			}
+			helperSource := source[start:end]
+			if !strings.Contains(helperSource, tt.statement) {
+				t.Fatalf("%s must target published_block_reference_repairs", tt.name)
+			}
+			if !strings.Contains(helperSource, "IF EXISTS") {
+				t.Fatalf("%s must remain conditional", tt.name)
+			}
+			if !strings.Contains(helperSource, "SerialConsistency(gocql.Serial)") {
+				t.Fatalf("%s must pin the global SERIAL domain", tt.name)
+			}
+			if !strings.Contains(helperSource, "MapScanCAS") {
+				t.Fatalf("%s must consume the conditional result with MapScanCAS", tt.name)
+			}
+			if strings.Contains(helperSource, ".Exec()") {
+				t.Fatalf("%s must not use ordinary Exec for the LWT", tt.name)
+			}
+		})
+	}
+}
+
 func TestPublishedBlockReferenceRepairNeverUsesLeaseExpiryAsCleanupAuthority(t *testing.T) {
 	raw, err := os.ReadFile("publish_repair.go")
 	if err != nil {
