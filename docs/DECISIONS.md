@@ -2,7 +2,7 @@
 
 This document tracks key development decisions and the development approach for SesameFS.
 
-**Last Updated**: 2026-09-29 (X1 critical-path reset)
+**Last Updated**: 2026-10-10 (X1 post-D contract: physical invariant, E1-16)
 
 ---
 
@@ -884,6 +884,33 @@ ten days; #216–#233 spent most of about two weeks outside the #201
 progression (apart from #219/#221/#226 R31 and runtime fixes), because a W2
 question was answered with a new certification architecture and audit rounds
 promoted hypothetical future bypasses to blockers.
+
+---
+
+## X1 post-D contract: physical invariant (E1-16)
+
+**Date:** 2026-10-10
+**Status:** Decided (owner approval of E1-15D §1). Docs only; no runtime change.
+
+**Decision.** X1 is a physical invariant: after exact COMMITTED D(P1), no
+current-version operation may reinstall P1, revoke or postpone D1, or publish
+HEAD content whose resolution depends on retired P1. A possibly accepted
+publication keeps D-blocking liveness until its permanent `fs:` exists. A
+logical `up:`/`pub:`/`fs:` reference of L written after D1 is liveness of L,
+not a P1 dependency. Its unbounded retention is convergence work, tracked as
+PRE-GC or follow-up with its severity preserved.
+
+**Why this is not new architecture.** D0 §3 already defines references as
+logical liveness of L. D0 §12 and G4 contract 5 (#247) forbid late
+references from revoking or postponing D1, and the COMMITTED recovery path
+implements that. One E1 ledger sentence ("durably add a P1 reference") had
+re-introduced the transitional D0 §13 veto after G4 removed it.
+
+**Effect.** See [E1-16](E1-16-POST-D-CONTRACT-ALIGNMENT.md) and
+[X1 §4](X1-CRITICAL-PATH.md#4-w2-exit-checklist): W2-1..9 and W2-12..14 close
+for X1 on existing evidence and source arguments over current code. W2-10
+stays OPEN. E1-15A/B and the R31 convergence residuals move from PRE-X1 to
+PRE-GC.
 
 ---
 

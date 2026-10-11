@@ -2,6 +2,12 @@
 
 Frozen base: main@4290a2bb394b8748973b2a4b7e9b8340d122a2af (#271 merged).
 
+> **Scope update (2026-10-10, [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)):**
+> the X1 invariant is aligned with G4 contract 5. The post-D `pub:` and
+> repair are logical references of L. E1-15C measured no HEAD advanced and no
+> P1 reinstall, so the class moves from P1 PRE-X1 to P1 PRE-GC. Evidence and
+> severity below are unchanged.
+
 ## Question
 
 Can a current Office/CreateFile writer, resumed after exact COMMITTED D(P1),

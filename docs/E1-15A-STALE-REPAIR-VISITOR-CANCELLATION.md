@@ -2,6 +2,12 @@
 
 Frozen base: main@3583d989d39fc6c0e2706b426dde1131c3dcb3a7 (#270 merged).
 
+> **Scope update (2026-10-10, [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)):**
+> the X1 invariant is aligned with G4 contract 5. The residual post-D pin is
+> a logical reference of L, with no reachable HEAD and no P1 reinstall, so its
+> P1 label moves from PRE-X1 to PRE-GC. Evidence and severity below are
+> unchanged.
+
 ## Question
 
 A repair visitor has already loaded repair R and classified it UNKNOWN. While

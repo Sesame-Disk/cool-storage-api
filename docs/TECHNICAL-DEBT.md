@@ -2664,3 +2664,16 @@ Registered by the PC-0 ninth audit pass (`docs/PUBLICATION-PROTOCOL-CHARACTERIZA
 **Method-value / aliased-callee coverage of the HEAD inventory (P2).** `TestPC0AllHeadCallersAreInventoried` is lexical: it sees named calls to the HEAD helpers and package-level `var = func` literals, and now — via `TestPC0RawHeadColumnWritersAreInventoried` — every raw-CQL string literal that writes `libraries.head_commit_id`. It still does not see a method value (`publish := fsHelper.UpdateLibraryHeadFromSnapshot; publish(...)`) or an aliased callee. The characterization document states this limit; closing it needs type information (`go/types`), not another regex.
 
 **3-DC evidence scripts are sensitive to startup and non-evidence legs (P2).** `scripts/w2-sync-putblock-xdc-provenance-validation.sh` aborts the whole run (`set -e`) when the N=1000 cost-measurement leg — which is not evidence — times out right after node restarts, so the fail-closed leg never runs; `scripts/w2-post-head-multidc-validation.sh` fails its `EACH_QUORUM` seed with `received only 2 responses` for a few seconds after `migrate`/restarts although the same seed passes in 0.03 s from a warm runner. Make the cost leg non-fatal (or retried) and add a post-`migrate` `EACH_QUORUM` readiness probe. Integration runs against the fixture also need `CASSANDRA_HOSTS` pointed at a fixture node (see `docs/TESTING.md`), otherwise `TestMain`'s cleanup connects to the dev Cassandra and fails the package after the test passed.
+
+## E1-16 test-infrastructure follow-ups (2026-10-10)
+
+Registered by the E1-16 validation runs ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md#validation)). Neither changes any X1 result.
+
+**The standard integration suite is at its time budget (P2).** E1 slices have raised the `go-all-test` integration timeout from 18m to 30m and then to 40m (E1-15D). On 2026-10-10, at main@5c3163871 with this branch's documentation edits:
+
+- the first standard run hit `panic: test timed out after 40m0s` while `TestW2NativeHEADAmbiguity` was still progressing;
+- a rerun with the same gates and `-timeout 75m` passed in 2399.523s, 0.5s under the 40m limit.
+
+Each new mandatory evidence leg pushes the standard suite past its budget. Decide between splitting the evidence children into a separate runner, running packages or gates in parallel, or an explicit budget policy. Do not keep raising the timeout silently.
+
+**E1 in-process-GC legs cannot run on a three-DC fixture (P2).** `openIntegrationProjectionDB` builds its `DatabaseConfig` without replication, so it declares only the local DC. On a three-DC keyspace the in-process GC's destructive topology gate correctly refuses the G2 handoff. As a result, E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13 fail on fixture progress ("GC retirement n=0", "worker did not visit owned real candidate"), not on safety. These legs are single-DC evidence by design. If they are wanted on three DCs, the harness must declare the fixture topology, for example from `CASSANDRA_REPLICATION_DCS`.
