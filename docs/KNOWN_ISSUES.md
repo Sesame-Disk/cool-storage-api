@@ -7771,10 +7771,17 @@ reads it.
 **Phase 3: disposition before A1, from the data.**
 - **Shape 1** resolves with library activity when its commit row exists;
   accepting it with monitoring is a legitimate outcome.
-- **Shapes 2 and 3**, if material, need authority rather than time: a
-  durable cancellation that the original writer's HEAD CAS cannot outrun.
-  That means a check in the same serial domain as HEAD (E1-15D option B) or
-  a proven equivalent.
+- **Shape 2, and any shape 3 that stays unresolved**, are investigated by
+  cause. A walk past the 1024-node chunk limit persists its cursor and can
+  finish on later visits. A transient read error clears when the
+  infrastructure recovers. Corrupt ancestry or a cycle is an integrity
+  problem to investigate. A persistent `failed` visit is not cancellation
+  authority and does not show that cancellation is the right fix.
+- **A durable cancellation is needed only when it is shown** that the
+  original publication must be invalidated and that no other safe
+  resolution exists. Even then it must be authority the original writer's
+  HEAD CAS cannot outrun: a check in the same serial domain as HEAD (E1-15D
+  option B) or a proven equivalent. Time is never that authority.
 - In every outcome the settlement may remove only the repair-owned `pub:` and
   the row, never `fs:<repo:fs_id>` (E1-15C/D).
 
