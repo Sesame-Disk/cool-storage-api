@@ -1,7 +1,7 @@
 # SesameFS v1.0 — Production Readiness Roadmap
 
 **Last updated:** 2026-08-14
-**Current status:** GC production activation is blocked by X1 (X2 closed 2026-08-14); see `IMPLEMENTATION_STATUS.md`
+**Current status:** GC production activation is blocked by X1 (X2 closed 2026-08-14); see `X1-CRITICAL-PATH.md`
 
 This document identifies every blocker, high-priority item, and fast-follow task required before
 the v1.0 production launch. Items are classified by priority and include current state analysis,

@@ -3727,7 +3727,7 @@ The sys-admin panel is fully accessible at `/sys/` in Docker deployments. Webpac
 - Admin libraries: ❌ Missing
 - Admin user search: ❌ Missing
 
-**Key decision**: Should groups/departments be managed via OIDC provider (claims-based sync) or locally in SesameFS? See `CURRENT_WORK.md` → "PRIORITY 1" for full analysis with 3 options.
+**Key decision**: Should groups/departments be managed via OIDC provider (claims-based sync) or locally in SesameFS? The full analysis with 3 options was in `CURRENT_WORK.md` "PRIORITY 1" in February 2026 (`git show 6554adb81:CURRENT_WORK.md`).
 
 **Key files**:
 - Frontend: `frontend/src/pages/sys-admin/` (all components), `frontend/config/webpack.entry.js` (entry points)
@@ -4467,7 +4467,7 @@ If a name existed at the grandparent level, it would incorrectly return 409.
 - `frontend/src/components/toolbar/repo-view-toobar.js` - Conditional button rendering
 - `frontend/src/pages/my-libs/my-libs.js` - Role-aware empty message
 
-**Remaining Frontend Work**: See CURRENT_WORK.md for list of UI elements needing permission checks
+**Remaining Frontend Work**: the list of UI elements needing permission checks was in `CURRENT_WORK.md` in January 2026 (`git show f624f9316:CURRENT_WORK.md`, "Frontend Permission UI Completion").
 
 ---
 

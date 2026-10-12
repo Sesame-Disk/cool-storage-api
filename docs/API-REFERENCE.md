@@ -581,7 +581,7 @@ retained and the deferred-orphan retry lifecycle is not implemented.
 
 ### Groups & Sharing (Web UI Only - Not Used by Desktop Clients)
 
-**For detailed status of all groups/sharing endpoints, see [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md#rest-api---groups) lines 130-142.**
+**For detailed status of all groups/sharing endpoints, see [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md#rest-api---groups).**
 
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|

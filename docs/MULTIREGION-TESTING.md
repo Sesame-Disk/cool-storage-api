@@ -1,5 +1,7 @@
 # Multi-Region Testing Guide
 
+> **Scope (2026-10-12):** this guide covers the original `docker-compose-multiregion.yaml` stack, still used by `scripts/test-failover.sh`, `scripts/run-tests.sh` and `scripts/bootstrap.sh`. Its test-runner service references `Dockerfile.test`, which no longer exists, so parts of it may not run as written. For the current two-datacenter cluster (two Cassandra DCs, per-region storage and API nodes) use `./scripts/run-mr-cluster.sh` as described in the README section "Multi-Region Testing".
+
 This document describes how to set up and test the multi-region storage capabilities of SesameFS.
 
 Use this stack for true region-aware validation: hostname routing, storage-class

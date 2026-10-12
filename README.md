@@ -53,100 +53,18 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 
 ---
 
-## Development Roadmap
+## Status and Roadmap
 
-### Phase 1: Foundation (MVP) - COMPLETE
-- [x] Project structure and Go modules setup
-- [x] Configuration management (YAML + env overrides)
-- [x] Cassandra connection and schema
-- [x] Library CRUD operations
-- [x] S3 storage integration (MinIO compatible)
-- [x] Basic file upload/download via `/seafhttp/`
-- [x] Token-based file access (configurable TTL)
-- [x] FastCDC chunking with adaptive sizing
-- [x] Block storage layer (content-addressable)
-- [x] Block check/upload/download endpoints
-- [x] Distributed token store (Cassandra-backed, stateless)
+Where things stand is tracked in these files, kept current with every PR:
 
-### Seafile Client Compatibility - COMPLETE
-**Tested with:** Seafile Desktop Client for macOS - login, sync, file upload all working.
+- [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md): what remains before a v1 release
+- [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md): one-screen list of open work and go-live blockers
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): status of record for every known issue
+- [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md): destructive garbage collection, which stays
+  disabled (`GC_ENABLED=false`) until its safety gates close
 
-- [x] `/api2/` legacy route aliases
-- [x] `GET /api2/repos/` - List libraries
-- [x] `GET /api2/repos/:id/dir/?p=/` - Directory listing
-- [x] `POST /api2/auth-token/` - Auth token exchange (dev credentials or `email + API key`)
-- [x] Sync protocol endpoints (`/seafhttp/repo/:id/*`)
-- [x] Commit/FS object model in Cassandra
-
-### Web Frontend (Seahub) - IN PROGRESS
-**Status:** Core functionality working. See [docs/FRONTEND.md](docs/FRONTEND.md).
-
-- [x] Library list (My Libraries)
-- [x] Directory browsing inside libraries
-- [x] File/folder icons and thumbnails
-- [x] Create new library
-- [x] Delete library (single and batch)
-- [x] Create folder
-- [x] Delete folder/file (single and batch)
-- [x] File locking UI (lock icon, lock/unlock actions)
-- [x] File tags display and management
-- [x] Share info dialog (view shares)
-- [ ] File upload via web
-- [ ] File download via web
-- [ ] Copy/Move operations
-- [ ] History/versions
-- [ ] Search
-
-### Phase 2: Stateless Distributed Architecture - COMPLETE
-- [x] Content-addressable block storage (S3)
-- [x] Block deduplication (by SHA256)
-- [x] Distributed token store (Cassandra TTL)
-- [x] Any server can handle any request (stateless)
-- [ ] `POST /api/v2/files/commit` - Finalize chunked upload
-- [ ] Upload session tracking (for resume across servers)
-
-### Phase 3: Multi-Hostname Multi-Tenancy
-- [ ] `hostname_mappings` table in Cassandra
-- [ ] Tenant resolution middleware (hostname -> org_id)
-- [ ] URL generation uses request hostname
-- [ ] Per-org storage configuration (S3 regions)
-- [ ] Per-org settings and quotas
-- [ ] Multi-region S3 routing (nearest to user)
-
-### Phase 4: Enterprise Features - IN PROGRESS
-- [x] Directory operations (list, create, delete)
-- [x] File operations (info, delete, move, copy, batch delete)
-- [x] File locking (lock, unlock, check lock status)
-- [x] File tagging (create, update, delete tags)
-- [x] Share info display (internal shares, links)
-- [ ] Quota management per org
-- [ ] Admin APIs
-- [ ] Audit logging
-- [x] Share links (view - create/delete pending)
-- [ ] OIDC authentication integration
-- [ ] Glacier integration (upload + restore)
-
-### Phase 5: Security Scanning
-- [ ] ClamAV integration (TCP, INSTREAM protocol)
-- [ ] YARA rules engine (phishing detection)
-- [ ] URL extraction and scanning (Safe Browsing, PhishTank)
-- [ ] Office document analysis (oletools)
-- [ ] PDF analysis (pdfid/pdf-parser)
-- [ ] Share link abuse prevention
-
-### Phase 6: Office Integration (OnlyOffice/Collabora)
-- [ ] WOPI protocol endpoints (CheckFileInfo, GetFile, PutFile)
-- [ ] JWT authentication
-- [ ] Co-authoring with real-time sync
-- [ ] File locking during edit
-- [ ] Document conversion
-
-### Phase 7: Advanced
-- [ ] Search (Elasticsearch)
-- [ ] Thumbnails and previews
-- [ ] Client-side encryption
-- [ ] Real-time notifications (WebSocket)
-- [ ] File versioning UI
+The original phase checklist is archived in
+[docs/legacy/README-ROADMAP-2026-10-12.md](docs/legacy/README-ROADMAP-2026-10-12.md).
 
 ---
 
@@ -283,8 +201,8 @@ shared MinIO. Same verbs via `./scripts/run-playwright.sh up | test | down`.
 > silently ignores a script writing over an `HttpOnly` cookie. Clear the site's cookies (or
 > use a fresh/incognito profile) and run the snippet again.
 
-See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed scenarios,
-and [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md)
+[docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) covers the older `docker-compose-multiregion.yaml` stack only. See
+[docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md)
 for a known file-attribution bug surfaced by these tests.
 
 ---
@@ -298,7 +216,7 @@ SesameFS includes a web interface extracted from Seafile Pro (Seahub), modified 
 docker compose up -d sesamefs frontend
 
 # Open http://localhost:3000
-# Login: admin@sesamefs.local / dev-token-123
+# Login is SSO-only in dev: seed the dev cookie as described in "Logging into a web UI" above
 ```
 
 See [docs/FRONTEND.md](docs/FRONTEND.md) for detailed setup guide.
@@ -361,20 +279,23 @@ This is intentional for cloud-native deployments — frontend and backend can be
 
 | Document | Contents |
 |----------|----------|
+| [CLAUDE.md](CLAUDE.md) | Working rules for this repository |
+| [CURRENT_WORK.md](CURRENT_WORK.md) | Active work and the GC vs. go-live gates |
+| [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md) | One-screen list of open work and blockers |
+| [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Status of record for every known issue |
+| [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md) | What remains before v1 |
+| [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) | Destructive GC safety roadmap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | **Production deployment guide** (VPS, SSL, S3, OIDC) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, storage architecture, GC, schemas |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Architecture decisions and the alternatives rejected |
 | [docs/API-REFERENCE.md](docs/API-REFERENCE.md) | API endpoints, implementation status, compatibility |
-| [docs/TESTING.md](docs/TESTING.md) | Test coverage, benchmarks, running tests |
-| [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) | Multi-region testing guide |
-| [docs/BUG-FILE-DETAIL-MODIFIER-20260618.md](docs/BUG-FILE-DETAIL-MODIFIER-20260618.md) | Known bug: `file/detail` last-modifier attribution |
-| [docs/FILE-LOCKING-DESIGN.md](docs/FILE-LOCKING-DESIGN.md) | How file locking should work (exclusive locks + OnlyOffice co-editing) |
-| [docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md](docs/BUG-LANGUAGE-LIST-ENGLISH-ONLY-20260618.md) | Known bug: profile language selector only offers English |
-| [docs/BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md](docs/BUG-SHARE-LINK-NO-INTERNAL-SCOPE-20260618.md) | Known gap: share links have no internal/org-only scope |
+| [docs/TESTING.md](docs/TESTING.md) | Running tests, coverage, benchmarks, multi-DC fixtures |
 | [docs/FRONTEND.md](docs/FRONTEND.md) | Web UI setup, patterns, Docker, troubleshooting |
 | [docs/OIDC.md](docs/OIDC.md) | OIDC authentication configuration |
-| [docs/TECHNICAL-DEBT.md](docs/TECHNICAL-DEBT.md) | Known issues, migration plans, incremental fixes |
+| [docs/TECHNICAL-DEBT.md](docs/TECHNICAL-DEBT.md) | Technical debt, migration plans, incremental fixes |
 | [docs/MIGRATION-FROM-SEAFILE.md](docs/MIGRATION-FROM-SEAFILE.md) | Seafile migration guide |
 | [docs/LICENSING.md](docs/LICENSING.md) | Legal considerations |
+| [docs/legacy/](docs/legacy/README.md) | Archived documents, each with the reason it was archived |
 
 ---
 
@@ -398,4 +319,4 @@ See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-See `CONTRIBUTING.md` (coming soon)
+Open an issue or a small, focused pull request. [CLAUDE.md](CLAUDE.md) holds the working rules for this repository (they apply to human contributors too): bad news first, backward compatible changes, tests with every change, and `GC_ENABLED=false`.

@@ -141,6 +141,8 @@ Both tests must pass:
 
 ### Step 6: Freeze and Document
 
+> **Superseded (2026-10-12):** the freeze model (🔒 FROZEN labels, soak periods, `RELEASE-CRITERIA.md`) is retired. Protocol changes still need evidence that stock Seafile clients keep working (steps 2–5 above), but nothing is "frozen". The old procedure is archived in [legacy/RELEASE-CRITERIA-2026-03-17.md](legacy/RELEASE-CRITERIA-2026-03-17.md).
+
 1. **Mark as frozen** in `docs/IMPLEMENTATION_STATUS.md`:
    ```markdown
    | `GET /seafhttp/repo/:id/fs-id-list/` | 🔒 FROZEN | **STABLE** | 2026-01-16 | Returns JSON array |
@@ -316,6 +318,8 @@ library.MagicStrong = argon2Hash  // 300× slower to brute-force
 ---
 
 ### 4. Cassandra for Metadata Storage
+
+> **Alternative evaluated and rejected (2026-01-19):** a migration to TiDB was evaluated in depth and the verdict was to stay with Cassandra. The analysis is archived in [legacy/CASSANDRA-TO-TIDB-MIGRATION-2026-01-19.md](legacy/CASSANDRA-TO-TIDB-MIGRATION-2026-01-19.md).
 
 **Decision**: Use Apache Cassandra for metadata (not PostgreSQL/MySQL)
 
@@ -663,6 +667,8 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 ---
 
 ### 2. Session Continuity Tracking
+
+> **Superseded (2026-10-12):** the CURRENT_WORK layout described below is no longer used. `CURRENT_WORK.md` now holds the active and recent slices plus the gates table; older content is archived in `docs/legacy/`. Kept as a record of the original decision.
 
 **Decision**: Maintain `CURRENT_WORK.md` for session-to-session context preservation
 

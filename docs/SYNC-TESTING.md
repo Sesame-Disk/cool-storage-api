@@ -376,5 +376,4 @@ PYEOF
 
 - [Seafile CLI Documentation](https://help.seafile.com/syncing_client/linux-cli/)
 - [Seafile Source Code](https://github.com/haiwen/seafile)
-- [CLAUDE.md - Sync Protocol Details](../CLAUDE.md)
 - [SEAFILE-SYNC-PROTOCOL.md](SEAFILE-SYNC-PROTOCOL.md) - Full protocol specification
