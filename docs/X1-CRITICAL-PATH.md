@@ -427,11 +427,12 @@ does not eliminate the post-check publication race.
 
 Disposition (E1-16, 2026-10-10): **CLOSED-EVIDENCE for repair-adopting
 funnels.** The sequence's precondition, temporary zero → COMMITTED D1 while
-HEAD reaches the commit, is excluded. The writer's non-expiring repair is
+HEAD reaches a commit that depends on P1, is excluded. The writer's non-expiring repair is
 queued before HEAD, and the funnel-independent EACH_QUORUM guard vetoes a new
 D until promotion writes `fs:`. E1-11 and E1-2 measured this schedule. A later
 promotion writes a logical `fs:` on L, which cannot revoke D1 (G4). The
-W2-10 handlers queue no repair and stay under W2-10.
+W2-10 handlers queue no repair and stay under W2-10. A repair for a legitimate
+publication on a later life P2 (E1-15C C1) is outside this sequence.
 
 P2 follow-up: an already-authorized delayed PUT can recreate retired K1 bytes.
 Characterize physical resurrection/leak at E1/PRE-X1. (E1-PUT-01, 2026-10-03,

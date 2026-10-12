@@ -120,12 +120,16 @@ with W2-11..14 evidence.
 | W2-13 | OPEN overall | **CLOSED-EVIDENCE (X1)**; discovery/scale/convergence → PRE-GC | the guard reads the repair table directly, independent of discovery (E1-13) |
 | W2-14 | OPEN overall | **CLOSED-EVIDENCE (X1)**; transition/convergence → PRE-GC | `pub:` expiry creates no candidate (E1-14) |
 
-A reachable repair after D cannot exist without a prior violation: its commit
-reached HEAD only through a pre-HEAD gate, and its non-expiring row vetoes D
-until promotion writes `fs:`. This also disposes the 2026-10-02 G4
-cross-audit dependency (X1 §7): E1-2 measured that exact schedule (reachable
-HEAD → temporary references expire → the durable repair vetoes D). A later
-promotion writes a logical `fs:` on L.
+A repair that is REACHABLE after D(P1) is not a violation by itself. A
+legitimate publication on a later life P2 has its own repair after D1: E1-15C
+C1 rematerializes P2, advances HEAD, and keeps the published file only on P2.
+What X1 excludes is narrower. A reachable repair whose publication still
+depends on retired P1 cannot exist without a prior violation: its commit
+reached HEAD only through a pre-HEAD exact-P gate on P1, and its non-expiring
+row vetoes D(P1) until promotion writes `fs:`. This also disposes the
+2026-10-02 G4 cross-audit dependency (X1 §7): E1-2 measured that exact
+schedule (reachable HEAD → temporary references expire → the durable repair
+vetoes D). A later promotion writes a logical `fs:` on L.
 
 ## Scope moves (severity unchanged)
 
