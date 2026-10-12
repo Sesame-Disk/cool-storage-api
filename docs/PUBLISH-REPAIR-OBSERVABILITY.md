@@ -322,6 +322,59 @@ visit-outcome series (`publish_repair_visits_total`) without any
 corresponding event here, so `pending_rows` rising while these rates stay
 flat is a valid — and informative — combination.
 
+## Abandoned repair retention (PRE-GC measurement)
+
+Phase 1 of the measurement plan in
+[`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01`](./KNOWN_ISSUES.md#issue-publish-repair-dead-row-retention-01-a-deadunreachable-publications-repair-row-surviving-request-local-cleanup-can-be-retained-and-repeatedly-re-pinned-indefinitely)
+(P2 PRE-GC since 2026-10-12) uses only the series above. It adds no code and
+no gate.
+
+```promql
+# Per node: keep the target label (`instance` or the deployment's equivalent)
+max by (instance) (publish_repair_pending_rows)
+max by (instance) (publish_repair_oldest_pending_age_seconds)
+
+# Freshness of those gauges, per node
+time() - publish_repair_last_complete_sweep_timestamp_seconds
+histogram_quantile(0.95, sum by (instance, le) (rate(publish_repair_sweep_duration_seconds_bucket[1h])))
+
+# Aggregate visit outcomes; does not identify rows
+sum by (instance, outcome) (increase(publish_repair_visits_total[6h]))
+```
+
+`max()` without `by` is a cross-node dashboard aggregation (see Scrape
+scope). It is not a per-node view.
+
+How to read it:
+
+- **Freshness first.** The backlog gauges change only when a sweep lists every
+  bucket. After a listing error they keep the previous value. Trust a node's
+  backlog only when its last complete sweep is recent, and account for the
+  sweep span.
+- **Revisits.** Healthy rows settle within minutes. There is no guaranteed
+  revisit interval: the 6 h retry cap bounds only a process-local backoff,
+  and the sweep is sequential.
+- **The 24 h threshold.** An oldest pending age above 24 h on a fresh node is
+  an operational investigation threshold, not a measured or guaranteed
+  bound.
+- **Outcomes.** `retained` is an inconclusive visit that returned no error.
+  `failed` is a visit that returned an error. That covers walk problems (the
+  1024-node chunk limit, an ancestry cycle, a malformed or unreadable parent)
+  as well as operational causes such as an unavailable DC. Neither outcome
+  rules out retention, and neither series names the rows.
+- **Inspect each row read-only** from the repair table:
+  - commit row present;
+  - HEAD equal to the commit's parent;
+  - walk cursor (`reachability_cursor_commit_id`);
+  - `staged_block_ids`.
+
+  Classify the row as one of the issue's shapes, or as an operational cause.
+
+These series do not say why a row was retained. They give per-node
+observations and count rows, not the bytes those rows pin. A retain reason
+and a pinned-bytes estimate are Phase 2: a separate code change, made only if
+Phase 1 shows real retention.
+
 ## What is deliberately not here
 
 - **Remaining TTL of the repair-owned pins** ("oldest successful

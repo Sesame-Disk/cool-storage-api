@@ -912,6 +912,15 @@ for X1 on existing evidence and source arguments over current code. W2-10
 stays OPEN. E1-15A/B and the R31 convergence residuals move from PRE-X1 to
 PRE-GC.
 
+**2026-10-12 amendment.** `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01`
+(abandoned repairs retaining later lives of L) is P2 PRE-GC, measure first.
+Time is not cleanup authority for a repair row: the row may protect a
+publication already in HEAD, and the HEAD CAS has no deadline. Unresolved
+rows are handled by their measured cause: a long walk, a transient error or
+an integrity problem. A durable cancellation is warranted only when the
+original publication is shown to need invalidating with no other safe path,
+and it must be authority the original writer's HEAD CAS cannot outrun.
+
 ---
 
 ## Future Decisions (To Be Made)

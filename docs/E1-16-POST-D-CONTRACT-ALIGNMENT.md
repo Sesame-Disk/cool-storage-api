@@ -143,9 +143,9 @@ vetoes D). A later promotion writes a logical `fs:` on L.
 | `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01` | P2 PRE-X1 | P2 PRE-GC |
 | `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01` | P2 PRE-X1 | P2 PRE-GC |
 
-Unchanged: `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` stays FOLLOW-UP /
-GENERAL. Its proposal to become a pre-activation gate (E1-15C) is a separate
-PRE-GC decision. E1-15D §2 stays the authority record, except that its row
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` was left unchanged here. That
+separate decision was taken on 2026-10-12: P2 PRE-GC, with a measure-first
+plan recorded in the issue. E1-15D §2 stays the authority record, except that its row
 "HEAD ≠ c1.parent" is superseded by E1-15E SUPERSEDED settlement.
 
 ## What still blocks `X1 CLOSED`

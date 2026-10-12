@@ -1,6 +1,55 @@
 # Current Work
 
-## Active slice: E1-16 post-D contract alignment with G4 (docs only)
+## Status snapshot (2026-10-12)
+
+The source of record for order and closure states is
+[docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md). This is a summary.
+
+- **GC:** `GC_ENABLED=false` is mandatory fleet-wide.
+- **Path:** W1 → G1–G5 (G1–G3 #207/#209/#212, G4 #247, G5 #248) → **E1 (in
+  progress)** → X1 CLOSED → PRE-GC → A1 → GC ON. X1 is OPEN.
+- **X1 contract:** a physical invariant (E1-16, #277). After COMMITTED D(P1),
+  nothing may reinstall P1, revoke or postpone D1, or publish HEAD content
+  that depends on retired P1. Logical references of L after D1 are retention
+  (PRE-GC), not X1.
+- **W2 checklist:** W2-0..9 and W2-11..14 are closed for X1. **W2-10
+  (content resurrection) is OPEN.**
+- **Remaining before X1 CLOSED:**
+  1. W2-10 (E1-17, next);
+  2. E1-01, after inventorying the G1–G5 crash evidence;
+  3. the three-DC residuals (28 of the 30 G5 failures now pass);
+  4. the D0 §25 reclassification list;
+  5. the identity claim-table PRE-X1 audit debt.
+- **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
+  table. Highlights:
+  - Phase 5 cascade (P0 latent) and the Phase 6 TOCTOU;
+  - the stale-claim settle race and the clock assumption;
+  - the certification-window fence (to be re-scoped);
+  - the HEAD-less ghost row;
+  - hard-delete `NONFENCING-01`: P1, also current-runtime; #243 was closed
+    without merge;
+  - the E1-16 convergence moves (E1-15A/B, W2-12..14 residuals);
+  - **abandoned repair retention:** P2, measure first, since 2026-10-12.
+- **Open follow-ups from the E1-16 runs:**
+  - `ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01` (P2, multi-DC
+    availability);
+  - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
+    legs do not run on three DCs.
+
+## Active slice: abandoned repair retention to PRE-GC (docs only)
+
+Base main@cf03f8415 (#277 merged). Branch docs/dead-row-retention-pre-gc.
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` moves from FOLLOW-UP / GENERAL to
+P2 PRE-GC with a measure-first plan:
+1. use the existing repair metrics (new runbook section);
+2. add a retain reason and a pinned-bytes estimate only if the retention is
+   real;
+3. disposition it before A1 from the data.
+
+No TTL on the repair row, because the row may protect a publication already in
+HEAD and the HEAD CAS has no deadline. No code, test or schema change.
+
+## Previous merged slice: E1-16 post-D contract alignment with G4 (PR #277)
 
 Base main@5c3163871803 (#276 and #261 merged). Branch
 docs/e1-16-post-d-contract-alignment.
