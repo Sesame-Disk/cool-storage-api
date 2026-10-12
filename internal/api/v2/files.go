@@ -4587,6 +4587,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 
 		revertFileBeforeHeadBarrier(repoID)
 		if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+			log.Printf("[RevertFile] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
 			return err
 		}
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
@@ -4809,6 +4810,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 
 		revertDirectoryBeforeHeadBarrier(repoID)
 		if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+			log.Printf("[RevertDirectory] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, dirPath, oldEntry.ID, err)
 			return err
 		}
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {

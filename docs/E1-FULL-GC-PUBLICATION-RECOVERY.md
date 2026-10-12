@@ -584,7 +584,7 @@ reached the historical file on retired P1: frozen-matrix E1-10 RED.
 The fix extends the E1-10e source admission to whole entries:
 - a strict recursive directory read, where a missing or malformed object
   fails closed;
-- each file's own permanent `fs:`;
+- each block-bearing file's own permanent `fs:`;
 - original exact P, rechecked before every HEAD CAS.
 
 Evidence:

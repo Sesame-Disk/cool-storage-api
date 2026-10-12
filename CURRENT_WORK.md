@@ -46,7 +46,7 @@ fix/e1-17-w2-10-residual-handlers.
   shapes).
 - **Fix:** the E1-10e source admission now covers whole entries:
   - a strict recursive directory read;
-  - each file's own permanent `fs:`;
+  - each block-bearing file's own permanent `fs:`;
   - exact P, rechecked before every HEAD CAS.
 - **Evidence:** GREEN 15/15; retained-history controls pass; an omission
   mutation brings RED back; race 4/4.

@@ -126,11 +126,14 @@ metadata, mapping or D was fabricated. The RED log is kept at
   missing object into an empty directory, it fails closed when the object is
   missing, untyped, not a directory, or malformed, or when an entry has no
   fs_id. `""`, `[]` and `null` are a real empty directory
-  (`parseRetainedHistoricalDirectory`, unit-tested). A depth bound of 256
-  stops a corrupt cyclic tree.
+  (`parseRetainedHistoricalDirectory`, unit-tested). The walk
+  (`walkRetainedHistoricalEntry`) has **no depth limit**, matching restore
+  before admission (`collectDirStats` has none). Content-addressed fs_ids,
+  verified at RecvFS and computed by v2, cannot form a cycle. A unit test
+  admits a 1000-level tree.
 - **`validateRetainedHistoricalSource`** rechecks immediately before every
   HEAD CAS:
-  - each file's own permanent `fs:`;
+  - each block-bearing file's own permanent `fs:`;
   - then one exact-P authority pass over the union of placements.
 
   It replaces `validateRetainedHistoricalFile`, which had no caller left.
@@ -142,7 +145,13 @@ admits directory items too.
 
 **Failure contracts are unchanged.** `RevertDirents` reports the item in its
 200 `failed` list. The other three return their existing generic error
-(500). The admission reason is logged.
+(500). In all four handlers the reason is logged both at capture ("not
+admitted") and at the pre-HEAD recheck ("failed pre-HEAD recheck").
+
+**Contract.** Every block that a restored entry depends on must have its
+file's own settled permanent `fs:` and pass exact P before every HEAD CAS.
+A file without blocks (size 0) has no physical life to depend on. It is
+admitted without a reference, unchanged from E1-10e and physically safe.
 
 **Not added:** no own pin, `pub:`, repair, rematerialization or ancestry
 certification.

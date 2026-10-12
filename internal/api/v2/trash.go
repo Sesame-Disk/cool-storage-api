@@ -455,6 +455,7 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 
 		restoreTrashBeforeHeadBarrier(repoID)
 		if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+			log.Printf("[RestoreTrashItem] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
 			return err
 		}
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
@@ -757,6 +758,7 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 		// Files since E1-10e; directories (every file in the subtree) since E1-17.
 		retained, err := fsHelper.captureRetainedHistoricalEntry(orgID, repoID, oldEntry)
 		if err != nil {
+			log.Printf("[RevertDirents] historical source not admitted repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
 			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
 			continue
 		}
@@ -821,6 +823,7 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 
 			revertDirentsBeforeHeadBarrier(repoID, filePath)
 			if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+				log.Printf("[RevertDirents] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
 				return err
 			}
 			if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {

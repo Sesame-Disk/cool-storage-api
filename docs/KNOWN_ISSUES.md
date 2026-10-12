@@ -6,7 +6,8 @@
 `RevertFile`, `RestoreTrashItem` (file and directory), `RevertDirectory` and
 `RevertDirents` directory items published HEAD on COMMITTED or retired P1 from
 an unpublished Sync commit (RED, all shapes). They now admit only settled
-history, the E1-10e policy extended recursively to directories. Concurrent
+history for every block dependency, the E1-10e policy extended recursively to
+directories. Concurrent
 Phase 5/6 history removal stays PRE-GC. See
 [E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
 
@@ -6943,7 +6944,7 @@ owner) and from the global SERIAL pin of the lease itself, which #234 closed.
 
 ### ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01: Revert/restore paths lack continuous own publication liveness (RevertDirents file admission partially fixed)
 
-**Status**: ✅ Closed for X1 (W2-10 CLOSED-FIX, E1-17, 2026-10-12). Every handler and shape admits only settled history: each file's own permanent `fs:`, a strict recursive directory read, original exact P, and a recheck before every HEAD CAS. RED→GREEN was demonstrated for all shapes on the unpublished-source schedule ([E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)). Still open as PRE-GC: concurrent Phase 5/6 history removal between observation and HEAD. No continuous own liveness or ancestry certification is added. History: PC-0 characterization; E1-10e first fixed RevertDirents file admission
+**Status**: ✅ Closed for X1 (W2-10 CLOSED-FIX, E1-17, 2026-10-12). Every handler and shape admits only settled history for every block dependency: each block-bearing file's own permanent `fs:`, a strict recursive directory read, original exact P, and a recheck before every HEAD CAS. RED→GREEN was demonstrated for all shapes on the unpublished-source schedule ([E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)). Still open as PRE-GC: concurrent Phase 5/6 history removal between observation and HEAD. No continuous own liveness or ancestry certification is added. History: PC-0 characterization; E1-10e first fixed RevertDirents file admission
 **Severity**: High (P1) — W2 writer protocol completeness / funnel migration
 **Affected**: `RevertFile`, `RevertDirectory` (`internal/api/v2/files.go`), `RestoreTrashItem`, `RevertDirents` (`internal/api/v2/trash.go`)
 **Registered**: 2026-09-10, PC-0 publication-protocol characterization audit

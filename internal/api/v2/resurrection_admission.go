@@ -186,38 +186,45 @@ type retainedHistoricalFile struct {
 	placements []commitBlockPlacement
 }
 
-// fs_ids are content-addressed, so a well-formed tree cannot nest this deep;
-// the bound stops a corrupt (cyclic) tree from recursing forever.
-const maxRetainedHistoricalDepth = 256
-
 // captureRetainedHistoricalEntry applies the file admission to a whole restored
 // entry. A directory is admitted only if every file in its historical subtree
 // is admitted.
 func (h *FSHelper) captureRetainedHistoricalEntry(orgID, repoID string, entry FSEntry) (retainedHistoricalSource, error) {
 	var source retainedHistoricalSource
-	err := h.collectRetainedHistoricalEntry(orgID, repoID, entry, 0, &source)
-	return source, err
-}
-
-func (h *FSHelper) collectRetainedHistoricalEntry(orgID, repoID string, entry FSEntry, depth int, source *retainedHistoricalSource) error {
-	if !isDirectoryEntry(&entry) {
-		placements, err := h.captureRetainedHistoricalFile(orgID, repoID, entry)
+	err := walkRetainedHistoricalEntry(entry, func(fsID string) ([]FSEntry, error) {
+		return h.readRetainedHistoricalDirectory(repoID, fsID)
+	}, func(file FSEntry) error {
+		placements, err := h.captureRetainedHistoricalFile(orgID, repoID, file)
 		if err != nil {
 			return err
 		}
-		source.files = append(source.files, retainedHistoricalFile{fsID: entry.ID, placements: placements})
+		source.files = append(source.files, retainedHistoricalFile{fsID: file.ID, placements: placements})
 		return nil
-	}
-	if depth >= maxRetainedHistoricalDepth {
-		return fmt.Errorf("historical directory nesting exceeds %d", maxRetainedHistoricalDepth)
-	}
-	children, err := h.readRetainedHistoricalDirectory(repoID, entry.ID)
-	if err != nil {
-		return err
-	}
-	for _, child := range children {
-		if err := h.collectRetainedHistoricalEntry(orgID, repoID, child, depth+1, source); err != nil {
+	})
+	return source, err
+}
+
+// walkRetainedHistoricalEntry visits every file under entry, depth-first and in
+// listing order, with no depth limit: restore had none before admission, and
+// content-addressed fs_ids (verified at RecvFS, computed by v2) cannot form a
+// cycle. The first error stops the walk.
+func walkRetainedHistoricalEntry(entry FSEntry, readDir func(fsID string) ([]FSEntry, error), visitFile func(FSEntry) error) error {
+	stack := []FSEntry{entry}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if !isDirectoryEntry(&current) {
+			if err := visitFile(current); err != nil {
+				return err
+			}
+			continue
+		}
+		children, err := readDir(current.ID)
+		if err != nil {
 			return err
+		}
+		for i := len(children) - 1; i >= 0; i-- {
+			stack = append(stack, children[i])
 		}
 	}
 	return nil

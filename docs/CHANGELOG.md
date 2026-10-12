@@ -20,7 +20,7 @@ shapes.
 `resurrection_admission.go`:
 - a strict recursive directory read (missing or malformed fails closed;
   `""`, `[]` and `null` mean empty);
-- each file's own permanent `fs:`;
+- each block-bearing file's own permanent `fs:`;
 - original exact P, rechecked before every HEAD CAS.
 
 `RevertDirents` now admits directory items too. Failure responses are

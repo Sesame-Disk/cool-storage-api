@@ -202,3 +202,74 @@ func TestParseRetainedHistoricalDirectory(t *testing.T) {
 		})
 	}
 }
+
+// The admission walk has no depth limit: a valid tree far deeper than any
+// former bound is admitted, every file is visited in listing order, and the
+// first read or file error stops the walk.
+func TestWalkRetainedHistoricalEntry(t *testing.T) {
+	dir := func(id string) FSEntry { return FSEntry{ID: id, Mode: ModeDir, Name: id} }
+	file := func(id string) FSEntry { return FSEntry{ID: id, Mode: 33188, Name: id} }
+
+	t.Run("deep-chain", func(t *testing.T) {
+		const depth = 1000
+		children := map[string][]FSEntry{}
+		for i := 0; i < depth; i++ {
+			children[fmt.Sprintf("d%d", i)] = []FSEntry{dir(fmt.Sprintf("d%d", i+1))}
+		}
+		children[fmt.Sprintf("d%d", depth)] = []FSEntry{file("leaf")}
+		var visited []string
+		err := walkRetainedHistoricalEntry(dir("d0"), func(id string) ([]FSEntry, error) {
+			list, ok := children[id]
+			if !ok {
+				return nil, fmt.Errorf("unexpected directory %s", id)
+			}
+			return list, nil
+		}, func(f FSEntry) error {
+			visited = append(visited, f.ID)
+			return nil
+		})
+		if err != nil || !reflect.DeepEqual(visited, []string{"leaf"}) {
+			t.Fatalf("deep tree: visited=%v err=%v", visited, err)
+		}
+	})
+
+	t.Run("order-and-file-root", func(t *testing.T) {
+		children := map[string][]FSEntry{
+			"root": {file("a"), dir("sub"), file("c")},
+			"sub":  {file("b1"), file("b2")},
+		}
+		var visited []string
+		read := func(id string) ([]FSEntry, error) { return children[id], nil }
+		visit := func(f FSEntry) error { visited = append(visited, f.ID); return nil }
+		if err := walkRetainedHistoricalEntry(dir("root"), read, visit); err != nil || !reflect.DeepEqual(visited, []string{"a", "b1", "b2", "c"}) {
+			t.Fatalf("order: visited=%v err=%v", visited, err)
+		}
+		visited = nil
+		if err := walkRetainedHistoricalEntry(file("solo"), read, visit); err != nil || !reflect.DeepEqual(visited, []string{"solo"}) {
+			t.Fatalf("file root: visited=%v err=%v", visited, err)
+		}
+	})
+
+	t.Run("errors-stop-the-walk", func(t *testing.T) {
+		readErr, fileErr := errors.New("unreadable directory"), errors.New("not admitted")
+		children := map[string][]FSEntry{"root": {file("a"), dir("bad"), file("never")}}
+		var visited []string
+		err := walkRetainedHistoricalEntry(dir("root"), func(id string) ([]FSEntry, error) {
+			if id == "bad" {
+				return nil, readErr
+			}
+			return children[id], nil
+		}, func(f FSEntry) error { visited = append(visited, f.ID); return nil })
+		if !errors.Is(err, readErr) || !reflect.DeepEqual(visited, []string{"a"}) {
+			t.Fatalf("read error: visited=%v err=%v", visited, err)
+		}
+		visited = nil
+		err = walkRetainedHistoricalEntry(dir("root"), func(id string) ([]FSEntry, error) { return children[id], nil }, func(f FSEntry) error {
+			visited = append(visited, f.ID)
+			return fileErr
+		})
+		if !errors.Is(err, fileErr) || !reflect.DeepEqual(visited, []string{"a"}) {
+			t.Fatalf("file error: visited=%v err=%v", visited, err)
+		}
+	})
+}
