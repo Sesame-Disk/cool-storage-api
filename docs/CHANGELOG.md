@@ -8,6 +8,35 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-12 — E1-17: W2-10 residual content-resurrection handlers closed
+
+**RED.** `RevertFile`, `RestoreTrashItem` (file and directory),
+`RevertDirectory` and `RevertDirents` directory items accepted a
+client-supplied commit that never won HEAD. With the unpublished-source
+schedule they published HEAD on COMMITTED or retired P1: real RED, all
+shapes.
+
+**Fix.** The E1-10e source admission now applies to whole entries, in
+`resurrection_admission.go`:
+- a strict recursive directory read (missing or malformed fails closed;
+  `""`, `[]` and `null` mean empty);
+- each file's own permanent `fs:`;
+- original exact P, rechecked before every HEAD CAS.
+
+`RevertDirents` now admits directory items too. Failure responses are
+unchanged.
+
+**Evidence.**
+- 15 named legs, GREEN, with the evidence gate wired into `TestMain` and
+  both compose runners;
+- retained-history controls pass;
+- an omission mutation brings RED back;
+- race 4/4;
+- a unit contract now pins six fallback reads.
+
+W2-10 is CLOSED-FIX. The integration timeout is raised explicitly from 40m
+to 50m (TECHNICAL-DEBT).
+
 ## 2026-10-12 — Abandoned repair retention moved to PRE-GC
 
 Documentation only. `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` moves from

@@ -12,14 +12,13 @@ The source of record for order and closure states is
   nothing may reinstall P1, revoke or postpone D1, or publish HEAD content
   that depends on retired P1. Logical references of L after D1 are retention
   (PRE-GC), not X1.
-- **W2 checklist:** W2-0..9 and W2-11..14 are closed for X1. **W2-10
-  (content resurrection) is OPEN.**
+- **W2 checklist:** every row, W2-0..14, is closed for X1. W2-10 (content
+  resurrection) was closed by E1-17 (CLOSED-FIX).
 - **Remaining before X1 CLOSED:**
-  1. W2-10 (E1-17, next);
-  2. E1-01, after inventorying the G1–G5 crash evidence;
-  3. the three-DC residuals (28 of the 30 G5 failures now pass);
-  4. the D0 §25 reclassification list;
-  5. the identity claim-table PRE-X1 audit debt.
+  1. E1-01, after inventorying the G1–G5 crash evidence (next);
+  2. the three-DC residuals (28 of the 30 G5 failures now pass);
+  3. the D0 §25 reclassification list;
+  4. the identity claim-table PRE-X1 audit debt.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
   table. Highlights:
   - Phase 5 cascade (P0 latent) and the Phase 6 TOCTOU;
@@ -36,7 +35,27 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: abandoned repair retention to PRE-GC (docs only)
+## Active slice: E1-17 W2-10 residual content-resurrection handlers
+
+Base main@747408b39 (#277 and #278 merged). Branch
+fix/e1-17-w2-10-residual-handlers.
+
+- **RED:** `RevertFile`, `RestoreTrashItem` (file and directory),
+  `RevertDirectory` and `RevertDirents` directory items published HEAD on
+  COMMITTED or retired P1 from an unpublished Sync commit (15 legs, all
+  shapes).
+- **Fix:** the E1-10e source admission now covers whole entries:
+  - a strict recursive directory read;
+  - each file's own permanent `fs:`;
+  - exact P, rechecked before every HEAD CAS.
+- **Evidence:** GREEN 15/15; retained-history controls pass; an omission
+  mutation brings RED back; race 4/4.
+- **Result:** W2-10 CLOSED-FIX. The integration timeout is raised
+  explicitly from 40m to 50m.
+
+[E1-17](docs/E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
+## Previous merged slice: abandoned repair retention to PRE-GC (docs only, PR #278)
 
 Base main@cf03f8415 (#277 merged). Branch docs/dead-row-retention-pre-gc.
 `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` moves from FOLLOW-UP / GENERAL to

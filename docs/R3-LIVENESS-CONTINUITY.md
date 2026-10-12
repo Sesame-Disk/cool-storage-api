@@ -214,7 +214,10 @@ PutCommit/RecvFS metadata can coexist with COMMITTED/TERMINAL retired P1 before
 any Sync HEAD publication. RevertDirents non-directory file admission now requires
 settled historical fs: via LQ→EQ fallback, captures original exact P and rechecks
 both before every HEAD CAS. That measured unpublished-source subset is
-CLOSED-FIX; the other handlers and directory shapes have no equivalent guard.
+CLOSED-FIX; the other handlers and directory shapes had no equivalent guard
+until E1-17 (2026-10-12), which extended the admission recursively to every
+handler and shape (W2-10 CLOSED-FIX; see
+[E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)).
 Continuous own liveness through HEAD, broader batches, retention/Phase5/6 and
 R31 remain OPEN; W2-10 overall is OPEN. See
 [E1-10e evidence](./E1-10E-W210-RESIDUAL-DISPOSITION.md) and

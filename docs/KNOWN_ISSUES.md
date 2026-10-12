@@ -1,5 +1,15 @@
 # Known Issues - SesameFS
 
+## W2-10 content resurrection closed (E1-17, 2026-10-12)
+
+`ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01` is closed for X1.
+`RevertFile`, `RestoreTrashItem` (file and directory), `RevertDirectory` and
+`RevertDirents` directory items published HEAD on COMMITTED or retired P1 from
+an unpublished Sync commit (RED, all shapes). They now admit only settled
+history, the E1-10e policy extended recursively to directories. Concurrent
+Phase 5/6 history removal stays PRE-GC. See
+[E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
 ## Abandoned repair retention moved to PRE-GC (2026-10-12)
 
 `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` is now **P2 PRE-GC**; it was
@@ -6933,7 +6943,7 @@ owner) and from the global SERIAL pin of the lease itself, which #234 closed.
 
 ### ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01: Revert/restore paths lack continuous own publication liveness (RevertDirents file admission partially fixed)
 
-**Status**: 🔴 Open — PC-0 characterization; E1-10e partially fixes RevertDirents file source admission, continuous publication liveness and other shapes/handlers remain open
+**Status**: ✅ Closed for X1 (W2-10 CLOSED-FIX, E1-17, 2026-10-12). Every handler and shape admits only settled history: each file's own permanent `fs:`, a strict recursive directory read, original exact P, and a recheck before every HEAD CAS. RED→GREEN was demonstrated for all shapes on the unpublished-source schedule ([E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)). Still open as PRE-GC: concurrent Phase 5/6 history removal between observation and HEAD. No continuous own liveness or ancestry certification is added. History: PC-0 characterization; E1-10e first fixed RevertDirents file admission
 **Severity**: High (P1) — W2 writer protocol completeness / funnel migration
 **Affected**: `RevertFile`, `RevertDirectory` (`internal/api/v2/files.go`), `RestoreTrashItem`, `RevertDirents` (`internal/api/v2/trash.go`)
 **Registered**: 2026-09-10, PC-0 publication-protocol characterization audit
@@ -11755,6 +11765,22 @@ A separate fix should retain the successfully copied source identity and require
 
 `verifyManifestBlocks` and `ensureCommitBlockOwnLiveness` in file_from_blocks.go create a goroutine per distinct block before their semaphore admission. A supported manifest can contain 131,072 blocks. Query concurrency is bounded but worker creation is not. PR #258 bounds its source capture and shared final validator only; these two earlier phases remain unchanged. A separate resource-bound fix should admit workers before goroutine creation, preserving cancellation and fail-closed publication outcomes. Confirmed by source inspection; no closure is claimed here.
 
+
+## ISSUE-RESURRECTION-ADMISSION-DIRECTORY-COST-01
+
+**Status:** OPEN. **Severity:** P2 / CURRENT-RUNTIME performance follow-up, introduced deliberately by E1-17 (2026-10-12). Not a safety issue.
+
+E1-17 made `RestoreTrashItem`, `RevertDirectory` and `RevertDirents` admit a directory only after checking every file in its historical subtree. This closed a real X1 violation. Each file costs about seven reads:
+- the library row;
+- the SHA-1 mapping;
+- the file layout;
+- its own permanent `fs:`;
+- the canonical block row;
+- the `fs:` and exact-P recheck before HEAD.
+
+Files are walked sequentially, and blocks within a file run in parallel (bound 20). Before E1-17 a directory restore read only metadata, so very large directories may now be slow enough to approach request timeouts. This has **not** been measured.
+
+**Next step.** Measure restore latency for large directories. Optimize only if it matters: for example, read the library row once per request, or bound file-level concurrency. Do not weaken the per-file admission or turn a missing object into an empty directory.
 
 ## ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01
 

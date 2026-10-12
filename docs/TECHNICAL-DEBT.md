@@ -2676,4 +2676,6 @@ Registered by the E1-16 validation runs ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNME
 
 Each new mandatory evidence leg pushes the standard suite past its budget. Decide between splitting the evidence children into a separate runner, running packages or gates in parallel, or an explicit budget policy. Do not keep raising the timeout silently.
 
+**2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
+
 **E1 in-process-GC legs cannot run on a three-DC fixture (P2).** `openIntegrationProjectionDB` builds its `DatabaseConfig` without replication, so it declares only the local DC. On a three-DC keyspace the in-process GC's destructive topology gate correctly refuses the G2 handoff. As a result, E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13 fail on fixture progress ("GC retirement n=0", "worker did not visit owned real candidate"), not on safety. These legs are single-DC evidence by design. If they are wanted on three DCs, the harness must declare the fixture topology, for example from `CASSANDRA_REPLICATION_DCS`.
