@@ -220,6 +220,14 @@ history removal (Phase 5/6), which remains PRE-GC.
     under its required gate;
   - API 20/20;
   - OIDC PASS.
+- **Cross-audit corrections and re-validation** (HEAD 274c691c5):
+  - the depth bound was removed (unit test: a 1000-level tree is admitted);
+  - rejection causes are logged at capture and at the pre-HEAD recheck;
+  - the contract wording was tightened.
+  Focused E1-17 and retained-history controls PASS, with the logs naming
+  every rejection. Standard `go-all-test` on the rebuilt stack (daemons
+  verified on the current image) exited **0**: integration 536 PASS / 0 FAIL
+  / 75 SKIP in 967.355s, API 20/20, OIDC 25/25.
 - **Integration budget.** The standard runner timeout is raised explicitly
   from 40m to 50m. E1-17 adds about 25s to a suite that ended at 2399.5s
   (TECHNICAL-DEBT, "E1-16 test-infrastructure follow-ups").
