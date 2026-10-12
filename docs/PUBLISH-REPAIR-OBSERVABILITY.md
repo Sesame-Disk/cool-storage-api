@@ -330,35 +330,49 @@ Phase 1 of the measurement plan in
 no gate.
 
 ```promql
-# Backlog and the oldest row, per node (see scope)
-max(publish_repair_pending_rows)
-max(publish_repair_oldest_pending_age_seconds)
+# Per node: keep the target label (`instance` or the deployment's equivalent)
+max by (instance) (publish_repair_pending_rows)
+max by (instance) (publish_repair_oldest_pending_age_seconds)
 
-# Do unresolved visits end clean (retained) or with errors (failed)?
-sum by (outcome) (increase(publish_repair_visits_total[6h]))
+# Freshness of those gauges, per node
+time() - publish_repair_last_complete_sweep_timestamp_seconds
+histogram_quantile(0.95, sum by (instance, le) (rate(publish_repair_sweep_duration_seconds_bucket[1h])))
+
+# Aggregate visit outcomes; does not identify rows
+sum by (instance, outcome) (increase(publish_repair_visits_total[6h]))
 ```
+
+`max()` without `by` is a cross-node dashboard aggregation (see Scrape
+scope). It is not a per-node view.
 
 How to read it:
 
-- Healthy rows settle within minutes: the request-local promotion, or the
-  first sweep after the advisory 5 min scheduling lease, with a sweep every
-  1 min. A `retained` visit reschedules with backoff capped at 6 h
-  (`publishedBlockReferenceRepairRetryMax`).
-- An oldest pending age above **24 h** (four maximum retry intervals) while
-  visits keep ending `retained` marks a retention candidate.
-  - Persistent `failed` visits point to infrastructure instead, for example
-    an unavailable DC. They are not this issue.
-- For each candidate, inspect read-only:
-  - whether the commit row exists;
-  - whether HEAD equals the commit's parent;
-  - the row's `staged_block_ids`.
+- **Freshness first.** The backlog gauges change only when a sweep lists every
+  bucket. After a listing error they keep the previous value. Trust a node's
+  backlog only when its last complete sweep is recent, and account for the
+  sweep span.
+- **Revisits.** Healthy rows settle within minutes. There is no guaranteed
+  revisit interval: the 6 h retry cap bounds only a process-local backoff,
+  and the sweep is sequential.
+- **The 24 h threshold.** An oldest pending age above 24 h on a fresh node is
+  an operational investigation threshold, not a measured or guaranteed
+  bound.
+- **Outcomes.** `retained` is an inconclusive visit that returned no error.
+  `failed` is a visit that returned an error. That covers walk problems (the
+  1024-node chunk limit, an ancestry cycle, a malformed or unreadable parent)
+  as well as operational causes such as an unavailable DC. Neither outcome
+  rules out retention, and neither series names the rows.
+- **Inspect each row read-only** from the repair table:
+  - commit row present;
+  - HEAD equal to the commit's parent;
+  - walk cursor (`reachability_cursor_commit_id`);
+  - `staged_block_ids`.
 
-  Classify the row as one of the issue's three shapes: idle library, missing
-  commit row, or incomplete walk.
+  Classify the row as one of the issue's shapes, or as an operational cause.
 
-These series do not explain why a row was retained. They also give one node's
-view and count the rows, not the bytes those rows pin. Adding a retain reason
-and a pinned-bytes estimate is Phase 2, a separate code change made only if
+These series do not say why a row was retained. They give per-node
+observations and count rows, not the bytes those rows pin. A retain reason
+and a pinned-bytes estimate are Phase 2: a separate code change, made only if
 Phase 1 shows real retention.
 
 ## What is deliberately not here

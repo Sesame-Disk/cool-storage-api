@@ -7695,37 +7695,72 @@ that a possibly-applied HEAD CAS did not publish". The HEAD CAS
 not bound when a paused writer can still publish. Any cleanup must pass
 [PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md](./PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md) §6.
 
-**Which rows stay retained today.** After E1-15E, a library that receives
-any later commit settles the row as SUPERSEDED. Three shapes remain, and
-each ends in a clean native UNKNOWN visit (`retained`), not `failed`:
+**What a later HEAD does to a retained row.** A visit classifies the row
+from the evidence it can read:
 
-1. HEAD still equals the repair commit's parent: the library was idle after
-   the crash. This settles by itself on the library's next commit.
-2. The commit row is missing: a crash between repair queueing and
-   `insertCommit`, or a loser cleanup that deleted the commit and then
-   failed to clear the row. The parent read returns not-found, the
-   SUPERSEDED witness is empty, and the visit stays UNKNOWN.
-3. Ancestry the resumable walk cannot complete.
+- **REACHABLE.** HEAD contains the repair commit: `fs:` is promoted and the
+  row is settled.
+- **SUPERSEDED** (E1-15E/F). HEAD moved on without the commit, and the walk
+  reached the commit's own parent as a valid witness: only the repair-owned
+  `pub:` and the row are removed.
+- **UNKNOWN.** The evidence is incomplete, so the row is retained.
 
-An unavailable DC shows up as `failed` visits instead. It retains until
-recovery and is not this issue.
+A later commit in the library therefore resolves the row only when one of
+the first two outcomes can be proven. Three shapes stay retained:
+
+1. **HEAD still equals the repair commit's parent** (the library has been idle
+   since the crash). If the commit row exists, the next library commit that
+   moves HEAD lets the walk reach that parent, and the row settles as
+   SUPERSEDED, or as REACHABLE if the new HEAD contains the commit.
+2. **The commit row is missing.** This happens after a crash between repair
+   queueing and `insertCommit`, or after a loser cleanup that deleted the
+   commit and then failed to clear the row. The parent read returns
+   not-found, so there is no SUPERSEDED witness. The visit stays a clean
+   UNKNOWN even after HEAD moves.
+3. **Ancestry the walk cannot complete.** This covers the 1024-node chunk
+   limit (the cursor advances, but that visit returns an error), an ancestry
+   cycle, a malformed parent, or a failed parent read. These visits return an
+   error.
+
+**How visit outcomes map to the shapes.** `retained` means the visit ended
+inconclusive without an error, which is typical of shapes 1 and 2.
+`failed` means the visit returned an error. That includes shape 3 and
+operational causes such as an unavailable DC or a timeout. `failed` does not
+rule out retention: investigate its cause.
 
 **Phase 1: existing signals, no code.** Use the metrics in
 [PUBLISH-REPAIR-OBSERVABILITY.md](./PUBLISH-REPAIR-OBSERVABILITY.md#abandoned-repair-retention-pre-gc-measurement):
 
-- `publish_repair_pending_rows`;
-- `publish_repair_oldest_pending_age_seconds`;
-- `publish_repair_visits_total{outcome="retained"}` versus `failed`.
+- `publish_repair_pending_rows` and
+  `publish_repair_oldest_pending_age_seconds`. These are per-node gauges,
+  updated only by a sweep that listed every bucket.
+- `publish_repair_last_complete_sweep_timestamp_seconds` and
+  `publish_repair_sweep_duration_seconds`, to check that those gauges are
+  fresh.
+- `publish_repair_visits_total` by outcome. This counter is aggregate and
+  does not identify the row behind an outcome.
 
-A healthy row settles within minutes: the request-local promotion, or the
-first sweep after its advisory 5 min scheduling lease (`lease_expires_at`
-never authorizes cleanup; sweep every 1 min). A `retained` visit schedules
-a retry with backoff capped at `publishedBlockReferenceRepairRetryMax`
-(6 h), so a retained row is revisited at least that often. A row still pending after
-24 h (four maximum retry intervals) while visits end `retained`, not
-`failed`, is a retention candidate. Investigate it read-only: commit row
-present, HEAD equal to its parent, `staged_block_ids`. Record the count, age
-and shape per environment.
+A healthy row settles within minutes, through the request-local promotion
+or a sweep shortly after its advisory 5 min scheduling lease
+(`lease_expires_at` never authorizes cleanup). Revisits are not guaranteed
+on any schedule:
+- the 6 h `publishedBlockReferenceRepairRetryMax` caps a process-local
+  backoff, which "does not bound how soon the discovery sweep will visit the
+  row again";
+- the sweep is sequential, so its span depends on backlog and on Cassandra.
+
+**24 h is an operational investigation threshold, not a revisit
+guarantee.** On a node whose last complete sweep is fresh, an oldest pending
+age above 24 h makes that node's backlog a retention candidate, whether its
+visits end `retained` or `failed`. Find the rows themselves read-only (list
+the repair table) and, for each one, check:
+- whether the commit row exists;
+- whether HEAD equals the commit's parent;
+- whether the walk progressed (`reachability_cursor_commit_id`);
+- its `staged_block_ids`.
+
+Classify each row into a shape, or into an operational cause, and record the
+count, age and shape per environment.
 
 **Phase 2: only if Phase 1 shows real retention.** Add the missing
 observability as a separate code PR. Today `retained` "proves neither why
@@ -7734,8 +7769,8 @@ shapes above and an estimate of the blocks/bytes those rows pin. No gate
 reads it.
 
 **Phase 3: disposition before A1, from the data.**
-- **Shape 1** is self-healing with library activity; accepting it with
-  monitoring is a legitimate outcome.
+- **Shape 1** resolves with library activity when its commit row exists;
+  accepting it with monitoring is a legitimate outcome.
 - **Shapes 2 and 3**, if material, need authority rather than time: a
   durable cancellation that the original writer's HEAD CAS cannot outrun.
   That means a check in the same serial domain as HEAD (E1-15D option B) or
