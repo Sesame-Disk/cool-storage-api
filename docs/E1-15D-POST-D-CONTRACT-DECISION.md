@@ -130,8 +130,8 @@ of L after D1 do not authorize, cancel or postpone deleting P1"), not as new
 architecture. See [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md). Consequences
 there: E1-15A/B move from PRE-X1 to PRE-GC with severity unchanged. Which
 convergence items gate A1 is still decided per issue tag;
-`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` keeps its FOLLOW-UP / GENERAL
-scope pending its own decision. Section 2 remains the authority record, except
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` kept its FOLLOW-UP / GENERAL
+scope here. Its own decision (2026-10-12) made it P2 PRE-GC, measure first. Section 2 remains the authority record, except
 that its row "HEAD ≠ c1.parent" is superseded by the SUPERSEDED settlement of
 [E1-15E](./E1-15E-ABANDONED-REPAIR-SETTLEMENT.md) and
 [E1-15F](./E1-15F-SUPERSEDED-CROSS-DC.md). The text below preserves the

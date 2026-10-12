@@ -8,6 +8,19 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-12 — Abandoned repair retention moved to PRE-GC
+
+Documentation only. `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` moves from
+FOLLOW-UP / GENERAL to P2 PRE-GC, because E1-15C measured an abandoned repair
+vetoing D of every later life of L. The plan:
+- measure first with the existing repair metrics (runbook section added);
+- add a retain reason only if the retention is real;
+- disposition it before A1 from that data.
+
+No TTL on the repair row: time-based cleanup was already removed by
+`ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01`, and the HEAD CAS has no deadline.
+X1 is unaffected.
+
 ## 2026-10-10 — E1-16 post-D contract alignment with G4
 
 Documentation only. The owner approved E1-15D §1 as alignment with G4 contract

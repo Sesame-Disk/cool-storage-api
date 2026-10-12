@@ -1,5 +1,15 @@
 # Known Issues - SesameFS
 
+## Abandoned repair retention moved to PRE-GC (2026-10-12)
+
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` is now **P2 PRE-GC**; it was
+FOLLOW-UP / GENERAL. An abandoned publication repair can keep every later
+life of L uncollectable (E1-15C), which defeats reclamation once destructive
+GC is on. It is not X1. The plan is to measure first: use the existing repair
+metrics, then add a retain reason only if the retention is real, then
+disposition it before A1 from that data. No TTL is put on the repair row;
+the issue entry explains why. Documentation only.
+
 ## E1-16 post-D contract alignment (2026-10-10)
 
 The X1 invariant is physical (G4 contract 5; D0 §3): a logical `up:`/`pub:`/`fs:`
@@ -7524,9 +7534,9 @@ keeps renewing, so its settlement also needs authority.
 
 ### ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01: A dead/unreachable publication's repair row surviving request-local cleanup can be retained and repeatedly re-pinned indefinitely
 
-**Status**: OPEN (2026-09-18; observed while reviewing the repair-worker observability, `feat/publish-repair-observability`; contract narrowed 2026-09-19) — FOLLOW-UP / GENERAL over-retention / reclamation efficiency; not a safety issue
-**Severity**: Medium (P2) — over-retention / reclamation efficiency: a genuinely dead/unreachable publication attempt whose repair row survived request-local cleanup has no terminal settlement path; successful unresolved visits can repeatedly refresh its 35-day `pub:`. No under-retention, no data loss. Does not block X1 safety closure. Does not block destructive-GC activation.
-**Scope**: FOLLOW-UP / GENERAL (storage cost and worker load; related to GC reclaim efficiency, but not a GC-activation gate)
+**Status**: OPEN — P2 PRE-GC since 2026-10-12, previously FOLLOW-UP / GENERAL (registered 2026-09-18 while reviewing the repair-worker observability, `feat/publish-repair-observability`; contract narrowed 2026-09-19). Over-retention / reclamation efficiency; not a safety issue. Measure before designing a fix (plan below)
+**Severity**: Medium (P2) — over-retention / reclamation efficiency: a genuinely dead/unreachable publication attempt whose repair row survived request-local cleanup has no terminal settlement path; successful unresolved visits can repeatedly refresh its 35-day `pub:`. No under-retention, no data loss. Does not block X1 safety closure. Must be measured, and dispositioned from that measurement, before destructive-GC activation (A1).
+**Scope**: PRE-GC (decided 2026-10-12): storage cost, worker load and GC reclaim efficiency. Not X1
 **Affected**: `CleanupFailedPublishAttempt` + `clearPendingPublishedFileRepairs` / `cleanupSeafHTTPFailedPublishAttempt` / `cleanupOnlyOfficeFailedPublishAttempt` (known-loser and pre-HEAD abort/rollback paths after the durable row is queued), `repairPublishedBlockReferenceRepairVisit` (UNKNOWN renewal of those residues)
 
 #### E1-15C evidence (2026-10-08)
@@ -7553,7 +7563,7 @@ Proposed, pending explicit decision: reconsider this as a pre-activation
 convergence gate (destructive GC would otherwise accumulate permanently
 uncollectable blocks). Scope line above is unchanged until decided.
 E1-16 (2026-10-10) approved the X1 contract split and left this scope
-unchanged. The gate question is a separate PRE-GC decision.
+unchanged. The gate question was decided on 2026-10-12: P2 PRE-GC (see below).
 
 **E1-15D correction (2026-10-09):** such a repair is *abandoned*, not provably
 dead. Real Sync `UpdateBranch?head=<its commit>` auto-merges the commit's
@@ -7666,6 +7676,72 @@ that fact is itself persisted as a durable, verifiable witness for that
 identity. Any design that would remove liveness must pass the gate of
 [PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md](./PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md)
 §6 (and the local-absence / observed-absence rule of §2.6 / §4.8).
+
+#### Decision and measurement plan (2026-10-12)
+
+The project owner moved this issue to **P2 PRE-GC**. E1-15C measured an
+abandoned repair vetoing D(P2) and every later life of L, so destructive GC
+would keep that content's storage indefinitely. That contradicts what A1
+activates GC for. It does not affect X1: nothing is reinstalled or lost.
+This change is documentation only. Measure first, and design a fix only if
+the measurement shows the retention matters.
+
+**Why no TTL on the repair row.** The row protects a publication that may
+already be in HEAD (crash after the HEAD CAS, before `fs:`). Time-based
+cleanup was the earlier pre-CAS lease, removed by
+`ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01` because lease expiry "is not proof
+that a possibly-applied HEAD CAS did not publish". The HEAD CAS
+(`UpdateLibraryHeadFromSnapshot`) carries no deadline, so elapsed time does
+not bound when a paused writer can still publish. Any cleanup must pass
+[PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md](./PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md) §6.
+
+**Which rows stay retained today.** After E1-15E, a library that receives
+any later commit settles the row as SUPERSEDED. Three shapes remain, and
+each ends in a clean native UNKNOWN visit (`retained`), not `failed`:
+
+1. HEAD still equals the repair commit's parent: the library was idle after
+   the crash. This settles by itself on the library's next commit.
+2. The commit row is missing: a crash between repair queueing and
+   `insertCommit`, or a loser cleanup that deleted the commit and then
+   failed to clear the row. The parent read returns not-found, the
+   SUPERSEDED witness is empty, and the visit stays UNKNOWN.
+3. Ancestry the resumable walk cannot complete.
+
+An unavailable DC shows up as `failed` visits instead. It retains until
+recovery and is not this issue.
+
+**Phase 1: existing signals, no code.** Use the metrics in
+[PUBLISH-REPAIR-OBSERVABILITY.md](./PUBLISH-REPAIR-OBSERVABILITY.md#abandoned-repair-retention-pre-gc-measurement):
+
+- `publish_repair_pending_rows`;
+- `publish_repair_oldest_pending_age_seconds`;
+- `publish_repair_visits_total{outcome="retained"}` versus `failed`.
+
+A healthy row settles within minutes: the request-local promotion, or the
+first sweep after its advisory 5 min scheduling lease (`lease_expires_at`
+never authorizes cleanup; sweep every 1 min). A `retained` visit schedules
+a retry with backoff capped at `publishedBlockReferenceRepairRetryMax`
+(6 h), so a retained row is revisited at least that often. A row still pending after
+24 h (four maximum retry intervals) while visits end `retained`, not
+`failed`, is a retention candidate. Investigate it read-only: commit row
+present, HEAD equal to its parent, `staged_block_ids`. Record the count, age
+and shape per environment.
+
+**Phase 2: only if Phase 1 shows real retention.** Add the missing
+observability as a separate code PR. Today `retained` "proves neither why
+the row was retained", so the PR would add a retain reason for the three
+shapes above and an estimate of the blocks/bytes those rows pin. No gate
+reads it.
+
+**Phase 3: disposition before A1, from the data.**
+- **Shape 1** is self-healing with library activity; accepting it with
+  monitoring is a legitimate outcome.
+- **Shapes 2 and 3**, if material, need authority rather than time: a
+  durable cancellation that the original writer's HEAD CAS cannot outrun.
+  That means a check in the same serial domain as HEAD (E1-15D option B) or
+  a proven equivalent.
+- In every outcome the settlement may remove only the repair-owned `pub:` and
+  the row, never `fs:<repo:fs_id>` (E1-15C/D).
 
 #### Related
 

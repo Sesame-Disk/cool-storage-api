@@ -307,8 +307,8 @@ Not W2 exit rows (follow-ups, may be reclassified in E1):
 `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01`,
 `ISSUE-SYNC-PUTBLOCK-READINESS-HOTPATH-COST-01`.
 E1-16 (2026-10-10) moved OWNED-PUB-CLEANUP-RACE and PROGRESS-PAXOS-DOMAIN from
-PRE-X1 to PRE-GC. DEAD-ROW-RETENTION stays FOLLOW-UP / GENERAL; making it a
-pre-activation gate is a separate PRE-GC decision.
+PRE-X1 to PRE-GC. DEAD-ROW-RETENTION was moved from FOLLOW-UP / GENERAL to P2
+PRE-GC on 2026-10-12, with a measure-first plan (§6).
 
 E1 evidence update (2026-10-03): with Cassandra plus pinned SILO
 `RELEASE.2026-09-16T00-00-00Z` (MinIO-compatible S3), a real delayed Sync PutBlock after terminal D
@@ -388,6 +388,7 @@ added here to count.
 | GC mapping resolver `CassandraStore.lookupBlockMapping()` reclassified from session consistency | `PCD1B3-PRE-GC-SESSION-CONSISTENCY-EXCEPTION` marker |
 | Library hard-delete lease: global SERIAL (✅ closed by PR #234) and fenced final batch | `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` (closed), `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` (open; current-runtime, §7) |
 | Post-D reference and R31 convergence moved from X1 by E1-16, severity unchanged: stale renewal after clear (E1-15A), writer post-D staging crash (E1-15B), known-loser durability (W2-12), repair discovery scale (W2-13), `pub:` zero-ref transition (W2-14), owned-`pub:` cleanup race and progress Paxos domain | `ISSUE-PUBLISH-REPAIR-STALE-RENEWAL-AFTER-CLEAR-01`, `ISSUE-PUBLICATION-POST-D-LIVENESS-BEFORE-VALIDATION-01`, `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01`, `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01`, `ISSUE-GC-PUB-REF-ZERO-REF-01`, `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01`, `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01` |
+| Abandoned publication repairs can keep every later life of L uncollectable (E1-15C). P2 PRE-GC since 2026-10-12, measure first: existing repair metrics, then a retain reason only if retention is real, then a disposition from the data. No TTL on the repair row; any cleanup needs authority the original writer's HEAD CAS cannot outrun | `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` |
 | Startup check refusing `GC_ENABLED=true` while any A1 gate item (tagged entry or row above) is open | first A1 item |
 
 Closed by the greenfield precondition, not carried into A1: Technical Debt

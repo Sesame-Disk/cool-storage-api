@@ -322,6 +322,45 @@ visit-outcome series (`publish_repair_visits_total`) without any
 corresponding event here, so `pending_rows` rising while these rates stay
 flat is a valid — and informative — combination.
 
+## Abandoned repair retention (PRE-GC measurement)
+
+Phase 1 of the measurement plan in
+[`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01`](./KNOWN_ISSUES.md#issue-publish-repair-dead-row-retention-01-a-deadunreachable-publications-repair-row-surviving-request-local-cleanup-can-be-retained-and-repeatedly-re-pinned-indefinitely)
+(P2 PRE-GC since 2026-10-12) uses only the series above. It adds no code and
+no gate.
+
+```promql
+# Backlog and the oldest row, per node (see scope)
+max(publish_repair_pending_rows)
+max(publish_repair_oldest_pending_age_seconds)
+
+# Do unresolved visits end clean (retained) or with errors (failed)?
+sum by (outcome) (increase(publish_repair_visits_total[6h]))
+```
+
+How to read it:
+
+- Healthy rows settle within minutes: the request-local promotion, or the
+  first sweep after the advisory 5 min scheduling lease, with a sweep every
+  1 min. A `retained` visit reschedules with backoff capped at 6 h
+  (`publishedBlockReferenceRepairRetryMax`).
+- An oldest pending age above **24 h** (four maximum retry intervals) while
+  visits keep ending `retained` marks a retention candidate.
+  - Persistent `failed` visits point to infrastructure instead, for example
+    an unavailable DC. They are not this issue.
+- For each candidate, inspect read-only:
+  - whether the commit row exists;
+  - whether HEAD equals the commit's parent;
+  - the row's `staged_block_ids`.
+
+  Classify the row as one of the issue's three shapes: idle library, missing
+  commit row, or incomplete walk.
+
+These series do not explain why a row was retained. They also give one node's
+view and count the rows, not the bytes those rows pin. Adding a retain reason
+and a pinned-bytes estimate is Phase 2, a separate code change made only if
+Phase 1 shows real retention.
+
 ## What is deliberately not here
 
 - **Remaining TTL of the repair-owned pins** ("oldest successful
