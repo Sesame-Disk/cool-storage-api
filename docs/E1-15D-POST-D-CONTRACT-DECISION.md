@@ -124,6 +124,19 @@ SHA-256 7e988a8bb98f9dfa1239921b42f4167218d8d5ab153957ca9a8045f3338f713f.
 
 ## Decision proposal (requires explicit approval)
 
+**Approval status (2026-10-10).** The project owner approved section 1 as an
+alignment with the G4 contract (2026-10-02, #247; G4 contract 5: "References
+of L after D1 do not authorize, cancel or postpone deleting P1"), not as new
+architecture. See [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md). Consequences
+there: E1-15A/B move from PRE-X1 to PRE-GC with severity unchanged. Which
+convergence items gate A1 is still decided per issue tag;
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` keeps its FOLLOW-UP / GENERAL
+scope pending its own decision. Section 2 remains the authority record, except
+that its row "HEAD ≠ c1.parent" is superseded by the SUPERSEDED settlement of
+[E1-15E](./E1-15E-ABANDONED-REPAIR-SETTLEMENT.md) and
+[E1-15F](./E1-15F-SUPERSEDED-CROSS-DC.md). The text below preserves the
+proposal as written.
+
 ### 1. Two contracts, stated separately
 
 | Contract | Statement | Measured status |

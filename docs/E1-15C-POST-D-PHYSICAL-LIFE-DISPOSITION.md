@@ -2,6 +2,12 @@
 
 Frozen base: main@304f6da8f7c30e4ad816d17d061dcde6816c0854 (#272 merged).
 
+> **Decision (2026-10-10):** the contract reconciliation proposed here was
+> approved as alignment with G4 contract 5 ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)).
+> The strict "no post-D reference" reading is retired. Post-D references and
+> abandoned repairs are retention/convergence (PRE-GC or follow-up). The
+> physical results below are unchanged.
+
 ## Question
 
 E1-15A/B showed that current code can leave references on block L that were

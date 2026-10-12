@@ -1,5 +1,18 @@
 # R3 liveness-continuity characterization
 
+## E1-16 post-D contract alignment (2026-10-10)
+
+[E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md) aligns the W2 criterion with G4
+contract 5: a logical reference of L written after COMMITTED D(P1) is not a
+P1 dependency. With that reading, and source arguments over current code,
+[X1 §4](./X1-CRITICAL-PATH.md#4-w2-exit-checklist) records the Sync rows
+(PutBlock → HEAD, retry from another pod, no-PutBlock, `recv-fs-before-put`)
+and the other adopted funnels as CLOSED for X1. Their post-HEAD R31 safety
+rests on the shared EACH_QUORUM repair guard. Content resurrection (W2-10)
+stays OPEN, so R3 remains OPEN. The provenance table below is a
+characterization snapshot; its `CONDITIONAL`/`UNKNOWN` cells describe
+temporal premises of each row and do not define current closure state.
+
 ## Greenfield first-production reconciliation (2026-09-30)
 
 W2-0 is **CLOSED-EVIDENCE for the covered current-version mechanism** under

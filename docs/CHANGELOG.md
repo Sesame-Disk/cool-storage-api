@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-10 — E1-16 post-D contract alignment with G4
+
+Documentation only. The owner approved E1-15D §1 as alignment with G4 contract
+5: X1 is physical, and a logical reference of L after COMMITTED D(P1) is not a
+P1 dependency. Verified against main@5c3163871: the funnel-independent
+EACH_QUORUM repair guard (repair rows have no TTL), Sync all-block validation
+regardless of provenance, `RecvFS` publishing nothing, and full recursive
+cross-repo capture. W2-1..9 and W2-12..14 are CLOSED for X1; W2-10 stays
+OPEN. E1-15A/B and the R31 convergence residuals move from PRE-X1 to PRE-GC
+with severity unchanged. Stale status text for #276/#261 is corrected. No
+runtime, test, guard or GC change.
+
 ## 2026-10-06 — RevertDirents unpublished file source admission
 
 Require settled historical permanent references and validate original physical

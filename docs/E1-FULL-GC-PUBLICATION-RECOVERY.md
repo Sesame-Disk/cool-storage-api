@@ -1,13 +1,13 @@
 # E1 — Full-GC publication and recovery evaluation
 
-Status: ACTIVE; E1-15F on claude/e1-15f-superseded-cross-dc, following merged #275 (main@e7a83ea789e8): 3-DC evidence for SUPERSEDED plus a parent-read liveness fix. Before it, E1-15E (#275): the repair worker settles superseded abandoned repairs (option A of E1-15D §3), narrowing the PRE-GC retention. Before it, E1-15D (#274). E1-15D shows abandoned commits stay publishable via Sync auto-merge, and proposes the contract split and cancellation authority for approval. Before it, E1-15C on #273, E1-15C measures no physical (D0 §13) RED from post-D refs on Office; it shows that dead repairs veto later lives of L; a contract reconciliation is pending a decision. E1-15B confirms post-D writer staging liveness on crash (P1 PRE-X1 OPEN, characterized). E1-11 and the measured E1-12/E1-13 subsets have pre-D evidence; the measured E1-14 subset shows `pub:` expiry alone reaches no candidate; E1-15A found a stale-renewal post-D RED and compensated it (PARTIAL-FIX / CLOSED-EVIDENCE only when the global check and withdrawal succeed; strict guarantee OPEN P1 PRE-X1); W2-12/13/14, E1-15 overall and E1/X1 remain OPEN.
+Status: ACTIVE; E1-16 (post-D contract alignment with G4, docs only, base main@5c3163871803 with #276 and #261 merged): the X1 invariant is physical; W2-1..9 and W2-12..14 close for X1; W2-10, E1-01, the three-DC residuals (suite re-measured 2026-10-10), the D0 §25 list and one PRE-X1 audit debt remain ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)). The section "E1-16 — post-D contract alignment" below supersedes the PRE-X1 labels and strict post-D reading in the older status text that follows. Before it, E1-15F (#276): 3-DC evidence for SUPERSEDED plus a parent-read liveness fix. Before it, E1-15E (#275): the repair worker settles superseded abandoned repairs (option A of E1-15D §3), narrowing the PRE-GC retention. Before it, E1-15D (#274). E1-15D shows abandoned commits stay publishable via Sync auto-merge, and proposes the contract split and cancellation authority for approval. Before it, E1-15C on #273, E1-15C measures no physical (D0 §13) RED from post-D refs on Office; it shows that dead repairs veto later lives of L; a contract reconciliation is pending a decision. E1-15B confirms post-D writer staging liveness on crash (P1 PRE-X1 OPEN, characterized). E1-11 and the measured E1-12/E1-13 subsets have pre-D evidence; the measured E1-14 subset shows `pub:` expiry alone reaches no candidate; E1-15A found a stale-renewal post-D RED and compensated it (PARTIAL-FIX / CLOSED-EVIDENCE only when the global check and withdrawal succeed; strict guarantee OPEN P1 PRE-X1); W2-12/13/14, E1-15 overall and E1/X1 remain OPEN.
 Matrix frozen before E1 runtime edits: 2026-10-03. Base main@eabd93bee includes merged G5 PR #248 and the pinned SILO backend from PR #249. Scope: supported greenfield deployment with one compatible release. Destructive GC remains OFF.
 
 Tested storage backend: `docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z`, a MinIO-compatible S3 backend. The Compose service remains named `minio`; this ledger does not claim tests against the archived MinIO server image.
 
 ## Contract and disposition rules
 
-Evaluate current main's full G1→G5 executor and every current writer/repair funnel able to publish a block reference. X1 invariant: once exact physical life P1 has committed D1 (and separately after terminal retirement), no legitimate current-version operation may durably add a P1 reference or publish HEAD with reachable content depending on P1.
+Evaluate current main's full G1→G5 executor and every current writer/repair funnel able to publish a block reference. X1 invariant (aligned with G4 contract 3–5 by E1-16, 2026-10-10): once exact physical life P1 has committed D1 (and separately after terminal retirement), no legitimate current-version operation may reinstall P1 or make it canonical again, revoke or postpone D1, or publish HEAD/commit/tree content depending on retired P1; a possibly accepted publication keeps D-blocking liveness until its permanent `fs:` exists. References are logical liveness of L (D0 §3): an `up:`/`pub:`/`fs:` row of L written after D1 is not a P1 dependency, and its retention is PRE-GC convergence. (Replaced wording: "may durably add a P1 reference or publish HEAD with reachable content depending on P1".)
 
 A surviving S3 byte alone is not a logical reference. Inspect exact canonical P/D lifecycle and durable root, (storage_class, storage_key), block_references, commit/HEAD/tree ancestry, bytes, repair rows. Read with production EACH_QUORUM/SERIAL where used. Settle ambiguous writes as UNKNOWN; timeout alone proves neither result.
 
@@ -542,3 +542,28 @@ settlement first (durable authority over the original attempt plus a
 concurrency analysis against Sync promotion, which takes its own
 protection); global commit cancellation is a fallback, not a requirement.
 A settlement never removes `fs:<repo:fs_id>`. No severity changed.
+
+## E1-16 — post-D contract alignment
+
+[E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md) records the owner's approval of
+E1-15D §1 on 2026-10-10 as alignment with G4 contract 3–5 (#247): D0 §3 already
+defines references as logical liveness of L, and the COMMITTED recovery path
+never consults L's new references (`internal/gc/worker.go`). The invariant
+paragraph above now states the physical reading. The frozen matrix RED
+conditions were already physical and are unchanged.
+
+Against code read at main@5c3163871803, the R31 safety rests on a
+funnel-independent guard: repair rows have no TTL, and the destructive
+EACH_QUORUM scan matches `staged_block_ids` regardless of classification or
+writer. Every repair-adopting funnel queues before HEAD. Sync validates every
+added block after repair regardless of provenance, `RecvFS` publishes nothing,
+and cross-repo copy captures and re-validates the full recursive block set.
+X1 dispositions: W2-1..9 and W2-12..14 CLOSED for X1; W2-10 OPEN.
+E1-15A/B and the R31 convergence residuals move from PRE-X1 to PRE-GC with
+severity unchanged. The 2026-10-02 G4 cross-audit dependency is CLOSED-EVIDENCE
+for repair-adopting funnels (E1-2/E1-11).
+
+Still before X1 CLOSED: W2-10 (E1-17); E1-01, first inventoried against the
+existing G1–G5 crash evidence; the three-DC residuals (28 of 30 G5 failures now pass); the D0 §25
+reclassification list; and the identity claim-table PRE-X1 audit debt.
+No runtime, test or guard changed. GC stays OFF.

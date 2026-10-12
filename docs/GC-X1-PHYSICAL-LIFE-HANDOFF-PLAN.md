@@ -736,6 +736,14 @@ That is only safe once the full writer side is closed (W2).
 The GC protocol must not change this semantic until the writer PRs are merged.
 Until then, post-D refs remain a contradiction/veto (`CURRENT / TRANSITIONAL`).
 
+> **Superseded by G4 (2026-10-02, #247), recorded by E1-16 (2026-10-10):**
+> COMMITTED recovery no longer treats post-D refs of L as a veto
+> (`internal/gc/worker.go`: "Never consult L's new references as authority
+> over the retired P1"). A post-D `up:`/`pub:`/`fs:` of L is liveness of L
+> that protects only a later life. X1 forbids reinstalling P1, revoking D1 or
+> publishing HEAD that depends on retired P1. See
+> [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md).
+
 ---
 
 ## 14. Writer protocol (`DECIDED`)
@@ -1099,6 +1107,12 @@ zero-proof
 Do not treat zero-proof itself as irreversible condemnation.
 
 Only after W2 may post-D refs stop being a contradiction/veto.
+
+E1-16 (2026-10-10) records how this criterion reads after G4: "depends on P1"
+means publishing HEAD content that needs retired P1, reinstalling P1, or
+revoking/postponing D1, plus R31 safety for a possibly accepted publication.
+A logical reference of L written after D1 is not such a dependency. See
+[X1 §4](./X1-CRITICAL-PATH.md#4-w2-exit-checklist).
 
 ### G1 — P4c-orphan exact identity + minimum durable discovery
 

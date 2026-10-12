@@ -1,5 +1,14 @@
 # G5 expanded three-DC validation, 2026-10-02
 
+> **Re-measured 2026-10-10 ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md#full-three-dc-suite-2026-10-10)):**
+> on a fresh three-DC fixture at main@5c3163871, 28 of the 30 integration
+> failures listed below pass. API is 20/20, OIDC passes and Seafile sync is
+> 10/11. `TestBlockMappingAuthority3DC` SKIPs, as it needs its own script.
+> `TestMultiInstanceSeafHTTPUploadWhileMovingNoLostFiles` remains
+> intermittent (`ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01`). The new
+> failures are classified in E1-16; none is an X1/W2 safety violation. The
+> record below is the original 2026-10-02 snapshot.
+
 This record separates complete PASS, observed FAIL and unexecuted phases. The
 full suite is not a global PASS, and absence of regressions is not established.
 First production is greenfield; no old deployment or mixed-version recovery

@@ -1,5 +1,23 @@
 # X1 critical path — reset to the #201 roadmap
 
+## E1-16 post-D contract alignment (2026-10-10)
+
+The project owner approved E1-15D §1 as alignment with the G4 contract
+(2026-10-02, #247), not as new architecture. The X1 invariant is physical:
+after exact COMMITTED D(P1), nothing may reinstall P1, revoke or postpone D1,
+or publish HEAD content that depends on retired P1. Logical `up:`/`pub:`/`fs:`
+references of L written after D1 are liveness of L (D0 §3, G4 contract 5);
+their retention is PRE-GC convergence. Against code read at main@5c3163871:
+W2-1..9 and W2-12..14 close for X1 (see §4). The R31 safety rests on the
+shared EACH_QUORUM repair guard, and the Sync, RecvFS and cross-repo source
+arguments are recorded in E1-16. W2-10 stays OPEN. E1-15A/B and the R31
+convergence residuals move from PRE-X1 to PRE-GC with their severity
+unchanged, so they still block A1. Remaining before X1 CLOSED: W2-10, E1-01,
+the three-DC residuals (suite re-measured 2026-10-10), the D0 §25 reclassification list and one PRE-X1 audit
+debt. See [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md). Dated entries below
+are historical snapshots, and their "remains OPEN" statements for W2 rows are
+superseded by §4. GC stays OFF.
+
 ## G5 covered development contract validated (2026-10-02)
 
 G4 is merged in #247, main@b57f5ce69. The [G5 implementation plan](./GC-G5-IMPLEMENTATION-PLAN.md)
@@ -185,6 +203,15 @@ of W2) and the R31 residuals named in #201 §16. Criterion for every row
 (#201 §25 W2): once D(P1) is committed, no legitimate writer may later publish
 durable liveness that depends on P1.
 
+Reading of "depends on P1" (E1-16, 2026-10-10; D0 §3/§12, G4 contract 3–5):
+a writer depends on P1 when it publishes HEAD/commit/tree content whose
+resolution needs retired P1, reinstalls P1, or revokes/postpones D1. A
+possibly accepted publication must also keep D-blocking liveness until its
+permanent `fs:` exists (R31 safety). A logical reference of L written or
+renewed after D1 does not depend on P1: G4 recovery ignores it and it protects
+only a later life. Its unbounded retention is PRE-GC convergence, not a W2
+violation.
+
 Row states:
 
 | State | Meaning |
@@ -205,37 +232,40 @@ adds a funnel later does not.
 | # | Row (R3 source) | Today | Tracking | State |
 |---|---|---|---|---|
 | W2-0 | **Cross-cutting:** continuous own liveness through HEAD, including the 48h `up:` and 35d `pub:` TTLs | Baseline TTL pins allowed expiry after exact-P and before HEAD. Current covered chains acquire a non-expiring repair before final exact-P; destructive absence observes that repair at EACH_QUORUM, with a final reference re-read covering promotion. A late acquisition must reject the settled deleting claim | R3 table; `ISSUE-W2-PUBLISH-PIN-EXPIRY-BEFORE-HEAD-01`; R31 | **CLOSED-EVIDENCE** for the covered current-version mechanism under the first-production contract: durable repair before final exact-P, destructive EACH_QUORUM observation, final reference re-read, native wire/SIGKILL/recovery and 3-DC evidence. No independent current-version W2-0 residual identified; R31 settlement/liveness and unadopted funnels remain their own OPEN rows |
-| W2-1 | `CreateFileFromBlocks`, exact session `up:` | pre-HEAD proven with the W2-0 mechanism (#204/#205) | — | OPEN through R31 (W2-12..14; W2-11 covered current-version safety closed): known-loser durability, discovery bound and zero-ref transition; covered pre-HEAD continuity re-audited against closed W2-0 and real wire/SIGKILL evidence |
-| W2-2 | `CreateFileFromBlocks`, foreign `fs:` reuse / dedup | W1 proven through HEAD with the W2-0 mechanism (#202) | — | OPEN through R31 (W2-12..14; W2-11 covered current-version safety closed): known-loser durability, discovery bound and zero-ref transition; covered pre-HEAD continuity re-audited against closed W2-0 and real wire/SIGKILL evidence |
-| W2-3 | Sync `PutBlock` → HEAD, and Sync retry from another pod | pre-HEAD proven for the PutBlock-provenanced subset, incl. cross-DC (#206/#210) | `ISSUE-SYNC-PUTBLOCK-EXPIRED-PROVENANCE-01` | OPEN |
-| W2-4 | Sync commit whose block had no associated PutBlock | Every added canonical placement is captured and revalidated after durable repair; no Sync upload pin is fabricated. Ten real Cassandra/MinIO safety legs cover direct/auto-merge, GC-first rejection, fully retired P, successful controls, and repair ownership; RED on PR #244. See [investigation/fix](./W2-4-SYNC-NO-PUTBLOCK.md) | `ISSUE-W2-SYNC-NOPUTBLOCK-PREHEAD-01` | **CLOSED-FIX pre-HEAD**; post-HEAD W2-12..14 remain OPEN |
-| W2-5 | `recv-fs-before-put` | Ordered direct fresh/reuse/retirement subset CLOSED-EVIDENCE (E1-7); broader protocol/post-HEAD UNKNOWN | [E1-7 evidence](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md) / R3 table | OPEN overall; measured contract only |
-| W2-6 | v2 stored upload (`UploadFile`), materialized and reusable target | Adopts the W2-0 mechanism: passes its materialized placement to the shared finalizer (PR #237). Real-Cassandra evidence `TestW2UploadFileExactPlacementBeforeHead` (GC-committed and fully-retired placement before stage → 409, HEAD unchanged, `pub:` dropped); RED on the previous code | `ISSUE-PC0-EXACT-P-FUNNEL-GAP-01` (UploadFile part) | `CLOSED-FIX` pre-HEAD; post-HEAD through W2-12…W2-14 |
-| W2-6a | v2 `CreateFile`, Office-template block publication (empty-file path has no blocks) | Carries the actual materialized SHA-256/class/key to final exact-P after staging `pub:`. Nine real Cassandra/MinIO legs prove rejection when GC wins before validation, with 409, HEAD unchanged and cleanup. The follow-up adds real expiry-after-authority protection through a non-expiring repair gate; real wire/SIGKILL evidence now covers the current-version chain under the first-production contract | `ISSUE-PC0-EXACT-P-FUNNEL-GAP-01` (CreateFile part; PC-0 F1); `ISSUE-W2-PUBLISH-PIN-EXPIRY-BEFORE-HEAD-01`; [plan/evidence](./W2-6A-CREATEFILE-EXACT-P.md) | **OPEN** — exact-P and covered pre-HEAD continuity proved; post-HEAD R31 (W2-12..14: known-loser durability, discovery and zero-ref transition) remains OPEN; W2-11 covered safety closed |
-| W2-7 | SeafHTTP normal/streaming finalize | E1-5a single-shot and E1-5b streaming retain original materialized P through retries, validate after durable repair before HEAD, reject COMMITTED/TERMINAL; streaming same-tracker retry rematerializes only rejected blocks | [E1-5b evidence](./E1-5B-SEAFHTTP-STREAMING-PUBLICATION-SAFETY.md) / [E1-5a evidence](./E1-5A-SEAFHTTP-SINGLE-PUBLICATION-SAFETY.md) | **CLOSED-FIX measured single-shot and streaming pre-HEAD**; post-HEAD/R31 OPEN |
-| W2-8 | OnlyOffice callback | E1-4 retains original materialized exact P through durable repair and validates before HEAD; current-code COMMITTED/TERMINAL callbacks were RED | [E1-4 evidence](./E1-4-ONLYOFFICE-PUBLICATION-SAFETY.md) | **CLOSED-FIX for measured pre-HEAD contract**; post-HEAD cleanup/recovery and R31 remain OPEN |
-| W2-9 | Cross-repo copy/move | E1-09 captures source exact P per retry and checks it after durable repair before HEAD; productive source-purge COMMITTED/TERMINAL RED -> GREEN | [E1-09](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md) | CLOSED-FIX measured single-file/block plaintext same-org/representation pre-HEAD; broader W2-9/post-HEAD R31 OPEN |
+| W2-1 | `CreateFileFromBlocks`, exact session `up:` | pre-HEAD proven with the W2-0 mechanism (#204/#205) | — | **CLOSED** (E1-16): pre-HEAD CLOSED-FIX (#204/#205), re-audited against closed W2-0 and real wire/SIGKILL evidence; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard (W2-11..14). Convergence residuals are PRE-GC |
+| W2-2 | `CreateFileFromBlocks`, foreign `fs:` reuse / dedup | W1 proven through HEAD with the W2-0 mechanism (#202) | — | **CLOSED** (E1-16): pre-HEAD CLOSED-FIX (W1 #202), re-audited against closed W2-0 and real wire/SIGKILL evidence; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard (W2-11..14). Convergence residuals are PRE-GC |
+| W2-3 | Sync `PutBlock` → HEAD, and Sync retry from another pod | pre-HEAD proven for the PutBlock-provenanced subset, incl. cross-DC (#206/#210). Since W2-4, both Sync HEAD paths validate every added block's exact placement after durable repair regardless of provenance; expired provenance equals absent provenance | `ISSUE-SYNC-PUTBLOCK-EXPIRED-PROVENANCE-01` | **CLOSED-EVIDENCE** (E1-16): source argument over the W2-4 gate, which applies to any pod and to direct and auto-merge publication; W2-4 RED→GREEN legs, #206/#210 3-DC, E1-PUT-01. Post-HEAD through the shared repair guard |
+| W2-4 | Sync commit whose block had no associated PutBlock | Every added canonical placement is captured and revalidated after durable repair; no Sync upload pin is fabricated. Ten real Cassandra/MinIO safety legs cover direct/auto-merge, GC-first rejection, fully retired P, successful controls, and repair ownership; RED on PR #244. See [investigation/fix](./W2-4-SYNC-NO-PUTBLOCK.md) | `ISSUE-W2-SYNC-NOPUTBLOCK-PREHEAD-01` | **CLOSED** (E1-16): CLOSED-FIX pre-HEAD; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard |
+| W2-5 | `recv-fs-before-put` | Ordered direct fresh/reuse/retirement subset CLOSED-EVIDENCE (E1-7); broader protocol/post-HEAD UNKNOWN | [E1-7 evidence](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md) / R3 table | **CLOSED-EVIDENCE** (E1-16): `RecvFS` stores fs objects only, without HEAD or block references, so every order reaches HEAD through the W2-4 Sync gate (direct or auto-merge); E1-7 measured continuations. Post-HEAD through the shared repair guard |
+| W2-6 | v2 stored upload (`UploadFile`), materialized and reusable target | Adopts the W2-0 mechanism: passes its materialized placement to the shared finalizer (PR #237). Real-Cassandra evidence `TestW2UploadFileExactPlacementBeforeHead` (GC-committed and fully-retired placement before stage → 409, HEAD unchanged, `pub:` dropped); RED on the previous code | `ISSUE-PC0-EXACT-P-FUNNEL-GAP-01` (UploadFile part) | **CLOSED** (E1-16): `CLOSED-FIX` pre-HEAD; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard |
+| W2-6a | v2 `CreateFile`, Office-template block publication (empty-file path has no blocks) | Carries the actual materialized SHA-256/class/key to final exact-P after staging `pub:`. Nine real Cassandra/MinIO legs prove rejection when GC wins before validation, with 409, HEAD unchanged and cleanup. The follow-up adds real expiry-after-authority protection through a non-expiring repair gate; real wire/SIGKILL evidence now covers the current-version chain under the first-production contract | `ISSUE-PC0-EXACT-P-FUNNEL-GAP-01` (CreateFile part; PC-0 F1); `ISSUE-W2-PUBLISH-PIN-EXPIRY-BEFORE-HEAD-01`; [plan/evidence](./W2-6A-CREATEFILE-EXACT-P.md) | **CLOSED** (E1-16): exact-P and covered pre-HEAD continuity CLOSED-FIX; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard (W2-11..14). Convergence residuals are PRE-GC |
+| W2-7 | SeafHTTP normal/streaming finalize | E1-5a single-shot and E1-5b streaming retain original materialized P through retries, validate after durable repair before HEAD, reject COMMITTED/TERMINAL; streaming same-tracker retry rematerializes only rejected blocks | [E1-5b evidence](./E1-5B-SEAFHTTP-STREAMING-PUBLICATION-SAFETY.md) / [E1-5a evidence](./E1-5A-SEAFHTTP-SINGLE-PUBLICATION-SAFETY.md) | **CLOSED** (E1-16): CLOSED-FIX single-shot and streaming pre-HEAD. The final exact-P read uses canonical state, not the `up:` row, so natural and controlled expiry share the path. Post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard |
+| W2-8 | OnlyOffice callback | E1-4 retains original materialized exact P through durable repair and validates before HEAD; current-code COMMITTED/TERMINAL callbacks were RED | [E1-4 evidence](./E1-4-ONLYOFFICE-PUBLICATION-SAFETY.md) | **CLOSED** (E1-16): CLOSED-FIX pre-HEAD; post-HEAD R31 safety CLOSED-EVIDENCE through the shared repair guard; post-HEAD cleanup is convergence (PRE-GC) |
+| W2-9 | Cross-repo copy/move | E1-09 captures source exact P per retry and checks it after durable repair before HEAD; productive source-purge COMMITTED/TERMINAL RED -> GREEN | [E1-09](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md) | **CLOSED** (E1-16): CLOSED-FIX for the measured subset, plus CLOSED-EVIDENCE for directories and multi-block, which run the same recursive copy, full-set capture and identical-set validation. Cross-representation copy is rejected before copying. Cross-DC through the shared fence/guard 3-DC evidence. Post-HEAD R31 safety through the shared repair guard |
 | W2-10 | Content resurrection: `RevertFile`, `RevertDirectory`, `RestoreTrashItem`, `RevertDirents` | Narrow retained-history schedules block GC before D. E1-10e additionally executes real COMMITTED/TERMINAL unpublished-source RED for a RevertDirents root file and adds settled historical fs: admission via LQ→EQ fallback plus original exact-P capture/per-HEAD revalidation. No own up:/pub:/repair. | [retained-file evidence](./E1-6-REVERTFILE-PUBLICATION-SAFETY.md), [E1-10d retained dirent](./E1-10D-REVERTDIRENTS-RETAINED-HISTORY.md), [E1-10e RED/fix](./E1-10E-W210-RESIDUAL-DISPOSITION.md) / `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01` | CLOSED-FIX measured RevertDirents file source-admission subset only. W2-10 overall, continuous liveness through HEAD, directories/broader batches, other handlers, retention/Phase5/6 and R31 OPEN |
 | W2-11 | R31: repair after HEAD — renewal after classify | Current non-expiring repair blocks a new D even with zero real refs during/after classification; REACHABLE installs fs: before removing repair; UNKNOWN/errors retain protection | [E1-11 evidence](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md) / `ISSUE-PUBLISH-REPAIR-RENEWAL-AFTER-CLASSIFY-01` | **CLOSED-EVIDENCE covered current-version pre-D safety contract**; no discovery/convergence bound, concurrent cleanup closure or post-COMMITTED revocation claim |
-| W2-12 | R31: known-loser durability | Office definitive-loser crash pre-D safety measured: actual negative CAS, SIGKILL, TTL expiry, productive GC guard and fresh-process UNKNOWN sweeps | [E1-12 evidence](./E1-12-KNOWN-LOSER-CRASH-SAFETY.md) / `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01` | **OPEN overall** — no durable loser witness or eventual cleanup/convergence authority; Office measured subset **CLOSED-EVIDENCE pre-D only** |
-| W2-13 | R31: repair discovery bound | Office real earlier-bucket backlog delays target execution; direct EQ repair guard vetoes D before target visit; fresh-process native UNKNOWN discovery/renewal | [E1-13 evidence](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md) / `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01` | **OPEN overall** discovery/convergence/scale; measured Office delayed-discovery pre-D subset **CLOSED-EVIDENCE**; no SLA/fairness or bounded completion |
-| W2-14 | R31: `pub:` zero-ref transition | Office real `pub:` (with and without durable repair) retired by actual TTL to global zero refs: productive Phase 0/1 and worker create no candidate/queue/D; P1/K1 retained; later native UNKNOWN renews exact repair-owned `pub:`. A causal mutation giving `pub:` the `up:` expiry projection yields a productive candidate | [E1-14 evidence](./E1-14-PUB-ZERO-REF-TRANSITION.md) / `ISSUE-GC-PUB-REF-ZERO-REF-01` | **OPEN overall** transition/convergence (dead block retained, P2 follow-up); measured safety subset **CLOSED-EVIDENCE / NOT-X1-RED**: `pub:` expiry alone cannot reach D |
+| W2-12 | R31: known-loser durability | Office definitive-loser crash pre-D safety measured: actual negative CAS, SIGKILL, TTL expiry, productive GC guard and fresh-process UNKNOWN sweeps | [E1-12 evidence](./E1-12-KNOWN-LOSER-CRASH-SAFETY.md) / `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01` | **CLOSED-EVIDENCE for X1** (E1-16): only REACHABLE promotes, UNKNOWN retains, and the funnel-independent guard vetoes D (E1-12). Durable loser witness and cleanup/convergence → PRE-GC (`ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01`) |
+| W2-13 | R31: repair discovery bound | Office real earlier-bucket backlog delays target execution; direct EQ repair guard vetoes D before target visit; fresh-process native UNKNOWN discovery/renewal | [E1-13 evidence](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md) / `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01` | **CLOSED-EVIDENCE for X1** (E1-16): the guard reads the repair table directly, independent of discovery, classification and writer (E1-13). Discovery, scale and convergence (no SLA, fairness or bounded completion) → PRE-GC (`ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01`) |
+| W2-14 | R31: `pub:` zero-ref transition | Office real `pub:` (with and without durable repair) retired by actual TTL to global zero refs: productive Phase 0/1 and worker create no candidate/queue/D; P1/K1 retained; later native UNKNOWN renews exact repair-owned `pub:`. A causal mutation giving `pub:` the `up:` expiry projection yields a productive candidate | [E1-14 evidence](./E1-14-PUB-ZERO-REF-TRANSITION.md) / `ISSUE-GC-PUB-REF-ZERO-REF-01` | **CLOSED-EVIDENCE for X1** (E1-16): `pub:` expiry alone cannot reach D (E1-14, NOT-X1-RED). Transition and convergence (dead block retained) → PRE-GC (`ISSUE-GC-PUB-REF-ZERO-REF-01`) |
 
 E1-15A (shared repair cancellation, not a W2 row): a stale visitor that has
 passed its durable re-check no longer leaves a post-D `pub:` after a
 legitimate clear when its global check and withdrawal both succeed. RED on #270 main, mitigated by an
 EACH_QUORUM-confirmed withdrawal after the write. The measured Office subset is
 PARTIAL-FIX / CLOSED-EVIDENCE on that path only. The write itself is not
-fenced, so crash, check/withdraw errors and ambiguous renewal keep the strict
-guarantee OPEN (P1 PRE-X1); E1-15 overall stays OPEN
+fenced, so crash, check/withdraw errors and ambiguous renewal can leave the
+pin (P1). Under the E1-16 alignment, that residual pin is a logical reference
+of L: it does not reinstall P1 or reach HEAD. Its scope moves from PRE-X1 to
+PRE-GC with severity unchanged
 ([evidence](./E1-15A-STALE-REPAIR-VISITOR-CANCELLATION.md),
 `ISSUE-PUBLISH-REPAIR-STALE-RENEWAL-AFTER-CLEAR-01`).
 
 E1-15B (writer post-D staging crash, not a W2 row): a real CreateFile writer
 resumed after exact COMMITTED D stages `pub:` before its final fence. Without
 a crash the fence rejects it (pre-HEAD holds). SIGKILL leaves the `pub:`
-durable, and after repair queueing every sweep renews it post-D. P1 PRE-X1
-OPEN, characterized and not fixed
+durable, and after repair queueing every sweep renews it post-D. Characterized
+and not fixed. The harm is retention of later lives, with no HEAD advanced and
+no P1 reinstalled (E1-15C). Under E1-16 the scope is P1 PRE-GC, formerly PRE-X1
 ([evidence](./E1-15B-WRITER-POST-D-STAGING-CRASH.md),
 `ISSUE-PUBLICATION-POST-D-LIVENESS-BEFORE-VALIDATION-01`). W2-6a pre-HEAD
 status is unchanged.
@@ -243,9 +273,9 @@ status is unchanged.
 E1-15C (physical disposition, not a W2 row): on Office, post-D references and a
 dead repair do not reinstall P1 or block its TERMINAL retirement, and a
 rematerialized P2 is published legitimately. No physical (D0 §13) RED was
-measured. The strict E1 "no post-D reference" reading stays RED. The
-demonstrated harm is that a dead repair vetoes D of every later life of L. A
-contract reconciliation is proposed for explicit decision
+measured. The demonstrated harm is that an abandoned repair vetoes D of every
+later life of L. The strict E1 "no post-D reference" reading was retired by
+E1-16 (2026-10-10), which aligns it with G4 contract 5
 ([evidence](./E1-15C-POST-D-PHYSICAL-LIFE-DISPOSITION.md)). No severity is
 lowered.
 
@@ -266,8 +296,9 @@ Proposed for explicit approval: X1 = physical invariant; post-D references
 and abandoned repairs = PRE-GC convergence; a settlement needs durable
 authority over the original attempt and a concurrency analysis against
 Sync promotion, with global commit cancellation only as a fallback
-([decision](./E1-15D-POST-D-CONTRACT-DECISION.md)). No severity is changed
-until approved.
+([decision](./E1-15D-POST-D-CONTRACT-DECISION.md)). §1 was approved on
+2026-10-10 as alignment with G4 ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)).
+Severities are unchanged; scopes moved from PRE-X1 to PRE-GC.
 
 Not W2 exit rows (follow-ups, may be reclassified in E1):
 `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01`,
@@ -275,6 +306,9 @@ Not W2 exit rows (follow-ups, may be reclassified in E1):
 `ISSUE-PUBLISH-REPAIR-CROSS-CHUNK-CYCLE-01`,
 `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01`,
 `ISSUE-SYNC-PUTBLOCK-READINESS-HOTPATH-COST-01`.
+E1-16 (2026-10-10) moved OWNED-PUB-CLEANUP-RACE and PROGRESS-PAXOS-DOMAIN from
+PRE-X1 to PRE-GC. DEAD-ROW-RETENTION stays FOLLOW-UP / GENERAL; making it a
+pre-activation gate is a separate PRE-GC decision.
 
 E1 evidence update (2026-10-03): with Cassandra plus pinned SILO
 `RELEASE.2026-09-16T00-00-00Z` (MinIO-compatible S3), a real delayed Sync PutBlock after terminal D
@@ -353,6 +387,7 @@ added here to count.
 | Historical repair-health-gate proposal: E1-11 closes the covered current-version W2-11 pre-D safety contract through the existing non-expiring repair guard, without CLOSED-GATED or a new health gate. W2-12..14 and other PRE-GC requirements remain OPEN | [E1-11 disposition](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md) |
 | GC mapping resolver `CassandraStore.lookupBlockMapping()` reclassified from session consistency | `PCD1B3-PRE-GC-SESSION-CONSISTENCY-EXCEPTION` marker |
 | Library hard-delete lease: global SERIAL (✅ closed by PR #234) and fenced final batch | `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` (closed), `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` (open; current-runtime, §7) |
+| Post-D reference and R31 convergence moved from X1 by E1-16, severity unchanged: stale renewal after clear (E1-15A), writer post-D staging crash (E1-15B), known-loser durability (W2-12), repair discovery scale (W2-13), `pub:` zero-ref transition (W2-14), owned-`pub:` cleanup race and progress Paxos domain | `ISSUE-PUBLISH-REPAIR-STALE-RENEWAL-AFTER-CLEAR-01`, `ISSUE-PUBLICATION-POST-D-LIVENESS-BEFORE-VALIDATION-01`, `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01`, `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01`, `ISSUE-GC-PUB-REF-ZERO-REF-01`, `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01`, `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01` |
 | Startup check refusing `GC_ENABLED=true` while any A1 gate item (tagged entry or row above) is open | first A1 item |
 
 Closed by the greenfield precondition, not carried into A1: Technical Debt
@@ -390,8 +425,20 @@ X1 closure / A1 / GC ON until structurally closed or activation fails closed;
 it does not block GC-OFF G4/G5 development. A last refs==0 recheck in recovery
 does not eliminate the post-check publication race.
 
+Disposition (E1-16, 2026-10-10): **CLOSED-EVIDENCE for repair-adopting
+funnels.** The sequence's precondition, temporary zero → COMMITTED D1 while
+HEAD reaches a commit that depends on P1, is excluded. The writer's non-expiring repair is
+queued before HEAD, and the funnel-independent EACH_QUORUM guard vetoes a new
+D until promotion writes `fs:`. E1-11 and E1-2 measured this schedule. A later
+promotion writes a logical `fs:` on L, which cannot revoke D1 (G4). The
+W2-10 handlers queue no repair and stay under W2-10. A repair for a legitimate
+publication on a later life P2 (E1-15C C1) is outside this sequence.
+
 P2 follow-up: an already-authorized delayed PUT can recreate retired K1 bytes.
-Characterize physical resurrection/leak at E1/PRE-X1. The separate greenfield
+Characterize physical resurrection/leak at E1/PRE-X1. (E1-PUT-01, 2026-10-03,
+Sync PutBlock path: K1 bytes return without metadata and P1 is not
+reinstalled, so this is a storage leak, NOT-X1-RED. Formal reclassification of
+H belongs to the final E1 list.) The separate greenfield
 evaluation of empty-state legacy recovery remains recorded in
 GC-G4-IMPLEMENTATION-PLAN.md. The G4 plan contains the confirmed source chain
 and the current integration/monitoring corrections.
