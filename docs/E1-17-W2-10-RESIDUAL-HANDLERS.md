@@ -151,12 +151,21 @@ certification.
 - **Ordering.** As in E1-10e, admission runs before conflict, skip and
   same-content resolution. A non-admitted history therefore fails even when
   that request would not have published anything. This is fail-closed.
-- **Cost.** A directory restore now performs about seven admission reads per
-  file: library row, mapping, layout, reference and block, then the recheck.
+- **Cost.** In `main`, a directory restore already walked the subtree once
+  for the quota delta (`fsEntryDelta` → `collectDirStats`): one
+  `fs_objects` read per node, sequential, on every HEAD attempt. E1-17 adds
+  about seven reads per single-block file. Four per block are the admission
+  itself: `fs:` and exact P at capture, and again before HEAD. The rest are
+  partly avoidable:
+  - the `libraries` row is re-read for every file, though it is the same
+    row;
+  - the file layout read duplicates the stats walk;
+  - the SHA-1 mapping applies only to Sync blocks.
+
   Files are processed sequentially; blocks within a file run in parallel
-  (bound 20). Before this change it only read metadata. Large-directory
-  latency has not been measured; it is registered as
-  `ISSUE-RESURRECTION-ADMISSION-DIRECTORY-COST-01` (P2, measure first).
+  (bound 20). Large-directory latency has not been measured; it is
+  registered as `ISSUE-RESURRECTION-ADMISSION-DIRECTORY-COST-01` (P2,
+  measure first).
 
 **Post-HEAD.** The published entries keep their historical fs_ids:
 - `contentModifiedFileEntry` changes only name, mtime and modifier;

@@ -11778,9 +11778,21 @@ E1-17 made `RestoreTrashItem`, `RevertDirectory` and `RevertDirents` admit a dir
 - the canonical block row;
 - the `fs:` and exact-P recheck before HEAD.
 
-Files are walked sequentially, and blocks within a file run in parallel (bound 20). Before E1-17 a directory restore read only metadata, so very large directories may now be slow enough to approach request timeouts. This has **not** been measured.
+Files are walked sequentially, and blocks within a file run in parallel (bound 20).
 
-**Next step.** Measure restore latency for large directories. Optimize only if it matters: for example, read the library row once per request, or bound file-level concurrency. Do not weaken the per-file admission or turn a missing object into an empty directory.
+**Baseline.** Before E1-17, `main` already walked the subtree once for the quota delta (`fsEntryDelta` → `collectDirStats`): one `fs_objects` read per node, sequential, on every HEAD attempt. E1-17 therefore takes a directory restore from about one read per file to about eight. Of those, four per block are the admission itself (`fs:` and exact P, at capture and before HEAD). The rest are partly avoidable:
+- the `libraries` row is re-read for every file, though it is the same row;
+- the layout read duplicates the stats walk;
+- the SHA-1 mapping applies only to Sync blocks.
+
+Very large directories may approach request timeouts. This has **not** been measured.
+
+**Next step.** Measure restore latency for large directories. Optimize only if it matters:
+- read the library row once per request;
+- share the layout read with the stats walk;
+- bound file-level concurrency.
+
+Do not weaken the per-file admission or turn a missing object into an empty directory.
 
 ## ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01
 
