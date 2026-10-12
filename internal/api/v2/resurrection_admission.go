@@ -2,6 +2,7 @@ package v2
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -174,12 +175,115 @@ func (h *FSHelper) requireHistoricalFileReferences(orgID, repoID, fsID string, p
 	})
 }
 
-// Recheck the retained references and original exact P immediately before each
-// HEAD. Unknown, changed and claimed lives fail closed via the existing authority
-// primitive. The fallback does not close observation-to-HEAD continuity.
-func (h *FSHelper) validateRetainedHistoricalFile(orgID, repoID, fsID string, placements []commitBlockPlacement) error {
-	if err := h.requireHistoricalFileReferences(orgID, repoID, fsID, placements); err != nil {
+// retainedHistoricalSource is the admission evidence for one restored entry:
+// every file in it, with the exact placements captured for that file.
+type retainedHistoricalSource struct {
+	files []retainedHistoricalFile
+}
+
+type retainedHistoricalFile struct {
+	fsID       string
+	placements []commitBlockPlacement
+}
+
+// fs_ids are content-addressed, so a well-formed tree cannot nest this deep;
+// the bound stops a corrupt (cyclic) tree from recursing forever.
+const maxRetainedHistoricalDepth = 256
+
+// captureRetainedHistoricalEntry applies the file admission to a whole restored
+// entry. A directory is admitted only if every file in its historical subtree
+// is admitted.
+func (h *FSHelper) captureRetainedHistoricalEntry(orgID, repoID string, entry FSEntry) (retainedHistoricalSource, error) {
+	var source retainedHistoricalSource
+	err := h.collectRetainedHistoricalEntry(orgID, repoID, entry, 0, &source)
+	return source, err
+}
+
+func (h *FSHelper) collectRetainedHistoricalEntry(orgID, repoID string, entry FSEntry, depth int, source *retainedHistoricalSource) error {
+	if !isDirectoryEntry(&entry) {
+		placements, err := h.captureRetainedHistoricalFile(orgID, repoID, entry)
+		if err != nil {
+			return err
+		}
+		source.files = append(source.files, retainedHistoricalFile{fsID: entry.ID, placements: placements})
+		return nil
+	}
+	if depth >= maxRetainedHistoricalDepth {
+		return fmt.Errorf("historical directory nesting exceeds %d", maxRetainedHistoricalDepth)
+	}
+	children, err := h.readRetainedHistoricalDirectory(repoID, entry.ID)
+	if err != nil {
 		return err
+	}
+	for _, child := range children {
+		if err := h.collectRetainedHistoricalEntry(orgID, repoID, child, depth+1, source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Strict counterpart of GetDirectoryEntries for admission. That reader treats a
+// missing object as an empty directory, which here would admit an unread tree.
+func (h *FSHelper) readRetainedHistoricalDirectory(repoID, fsID string) ([]FSEntry, error) {
+	var kind, entriesJSON *string
+	if err := readHistoricalAdmissionRow(func(consistency gocql.Consistency) error {
+		kind, entriesJSON = nil, nil
+		if err := h.db.Session().Query(`SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Consistency(consistency).Scan(&kind, &entriesJSON); err != nil {
+			return err
+		}
+		if kind == nil {
+			return gocql.ErrNotFound
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("read historical directory: %w", err)
+	}
+	return parseRetainedHistoricalDirectory(fsID, *kind, entriesJSON)
+}
+
+func parseRetainedHistoricalDirectory(fsID, kind string, entriesJSON *string) ([]FSEntry, error) {
+	if kind != "dir" {
+		return nil, fmt.Errorf("historical directory %s has object type %q", fsID, kind)
+	}
+	raw := ""
+	if entriesJSON != nil {
+		raw = strings.TrimSpace(*entriesJSON)
+	}
+	// An empty directory is stored as "", "[]" or "null" (a marshalled nil slice).
+	if raw == "" || raw == "[]" || raw == "null" {
+		return nil, nil
+	}
+	var entries []FSEntry
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("historical directory %s is malformed: %w", fsID, err)
+	}
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.ID) == "" {
+			return nil, fmt.Errorf("historical directory %s has an entry without fs_id", fsID)
+		}
+	}
+	return entries, nil
+}
+
+// validateRetainedHistoricalSource rechecks every captured file immediately
+// before each HEAD: its own permanent references, then one exact-P authority
+// pass over the union of placements. Unknown, changed and claimed lives fail
+// closed via the existing authority primitive. The fallback does not close
+// observation-to-HEAD continuity.
+func (h *FSHelper) validateRetainedHistoricalSource(orgID, repoID string, source retainedHistoricalSource) error {
+	var placements []commitBlockPlacement
+	seen := make(map[commitBlockPlacement]bool)
+	for _, file := range source.files {
+		if err := h.requireHistoricalFileReferences(orgID, repoID, file.fsID, file.placements); err != nil {
+			return err
+		}
+		for _, placement := range file.placements {
+			if !seen[placement] {
+				seen[placement] = true
+				placements = append(placements, placement)
+			}
+		}
 	}
 	return (&FileHandler{db: h.db}).validateCommitBlockPublicationFences(orgID, placements)
 }

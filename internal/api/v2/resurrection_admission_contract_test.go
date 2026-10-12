@@ -91,11 +91,15 @@ func historicalAdmissionReadContract(raw []byte) error {
 		})
 		return true
 	})
-	if wrappers != 5 || queries != 5 {
+	// E1-10e added five reads; E1-17 adds the strict historical directory read.
+	if wrappers != 6 || queries != 6 {
 		return fmt.Errorf("scoped fallback wrappers=%d queries=%d", wrappers, queries)
 	}
+	// fs_objects is read twice: the historical file layout (E1-10e) and the
+	// strict historical directory listing (E1-17). Every other table once.
+	expected := map[string]int{"fs_objects": 2, "libraries": 1, "block_id_mappings": 1, "blocks": 1, "block_references": 1}
 	for table, count := range tables {
-		if count != 1 {
+		if count != expected[table] {
 			return fmt.Errorf("%s callback-bound reads=%d", table, count)
 		}
 	}
@@ -148,7 +152,7 @@ func TestHistoricalAdmissionReadsUseScopedFallback(t *testing.T) {
 	// Mutate each actual read independently, including a later override.
 	pin := ".Consistency(consistency)"
 	offset := 0
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 6; i++ {
 		pos := strings.Index(string(raw[offset:]), pin)
 		if pos < 0 {
 			t.Fatal("missing target pin")
@@ -166,5 +170,35 @@ func TestHistoricalAdmissionReadsUseScopedFallback(t *testing.T) {
 			})
 		}
 		offset = pos + len(pin)
+	}
+}
+
+// A historical directory is admitted only from a typed, well-formed listing.
+// The empty encodings are a real empty directory; anything else that cannot be
+// read as a listing fails closed instead of becoming an empty tree.
+func TestParseRetainedHistoricalDirectory(t *testing.T) {
+	str := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		kind    string
+		raw     *string
+		entries int
+		wantErr bool
+	}{
+		{"null-column", "dir", nil, 0, false},
+		{"empty-string", "dir", str(""), 0, false},
+		{"empty-array", "dir", str("[]"), 0, false},
+		{"marshalled-nil", "dir", str("null"), 0, false},
+		{"two-entries", "dir", str(`[{"id":"a1","mode":33188,"name":"f"},{"id":"b2","mode":16384,"name":"d"}]`), 2, false},
+		{"file-object", "file", str("[]"), 0, true},
+		{"malformed", "dir", str(`[{"id":`), 0, true},
+		{"entry-without-id", "dir", str(`[{"mode":33188,"name":"f"}]`), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, err := parseRetainedHistoricalDirectory("fs", tc.kind, tc.raw)
+			if (err != nil) != tc.wantErr || len(entries) != tc.entries {
+				t.Fatalf("entries=%d err=%v, want entries=%d error=%t", len(entries), err, tc.entries, tc.wantErr)
+			}
+		})
 	}
 }
