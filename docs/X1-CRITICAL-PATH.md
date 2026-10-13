@@ -1,5 +1,14 @@
 # X1 critical path — reset to the #201 roadmap
 
+## E1-01A C1/C2 process-crash evidence (2026-10-13)
+
+[E1-01A](./E1-01A-G2-PROCESS-CRASH.md) adds real worker SIGKILL evidence at
+PREPARED-before-commit and committed-handoff-before-promotion, each with a
+same-boundary no-kill control and independent process recovery/replay.
+The scoped single-DC matrix passes; no product defect was reproduced in these cuts.
+This is test-only evidence. Other E1-01 boundaries and the three-DC residuals remain
+pending; E1-01 and X1 are OPEN. Production GC stays OFF.
+
 ## E1-01 bounded evidence plan (2026-10-13)
 
 The [E1-01 plan](./E1-01-CRASH-EVIDENCE-PLAN.md) inventories current G1–G5 crash/replay

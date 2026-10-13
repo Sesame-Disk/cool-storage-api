@@ -54,7 +54,8 @@ func TestMain(m *testing.M) {
 	// comment could not: R26 was added to docker-compose and missed here, and the
 	// omission was invisible in the standard run only because P4A happens to be set
 	// alongside it.
-	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E115E_REPAIR_SETTLEMENT_EVIDENCE") == "1" ||
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_G2_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E115E_REPAIR_SETTLEMENT_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E115D_ABANDONED_COMMIT_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E115C_POST_D_PHYSICAL_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E115B_WRITER_POST_D_EVIDENCE") == "1" ||
@@ -158,6 +159,12 @@ func TestMain(m *testing.M) {
 	}()
 
 	code := m.Run()
+	if os.Getenv(e101EvidenceEnv) == "1" {
+		if missing := e101Missing(); len(missing) > 0 {
+			fmt.Printf("%s=1 requires all G2 process-crash/control legs; missing=%s\n", e101EvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
 	if os.Getenv(g5CoexistenceEvidenceEnv) == "1" && !g5CoexistenceObserved {
 		fmt.Println("required G5 isolated old-life continuation evidence was not observed")
 		code = 1
@@ -696,7 +703,7 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 	return createLibraryForTestWithCleanup(t, c, c, name, body, cleanup)
 }
 
-func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient, name string, body interface{}, cleanup bool) string {
+func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient, name string, body interface{}, cleanup bool, preserveOnFailure ...bool) string {
 	t.Helper()
 
 	const maxAttempts = 5
@@ -706,6 +713,10 @@ func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient,
 			liveRepoIDs.Store(repoID, struct{}{})
 			if cleanup {
 				t.Cleanup(func() {
+					if len(preserveOnFailure) > 0 && preserveOnFailure[0] && (t.Failed() || t.Skipped()) {
+						t.Logf("preserving failed fixture library %s", repoID)
+						return // Keep liveRepoIDs protection through TestMain's sweep.
+					}
 					liveRepoIDs.Delete(repoID)
 					resp := cleanupClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
 					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
