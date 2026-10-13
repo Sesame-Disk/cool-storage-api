@@ -69,8 +69,10 @@ If accepted current evidence already proves one cut, cite and reuse it rather th
    Cassandra topology/consistencies and SILO version; do not assume a healthy old container runs that SHA.
 2. Use a fixture-owned org/keyspace and objects with no peer destructive worker. Verify GC configuration,
    topology and service readiness before collecting evidence. Use the existing isolated e19 machinery where appropriate.
-3. A child runs **production `Worker.ProcessOnce`**, including the actual claim, liveness probe,
-   Prepare/Commit/Promote path. Pause after successful PREPARED (C1), or after confirmed handoff commit
+3. A child runs **production `Worker.ProcessOrgOnce(ctx, orgID)`** for the fixture-owned organization,
+   preserving the current `processOrg` -> `processBlock` path, including the actual claim, liveness probe
+   and Prepare/Commit/Promote handoff. Keep the existing `TestNoGlobalGCFanoutInIntegrationSuite` guard;
+   do not drain unrelated organizations. Pause after successful PREPARED (C1), or after confirmed handoff commit
    and before Promote (C2). Prefer an integration-test `GCStore` wrapper that delegates the actual Prepare/Commit
    call and pauses only its confirmed return for the owned identity; no new productive hook is planned.
    Add a minimal `integration`-tagged seam only if that existing interface cannot hold the cut.
