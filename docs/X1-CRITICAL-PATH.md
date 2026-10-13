@@ -1,5 +1,14 @@
 # X1 critical path — reset to the #201 roadmap
 
+## E1-01 bounded evidence plan (2026-10-13)
+
+The [E1-01 plan](./E1-01-CRASH-EVIDENCE-PLAN.md) inventories current G1–G5 crash/replay
+coverage and separates mock, real-service replay and OS process-death evidence.
+The first execution PR is limited to PREPARED-before-commit and committed-handoff-before-promotion;
+any reproduced product defect is a separate small fix PR. Planning closes no gate.
+E1-01, the three-DC residuals, D0 §25 and identity audit remain pending; X1 is OPEN.
+Production GC stays OFF; isolated development GC is permitted for evidence.
+
 ## E1-17 W2-10 residual handlers (2026-10-12)
 
 The E1-10e unpublished-source schedule was demonstrated RED on main@747408b39
