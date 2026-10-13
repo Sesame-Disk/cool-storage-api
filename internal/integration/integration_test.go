@@ -81,6 +81,7 @@ func TestMain(m *testing.M) {
 		os.Getenv("SESAMEFS_REQUIRE_E110C_REVERTDIR_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E110D_REVERTDIRENTS_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E110E_UNPUBLISHED_RESURRECTION_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E117_RESIDUAL_RESURRECTION_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E17_SYNC_RECVFS_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E19_CROSS_REPO_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" ||
@@ -260,6 +261,12 @@ func TestMain(m *testing.M) {
 	if os.Getenv(e111EvidenceEnv) == "1" {
 		if missing := e111Missing(e111Observed); len(missing) > 0 {
 			fmt.Printf("%s=1 requires all named E1-11 repair liveness legs; missing=%s (check -run filters)\n", e111EvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
+	if os.Getenv(e117EvidenceEnv) == "1" {
+		if missing := e117Missing(e117Evidence); len(missing) > 0 {
+			fmt.Printf("%s=1 requires all named E1-17 residual resurrection legs; missing=%s (check -run filters)\n", e117EvidenceEnv, strings.Join(missing, ","))
 			code = 1
 		}
 	}

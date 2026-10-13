@@ -1,6 +1,6 @@
 # E1 — Full-GC publication and recovery evaluation
 
-Status: ACTIVE; E1-16 (post-D contract alignment with G4, docs only, base main@5c3163871803 with #276 and #261 merged): the X1 invariant is physical; W2-1..9 and W2-12..14 close for X1; W2-10, E1-01, the three-DC residuals (suite re-measured 2026-10-10), the D0 §25 list and one PRE-X1 audit debt remain ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)). The section "E1-16 — post-D contract alignment" below supersedes the PRE-X1 labels and strict post-D reading in the older status text that follows. Before it, E1-15F (#276): 3-DC evidence for SUPERSEDED plus a parent-read liveness fix. Before it, E1-15E (#275): the repair worker settles superseded abandoned repairs (option A of E1-15D §3), narrowing the PRE-GC retention. Before it, E1-15D (#274). E1-15D shows abandoned commits stay publishable via Sync auto-merge, and proposes the contract split and cancellation authority for approval. Before it, E1-15C on #273, E1-15C measures no physical (D0 §13) RED from post-D refs on Office; it shows that dead repairs veto later lives of L; a contract reconciliation is pending a decision. E1-15B confirms post-D writer staging liveness on crash (P1 PRE-X1 OPEN, characterized). E1-11 and the measured E1-12/E1-13 subsets have pre-D evidence; the measured E1-14 subset shows `pub:` expiry alone reaches no candidate; E1-15A found a stale-renewal post-D RED and compensated it (PARTIAL-FIX / CLOSED-EVIDENCE only when the global check and withdrawal succeed; strict guarantee OPEN P1 PRE-X1); W2-12/13/14, E1-15 overall and E1/X1 remain OPEN.
+Status: ACTIVE; E1-17 (W2-10 residual handlers, base main@747408b39): all content-resurrection shapes were RED on the unpublished-source schedule and are now CLOSED-FIX by recursive source admission, so every W2 row is closed for X1 ([E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)). Before it, E1-16 (post-D contract alignment with G4, docs only, base main@5c3163871803 with #276 and #261 merged): the X1 invariant is physical; W2-1..9 and W2-12..14 close for X1; W2-10, E1-01, the three-DC residuals (suite re-measured 2026-10-10), the D0 §25 list and one PRE-X1 audit debt remain ([E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md)). The section "E1-16 — post-D contract alignment" below supersedes the PRE-X1 labels and strict post-D reading in the older status text that follows. Before it, E1-15F (#276): 3-DC evidence for SUPERSEDED plus a parent-read liveness fix. Before it, E1-15E (#275): the repair worker settles superseded abandoned repairs (option A of E1-15D §3), narrowing the PRE-GC retention. Before it, E1-15D (#274). E1-15D shows abandoned commits stay publishable via Sync auto-merge, and proposes the contract split and cancellation authority for approval. Before it, E1-15C on #273, E1-15C measures no physical (D0 §13) RED from post-D refs on Office; it shows that dead repairs veto later lives of L; a contract reconciliation is pending a decision. E1-15B confirms post-D writer staging liveness on crash (P1 PRE-X1 OPEN, characterized). E1-11 and the measured E1-12/E1-13 subsets have pre-D evidence; the measured E1-14 subset shows `pub:` expiry alone reaches no candidate; E1-15A found a stale-renewal post-D RED and compensated it (PARTIAL-FIX / CLOSED-EVIDENCE only when the global check and withdrawal succeed; strict guarantee OPEN P1 PRE-X1); W2-12/13/14, E1-15 overall and E1/X1 remain OPEN.
 Matrix frozen before E1 runtime edits: 2026-10-03. Base main@eabd93bee includes merged G5 PR #248 and the pinned SILO backend from PR #249. Scope: supported greenfield deployment with one compatible release. Destructive GC remains OFF.
 
 Tested storage backend: `docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z`, a MinIO-compatible S3 backend. The Compose service remains named `minio`; this ledger does not claim tests against the archived MinIO server image.
@@ -567,3 +567,33 @@ Still before X1 CLOSED: W2-10 (E1-17); E1-01, first inventoried against the
 existing G1–G5 crash evidence; the three-DC residuals (28 of 30 G5 failures now pass); the D0 §25
 reclassification list; and the identity claim-table PRE-X1 audit debt.
 No runtime, test or guard changed. GC stays OFF.
+
+## E1-17 — W2-10 residual content-resurrection handlers
+
+[E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md) ran the E1-10e unpublished-source
+schedule (real web upload, Sync PutCommit/RecvFS, owned `up:` lapse, real GC
+to COMMITTED/TERMINAL) against each remaining shape:
+- `RevertFile`;
+- `RestoreTrashItem` file and directory;
+- `RevertDirectory`;
+- `RevertDirents` directory items.
+
+On main@747408b39 all 15 legs published HEAD. The 10 COMMITTED/TERMINAL legs
+reached the historical file on retired P1: frozen-matrix E1-10 RED.
+
+The fix extends the E1-10e source admission to whole entries:
+- a strict recursive directory read, where a missing or malformed object
+  fails closed;
+- each block-bearing file's own permanent `fs:`;
+- original exact P, rechecked before every HEAD CAS.
+
+Evidence:
+- GREEN 15/15;
+- retained-history controls E1-6, E1-10, E1-10b, E1-10c, E1-10d and E1-10e
+  pass;
+- an omission mutation brings all 15 violations back;
+- race 4/4.
+
+W2-10 is CLOSED-FIX. Concurrent Phase 5/6 history removal remains PRE-GC.
+Still before X1 CLOSED: E1-01, the three-DC residuals, the D0 §25 list and
+the identity claim-table audit debt.

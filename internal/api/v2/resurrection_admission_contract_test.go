@@ -91,11 +91,15 @@ func historicalAdmissionReadContract(raw []byte) error {
 		})
 		return true
 	})
-	if wrappers != 5 || queries != 5 {
+	// E1-10e added five reads; E1-17 adds the strict historical directory read.
+	if wrappers != 6 || queries != 6 {
 		return fmt.Errorf("scoped fallback wrappers=%d queries=%d", wrappers, queries)
 	}
+	// fs_objects is read twice: the historical file layout (E1-10e) and the
+	// strict historical directory listing (E1-17). Every other table once.
+	expected := map[string]int{"fs_objects": 2, "libraries": 1, "block_id_mappings": 1, "blocks": 1, "block_references": 1}
 	for table, count := range tables {
-		if count != 1 {
+		if count != expected[table] {
 			return fmt.Errorf("%s callback-bound reads=%d", table, count)
 		}
 	}
@@ -148,7 +152,7 @@ func TestHistoricalAdmissionReadsUseScopedFallback(t *testing.T) {
 	// Mutate each actual read independently, including a later override.
 	pin := ".Consistency(consistency)"
 	offset := 0
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 6; i++ {
 		pos := strings.Index(string(raw[offset:]), pin)
 		if pos < 0 {
 			t.Fatal("missing target pin")
@@ -167,4 +171,105 @@ func TestHistoricalAdmissionReadsUseScopedFallback(t *testing.T) {
 		}
 		offset = pos + len(pin)
 	}
+}
+
+// A historical directory is admitted only from a typed, well-formed listing.
+// The empty encodings are a real empty directory; anything else that cannot be
+// read as a listing fails closed instead of becoming an empty tree.
+func TestParseRetainedHistoricalDirectory(t *testing.T) {
+	str := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		kind    string
+		raw     *string
+		entries int
+		wantErr bool
+	}{
+		{"null-column", "dir", nil, 0, false},
+		{"empty-string", "dir", str(""), 0, false},
+		{"empty-array", "dir", str("[]"), 0, false},
+		{"marshalled-nil", "dir", str("null"), 0, false},
+		{"two-entries", "dir", str(`[{"id":"a1","mode":33188,"name":"f"},{"id":"b2","mode":16384,"name":"d"}]`), 2, false},
+		{"file-object", "file", str("[]"), 0, true},
+		{"malformed", "dir", str(`[{"id":`), 0, true},
+		{"entry-without-id", "dir", str(`[{"mode":33188,"name":"f"}]`), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, err := parseRetainedHistoricalDirectory("fs", tc.kind, tc.raw)
+			if (err != nil) != tc.wantErr || len(entries) != tc.entries {
+				t.Fatalf("entries=%d err=%v, want entries=%d error=%t", len(entries), err, tc.entries, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The admission walk has no depth limit: a valid tree far deeper than any
+// former bound is admitted, every file is visited in listing order, and the
+// first read or file error stops the walk.
+func TestWalkRetainedHistoricalEntry(t *testing.T) {
+	dir := func(id string) FSEntry { return FSEntry{ID: id, Mode: ModeDir, Name: id} }
+	file := func(id string) FSEntry { return FSEntry{ID: id, Mode: 33188, Name: id} }
+
+	t.Run("deep-chain", func(t *testing.T) {
+		const depth = 1000
+		children := map[string][]FSEntry{}
+		for i := 0; i < depth; i++ {
+			children[fmt.Sprintf("d%d", i)] = []FSEntry{dir(fmt.Sprintf("d%d", i+1))}
+		}
+		children[fmt.Sprintf("d%d", depth)] = []FSEntry{file("leaf")}
+		var visited []string
+		err := walkRetainedHistoricalEntry(dir("d0"), func(id string) ([]FSEntry, error) {
+			list, ok := children[id]
+			if !ok {
+				return nil, fmt.Errorf("unexpected directory %s", id)
+			}
+			return list, nil
+		}, func(f FSEntry) error {
+			visited = append(visited, f.ID)
+			return nil
+		})
+		if err != nil || !reflect.DeepEqual(visited, []string{"leaf"}) {
+			t.Fatalf("deep tree: visited=%v err=%v", visited, err)
+		}
+	})
+
+	t.Run("order-and-file-root", func(t *testing.T) {
+		children := map[string][]FSEntry{
+			"root": {file("a"), dir("sub"), file("c")},
+			"sub":  {file("b1"), file("b2")},
+		}
+		var visited []string
+		read := func(id string) ([]FSEntry, error) { return children[id], nil }
+		visit := func(f FSEntry) error { visited = append(visited, f.ID); return nil }
+		if err := walkRetainedHistoricalEntry(dir("root"), read, visit); err != nil || !reflect.DeepEqual(visited, []string{"a", "b1", "b2", "c"}) {
+			t.Fatalf("order: visited=%v err=%v", visited, err)
+		}
+		visited = nil
+		if err := walkRetainedHistoricalEntry(file("solo"), read, visit); err != nil || !reflect.DeepEqual(visited, []string{"solo"}) {
+			t.Fatalf("file root: visited=%v err=%v", visited, err)
+		}
+	})
+
+	t.Run("errors-stop-the-walk", func(t *testing.T) {
+		readErr, fileErr := errors.New("unreadable directory"), errors.New("not admitted")
+		children := map[string][]FSEntry{"root": {file("a"), dir("bad"), file("never")}}
+		var visited []string
+		err := walkRetainedHistoricalEntry(dir("root"), func(id string) ([]FSEntry, error) {
+			if id == "bad" {
+				return nil, readErr
+			}
+			return children[id], nil
+		}, func(f FSEntry) error { visited = append(visited, f.ID); return nil })
+		if !errors.Is(err, readErr) || !reflect.DeepEqual(visited, []string{"a"}) {
+			t.Fatalf("read error: visited=%v err=%v", visited, err)
+		}
+		visited = nil
+		err = walkRetainedHistoricalEntry(dir("root"), func(id string) ([]FSEntry, error) { return children[id], nil }, func(f FSEntry) error {
+			visited = append(visited, f.ID)
+			return fileErr
+		})
+		if !errors.Is(err, fileErr) || !reflect.DeepEqual(visited, []string{"a"}) {
+			t.Fatalf("file error: visited=%v err=%v", visited, err)
+		}
+	})
 }

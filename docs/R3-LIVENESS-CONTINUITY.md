@@ -213,10 +213,19 @@ E1-10e disproves metadata existence as a permanent-liveness witness: real
 PutCommit/RecvFS metadata can coexist with COMMITTED/TERMINAL retired P1 before
 any Sync HEAD publication. RevertDirents non-directory file admission now requires
 settled historical fs: via LQ→EQ fallback, captures original exact P and rechecks
-both before every HEAD CAS. That measured unpublished-source subset is
-CLOSED-FIX; the other handlers and directory shapes have no equivalent guard.
-Continuous own liveness through HEAD, broader batches, retention/Phase5/6 and
-R31 remain OPEN; W2-10 overall is OPEN. See
+both before every HEAD CAS. That measured unpublished-source subset was
+CLOSED-FIX.
+
+**Current state (E1-17, 2026-10-12).** The admission now covers every
+handler and shape, recursively for directories, and **W2-10 is CLOSED-FIX**
+([E1-17](./E1-17-W2-10-RESIDUAL-HANDLERS.md)). Every block a restored entry
+depends on must have its file's own settled permanent `fs:` and pass exact
+P before every HEAD CAS. Files without blocks have no physical dependency.
+Continuous own liveness through HEAD is not claimed. Concurrent
+retention/Phase 5/6 removal is PRE-GC, and R31 follows X1 §4.
+
+*Historical (E1-10e snapshot, superseded by E1-17):* the other handlers and
+directory shapes had no equivalent guard, and W2-10 overall was OPEN. See
 [E1-10e evidence](./E1-10E-W210-RESIDUAL-DISPOSITION.md) and
 `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`.
 

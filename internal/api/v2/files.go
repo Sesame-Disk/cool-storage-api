@@ -4482,6 +4482,14 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 
 	oldEntry := *oldResult.TargetEntry
 	revertFileAfterHistoricalEntryBarrier(repoID, oldEntry.ID)
+	// A client-supplied commit need never have won HEAD; its blocks may have
+	// been retired (W2-10, E1-17). Admit only settled history.
+	retained, err := fsHelper.captureRetainedHistoricalEntry(orgID, repoID, oldEntry)
+	if err != nil {
+		log.Printf("[RevertFile] historical source not admitted repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revert file"})
+		return
+	}
 
 	fileName := path.Base(filePath)
 	parentDir := path.Dir(filePath)
@@ -4578,6 +4586,10 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 		}
 
 		revertFileBeforeHeadBarrier(repoID)
+		if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+			log.Printf("[RevertFile] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, filePath, oldEntry.ID, err)
+			return err
+		}
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 			return err
 		}
@@ -4695,6 +4707,13 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	}
 
 	revertDirectoryAfterHistoricalEntryBarrier(repoID, oldEntry.ID)
+	// Every file in the historical subtree must be settled history (W2-10, E1-17).
+	retained, err := fsHelper.captureRetainedHistoricalEntry(orgID, repoID, oldEntry)
+	if err != nil {
+		log.Printf("[RevertDirectory] historical source not admitted repo=%s path=%s fs_id=%s: %v", repoID, dirPath, oldEntry.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revert directory"})
+		return
+	}
 
 	dirName := path.Base(dirPath)
 	parentDir := path.Dir(dirPath)
@@ -4790,6 +4809,10 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 		}
 
 		revertDirectoryBeforeHeadBarrier(repoID)
+		if err := fsHelper.validateRetainedHistoricalSource(orgID, repoID, retained); err != nil {
+			log.Printf("[RevertDirectory] historical source failed pre-HEAD recheck repo=%s path=%s fs_id=%s: %v", repoID, dirPath, oldEntry.ID, err)
+			return err
+		}
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 			return err
 		}
