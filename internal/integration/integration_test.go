@@ -703,7 +703,7 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 	return createLibraryForTestWithCleanup(t, c, c, name, body, cleanup)
 }
 
-func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient, name string, body interface{}, cleanup bool) string {
+func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient, name string, body interface{}, cleanup bool, preserveOnFailure ...bool) string {
 	t.Helper()
 
 	const maxAttempts = 5
@@ -713,6 +713,10 @@ func createLibraryForTestWithCleanup(t *testing.T, c, cleanupClient *testClient,
 			liveRepoIDs.Store(repoID, struct{}{})
 			if cleanup {
 				t.Cleanup(func() {
+					if len(preserveOnFailure) > 0 && preserveOnFailure[0] && (t.Failed() || t.Skipped()) {
+						t.Logf("preserving failed fixture library %s", repoID)
+						return // Keep liveRepoIDs protection through TestMain's sweep.
+					}
 					liveRepoIDs.Delete(repoID)
 					resp := cleanupClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
 					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {

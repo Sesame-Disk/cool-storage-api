@@ -37,7 +37,7 @@ func sha1hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string, size int64) string {
+func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string, size int64, preserveOnFailure ...bool) string {
 	t.Helper()
 	resp := c.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/block-upload-session/", repoID), map[string]interface{}{
 		"parent_dir": parentDir,
@@ -51,6 +51,10 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 		t.Fatalf("empty session_id in response: %v", out)
 	}
 	t.Cleanup(func() {
+		if len(preserveOnFailure) > 0 && preserveOnFailure[0] && (t.Failed() || t.Skipped()) {
+			t.Logf("preserving failed upload session %s", sid)
+			return
+		}
 		cleanupBlockUploadSessionForTest(t, sid)
 	})
 	return sid
@@ -73,6 +77,10 @@ func webCreateBlockSession(t *testing.T, c *testClient, repoID, parentDir string
 //
 // See ISSUE-GC-TEST-RESIDUE-01 (branch 1A) and docs/GC-DELETE-CLEANUP-INVESTIGATION.md F1.
 func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, externalSHA1 string, referrers ...string) {
+	cleanupUploadedBlockArtifactsWithPolicyForTest(t, orgID, repoID, blockID, externalSHA1, false, referrers...)
+}
+
+func cleanupUploadedBlockArtifactsWithPolicyForTest(t *testing.T, orgID, repoID, blockID, externalSHA1 string, preserveOnFailure bool, referrers ...string) {
 	t.Helper()
 
 	// Built here rather than inside t.Cleanup so an unreachable MinIO degrades to a
@@ -82,6 +90,10 @@ func cleanupUploadedBlockArtifactsForTest(t *testing.T, orgID, repoID, blockID, 
 	blockStore := blockStoreForCleanupOrNil(t, orgID)
 
 	t.Cleanup(func() {
+		if preserveOnFailure && (t.Failed() || t.Skipped()) {
+			t.Logf("preserving failed upload fixture %s/%s", orgID, blockID)
+			return
+		}
 		database := shareProjectionDBForTest(t)
 		var storageKey string
 		if err := database.Session().Query(

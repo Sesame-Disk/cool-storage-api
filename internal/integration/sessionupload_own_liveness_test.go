@@ -302,11 +302,12 @@ type sessionUploadHeadFixture struct {
 	sessionRef string
 }
 
-func newSessionUploadHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pkg.FileHandler) *sessionUploadHeadFixture {
+func newSessionUploadHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pkg.FileHandler, preserveOnFailure ...bool) *sessionUploadHeadFixture {
 	t.Helper()
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-suh-%d", time.Now().UnixNano()))
+	name := fmt.Sprintf("inttest-suh-%d", time.Now().UnixNano())
+	repoID := createLibraryForTestWithCleanup(t, adminClient, adminClient, name, map[string]string{"repo_name": name}, true, preserveOnFailure...)
 	content := []byte("sessionupload-head-" + uuid.NewString())
-	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)))
+	sessionID := webCreateBlockSession(t, adminClient, repoID, "/", int64(len(content)), preserveOnFailure...)
 	uploadResp := webUploadBlock(t, adminClient, sessionID, content)
 	if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
 		body := responseBody(t, uploadResp)
@@ -331,7 +332,7 @@ func newSessionUploadHeadFixture(t *testing.T, database *dbpkg.DB, handler *v2pk
 		session.OrgID, blockID).Scan(&storageClass, &storageKey); err != nil {
 		t.Fatalf("read seeded block placement %s/%s: %v", session.OrgID, blockID, err)
 	}
-	cleanupUploadedBlockArtifactsForTest(t, session.OrgID, repoID, blockID, externalSHA1, sessionRef)
+	cleanupUploadedBlockArtifactsWithPolicyForTest(t, session.OrgID, repoID, blockID, externalSHA1, len(preserveOnFailure) > 0 && preserveOnFailure[0], sessionRef)
 	inner := &borrowedFSHeadFixture{
 		database: database, handler: handler, storageClass: storageClass,
 		repoID: repoID, orgID: session.OrgID, orgUUID: orgUUID,
