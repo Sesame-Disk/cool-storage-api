@@ -252,3 +252,129 @@ W2-10 is **CLOSED-FIX** for X1:
 - the identity claim-table PRE-X1 audit debt.
 
 Production GC stays OFF.
+
+### Pre-HEAD recheck witness (2026-10-14)
+
+The 15 residual legs above reject at capture and assert `headVisits == 0`, so
+neither the pre-HEAD barrier nor `validateRetainedHistoricalSource` is reached in
+them. E1-16 already executes successful rechecks in `normal`, `retained-history-gc`,
+`multiblock-retained-history-gc` (one pre-HEAD visit) and `head-conflict` (two visits).
+The missing witness was rejection when the own permanent `fs:` disappears between
+capture and publication; the new test targets that branch.
+
+`TestE117PreHEADRecheckRejectsLostAuthority`
+(`internal/integration/e117b_prehead_recheck_test.go`, gate
+`SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`) runs the supported restore path
+on settled history so capture passes, then removes the permanent `fs:` reference
+the recheck reads at the existing pre-HEAD barrier — the same callback e16's
+`head-conflict` leg uses — and requires the recheck to reject:
+
+- control leg: mutation withheld, the revert succeeds and HEAD advances;
+- trip leg: the pre-HEAD barrier is reached (`headVisits == 1`), the handler logs
+  `historical source failed pre-HEAD recheck … lacks settled permanent
+  liveness`, the response is not 200, HEAD is unchanged and no repair is
+  installed.
+
+Observed 2026-10-14 in the isolated stack (real Cassandra and MinIO): both legs
+PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
+data race. The initial focused run did not include the standard integration/API/OIDC gates for this
+addition.
+
+This witnesses the shared reference-recheck branch through RevertFile. It changes no runtime,
+schema, guard or gate state; X1 remains OPEN and `GC_ENABLED=false` remains
+mandatory.
+
+### PR #286 rebase and independent audit (2026-10-14)
+
+Rebased safely onto `main@25b74624ed5f8efc274a61210974c6eb4b8177f2` with a local
+backup of published HEAD `2563af3c63e6993908dc5956bf111224d4d8f6b2`. Existing merge
+history was preserved. Conflict resolution retains every A/B/C/D gate plus the new
+pre-HEAD gate, and both sides' evidence/history entries. No runtime source changed.
+
+The original test had a reproduced P2 harness false PASS: after one successful
+invocation, `-count=2` could skip the second rejection leg and still exit 0 because
+the global evidence map retained the first invocation. `tmp/pr286-stale-skip-baseline.log`
+proves it on a disposable source copy (actual required-leg SKIP and test exit 0).
+The minimal correction resets evidence on every invocation and accounts for a leg
+only after all fixture cleanups, when neither Failed nor Skipped. The same injected
+schedule now exits 1 naming the missing rejection leg (`pr286-stale-skip-fixed.log`).
+This is a gate correction, not a reproduced product defect or a runtime change.
+
+Initial audited implementation: `bc8c31cc8b55b6cb49c89f49b2e7115c40fbfbc7`.
+Initial audit image source SHA-256:
+- Test: `5aaa6efb40e4223274cf09218b221535e2e5c3c0a8792b6586b44ac07f6c2dc5`.
+- TestMain: `ff2683c7200051c272f2df8996be307498b4d1c8558c47900c80da989e0508a9`.
+Runner images: integration `sha256:963fed7c94d2eab128b42dcdc27b67707d88b40ebec5c8720668641f6a131360`;
+all `sha256:e82acde5bf2ecda1c55b8bc739cdef526d1c6411eb154e7753212f3a4ea3cc00`.
+Linux Docker, real Cassandra 5.0.9, single datacenter1/RF1 NTS, LOCAL_QUORUM/SERIAL;
+SILO `RELEASE.2026-09-16T00-00-00Z`. Focused probes use GC-OFF e19. No GC flag changed.
+
+Local ignored `tmp/` evidence:
+- `pr286-race.log`: E117b two legs, E16 six and E117 residual fifteen, repeated twice,
+  PASS with race (113.755s, exit 0); capture and pre-HEAD were reached in the new cases.
+- `pr286-unit-vet.log`: complete short Go tree and normal/integration vet PASS, exit 0.
+- `pr286-recheck-omission.log`: only the RevertFile pre-HEAD recheck is bypassed in a
+  disposable container copy. Control succeeds; trip returns 200 and the test fails
+  specifically for admitting the source with its own permanent reference removed
+  (test exit 1). This proves causal sensitivity, rather than an unrelated error pass.
+- `pr286-gate-negatives.log`: isolated new gate rejects both omitted legs and missing
+  backend (each test exit 1). Repeated required-leg SKIP regression also rejected above.
+- `pr286-go-all.log`: the standard Compose runner PASS: full required integration
+  (1363.859s), API 20/20 suites (101s), OIDC 25/25 tests (1s), plus short Go coverage.
+  Both the persisted container exit and outer process exit are 0. All A/B/C/D gates
+  and the new pre-HEAD gate remained required.
+- `pr286-teardown-skip.log`: an injected SKIP during rejection-leg cleanup is also
+  rejected with test exit 1 and the missing leg named (23.653s).
+
+Scope: one single-file/single-block RevertFile schedule exercises the shared permanent
+reference recheck. It is not an independent behavioral drill of the other three callers,
+directory layouts, exact-placement loss/UNKNOWN or mutations after the recheck. Those
+must not be inferred from this witness. X1/E1 remain OPEN and ordinary GC stays OFF.
+
+### PR #286 crossed-audit corrections (2026-10-14)
+
+Two P2 THIS-PR findings are confirmed and corrected. E1-16 already exercises
+successful pre-HEAD rechecks; the claim of no prior execution was false. The
+new witness adds the lost-own-permanent-reference rejection branch, not first
+execution of the shared helper. Current Work and the changelog now say this;
+the prior sweep's overclaim is explicitly marked as superseded.
+
+The parent test's end-of-body check did not run on an early `requireCassandra`
+SKIP. In a disposable copy of the actual Docker runner, close the test session
+only on the first repetition and reset the cached test connection in cleanup:
+the real availability query then SKIPs; a healthy second repetition passes and
+masks the first, yielding test exit 0 (`pr286-review-early-baseline.log`). No
+Cassandra service was stopped and no production handler was modified.
+
+The correction moves the per-invocation evidence check into a parent cleanup
+registered before `requireCassandra`; subtest evidence still waits for all
+fixture cleanups. TestMain retains its omitted-test check. With the final source:
+- Early SKIP then PASS: test exit 1 (21.428s); both missing legs named.
+- PASS then early SKIP: test exit 1 (22.612s); both missing legs named.
+- Second-repetition rejection-leg SKIP: test exit 1 (23.538s).
+- Rejection-leg cleanup SKIP: test exit 1 (21.885s).
+Logs are `tmp/pr286-review-{early-first-fixed,early-second-fixed,leg-skip-fixed,cleanup-skip-fixed}.log`.
+Negative-probe wrapper exits are 0 only after checking the expected test exit and
+specific SKIP/missing-leg output; they are not passing test runs.
+
+Final focused image: `sha256:c11d47233767ab3e04b822a4d545735160e2b6d2a186e637d7e8791a0d91e30f`.
+New test SHA-256: `08a940a9eb61fdf7f8d4e2e064e0c8258b7bce38006377c2f7eb9ca5126c0f60`.
+TestMain SHA-256 is unchanged from the initial audit above.
+Final positive `-race -count=2`: the two new legs, six E1-16 legs and fifteen
+E1-17 residual legs PASS (129.692s, exit 0), plus the static wiring guard and
+integration vet PASS (`tmp/pr286-review-positive.log`). No required leg SKIP.
+With the new gate disabled, the same early-SKIP schedule remains optional and
+exits 0 (28.800s; `tmp/pr286-review-optional-gate.log`). TestMain still rejects
+total omission with `-run '^$'` and the gate enabled (test exit 1, both missing
+legs named; 24.021s, `tmp/pr286-review-omitted.log`).
+
+E1-16's pre-existing accumulation and premature cleanup credit also reproduced
+in actual Docker code (PASS then early SKIP: test exit 0, 28.516s; cleanup SKIP:
+test exit 0, 28.490s). It remains a separate P2 OPEN follow-up:
+[ISSUE-E16-REPEATED-EVIDENCE-GATE-01](./KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01).
+Its implementation is unchanged in this PR.
+
+The standard full integration/API/OIDC PASS above belongs to the initial audit
+implementation, not a rerun after this cleanup-only gate correction. Runtime,
+TestMain and Compose wiring are unchanged; final validation focuses on this
+harness change. Single-DC scope and X1/E1 OPEN remain unchanged; no GC flag changed.

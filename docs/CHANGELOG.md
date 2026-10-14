@@ -8,6 +8,51 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — PR #286 crossed-audit corrections
+
+Corrected the coverage claim: E1-16 already exercises successful pre-HEAD
+rechecks; #286 adds the missing lost-permanent-reference rejection witness.
+The new gate now checks each invocation even after an early parent SKIP;
+previously SKIP then PASS under `-count=2` could still exit 0. Both early-SKIP
+orders and leg/cleanup SKIPs reject in Docker. Final focused `-race -count=2`
+and integration vet PASS; optional gate behavior is preserved. The full runner
+PASS recorded below predates this harness-only correction and was not repeated.
+The independently reproduced pre-existing E1-16 evidence accumulation defect is
+tracked as [P2 follow-up](./KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01).
+No runtime change or gate closure. See the [audit ledger](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
+## 2026-10-14 — PR #286 rebase and independent audit
+
+Safely rebased onto main@25b74624ed5f, preserving merged crash gates and evidence.
+Corrected a reproduced P2 test-gate false PASS from stale repetition evidence or
+cleanup SKIP. Docker short Go/vet, race repetitions, full required integration,
+API (20/20 suites) and OIDC (25/25 tests) PASS; both full-runner exits are 0.
+Causal recheck-omission and omitted/SKIP probes reject. The witness covers the
+shared permanent-reference branch through RevertFile on one DC; no runtime change
+or gate closure. See [audit evidence](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
+## 2026-10-14 — E1-17 pre-HEAD recheck witness (test-only)
+
+`TestE117PreHEADRecheckRejectsLostAuthority` (gate
+`SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`) closes the evidence gap the
+verification sweep found on the E1-17 row: the 15 residual legs assert
+`headVisits == 0` and do not exercise the capture-to-HEAD recheck. E1-16 already
+executes successful rechecks in retained-history restoration and HEAD-conflict
+controls. The missing evidence was rejection after loss of the own permanent
+`fs:` reference between capture and HEAD publication.
+
+The new leg runs the supported restore path on settled history so capture passes,
+then removes the permanent `fs:` reference the recheck reads at the existing
+pre-HEAD barrier, and requires the recheck to reject: response not 200, HEAD
+unchanged, no repair installed. A control leg with the mutation withheld reverts
+successfully and advances HEAD. Both legs observe the pre-HEAD barrier reached,
+the inverse of the residual legs' `headVisits == 0`.
+
+Observed 2026-10-14 in the isolated stack (real Cassandra and MinIO): both legs
+PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
+data race. Not run: the standard integration/API/OIDC gates. No runtime, schema
+or guard change; X1 remains OPEN and `GC_ENABLED=false` remains mandatory.
+
 ## 2026-10-14 — E1-01C physical recovery process-crash evidence (#287)
 
 [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md) adds real recovery-process SIGKILL
@@ -37,6 +82,10 @@ the code, the tests and the sources of record. Three items needed correction:
 - `docs/OPEN-WORK-INDEX.md`: the PR #231 closure record moved to
   `docs/legacy/CURRENT_WORK-HISTORY-2026-10-12.md`; the plain-text pointer,
   which a filename search could not catch, now links there.
+
+The sweep originally overclaimed absent pre-HEAD coverage; corrected by the
+PR #286 crossed audit: E1-16 already exercises successful rechecks. The original
+snapshot below records that earlier claim, not the current coverage assessment.
 
 Reported by the sweep but not changed here: E1-17's pre-HEAD recheck
 (`validateRetainedHistoricalSource`) is referenced only by its four production

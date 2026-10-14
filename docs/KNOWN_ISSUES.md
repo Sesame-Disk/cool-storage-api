@@ -11837,3 +11837,29 @@ broader batches/layouts, concurrent retention/cleanup, Phase5/6 and R31 remain
 OPEN. Foreign settled fs: is not a continuous own-pin proof through HEAD.
 W2-10/E1/X1 remain OPEN; production GC OFF, shared development GC unchanged.
 See [frozen plan and evidence](./E1-10E-W210-RESIDUAL-DISPOSITION.md).
+
+## ISSUE-E16-REPEATED-EVIDENCE-GATE-01
+
+**Status:** OPEN. **Severity:** P2. **Scope:** FOLLOW-UP / test evidence;
+pre-existing on main@25b74624ed5f, not introduced or worsened by PR #286.
+
+`TestE16RevertFileRetainedHistory` keeps a global `e16Evidence` map across
+`go test -count` repetitions and credits each leg before fixture cleanups.
+TestMain checks only the accumulated map. A complete first repetition followed
+by an early Cassandra-query SKIP therefore exits 0 without evidence for the
+second repetition. A cleanup SKIP can also occur after the leg is credited.
+
+The first sequence was reproduced in the actual Docker integration runner using
+a disposable source copy: close its test session before the second availability
+probe; `requireCassandra` takes its existing SKIP path, but all six first-run
+slots remain true and the test exits 0 (`tmp/pr286-review-e16-baseline.log`).
+A disposable cleanup-SKIP probe on the `normal` leg also exits 0 after that
+leg was credited (`tmp/pr286-review-e16-cleanup-baseline.log`). Both sequences
+were checked against actual E1-16 code, not a standalone imitation harness.
+This is evidence-gate unsoundness, not a reproduced product/storage violation.
+
+Follow-up: reset the map per invocation, credit only after successful nonskipped
+cleanups, and check each parent invocation from a cleanup registered before
+`requireCassandra`; retain TestMain's omitted-test check. Verify both orders of
+early SKIP and cleanup SKIP in Docker. E1-16 runtime/test implementation is
+unchanged by #286; no X1/E1 closure or activation decision follows from this issue.
