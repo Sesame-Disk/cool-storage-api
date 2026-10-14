@@ -4,6 +4,12 @@ Base: main@5c3163871803 (#261 merged). Documentation only: no runtime,
 schema, CQL, test, guard, mutation-suite or configuration change.
 `GC_ENABLED=false` remains mandatory. X1 remains OPEN.
 
+> **Update 2026-10-14 (verification sweep).** W2-10 was closed after this
+> snapshot — E1-17 CLOSED-FIX (PR #279), recorded in
+> [X1-CRITICAL-PATH §4](./X1-CRITICAL-PATH.md). The W2 disposition table and the
+> "What still blocks `X1 CLOSED`" list below preserve this document's 2026-10-10
+> state; X1 §4 is the source of record.
+
 ## Decision (approved 2026-10-10)
 
 The project owner approved E1-15D §1 as an **alignment with the G4 contract

@@ -8,6 +8,34 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — Verification sweep of PRs #277–#283 and its corrections
+
+Documentation only; no status, severity or gate state changes. X1 remains OPEN
+and `GC_ENABLED=false` remains mandatory. An independent re-read of the seven
+PRs merged after the 2026-10-09 progress report checked their claims against
+the code, the tests and the sources of record. Three items needed correction:
+
+- `docs/PUBLISH-REPAIR-OBSERVABILITY.md`: the abandoned-repair section defined
+  `retained` as a visit that "returned no error". The classifier
+  (`tagPublishedBlockReferenceRepairOutcome` in `publish_repair.go`) returns
+  `ok` for a nil error and `retained` only for the non-nil
+  `errPublishedBlockReferenceRepairRetained`; the same file's metric section
+  already defined it that way.
+- `docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md`: a dated note records that W2-10
+  was closed after that snapshot by E1-17 (PR #279), so its W2 disposition
+  table and its "What still blocks `X1 CLOSED`" list are the 2026-10-10 state,
+  not the current one; X1 §4 is the source of record.
+- `docs/OPEN-WORK-INDEX.md`: the PR #231 closure record moved to
+  `docs/legacy/CURRENT_WORK-HISTORY-2026-10-12.md`; the plain-text pointer,
+  which a filename search could not catch, now links there.
+
+Reported by the sweep but not changed here: E1-17's pre-HEAD recheck
+(`validateRetainedHistoricalSource`) is referenced only by its four production
+call sites and by no test, while the 15 E1-17 evidence legs reject at capture,
+so W2-10's closure is behaviourally covered for admission and code-only for the
+recheck; and `docs/FILE-LOCKING-DESIGN.md` is no longer referenced from
+anywhere after the README trim.
+
 ## 2026-10-14 — Sandbox-gated multi-region wrapper
 
 Tooling and docs only; no runtime, schema, guard or test change.
