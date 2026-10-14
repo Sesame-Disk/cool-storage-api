@@ -35,7 +35,18 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-17 pre-HEAD recheck witness (test-only)
+## Active slice: E1-01 remaining-cut inventory (documentation only)
+
+Branch `codex/e101-remaining-cut-inventory`, base main@bd8cab852 (#286 merged).
+[E1-01 section 0](docs/E1-01-CRASH-EVIDENCE-PLAN.md#0-current-reconciliation-and-next-bounded-execution-2026-10-14)
+reconciles merged A/B/C/D K evidence with actual C0/C3 and internal C8 call order.
+C0's unsettled root is safe retention; C3's PUBLISHED/PREPARED intermediate state
+is not proved by C2 or C4. Neither is closed. The next execution is bounded to C8
+after exact orphan/discovery removal, before root removal, with TERMINAL retained.
+This PR supplies the inventory and plan, no new process-death result or runtime fix.
+E1-01/X1 remain OPEN; the E1-16 test-gate P2 remains a separate follow-up.
+
+## Previous merged slice: E1-17 pre-HEAD recheck witness (#286)
 
 PR #286, branch `test/e117-prehead-recheck`, rebased onto main@25b74624ed5f.
 Adds
