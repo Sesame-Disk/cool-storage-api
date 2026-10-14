@@ -8,6 +8,16 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — PR #286 rebase and independent audit
+
+Safely rebased onto main@25b74624ed5f, preserving merged crash gates and evidence.
+Corrected a reproduced P2 test-gate false PASS from stale repetition evidence or
+cleanup SKIP. Docker short Go/vet, race repetitions, full required integration,
+API (20/20 suites) and OIDC (25/25 tests) PASS; both full-runner exits are 0.
+Causal recheck-omission and omitted/SKIP probes reject. The witness covers the
+shared permanent-reference branch through RevertFile on one DC; no runtime change
+or gate closure. See [audit evidence](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
 ## 2026-10-14 — E1-17 pre-HEAD recheck witness (test-only)
 
 `TestE117PreHEADRecheckRejectsLostAuthority` (gate

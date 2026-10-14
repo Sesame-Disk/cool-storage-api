@@ -274,9 +274,56 @@ the recheck reads at the existing pre-HEAD barrier — the same callback e16's
 
 Observed 2026-10-14 in the isolated stack (real Cassandra and MinIO): both legs
 PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
-data race. The standard integration/API/OIDC gates were not run for this
+data race. The initial focused run did not include the standard integration/API/OIDC gates for this
 addition.
 
-This closes the evidence gap on W2-10's second half. It changes no runtime,
+This witnesses the shared reference-recheck branch through RevertFile. It changes no runtime,
 schema, guard or gate state; X1 remains OPEN and `GC_ENABLED=false` remains
 mandatory.
+
+### PR #286 rebase and independent audit (2026-10-14)
+
+Rebased safely onto `main@25b74624ed5f8efc274a61210974c6eb4b8177f2` with a local
+backup of published HEAD `2563af3c63e6993908dc5956bf111224d4d8f6b2`. Existing merge
+history was preserved. Conflict resolution retains every A/B/C/D gate plus the new
+pre-HEAD gate, and both sides' evidence/history entries. No runtime source changed.
+
+The original test had a reproduced P2 harness false PASS: after one successful
+invocation, `-count=2` could skip the second rejection leg and still exit 0 because
+the global evidence map retained the first invocation. `tmp/pr286-stale-skip-baseline.log`
+proves it on a disposable source copy (actual required-leg SKIP and test exit 0).
+The minimal correction resets evidence on every invocation and accounts for a leg
+only after all fixture cleanups, when neither Failed nor Skipped. The same injected
+schedule now exits 1 naming the missing rejection leg (`pr286-stale-skip-fixed.log`).
+This is a gate correction, not a reproduced product defect or a runtime change.
+
+Frozen audited implementation: `bc8c31cc8b55b6cb49c89f49b2e7115c40fbfbc7`.
+Final image source SHA-256:
+- Test: `5aaa6efb40e4223274cf09218b221535e2e5c3c0a8792b6586b44ac07f6c2dc5`.
+- TestMain: `ff2683c7200051c272f2df8996be307498b4d1c8558c47900c80da989e0508a9`.
+Runner images: integration `sha256:963fed7c94d2eab128b42dcdc27b67707d88b40ebec5c8720668641f6a131360`;
+all `sha256:e82acde5bf2ecda1c55b8bc739cdef526d1c6411eb154e7753212f3a4ea3cc00`.
+Linux Docker, real Cassandra 5.0.9, single datacenter1/RF1 NTS, LOCAL_QUORUM/SERIAL;
+SILO `RELEASE.2026-09-16T00-00-00Z`. Focused probes use GC-OFF e19. No GC flag changed.
+
+Local ignored `tmp/` evidence:
+- `pr286-race.log`: E117b two legs, E16 six and E117 residual fifteen, repeated twice,
+  PASS with race (113.755s, exit 0); capture and pre-HEAD were reached in the new cases.
+- `pr286-unit-vet.log`: complete short Go tree and normal/integration vet PASS, exit 0.
+- `pr286-recheck-omission.log`: only the RevertFile pre-HEAD recheck is bypassed in a
+  disposable container copy. Control succeeds; trip returns 200 and the test fails
+  specifically for admitting the source with its own permanent reference removed
+  (test exit 1). This proves causal sensitivity, rather than an unrelated error pass.
+- `pr286-gate-negatives.log`: isolated new gate rejects both omitted legs and missing
+  backend (each test exit 1). Repeated required-leg SKIP regression also rejected above.
+- `pr286-go-all.log`: the standard Compose runner PASS: full required integration
+  (1363.859s), API 20/20 suites (101s), OIDC 25/25 tests (1s), plus short Go coverage.
+  Both the persisted container exit and outer process exit are 0. All A/B/C/D gates
+  and the new pre-HEAD gate remained required.
+- `pr286-teardown-skip.log`: an injected SKIP during rejection-leg cleanup is also
+  rejected with test exit 1 and the missing leg named (23.653s).
+
+Scope: one single-file/single-block RevertFile schedule exercises the shared permanent
+reference recheck. It is not an independent behavioral drill of the other three callers,
+directory layouts, exact-placement loss/UNKNOWN or mutations after the recheck. Those
+must not be inferred from this witness. X1/E1 remain OPEN and ordinary GC stays OFF.

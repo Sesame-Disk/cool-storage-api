@@ -37,7 +37,8 @@ The source of record for order and closure states is
 
 ## Active slice: E1-17 pre-HEAD recheck witness (test-only)
 
-Branch `test/e117-prehead-recheck`, base main@f580787ed. Adds
+PR #286, branch `test/e117-prehead-recheck`, rebased onto main@25b74624ed5f.
+Adds
 `TestE117PreHEADRecheckRejectsLostAuthority`
 (`internal/integration/e117b_prehead_recheck_test.go`, gate
 `SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`, wired into `TestMain` and both
@@ -45,9 +46,12 @@ compose runners). The 15 residual legs assert `headVisits == 0`, so
 `validateRetainedHistoricalSource` was never reached by a test; this leg runs the
 supported restore path on settled history, removes the permanent `fs:` the
 recheck reads at the existing pre-HEAD barrier, and requires rejection with HEAD
-unchanged. Both legs PASS in the isolated stack (real Cassandra and MinIO) and
-`-race -count=2` with the six e16 legs passes with no data race; the standard
-integration/API/OIDC gates were not run. See
+unchanged. Independent audit corrected a reproduced stale-evidence/SKIP false PASS
+in the new gate; evidence now resets per invocation and is recorded after cleanups.
+Docker short Go, vet, race repetitions, full required integration, API (20/20 suites)
+and OIDC (25/25 tests) PASS, with both full-runner exits 0. Mutation and omitted/SKIP
+negative probes reject as required. Scope is the shared permanent-reference recheck
+through single-file RevertFile on one DC; X1/E1 remain OPEN. See
 [docs/E1-17-W2-10-RESIDUAL-HANDLERS.md](docs/E1-17-W2-10-RESIDUAL-HANDLERS.md)
 §Pre-HEAD recheck witness and [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
 
