@@ -23,7 +23,7 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 | C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
 | C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
 | C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
-| C8 internal | [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) records root-only TERMINAL K evidence after orphan/discovery removal (merged #290, single DC). [E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) selects the separate orphan-absent/discovery-present/root-present cut; its validation is pending. U/R controls retain their original scope; no all-C8 closure. |
+| C8 internal | [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) records root-only TERMINAL K evidence after orphan/discovery removal (merged #290, single DC). [E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) records the separate orphan-absent/discovery-present/root-present K cut (in review, single DC). U/R controls retain their original scope; no all-C8 closure. |
 
 The A/B/C/D ledgers retain their frozen sources and scope. E adds only its
 recorded internal boundary; its ledger separates new results from reused controls.
@@ -60,8 +60,9 @@ No new C0/C3 K claim or closure follows from these controls.
 
 ### 0.3 Selected next drill: one internal C8 root-only TERMINAL cut
 
-Execution record: [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) implements this
-selection; results and validation limits are in that ledger. The bounded plan follows.
+Historical selection from #289, now merged in #290. The current next drill is
+section 0.4. Execution record: [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md);
+results and validation limits are in that ledger. Its bounded plan is preserved below.
 
 [DeleteS3Orphan](../internal/gc/store_cassandra.go) removes, in order, the exact
 orphan, the exact by-day discovery row, then the recovery root. The selected E slice
@@ -90,7 +91,7 @@ Do not fabricate authority with direct setup CQL; add no new productive hook if
 the existing observer can hold the cut. If it cannot, report that instrumentation
 limit before expanding scope. The E ledger records the observed drill; this
 inventory does not expand its scope or close a gate.
-C0/C3, the other C8 substep, global scheduling and three-DC residuals remain OPEN.
+The earlier C8 substep is tracked in section 0.4. C0/C3, global scheduling and three-DC residuals remain OPEN.
 
 ### 0.4 Selected next drill: discovery retained after orphan deletion
 
@@ -99,7 +100,8 @@ orphan DELETE before discovery DELETE. Parent must prove TERMINAL, orphan absent
 exact discovery/root and original token present, canonical/K1 absent and settled
 work. Fresh-process recovery must remove the still-present projection using the
 root token, then remove the root; replay must preserve TERMINAL and unchanged HEAD.
-E proves the later root-only state, not this outstanding discovery deletion.
+E proves the later root-only state; F records this outstanding discovery deletion
+with its validation limits and frozen sources in the linked ledger.
 Reuse observer/harness and fail-closed gate, with SIGKILL/resume and preserved
 failure evidence. No runtime change presumed; C0/C3 and three-DC remain separate.
 

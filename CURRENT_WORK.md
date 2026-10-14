@@ -42,7 +42,10 @@ Branch `codex/e101-discovery-retained-crash`, base main@2b282a07a (#290).
 orphan DELETE before discovery DELETE: TERMINAL, orphan absent, discovery/root
 present. Reuse productive preparation, observer, independent durable oracle,
 SIGKILL/resume, fresh-process recovery/replay, preservation and a separate gate.
-Docker validation and audit are pending. No runtime change; E1-01/X1 OPEN.
+Directed Docker, race repetitions, gate/recovery-child negatives and preservation
+PASS. Short Go/vet and full required integration/API/OIDC PASS; container and outer
+runner exits are 0. A/B/C/D/E controls remain green; scoped audit found no blockers.
+Frozen source/image and one-DC scope in ledger. No runtime change; E1-01/X1 OPEN.
 
 ## Previous merged slice: E1-01E root-only TERMINAL process-crash evidence (#290)
 

@@ -2,16 +2,17 @@
 
 ## E1-01F discovery-retained TERMINAL evidence (2026-10-14)
 
-[E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) plans one internal C8 cut after
+[E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) records one internal C8 cut after
 orphan deletion, before discovery deletion. Unlike merged #290, the exact
-projection still needs removal using the durable root token. Validation is pending;
+projection still needs removal using the durable root token at the cut. Directed,
+race, negative controls and standard integration/API/OIDC PASS; ledger gives scope.
 C0/C3 and three-DC residuals remain separate. E1-01/X1 OPEN; no activation authority.
 
 ## E1-01E root-only TERMINAL evidence (2026-10-14)
 
 [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) is the execution of #289's single
 internal C8 cut, after orphan/discovery deletion and before root deletion.
-C0/C3, the earlier orphan-only cleanup cut and three-DC residuals remain separate;
+F records the earlier discovery-retained cleanup cut; C0/C3 and three-DC residuals remain separate;
 E1-01/X1 stay OPEN. The ledger records validation without activation authority.
 
 ## E1-01 remaining-cut inventory (2026-10-14)
