@@ -50,6 +50,7 @@ type e101ProcessData struct {
 	Block, Class, Marker, Cut, Mode, Expect, Repo, Session, SHA1 string
 	Candidate                                                    gcpkg.BlockGCCandidateInfo
 	Authority                                                    gcpkg.BlockDeleteAuthority
+	FirstSeenAt                                                  time.Time
 }
 
 // Pause only delegated successful current-protocol calls; no productive hook or fabricated outcome.
@@ -240,7 +241,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						cleanupGCBlockFixturesForTest(t, fx.orgUUID, fx.blockID)
 						e115aVerifyNoRoot(t, database, fx)
 					})
-					if e101cCut(cut) {
+					if e101RecoveryCut(cut) {
 						w2AssertBytes(t, fx)
 						data = e101cPrepare(t, data)
 					}
@@ -291,7 +292,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						}
 						err := <-exited
 						finished = true
-						if err != nil || (e101cCut(cut) && !bytes.Contains(output.Bytes(), []byte("E101C_PHYSICAL_COMPLETED"))) {
+						if err != nil || (e101RecoveryCut(cut) && !bytes.Contains(output.Bytes(), []byte("E101C_PHYSICAL_COMPLETED"))) {
 							t.Fatalf("no-kill worker: %v\n%s", err, output.String())
 						}
 					}
@@ -379,8 +380,11 @@ func e101AssertRecovered(t *testing.T, fx *w2CreateFileFixture, data e101Process
 	if rows := w2Repairs(t, fx); len(rows) != 0 {
 		t.Fatalf("GC invented publication repair: %+v", rows)
 	}
-	if e101bCut(data.Cut) || e101cCut(data.Cut) {
+	if e101bCut(data.Cut) || e101RecoveryCut(data.Cut) {
 		e101bBookkeeping(t, fx.database, data, false)
+	}
+	if e101dCut(data.Cut) {
+		e101dAssertSettled(t, fx.database, data)
 	}
 	t.Logf("independently observed %s P=%+v D=%+v", data.Expect, data.Authority.Target, data.Authority)
 }
@@ -452,6 +456,13 @@ func e101Capture(database *dbpkg.DB, data e101ProcessData) e101Snapshot {
 			cl = gocql.Serial
 		}
 		read(table, "SELECT * FROM "+table+" WHERE org_id=? AND block_id=?", cl, data.Org.String(), data.Block)
+	}
+	if e101dCut(data.Cut) {
+		if data.FirstSeenAt.IsZero() {
+			s.Errors["discovery"] = "missing exact first_seen_at"
+		} else {
+			read("gc_s3_orphans_by_day", `SELECT * FROM gc_s3_orphans_by_day WHERE first_seen_day=? AND bucket=? AND first_seen_at=? AND org_id=? AND block_id=? AND storage_class=? AND storage_key=? AND gc_claim_id=? AND gc_claimed_at=?`, gocql.EachQuorum, dbpkg.GCProjectionUTCDate(data.FirstSeenAt), dbpkg.GCDiscoveryBucket(data.Org.String(), data.Block), data.FirstSeenAt, data.Org.String(), data.Block, data.Authority.Target.StorageClass, data.Authority.Target.StorageKey, data.Authority.ClaimID, data.Authority.ClaimedAt)
+		}
 	}
 	read("head", "SELECT head_commit_id FROM libraries WHERE org_id=? AND library_id=?", gocql.Serial, data.Org.String(), data.Repo)
 	for b := 0; b < dbpkg.PublishedBlockReferenceRepairBuckets; b++ {
@@ -545,12 +556,12 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 	if err != nil || json.Unmarshal(encoded, &failure) != nil {
 		t.Fatalf("invalid retained snapshot: %v", err)
 	}
-	retainedWork := !e101cCut(cut)
+	retainedWork := !e101RecoveryCut(cut)
 	expectedCandidates := 1
 	if !retainedWork {
 		expectedCandidates = 0
 	}
-	if failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
+	if (e101dCut(cut) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
 		t.Fatal("failure snapshot lost or changed the exact durable boundary state")
 	}
 	// A new session must observe the same live state AFTER the failed subprocess and TestMain sweeps.

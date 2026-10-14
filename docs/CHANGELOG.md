@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — E1-01C physical recovery process-crash evidence (#287)
+
+[E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md) adds real recovery-process SIGKILL
+at C6 (DELETE confirmed, phase not persisted) and C7 (phase persisted, not TERMINAL),
+same-boundary resume controls, independent recovery/replay and failed-fixture preservation.
+Docker race, required integration, API and OIDC stages PASS on the frozen source;
+the ledger records the unavailable original outer-process exit after client resume.
+Single-DC, test-only evidence: no product violation reproduced, no E1-01/X1 gate closed.
+
 ## 2026-10-14 — Verification sweep of PRs #277–#283 and its corrections
 
 Documentation only; no status, severity or gate state changes. X1 remains OPEN

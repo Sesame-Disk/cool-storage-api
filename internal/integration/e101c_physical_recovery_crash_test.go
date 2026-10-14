@@ -78,7 +78,10 @@ func e101cChild(t *testing.T, database *dbpkg.DB, data e101ProcessData) {
 		return
 	}
 	scoped := &w2OwnedRecoveryStore{GCStore: store, org: data.Org, block: data.Block}
-	paused := &e101cPausedStore{w2OwnedRecoveryStore: scoped, t: t, data: data}
+	var paused gcpkg.GCStore = &e101cPausedStore{w2OwnedRecoveryStore: scoped, t: t, data: data}
+	if e101dCut(data.Cut) {
+		paused = &e101dPausedStore{w2OwnedRecoveryStore: scoped, t: t, data: data}
+	}
 	if n, err := w2Worker(t, paused, data.Class).RecoverS3Orphans(t.Context(), 1000); err != nil || n != 1 {
 		t.Fatalf("physical recovery n=%d err=%v", n, err)
 	}
@@ -98,6 +101,9 @@ func e101cPrepare(t *testing.T, data e101ProcessData) e101ProcessData {
 		t.Fatalf("preparation exact D unavailable: %v", err)
 	}
 	e101bBookkeeping(t, shareProjectionDBForTest(t), data, false)
+	if e101dCut(data.Cut) {
+		data.FirstSeenAt = e101dFirstSeen(t, data)
+	}
 	data.Mode = "physical"
 	return data
 }
