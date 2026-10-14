@@ -8,6 +8,28 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — E1-17 pre-HEAD recheck witness (test-only)
+
+`TestE117PreHEADRecheckRejectsLostAuthority` (gate
+`SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`) closes the evidence gap the
+verification sweep found on the E1-17 row: the 15 residual legs assert
+`headVisits == 0`, so `validateRetainedHistoricalSource` — E1-17's
+capture-to-HEAD recheck — was never reached by any test, and the function was
+named by no test at all. W2-10's closure was therefore behaviourally covered for
+admission and unobserved for the recheck.
+
+The new leg runs the supported restore path on settled history so capture passes,
+then removes the permanent `fs:` reference the recheck reads at the existing
+pre-HEAD barrier, and requires the recheck to reject: response not 200, HEAD
+unchanged, no repair installed. A control leg with the mutation withheld reverts
+successfully and advances HEAD. Both legs observe the pre-HEAD barrier reached,
+the inverse of the residual legs' `headVisits == 0`.
+
+Observed 2026-10-14 in the isolated stack (real Cassandra and MinIO): both legs
+PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
+data race. Not run: the standard integration/API/OIDC gates. No runtime, schema
+or guard change; X1 remains OPEN and `GC_ENABLED=false` remains mandatory.
+
 ## 2026-10-14 — Sandbox-gated multi-region wrapper
 
 Tooling and docs only; no runtime, schema, guard or test change.

@@ -252,3 +252,31 @@ W2-10 is **CLOSED-FIX** for X1:
 - the identity claim-table PRE-X1 audit debt.
 
 Production GC stays OFF.
+
+### Pre-HEAD recheck witness (2026-10-14)
+
+The 15 residual legs above reject at capture and assert `headVisits == 0`, so
+neither the pre-HEAD barrier nor `validateRetainedHistoricalSource` is reached in
+them: the recheck's rejection path had no behavioural witness. It does now.
+
+`TestE117PreHEADRecheckRejectsLostAuthority`
+(`internal/integration/e117b_prehead_recheck_test.go`, gate
+`SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`) runs the supported restore path
+on settled history so capture passes, then removes the permanent `fs:` reference
+the recheck reads at the existing pre-HEAD barrier — the same callback e16's
+`head-conflict` leg uses — and requires the recheck to reject:
+
+- control leg: mutation withheld, the revert succeeds and HEAD advances;
+- trip leg: the pre-HEAD barrier is reached (`headVisits == 1`), the handler logs
+  `historical source failed pre-HEAD recheck … lacks settled permanent
+  liveness`, the response is not 200, HEAD is unchanged and no repair is
+  installed.
+
+Observed 2026-10-14 in the isolated stack (real Cassandra and MinIO): both legs
+PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
+data race. The standard integration/API/OIDC gates were not run for this
+addition.
+
+This closes the evidence gap on W2-10's second half. It changes no runtime,
+schema, guard or gate state; X1 remains OPEN and `GC_ENABLED=false` remains
+mandatory.
