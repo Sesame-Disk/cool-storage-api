@@ -39,7 +39,8 @@ The source of record for order and closure states is
 
 [E1-01D](docs/E1-01D-TERMINAL-CLEANUP-CRASH.md) covers only the first C8 boundary:
 TERMINAL persisted, before the real aggregate orphan/discovery/root cleanup call.
-The two process-death/resume controls and Docker verification are pending. Internal
+The kill/resume controls, independent recovery/replay, failure preservation, race repeat and
+standard Docker integration/API/OIDC PASS; both recorded runner exits are 0. Internal
 cleanup substeps and C0/C3 inventory remain separate; E1-01/X1 remain OPEN, production GC OFF.
 
 ## Previous merged slice: E1-01C physical recovery crash evidence (#287)
