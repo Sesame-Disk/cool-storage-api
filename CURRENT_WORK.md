@@ -42,7 +42,9 @@ DELETE, before phase persistence) and C7 (phase persisted, before TERMINAL).
 [E1-01A](docs/E1-01A-G2-PROCESS-CRASH.md) (#281) and
 [E1-01B](docs/E1-01B-G3-PROCESS-CRASH.md) (#283) are merged single-DC process-death
 evidence for C1/C2 and C4/C5. C8 and the C0/C3 inventory remain separate;
-E1-01/X1 remain OPEN and production GC remains OFF. C6/C7 verification is pending.
+C6/C7 kill/control and independent recovery/replay, preservation negatives, race repeat and the
+standard Docker integration/API/OIDC stages PASS on the frozen source (see ledger).
+E1-01/X1 remain OPEN and production GC remains OFF.
 
 ## Active slice: verification sweep of PRs #277–#283 (docs corrections)
 
