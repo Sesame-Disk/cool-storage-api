@@ -41,6 +41,14 @@ func e117bMissing(observed map[string]bool) []string {
 
 func TestE117PreHEADRecheckRejectsLostAuthority(t *testing.T) {
 	e117bEvidence = map[string]bool{} // Each repetition must prove both legs anew.
+	// Check this invocation even if requireCassandra ends it with an early SKIP.
+	t.Cleanup(func() {
+		if os.Getenv(e117bEvidenceEnv) == "1" {
+			if missing := e117bMissing(e117bEvidence); len(missing) > 0 {
+				t.Errorf("required legs missing: %s", strings.Join(missing, ", "))
+			}
+		}
+	})
 	requireCassandra(t)
 
 	for _, leg := range e117bLegs {
@@ -147,9 +155,4 @@ func TestE117PreHEADRecheckRejectsLostAuthority(t *testing.T) {
 		})
 	}
 
-	if os.Getenv(e117bEvidenceEnv) == "1" {
-		if missing := e117bMissing(e117bEvidence); len(missing) > 0 {
-			t.Fatalf("required legs missing: %s", strings.Join(missing, ", "))
-		}
-	}
 }

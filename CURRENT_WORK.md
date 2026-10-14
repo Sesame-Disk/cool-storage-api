@@ -43,17 +43,23 @@ Adds
 (`internal/integration/e117b_prehead_recheck_test.go`, gate
 `SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`, wired into `TestMain` and both
 compose runners). The 15 residual legs assert `headVisits == 0`, so
-`validateRetainedHistoricalSource` was never reached by a test; this leg runs the
+they do not exercise the recheck. E1-16 already covers successful rechecks; this
+leg adds rejection on lost permanent authority. It runs the
 supported restore path on settled history, removes the permanent `fs:` the
 recheck reads at the existing pre-HEAD barrier, and requires rejection with HEAD
 unchanged. Independent audit corrected a reproduced stale-evidence/SKIP false PASS
-in the new gate; evidence now resets per invocation and is recorded after cleanups.
-Docker short Go, vet, race repetitions, full required integration, API (20/20 suites)
-and OIDC (25/25 tests) PASS, with both full-runner exits 0. Mutation and omitted/SKIP
-negative probes reject as required. Scope is the shared permanent-reference recheck
+in the new gate; evidence now resets per invocation, is recorded after cleanups,
+and is checked even after an early parent SKIP.
+Initial audit: Docker short Go, vet, race, full required integration, API (20/20 suites)
+and OIDC (25/25 tests) PASS, with both full-runner exits 0. After the crossed-audit
+gate correction, focused race repetitions/integration vet PASS; both orders of
+early SKIP, rejection-leg SKIP and cleanup SKIP reject. The full runner was not
+repeated for this harness-only correction. Scope is the shared permanent-reference recheck
 through single-file RevertFile on one DC; X1/E1 remain OPEN. See
 [docs/E1-17-W2-10-RESIDUAL-HANDLERS.md](docs/E1-17-W2-10-RESIDUAL-HANDLERS.md)
 §Pre-HEAD recheck witness and [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
+The pre-existing E1-16 gate defect is tracked separately as
+[ISSUE-E16-REPEATED-EVIDENCE-GATE-01](docs/KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01).
 
 ## Previous merged slice: E1-01D terminal-before-cleanup evidence (#288)
 
@@ -83,8 +89,9 @@ the tests and the sources of record. Corrections: the abandoned-repair
 a dated W2-10 note in [E1-16](docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md), and the
 dangling PR #231 pointer in [OPEN-WORK-INDEX](docs/OPEN-WORK-INDEX.md). Open
 findings reported with the sweep: E1-17's pre-HEAD recheck
-(`validateRetainedHistoricalSource`) has no test coverage — the 15 evidence legs
-reject at capture — and `docs/FILE-LOCKING-DESIGN.md` is now referenced from
+was overreported as wholly uncovered: E1-16 already covers successful rechecks,
+while the 15 residual legs reject at capture. PR #286 witnesses lost-reference
+rejection; and `docs/FILE-LOCKING-DESIGN.md` is now referenced from
 nothing. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
 
 ## Previous merged slice: sandbox-gated dev multi-region stack (tooling, PR #284)

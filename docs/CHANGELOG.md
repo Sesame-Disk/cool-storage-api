@@ -8,6 +8,19 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — PR #286 crossed-audit corrections
+
+Corrected the coverage claim: E1-16 already exercises successful pre-HEAD
+rechecks; #286 adds the missing lost-permanent-reference rejection witness.
+The new gate now checks each invocation even after an early parent SKIP;
+previously SKIP then PASS under `-count=2` could still exit 0. Both early-SKIP
+orders and leg/cleanup SKIPs reject in Docker. Final focused `-race -count=2`
+and integration vet PASS; optional gate behavior is preserved. The full runner
+PASS recorded below predates this harness-only correction and was not repeated.
+The independently reproduced pre-existing E1-16 evidence accumulation defect is
+tracked as [P2 follow-up](./KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01).
+No runtime change or gate closure. See the [audit ledger](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
+
 ## 2026-10-14 — PR #286 rebase and independent audit
 
 Safely rebased onto main@25b74624ed5f, preserving merged crash gates and evidence.
@@ -23,10 +36,10 @@ or gate closure. See [audit evidence](./E1-17-W2-10-RESIDUAL-HANDLERS.md).
 `TestE117PreHEADRecheckRejectsLostAuthority` (gate
 `SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE`) closes the evidence gap the
 verification sweep found on the E1-17 row: the 15 residual legs assert
-`headVisits == 0`, so `validateRetainedHistoricalSource` — E1-17's
-capture-to-HEAD recheck — was never reached by any test, and the function was
-named by no test at all. W2-10's closure was therefore behaviourally covered for
-admission and unobserved for the recheck.
+`headVisits == 0` and do not exercise the capture-to-HEAD recheck. E1-16 already
+executes successful rechecks in retained-history restoration and HEAD-conflict
+controls. The missing evidence was rejection after loss of the own permanent
+`fs:` reference between capture and HEAD publication.
 
 The new leg runs the supported restore path on settled history so capture passes,
 then removes the permanent `fs:` reference the recheck reads at the existing
@@ -69,6 +82,10 @@ the code, the tests and the sources of record. Three items needed correction:
 - `docs/OPEN-WORK-INDEX.md`: the PR #231 closure record moved to
   `docs/legacy/CURRENT_WORK-HISTORY-2026-10-12.md`; the plain-text pointer,
   which a filename search could not catch, now links there.
+
+The sweep originally overclaimed absent pre-HEAD coverage; corrected by the
+PR #286 crossed audit: E1-16 already exercises successful rechecks. The original
+snapshot below records that earlier claim, not the current coverage assessment.
 
 Reported by the sweep but not changed here: E1-17's pre-HEAD recheck
 (`validateRetainedHistoricalSource`) is referenced only by its four production

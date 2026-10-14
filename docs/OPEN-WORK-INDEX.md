@@ -1,5 +1,12 @@
 # Open Work Index
 
+## E1-16 repeated evidence gate follow-up (2026-10-14)
+
+[ISSUE-E16-REPEATED-EVIDENCE-GATE-01](./KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01)
+is P2 OPEN / FOLLOW-UP, pre-existing: accumulated repetition evidence and credit
+before cleanup can admit SKIP as PASS. Separate small harness fix; PR #286 fixes
+only its own gate. No runtime defect or gate closure is inferred.
+
 ## W2-10 closed (E1-17, 2026-10-12)
 
 Content resurrection (W2-10) is CLOSED-FIX: all four handlers and their file
