@@ -18,9 +18,11 @@ const e101dTerminalCut = "terminal-before-cleanup"
 var e101dObserved = map[string]bool{}
 var e101dCuts = []string{e101dTerminalCut}
 
-func e101dMissing() []string          { return e101MissingLegs(e101dObserved, e101dCuts) }
-func e101dCut(cut string) bool        { return cut == e101dTerminalCut }
-func e101RecoveryCut(cut string) bool { return e101cCut(cut) || e101dCut(cut) || e101eCut(cut) }
+func e101dMissing() []string   { return e101MissingLegs(e101dObserved, e101dCuts) }
+func e101dCut(cut string) bool { return cut == e101dTerminalCut }
+func e101RecoveryCut(cut string) bool {
+	return e101cCut(cut) || e101dCut(cut) || e101eCut(cut) || e101fCut(cut)
+}
 
 // The productive caller already persisted TERMINAL. Pause before this real
 // aggregate call; its internal orphan/discovery/root substeps are separate cuts.

@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — E1-01F discovery-retained TERMINAL process crash
+
+[E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) witnesses real orphan deletion
+before discovery deletion, with exact TERMINAL/root/token and discovery retained.
+Productive preparation, exact query observer, independent durable oracle,
+SIGKILL/resume, fresh-process recovery/replay, preserved failures and separate gate.
+Directed/race/negative controls, short Go/vet and standard integration/API/OIDC
+PASS; full-runner container and outer exits 0. A/B/C/D/E and all six preservation
+controls remain green. No runtime/schema/default change or product defect
+reproduced; single-DC scope, E1-01/X1 OPEN. Frozen sources/results in ledger.
+
 ## 2026-10-14 — E1-01E root-only TERMINAL process-crash evidence
 
 [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) adds one internal C8 cut, after
