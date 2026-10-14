@@ -35,7 +35,14 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01C physical recovery crash evidence
+## Active slice: E1-01D terminal-before-cleanup evidence
+
+[E1-01D](docs/E1-01D-TERMINAL-CLEANUP-CRASH.md) covers only the first C8 boundary:
+TERMINAL persisted, before the real aggregate orphan/discovery/root cleanup call.
+The two process-death/resume controls and Docker verification are pending. Internal
+cleanup substeps and C0/C3 inventory remain separate; E1-01/X1 remain OPEN, production GC OFF.
+
+## Previous merged slice: E1-01C physical recovery crash evidence (#287)
 
 [E1-01C](docs/E1-01C-PHYSICAL-RECOVERY-CRASH.md) is limited to C6 (after real S3
 DELETE, before phase persistence) and C7 (phase persisted, before TERMINAL).
