@@ -31,10 +31,13 @@ const e101EvidenceEnv = "SESAMEFS_REQUIRE_E101_G2_CRASH_EVIDENCE"
 var e101Observed = map[string]bool{}
 
 func e101Missing() []string {
+	return e101MissingLegs(e101Observed, []string{"prepared", "committed"})
+}
+func e101MissingLegs(observed map[string]bool, cuts []string) []string {
 	var missing []string
-	for _, cut := range []string{"prepared", "committed"} {
+	for _, cut := range cuts {
 		for _, action := range []string{"kill", "resume"} {
-			if leg := cut + "/" + action; !e101Observed[leg] {
+			if leg := cut + "/" + action; !observed[leg] {
 				missing = append(missing, leg)
 			}
 		}
@@ -105,9 +108,17 @@ func TestE101GCProcessChild(t *testing.T) {
 		e101VerifyFailure(t, database, data)
 		return
 	}
+	if data.Mode == "settle" {
+		e101bReplay(t, database, data)
+		return
+	}
 	if data.Mode == "worker" {
 		scope := &w2ClosureOwnedQueue{GCStore: store, org: data.Org, block: data.Block, identity: data.Candidate.Identity()}
-		paused := &e101PausedStore{w2ClosureOwnedQueue: scope, t: t, data: data}
+		base := &e101PausedStore{w2ClosureOwnedQueue: scope, t: t, data: data}
+		var paused gcpkg.GCStore = base
+		if e101bCut(data.Cut) {
+			paused = &e101bPausedStore{e101PausedStore: base}
+		}
 		if n, err := w2Worker(t, paused, data.Class).ProcessOrgOnce(t.Context(), data.Org); err != nil || n != 1 || !scope.visited {
 			t.Fatalf("worker n=%d visited=%v err=%v", n, scope.visited, err)
 		}
@@ -178,15 +189,22 @@ func TestE101G2ProcessCrash(t *testing.T) {
 		t.Fatal("E1-01A requires Linux Docker")
 	}
 	e19RequireNoBackgroundGC(t)
+	e101RunMatrix(t, []string{"prepared", "committed"}, e101Observed, e101AssertBoundary, nil)
+}
+
+func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, boundary func(*testing.T, *w2CreateFileFixture, e101ProcessData), beforeRecovery func(*testing.T, *w2CreateFileFixture, e101ProcessData, e101Snapshot)) {
+	if runtime.GOOS != "linux" || os.Getenv("SESAMEFS_TEST_IN_CONTAINER") != "1" {
+		t.Fatal("E1-01 process evidence requires Linux Docker")
+	}
 	database := shareProjectionDBForTest(t)
-	for _, cut := range []string{"prepared", "committed"} {
+	for _, cut := range cuts {
 		t.Run(cut, func(t *testing.T) {
 			for _, action := range []string{"kill", "resume"} {
 				t.Run(action, func(t *testing.T) {
 					// Account for evidence only after parent-owned fixture teardown has succeeded.
 					t.Cleanup(func() {
 						if !t.Failed() && !t.Skipped() {
-							e101Observed[cut+"/"+action] = true
+							observed[cut+"/"+action] = true
 						}
 					})
 					class := x1StorageClass(t)
@@ -239,7 +257,7 @@ func TestE101G2ProcessCrash(t *testing.T) {
 					if err != nil || json.Unmarshal(encoded, &data.Authority) != nil {
 						t.Fatalf("read exact boundary authority: %v", err)
 					}
-					e101AssertBoundary(t, fx, data)
+					boundary(t, fx, data)
 					snapshot := e101Capture(database, data)
 					before = &snapshot
 					if len(snapshot.Errors) != 0 {
@@ -272,6 +290,9 @@ func TestE101G2ProcessCrash(t *testing.T) {
 					data.Expect = "terminal"
 					if cut == "prepared" && action == "kill" {
 						data.Expect = "aborted"
+					}
+					if beforeRecovery != nil {
+						beforeRecovery(t, fx, data, *before)
 					}
 					e101Recover(t, data)
 					e101AssertRecovered(t, fx, data)
@@ -347,14 +368,20 @@ func e101AssertRecovered(t *testing.T, fx *w2CreateFileFixture, data e101Process
 	if rows := w2Repairs(t, fx); len(rows) != 0 {
 		t.Fatalf("GC invented publication repair: %+v", rows)
 	}
+	if e101bCut(data.Cut) {
+		e101bBookkeeping(t, fx.database, data, false)
+	}
 	t.Logf("independently observed %s P=%+v D=%+v", data.Expect, data.Authority.Target, data.Authority)
 }
 
 func e101Isolated(t *testing.T, endpoint string) {
+	e101IsolatedMatrix(t, endpoint, "TestE101G2ProcessCrash", e101EvidenceEnv, "SESAMEFS_E101_CHILD", e101Observed, []string{"prepared", "committed"})
+}
+func e101IsolatedMatrix(t *testing.T, endpoint, testName, gate, child string, observed map[string]bool, cuts []string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
-	run := "^TestE101G2ProcessCrash$"
+	run := "^" + testName + "$"
 	if _, sub, ok := strings.Cut(flag.Lookup("test.run").Value.String(), "/"); ok {
 		run += "/" + sub
 	}
@@ -366,23 +393,23 @@ func e101Isolated(t *testing.T, endpoint string) {
 		}
 		cmd.Env = append(cmd.Env, entry)
 	}
-	cmd.Env = append(cmd.Env, e101EvidenceEnv+"=1", "SESAMEFS_E101_CHILD=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
+	cmd.Env = append(cmd.Env, gate+"=1", child+"=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("isolated E1-01A evidence: %v", err)
+		t.Fatalf("isolated %s evidence: %v", testName, err)
 	}
-	for _, leg := range e101Missing() {
-		e101Observed[leg] = true
+	for _, leg := range e101MissingLegs(observed, cuts) {
+		observed[leg] = true
 	}
 }
 
 // Snapshot reads never fail/skip the test halfway: UNKNOWN is recorded and the fixture is retained.
 type e101Snapshot struct {
-	Rows                map[string][]map[string]interface{}
-	Root                gcpkg.S3OrphanRecoveryRootInfo
-	RootFound, K1Exists bool
-	K1Bytes             []byte
-	Errors              map[string]string
+	Rows                            map[string][]map[string]interface{}
+	Root                            gcpkg.S3OrphanRecoveryRootInfo
+	RootFound, K1Exists, QueueFound bool
+	K1Bytes                         []byte
+	Errors                          map[string]string
 }
 type e101Failure struct {
 	Data           e101ProcessData
@@ -420,7 +447,12 @@ func e101Capture(database *dbpkg.DB, data e101ProcessData) e101Snapshot {
 		read(fmt.Sprintf("repairs/%d", b), "SELECT * FROM published_block_reference_repairs WHERE bucket=? AND org_id=? AND repo_id=?", gocql.EachQuorum, b, data.Org.String(), data.Repo)
 	}
 	var err error
-	s.Root, s.RootFound, err = gcpkg.NewCassandraStore(database).GetS3OrphanRecoveryRootExact(data.Org, data.Block, data.Authority)
+	store := gcpkg.NewCassandraStore(database)
+	s.QueueFound, err = store.QueueItemExists(data.Org, data.Candidate.CandidateAt, gcpkg.ItemBlock, data.Block, data.Candidate.ItemIdentity())
+	if err != nil {
+		s.Errors["queue"] = err.Error()
+	}
+	s.Root, s.RootFound, err = store.GetS3OrphanRecoveryRootExact(data.Org, data.Block, data.Authority)
 	if err != nil {
 		s.Errors["root"] = err.Error()
 	}
@@ -468,6 +500,9 @@ func e101PreserveFailure(t *testing.T, database *dbpkg.DB, data e101ProcessData,
 }
 
 func TestE101FailureSnapshotSurvivesTeardown(t *testing.T) {
+	e101FailureControl(t, "TestE101G2ProcessCrash", "committed", e101EvidenceEnv, 1, 0)
+}
+func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecycles int) {
 	endpoint := os.Getenv("SESAMEFS_E19_ISOLATED_URL")
 	if runtime.GOOS != "linux" || os.Getenv("SESAMEFS_TEST_IN_CONTAINER") != "1" || endpoint == "" {
 		t.Fatal("failure preservation control requires the isolated Docker fleet")
@@ -475,7 +510,7 @@ func TestE101FailureSnapshotSurvivesTeardown(t *testing.T) {
 	dir := t.TempDir() // Owned by this verifier, outside the deliberately failed child's TempDir.
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestE101G2ProcessCrash$/committed/kill", "-test.v", "-test.count=1", "-test.timeout=5m")
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+testName+"$/"+cut+"/kill", "-test.v", "-test.count=1", "-test.timeout=5m")
 	for _, entry := range os.Environ() {
 		name := strings.SplitN(entry, "=", 2)[0]
 		if strings.HasPrefix(name, "SESAMEFS_REQUIRE_") || name == "SESAMEFS_E101_FAIL_AFTER_KILL" || name == "SESAMEFS_E101_EVIDENCE_DIR" || strings.HasSuffix(name, "_CHILD") {
@@ -483,7 +518,7 @@ func TestE101FailureSnapshotSurvivesTeardown(t *testing.T) {
 		}
 		cmd.Env = append(cmd.Env, entry)
 	}
-	cmd.Env = append(cmd.Env, e101EvidenceEnv+"=1", "SESAMEFS_E101_FAIL_AFTER_KILL=1", "SESAMEFS_E101_EVIDENCE_DIR="+dir)
+	cmd.Env = append(cmd.Env, gate+"=1", "SESAMEFS_E101_FAIL_AFTER_KILL=1", "SESAMEFS_E101_EVIDENCE_DIR="+dir)
 	out, err := cmd.CombinedOutput()
 	t.Logf("expected failing preservation child: %s", out)
 	var failed *exec.ExitError
@@ -499,8 +534,8 @@ func TestE101FailureSnapshotSurvivesTeardown(t *testing.T) {
 	if err != nil || json.Unmarshal(encoded, &failure) != nil {
 		t.Fatalf("invalid retained snapshot: %v", err)
 	}
-	if failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || !failure.After.K1Exists || len(failure.After.K1Bytes) == 0 || len(failure.After.Rows["blocks"]) != 1 || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != 1 || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != 0 {
-		t.Fatal("failure snapshot lost or changed the exact committed/PREPARED counterexample state")
+	if failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || !failure.After.QueueFound || !failure.After.K1Exists || len(failure.After.K1Bytes) == 0 || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != 1 || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
+		t.Fatal("failure snapshot lost or changed the exact durable boundary state")
 	}
 	// A new session must observe the same live state AFTER the failed subprocess and TestMain sweeps.
 	data := failure.Data
