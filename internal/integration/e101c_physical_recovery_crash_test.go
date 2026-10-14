@@ -62,6 +62,10 @@ func e101cChild(t *testing.T, database *dbpkg.DB, data e101ProcessData) {
 		e101eChild(t, data)
 		return
 	}
+	if data.Mode == "physical" && e101fCut(data.Cut) {
+		e101fChild(t, data)
+		return
+	}
 	store := gcpkg.NewCassandraStore(database)
 	if data.Mode == "prepare-physical" {
 		scope := &w2ClosureOwnedQueue{GCStore: store, org: data.Org, block: data.Block, identity: data.Candidate.Identity()}
@@ -105,7 +109,7 @@ func e101cPrepare(t *testing.T, data e101ProcessData) e101ProcessData {
 		t.Fatalf("preparation exact D unavailable: %v", err)
 	}
 	e101bBookkeeping(t, shareProjectionDBForTest(t), data, false)
-	if e101dCut(data.Cut) || e101eCut(data.Cut) {
+	if e101dCut(data.Cut) || e101eCut(data.Cut) || e101fCut(data.Cut) {
 		data.FirstSeenAt = e101dFirstSeen(t, data)
 	}
 	data.Mode = "physical"

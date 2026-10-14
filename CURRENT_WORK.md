@@ -35,7 +35,16 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01E root-only TERMINAL process-crash evidence
+## Active slice: E1-01F discovery-retained TERMINAL process crash
+
+Branch `codex/e101-discovery-retained-crash`, base main@2b282a07a (#290).
+[E1-01F](docs/E1-01F-DISCOVERY-RETAINED-CRASH.md) is limited to successful exact
+orphan DELETE before discovery DELETE: TERMINAL, orphan absent, discovery/root
+present. Reuse productive preparation, observer, independent durable oracle,
+SIGKILL/resume, fresh-process recovery/replay, preservation and a separate gate.
+Docker validation and audit are pending. No runtime change; E1-01/X1 OPEN.
+
+## Previous merged slice: E1-01E root-only TERMINAL process-crash evidence (#290)
 
 Branch `codex/e101-root-only-terminal-crash`, base main@1b16f092f (#289).
 [E1-01E](docs/E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) implements one internal C8 cut:

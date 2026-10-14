@@ -54,7 +54,8 @@ func TestMain(m *testing.M) {
 	// comment could not: R26 was added to docker-compose and missed here, and the
 	// omission was invisible in the standard run only because P4A happens to be set
 	// alongside it.
-	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_ONLY_CRASH_EVIDENCE") == "1" ||
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_DISCOVERY_RETAINED_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_ONLY_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_TERMINAL_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_PHYSICAL_CRASH_EVIDENCE") == "1" ||
@@ -164,6 +165,12 @@ func TestMain(m *testing.M) {
 	}()
 
 	code := m.Run()
+	if os.Getenv(e101fEvidenceEnv) == "1" {
+		if missing := e101fMissing(); len(missing) > 0 {
+			fmt.Printf("%s=1 requires both discovery-retained terminal crash/control legs; missing=%s\n", e101fEvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
 	if os.Getenv(e101eEvidenceEnv) == "1" {
 		if missing := e101eMissing(); len(missing) > 0 {
 			fmt.Printf("%s=1 requires both root-only terminal crash/control legs; missing=%s\n", e101eEvidenceEnv, strings.Join(missing, ","))

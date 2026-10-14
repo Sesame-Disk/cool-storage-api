@@ -1,5 +1,12 @@
 # Open Work Index
 
+## E1-01F discovery-retained TERMINAL evidence (2026-10-14)
+
+[E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) plans one internal C8 cut after
+orphan deletion, before discovery deletion. Unlike merged #290, the exact
+projection still needs removal using the durable root token. Validation is pending;
+C0/C3 and three-DC residuals remain separate. E1-01/X1 OPEN; no activation authority.
+
 ## E1-01E root-only TERMINAL evidence (2026-10-14)
 
 [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) is the execution of #289's single
@@ -11,8 +18,8 @@ E1-01/X1 stay OPEN. The ledger records validation without activation authority.
 
 Merged A/B/C/D prove their single-DC process cuts, not all E1-01. C0, C3 and
 internal C8 stay OPEN; [current inventory and next drill](./E1-01-CRASH-EVIDENCE-PLAN.md#0-current-reconciliation-and-next-bounded-execution-2026-10-14)
-separates their actual durable states. Next execution: root-only TERMINAL after
-orphan/discovery deletion, before root deletion. Documentation closes no gate.
+separates their actual durable states. Root-only TERMINAL is now merged in #290; F addresses the earlier discovery-retained
+cut. Documentation closes no gate.
 
 ## E1-16 repeated evidence gate follow-up (2026-10-14)
 
