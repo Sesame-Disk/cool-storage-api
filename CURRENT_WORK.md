@@ -35,7 +35,17 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01F discovery-retained TERMINAL process crash
+## Active slice: E1-01G PUBLISHED/PREPARED process crash
+
+Branch `codex/e101-published-prepared-crash`, base main@6f8fc2630 (#291).
+[E1-01G](docs/E1-01G-PUBLISHED-PREPARED-CRASH.md) is bounded to C3: successful
+exact PUBLISHED lifecycle INSERT before PREPARED-to-COMMITTED orphan CAS, with
+committed handoff and original canonical/K1 still intact. Productive org-scoped
+worker, existing observer, independent durable oracle, SIGKILL/resume, orphan
+recovery before separate queue settlement/replay, preservation and required gate.
+Docker validation and final audit are pending; no runtime change, E1-01/X1 OPEN.
+
+## Previous merged slice: E1-01F discovery-retained TERMINAL process crash (#291)
 
 Branch `codex/e101-discovery-retained-crash`, base main@2b282a07a (#290).
 [E1-01F](docs/E1-01F-DISCOVERY-RETAINED-CRASH.md) is limited to successful exact
