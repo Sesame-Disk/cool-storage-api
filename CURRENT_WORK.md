@@ -35,7 +35,18 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01 remaining-cut inventory (documentation only)
+## Active slice: E1-01E root-only TERMINAL process-crash evidence
+
+Branch `codex/e101-root-only-terminal-crash`, base main@1b16f092f (#289).
+[E1-01E](docs/E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) implements one internal C8 cut:
+after real orphan/discovery deletion, before recovery-root deletion. The existing
+query observer holds the productive call; the parent proves exact root-only
+TERMINAL independently. SIGKILL/resume, independent recovery/replay and failed
+fixture preservation are required, with a two-leg fail-closed runner gate.
+Directed Docker and short Go/vet PASS; race, gate negatives and standard runner
+are pending in the ledger. No runtime change; E1-01/X1 OPEN, production GC OFF.
+
+## Previous merged slice: E1-01 remaining-cut inventory (#289)
 
 Branch `codex/e101-remaining-cut-inventory`, base main@bd8cab852 (#286 merged).
 [E1-01 section 0](docs/E1-01-CRASH-EVIDENCE-PLAN.md#0-current-reconciliation-and-next-bounded-execution-2026-10-14)

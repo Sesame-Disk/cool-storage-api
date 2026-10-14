@@ -383,7 +383,7 @@ func e101AssertRecovered(t *testing.T, fx *w2CreateFileFixture, data e101Process
 	if e101bCut(data.Cut) || e101RecoveryCut(data.Cut) {
 		e101bBookkeeping(t, fx.database, data, false)
 	}
-	if e101dCut(data.Cut) {
+	if e101dCut(data.Cut) || e101eCut(data.Cut) {
 		e101dAssertSettled(t, fx.database, data)
 	}
 	t.Logf("independently observed %s P=%+v D=%+v", data.Expect, data.Authority.Target, data.Authority)
@@ -457,7 +457,7 @@ func e101Capture(database *dbpkg.DB, data e101ProcessData) e101Snapshot {
 		}
 		read(table, "SELECT * FROM "+table+" WHERE org_id=? AND block_id=?", cl, data.Org.String(), data.Block)
 	}
-	if e101dCut(data.Cut) {
+	if e101dCut(data.Cut) || e101eCut(data.Cut) {
 		if data.FirstSeenAt.IsZero() {
 			s.Errors["discovery"] = "missing exact first_seen_at"
 		} else {
@@ -541,6 +541,11 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 		cmd.Env = append(cmd.Env, entry)
 	}
 	cmd.Env = append(cmd.Env, gate+"=1", "SESAMEFS_E101_FAIL_AFTER_KILL=1", "SESAMEFS_E101_EVIDENCE_DIR="+dir)
+	// Keep E's fixture-owning process on e19: a second forwarding TestMain
+	// cannot inherit its liveRepoIDs and could sweep a root-only library.
+	if e101eCut(cut) {
+		cmd.Env = append(cmd.Env, "SESAMEFS_E101E_CHILD=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
+	}
 	out, err := cmd.CombinedOutput()
 	t.Logf("expected failing preservation child: %s", out)
 	var failed *exec.ExitError
@@ -557,11 +562,15 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 		t.Fatalf("invalid retained snapshot: %v", err)
 	}
 	retainedWork := !e101RecoveryCut(cut)
+	expectedOrphans := 1
+	if e101eCut(cut) {
+		expectedOrphans = 0
+	}
 	expectedCandidates := 1
 	if !retainedWork {
 		expectedCandidates = 0
 	}
-	if (e101dCut(cut) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
+	if (e101dCut(cut) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || (e101eCut(cut) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 0) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != expectedOrphans || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
 		t.Fatal("failure snapshot lost or changed the exact durable boundary state")
 	}
 	// A new session must observe the same live state AFTER the failed subprocess and TestMain sweeps.
@@ -608,6 +617,7 @@ func e101VerifyFailure(t *testing.T, database *dbpkg.DB, data e101ProcessData) {
 	t.Log("E101_FAILURE_SNAPSHOT_VERIFIED")
 	t.Cleanup(func() { cleanupBlockUploadSessionForTest(t, data.Session) })
 	cleanupUploadedBlockArtifactsForTest(t, data.Org.String(), data.Repo, data.Block, data.SHA1, dbpkg.BlockReferrerForUpload(data.Session))
+
 	e101Recover(t, data)
 	cleanupGCBlockFixturesForTest(t, data.Org, data.Block)
 	fx := &w2CreateFileFixture{w2UploadFileFixture: &w2UploadFileFixture{borrowedFSHeadFixture: &borrowedFSHeadFixture{orgUUID: data.Org, orgID: data.Org.String(), blockID: data.Block}}}

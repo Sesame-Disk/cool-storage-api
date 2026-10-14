@@ -1,5 +1,12 @@
 # Open Work Index
 
+## E1-01E root-only TERMINAL evidence (2026-10-14)
+
+[E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) is the execution of #289's single
+internal C8 cut, after orphan/discovery deletion and before root deletion.
+C0/C3, the earlier orphan-only cleanup cut and three-DC residuals remain separate;
+E1-01/X1 stay OPEN. The ledger records validation without activation authority.
+
 ## E1-01 remaining-cut inventory (2026-10-14)
 
 Merged A/B/C/D prove their single-DC process cuts, not all E1-01. C0, C3 and
