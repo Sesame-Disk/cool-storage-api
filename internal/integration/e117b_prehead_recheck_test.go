@@ -40,10 +40,17 @@ func e117bMissing(observed map[string]bool) []string {
 }
 
 func TestE117PreHEADRecheckRejectsLostAuthority(t *testing.T) {
+	e117bEvidence = map[string]bool{} // Each repetition must prove both legs anew.
 	requireCassandra(t)
 
 	for _, leg := range e117bLegs {
 		t.Run(leg, func(t *testing.T) {
+			// Registered first, so evidence is counted only after every fixture cleanup.
+			t.Cleanup(func() {
+				if !t.Failed() && !t.Skipped() {
+					e117bEvidence[leg] = true
+				}
+			})
 			database := shareProjectionDBForTest(t)
 			fx := &w2CreateFileFixture{w2UploadFileFixture: newW2UploadFileFixture(t, database, newBorrowedFSHeadHandler(t, database, x1StorageClass(t)))}
 
@@ -137,7 +144,6 @@ func TestE117PreHEADRecheckRejectsLostAuthority(t *testing.T) {
 				}
 			}
 
-			e117bEvidence[leg] = true
 		})
 	}
 
