@@ -30,6 +30,15 @@ PASS, and `-race -count=2` over this leg plus the six e16 legs passes with no
 data race. Not run: the standard integration/API/OIDC gates. No runtime, schema
 or guard change; X1 remains OPEN and `GC_ENABLED=false` remains mandatory.
 
+## 2026-10-14 — E1-01C physical recovery process-crash evidence (#287)
+
+[E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md) adds real recovery-process SIGKILL
+at C6 (DELETE confirmed, phase not persisted) and C7 (phase persisted, not TERMINAL),
+same-boundary resume controls, independent recovery/replay and failed-fixture preservation.
+Docker race, required integration, API and OIDC stages PASS on the frozen source;
+the ledger records the unavailable original outer-process exit after client resume.
+Single-DC, test-only evidence: no product violation reproduced, no E1-01/X1 gate closed.
+
 ## 2026-10-14 — Verification sweep of PRs #277–#283 and its corrections
 
 Documentation only; no status, severity or gate state changes. X1 remains OPEN
@@ -81,6 +90,14 @@ the server Dockerfiles use `FROM --platform=$BUILDPLATFORM` and the classic
 builder fails on it with an opaque "failed to parse platform" error. Nothing is
 applied without the flag: the stock multi-region stack is unchanged. Docker
 Compose v2.24+ is required for the `!override` tag.
+
+## 2026-10-13 — E1-01A/B process-crash evidence (#281, #283)
+
+[E1-01A](./E1-01A-G2-PROCESS-CRASH.md) proves C1/C2 and
+[E1-01B](./E1-01B-G3-PROCESS-CRASH.md) proves C4/C5 through real Linux worker
+SIGKILL, same-boundary controls and independent recovery/replay on Cassandra/SILO.
+Failed fixtures retain exact authority and snapshots through teardown. These merged
+slices add single-DC tests only, reproduce no product violation and close no E1/X1 gate.
 
 ## 2026-10-13 — Lean documentation and shared agent instructions
 

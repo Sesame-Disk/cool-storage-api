@@ -54,7 +54,10 @@ func TestMain(m *testing.M) {
 	// comment could not: R26 was added to docker-compose and missed here, and the
 	// omission was invisible in the standard run only because P4A happens to be set
 	// alongside it.
-	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_G3_CRASH_EVIDENCE") == "1" ||
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E101_TERMINAL_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E101_PHYSICAL_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E101_G3_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_G2_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E115E_REPAIR_SETTLEMENT_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E115D_ABANDONED_COMMIT_EVIDENCE") == "1" ||
@@ -84,7 +87,6 @@ func TestMain(m *testing.M) {
 		os.Getenv("SESAMEFS_REQUIRE_E110D_REVERTDIRENTS_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E110E_UNPUBLISHED_RESURRECTION_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E117_RESIDUAL_RESURRECTION_EVIDENCE") == "1" ||
-		os.Getenv("SESAMEFS_REQUIRE_E117_REHEAD_RECHECK_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E17_SYNC_RECVFS_CHARACTERIZATION") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E19_CROSS_REPO_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_P2_EVIDENCE") == "1" ||
@@ -164,6 +166,18 @@ func TestMain(m *testing.M) {
 	if os.Getenv(e117bEvidenceEnv) == "1" {
 		if missing := e117bMissing(e117bEvidence); len(missing) > 0 {
 			fmt.Printf("%s=1 requires both pre-HEAD recheck legs; missing=%s\n", e117bEvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
+	if os.Getenv(e101dEvidenceEnv) == "1" {
+		if missing := e101dMissing(); len(missing) > 0 {
+			fmt.Printf("%s=1 requires both terminal-before-cleanup crash/control legs; missing=%s\n", e101dEvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
+	if os.Getenv(e101cEvidenceEnv) == "1" {
+		if missing := e101cMissing(); len(missing) > 0 {
+			fmt.Printf("%s=1 requires all physical recovery process-crash/control legs; missing=%s\n", e101cEvidenceEnv, strings.Join(missing, ","))
 			code = 1
 		}
 	}

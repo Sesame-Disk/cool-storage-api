@@ -51,6 +51,25 @@ integration/API/OIDC gates were not run. See
 [docs/E1-17-W2-10-RESIDUAL-HANDLERS.md](docs/E1-17-W2-10-RESIDUAL-HANDLERS.md)
 §Pre-HEAD recheck witness and [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
 
+## Previous merged slice: E1-01D terminal-before-cleanup evidence (#288)
+
+[E1-01D](docs/E1-01D-TERMINAL-CLEANUP-CRASH.md) covers only the first C8 boundary:
+TERMINAL persisted, before the real aggregate orphan/discovery/root cleanup call.
+The kill/resume controls, independent recovery/replay, failure preservation, race repeat and
+standard Docker integration/API/OIDC PASS; both recorded runner exits are 0. Internal
+cleanup substeps and C0/C3 inventory remain separate; E1-01/X1 remain OPEN, production GC OFF.
+
+## Previous merged slice: E1-01C physical recovery crash evidence (#287)
+
+[E1-01C](docs/E1-01C-PHYSICAL-RECOVERY-CRASH.md) is limited to C6 (after real S3
+DELETE, before phase persistence) and C7 (phase persisted, before TERMINAL).
+[E1-01A](docs/E1-01A-G2-PROCESS-CRASH.md) (#281) and
+[E1-01B](docs/E1-01B-G3-PROCESS-CRASH.md) (#283) are merged single-DC process-death
+evidence for C1/C2 and C4/C5. C8 and the C0/C3 inventory remain separate;
+C6/C7 kill/control and independent recovery/replay, preservation negatives, race repeat and the
+standard Docker integration/API/OIDC stages PASS on the frozen source (see ledger).
+E1-01/X1 remain OPEN and production GC remains OFF.
+
 ## Previous merged slice: verification sweep corrections (PR #285)
 
 Branch `docs/verify-sweep-corrections`, base main@f580787ed. Independent re-read
@@ -58,10 +77,11 @@ of the seven PRs merged after the 2026-10-09 progress report against the code,
 the tests and the sources of record. Corrections: the abandoned-repair
 `retained` definition in [PUBLISH-REPAIR-OBSERVABILITY](docs/PUBLISH-REPAIR-OBSERVABILITY.md),
 a dated W2-10 note in [E1-16](docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md), and the
-dangling PR #231 pointer in [OPEN-WORK-INDEX](docs/OPEN-WORK-INDEX.md). Findings
-it reported: E1-17's pre-HEAD recheck (`validateRetainedHistoricalSource`) had no
-test coverage (closed by the slice above), and `docs/FILE-LOCKING-DESIGN.md` is
-referenced from nothing (still open). See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
+dangling PR #231 pointer in [OPEN-WORK-INDEX](docs/OPEN-WORK-INDEX.md). Open
+findings reported with the sweep: E1-17's pre-HEAD recheck
+(`validateRetainedHistoricalSource`) has no test coverage — the 15 evidence legs
+reject at capture — and `docs/FILE-LOCKING-DESIGN.md` is now referenced from
+nothing. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
 
 ## Previous merged slice: sandbox-gated dev multi-region stack (tooling, PR #284)
 

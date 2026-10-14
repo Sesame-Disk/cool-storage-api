@@ -46,10 +46,11 @@ func e101MissingLegs(observed map[string]bool, cuts []string) []string {
 }
 
 type e101ProcessData struct {
-	Org                                                    uuid.UUID
-	Block, Class, Marker, Cut, Mode, Expect, Repo, Session string
-	Candidate                                              gcpkg.BlockGCCandidateInfo
-	Authority                                              gcpkg.BlockDeleteAuthority
+	Org                                                          uuid.UUID
+	Block, Class, Marker, Cut, Mode, Expect, Repo, Session, SHA1 string
+	Candidate                                                    gcpkg.BlockGCCandidateInfo
+	Authority                                                    gcpkg.BlockDeleteAuthority
+	FirstSeenAt                                                  time.Time
 }
 
 // Pause only delegated successful current-protocol calls; no productive hook or fabricated outcome.
@@ -63,19 +64,22 @@ func (s *e101PausedStore) hold(a gcpkg.BlockDeleteAuthority) {
 	if a.Target != s.data.Candidate.Target || !s.visited || len(s.liveness) != 1 || s.liveness[0] != dbpkg.BlockPublicationZero || s.errs[0] != nil {
 		s.t.Fatal("boundary lacked the owned physical identity and real zero-liveness proof")
 	}
+	e101Pause(s.t, s.data, a)
+}
+func e101Pause(t *testing.T, data e101ProcessData, a gcpkg.BlockDeleteAuthority) {
 	// Cassandra timestamps persist millisecond precision, as normalizeBlockDeleteAuthority does.
 	a.ClaimedAt = a.ClaimedAt.UTC().Truncate(time.Millisecond)
 	encoded, err := json.Marshal(a)
 	if err != nil {
-		s.t.Fatal(err)
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.data.Marker+".tmp", encoded, 0600); err != nil {
-		s.t.Fatal(err)
+	if err := os.WriteFile(data.Marker+".tmp", encoded, 0600); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.Rename(s.data.Marker+".tmp", s.data.Marker); err != nil {
-		s.t.Fatal(err)
+	if err := os.Rename(data.Marker+".tmp", data.Marker); err != nil {
+		t.Fatal(err)
 	}
-	e112AwaitFile(s.t, s.data.Marker+".resume")
+	e112AwaitFile(t, data.Marker+".resume")
 }
 func (s *e101PausedStore) PrepareBlockDeleteOrphan(org uuid.UUID, block string, a gcpkg.BlockDeleteAuthority, sha1 string, now time.Time) gcpkg.StartBlockDeleteOrphanResult {
 	r := s.GCStore.PrepareBlockDeleteOrphan(org, block, a, sha1, now)
@@ -104,6 +108,10 @@ func TestE101GCProcessChild(t *testing.T) {
 	t.Logf("fresh GC process pid=%d mode=%s", os.Getpid(), data.Mode)
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
+	if data.Mode == "prepare-physical" || data.Mode == "physical" {
+		e101cChild(t, database, data)
+		return
+	}
 	if data.Mode == "verify_failure" {
 		e101VerifyFailure(t, database, data)
 		return
@@ -213,7 +221,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 					web.dropOwnSessionRef(t)
 					store := gcpkg.NewCassandraStore(database)
 					candidate := w2Candidate(t, store, fx.orgUUID, fx.blockID, class)
-					data := e101ProcessData{Org: fx.orgUUID, Block: fx.blockID, Class: class, Marker: filepath.Join(t.TempDir(), "cut"), Cut: cut, Mode: "worker", Candidate: candidate, Repo: fx.repoID, Session: fx.sessionID}
+					data := e101ProcessData{Org: fx.orgUUID, Block: fx.blockID, Class: class, Marker: filepath.Join(t.TempDir(), "cut"), Cut: cut, Mode: "worker", Candidate: candidate, Repo: fx.repoID, Session: fx.sessionID, SHA1: fx.sha1ID}
 					var before *e101Snapshot
 					t.Cleanup(func() {
 						if t.Failed() || t.Skipped() {
@@ -233,6 +241,10 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						cleanupGCBlockFixturesForTest(t, fx.orgUUID, fx.blockID)
 						e115aVerifyNoRoot(t, database, fx)
 					})
+					if e101RecoveryCut(cut) {
+						w2AssertBytes(t, fx)
+						data = e101cPrepare(t, data)
+					}
 					cmd, cancel := e101Command(t, data)
 					defer cancel()
 					var output bytes.Buffer
@@ -280,7 +292,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						}
 						err := <-exited
 						finished = true
-						if err != nil {
+						if err != nil || (e101RecoveryCut(cut) && !bytes.Contains(output.Bytes(), []byte("E101C_PHYSICAL_COMPLETED"))) {
 							t.Fatalf("no-kill worker: %v\n%s", err, output.String())
 						}
 					}
@@ -368,8 +380,11 @@ func e101AssertRecovered(t *testing.T, fx *w2CreateFileFixture, data e101Process
 	if rows := w2Repairs(t, fx); len(rows) != 0 {
 		t.Fatalf("GC invented publication repair: %+v", rows)
 	}
-	if e101bCut(data.Cut) {
+	if e101bCut(data.Cut) || e101RecoveryCut(data.Cut) {
 		e101bBookkeeping(t, fx.database, data, false)
+	}
+	if e101dCut(data.Cut) {
+		e101dAssertSettled(t, fx.database, data)
 	}
 	t.Logf("independently observed %s P=%+v D=%+v", data.Expect, data.Authority.Target, data.Authority)
 }
@@ -441,6 +456,13 @@ func e101Capture(database *dbpkg.DB, data e101ProcessData) e101Snapshot {
 			cl = gocql.Serial
 		}
 		read(table, "SELECT * FROM "+table+" WHERE org_id=? AND block_id=?", cl, data.Org.String(), data.Block)
+	}
+	if e101dCut(data.Cut) {
+		if data.FirstSeenAt.IsZero() {
+			s.Errors["discovery"] = "missing exact first_seen_at"
+		} else {
+			read("gc_s3_orphans_by_day", `SELECT * FROM gc_s3_orphans_by_day WHERE first_seen_day=? AND bucket=? AND first_seen_at=? AND org_id=? AND block_id=? AND storage_class=? AND storage_key=? AND gc_claim_id=? AND gc_claimed_at=?`, gocql.EachQuorum, dbpkg.GCProjectionUTCDate(data.FirstSeenAt), dbpkg.GCDiscoveryBucket(data.Org.String(), data.Block), data.FirstSeenAt, data.Org.String(), data.Block, data.Authority.Target.StorageClass, data.Authority.Target.StorageKey, data.Authority.ClaimID, data.Authority.ClaimedAt)
+		}
 	}
 	read("head", "SELECT head_commit_id FROM libraries WHERE org_id=? AND library_id=?", gocql.Serial, data.Org.String(), data.Repo)
 	for b := 0; b < dbpkg.PublishedBlockReferenceRepairBuckets; b++ {
@@ -534,7 +556,12 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 	if err != nil || json.Unmarshal(encoded, &failure) != nil {
 		t.Fatalf("invalid retained snapshot: %v", err)
 	}
-	if failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || !failure.After.QueueFound || !failure.After.K1Exists || len(failure.After.K1Bytes) == 0 || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != 1 || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
+	retainedWork := !e101RecoveryCut(cut)
+	expectedCandidates := 1
+	if !retainedWork {
+		expectedCandidates = 0
+	}
+	if (e101dCut(cut) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != 1 || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
 		t.Fatal("failure snapshot lost or changed the exact durable boundary state")
 	}
 	// A new session must observe the same live state AFTER the failed subprocess and TestMain sweeps.
@@ -580,7 +607,7 @@ func e101VerifyFailure(t *testing.T, database *dbpkg.DB, data e101ProcessData) {
 	}
 	t.Log("E101_FAILURE_SNAPSHOT_VERIFIED")
 	t.Cleanup(func() { cleanupBlockUploadSessionForTest(t, data.Session) })
-	cleanupUploadedBlockArtifactsForTest(t, data.Org.String(), data.Repo, data.Block, sha1hex(failure.After.K1Bytes), dbpkg.BlockReferrerForUpload(data.Session))
+	cleanupUploadedBlockArtifactsForTest(t, data.Org.String(), data.Repo, data.Block, data.SHA1, dbpkg.BlockReferrerForUpload(data.Session))
 	e101Recover(t, data)
 	cleanupGCBlockFixturesForTest(t, data.Org, data.Block)
 	fx := &w2CreateFileFixture{w2UploadFileFixture: &w2UploadFileFixture{borrowedFSHeadFixture: &borrowedFSHeadFixture{orgUUID: data.Org, orgID: data.Org.String(), blockID: data.Block}}}
