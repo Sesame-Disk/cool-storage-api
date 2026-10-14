@@ -75,6 +75,34 @@ migrations on startup. It no longer carries manual table DDL.
 ./scripts/bootstrap.sh multiregion --down
 ```
 
+#### Sandbox / restricted hosts (opt-in)
+
+`--sandbox` layers `docker-compose.multiregion.sandbox.yaml` on the stock stack.
+Use it only where the standard layout cannot work — it changes four things and
+nothing else:
+
+| Stock stack | With `--sandbox` | Why |
+|---|---|---|
+| region configs and `nginx.conf` bind-mounted from `configs/` | baked into the images (`CONFIG_FILE` build arg, `docker/multiregion/Dockerfile.nginx`) | on those hosts the daemon cannot bind-mount workspace files; the missing source is materialised as an empty directory and hides the config |
+| nginx LB on host `8080` | `8081` (`MR_NGINX_HOST_PORT`) | host `8080` is taken by the environment's outbound proxy |
+| USA region on host `3000` | `3001` (`SESAMEFS_USA_HOST_PORT`) | host `3000` is taken |
+| nginx healthcheck probes `localhost` | probes `127.0.0.1` | the baked nginx listens on IPv4 only while `localhost` resolves to `::1` there, so the probe reports a false negative |
+
+```bash
+# Start, inspect or stop the sandbox-mode stack
+./scripts/bootstrap.sh multiregion --sandbox
+./scripts/bootstrap.sh multiregion --sandbox --status
+./scripts/bootstrap.sh multiregion --sandbox --down
+```
+
+`/etc/hosts` entries are not required in this mode: `--status` routes with a
+`Host` header, so `curl -H 'Host: us.sesamefs.local' http://localhost:8081/ping`
+is equivalent to the hostname checks above. Sandbox mode also requires Compose
+v2.24+ for the `!override` tag and the `buildx` plugin, since the server images
+build with `FROM --platform=$BUILDPLATFORM` (the wrapper checks for buildx before
+building and says so if it is missing). Without the flag the stack is exactly
+what the preceding sections describe.
+
 ### Alternative: Manual Start
 
 ```bash

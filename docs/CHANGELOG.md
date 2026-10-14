@@ -8,6 +8,30 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — Sandbox-gated multi-region wrapper
+
+Tooling and docs only; no runtime, schema, guard or test change.
+`scripts/bootstrap.sh multiregion` gains an opt-in `--sandbox` flag that layers
+the new `docker-compose.multiregion.sandbox.yaml` on the stock stack:
+
+- region configs and `nginx.conf` are baked into the images (`CONFIG_FILE` build
+  arg, `docker/multiregion/Dockerfile.nginx`) instead of bind-mounted, because a
+  daemon that cannot bind-mount workspace files materialises the missing source
+  as an empty directory and hides the config;
+- the LB moves from `8080` to `8081` (`MR_NGINX_HOST_PORT`) and USA from `3000`
+  to `3001` (`SESAMEFS_USA_HOST_PORT`), since both host ports are already taken
+  there;
+- the nginx healthcheck probes `127.0.0.1` instead of `localhost`, which
+  resolves to `::1` while the baked nginx listens on IPv4 only.
+
+Multi-region `--status` now routes with a `Host` header, so it no longer depends
+on `/etc/hosts` entries, and the region endpoints are reported with the resolved
+LB port. Sandbox mode checks for the `buildx` plugin before building, because
+the server Dockerfiles use `FROM --platform=$BUILDPLATFORM` and the classic
+builder fails on it with an opaque "failed to parse platform" error. Nothing is
+applied without the flag: the stock multi-region stack is unchanged. Docker
+Compose v2.24+ is required for the `!override` tag.
+
 ## 2026-10-13 — Lean documentation and shared agent instructions
 
 Documentation only; runtime, schema, GC enablement and issue closure states are unchanged.

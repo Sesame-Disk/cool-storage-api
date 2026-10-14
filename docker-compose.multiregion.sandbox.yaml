@@ -1,0 +1,46 @@
+# Sandbox / restricted-host override for the multi-region test stack.
+#
+# Opt-in only. Apply it through the wrapper, which layers this file on
+# docker-compose-multiregion.yaml and supplies the sandbox host ports:
+#
+#   ./scripts/bootstrap.sh multiregion --sandbox
+#
+# It exists because some hosts cannot run the stock stack unchanged:
+#   - the Docker daemon cannot bind-mount workspace files at runtime, so the
+#     region configs are baked into the server images (Dockerfile ARG
+#     CONFIG_FILE) and the nginx config into docker/multiregion/Dockerfile.nginx
+#     instead of being mounted;
+#   - host 8080 is the environment's outbound proxy, so the LB moves to 8081
+#     (and host 3000 is taken, hence SESAMEFS_USA_HOST_PORT in the wrapper);
+#   - the baked nginx listens on IPv4 only while busybox wget resolves
+#     "localhost" to ::1 there, which makes the shipped probe a false negative,
+#     so the healthcheck targets 127.0.0.1.
+#
+# Nothing here is applied without --sandbox. Requires Compose v2.24+ for the
+# !override tag.
+services:
+  nginx:
+    image: sesamefs-mr-nginx:local
+    build:
+      context: .
+      dockerfile: docker/multiregion/Dockerfile.nginx
+    volumes: !override []
+    ports: !override
+      - "${MR_NGINX_HOST_PORT:-8081}:80"
+    healthcheck:
+      test: !override ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  sesamefs-usa:
+    build:
+      args:
+        CONFIG_FILE: configs/config-usa.yaml
+    volumes: !override []
+
+  sesamefs-eu:
+    build:
+      args:
+        CONFIG_FILE: configs/config-eu.yaml
+    volumes: !override []
