@@ -357,8 +357,10 @@ How to read it:
 - **The 24 h threshold.** An oldest pending age above 24 h on a fresh node is
   an operational investigation threshold, not a measured or guaranteed
   bound.
-- **Outcomes.** `retained` is an inconclusive visit that returned no error.
-  `failed` is a visit that returned an error. That covers walk problems (the
+- **Outcomes.** `retained` is an inconclusive visit: the settlement selected the
+  retain/retry outcome and the visit returned that retain sentinel. It is a
+  **non-nil** error, not a no-error visit — `ok` is the only no-error outcome,
+  and `failed` is any other error. That covers walk problems (the
   1024-node chunk limit, an ancestry cycle, a malformed or unreadable parent)
   as well as operational causes such as an unavailable DC. Neither outcome
   rules out retention, and neither series names the rows.

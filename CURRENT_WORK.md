@@ -51,6 +51,18 @@ integration/API/OIDC gates were not run. See
 [docs/E1-17-W2-10-RESIDUAL-HANDLERS.md](docs/E1-17-W2-10-RESIDUAL-HANDLERS.md)
 §Pre-HEAD recheck witness and [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
 
+## Previous merged slice: verification sweep corrections (PR #285)
+
+Branch `docs/verify-sweep-corrections`, base main@f580787ed. Independent re-read
+of the seven PRs merged after the 2026-10-09 progress report against the code,
+the tests and the sources of record. Corrections: the abandoned-repair
+`retained` definition in [PUBLISH-REPAIR-OBSERVABILITY](docs/PUBLISH-REPAIR-OBSERVABILITY.md),
+a dated W2-10 note in [E1-16](docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md), and the
+dangling PR #231 pointer in [OPEN-WORK-INDEX](docs/OPEN-WORK-INDEX.md). Findings
+it reported: E1-17's pre-HEAD recheck (`validateRetainedHistoricalSource`) had no
+test coverage (closed by the slice above), and `docs/FILE-LOCKING-DESIGN.md` is
+referenced from nothing (still open). See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
+
 ## Previous merged slice: sandbox-gated dev multi-region stack (tooling, PR #284)
 
 Branch `feat/sandbox-gated-multiregion`, base main@acc6c6f45. The dev
