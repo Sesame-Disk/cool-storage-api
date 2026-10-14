@@ -60,6 +60,14 @@ builder fails on it with an opaque "failed to parse platform" error. Nothing is
 applied without the flag: the stock multi-region stack is unchanged. Docker
 Compose v2.24+ is required for the `!override` tag.
 
+## 2026-10-13 — E1-01A/B process-crash evidence (#281, #283)
+
+[E1-01A](./E1-01A-G2-PROCESS-CRASH.md) proves C1/C2 and
+[E1-01B](./E1-01B-G3-PROCESS-CRASH.md) proves C4/C5 through real Linux worker
+SIGKILL, same-boundary controls and independent recovery/replay on Cassandra/SILO.
+Failed fixtures retain exact authority and snapshots through teardown. These merged
+slices add single-DC tests only, reproduce no product violation and close no E1/X1 gate.
+
 ## 2026-10-13 — Lean documentation and shared agent instructions
 
 Documentation only; runtime, schema, GC enablement and issue closure states are unchanged.

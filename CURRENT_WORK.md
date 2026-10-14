@@ -35,6 +35,17 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
+## Active slice: E1-01C physical recovery crash evidence
+
+[E1-01C](docs/E1-01C-PHYSICAL-RECOVERY-CRASH.md) is limited to C6 (after real S3
+DELETE, before phase persistence) and C7 (phase persisted, before TERMINAL).
+[E1-01A](docs/E1-01A-G2-PROCESS-CRASH.md) (#281) and
+[E1-01B](docs/E1-01B-G3-PROCESS-CRASH.md) (#283) are merged single-DC process-death
+evidence for C1/C2 and C4/C5. C8 and the C0/C3 inventory remain separate;
+C6/C7 kill/control and independent recovery/replay, preservation negatives, race repeat and the
+standard Docker integration/API/OIDC stages PASS on the frozen source (see ledger).
+E1-01/X1 remain OPEN and production GC remains OFF.
+
 ## Active slice: verification sweep of PRs #277–#283 (docs corrections)
 
 Branch `docs/verify-sweep-corrections`, base main@f580787ed. Independent re-read
