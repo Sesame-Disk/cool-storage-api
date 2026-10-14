@@ -1,8 +1,91 @@
 # E1-01 — bounded crash-evidence plan
 
-Status: PLAN / source inventory, 2026-10-13. Base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279).
+Status: SOURCE INVENTORY / OPEN, updated 2026-10-14 against `main@bd8cab8529e34ff0a245e76e4db268919cfe164b` (#286).
+Original planning base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279); its dated inventory and execution plan remain below.
 This PR changes documentation only. It records no new crash result, fixes no runtime defect and closes no gate.
 X1 remains OPEN; production GC remains OFF. Deliberate destructive GC in an isolated development fixture is required for the drills.
+
+## 0. Current reconciliation and next bounded execution (2026-10-14)
+
+This update implements the source-inventory step, not another K drill. It compares
+current Cassandra/worker call order with merged process evidence and existing
+U/R controls. No new product counterexample was found in this review; missing
+process evidence remains an evidence obligation, not a demonstrated runtime bug.
+
+### 0.1 Accepted evidence by exact cut
+
+| Cut | Current evidence and remaining qualification |
+|---|---|
+| C0: recovery root persisted, before PREPARED orphan LWT | U root-retention/late-producer controls and historical G1 R replay; no current-producer K witness identified in the reviewed tests/ledgers. Safe retention is permitted; no reclamation deadline is inferred. |
+| C1/C2 | [E1-01A](./E1-01A-G2-PROCESS-CRASH.md), merged #281: productive preparation/committed handoff, SIGKILL, resume controls and independent recovery/replay. |
+| C3: exact lifecycle PUBLISHED, orphan still PREPARED | Promotion source ordering and U recovery controls; no exact intermediate-state K witness identified in the reviewed tests/ledgers. C2 stops before Promote, C4 after its successful return. |
+| C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
+| C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
+| C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
+| C8 internal | U exact terminal/root/projection controls and G1 R terminal settlement. Orphan-absent/discovery-present/root-present and orphan-absent/discovery-absent/root-present remain separately inventoried; no process-death result is asserted for either. |
+
+The A/B/C/D ledgers retain their frozen source, single-DC scope, preservation
+controls and measured exits. Their existing results are reused, not rerun or
+extended by this documentation PR. None closes all E1-01 or X1.
+
+### 0.2 C0/C3 source obligations and limits
+
+In [PrepareBlockDeleteOrphan](../internal/gc/store_cassandra.go), the exact blocks
+claim is checked, the root is published and read back, then the PREPARED orphan
+LWT is attempted. A C0 drill must independently confirm the exact handoff is
+still uncommitted, its root exists and its orphan does not; entering Prepare or
+observing an earlier claim read cannot prove those facts under concurrency.
+That root alone is not a certificate to delete K1. Worker root recovery observes the exact
+lifecycle when the orphan is absent and retains an unsettled root. Deleting that
+root merely because the orphan is missing could strand a late PREPARED producer.
+`TestG2RecoveryRetainsRootAcrossLatePreparedProducer` and
+`TestG2RecoveryRetainsRootWhilePreparedOwnerCanStillCommit` model this with mocks.
+G1's `root without canonical survives worker restart and remains durable` uses
+real Cassandra but historical StartBlockDeleteOrphan, direct scoped row removal,
+MockStorageProvider and a new worker in the same process. It is R, not a
+productive C0/SILO/SIGKILL observation. C0 remains OPEN for final evidence or an
+explicitly justified disposition; automatic root removal is not proposed.
+
+In PromoteBlockDeleteOrphan, confirmed blocks handoff and exact PREPARED orphan
+precede insertBlockDeleteLifecycle; the orphan PREPARED-to-COMMITTED CAS follows
+that insertion. C3 has durable D1/P1/root/PUBLISHED plus a PREPARED orphan, unlike
+C2's pre-Promote boundary and C4's completed promotion. Recovery classifies the
+committed blocks handoff and retries promotion before canonical retirement.
+`TestG2RecoveryPromotesCommittedHandoffAfterCrash` models that route in a mock.
+The ambiguous-promotion mock flag returns before lifecycle insertion; its test
+must not be labelled a C3 middle-of-promotion witness. The G1 source guard checks
+historical StartBlockDeleteOrphan ordering, not the current Prepare method.
+No new C0/C3 K claim or closure follows from these controls.
+
+### 0.3 Selected next drill: one internal C8 root-only TERMINAL cut
+
+[DeleteS3Orphan](../internal/gc/store_cassandra.go) removes, in order, the exact
+orphan, the exact by-day discovery row, then the recovery root. The next execution
+slice is only **after the discovery DELETE returns successfully, before the root
+DELETE starts**. Root-only recovery takes a different branch from D's intact
+orphan: a TERMINAL lifecycle permits metadata settlement using the root's durable
+first_seen_at. G1 controls model this branch; D's kill-before-call does not kill
+an actor already inside it. The earlier orphan-only-delete cut stays separate.
+
+Reuse D's fixture, SIGKILL/resume, independent recovery/replay and failure
+preservation. Prefer the existing [NewWithObservers](../internal/db/db.go)
+diagnostic session to pause the successful owned discovery query; a GCStore
+wrapper around the aggregate call cannot hold an internal Cassandra substep.
+The observer's result alone is not the oracle: the parent must independently
+verify TERMINAL, orphan/discovery absent, exact root/first_seen_at retained,
+canonical/K1 absent, unchanged HEAD, zero refs/repairs and settled work before
+SIGKILL. Require exactly that state in both kill and resume controls.
+
+A fresh process must enumerate the retained root, finish metadata settlement,
+and replay without restoring K1 or changing TERMINAL/HEAD. Failure must preserve
+the root and external snapshot before explicit owned disposal. Keep the required
+gate fail-closed for missing/Skipped legs and unavailable recovery; prove omission
+and both repetition orders. Scope: one cut, two positive legs, existing preservation
+control, existing harness and no runtime/schema/writer/scheduler/GC-default change.
+Do not fabricate authority with direct setup CQL; add no new productive hook if
+the existing observer can hold the cut. If it cannot, report that instrumentation
+limit before expanding scope. This plan asserts no successful observer drill yet.
+C0/C3, the other C8 substep, global scheduling and three-DC residuals remain OPEN.
 
 ## 1. Question and scope
 
@@ -29,7 +112,10 @@ Trace: [worker](../internal/gc/worker.go), [Cassandra store](../internal/gc/stor
 The historical `pending_mapping_cleanup` phase now finishes lifecycle metadata; do not add a mapping-delete requirement.
 `StartBlockDeleteOrphan` and delete-before-Finalize candidate harnesses are not the current worker protocol.
 
-## 2. Existing evidence: what it does and does not prove
+## 2. Original source inventory (2026-10-13)
+
+The table below preserves the planning snapshot before A/B/C/D merged. Section 0
+is the current reconciliation; its later K evidence supersedes missing-K claims below.
 
 Levels: **U** = mock/source guard; **R** = real-service state/replay; **K** = OS-killed process and independent recovery.
 An R test creating a fresh Worker is useful durable-state evidence, but is not K. A test name containing `Crash`
@@ -60,7 +146,9 @@ This is a source inventory, not an exhaustive K result. Before adding a drill, s
 for that exact cut, process, storage backend, durable observations and recovery entry point. Record any additional
 positive proof. Missing evidence is not a demonstrated runtime bug and does not mandate a new mechanism.
 
-## 3. First execution PR: C1 and C2 only
+## 3. Original first execution plan: C1 and C2 only
+
+Implemented by merged #281; retained as the dated plan, not the next slice.
 
 Deliver one test-only PR covering two contiguous G2 boundaries. Do not implement C0/C3–C8 in that PR.
 If accepted current evidence already proves one cut, cite and reuse it rather than duplicating it.
@@ -119,7 +207,9 @@ must turn GREEN with its controls. Do not combine an unrelated fix with crash in
 because a gap exists. Non-reproduction alone cannot close an obligation: use reviewable positive evidence or an
 explicit, justified disposition under the existing contract. No synthetic future caller, rollout or bypass is a finding.
 
-## 5. Later slices and gates
+## 5. Original later-slice order and continuing gates
+
+A/B/C/D are now merged; section 0 selects the next still-unproven internal cut.
 
 After C1/C2 evidence is reviewed, select only still-unproven current cuts from the inventory:
 canonical-retirement C4/C5 in one small PR; physical-delete/terminal cleanup C6–C8 split at the phase or terminal boundary;
@@ -155,3 +245,27 @@ Validation (2026-10-13): every relative file link and named test function resolv
 and U/R/K limitations reviewed; staged diff checked (two documentation files only), `git diff --cached --check` PASS.
 Docker image rebuilt with `Dockerfile.gotest`; `go test -count=1 -timeout 5m -run '^Test(G[1-5]|X1PhysicalLifeHandoff)' ./internal/gc` PASS.
 This validates existing unit/source/document guards, not a new real-service crash drill or E1-01 closure.
+
+## 7. Audit of the remaining-cut inventory (2026-10-14)
+
+Reviewed against main@bd8cab8529e34ff0a245e76e4db268919cfe164b. Re-read real
+Prepare/Promote/DeleteS3Orphan ordering, worker root-only/committed recovery,
+MockStore's ambiguity injection, G1 R setup and merged A/B/C/D cut oracles.
+Current/referenced evidence and the dated initial planning snapshot are separated;
+no mock replay or fresh Worker is relabelled process death. No new runtime
+counterexample or closure is claimed. Diff: four documentation files only.
+
+Relative file links and all 19 named test functions resolve. The new section
+anchor resolves in the source headings. Source order checks confirm root
+publication/read before PREPARED insert, lifecycle insertion before orphan
+COMMITTED CAS, and orphan -> discovery -> root deletion. `git diff --check` PASS.
+
+Docker image built with Dockerfile.gotest:
+`sha256:97bce0146108e35fc224fd0e6e617818e3ffc4c7c291ae016e5179118457a9cc`.
+`go test -count=1 -timeout 5m -run '^Test(G[1-5]|X1PhysicalLifeHandoff)' ./internal/gc`
+PASS (0.068s, exit 0); local ignored logs `tmp/e101-inventory-build.log` and
+`tmp/e101-inventory-unit.log`, both recorded exits 0. These are existing unit/source
+guards, not new real-service or K evidence. No new test was added to mirror prose.
+Not run for this documentation-only diff: integration, race, API/OIDC, Sync and
+three-DC tests. Prior A/B/C/D results retain their own ledgers and frozen sources.
+E1-01/X1 remain OPEN; production GC stays OFF and no development GC flag changed.

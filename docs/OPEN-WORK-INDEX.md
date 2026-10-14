@@ -1,5 +1,12 @@
 # Open Work Index
 
+## E1-01 remaining-cut inventory (2026-10-14)
+
+Merged A/B/C/D prove their single-DC process cuts, not all E1-01. C0, C3 and
+internal C8 stay OPEN; [current inventory and next drill](./E1-01-CRASH-EVIDENCE-PLAN.md#0-current-reconciliation-and-next-bounded-execution-2026-10-14)
+separates their actual durable states. Next execution: root-only TERMINAL after
+orphan/discovery deletion, before root deletion. Documentation closes no gate.
+
 ## E1-16 repeated evidence gate follow-up (2026-10-14)
 
 [ISSUE-E16-REPEATED-EVIDENCE-GATE-01](./KNOWN_ISSUES.md#issue-e16-repeated-evidence-gate-01)

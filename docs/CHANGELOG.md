@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — E1-01 remaining-cut inventory and bounded next drill
+
+Reconciled merged A/B/C/D evidence with current Cassandra/worker ordering.
+C0 root retention, C3 PUBLISHED lifecycle beside PREPARED orphan and C8 internal
+cleanup states remain separately tracked. The original dated plan is preserved;
+[current section 0](./E1-01-CRASH-EVIDENCE-PLAN.md#0-current-reconciliation-and-next-bounded-execution-2026-10-14)
+selects only root-only TERMINAL after orphan/discovery removal for the next
+execution PR. No new runtime test, crash result, product defect or gate closure.
+
 ## 2026-10-14 — PR #286 crossed-audit corrections
 
 Corrected the coverage claim: E1-16 already exercises successful pre-HEAD
