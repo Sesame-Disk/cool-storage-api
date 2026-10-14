@@ -1,18 +1,19 @@
 # E1-01 — bounded crash-evidence plan
 
-Status: SOURCE INVENTORY / OPEN, updated 2026-10-14 against `main@bd8cab8529e34ff0a245e76e4db268919cfe164b` (#286).
+Status: SOURCE INVENTORY / OPEN, updated 2026-10-14 against `main@1b16f092f3e5c2abd9e5f607c3b60ebd2628595c` (#289).
 Original planning base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279); its dated inventory and execution plan remain below.
-This PR changes documentation only. It records no new crash result, fixes no runtime defect and closes no gate.
+The original planning/inventory PRs changed documentation only. Execution results
+belong to the linked A/B/C/D/E ledgers; this inventory closes no gate.
 X1 remains OPEN; production GC remains OFF. Deliberate destructive GC in an isolated development fixture is required for the drills.
 
 ## 0. Current reconciliation and next bounded execution (2026-10-14)
 
-This update implements the source-inventory step, not another K drill. It compares
+The source-inventory step compares
 current Cassandra/worker call order with merged process evidence and existing
 U/R controls. No new product counterexample was found in this review; missing
 process evidence remains an evidence obligation, not a demonstrated runtime bug.
 
-### 0.1 Accepted evidence by exact cut
+### 0.1 Recorded evidence by exact cut
 
 | Cut | Current evidence and remaining qualification |
 |---|---|
@@ -22,11 +23,11 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 | C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
 | C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
 | C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
-| C8 internal | U exact terminal/root/projection controls and G1 R terminal settlement. Orphan-absent/discovery-present/root-present and orphan-absent/discovery-absent/root-present remain separately inventoried; no process-death result is asserted for either. |
+| C8 internal | [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) records root-only TERMINAL K evidence after orphan/discovery removal (in review, single DC). Orphan-absent/discovery-present/root-present remains a separate unproven internal cut. U/R controls retain their original scope; no all-C8 closure. |
 
-The A/B/C/D ledgers retain their frozen source, single-DC scope, preservation
-controls and measured exits. Their existing results are reused, not rerun or
-extended by this documentation PR. None closes all E1-01 or X1.
+The A/B/C/D ledgers retain their frozen sources and scope. E adds only its
+recorded internal boundary; its ledger separates new results from reused controls.
+None closes all E1-01 or X1.
 
 ### 0.2 C0/C3 source obligations and limits
 
@@ -59,9 +60,12 @@ No new C0/C3 K claim or closure follows from these controls.
 
 ### 0.3 Selected next drill: one internal C8 root-only TERMINAL cut
 
+Execution record: [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) implements this
+selection; results and validation limits are in that ledger. The bounded plan follows.
+
 [DeleteS3Orphan](../internal/gc/store_cassandra.go) removes, in order, the exact
-orphan, the exact by-day discovery row, then the recovery root. The next execution
-slice is only **after the discovery DELETE returns successfully, before the root
+orphan, the exact by-day discovery row, then the recovery root. The selected E slice
+is only **after the discovery DELETE returns successfully, before the root
 DELETE starts**. Root-only recovery takes a different branch from D's intact
 orphan: a TERMINAL lifecycle permits metadata settlement using the root's durable
 first_seen_at. G1 controls model this branch; D's kill-before-call does not kill
@@ -84,7 +88,8 @@ and both repetition orders. Scope: one cut, two positive legs, existing preserva
 control, existing harness and no runtime/schema/writer/scheduler/GC-default change.
 Do not fabricate authority with direct setup CQL; add no new productive hook if
 the existing observer can hold the cut. If it cannot, report that instrumentation
-limit before expanding scope. This plan asserts no successful observer drill yet.
+limit before expanding scope. The E ledger records the observed drill; this
+inventory does not expand its scope or close a gate.
 C0/C3, the other C8 substep, global scheduling and three-DC residuals remain OPEN.
 
 ## 1. Question and scope
@@ -246,7 +251,10 @@ and U/R/K limitations reviewed; staged diff checked (two documentation files onl
 Docker image rebuilt with `Dockerfile.gotest`; `go test -count=1 -timeout 5m -run '^Test(G[1-5]|X1PhysicalLifeHandoff)' ./internal/gc` PASS.
 This validates existing unit/source/document guards, not a new real-service crash drill or E1-01 closure.
 
-## 7. Audit of the remaining-cut inventory (2026-10-14)
+## 7. Original remaining-cut inventory audit (#289, 2026-10-14)
+
+Historical validation of the documentation-only inventory is preserved below.
+Current execution validation belongs to the E1-01E ledger.
 
 Reviewed against main@bd8cab8529e34ff0a245e76e4db268919cfe164b. Re-read real
 Prepare/Promote/DeleteS3Orphan ordering, worker root-only/committed recovery,

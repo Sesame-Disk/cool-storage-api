@@ -43,8 +43,10 @@ after real orphan/discovery deletion, before recovery-root deletion. The existin
 query observer holds the productive call; the parent proves exact root-only
 TERMINAL independently. SIGKILL/resume, independent recovery/replay and failed
 fixture preservation are required, with a two-leg fail-closed runner gate.
-Directed Docker and short Go/vet PASS; race, gate negatives and standard runner
-are pending in the ledger. No runtime change; E1-01/X1 OPEN, production GC OFF.
+Directed Docker, race repetitions, gate/recovery-child negatives, short Go/vet
+and full required integration/API/OIDC PASS; both full-runner exits are 0.
+A/B/C/D controls remain green. See ledger for frozen sources and single-DC scope.
+No runtime change; E1-01/X1 OPEN, production GC OFF.
 
 ## Previous merged slice: E1-01 remaining-cut inventory (#289)
 

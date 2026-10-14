@@ -16,7 +16,9 @@ observer, independent durable oracle, SIGKILL/resume, fresh-process recovery/rep
 failure preservation and required runner gate; no runtime/schema/default change.
 A directed harness 404 from an intermediary's library sweep was corrected by
 running E's preservation child directly on e19; block cleanups remain unchanged.
-Validation and limits are recorded in the ledger; E1-01/X1 remain OPEN.
+Directed, race, omitted/SKIP/unavailable-child negatives, short Go/vet and the
+standard integration/API/OIDC PASS; both full-runner exits are 0. A/B/C/D and
+their preservation controls remain green. Scope/identity in ledger; E1-01/X1 OPEN.
 
 ## 2026-10-14 — E1-01 remaining-cut inventory and bounded next drill
 
