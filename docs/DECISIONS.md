@@ -139,31 +139,24 @@ Both tests must pass:
 - ✅ `./run-sync-comparison.sh` - Only expected differences (tokens, timestamps)
 - ✅ `./run-real-client-sync.sh` - Files sync successfully
 
-### Step 6: Freeze and Document
+### Step 6: Record Compatibility Evidence
 
-1. **Mark as frozen** in `docs/IMPLEMENTATION_STATUS.md`:
-   ```markdown
-   | `GET /seafhttp/repo/:id/fs-id-list/` | 🔒 FROZEN | **STABLE** | 2026-01-16 | Returns JSON array |
-   ```
+The component freeze/promotion model (FROZEN labels and soak periods) was retired on 2026-10-12.
+This does not retire accepted architecture decisions or pinned safety/evidence contracts, which
+remain governed by [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md). The old component procedure is
+archived in [legacy/RELEASE-CRITERIA-2026-03-17.md](legacy/RELEASE-CRITERIA-2026-03-17.md).
 
-2. **Document in RFC** if new behavior discovered:
-   - Update `docs/SEAFILE-SYNC-PROTOCOL-RFC.md`
-   - Add test vector if applicable
-   - Update quick reference: `docs/SEAFILE-SYNC-PROTOCOL.md`
-
-3. **Update CURRENT_WORK.md**:
-   ```markdown
-   ## Frozen/Stable Components 🔒
-   - `internal/api/sync.go` lines 949-952 - fs-id-list format (JSON array)
-   ```
-
-4. **Add comment in code**:
-   ```go
-   // FROZEN (2026-01-16): Stock Seafile returns JSON array, not newline-separated text
-   // Verified with run-sync-comparison.sh and run-real-client-sync.sh
-   // DO NOT CHANGE without testing against stock Seafile
-   c.JSON(http.StatusOK, fsIDs)
-   ```
+1. Update the affected row in [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) with the
+   observed behaviour, verification date, evidence and limits; do not introduce freeze approvals
+   or soak counters.
+2. If protocol behaviour was discovered or corrected, update
+   [SEAFILE-SYNC-PROTOCOL-RFC.md](SEAFILE-SYNC-PROTOCOL-RFC.md), applicable test vectors and
+   [SEAFILE-SYNC-PROTOCOL.md](SEAFILE-SYNC-PROTOCOL.md).
+3. Record the slice and its evidence in [../CURRENT_WORK.md](../CURRENT_WORK.md), linking to
+   the canonical issue or investigation. Record the merged result in [CHANGELOG.md](CHANGELOG.md).
+4. Where a protocol quirk needs a code comment, explain the required wire behaviour and point
+   to the regression or stock-client evidence. A historical FROZEN comment is not a blanket
+   prohibition on a verified correction.
 
 ---
 
@@ -316,6 +309,8 @@ library.MagicStrong = argon2Hash  // 300× slower to brute-force
 ---
 
 ### 4. Cassandra for Metadata Storage
+
+> **Alternative evaluated and rejected (2026-01-19):** a migration to TiDB was evaluated in depth and the verdict was to stay with Cassandra. The analysis is archived in [legacy/CASSANDRA-TO-TIDB-MIGRATION-2026-01-19.md](legacy/CASSANDRA-TO-TIDB-MIGRATION-2026-01-19.md).
 
 **Decision**: Use Apache Cassandra for metadata (not PostgreSQL/MySQL)
 
@@ -663,6 +658,8 @@ expected_magic = "7b936d1d...1311b21e..."  # Known correct value
 ---
 
 ### 2. Session Continuity Tracking
+
+> **Superseded (2026-10-12):** the CURRENT_WORK layout described below is no longer used. `CURRENT_WORK.md` now holds the active and recent slices plus the gates table; older content is archived in `docs/legacy/`. Kept as a record of the original decision.
 
 **Decision**: Maintain `CURRENT_WORK.md` for session-to-session context preservation
 

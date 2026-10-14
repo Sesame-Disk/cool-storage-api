@@ -626,6 +626,6 @@ var (
 ## Questions?
 
 For implementation details or clarification, see:
-- `/docs/MANUAL_TESTING_GUIDE.md` - Testing procedures
+- [Current testing procedures](../TESTING.md); the original walkthrough is preserved in [MANUAL_TESTING_GUIDE-2026-01-23.md](MANUAL_TESTING_GUIDE-2026-01-23.md).
 - `/docs/ARCHITECTURE.md` - System design
 - `/docs/DATABASE-GUIDE.md` - Cassandra schema

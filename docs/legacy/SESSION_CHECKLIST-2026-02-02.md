@@ -137,10 +137,10 @@ Modified: internal/api/sync.go (added new endpoint)
 
 ---
 
-## ✅ Release Criteria Updates (See [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md))
+## ✅ Release Criteria Updates (See [RELEASE-CRITERIA.md](RELEASE-CRITERIA-2026-03-17.md))
 
 ### If Tests Were Added or Modified
-- [ ] Update the **Component Test Map** entry in `docs/RELEASE-CRITERIA.md`
+- [ ] Update the **Component Test Map** entry in [docs/RELEASE-CRITERIA.md](RELEASE-CRITERIA-2026-03-17.md)
 - [ ] Re-measure coverage if significant tests were added
 - [ ] Check if any component now meets freeze prerequisites (→ promote to 🟢)
 

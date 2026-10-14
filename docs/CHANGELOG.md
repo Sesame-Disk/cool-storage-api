@@ -8,6 +8,24 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-13 — Lean documentation and shared agent instructions
+
+Documentation only; runtime, schema, GC enablement and issue closure states are unchanged.
+The original cleanup is rebased onto main@f8e08008c, preserving its E1-16/E1-17 and
+crash-evidence updates. AGENTS.md is the sole repository instruction file for Codex and
+current Claude Code; README documents loading prerequisites and verification.
+
+Retired component freeze steps and legend rules are replaced by compatibility evidence.
+Historical bodies are retained with repaired links. The technical-debt archive is named
+HISTORY to distinguish its superseded checklist from resolved debt; active tasks keep pointers.
+Conflict resolution, exact-lease rebases, isolated GC tests, compatibility exceptions and audit
+severity/scope are explicit. CURRENT_WORK keeps separate GC and non-GC readiness gates; the
+v1 roadmap is labelled as a dated planning snapshot.
+The follow-up audit repaired a plain-text testing-guide reference in the older search plan
+and linked historical procedural references to their archived destinations. Navigation checks
+now also search for references to moved files outside Markdown link targets.
+
+
 ## 2026-10-12 — E1-17: W2-10 residual content-resurrection handlers closed
 
 **RED.** `RevertFile`, `RestoreTrashItem` (file and directory),
@@ -1545,8 +1563,8 @@ reconciliation delta could over/under-count against a normal HEAD/counter write;
 a T1 reconciler could delete T2 without generation/attempt identity; and a
 canonical soft-delete CAS could crash before its derived counter batch without a
 marker or discovery path. These are historical constraints, not current main bugs
-and not scope for W2. The preexisting repair lease/reachability findings, which can span pre-HEAD lease expiry and ambiguous/applied HEAD outcomes, are tracked as [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01) and
-[ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01).
+and not scope for W2. The preexisting repair lease/reachability findings, which can span pre-HEAD lease expiry and ambiguous/applied HEAD outcomes, are tracked as [ISSUE-PUBLISH-REPAIR-TIMEOUT-CLEANUP-01](KNOWN_ISSUES.md#issue-publish-repair-timeout-cleanup-01-publish-repair-treats-lease-expiry-as-cleanup-authority) and
+[ISSUE-PUBLISH-REPAIR-REACHABILITY-01](KNOWN_ISSUES.md#issue-publish-repair-reachability-01-repair-head-reachability-and-ancestry-are-not-bounded-authority).
 
 The existing main development volume was not deleted when its unrelated
 migration-checksum mismatch appeared; the evidence used a fresh isolated
