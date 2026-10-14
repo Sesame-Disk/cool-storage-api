@@ -35,6 +35,22 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
+## Active slice: sandbox-gated dev multi-region stack (tooling)
+
+Branch `feat/sandbox-gated-multiregion`, base main@acc6c6f45. The dev
+multi-region stack comes up on restricted hosts through
+`./scripts/bootstrap.sh multiregion --sandbox`, which layers
+[docker-compose.multiregion.sandbox.yaml](docker-compose.multiregion.sandbox.yaml):
+region/nginx configs baked into the images, LB on 8081, USA on 3001, nginx
+healthcheck on 127.0.0.1. Off by default — without the flag the compose
+selection stays `-f docker-compose-multiregion.yaml` — and `--status` now routes
+with a `Host` header instead of `/etc/hosts`. Host prerequisite, not in the repo:
+the `buildx` CLI plugin (`~/.docker/cli-plugins/docker-buildx`); the server
+Dockerfiles build `FROM --platform=$BUILDPLATFORM`, and without buildx the build
+fails as "failed to parse platform". Sandbox mode checks for it before building.
+See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) §Sandbox and
+[docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
+
 ## Active slice: E1-17 W2-10 residual content-resurrection handlers
 
 Base main@747408b39 (#277 and #278 merged). Branch
