@@ -95,3 +95,11 @@ at C6/C7; disposal must not derive the mapping identity from empty bytes. A/B co
 Root enumeration and checkpoints retain the inherited fixture-local filtering; no global scheduling,
 seek persistence or fairness claim. C8's separate cleanup substeps, C0/C3 and P2 publication remain
 outside this PR. No product violation reproduced in these schedules; E1-01 and X1 remain OPEN.
+
+Main update audit (2026-10-14): rebased onto `main@e091d9756ec03c9b0e8aa0fee886ef3027541059`.
+Equivalent reviewable implementation commit: `1452f0fb6` (the frozen pre-rebase source above
+is retained by a local backup ref). Only CURRENT_WORK/CHANGELOG had conflicts; both main's
+new entries and this evidence were preserved. All four test/runner files are byte-identical
+in Git to the frozen implementation. New main changes affect documentation and the separate
+multi-region bootstrap path, not this executed single-DC runner; no runtime suite was repeated
+solely for the rebase. Final relative links, Compose configuration and diff checks PASS.
