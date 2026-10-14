@@ -35,7 +35,20 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: sandbox-gated dev multi-region stack (tooling)
+## Active slice: verification sweep of PRs #277–#283 (docs corrections)
+
+Branch `docs/verify-sweep-corrections`, base main@f580787ed. Independent re-read
+of the seven PRs merged after the 2026-10-09 progress report against the code,
+the tests and the sources of record. Corrections: the abandoned-repair
+`retained` definition in [PUBLISH-REPAIR-OBSERVABILITY](docs/PUBLISH-REPAIR-OBSERVABILITY.md),
+a dated W2-10 note in [E1-16](docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md), and the
+dangling PR #231 pointer in [OPEN-WORK-INDEX](docs/OPEN-WORK-INDEX.md). Open
+findings reported with the sweep: E1-17's pre-HEAD recheck
+(`validateRetainedHistoricalSource`) has no test coverage — the 15 evidence legs
+reject at capture — and `docs/FILE-LOCKING-DESIGN.md` is now referenced from
+nothing. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-14).
+
+## Previous merged slice: sandbox-gated dev multi-region stack (tooling, PR #284)
 
 Branch `feat/sandbox-gated-multiregion`, base main@acc6c6f45. The dev
 multi-region stack comes up on restricted hosts through
