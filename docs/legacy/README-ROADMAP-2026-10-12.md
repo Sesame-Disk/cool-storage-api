@@ -1,6 +1,6 @@
 # README roadmap (archived 2026-10-12)
 
-**Why archived:** the phase checklist in `README.md` had not tracked reality: done items were unchecked (web upload/download, quotas, admin APIs, OIDC, encrypted libraries, versioning UI) and planned items described approaches not taken (Elasticsearch search; WOPI instead of the OnlyOffice API). Moved here unchanged.
+**Why archived:** the phase checklist in `README.md` had not tracked reality: done items were unchecked (web upload/download, quotas, admin APIs, OIDC, encrypted libraries, versioning UI) and planned items described approaches not taken (Elasticsearch search; WOPI instead of the OnlyOffice API). Historical text is preserved, with relative links repaired.
 
 **Source:** `README.md` at commit `5c3163871`, lines 56–152.
 **Current status lives in:** `docs/V1-PRODUCTION-ROADMAP.md`, `docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`, `docs/X1-CRITICAL-PATH.md`.
@@ -33,7 +33,7 @@
 - [x] Commit/FS object model in Cassandra
 
 ### Web Frontend (Seahub) - IN PROGRESS
-**Status:** Core functionality working. See [docs/FRONTEND.md](docs/FRONTEND.md).
+**Status:** Core functionality working. See [docs/FRONTEND.md](../FRONTEND.md).
 
 - [x] Library list (My Libraries)
 - [x] Directory browsing inside libraries
@@ -103,4 +103,3 @@
 - [ ] File versioning UI
 
 ---
-

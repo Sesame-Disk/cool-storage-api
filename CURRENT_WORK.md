@@ -625,18 +625,16 @@ the only blocker" turns into "X1 closed → ship it":
 | Gate | Blocked by | Status |
 |---|---|---|
 | **Activating destructive GC** (`GC_ENABLED=true`) | **X1, then the PRE-GC / A1 gate** ([docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) §6). X2 closed 2026-08-14. | X1 OPEN; D0 architecture implemented through G1–G5 (#207, #209, #212, #247, #248); E1 in progress, with the exit items listed in [E1-16](docs/E1-16-POST-D-CONTRACT-ALIGNMENT.md); PRE-GC items open |
-| **Putting SesameFS in production at all** | **Independent security / resource findings that have nothing to do with GC** | Several open — see below |
+| **Putting SesameFS in production at all** | **Independent security / resource findings that have nothing to do with GC** | See the canonical non-GC readiness links below |
 
 X1 is the critical-path blocker for the *first* row **only**, and even there
 X1 CLOSED is not activation: the PRE-GC / A1 gate must also close. X1 is not
 a production blocker for the second row, and no status document should say
 that it is.
 
-**🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
-1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. **Destructive Garbage Collection** - 🔴 **BLOCKED** by X1 physical-delete ABA and then by the PRE-GC / A1 gate ([docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) §6): X2 cross-DC reference visibility closed 2026-08-14 (destructive liveness at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster). Keep `GC_ENABLED=false` on every replica in every DC; the implementation and lease exist but are not permission to activate deletion.
-3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
-4. **Non-GC readiness findings** - 🔴 **OPEN**, independent of X1. Canonical status per id in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md), one-screen list in [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md). Single-node HIGHs still open: `ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`, `ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01` (`ISSUE-RECVFS-DECOMPRESSION-AMPLIFICATION-01` fixed 2026-10-05 on `fix/sync-recvfs-decompression-bound`, merged to main by PR #261). Multi-instance additionally requires `ISSUE-UPLOAD-CHUNK-MULTINODE-01` and `ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01`. (`ISSUE-LIBRARY-MUTATION-NO-PERMISSION-CHECK-01` closed 2026-08-22.)
+**Non-GC readiness:** consult [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md) for
+the current deployment blockers and [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for
+status per issue. Those findings remain independent of the destructive-GC gate.
 
 ---
 

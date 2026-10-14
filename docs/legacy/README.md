@@ -1,19 +1,19 @@
 # Legacy documentation
 
-Outdated or superseded documents, kept unchanged so they can still be consulted. Nothing here
-describes the current system; when a statement here conflicts with a living doc, the living doc
+Historical or superseded documents, with evidence bodies preserved and relocated links repaired.
+An archived unchecked task is not automatically resolved; when a statement here conflicts with a living doc, the living doc
 wins. Current status lives in `CURRENT_WORK.md`, `docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`
 and `docs/X1-CRITICAL-PATH.md`.
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-13
 
 | File | Archived | Why | Replaced by |
 |---|---|---|---|
-| `CURRENT_WORK-HISTORY-2026-10-12.md` | 2026-10-12 | Sections cut from `CURRENT_WORK.md` (lines 528–1335, 1356–1973): September slices, session summaries, the February "What's Next", Strategic Roadmap, the retired "frozen components" list and Quick Commands | `CURRENT_WORK.md`, `docs/CHANGELOG.md`, `CLAUDE.md` |
-| `TECHNICAL-DEBT-RESOLVED-2026-10-12.md` | 2026-10-12 | Resolved or obsolete sections of `docs/TECHNICAL-DEBT.md`; the live file keeps a one-line stub at each moved heading so existing `§` references still resolve | `docs/TECHNICAL-DEBT.md` |
+| `CURRENT_WORK-HISTORY-2026-10-12.md` | 2026-10-12 | Sections cut from `CURRENT_WORK.md` (lines 528–1335, 1356–1973): September slices, session summaries, the February "What's Next", Strategic Roadmap, the retired "frozen components" list and Quick Commands | `CURRENT_WORK.md`, `docs/CHANGELOG.md`, `AGENTS.md` |
+| `TECHNICAL-DEBT-HISTORY-2026-10-12.md` | 2026-10-12 | Resolved sections and superseded coverage/checklist snapshots of `docs/TECHNICAL-DEBT.md`; open tasks still have active tracking; the live file keeps a one-line stub at each moved heading so existing `§` references still resolve | `docs/TECHNICAL-DEBT.md` |
 | `IMPLEMENTATION_STATUS-SNAPSHOT-2026-07-21.md` | 2026-10-12 | Readiness percentages, freeze rules, blockers and priorities from `docs/IMPLEMENTATION_STATUS.md`, last maintained in January–July | `docs/V1-PRODUCTION-ROADMAP.md`, `docs/X1-CRITICAL-PATH.md`, `docs/KNOWN_ISSUES.md` |
 | `README-ROADMAP-2026-10-12.md` | 2026-10-12 | The README's phase checklist had stopped tracking reality (finished work unchecked; Elasticsearch and WOPI plans not pursued) | `docs/V1-PRODUCTION-ROADMAP.md`, `docs/OPEN-WORK-INDEX.md` |
-| `SESSION_CHECKLIST-2026-02-02.md` | 2026-10-12 | End-of-session ritual; points to `CLAUDE.md` sections that no longer exist and to the retired 🔒 FROZEN model. No edits since February | `CLAUDE.md` rules; per-PR updates to `CURRENT_WORK.md`, `KNOWN_ISSUES.md`, `CHANGELOG.md` |
+| `SESSION_CHECKLIST-2026-02-02.md` | 2026-10-12 | End-of-session ritual; points to `CLAUDE.md` sections that no longer exist and to the retired 🔒 FROZEN model. No edits since February | `AGENTS.md` rules; per-PR updates to `CURRENT_WORK.md`, `KNOWN_ISSUES.md`, `CHANGELOG.md` |
 | `RELEASE-CRITERIA-2026-03-17.md` | 2026-10-12 | Freeze-and-soak procedure no longer followed (`sync.go`, `seafhttp.go`, `onlyoffice.go` have changed hundreds of times since their "freeze") | `docs/V1-PRODUCTION-ROADMAP.md`, `docs/TESTING.md` |
 | `SYNC-PROTOCOL-INVESTIGATION-WORKFLOW-2026-01-18.md` | 2026-10-12 | Its "stock Seafile is the reference" workflow is already in `docs/DECISIONS.md` ("Protocol-Driven Development"); nothing links to it | `docs/DECISIONS.md` |
 | `MANUAL_TESTING_GUIDE-2026-01-23.md` | 2026-10-12 | January curl walkthrough using `go run`; replaced by Docker-based tests | `docs/TESTING.md`, `scripts/test.sh` |
@@ -34,5 +34,6 @@ and `docs/X1-CRITICAL-PATH.md`.
 - When only part of a living doc is outdated, cut that part into a dated file here, name the
   source commit and line ranges in its header, and leave a one-line pointer behind if other docs
   reference the moved section.
+- Preserve open-item pointers and update relative links when moving a record; archiving is not closure.
 - Never delete files from this folder. Git history is not a substitute: people browsing the repo
   should be able to find the record.

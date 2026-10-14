@@ -3,7 +3,7 @@
 **Why archived:** these sections of `docs/IMPLEMENTATION_STATUS.md` were last maintained between
 January and 2026-07-21: readiness percentages, a production-blocker list, the freeze/promotion
 rules (retired with `RELEASE-CRITERIA.md`), "next priorities", documentation status and metrics.
-Several no longer hold. Moved here unchanged.
+Several no longer hold. Historical bodies are preserved, with relative links repaired.
 
 **Source:** `docs/IMPLEMENTATION_STATUS.md` at commit `5c3163871`, lines 7–31 and 422–614.
 **Current status lives in:** `docs/V1-PRODUCTION-ROADMAP.md` (readiness), `docs/X1-CRITICAL-PATH.md`
@@ -31,7 +31,7 @@ Several no longer hold. Moved here unchanged.
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
 6. ~~Desktop sync active-active conflict recovery~~ - ✅ BASELINE VERIFIED for the current hardening scope. `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch` now use parent-chain validation, CAS, bounded retry, ancestry-gated server-side auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. `scripts/test-sync-active-active.sh` now proves both the non-overlapping concurrent-write race with observed `parent mismatch` plus `auto-merge`, and the same-path unsafe-conflict path with observed retry-budget `503` while both desktop clients preserve their divergent local edits. Broader scenario coverage remains follow-up test debt rather than a current blocker.
-7. **GC Multi-Instance Coordination** - ✅ Lease implemented, but activation remains 🔴 BLOCKED — the lease coordinates enabled replicas but cannot close X1. Keep `GC_ENABLED=false` on every replica in every DC. Only after X1 closes and the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6) closes may designated replicas in one DC participate under the lease.
+7. **GC Multi-Instance Coordination** - ✅ Lease implemented, but activation remains 🔴 BLOCKED — the lease coordinates enabled replicas but cannot close X1. Keep `GC_ENABLED=false` on every replica in every DC. Only after X1 closes and the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](../X1-CRITICAL-PATH.md) §6) closes may designated replicas in one DC participate under the lease.
 8. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 9. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
 
@@ -232,3 +232,28 @@ These MUST be completed before production deployment:
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
 - Infrastructure: ~95% (monitoring ✅, health checks ✅, GC implementation present but production activation blocked by X1)
 - Documentation: ~85% (deployment, migration, testing, API, architecture, and feature docs exist; missing: end-user guides and operational admin runbooks)
+
+
+## Historical promotion thresholds (retired)
+
+**Source:** docs/IMPLEMENTATION_STATUS.md at 5c3163871, lines 43–45.
+
+**Promotion rules**: See [RELEASE-CRITERIA-2026-03-17.md](RELEASE-CRITERIA-2026-03-17.md) for the full historical procedure.
+- ✅ → 🟢: needs ≥ 80% Go coverage (60% for shared pkgs), ≥ 90% integration endpoint coverage, zero open bugs, Component Test Map entry
+- 🟢 → 🔒: needs 3 consecutive clean sessions with all tests passing and no new bugs
+
+
+## Historical status legend (retired)
+
+Source: docs/IMPLEMENTATION_STATUS.md at 5c3163871. These approval and soak requirements
+are historical; use [../IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md#status-legend).
+
+## Status Legend
+
+| Symbol | Meaning | Stability | Safe to Modify? |
+|--------|---------|-----------|-----------------|
+| 🔒 **FROZEN** | Meets all freeze criteria, soak period complete | **STABLE** | ❌ No - only with user approval |
+| 🟢 **RELEASE-CANDIDATE** | Meets freeze prerequisites, in soak period | **STABLE** | ⚠️ Bug fixes only - resets soak counter |
+| ✅ **COMPLETE** | Implemented, basic testing done | Mostly stable | ⚠️ Caution - review tests first |
+| 🟡 **PARTIAL** | Stub exists or incomplete implementation | **UNSTABLE** | ✅ Yes - active development |
+| ❌ **TODO** | Not started | N/A | ✅ Yes - greenfield |

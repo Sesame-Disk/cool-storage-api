@@ -1,12 +1,13 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-07-21
+**Matrix verification dates:** recorded per row below. **Documentation structure updated:** 2026-10-13.
 
 ---
 
 This file is the feature and endpoint matrix. Readiness, blockers and priorities are not tracked
-here: see [V1-PRODUCTION-ROADMAP.md](V1-PRODUCTION-ROADMAP.md), [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md)
-(destructive GC stays disabled) and [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md). The older readiness
+here: see [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+and [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md) (destructive GC stays disabled).
+[V1-PRODUCTION-ROADMAP.md](V1-PRODUCTION-ROADMAP.md) provides dated planning context. The older readiness
 summary, freeze rules and metrics are archived in
 [legacy/IMPLEMENTATION_STATUS-SNAPSHOT-2026-07-21.md](legacy/IMPLEMENTATION_STATUS-SNAPSHOT-2026-07-21.md).
 
@@ -14,15 +15,17 @@ summary, freeze rules and metrics are archived in
 
 | Symbol | Meaning | Stability | Safe to Modify? |
 |--------|---------|-----------|-----------------|
-| 🔒 **FROZEN** | Meets all freeze criteria, soak period complete | **STABLE** | ❌ No - only with user approval |
-| 🟢 **RELEASE-CANDIDATE** | Meets freeze prerequisites, in soak period | **STABLE** | ⚠️ Bug fixes only - resets soak counter |
+| 🔒 **FROZEN** (legacy label) | Implemented, compatibility-sensitive | See row evidence/date | Changes require evidence for affected contracts; no freeze approval or soak period |
+| 🟢 **RELEASE-CANDIDATE** (legacy label) | Compatibility-sensitive candidate | See row evidence/date | Changes require evidence for affected contracts; no promotion/soak counter |
 | ✅ **COMPLETE** | Implemented, basic testing done | Mostly stable | ⚠️ Caution - review tests first |
 | 🟡 **PARTIAL** | Stub exists or incomplete implementation | **UNSTABLE** | ✅ Yes - active development |
 | ❌ **TODO** | Not started | N/A | ✅ Yes - greenfield |
 
 **The freeze/promotion model is retired (2026-10-12).** A 🔒 FROZEN or 🟢 label below now means
-*compatibility-sensitive*: a change needs evidence that Seafile desktop/mobile clients still work,
-not a soak period. The old procedure is in
+*compatibility-sensitive*: verify the affected contract, including Seafile desktop/mobile clients
+when a change affects them. These labels do not establish current production readiness or a soak
+period. The retirement concerns component freeze/promotion only; accepted X1 architecture and
+evidence contracts remain governed by [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md). The old procedure is in
 [legacy/RELEASE-CRITERIA-2026-03-17.md](legacy/RELEASE-CRITERIA-2026-03-17.md).
 
 ---
@@ -399,4 +402,3 @@ Pending compatibility cleanup:
 | All other tables | ✅ COMPLETE | See `docs/DATABASE-GUIDE.md` |
 
 ---
-

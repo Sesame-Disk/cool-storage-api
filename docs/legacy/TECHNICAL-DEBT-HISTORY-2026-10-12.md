@@ -1,11 +1,15 @@
-# Technical debt: resolved and obsolete sections (archived 2026-10-12)
+# Technical debt: historical sections (archived 2026-10-12)
 
-**Why archived:** these sections of `docs/TECHNICAL-DEBT.md` describe items that are fixed or
-resolved, a January test-coverage table now owned by `docs/TESTING.md`, and a dated
-"action items / monitoring" plan no longer followed. They were moved here unchanged. The live file
-keeps each heading with a pointer here, so references such as "TECHNICAL-DEBT §9" still resolve.
-Section numbers in that file are not unique (5 and 20–25 appear twice); this archive does not
-renumber anything.
+**Why archived:** resolved sections, dated coverage/monitoring snapshots and a superseded
+summary checklist from docs/TECHNICAL-DEBT.md. Archiving the checklist does not resolve its
+unchecked items. Active debt remains in [../TECHNICAL-DEBT.md](../TECHNICAL-DEBT.md), including
+authentication (§6), modifier/email policy (§8), batch/test debt (§12), API-key scopes (§14),
+and upload-token/resume semantics (§15). Issue status remains in
+[../KNOWN_ISSUES.md](../KNOWN_ISSUES.md). Coverage instructions live in [../TESTING.md](../TESTING.md).
+
+The historical bodies are preserved; relative links are adjusted for their new location. The
+live file keeps moved headings as pointers. Section numbers are not unique (5 and 20–25 occur
+more than once); identify ambiguous entries by title.
 
 **Source:** `docs/TECHNICAL-DEBT.md` at commit `5c3163871`. Each block below names its original lines.
 
@@ -391,5 +395,3 @@ against the fix has been rewritten rather than deleted, so the reasoning survive
 `TestP4ASettlementReadsUseTheSerialDomain`, plus the `m_settlement_read_is_ordinary`
 mutation in `scripts/p4a-mutation-validation.sh`, which requires the guard to go red when
 the read is downgraded.
-
-

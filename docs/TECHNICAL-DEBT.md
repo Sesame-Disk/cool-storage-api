@@ -159,7 +159,7 @@ projection before deleting the root.
 
 ## 1. Multi-Host ServiceURL — ✅ FIXED (2026-02-09, simplified 2026-03-30)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 2. Modal Pattern — ✅ MIGRATION COMPLETE (2026-01-30)
 
@@ -224,7 +224,7 @@ The backend must implement these exact paths (from seafile-js):
 
 ## 4. Test Coverage (ONGOING)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+The dated coverage snapshot is in [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md). Test/coverage guidance lives in [TESTING.md](TESTING.md); moving the snapshot does not close coverage debt.
 
 ## 20. Block Metadata Hot-Path LWT (DEFERRED)
 
@@ -257,7 +257,7 @@ measurement of the remaining install/repair CAS cost is still deferred.
 
 ## 21. Cassandra-Real Coverage For GC Claim Retry (RESOLVED 2026-08-26, P4a)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 22. SeafHTTP Publish-Attempt ID Resolution Mismatch (DEFERRED)
 
@@ -876,11 +876,11 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 
 ## Summary: Action Items
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+The superseded checklist is in [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md). Its unchecked items are not resolved by archiving. See the active authentication (§6), modifier/email (§8), batch/test (§12), API-key scope (§14) and upload-token/resume (§15) sections below, plus [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for issue status.
 
 ## 9. SeafHTTP Token Auth: 403 → 401 — ✅ FIXED (2026-02-22)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 10. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-18), Gap B pending
 
@@ -994,11 +994,11 @@ GC Phase 6:
 
 ## Monitoring Technical Debt
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 11. Inline HTML in Go Code — ✅ FIXED (2026-03-05)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 12. Atomic Batch Operations & DRY Helpers Refactoring — 🟡 PARTIAL (2026-03-18)
 
@@ -1619,7 +1619,7 @@ Either:
 
 ### 19.e. RESOLVED (2026-09-11): Initial-Commit Paths Bypassed CAS
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ### 19.f. Crash Window Between CAS Commit and `syncLibraryHeadDerivedState`
 
@@ -1643,7 +1643,7 @@ Path to add: introduce an `fsTreeStore` interface that `FSHelper` satisfies, and
 
 ### 19.h. RESOLVED: Cross-Repo Move Mutable-Refcount Lag
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ### 19.i. Async Cleanup Goroutines Are Fire-and-Forget With No Observability
 
@@ -1772,7 +1772,7 @@ enforcement.
 
 ### 19.p. RESOLVED: Ambiguous Mutable-Refcount LWT Idempotence
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ### 19.q. Chunked Block-Metadata LWT Throttling Is Process-Local, Not Cluster-Wide
 
@@ -1816,7 +1816,7 @@ invariant.
 
 ### 19.r. `blocks` Is Hot-Partitioned By `org_id` — RESOLVED (2026-05-26)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## Pending-published fs_object cleanup (row-per-owner model)
 
@@ -2180,7 +2180,7 @@ change than the P3 writer boundary.
 
 ## 22. `ReleaseStaleBlockClaim` reads at session consistency (RESOLVED 2026-08-26, P4a)
 
-Moved to [legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md](legacy/TECHNICAL-DEBT-RESOLVED-2026-10-12.md) (resolved or obsolete, 2026-10-12).
+Moved to [legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md](legacy/TECHNICAL-DEBT-HISTORY-2026-10-12.md) (resolved or obsolete, 2026-10-12).
 
 ## 23. GC no longer cleans metadata-free stub rows (LOW, introduced deliberately by P4a)
 

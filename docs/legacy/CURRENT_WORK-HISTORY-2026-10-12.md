@@ -2,7 +2,7 @@
 
 **Why archived:** `CURRENT_WORK.md` had grown to 1,973 lines. Only its top (the active and
 recent E1 slices) and the gates table were still maintained. Everything below was moved here
-unchanged so it can still be consulted. Several statements here are no longer true: for example,
+with evidence text preserved and relative links repaired so it can still be consulted. Several statements here are no longer true: for example,
 the "Frozen Components" list (most of those files have changed since), "GC ✅ DONE" in the
 Strategic Roadmap (destructive GC is still gated by X1 and PRE-GC/A1) and the port 8082 in
 Quick Commands (it is 8080 by default).
@@ -46,7 +46,7 @@ ambiguous acquire); downgrading the pin to `LOCAL_SERIAL` gives two owners in
 this checkout's compose project and never modify the host tree.
 `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` is closed. The separate P1
 non-fencing finding remains a FOLLOW-UP; this change does not make a broader GC
-readiness claim. Per [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) §7 this
+readiness claim. Per [docs/X1-CRITICAL-PATH.md](../X1-CRITICAL-PATH.md) §7 this
 closes the first of the two current-runtime lease items (the global SERIAL
 pin); the generation-fenced final batch (`ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`)
 remains open in both §6 and §7. `GC_ENABLED=false` remains mandatory.
@@ -60,7 +60,7 @@ existing contradiction policy; a late repair cannot veto D. Both worker
 regressions are included in 17 mandatory continuity legs. G2/G3 retirement and
 durable physical continuation are proved; the future physical executor remains
 outside this PR. W2-0/W2-6a remain OPEN and GC_ENABLED=false.
-See [crossed audit evidence](./docs/W2-0-PUBLICATION-CONTINUITY.md).
+See [crossed audit evidence](../W2-0-PUBLICATION-CONTINUITY.md).
 
 ## Merged PR #239: fix/w2-0-publish-liveness-through-head (base main@50c50903e, 2026-09-29)
 
@@ -84,7 +84,7 @@ existing classifier seam; process death is modeled by an abrupt panic, with
 real durable rows and discovery-worker recovery. Neither is a wire-level HEAD
 ambiguity or an OS process-kill experiment. Full closure still requires those
 experiments and rollout evidence. Historical W2-1/2/6 claims are not upgraded.
-See [plan, evidence and limits](./docs/W2-0-PUBLICATION-CONTINUITY.md).
+See [plan, evidence and limits](../W2-0-PUBLICATION-CONTINUITY.md).
 
 **Previous branch - W2-6a CreateFile Office-template exact placement (`fix/w2-6a-createfile-office-exact-p`, base `main@63aa84573`, 2026-09-29):**
 Scoped follow-up after merged #237. `CreateFile` carries the actual materialized
@@ -93,7 +93,7 @@ and immediately before HEAD. Real Cassandra/MinIO RED: all six GC races (two
 for each Office extension) returned 201 and advanced HEAD. GREEN after the fix:
 409, HEAD unchanged, `pub:` cleaned, D unrevoked or fully retired P still absent.
 The nine Office legs also cover fresh/reused templates; empty CreateFile remains
-blockless. Plan and evidence: [docs/W2-6A-CREATEFILE-EXACT-P.md](docs/W2-6A-CREATEFILE-EXACT-P.md).
+blockless. Plan and evidence: [docs/W2-6A-CREATEFILE-EXACT-P.md](../W2-6A-CREATEFILE-EXACT-P.md).
 Cross-audit correction: W2-6a remains `OPEN`. The fix rejects GC that wins before
 exact-P validation; TTL-bound `pub:` (35d) does not prove continuity until HEAD.
 W2-0 remains OPEN even for adopting callers; historical closure claims require
@@ -116,7 +116,7 @@ blocks). That is the next scoped W2 row, followed by SeafHTTP and OnlyOffice.
 `GC_ENABLED=false` remains mandatory.
 
 **Merged #236 — X1 critical-path reset (docs only, `docs/x1-reset-critical-path`, base `main@a5dea859a`, 2026-09-29):**
-[docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) is now the source of
+[docs/X1-CRITICAL-PATH.md](../X1-CRITICAL-PATH.md) is now the source of
 record for the order of work toward X1. It restores the #201 roadmap
 (W2 exit checklist → G4 → G5 → E1 → X1 CLOSED → PRE-GC list → A1) and
 supersedes the "PC-D1B.5 → productive consumer → PC-2" ordering written in
@@ -170,7 +170,7 @@ does not block #233).
 `GC_ENABLED=false` remains mandatory.
 
 **Merged PC-D1B.4 certification-window lifecycle fence — cross-audit round 4, final Paxos race characterization (2026-09-24, `docs/pc-d1b4-certification-window-fence`, base `main@62a2c0e0`):**
-Decision record: [docs/PC-D1B-CERTIFICATION-WINDOW-FENCE.md](docs/PC-D1B-CERTIFICATION-WINDOW-FENCE.md),
+Decision record: [docs/PC-D1B-CERTIFICATION-WINDOW-FENCE.md](../PC-D1B-CERTIFICATION-WINDOW-FENCE.md),
 `ISSUE-PCD1B4-CERTIFICATION-WINDOW-FENCE-01`. Only the destruction of
 witness-covered state (HEAD commit, reachable fs_object, permanent `fs:`
 reference) can falsify a witness; claims already forbid semantic replacement,
@@ -362,7 +362,7 @@ stored witness gains `R`/`D`/`A`, which needs composable-digest semantics, an
 epoch-bump rule, and the cost of new `IF` predicates on the landed PC-D1A
 primitives. Registered as `ISSUE-PCD1B-METADATA-IDENTITY-AUTHORITY-01`;
 record:
-[docs/PC-D1B-METADATA-IDENTITY-AUTHORITY.md](docs/PC-D1B-METADATA-IDENTITY-AUTHORITY.md).
+[docs/PC-D1B-METADATA-IDENTITY-AUTHORITY.md](../PC-D1B-METADATA-IDENTITY-AUTHORITY.md).
 
 **Publish-repair worker observability (2026-09-18, `feat/publish-repair-observability`):**
 the metrics #223 §8.8 H asked for and the prerequisite of the fail-closed
@@ -371,7 +371,7 @@ GC health gate (§8.8 G / #224 D12): pending rows and oldest pending age
 duration, per-row sweep outcomes, visit outcomes (ok / retained / failed),
 renewal failures, post-HEAD reconciliation-failure events by funnel, immediate-repair
 outcomes. Report only; no gate, no protocol or schema change. Runbook:
-[docs/PUBLISH-REPAIR-OBSERVABILITY.md](docs/PUBLISH-REPAIR-OBSERVABILITY.md).
+[docs/PUBLISH-REPAIR-OBSERVABILITY.md](../PUBLISH-REPAIR-OBSERVABILITY.md).
 Not added on purpose: remaining pin TTL per block (cost + not a certified
 witness; the gate design decides). Follow-up
 `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` (P2, FOLLOW-UP / GENERAL):
@@ -409,7 +409,7 @@ GC unchanged. **Parked**: it blocks declaring X1 closed and activating
 destructive GC on this guarantee, not ordinary development; next work is
 repair-worker observability (prerequisite of a fail-closed GC health gate),
 then the gone-check and Paxos-domain follow-ups — not another renewal
-variant. Record: [docs/R31-REPAIR-LIVENESS-DESIGN-PROOF.md](docs/R31-REPAIR-LIVENESS-DESIGN-PROOF.md).
+variant. Record: [docs/R31-REPAIR-LIVENESS-DESIGN-PROOF.md](../R31-REPAIR-LIVENESS-DESIGN-PROOF.md).
 
 **Publish-repair liveness: PR #220 and PR #222 closed without merge (2026-09-18, `docs/r31-publish-repair-liveness-lessons`):**
 `ISSUE-PUBLISH-REPAIR-RENEWAL-AFTER-CLASSIFY-01` remains **OPEN** (P1,
@@ -424,7 +424,7 @@ zero-ref interval. Nothing from either PR is in `main`. The canonical
 record — problem, both attempts, counterexamples, invariants
 (main-liveness non-regression; bounded durable state under unlimited
 retries), the stop rule and the mandatory design gate — is
-[docs/PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md](docs/PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md).
+[docs/PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md](../PUBLISH-REPAIR-LIVENESS-REJECTED-DESIGNS.md).
 The record also freezes the operational model of `main` (§8): the 35d
 `pub:` TTL is a crash/recovery backstop, not publication latency — every
 content funnel attempts `stage pub: → queue repair → HEAD → request-local fs:
@@ -563,7 +563,7 @@ a zero-field `PublicationCoordinator` whose only method is the pure
 `ValidateSettlement`. **Zero funnels migrated, zero runtime change, zero productive
 importers, zero schema/CQL/CL/TTL/GC change.** No existing HEAD classifier
 (`InitialHeadOutcome`, v2 sentinels, Sync errors) was converted: the §9 mapping
-in [`docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md`](docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md)
+in [`docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md`](../PUBLICATION-PROTOCOL-CHARACTERIZATION.md)
 shows one v2 shape whose classification would change, so the unification stays
 a separate PR. `TestPC0PublicationCoordinatorTypeIsNotImplemented` was retired
 and replaced by eight `TestPC1*` source contracts in
@@ -642,7 +642,7 @@ stage: `BORROWED` must acquire durable own `up:`, while rejected
 `UNPROVENANCED`/`ERROR` must not enter `stage pub:`. Current Sync can stage
 before its scope gate discovers those outcomes; that is a W2 gap, not an
 observed universal ordering. Verdict in
-[`docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md`](docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md):
+[`docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md`](../PUBLICATION-PROTOCOL-CHARACTERIZATION.md):
 `PROCEED WITH COORDINATOR`. W2/R31/X1 remain OPEN. `GC_ENABLED=false`.
 
 **H1 (2026-09-11, `fix/h1-conditional-head-initializer`):** PC-0 merged
@@ -670,7 +670,7 @@ marker was tried, audited as a separate idempotency subsystem, and parked on
 KNOWN_LOSER's best-effort commit discard before the adopted-HEAD visibility
 check, not after; and a definitive (non-ambiguous) CAS rejection now discards
 its own now-orphaned attempt-unique commit row. See
-[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md#issue-library-initial-head-concurrency-01)
+[`docs/KNOWN_ISSUES.md`](../KNOWN_ISSUES.md#issue-library-initial-head-concurrency-01-concurrent-initial-library-head-initialization-can-race)
 for the full writeup. Registered
 `ISSUE-LIBRARY-HEAD-ADOPTED-TREE-VISIBILITY-01` as a separate follow-up:
 adopting a blind-DC HEAD only proves its `commits` row is locally servable,
@@ -835,8 +835,8 @@ The preceding G1 (PR #207, merged), G2 (PR #209, merged; PREPARED-to-COMMITTED h
 2. **Backend API**: ~98% complete by surface count, which is not the same as ready — see blocker #4 for the open authorization/resource findings. OIDC ✅, GC implementation present; destructive activation blocked by X1 and the PRE-GC / A1 gate (X2 closed 2026-08-14), Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
-5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — the *deletion-activation* gate rests on X1 and then on the PRE-GC / A1 gate ([docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) §6). The upload-fence PR series addresses separate writer/GC races and does not close it. **Product go-live is a different gate** and is not held by X1: see the table above and blocker #4.
-6. **X1 design state:** accepted architecture is frozen in [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) (D0, 2026-09-02). **Order of work (2026-09-29 reset):** [`docs/X1-CRITICAL-PATH.md`](docs/X1-CRITICAL-PATH.md) — W2 exit checklist → G4 → G5 → E1 → X1 CLOSED, then the PRE-GC list and A1; PC-2 and the PC-D1 line are not X1 prerequisites. That is a documentation freeze, not X1 closure and not GC activation. Historical option comparison remains in [`docs/GC-X1-CLOSURE-OPTIONS.md`](docs/GC-X1-CLOSURE-OPTIONS.md) and is **not** the active roadmap. #199/#200 are characterization evidence only; W1 now consumes the #200 BorrowedFS result in the writer path. `GC_ENABLED=false` is pinned explicitly in `docker-compose.prod.yml`. The current branch contains the W2/R31 post-HEAD repair slice, G1 exact `(P,D)` identity and durable recovery discovery, and G2 PREPARED-to-COMMITTED handoff; G4-G5 and X1 remain open; G3 canonical retirement is implemented by #212. This branch does not activate destructive GC.
+5. **Current risk shape**: destructive GC must remain disabled fleet-wide. Of the two confirmed live-data safety blockers, X2 is closed (fix proven on a real three-DC cluster, regression mutation-verified) and X1 remains open — the *deletion-activation* gate rests on X1 and then on the PRE-GC / A1 gate ([docs/X1-CRITICAL-PATH.md](../X1-CRITICAL-PATH.md) §6). The upload-fence PR series addresses separate writer/GC races and does not close it. **Product go-live is a different gate** and is not held by X1: see the table above and blocker #4.
+6. **X1 design state:** accepted architecture is frozen in [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](../GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) (D0, 2026-09-02). **Order of work (2026-09-29 reset):** [`docs/X1-CRITICAL-PATH.md`](../X1-CRITICAL-PATH.md) — W2 exit checklist → G4 → G5 → E1 → X1 CLOSED, then the PRE-GC list and A1; PC-2 and the PC-D1 line are not X1 prerequisites. That is a documentation freeze, not X1 closure and not GC activation. Historical option comparison remains in [`docs/GC-X1-CLOSURE-OPTIONS.md`](../GC-X1-CLOSURE-OPTIONS.md) and is **not** the active roadmap. #199/#200 are characterization evidence only; W1 now consumes the #200 BorrowedFS result in the writer path. `GC_ENABLED=false` is pinned explicitly in `docker-compose.prod.yml`. The current branch contains the W2/R31 post-HEAD repair slice, G1 exact `(P,D)` identity and durable recovery discovery, and G2 PREPARED-to-COMMITTED handoff; G4-G5 and X1 remain open; G3 canonical retirement is implemented by #212. This branch does not activate destructive GC.
 7. **Current X1/P3 key:** P1 locator authority merged 2026-08-21 (PR #181), P0/R12 landed 2026-08-23 (PR #183), and P2/R9/R24 closed 2026-08-24 after its structural prerequisite (PR #184). This branch implements the P3 writer boundary: existing-incarnation PUTs revalidate exact `(storage_class, storage_key)` authority immediately before PUT, and metadata repair is non-creating and tuple-bound. Docker evidence for R10/R13/R17 is green, including a deliberate-mutation run in which reordering the fence reads, making the repair create-capable, re-tagging a permanent failure as retryable, or restoring SERIAL to the dedup path each turns a gate red. The cross-DC half of the consistency contract is now MEASURED on the real three-datacenter fixture (`scripts/x2-multidc-validation.sh --p3`): with dc-na down neither fence publication may complete, a fence published in dc-eu blocks a dc-na writer, and both weaker publication levels turn the fail-closed leg red — the `QUORUM` mutation being what the third datacenter exists for. Fence reads pin their own consistency so the argument does not depend on `database.consistency`, which accepts `ONE`. R13's P3 writer boundary is GREEN. Strict A+ sequential-life / keep-canonical-until-delete is SUPERSEDED as the X1 closure target by D0 physical-life handoff; it is not an OPEN residual of `StartBlockDeleteOrphan`. R18/R27 are explicitly open in CURRENT production because rejected `up:` references are retained and deferred-orphan rescheduling is not implemented; D0 marks the old postpone-and-reproject design `PENDING RE-EVALUATION`. Keep `GC_ENABLED=false` on every replica in every DC.
 
 8. **Current X1/P4a key:** this branch binds the destructive claim to the exact physical incarnation and to a per-attempt owner. Migration `017` puts `storage_key` on `gc_block_candidates` and its `_by_day` projection; `EnsureBlockGCCandidate` captures it from the canonical row and refuses to write a candidate it cannot name a `P` for. The claim CAS is `IF storage_class = ? AND storage_key = ? AND gc_state = null AND gc_claim_id = null AND gc_claimed_at = null`, `claimID` is a fresh UUID per ATTEMPT (`blockDeleteClaimID` is deleted and its absence is gated), and release, stale takeover, finalize and candidate cleanup all condition on the exact tuple. `ClaimBlockDelete` returns a classified outcome, so a non-applied CAS is no longer read as completion. Evidence is green on real Cassandra under `SESAMEFS_REQUIRE_P4A_EVIDENCE=1` (four legs: exclusive ownership with exact takeover, the ABA case, retry semantics, and stale-claim release bound to the observed incarnation), with deliberate mutations red via `scripts/p4a-mutation-validation.sh` (see the count below). **P4a snapshot (historical):** R14a GREEN, R16 GREEN, R20 PARTIAL; at that merge R14b was still OPEN and the orphan path had not yet settled in the serial domain. **Current:** R14b GREEN (#194 / P4b-2). `StartBlockDeleteOrphan` is bound to exact stored `(P,D)` and is not an untouched residual keeping strict A+ non-overlap OPEN. That sequential-life target is SUPERSEDED by D0. X1 remains OPEN. Technical debt #21 and #22 are closed; #23 (GC no longer sweeps metadata-free stubs) and #24 (pre-017 candidate rows need a fresh zero-ref decision, not a backfill) are opened as follow-ups, #24 being a PRE-ACTIVATION requirement rather than a merge blocker. A second review pass found and fixed four defects in the first cut: the stale takeover re-read the row instead of CASing against the authority it observed (so a P1 worker could drop P2 fence); the same hole existed at the owner-agnostic pre-check call site, reachable with no clock skew; the orphan publication and the S3 delete took their locator from an ordinary post-claim re-read rather than from the claim; and ErrBlockCandidateTargetUnavailable was fatal at all three enqueue sites, which was self-poisoning on the fs_object path. The deliberate mutations are red — the script reports its own current total, and the evidence update below is authoritative for it; two of them earned their keep by exposing a non-compiling mutation and a store/mock mirror with neither copy protecting the other. One behavioural narrowing to be aware of: GC no longer deletes metadata-free stub rows, because it has no exact authority over a row with no locator — an unclaimed stub is not an upload fence, and the only producer of a `deleting` metadata-free stub was the old claim CAS. The writer path does claim metadata-free rows, under `gc_state='repairing_stub'`, and cleans up its own; those are not a delete fence and were never GC's to touch. A third review pass closed the last claim-side hole: `releaseBlockClaim` collapsed `BlockReleaseNotOwner` into a bare `nil`, so a late loser — an attempt whose claim was taken over while it worked — walked through the "re-referenced after claim" unwind and consumed the CURRENT owner's candidate. Nothing about the candidate changes in that race (same block, same `P`, same `candidate_at`), so the exact-`P` CAS cannot refuse it; the wrapper now returns the outcome and settlement requires `BlockReleaseReleased`. R16 is GREEN only with both entrances closed — `BlockClaimFreshOwner` at the claim and this one at the release. Landed with it: the post-claim stub branches (driven by an ordinary read the claim had already contradicted in the serial domain, and DLQ-bound with the fence up) are gone in favour of hand-back-and-postpone; `GCFailureCodeBlockAuthorityInvalid` was documented as postponing but was never in `shouldPostponeWithoutRetry`; and the grace postpone and an unnameable claim owner got their own codes. Keep `GC_ENABLED=false` on every replica in every DC.
@@ -980,7 +980,7 @@ conservative keep-`blocks(P1)`-until-delete strategy, which D0 supersedes
 because durable exact handoff keeps authority on P1 without leaving `blocks(P1)`
 canonical through cleanup. G3 Finalize vacates `blocks(L)` while `orphan(Pold)`
 still fences writers; productive `blocks=P2` + `orphan=P1` is G4. Source of
-record: [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
+record: [`docs/GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md`](../GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md).
 **Still CURRENT/TRANSITIONAL:** orphan `(org,L)` writer fence, Finalize-before-S3,
 recovery ref re-check, and the P4c-orphan PK. G1's exact `(P,D)` recovery identities have no TTL; G2's PREPARED/COMMITTED handoff is implemented on this branch but does not activate GC. R31 OPEN. H not
 reclassified. R18/R27 pending re-evaluation. 020 stays. Activation remains A1
@@ -1016,7 +1016,7 @@ does not claim “no physical ABA”; H stays OPEN.
 - ✅ If 🟡 PARTIAL / ❌ TODO → Safe to actively develop
 
 ### Step 3: At End of Session - Update Documentation
-**📋 MANDATORY: Run [docs/SESSION_CHECKLIST.md](docs/SESSION_CHECKLIST.md)**
+**📋 MANDATORY: Run [docs/SESSION_CHECKLIST.md](SESSION_CHECKLIST-2026-02-02.md)**
 
 ---
 
@@ -1164,21 +1164,21 @@ Routes registered in `internal/api/v2/admin.go`.
 ### ✅ ~~PRIORITY 1: Admin Library Management~~ — DONE (2026-02-12)
 
 **Status**: ✅ Complete — 12 endpoints implemented in `internal/api/v2/admin.go`
-**Details**: [docs/ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 1
+**Details**: [docs/ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 1
 
 All admin library endpoints implemented: list, search, get, create, delete, transfer, browse dirents, history settings, shared items, trash libraries. Frontend `seafile-api.js` methods already wired.
 
 ### ✅ ~~PRIORITY 2: Admin Share Link & Upload Link Management~~ — DONE (2026-02-12)
 
 **Status**: ✅ Complete — 13 endpoints across 5 files
-**Details**: [docs/ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 2
+**Details**: [docs/ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 2
 
 Admin share link list/delete fixed; upload links full feature (DB tables, user CRUD, admin list/delete); per-user link endpoints; frontend API methods added.
 
 ### 🔴 PRIORITY 3: Audit Logs & Activity Logs — PRIORITIZE NEXT
 
 **Status**: 🟡 Partial foundations exist: `audit_log` for deletion events and `users.last_login_at` for latest successful login, but no historical login/file activity dataset or APIs
-**Details**: [docs/ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 3
+**Details**: [docs/ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 3
 
 **Two related systems need implementation:**
 
@@ -1264,12 +1264,12 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 | Item | Status | Notes |
 |------|--------|-------|
 | **Admin Panel (Groups/Users)** | ✅ DONE | Option A (OIDC-managed). 16 endpoints + OIDC sync. 29 tests. |
-| **Admin Library Management** | ✅ DONE | 12 endpoints in admin.go. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 1 |
-| **Admin Link Management** | ✅ DONE | Share + upload links. 13 endpoints. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 2 |
-| **Superadmin Departments/Address Book** | ✅ DONE | 9 endpoints. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 4 |
-| **Org Admin Panel** | ✅ DONE | 50+ endpoints. Full parity with superadmin. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 5 |
+| **Admin Library Management** | ✅ DONE | 12 endpoints in admin.go. See [ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 1 |
+| **Admin Link Management** | ✅ DONE | Share + upload links. 13 endpoints. See [ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 2 |
+| **Superadmin Departments/Address Book** | ✅ DONE | 9 endpoints. See [ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 4 |
+| **Org Admin Panel** | ✅ DONE | 50+ endpoints. Full parity with superadmin. See [ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 5 |
 | **Org Delete (3-state lifecycle)** | ✅ DONE (backend) | active → deactivated → deleted (30-day grace → cascade). Frontend TODO: ISSUE-FRONTEND-ORG-DELETE-01 |
-| **Audit Logs** | ❌ TODO | 5 tables, ~5 endpoints, ~15 handler integrations. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 3 |
+| **Audit Logs** | ❌ TODO | 5 tables, ~5 endpoints, ~15 handler integrations. See [ADMIN-FEATURES.md](../ADMIN-FEATURES.md) § 3 |
 | **File History UI** | ✅ DONE | Detail sidebar History tab + full-page view. 17 integration tests. |
 | **GC TTL Enforcement** | ✅ DONE | Scanner Phase 5 (version_ttl_days) + Phase 6 (auto_delete_days) + share link deletion |
 | **Frontend Modal Migration** | ✅ 122/122 | All done; ~51 ModalPortal wrappers to clean up |
@@ -1307,7 +1307,7 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 
 ## Frozen/Stable Components 🔒
 
-**Freeze procedure**: See [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md) for the formal stability rules and Component Test Map. Components need ≥ 80% Go coverage, ≥ 90% integration endpoint coverage, zero open bugs, and 3 clean sessions in 🟢 RELEASE-CANDIDATE before reaching 🔒 FROZEN.
+**Freeze procedure**: See [docs/RELEASE-CRITERIA.md](RELEASE-CRITERIA-2026-03-17.md) for the formal stability rules and Component Test Map. Components need ≥ 80% Go coverage, ≥ 90% integration endpoint coverage, zero open bugs, and 3 clean sessions in 🟢 RELEASE-CANDIDATE before reaching 🔒 FROZEN.
 
 ### ⚠️ CRITICAL: Sync Code FROZEN (2026-01-19)
 **User directive**: DO NOT MODIFY sync code without explicit approval
@@ -1364,7 +1364,7 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 - **Sync Protocol**: 100% working, desktop clients fully compatible 🔒 FROZEN
 - **Backend API**: ~98% implemented — OIDC ✅, GC implementation present; destructive activation blocked by X1 and the PRE-GC / A1 gate (X2 closed 2026-08-14), Library Settings ✅, OnlyOffice ✅, Tags cascade ✅, Org Admin Panel ✅, Superadmin Departments ✅
 - **Frontend UI**: ~83% functional (all modals migrated, folder icons ✅, ~51 ModalPortal wrappers to clean up)
-- **Production Ready**: blocked for destructive GC until X1 closes and then the PRE-GC / A1 gate ([docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) §6) closes (X2 closed 2026-08-14); keep `GC_ENABLED=false` on every replica/DC
+- **Production Ready**: blocked for destructive GC until X1 closes and then the PRE-GC / A1 gate ([docs/X1-CRITICAL-PATH.md](../X1-CRITICAL-PATH.md) §6) closes (X2 closed 2026-08-14); keep `GC_ENABLED=false` on every replica/DC
 - **Admin Panels**: Both superadmin and org admin at feature parity
 - **Active Bugs**: tracked canonically in `docs/KNOWN_ISSUES.md`; GC activation needs X1 and then the PRE-GC / A1 gate (X2 closed)
 
@@ -1393,20 +1393,20 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 ## Documentation Map 📚
 
 ### Session Continuity (Read First Every Session)
-- **[CURRENT_WORK.md](CURRENT_WORK.md)** - This file - Session state, priorities
-- **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)** - Detailed bug tracking
-- **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - Session history
-- **[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)** - Component stability matrix
+- **[CURRENT_WORK.md](../../CURRENT_WORK.md)** - This file - Session state, priorities
+- **[docs/KNOWN_ISSUES.md](../KNOWN_ISSUES.md)** - Detailed bug tracking
+- **[docs/CHANGELOG.md](../CHANGELOG.md)** - Session history
+- **[docs/IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md)** - Component stability matrix
 
 ### Protocol & Sync (🔒 Reference Implementation)
-- **[docs/SEAFILE-SYNC-PROTOCOL-RFC.md](docs/SEAFILE-SYNC-PROTOCOL-RFC.md)** - Formal RFC with test vectors 🔒
-- **[docs/ENCRYPTION.md](docs/ENCRYPTION.md)** - Encrypted libraries, PBKDF2, Argon2id
+- **[docs/SEAFILE-SYNC-PROTOCOL-RFC.md](../SEAFILE-SYNC-PROTOCOL-RFC.md)** - Formal RFC with test vectors 🔒
+- **[docs/ENCRYPTION.md](../ENCRYPTION.md)** - Encrypted libraries, PBKDF2, Argon2id
 
 ### Implementation Guides
-- **[docs/API-REFERENCE.md](docs/API-REFERENCE.md)** - API endpoints, implementation status
-- **[docs/ENDPOINT-REGISTRY.md](docs/ENDPOINT-REGISTRY.md)** - ⚠️ CHECK BEFORE ADDING ENDPOINTS
-- **[docs/FRONTEND.md](docs/FRONTEND.md)** - React frontend patterns, modal fixes
-- **[CLAUDE.md](CLAUDE.md)** - Complete project context for AI assistant
+- **[docs/API-REFERENCE.md](../API-REFERENCE.md)** - API endpoints, implementation status
+- **[docs/ENDPOINT-REGISTRY.md](../ENDPOINT-REGISTRY.md)** - ⚠️ CHECK BEFORE ADDING ENDPOINTS
+- **[docs/FRONTEND.md](../FRONTEND.md)** - React frontend patterns, modal fixes
+- **[CLAUDE.md](../../AGENTS.md)** - Complete project context for AI assistant
 
 ---
 
@@ -1435,7 +1435,7 @@ curl -H "Authorization: Token dev-token-readonly" http://localhost:8082/api2/acc
 
 ## End of Session Checklist
 
-**📋 See [docs/SESSION_CHECKLIST.md](docs/SESSION_CHECKLIST.md) for complete checklist**
+**📋 See [docs/SESSION_CHECKLIST.md](SESSION_CHECKLIST-2026-02-02.md) for complete checklist**
 
 Quick reminders:
 - [x] Update `CURRENT_WORK.md` (what was done, next priorities)

@@ -388,3 +388,35 @@ npm test -- --coverage --watchAll=false
 > A component is **production-frozen** when it has ≥ 80% Go unit test coverage (or ≥ 60% for shared packages), ≥ 90% integration endpoint coverage, zero open bugs, a completed Component Test Map entry, and 3 consecutive clean sessions in RELEASE-CANDIDATE status.
 
 This is recorded. Follow it.
+
+
+## Archived protocol-workflow freeze step (retired 2026-10-12)
+
+Source: docs/DECISIONS.md at 5c3163871. Preserved as historical procedure, not current instructions.
+The current evidence-recording step is in [../DECISIONS.md](../DECISIONS.md#step-6-record-compatibility-evidence).
+
+### Step 6: Freeze and Document
+
+1. **Mark as frozen** in `docs/IMPLEMENTATION_STATUS.md`:
+   ```markdown
+   | `GET /seafhttp/repo/:id/fs-id-list/` | 🔒 FROZEN | **STABLE** | 2026-01-16 | Returns JSON array |
+   ```
+
+2. **Document in RFC** if new behavior discovered:
+   - Update `docs/SEAFILE-SYNC-PROTOCOL-RFC.md`
+   - Add test vector if applicable
+   - Update quick reference: `docs/SEAFILE-SYNC-PROTOCOL.md`
+
+3. **Update CURRENT_WORK.md**:
+   ```markdown
+   ## Frozen/Stable Components 🔒
+   - `internal/api/sync.go` lines 949-952 - fs-id-list format (JSON array)
+   ```
+
+4. **Add comment in code**:
+   ```go
+   // FROZEN (2026-01-16): Stock Seafile returns JSON array, not newline-separated text
+   // Verified with run-sync-comparison.sh and run-real-client-sync.sh
+   // DO NOT CHANGE without testing against stock Seafile
+   c.JSON(http.StatusOK, fsIDs)
+   ```

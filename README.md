@@ -55,9 +55,9 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 
 ## Status and Roadmap
 
-Where things stand is tracked in these files, kept current with every PR:
+Use the issue and GC records below for current status; the v1 roadmap provides dated planning context:
 
-- [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md): what remains before a v1 release
+- [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md): dated v1 planning; current issue status lives in the records below
 - [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md): one-screen list of open work and go-live blockers
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): status of record for every known issue
 - [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md): destructive garbage collection, which stays
@@ -189,7 +189,8 @@ already in use on your machine, e.g. `LB_HOST_PORT=18080 ./scripts/run-mr-cluste
 (the full list of `*_HOST_PORT` vars is at the top of `scripts/run-mr-cluster.sh`).
 
 **Single-node (lighter)** — `docker-compose.mr.yaml`: one shared Cassandra + one
-shared MinIO. Same verbs via `./scripts/run-playwright.sh up | test | down`.
+shared MinIO. Use separate invocations:
+ `./scripts/run-playwright.sh up`, `./scripts/run-playwright.sh test`, or `./scripts/run-playwright.sh down`.
 
 > **Logging into a web UI:** the login page is SSO-only (password login disabled in
 > dev). Seed the dev cookie in the browser console, then reload:
@@ -279,11 +280,11 @@ This is intentional for cloud-native deployments — frontend and backend can be
 
 | Document | Contents |
 |----------|----------|
-| [CLAUDE.md](CLAUDE.md) | Working rules for this repository |
+| [AGENTS.md](AGENTS.md) | Working rules for this repository |
 | [CURRENT_WORK.md](CURRENT_WORK.md) | Active work and the GC vs. go-live gates |
 | [docs/OPEN-WORK-INDEX.md](docs/OPEN-WORK-INDEX.md) | One-screen list of open work and blockers |
 | [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Status of record for every known issue |
-| [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md) | What remains before v1 |
+| [docs/V1-PRODUCTION-ROADMAP.md](docs/V1-PRODUCTION-ROADMAP.md) | Dated v1 planning |
 | [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md) | Destructive GC safety roadmap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | **Production deployment guide** (VPS, SSL, S3, OIDC) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, storage architecture, GC, schemas |
@@ -319,4 +320,19 @@ See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Open an issue or a small, focused pull request. [CLAUDE.md](CLAUDE.md) holds the working rules for this repository (they apply to human contributors too): bad news first, backward compatible changes, tests with every change, and `GC_ENABLED=false`.
+Open an issue or a small, focused pull request. [AGENTS.md](AGENTS.md) holds the working rules for this repository (they apply to human contributors too): bad news first, backward compatible changes, tests with every change, and `GC_ENABLED=false`.
+
+### Agent instructions
+
+[AGENTS.md](AGENTS.md) is the only repository instruction file. Codex discovers it automatically.
+Claude Code v2.1.277 or later can load it directly with its built-in AGENTS.md plugin enabled
+and Project instructions set to the default `claude-md-or-agents-md`. Do not add a second
+CLAUDE.md or a hook that duplicates these rules. A CLAUDE.md or CLAUDE.local.md in the working
+directory or a parent can suppress AGENTS.md under the default setting; remove that project
+override or select `claude-md-and-agents-md` in `/config`. Managed restrictions still apply.
+Check `/context` in a fresh Claude session to confirm AGENTS.md loaded. Use v2.1.281 or later
+for sessions on Bedrock or with telemetry disabled; earlier versions can lack this support there.
+The first session after upgrading from v2.1.276 or earlier may also require a restart. Upgrade
+or enable the built-in plugin if AGENTS.md is unavailable. See the
+[Claude Code instruction-loading reference](https://code.claude.com/docs/en/memory#agentsmd)
+and [Codex instruction discovery](https://developers.openai.com/codex/guides/agents-md).
