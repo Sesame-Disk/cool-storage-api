@@ -19,7 +19,7 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 |---|---|
 | C0: recovery root persisted, before PREPARED orphan LWT | U root-retention/late-producer controls and historical G1 R replay; no current-producer K witness identified in the reviewed tests/ledgers. Safe retention is permitted; no reclamation deadline is inferred. |
 | C1/C2 | [E1-01A](./E1-01A-G2-PROCESS-CRASH.md), merged #281: productive preparation/committed handoff, SIGKILL, resume controls and independent recovery/replay. |
-| C3: exact lifecycle PUBLISHED, orphan still PREPARED | Promotion source ordering and U recovery controls; no exact intermediate-state K witness identified in the reviewed tests/ledgers. C2 stops before Promote, C4 after its successful return. [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) selects C3; its validation is pending. |
+| C3: exact lifecycle PUBLISHED, orphan still PREPARED | [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records productive C3 SIGKILL/resume and independent recovery/replay (in review, single DC). C2 stops before Promote, C4 after its successful return; neither independently supplied this middle-of-promotion witness. |
 | C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
 | C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
 | C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
@@ -56,7 +56,8 @@ committed blocks handoff and retries promotion before canonical retirement.
 The ambiguous-promotion mock flag returns before lifecycle insertion; its test
 must not be labelled a C3 middle-of-promotion witness. The G1 source guard checks
 historical StartBlockDeleteOrphan ordering, not the current Prepare method.
-No new C0/C3 K claim or closure follows from these controls.
+These U/R controls supply no C0/C3 K claim by themselves; G separately records
+the current-producer C3 process cut. C0 and overall E1-01/X1 remain OPEN.
 
 ### 0.3 Selected next drill: one internal C8 root-only TERMINAL cut
 
@@ -107,7 +108,7 @@ failure evidence. No runtime change presumed; C0/C3 and three-DC remain separate
 
 ### 0.5 Selected next drill: PUBLISHED lifecycle, PREPARED orphan
 
-[E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) selects exactly C3, after the
+[E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records exactly C3, after the
 successful lifecycle INSERT inside PromoteBlockDeleteOrphan and before the
 orphan's COMMITTED CAS. Parent must independently prove committed blocks D1/P1,
 PUBLISHED lifecycle, PREPARED orphan, original root/discovery/token and canonical/

@@ -43,7 +43,12 @@ exact PUBLISHED lifecycle INSERT before PREPARED-to-COMMITTED orphan CAS, with
 committed handoff and original canonical/K1 still intact. Productive org-scoped
 worker, existing observer, independent durable oracle, SIGKILL/resume, orphan
 recovery before separate queue settlement/replay, preservation and required gate.
-Docker validation and final audit are pending; no runtime change, E1-01/X1 OPEN.
+Directed/race, negative gate/recovery/no-kill controls, preservation, short Go/vet
+and full required integration/API/OIDC PASS; container and outer exits 0. All A–G
+and seven preservation controls remain green; scoped audit found no blockers.
+Initial preservation HTTP 404 corrected by direct E19 execution, as in E/F;
+ledger records the failure, frozen sources and single-DC scope. No runtime change;
+E1-01/X1 OPEN, ordinary/production GC OFF.
 
 ## Previous merged slice: E1-01F discovery-retained TERMINAL process crash (#291)
 

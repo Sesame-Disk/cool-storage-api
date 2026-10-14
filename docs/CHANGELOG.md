@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
+
+[E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) witnesses C3 inside productive
+promotion: committed D1/P1, exact PUBLISHED lifecycle with PREPARED orphan and
+canonical/K1 intact. Existing observer, independent durable reads, SIGKILL/resume,
+orphan recovery before separate queue settlement/replay, preservation and gate.
+Initial preservation-control HTTP 404 corrected by direct E19 execution as in E/F;
+no block cleanup/runtime change. Directed/race/negative controls, short Go/vet and
+standard integration/API/OIDC PASS; both runner exits 0. A–G and seven preservation
+controls remain green. Frozen ledger gives one-DC scope; E1-01/X1 OPEN, no activation.
+
 ## 2026-10-14 — E1-01F discovery-retained TERMINAL process crash
 
 [E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) witnesses real orphan deletion

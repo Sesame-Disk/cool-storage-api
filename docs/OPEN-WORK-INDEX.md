@@ -2,9 +2,10 @@
 
 ## E1-01G PUBLISHED/PREPARED evidence (2026-10-14)
 
-[E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) plans C3 inside real promotion:
+[E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records C3 inside real promotion:
 committed D1/P1, PUBLISHED lifecycle and PREPARED orphan. C2/C4 do not witness
-this intermediate state. Validation is pending; C0 and three-DC residuals remain
+this intermediate state. Directed/race/negatives and standard integration/API/OIDC
+PASS; ledger records the corrected harness failure and scope. C0 and three-DC residuals remain
 separate. E1-01/X1 OPEN, no activation authority.
 
 ## E1-01F discovery-retained TERMINAL evidence (2026-10-14)
