@@ -356,7 +356,7 @@ npm test -- --coverage --watchAll=false
 ### At End of Session
 1. For each 🟢 component: increment session counter if all tests passed and no bugs filed
 2. Update `docs/IMPLEMENTATION_STATUS.md` with current status
-3. Run existing `docs/SESSION_CHECKLIST.md` as usual
+3. Run existing [docs/SESSION_CHECKLIST.md](SESSION_CHECKLIST-2026-02-02.md) as usual
 
 ---
 

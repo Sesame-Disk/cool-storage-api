@@ -21,6 +21,9 @@ HISTORY to distinguish its superseded checklist from resolved debt; active tasks
 Conflict resolution, exact-lease rebases, isolated GC tests, compatibility exceptions and audit
 severity/scope are explicit. CURRENT_WORK keeps separate GC and non-GC readiness gates; the
 v1 roadmap is labelled as a dated planning snapshot.
+The follow-up audit repaired a plain-text testing-guide reference in the older search plan
+and linked historical procedural references to their archived destinations. Navigation checks
+now also search for references to moved files outside Markdown link targets.
 
 
 ## 2026-10-12 — E1-17: W2-10 residual content-resurrection handlers closed
