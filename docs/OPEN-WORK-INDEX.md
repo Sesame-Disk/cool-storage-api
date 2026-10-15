@@ -1,5 +1,15 @@
 # Open Work Index
 
+## E1-12 scoped three-DC evidence (2026-10-15)
+
+[Current-main E1-12 validation](./E1-12-KNOWN-LOSER-CRASH-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+passes the six existing legs, race twice, EU coordinator and original negatives
+without code changes after #296. Real writer death, new-process SUPERSEDED sweep
+and exact owned metadata/K1/expiry cleanup are measured; auxiliary discovery
+probes remain in private volumes. Five other historical E1 cases remain pending,
+including E1-13 as the next bounded measurement. This closes no umbrella issue,
+E1-01/X1/PRE-GC/A1 gate or activation decision; ordinary GC stays OFF.
+
 ## E1-11 three-DC fixture-progress correction (2026-10-15)
 
 [Scoped reproduction and evidence](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md#three-dc-reproduction-and-scoped-correction-2026-10-15):
