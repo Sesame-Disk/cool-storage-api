@@ -35,26 +35,20 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: harness topology declaration (test-only)
+## Active slice: correct the E1 three-DC diagnosis (PR #293, docs only)
 
-Branch `test/harness-fixture-topology`, base main@a71eec36a (#292). `openIntegrationProjectionDB`
-now loads the server config — topology included — the way `shareProjectionDBForTest`
-has since `fa73da717`. Both shared projection DB helpers now carry
-`CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS` into the destructive
-GC gate's declared-vs-live comparison; dedicated test connections are outside
-this change. Verified on the isolated
-single-DC stack: the gate accepts the declared dev map and refuses a synthetic
-three-DC declaration naming `dc-na`/`dc-eu`/`dc-asia`; H1 initial-head tests pass.
-`docs/TECHNICAL-DEBT.md`'s three-DC entry is corrected, not closed: its attribution
-to this helper for seven E1 legs is unsupported — those legs use the topology-aware
-sibling — so that symptom's cause remains open and the legs were not re-run on three
-DC. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-15).
-Standalone runner compatibility is restored by explicit AUTH_DEV_MODE=true in
-four runner_env functions, with a clean-environment config regression RED→GREEN
-for all four. New short Go/vet and regression race repetitions PASS. The complete
-H1 three-DC script PASS (both blind initializer cycles, TestMain cleanup, exit 0).
-The other three scripts' config paths are covered; their complete scenarios were
-not rerun. Production validation/defaults are unchanged; seven E1 residuals stay OPEN.
+Branch `test/harness-fixture-topology`, base main@a71eec36a (#292).
+The seven recorded E1 fixture-progress failures already use shareProjectionDBForTest;
+openIntegrationProjectionDB was not shown to cause them or to block a current
+caller through its omitted topology. The proposed implementation is withdrawn:
+full config validation introduced independent-runner auth dependencies without
+a demonstrated X1 fix. Helper, scripts and tests match main; no runtime change.
+
+[Technical debt](docs/TECHNICAL-DEBT.md) records the corrected diagnosis, why code
+is deferred and the evidence needed to reconsider it. [The dated archive](docs/legacy/PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md)
+preserves withdrawn-version results, including real H1 three-DC evidence, without
+certifying this final diff or closing the seven E1 obligations. E1/X1 remain OPEN;
+ordinary/production GC OFF. This is a diagnosis correction, not an X1 runtime fix.
 
 ## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 

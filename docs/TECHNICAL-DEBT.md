@@ -2368,43 +2368,30 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 
 **2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
 
-**E1 in-process-GC legs cannot run on a three-DC fixture (P2).** `openIntegrationProjectionDB` builds its `DatabaseConfig` without replication, so it declares only the local DC. On a three-DC keyspace the in-process GC's destructive topology gate correctly refuses the G2 handoff. As a result, E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13 fail on fixture progress ("GC retirement n=0", "worker did not visit owned real candidate"), not on safety. These legs are single-DC evidence by design. If they are wanted on three DCs, the harness must declare the fixture topology, for example from `CASSANDRA_REPLICATION_DCS`.
+**E1 three-DC fixture-progress failures (P2, OPEN; cause unestablished).**
+Historical runs recorded "GC retirement n=0" / "worker did not visit owned real
+candidate" for E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13. The earlier
+attribution to openIntegrationProjectionDB is unsupported: those legs route through
+shareProjectionDBForTest, which has loaded config.Load since `fa73da717`
+(2026-10-02). Do not treat that attribution as an established cause or resolution.
 
-**2026-10-15 (harness aligned; the mechanism above does not hold).**
-`openIntegrationProjectionDB` now loads the server config the way
-`shareProjectionDBForTest` has since `fa73da717` (2026-10-02). The two shared
-projection DB helpers now use the same topology declaration. Dedicated test
-connections, including the upload-mapping observer session, are outside this
-change; not every connection in the suite has been aligned. Two corrections to
-the entry above:
+openIntegrationProjectionDB still constructs a partial DatabaseConfig and omits
+the replication map. Its current consumers are the five H1 tests, optional
+provenance-cost characterization and TestMain cleanup; they do not execute G2
+through that helper. No current-caller failure caused by this omission was
+shown. Making its configuration uniform therefore does not demonstrate an X1 fix.
 
-- **The attribution is unsupported.** E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and
-  E1-13 route through `shareProjectionDBForTest`, not through
-  `openIntegrationProjectionDB`, and that helper already loaded the server config
-  two days before this entry was written. Their recorded symptom therefore has
-  some other cause, which is **not identified here and stays open**.
-- **The named helper's reach is small.** Its callers are the H1 initial-head tests,
-  the single-DC `TestW2SyncXDCProvenanceCostCharacterization` and `TestMain`'s
-  cleanup; none runs destructive GC, so none was refused by the gate for this
-  reason. Aligning the two shared helpers does not resolve or close the recorded
-  three-DC fixture-progress failures.
+**2026-10-15 decision, PR #293: documentation only.** The proposed config.Load
+change also required unrelated application/auth configuration in independent
+runners. Fixing four runners and passing H1 did not cover all affected paths;
+the hard-delete lease runner's configuration failure was subsequently reproduced.
+The helper, runner edits and added test are withdrawn from this PR rather than
+expanding that unproved maintenance benefit into a harness-wide repair campaign.
+The [withdrawn implementation/evidence archive](./legacy/PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md)
+preserves the earlier results with provenance; it closes no open issue or gate.
 
-Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
-(`datacenter1:1`) the gate accepts the harness config; with a synthetic
-`dc-na:1,dc-eu:1,dc-asia:1` declaration it refuses with the exact-mismatch error
-naming those datacenters, which the hand-built config could not produce because it
-ignored `CASSANDRA_REPLICATION_DCS`. H1 initial-head tests pass unchanged. The
-seven legs were not re-run on a three-DC fixture.
-
-**2026-10-15 (standalone runner compatibility).** Loading the full config exposed
-a separate P2 in this PR: the four standalone Go runner_env functions did not
-supply auth development configuration. config.Load rejected them, and TestMain's
-final projection verifier failed before connecting to Cassandra. The migration
-CLI's process-local .env loading does not configure later go test processes.
-The runners now declare AUTH_DEV_MODE=true explicitly. A regression executes each
-real runner_env in a clean subprocess, checks full config.Load and the three-DC
-map, and fails for all four before the fix. After the fix it passes, including
-race repetitions. The complete H1 script passes both blind initializer cycles
-against three real DCs, including final cleanup and exit 0. Other three scripts'
-configuration paths are verified, not their full scenarios. This restores runner
-compatibility; it does not resolve the seven E1 failures described above or close X1.
+Reconsider a code change when an existing caller is shown to fail specifically
+because of the omitted topology, with a failing-before/passing-after regression
+and compatibility checks for its actual consumers. The seven E1 failures still
+need a representative reproduction and causal diagnosis; no three-DC capability,
+X1, PRE-GC or A1 closure is claimed here. Ordinary/production GC remains OFF.

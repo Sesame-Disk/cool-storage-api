@@ -97,7 +97,6 @@ runner_env() {
 	local node="${dc#dc-}"
 	shift
 	docker exec "$RUNNER" env \
-		AUTH_DEV_MODE=true \
 		SESAMEFS_URL=http://sesamefs:8080 \
 		CASSANDRA_HOSTS="cassandra-$node:9042" \
 		CASSANDRA_LOCAL_DC="$dc" \

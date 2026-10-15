@@ -5,10 +5,11 @@ An archived unchecked task is not automatically resolved; when a statement here 
 wins. Current status lives in `CURRENT_WORK.md`, `docs/OPEN-WORK-INDEX.md`, `docs/KNOWN_ISSUES.md`
 and `docs/X1-CRITICAL-PATH.md`.
 
-**Last updated:** 2026-10-13
+**Last updated:** 2026-10-15
 
 | File | Archived | Why | Replaced by |
 |---|---|---|---|
+| [PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md](./PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md) | 2026-10-15 | Unmerged helper/runner implementation withdrawn: no demonstrated current X1 failure fixed, new standalone-runner auth dependencies; frozen validation records preserved | `docs/TECHNICAL-DEBT.md`, `docs/CHANGELOG.md`, `CURRENT_WORK.md` |
 | `CURRENT_WORK-HISTORY-2026-10-12.md` | 2026-10-12 | Sections cut from `CURRENT_WORK.md` (lines 528–1335, 1356–1973): September slices, session summaries, the February "What's Next", Strategic Roadmap, the retired "frozen components" list and Quick Commands | `CURRENT_WORK.md`, `docs/CHANGELOG.md`, `AGENTS.md` |
 | `TECHNICAL-DEBT-HISTORY-2026-10-12.md` | 2026-10-12 | Resolved sections and superseded coverage/checklist snapshots of `docs/TECHNICAL-DEBT.md`; open tasks still have active tracking; the live file keeps a one-line stub at each moved heading so existing `§` references still resolve | `docs/TECHNICAL-DEBT.md` |
 | `IMPLEMENTATION_STATUS-SNAPSHOT-2026-07-21.md` | 2026-10-12 | Readiness percentages, freeze rules, blockers and priorities from `docs/IMPLEMENTATION_STATUS.md`, last maintained in January–July | `docs/V1-PRODUCTION-ROADMAP.md`, `docs/X1-CRITICAL-PATH.md`, `docs/KNOWN_ISSUES.md` |
