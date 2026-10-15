@@ -280,3 +280,144 @@ PASS. Raw metrics.go text differs only in comments; earlier raw-Go identity
 statements describe their recorded snapshots, not this textual correction.
 The recorded full go-all-test and race results are prior runs, not new executions
 claimed here. Updated scoped audit has no unresolved introduced P0/P1/P2.
+
+## Bounded three-DC diagnosis plan (2026-10-15)
+
+Base `main@550a2257bcdfe6902bad64d9541714367ff96f1e` (#295 merged), branch
+`codex/e111-three-dc-diagnosis`. Scope: the existing six E1-11 legs and their
+recorded three-DC fixture-progress failure; no new safety invariant or gate closure.
+
+1. Freeze unmodified test/runtime sources. Use a fresh private Docker project:
+   Cassandra 5.0.9, NetworkTopologyStrategy RF1 in dc-na/dc-eu/dc-asia, SILO and
+   a current-source GC-OFF backend. Verify all three nodes, actual/declared map,
+   readiness, owned candidate and session used by the productive worker.
+2. Run the existing required E1-11 matrix unchanged. Preserve failures and
+   teardown evidence. Trace shareProjectionDBForTest and the observed native
+   worker session separately; do not assume the withdrawn #293 diagnosis.
+3. Only after reproduction, isolate one cause. A test-session configuration
+   correction must preserve the real topology gate, native wire faults,
+   LOCAL_QUORUM/SERIAL/EACH_QUORUM queries and existing proof/cleanup assertions.
+   Do not refactor independent helpers or silently certify other E1 residuals.
+4. Require the identical matrix GREEN on the same three-DC fixture, appropriate
+   race repetitions, the original fail-closed gate controls and relevant one-DC
+   compatibility evidence. A runtime defect would require its own bounded fix.
+5. Audit source/image identity, positive versus expected-negative exits, missing
+   or skipped evidence, and owned cleanup before opening the focused PR. Report
+   all unrun suites and retain E1-01/X1/PRE-GC/A1 OPEN; ordinary GC stays OFF.
+
+Hypothesis to test: E1-11 constructs its observed worker via w2EvidenceSession,
+whose DatabaseConfig declares only LocalDC, omitting the configured replication
+map. This is not openIntegrationProjectionDB and is not yet causal evidence.
+
+## Three-DC reproduction and scoped correction (2026-10-15)
+
+The original matrix **FAILS** on frozen main@550a2257b: normal PASS, five GC
+legs FAIL, process exit 1. Every failed leg reports `worker did not visit owned
+real candidate`; the productive worker logs `destructive topology gate rejected
+the G2 handoff`, with actual dc-asia:1,dc-eu:1,dc-na:1 versus declared dc-na:1.
+All six fixtures verify owned metadata/repairs/K1 cleanup. This is a reproduced
+fixture-progress failure, not an X1 physical-safety violation.
+
+**Cause.** The fixture's shareProjectionDBForTest already loads the full map.
+E1-11 separately creates its observed worker DB with w2EvidenceSession, whose
+minimal DatabaseConfig omits replication. The real gate therefore correctly
+refuses before the candidate visit. This is distinct from the unsupported
+openIntegrationProjectionDB attribution withdrawn in #293.
+
+**Correction.** In e111GC only, wrap the same observed/faulted native session
+with the fixture's validated config.Load().Database before constructing its
+CassandraStore. No query, observer, proxy, timeout, consistency, assertion or
+production gate is replaced. The fixture already requires config.Load before
+this call, so this creates no new application/auth dependency for independent
+runners. The shared helpers and other E1 consumers are unchanged. Implementation
+`9d02e73d80daff4862a16f8e8bee0457bf3a01c3` adds nine test-only lines.
+
+### Frozen execution identity and topology
+
+- Baseline image `sesamefs-e111-3dc-red`:
+  `sha256:899e2be85b638e7d6c525a243db7189943e8f74061f71126ff8bec5a99c77296`,
+  plan snapshot a84bc04cc; all test/runtime source identical to the base.
+- Corrected image `sesamefs-e111-3dc-green`:
+  `sha256:ab4c54ea7741998e6c24749470edee1260c6f97731407eacef632f8705938da7`.
+  LF-normalized e111_repair_liveness_test.go hashes:
+  baseline `cd4d542a3c96f67709dfa581f744cbe93337991c023f4b571491731232804b8f`,
+  corrected `f90b15131d8ebd54ae937a546f0fa87a2b96601d988bc6e69c68f2e43abc746f`.
+  Unchanged w2_native_wire_test.go:
+  `d22a369ca0b7150463589480823ca84805b7c535345edaa8fe4fcf58e556a842`.
+- Fresh private project sesamefs-e111-3dc, no host ports; Cassandra 5.0.9,
+  NetworkTopologyStrategy RF1 in dc-na/dc-eu/dc-asia, all three UN/healthy.
+  The dedicated sesamefs_e19 keyspace's actual system_schema map matches the
+  explicit CASSANDRA_REPLICATION_DCS declaration. SERIAL and EACH_QUORUM remain real.
+- SILO RELEASE.2026-09-16T00-00-00Z image
+  `sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46`;
+  private owned buckets/objects, no shared stack. Backend built from base source,
+  binary SHA256 `f95399fbbcf07e5f853c04067839247222280b1bf02511e0142bfb95177cc6ab`.
+  Backend GC OFF; the matrix verifies all supplied API URLs are GC-OFF.
+  API/seed backend uses dc-na; test native/verification sessions use dc-na,
+  then dc-eu in the separate EU run. This is healthy multi-DC topology evidence,
+  not a divergent-replica, outage or every-coordinator proof.
+- One-DC compatibility reuses private sesamefs-e101h Cassandra/SILO volumes,
+  datacenter1 RF1, with a backend built from the same current source and GC OFF.
+  Only the E1-11 gate is required for its directed selector.
+
+### Results and failure accounting
+
+Ignored logs and explicit exits in tmp/:
+
+| Log | Result |
+|---|---|
+| e111-3dc-red.log | Original matrix 1/6 PASS, 5 FAIL; six verified teardowns, exit 1. No SKIPs. |
+| e111-3dc-green.log | Same six legs PASS, six verified teardowns, exit 0; gate inventory and no-global-fanout guards PASS. |
+| e111-3dc-race.log | Corrected matrix -race -count=2, 12/12 legs and 12 teardowns PASS, exit 0. |
+| e111-3dc-eu.log | Full six-leg matrix through dc-eu PASS, six teardowns, exit 0. |
+| e111-3dc-negatives.log | Original filtered/unavailable/child-filtered gate controls PASS. Original omission mutation produces exact COMMITTED D(P1), expected test exit 1 and verified disposal. Deliberately declaring only dc-na:1 still triggers the real topology rejection and expected test exit 1, with cleanup. Wrapper exit 0. |
+| e111-one-dc.log | Six legs/cleanups PASS, but package exit 1 because Compose inherited unrelated mandatory gates. This run is not an overall PASS. |
+| e111-one-dc-scoped.log | Corrected launch unsets unrelated SESAMEFS_REQUIRE_* and requires E1-11 alone: 6/6 legs/teardowns PASS, package/runner exit 0. |
+| e111-unit-vet.log | Complete short Go tree, ordinary vet and integration vet PASS, wrapper exit 0. |
+
+The early fixture-start attempts failed before tests (OnlyOffice configuration
+required a secret; keyspace absent). OnlyOffice was disabled for this fixture and
+the explicit three-DC keyspace was created before migration; no product code
+changed to fix startup. Native classifier/guard losses remain actual driver
+errors and are positively checked by E1-11; no unavailable-storage SKIP counted.
+
+After all three-DC runs, independent EACH_QUORUM counts of recovery roots,
+orphans and publication repairs are zero. The mutation restores its source in
+the disposable runner; publication_liveness.go matches the immutable green
+image byte-for-byte. No mutation enters the PR. TestMain's pre-existing partial
+cleanup-DB declaration still emits a topology warning; it is not the corrected
+worker session and no general harness repair is claimed.
+
+### Reproduction and final scope
+
+With an isolated GC-OFF API, SILO, migrated test keyspace and explicit complete
+Cassandra topology configured as above (see [testing](./TESTING.md)):
+
+```bash
+for v in ${!SESAMEFS_REQUIRE_@}; do unset "$v"; done
+export SESAMEFS_REQUIRE_E111_REPAIR_LIVENESS_EVIDENCE=1
+unset SESAMEFS_E111_ISOLATED_URL
+go test -tags integration -v -count=1 -timeout 8m -run '^(TestCurrentRuntimeRepairLiveness|TestCurrentRuntimeRepairLivenessCompleteness)$' ./internal/integration
+```
+
+Run inside the built Docker image. Each supplied SESAMEFS_URL must point to the
+isolated backend and CASSANDRA_KEYSPACE to its migrated keyspace; set all hosts,
+local DC and replication map explicitly. Repeat with -race -count=2; the EU run
+changes only CASSANDRA_HOSTS/LOCAL_DC. Gate/mutation scripts are the existing
+scripts/e111-repair-liveness-gates.sh and scripts/e111-repair-liveness-mutation.sh,
+run sequentially in a disposable container with their required E19 hostname.
+
+Not run: full standard integration/API/OIDC, standalone Sync/frontend or the
+other six historical E1 three-DC cases. No runtime/schema/API/default/dependency
+change; no complete three-DC suite, E1-01/X1/PRE-GC/A1 closure or activation claim.
+The remaining six fixture-progress cases retain their open diagnosis/evidence
+obligations. PREPARED-without-projection remains pending as recorded by #295.
+Final scoped audit: no introduced blocker identified. All existing six leg
+assertions, native fault paths, required gates, observers and cleanup controls
+remain unchanged. Production code, the shared helper, scripts, Compose and
+configuration defaults have no diff. The only Go change is the nine-line local
+E1-11 adapter correction; all remaining edits are the frozen plan/evidence and
+tracking summaries. Relative links (245), new evidence anchor, source/image
+hashes and git diff --check PASS. The original configuration failure and
+mis-scoped one-DC exit remain disclosed; no skipped leg is credited as evidence.
+Backward compatible: yes, supported runtime contracts/configurations are unchanged.

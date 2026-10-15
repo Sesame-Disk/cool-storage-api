@@ -2368,7 +2368,7 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 
 **2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
 
-**E1 three-DC fixture-progress failures (P2, OPEN; cause unestablished).**
+**E1 three-DC fixture-progress failures (P2, OPEN; E1-11 scoped correction below).**
 Historical runs recorded "GC retirement n=0" / "worker did not visit owned real
 candidate" for E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13. The earlier
 attribution to openIntegrationProjectionDB is unsupported: those legs route through
@@ -2392,6 +2392,18 @@ preserves the earlier results with provenance; it closes no open issue or gate.
 
 Reconsider a code change when an existing caller is shown to fail specifically
 because of the omitted topology, with a failing-before/passing-after regression
-and compatibility checks for its actual consumers. The seven E1 failures still
-need a representative reproduction and causal diagnosis; no three-DC capability,
+and compatibility checks for its actual consumers. The remaining E1 failures still
+need representative reproduction and causal diagnosis; no general three-DC capability,
 X1, PRE-GC or A1 closure is claimed here. Ordinary/production GC remains OFF.
+
+**2026-10-15 E1-11 scoped diagnosis.** The original six-leg matrix reproduces
+five worker-visit failures on three DCs. Its separate w2EvidenceSession wrapper
+omits replication; the gate correctly sees declared dc-na:1 versus the actual
+three-DC map. Passing the validated fixture config to the same native session
+inside e111GC turns all six legs GREEN, including race repetitions and an EU
+coordinator run; a one-DC compatibility run also passes. The shared helper and
+openIntegrationProjectionDB are unchanged. [Frozen evidence and limits](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+record expected-negative exits, cleanup and the initial mis-scoped one-DC run.
+This resolves the measured E1-11 fixture blocker only. E1-3, E1-7, E1-09,
+E1-10e, E1-12 and E1-13 remain OPEN; their causes and full-suite progress are
+not certified by this result. The umbrella P2 remains OPEN; no runtime/X1 gate closes.

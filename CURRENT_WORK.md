@@ -35,7 +35,19 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01 source/evidence reconciliation
+## Active slice: E1-11 three-DC fixture diagnosis
+
+Base `main@550a2257b` (#295). [E1-11 evidence](docs/E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+reproduces five worker-visit failures: the observed native session declares only
+its local DC. Nine lines in e111GC pass the validated full fixture declaration
+to that same session; the real topology gate and wire faults remain intact.
+Three-DC six-leg matrix, race twice, EU coordinator, scoped one-DC compatibility,
+original gate/mutation negatives and short Go/vet PASS. Initial mis-scoped
+one-DC package exit 1 is retained in the ledger. Other six E1 cases and the
+partial shared helpers remain outside this correction. No runtime change or
+E1-01/X1/PRE-GC/A1 closure; ordinary/production GC OFF.
+
+## Previous merged slice: E1-01 source/evidence reconciliation (#295)
 
 Base `main@2e74e4cad` (#294). [The current matrix and open dispositions](docs/E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
 reconcile all enumerated C0–C8 cuts with current instrumentation/oracles and

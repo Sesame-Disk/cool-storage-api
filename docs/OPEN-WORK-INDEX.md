@@ -1,5 +1,15 @@
 # Open Work Index
 
+## E1-11 three-DC fixture-progress correction (2026-10-15)
+
+[Scoped reproduction and evidence](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md#three-dc-reproduction-and-scoped-correction-2026-10-15):
+original matrix fails five GC legs because its observed session omits the full
+replication declaration. The local E1-11 adapter correction passes the same
+six legs in three DCs, race twice, EU coordinator and a scoped one-DC run.
+The real gate and native fault controls remain enforced; no runtime change.
+The other six cases in the existing P2 umbrella remain OPEN with their own
+diagnosis obligations. E1-01/X1/PRE-GC/A1 stay OPEN; ordinary GC OFF.
+
 ## E1-01 reconciled C0–C8 inventory (2026-10-15)
 
 [Current matrix and open dispositions](./E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
