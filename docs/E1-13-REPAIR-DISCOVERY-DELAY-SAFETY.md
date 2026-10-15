@@ -216,3 +216,29 @@ is not accepted as full-suite evidence. The unchanged final image was restarted
 with the default go-all-test service command at 20:23 UTC; its result must be
 recorded separately. No timeout, gate, GC configuration or test assertion was
 relaxed for this retry.
+## Bounded three-DC validation plan (2026-10-15)
+
+Base `main@485d9b87640a66324e405ea54facdeb5d72bb5ed` (#297 merged), branch
+`codex/e113-three-dc-evidence`. Measure only the existing five E1-13 legs;
+the target's GC call already inherits #296's e111GC topology correction.
+
+1. Freeze current source/image. Reuse only the private owned #296/#297
+   Cassandra 5.0.9/SILO fixture after verifying zero roots/orphans/repairs,
+   complete NetworkTopologyStrategy RF1 declaration for dc-na/dc-eu/dc-asia,
+   all-node readiness and GC-OFF API. Record retained auxiliary storage probes
+   separately; do not claim the whole bucket is empty.
+2. Run the unchanged required five-leg matrix. Check naturally observed earlier
+   backlog buckets, target unvisited/zero-ref state, direct EQ repair guard,
+   real sweep SIGKILL/restart and native UNKNOWN/exact pub renewal. Current
+   fixtures hold HEAD at the interrupted attempt's parent; no competitor moves
+   it to SUPERSEDED. Do not relabel the fixture's panic as a writer OS crash.
+3. Repeat with race twice and native sessions through dc-eu, sequentially.
+   Execute original filtered/unavailable/child-filtered negatives and the
+   guard-only omission mutation in a disposable source copy. Require the real
+   COMMITTED certificate, target-not-visited marker, all three existing owned
+   cleanup checks and restored source identity.
+4. Preserve and diagnose any failure before a bounded correction. If current
+   code passes, publish only evidence/tracking, with no invented code fix.
+5. Audit source/topology, commands/exits, cleanup, links and claims before PR.
+   Finite backlog is not a fairness/latency guarantee. Other E1 cases, the P2
+   umbrella, E1-01/X1/PRE-GC/A1 and ordinary GC-OFF disposition remain separate.
