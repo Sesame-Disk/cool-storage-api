@@ -1,5 +1,15 @@
 # Open Work Index
 
+## E1-13 scoped three-DC evidence (2026-10-15)
+
+[Current-main E1-13 validation](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+passes the five existing legs, race twice, EU coordinator and original negatives
+without code changes. Native UNKNOWN, unvisited-target protection, real sweep
+SIGKILL/restart and all three owned cleanup surfaces are measured; finite backlog
+supplies no fairness/latency bound. Auxiliary discovery probes remain retained.
+E1-3, E1-7, E1-09 and E1-10e still need bounded reproduction/validation; the P2
+umbrella, full-suite obligations and E1-01/X1/PRE-GC/A1 remain OPEN. GC stays OFF.
+
 ## E1-12 scoped three-DC evidence (2026-10-15)
 
 [Current-main E1-12 validation](./E1-12-KNOWN-LOSER-CRASH-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)

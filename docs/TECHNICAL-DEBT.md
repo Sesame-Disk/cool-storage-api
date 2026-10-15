@@ -2416,3 +2416,13 @@ distinguishes current SUPERSEDED restart settlement, exact owned fixture cleanup
 and retained auxiliary storage-class probes. This is scoped positive evidence,
 not a rerun proving every historical failure's cause. E1-3, E1-7, E1-09,
 E1-10e and E1-13 remain pending; the P2 umbrella and full-suite obligations stay OPEN.
+
+**2026-10-15 E1-13 current-main validation.** After #296/#297, the unchanged
+five-leg E1-13 matrix passes on the private healthy three-DC fixture, race twice
+and through EU. The GC leg inherits e111GC's complete declaration; no new fix
+is needed. [Frozen E1-13 evidence](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+records native UNKNOWN, unvisited-target protection, sweep SIGKILL/restart,
+original gate/omission negatives and all three owned cleanup surfaces. Retained
+auxiliary probes and finite-backlog limits are explicit. This is current scoped
+positive evidence, not proof of every historical failure's cause. E1-3, E1-7,
+E1-09 and E1-10e remain pending; the P2 umbrella/full-suite obligations stay OPEN.
