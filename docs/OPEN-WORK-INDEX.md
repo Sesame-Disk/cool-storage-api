@@ -4,8 +4,9 @@
 
 [Current matrix and open dispositions](./E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
 match current worker/store transitions to merged A–H process evidence (#294
-included). Recorded cuts have one-DC evidence; this review identifies no further
-uncovered successful-transition cut within the enumerated sequence. Global G5
+included). Recorded named points have one-DC evidence; internal durable writes
+are not exhaustively covered. PREPARED before discovery publication awaits
+equivalence/additional-evidence disposition in E1-01. Global G5
 progress, three-DC/ambiguity qualifications and final D0 dispositions are separate.
 Next execution is one representative existing three-DC fixture-progress diagnosis,
 with no assumed helper cause or speculative refactor. E1-01/X1 remain OPEN;

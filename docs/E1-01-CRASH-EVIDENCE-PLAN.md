@@ -157,13 +157,25 @@ Promote inserts PUBLISHED before the orphan COMMITTED CAS; Finalize precedes
 candidate/queue settlement. Recovery deletes exact K1 before phase persistence,
 then terminates the lifecycle before DeleteS3Orphan removes orphan, discovery
 and root in that order. Source: [worker](../internal/gc/worker.go),
-[Cassandra store](../internal/gc/store_cassandra.go). No additional uncovered
-successful-transition cut was identified within this enumerated C0–C8 sequence.
+[Cassandra store](../internal/gc/store_cassandra.go). The K evidence reconciled
+here corresponds to the named C0–C8 observation points; it does not establish
+coverage of every internal durable write between them.
+
+In particular, Prepare can persist the exact PREPARED orphan LWT before
+`ensureS3OrphanProjectionResult` publishes `gc_s3_orphans_by_day`. This leaves
+root and PREPARED present with discovery still absent. H pauses before the
+orphan INSERT; A pauses after successful Prepare return, including projection
+publication. Neither is specific K evidence for this intermediate window.
+Root recovery calls `PublishS3OrphanDiscovery` before canonical recovery, but
+that route alone does not prove process-death behavior at this window. Its
+equivalence to existing evidence or need for a separate drill remains pending
+final E1-01 disposition; this docs-only PR adds no experiment or runtime finding.
 This is a source/evidence reconciliation, not proof of every error/concurrency schedule.
 
 | Obligation | Current disposition and next evidence needed |
 |---|---|
 | Enumerated C0–C8 process cuts | Recorded K evidence on one DC, with resume/replay and failure preservation. Maintainer acceptance/final E1-01 disposition remains OPEN; this PR closes no gate. |
+| Internal PREPARED-without-projection window | Root and exact PREPARED orphan present, discovery absent. No specific K witness is established here. Justify equivalence or select additional evidence in final E1-01 disposition; do not infer a product defect or require an experiment in this PR. |
 | C0 unresolved root | Safe retention is the expected outcome under current authority rules. H's Abort/DeletePrepared fixture disposal is separate. No automatic reclamation deadline or product defect is established. |
 | Global G5 scheduling, persisted checkpoints and fairness | A–H use [w2OwnedRecoveryStore](../internal/integration/w2_worker_repair_lifecycle_test.go): real root reads filtered to owned identity; LoadGCStats returns not-found and SaveGCStats is a no-op. They do not certify global progress or cursor durability. Existing [G5 real-stack controls](../internal/integration/g5_recovery_scheduling_test.go) retain their R scope; do not invent a new runtime fix from that limitation. |
 | Three-DC and ambiguity/outage coverage | A–H are single-DC healthy-service recovery schedules, not three-DC, every LWT/S3 ambiguous result or outage proof. Cross-check existing controls/results before requiring more tests. The [seven recorded E1 fixture-progress failures](./TECHNICAL-DEBT.md#e1-16-test-infrastructure-follow-ups-2026-10-10) remain OPEN with cause unestablished; #293's withdrawn loader change supplies no diagnosis/fix. |
@@ -384,7 +396,8 @@ and the existing section-0 anchor is preserved. Source checks confirm Prepare,
 Promote, physical-delete/phase and terminal/orphan/discovery/root ordering.
 All eight gates remain in TestMain and both Compose commands. Fixture-local
 checkpoint overrides were checked against their actual implementations.
-`git diff --check` PASS; no THIS-PR blocker identified in this scoped audit.
+`git diff --check` PASS. The initial scoped audit missed an overly broad
+coverage conclusion; the crossed-audit correction below supersedes it.
 
 Docker image `sesamefs-e101-reconciliation`:
 `sha256:dab75325dc6d5168cd17c1f92545d1e28d1ba38c8f7717e7f46a8f3d3f4040dc`.
@@ -394,3 +407,19 @@ PASS (0.073s, exit 0); ignored logs `tmp/e101-reconciliation-build.log` and
 changed after this image build. No new tests were added to mirror prose.
 Not run for this docs-only PR: full Go tree, vet, integration, race, API/OIDC,
 Sync/frontend and three-DC suites. No new service/crash evidence or gate closure.
+
+### Crossed-audit correction — named cuts versus internal writes
+
+The P2 THIS-PR documentation finding is accepted: the initial conclusion about
+no additional uncovered successful-transition cut exceeded the named-point
+reconciliation. Section 0.7 and its CURRENT_WORK/index/changelog summaries now
+limit K coverage to those points and explicitly retain PREPARED-without-projection
+as pending evidence equivalence/additional-drill disposition. No runtime defect
+is established, no new experiment is added and no gate disposition changes.
+
+Correction checks: all 281 relative file links and the three section anchors
+still resolve; source order and A/H pause locations were rechecked; no broad
+absence-of-additional-cuts claim remains in the new inventory/summaries.
+`git diff --check` PASS; final diff remains five Markdown files. Prior Docker
+unit results above predate this prose correction. Runtime tests, integration,
+race and three-DC suites were not repeated for the correction.

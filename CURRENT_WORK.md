@@ -39,8 +39,10 @@ The source of record for order and closure states is
 
 Base `main@2e74e4cad` (#294). [The current matrix and open dispositions](docs/E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
 reconcile all enumerated C0–C8 cuts with current instrumentation/oracles and
-merged A–H results. No further uncovered successful-transition cut was identified
-within that sequence. C0 retention is correct; explicit disposal is separate.
+merged A–H results at the named points, without claiming every internal durable
+write is covered. PREPARED present before discovery publication has no specific K
+witness here; equivalence or further evidence awaits final E1-01 disposition.
+C0 retention is correct; explicit disposal is separate.
 Evidence remains one-DC and fixture-scoped, with no global cursor/fairness proof.
 Next execution: diagnose one existing three-DC fixture-progress failure on frozen
 current code before choosing a fix. #293 established no cause for those failures.
