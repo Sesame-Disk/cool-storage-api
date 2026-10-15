@@ -15,7 +15,7 @@ The source of record for order and closure states is
 - **W2 checklist:** every row, W2-0..14, is closed for X1. W2-10 (content
   resurrection) was closed by E1-17 (CLOSED-FIX).
 - **Remaining before X1 CLOSED:**
-  1. E1-01, after final source/evidence reconciliation of A–H (next);
+  1. E1-01 final disposition after the A–H reconciliation (recorded; still OPEN);
   2. the three-DC residuals (28 of the 30 G5 failures now pass);
   3. the D0 §25 reclassification list;
   4. the identity claim-table PRE-X1 audit debt.
@@ -35,7 +35,19 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01H root before PREPARED process crash
+## Active slice: E1-01 source/evidence reconciliation
+
+Base `main@2e74e4cad` (#294). [The current matrix and open dispositions](docs/E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
+reconcile all enumerated C0–C8 cuts with current instrumentation/oracles and
+merged A–H results. No further uncovered successful-transition cut was identified
+within that sequence. C0 retention is correct; explicit disposal is separate.
+Evidence remains one-DC and fixture-scoped, with no global cursor/fairness proof.
+Next execution: diagnose one existing three-DC fixture-progress failure on frozen
+current code before choosing a fix. #293 established no cause for those failures.
+Documentation only; no new crash execution or E1-01/X1/PRE-GC/A1 closure.
+Ordinary/production GC remains OFF; final gate dispositions belong to the maintainer.
+
+## Previous merged slice: E1-01H root before PREPARED process crash (#294)
 
 Branch `codex/e101-root-before-prepared-crash`, rebased onto main@6324057eb (#293).
 [E1-01H](docs/E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) adds C0: the exact root

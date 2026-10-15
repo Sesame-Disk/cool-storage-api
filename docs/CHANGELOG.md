@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Reconcile merged E1-01 A–H evidence with current code
+
+[The source inventory](./E1-01-CRASH-EVIDENCE-PLAN.md) now maps each enumerated
+C0–C8 cut to its current pause/oracle and merged ledger, including H in #294.
+No additional uncovered successful-transition cut was identified within that
+sequence. This is a documentation review of recorded one-DC evidence, not a
+new test run or automatic E1-01 closure. Safe C0 retention and fixture disposal
+remain distinct; global scheduling, three-DC and D0 qualifications stay explicit.
+Next execution is a representative existing three-DC failure diagnosis before
+any causal correction. No runtime/configuration/test change or gate closure.
+
 ## 2026-10-15 — E1-01H root before PREPARED process crash
 
 [E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) witnesses productive C0:
