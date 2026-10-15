@@ -2407,3 +2407,12 @@ record expected-negative exits, cleanup and the initial mis-scoped one-DC run.
 This resolves the measured E1-11 fixture blocker only. E1-3, E1-7, E1-09,
 E1-10e, E1-12 and E1-13 remain OPEN; their causes and full-suite progress are
 not certified by this result. The umbrella P2 remains OPEN; no runtime/X1 gate closes.
+**2026-10-15 E1-12 current-main validation.** After #296, the unchanged six-leg
+E1-12 matrix passes on the same private healthy three-DC fixture, including
+race repetitions, an EU-coordinator run, original gate negatives and the guard
+omission control. Its GC legs already call the corrected e111GC; no new code fix
+is needed or claimed. [Frozen E1-12 evidence](./E1-12-KNOWN-LOSER-CRASH-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+distinguishes current SUPERSEDED restart settlement, exact owned fixture cleanup
+and retained auxiliary storage-class probes. This is scoped positive evidence,
+not a rerun proving every historical failure's cause. E1-3, E1-7, E1-09,
+E1-10e and E1-13 remain pending; the P2 umbrella and full-suite obligations stay OPEN.

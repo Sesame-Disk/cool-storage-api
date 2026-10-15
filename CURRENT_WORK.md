@@ -35,7 +35,18 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-11 three-DC fixture diagnosis
+## Active slice: E1-12 current-main three-DC evidence
+
+Base `main@a5adc93e3` (#296). [E1-12 ledger](docs/E1-12-KNOWN-LOSER-CRASH-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+records six unchanged legs PASS in three DCs, race twice and an EU-coordinator
+run, with real SIGKILL, current SUPERSEDED restart settlement, owned K1/expiry
+cleanup and original gate/omission negatives. The GC legs inherit e111GC's
+#296 correction; this slice needs no code fix. The bucket retains auxiliary
+storage-class probes, disclosed separately from the owned E1-12 cleanup.
+Five other historical E1 cases remain pending. Documentation only; E1-01/X1
+and PRE-GC/A1 stay OPEN, ordinary/production GC OFF.
+
+## Previous merged slice: E1-11 three-DC fixture diagnosis (#296)
 
 Base `main@550a2257b` (#295). [E1-11 evidence](docs/E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
 reproduces five worker-visit failures: the observed native session declares only
