@@ -35,7 +35,22 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01G PUBLISHED/PREPARED process crash
+## Active slice: correct the E1 three-DC diagnosis (PR #293, docs only)
+
+Branch `test/harness-fixture-topology`, base main@a71eec36a (#292).
+The seven recorded E1 fixture-progress failures already use shareProjectionDBForTest;
+openIntegrationProjectionDB was not shown to cause them or to block a current
+caller through its omitted topology. The proposed implementation is withdrawn:
+full config validation introduced independent-runner auth dependencies without
+a demonstrated X1 fix. Helper, scripts and tests match main; no runtime change.
+
+[Technical debt](docs/TECHNICAL-DEBT.md) records the corrected diagnosis, why code
+is deferred and the evidence needed to reconsider it. [The dated archive](docs/legacy/PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md)
+preserves withdrawn-version results, including real H1 three-DC evidence, without
+certifying this final diff or closing the seven E1 obligations. E1/X1 remain OPEN;
+ordinary/production GC OFF. This is a diagnosis correction, not an X1 runtime fix.
+
+## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 
 Branch `codex/e101-published-prepared-crash`, base main@6f8fc2630 (#291).
 [E1-01G](docs/E1-01G-PUBLISHED-PREPARED-CRASH.md) is bounded to C3: successful

@@ -8,6 +8,22 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Correct the E1 three-DC harness diagnosis (PR #293, docs only)
+
+The recorded attribution of seven E1 fixture-progress failures to
+openIntegrationProjectionDB is unsupported: those legs already use the
+configuration-aware shareProjectionDBForTest. Their cause and evidence obligations
+remain open. The proposed helper/configuration change is withdrawn: no current
+caller failure caused by its omitted topology was demonstrated, while full config
+validation introduced auth dependencies in independent runners. Restoring the
+helper, scripts and tests to main keeps this PR documentation-only.
+
+[Withdrawn implementation and validation evidence](./legacy/PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md)
+preserve the earlier Docker results, including H1's three-DC run, with frozen
+versions and limits. They are not new validation of this final docs-only diff.
+Reconsider code only after a concrete existing-caller failure and a bounded fix
+are demonstrated. No E1/X1/PRE-GC/A1 closure or activation is implied.
+
 ## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
 
 [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) witnesses C3 inside productive

@@ -2368,4 +2368,30 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 
 **2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
 
-**E1 in-process-GC legs cannot run on a three-DC fixture (P2).** `openIntegrationProjectionDB` builds its `DatabaseConfig` without replication, so it declares only the local DC. On a three-DC keyspace the in-process GC's destructive topology gate correctly refuses the G2 handoff. As a result, E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13 fail on fixture progress ("GC retirement n=0", "worker did not visit owned real candidate"), not on safety. These legs are single-DC evidence by design. If they are wanted on three DCs, the harness must declare the fixture topology, for example from `CASSANDRA_REPLICATION_DCS`.
+**E1 three-DC fixture-progress failures (P2, OPEN; cause unestablished).**
+Historical runs recorded "GC retirement n=0" / "worker did not visit owned real
+candidate" for E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13. The earlier
+attribution to openIntegrationProjectionDB is unsupported: those legs route through
+shareProjectionDBForTest, which has loaded config.Load since `fa73da717`
+(2026-10-02). Do not treat that attribution as an established cause or resolution.
+
+openIntegrationProjectionDB still constructs a partial DatabaseConfig and omits
+the replication map. Its current consumers are the five H1 tests, optional
+provenance-cost characterization and TestMain cleanup; they do not execute G2
+through that helper. No current-caller failure caused by this omission was
+shown. Making its configuration uniform therefore does not demonstrate an X1 fix.
+
+**2026-10-15 decision, PR #293: documentation only.** The proposed config.Load
+change also required unrelated application/auth configuration in independent
+runners. Fixing four runners and passing H1 did not cover all affected paths;
+the hard-delete lease runner's configuration failure was subsequently reproduced.
+The helper, runner edits and added test are withdrawn from this PR rather than
+expanding that unproved maintenance benefit into a harness-wide repair campaign.
+The [withdrawn implementation/evidence archive](./legacy/PR-293-WITHDRAWN-IMPLEMENTATION-2026-10-15.md)
+preserves the earlier results with provenance; it closes no open issue or gate.
+
+Reconsider a code change when an existing caller is shown to fail specifically
+because of the omitted topology, with a failing-before/passing-after regression
+and compatibility checks for its actual consumers. The seven E1 failures still
+need a representative reproduction and causal diagnosis; no three-DC capability,
+X1, PRE-GC or A1 closure is claimed here. Ordinary/production GC remains OFF.
