@@ -49,6 +49,12 @@ three-DC declaration naming `dc-na`/`dc-eu`/`dc-asia`; H1 initial-head tests pas
 to this helper for seven E1 legs is unsupported — those legs use the topology-aware
 sibling — so that symptom's cause remains open and the legs were not re-run on three
 DC. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-15).
+Standalone runner compatibility is restored by explicit AUTH_DEV_MODE=true in
+four runner_env functions, with a clean-environment config regression RED→GREEN
+for all four. New short Go/vet and regression race repetitions PASS. The complete
+H1 three-DC script PASS (both blind initializer cycles, TestMain cleanup, exit 0).
+The other three scripts' config paths are covered; their complete scenarios were
+not rerun. Production validation/defaults are unchanged; seven E1 residuals stay OPEN.
 
 ## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 

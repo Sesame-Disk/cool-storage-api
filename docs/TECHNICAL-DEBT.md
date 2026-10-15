@@ -2395,3 +2395,16 @@ Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
 naming those datacenters, which the hand-built config could not produce because it
 ignored `CASSANDRA_REPLICATION_DCS`. H1 initial-head tests pass unchanged. The
 seven legs were not re-run on a three-DC fixture.
+
+**2026-10-15 (standalone runner compatibility).** Loading the full config exposed
+a separate P2 in this PR: the four standalone Go runner_env functions did not
+supply auth development configuration. config.Load rejected them, and TestMain's
+final projection verifier failed before connecting to Cassandra. The migration
+CLI's process-local .env loading does not configure later go test processes.
+The runners now declare AUTH_DEV_MODE=true explicitly. A regression executes each
+real runner_env in a clean subprocess, checks full config.Load and the three-DC
+map, and fails for all four before the fix. After the fix it passes, including
+race repetitions. The complete H1 script passes both blind initializer cycles
+against three real DCs, including final cleanup and exit 0. Other three scripts'
+configuration paths are verified, not their full scenarios. This restores runner
+compatibility; it does not resolve the seven E1 failures described above or close X1.

@@ -34,7 +34,31 @@ all five H1 tests, provenance-cost characterization, H1 race repetitions, short
 Go tree and normal/integration vet PASS. Standard required integration (A–G and
 seven preservation controls), API 20/20 suites and OIDC 25/25 tests PASS; container
 and outer exits 0. Subsequent precision edits change only docs and a Go comment.
-No real three-DC fixture was run; the synthetic map is a negative on single-DC RF1.
+Those earlier runs used single-DC RF1; the synthetic map is a topology negative.
+
+Standalone runner follow-up, implementation `d71ff7e1c`: full config validation
+introduced an auth dependency in four existing runner_env functions. Explicit
+AUTH_DEV_MODE=true restores their development fixture contract without relaxing
+production validation. New TestMultidcRunnerConfiguration runs their actual shell
+functions with inherited application config removed; all four fail before the
+fix and pass after. Child completion plus exact declared topology are mandatory.
+
+Docker evidence (ignored tmp/pr293-* logs): runner-config-red exit 1 (four HMAC
+errors); runner-config-green exit 0 (0.068s); runner-config-race count=2 plus gate/
+fanout guards exit 0 (9.338s); runner-fix-unit-vet exit 0 (short Go and both vets).
+Full h1-3dc exit 0: seed, publish and blind-EU initializer pass for both Sync and
+v2, including TestMain's final verifier. Real Cassandra 5.0.9, dc-na/dc-eu/dc-asia
+RF1, three UN nodes and matching declared/live maps. Backend GC stayed OFF.
+The LF-normalized full script ran unchanged apart from its path in ignored tmp/;
+fixtures were new/owned and three-DC teardown completed. No other project touched.
+
+Frozen validation image sesamefs-pr293-runner-fix:
+`sha256:5f3959667cad79695c62170ecce9b134ebd01ac06b67d12751693f60ff2f1da7`;
+full H1 image sesamefs-h1-initial-head-3dc:
+`sha256:a0e03c102a07a13ed66ee27b04f45d8ae9244e2c048174401af21eabe2c52311`.
+Other three runners' configuration paths, not full scenarios, were rerun. Standard
+integration/API/OIDC remain the earlier 4d374fe39 results, not new full-suite runs.
+The seven E1 three-DC residuals remain unproved/open; no X1 closure or activation.
 
 ## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
 
