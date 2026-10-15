@@ -128,3 +128,28 @@ counterexamples against the unchanged production runtime.
 without race reports. Final formatting and whole-diff checks passed. Optional
 isolated 3DC/proxy/saturation legs are not claimed as passed. E1 remains partial,
 W2-11/14 and X1 OPEN, and no production GC activation gate changed.
+
+## Scoped three-DC verification plan — 2026-10-15
+
+Base: main@7fa8b26995c3f9f5945839d1dd44fd808be545f7 (merged #298).
+Freeze this plan before changing Go source. Scope is the existing three E1-3
+legs; do not change productive GC, publication, schema, observer barriers or
+shared session helpers.
+
+1. Reproduce the unchanged test against the isolated Cassandra 5.0.9 / SILO
+   stack with NetworkTopologyStrategy RF1 in dc-na, dc-eu and dc-asia. Record
+   actual replication, GC-disabled backend, named PASS/FAIL and cleanup state.
+2. If the worker's local adapter demonstrably omits the validated replication
+   declaration, wrap its existing observed session with config.Load().Database,
+   following e111GC. Preserve the productive topology gate and real proof reads.
+   Otherwise report the measured cause before broadening this scope.
+3. Repeat all three legs, race repetitions, an EU-coordinator run and single-DC
+   compatibility. Re-run both original behavior mutations only in disposable
+   containers: omitted final exact-P check and omitted second refs read. Require
+   the documented behavior assertion, then restore and compare source.
+4. Run relevant Go short tests and vet in Docker; audit the complete diff,
+   source identity, owned cleanup, retained discovery probes and current main.
+   Record executed and omitted checks, then open a focused PR.
+
+This is evidence for named healthy-topology schedules, not a partition, TTL,
+restart, all-funnel or gate-closure claim. E1/X1 remain open and ordinary GC off.
