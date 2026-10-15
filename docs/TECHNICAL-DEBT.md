@@ -2438,3 +2438,30 @@ record exact assertions, retained auxiliary probes and checks omitted. This
 resolves the measured E1-3 blocker only: shared helpers stay unchanged,
 E1-7/E1-09/E1-10e and full-suite obligations remain pending; umbrella P2 and
 E1-01/X1/PRE-GC/A1 stay OPEN. Ordinary/production GC remains OFF.
+
+**2026-10-15 E1-7 scoped diagnosis.** The unchanged six-leg matrix reproduces
+four PASS and two `GC retirement n=0 proof=false` failures. e17CommitGC's observed
+wrapper omits replication; the productive topology gate correctly rejects its
+local-only declaration against actual three DCs. Eight test-only lines pass the
+validated fixture map to that same session. All six legs, race, EU and original
+gate/persistence negatives pass. Positive-reference helpers stay unchanged.
+[Evidence and compatibility scope](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+record other callers, owned cleanup, auxiliary probes and checks omitted.
+E1-09/E1-10e still need their own three-DC measurements; the umbrella P2 and
+full-suite obligations remain OPEN. No runtime or E1-01/X1/PRE-GC/A1 closure;
+ordinary/production GC stays OFF.
+
+## E1 compatibility COMMITTED teardown residues
+
+**P2, FOLLOW-UP / GENERAL, OPEN (2026-10-15).** In the E1-7 one-DC compatibility
+run, E1-10e/committed and all five E1-17 */committed cases leave exact orphan/root
+rows: x1Cleanup drops canonical/lifecycle state but not these tables, while
+fixture object cleanup deletes K directly. Six current pairs were measured and
+explicitly disposed only after block/refs/lifecycle/K absence was verified;
+twenty older pairs were preserved. The productive adapter fix does not change
+this teardown or the one-DC declaration. This is pre-existing test hygiene,
+not evidence of a productive safety failure and not a blocker of the scoped
+E1-7 topology correction. [Frozen audit and exact disposal](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15).
+Follow-up: make owned COMMITTED teardown retire exact recovery metadata and
+verify discovery/root/orphan absence, without weakening the measured COMMITTED
+state or touching unrelated fixtures. No X1/PRE-GC/A1 gate is closed here.

@@ -1,5 +1,18 @@
 # Open Work Index
 
+## E1-7 scoped three-DC retirement correction (2026-10-15)
+
+[Reproduction and evidence](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+show two real retirement failures among six existing legs. Eight test-only lines
+correct e17CommitGC's declaration while keeping the same native observer and
+productive gate/proof. Three-DC six-leg matrix, race, EU, required negatives and
+cleanup audit pass. Other helper callers have compatibility checks; E1-09 and
+E1-10e still need their own three-DC validation. P2 umbrella/full-suite duties
+and E1-01/X1/PRE-GC/A1 stay OPEN; ordinary/production GC OFF.
+
+One-DC compatibility also reproduced independent P2 [COMMITTED teardown residues](./TECHNICAL-DEBT.md#e1-compatibility-committed-teardown-residues).
+Six current owned pairs were explicitly disposed; the cleanup follow-up stays OPEN.
+
 ## E1-3 scoped three-DC fixture correction (2026-10-15)
 
 [Reproduction and evidence](./E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)

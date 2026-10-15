@@ -13,6 +13,7 @@ import (
 	"time"
 
 	apipkg "github.com/Sesame-Disk/sesamefs/internal/api"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -379,6 +380,13 @@ func e17CommitGC(t *testing.T, fx *w2CreateFileFixture) gcpkg.BlockDeleteAuthori
 	t.Helper()
 	proof := e13Observer(fx.orgID, fx.blockID, "e17-zero")
 	workerDB := w2EvidenceSession(t, splitEnvOrDefault("CASSANDRA_HOSTS", "cassandra:9042")[0], proof)
+	// Preserve the observed native session, supplying the full validated fixture
+	// topology to the productive gate. All current callers already load config.
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerDB = dbpkg.NewPublicationEvidenceDB(workerDB.Session(), cfg.Database)
 	store := gcpkg.NewCassandraStore(workerDB)
 	c := w2Candidate(t, store, fx.orgUUID, fx.blockID, fx.target.StorageClass)
 	scope := &w2ClosureOwnedQueue{GCStore: store, org: fx.orgUUID, block: fx.blockID, identity: c.Identity()}

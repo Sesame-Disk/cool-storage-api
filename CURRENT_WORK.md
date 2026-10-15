@@ -35,7 +35,20 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite budget and remaining historical
     E1 three-DC cases still need scoped validation (see current ledgers).
 
-## Active slice: E1-3 observed-worker three-DC correction
+## Active slice: E1-7 observed retirement worker correction
+
+Base main@7a8bf5b86 (#299). [E1-7 ledger](docs/E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+records original 4/6 PASS and two retirement failures at the real topology gate.
+Eight test-only lines give e17CommitGC the validated fixture declaration on the
+same observed session. Six legs, race, EU and original gate/persistence negatives
+pass with their stated scopes; owned cleanup is audited and 33 auxiliary probes
+remain retained. Other helper callers receive compatibility checks, not blanket
+three-DC certification. Their 39-case one-DC batch passes assertions, but six
+independent COMMITTED teardown residues needed explicit disposal (tracked P2).
+E1-09/E1-10e and full-suite obligations remain pending;
+P2 umbrella/E1-01/X1/PRE-GC/A1 OPEN, ordinary/production GC OFF.
+
+## Previous merged slice: E1-3 observed-worker three-DC correction (#299)
 
 Base main@7fa8b2699 (#298). [E1-3 ledger](docs/E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
 records 1/3 PASS and two real topology-gate/barrier failures before a nine-line
