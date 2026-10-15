@@ -2372,9 +2372,11 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 
 **2026-10-15 (harness aligned; the mechanism above does not hold).**
 `openIntegrationProjectionDB` now loads the server config the way
-`shareProjectionDBForTest` has since `fa73da717` (2026-10-02), so the harness
-declares the fixture topology everywhere rather than in most places and no harness
-DB declares a local-only topology. Two corrections to the entry above:
+`shareProjectionDBForTest` has since `fa73da717` (2026-10-02). The two shared
+projection DB helpers now use the same topology declaration. Dedicated test
+connections, including the upload-mapping observer session, are outside this
+change; not every connection in the suite has been aligned. Two corrections to
+the entry above:
 
 - **The attribution is unsupported.** E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and
   E1-13 route through `shareProjectionDBForTest`, not through
@@ -2384,8 +2386,8 @@ DB declares a local-only topology. Two corrections to the entry above:
 - **The named helper's reach is small.** Its callers are the H1 initial-head tests,
   the single-DC `TestW2SyncXDCProvenanceCostCharacterization` and `TestMain`'s
   cleanup; none runs destructive GC, so none was refused by the gate for this
-  reason. The capability this entry asks for is therefore narrower than recorded —
-  and it is now uniform.
+  reason. Aligning the two shared helpers does not resolve or close the recorded
+  three-DC fixture-progress failures.
 
 Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
 (`datacenter1:1`) the gate accepts the harness config; with a synthetic

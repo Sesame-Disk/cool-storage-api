@@ -652,10 +652,10 @@ func lookupUserIDByEmailForCleanup(session *gocql.Session, email string) (string
 
 // openIntegrationProjectionDB opens the projection database against the fixture's
 // declared topology, the same way shareProjectionDBForTest does: the server config
-// carries every DC, and the destructive GC gate compares the live keyspace
-// replication against this declaration exactly. A hand-built config that declares
-// only the local DC refuses the G2 handoff on a three-DC fixture, which is the
-// fixture progress failure recorded in docs/TECHNICAL-DEBT.md.
+// carries the configured DC map. The destructive GC gate compares live keyspace
+// replication against that declaration exactly. This aligns the two shared
+// projection DB helpers; it does not identify the cause of the E1 fixture-progress
+// failures recorded in docs/TECHNICAL-DEBT.md.
 func openIntegrationProjectionDB() (*dbpkg.DB, error) {
 	cfg, err := config.Load()
 	if err != nil {

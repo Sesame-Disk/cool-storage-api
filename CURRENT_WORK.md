@@ -39,9 +39,10 @@ The source of record for order and closure states is
 
 Branch `test/harness-fixture-topology`, base main@a71eec36a (#292). `openIntegrationProjectionDB`
 now loads the server config — topology included — the way `shareProjectionDBForTest`
-has since `fa73da717`, so no harness DB declares a local-only topology and every
-harness connection carries `CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS`
-into the destructive GC gate's declared-vs-live comparison. Verified on the isolated
+has since `fa73da717`. Both shared projection DB helpers now carry
+`CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS` into the destructive
+GC gate's declared-vs-live comparison; dedicated test connections are outside
+this change. Verified on the isolated
 single-DC stack: the gate accepts the declared dev map and refuses a synthetic
 three-DC declaration naming `dc-na`/`dc-eu`/`dc-asia`; H1 initial-head tests pass.
 `docs/TECHNICAL-DEBT.md`'s three-DC entry is corrected, not closed: its attribution

@@ -8,14 +8,14 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
-## 2026-10-15 — Harness declares the fixture topology everywhere
+## 2026-10-15 — Shared projection DB helpers declare the fixture topology
 
 Test-harness only; no runtime, schema or gate change.
 `openIntegrationProjectionDB` now loads the server config the way
-`shareProjectionDBForTest` has since `fa73da717`, so the last topology-blind harness
-DB is gone: every harness connection declares
-`CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS`, which is what the
-destructive GC gate compares against the live keyspace.
+`shareProjectionDBForTest` has since `fa73da717`. Both shared helpers supply
+`CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS` to the destructive
+GC gate's declared-vs-live comparison. Dedicated test connections remain outside
+this change; no suite-wide topology claim is made.
 
 Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
 (`datacenter1:1`) the gate accepts the harness config; with a synthetic
@@ -28,6 +28,13 @@ it: the entry's mechanism attribution — that this helper blocks seven named E1
 is unsupported, because those legs use the topology-aware sibling helper, so the
 recorded "GC retirement n=0" symptom has some other, still unidentified cause. X1
 remains OPEN and `GC_ENABLED=false` remains mandatory.
+
+Post-rebase validation on `4d374fe39`: topology accept/reject discriminator,
+all five H1 tests, provenance-cost characterization, H1 race repetitions, short
+Go tree and normal/integration vet PASS. Standard required integration (A–G and
+seven preservation controls), API 20/20 suites and OIDC 25/25 tests PASS; container
+and outer exits 0. Subsequent precision edits change only docs and a Go comment.
+No real three-DC fixture was run; the synthetic map is a negative on single-DC RF1.
 
 ## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
 
