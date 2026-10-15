@@ -1,5 +1,16 @@
 # Open Work Index
 
+## E1-01H root before PREPARED evidence (2026-10-15)
+
+[E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) adds the C0 process cut:
+root present, exact deleting/uncommitted claim, orphan/discovery/lifecycle absent,
+canonical/K1 intact. Fresh recovery retains C0 while paused and after SIGKILL;
+resume proceeds to TERMINAL. Fixture disposal is explicit, after verification.
+Directed/race/negatives and standard integration/API/OIDC PASS; A–H and all eight
+preservation controls PASS. Frozen ledger gives scope and audit. G is merged
+in #292. Next: reconcile C0–C8 evidence and remaining qualifications against the
+current code; no automatic E1-01/X1 closure or activation authority.
+
 ## E1-01G PUBLISHED/PREPARED evidence (2026-10-14)
 
 [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records C3 inside real promotion:

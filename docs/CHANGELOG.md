@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — E1-01H root before PREPARED process crash
+
+[E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) witnesses productive C0:
+root persisted, exact uncommitted claim, no orphan/discovery/lifecycle and intact
+canonical/K1. Independent recovery proves safe retention before action and after
+SIGKILL/replay; resume completes normal G2/G3 and reaches TERMINAL. Explicit
+fixture disposal follows separate verification and supplies no reclamation claim.
+Directed/race/negative controls, short Go/vet and standard integration/API/OIDC
+PASS; container and outer exits 0. A–H and eight preservation controls PASS.
+One-DC frozen ledger, required gate and minimal shared harness wiring only.
+No runtime/schema/API/default/dependency change; E1-01/X1 remain OPEN.
+
 ## 2026-10-15 — Correct the E1 three-DC harness diagnosis (PR #293, docs only)
 
 The recorded attribution of seven E1 fixture-progress failures to

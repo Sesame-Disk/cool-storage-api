@@ -1,9 +1,9 @@
 # E1-01 — bounded crash-evidence plan
 
-Status: SOURCE INVENTORY / OPEN, updated 2026-10-14 against `main@6f8fc2630` (#291).
+Status: SOURCE INVENTORY / OPEN, updated 2026-10-15 against `main@a71eec36a` (#292).
 Original planning base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279); its dated inventory and execution plan remain below.
 The original planning/inventory PRs changed documentation only. Execution results
-belong to the linked A/B/C/D/E/F/G ledgers; this inventory closes no gate.
+belong to the linked A/B/C/D/E/F/G/H ledgers; this inventory closes no gate.
 X1 remains OPEN; production GC remains OFF. Deliberate destructive GC in an isolated development fixture is required for the drills.
 
 ## 0. Current reconciliation and next bounded execution (2026-10-14)
@@ -17,9 +17,9 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 
 | Cut | Current evidence and remaining qualification |
 |---|---|
-| C0: recovery root persisted, before PREPARED orphan LWT | U root-retention/late-producer controls and historical G1 R replay; no current-producer K witness identified in the reviewed tests/ledgers. Safe retention is permitted; no reclamation deadline is inferred. |
+| C0: recovery root persisted, before PREPARED orphan LWT | [E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) records productive C0 SIGKILL/resume with independent pre-action and post-kill retention/replay (in review, single DC). Root/claim/canonical/K1 retention is correct; explicit fixture disposal supplies no automatic reclamation evidence. |
 | C1/C2 | [E1-01A](./E1-01A-G2-PROCESS-CRASH.md), merged #281: productive preparation/committed handoff, SIGKILL, resume controls and independent recovery/replay. |
-| C3: exact lifecycle PUBLISHED, orphan still PREPARED | [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records productive C3 SIGKILL/resume and independent recovery/replay (in review, single DC). C2 stops before Promote, C4 after its successful return; neither independently supplied this middle-of-promotion witness. |
+| C3: exact lifecycle PUBLISHED, orphan still PREPARED | [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records productive C3 SIGKILL/resume and independent recovery/replay (merged #292, single DC). C2 stops before Promote, C4 after its successful return; neither independently supplied this middle-of-promotion witness. |
 | C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
 | C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
 | C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
@@ -44,7 +44,7 @@ root merely because the orphan is missing could strand a late PREPARED producer.
 G1's `root without canonical survives worker restart and remains durable` uses
 real Cassandra but historical StartBlockDeleteOrphan, direct scoped row removal,
 MockStorageProvider and a new worker in the same process. It is R, not a
-productive C0/SILO/SIGKILL observation. C0 remains OPEN for final evidence or an
+productive C0/SILO/SIGKILL observation. H now records that narrow process cut; C0 remains OPEN for final evidence disposition or an
 explicitly justified disposition; automatic root removal is not proposed.
 
 In PromoteBlockDeleteOrphan, confirmed blocks handoff and exact PREPARED orphan
@@ -57,11 +57,11 @@ The ambiguous-promotion mock flag returns before lifecycle insertion; its test
 must not be labelled a C3 middle-of-promotion witness. The G1 source guard checks
 historical StartBlockDeleteOrphan ordering, not the current Prepare method.
 These U/R controls supply no C0/C3 K claim by themselves; G separately records
-the current-producer C3 process cut. C0 and overall E1-01/X1 remain OPEN.
+the current-producer C3 process cut. H records current-producer C0 safe retention, not automatic reclamation. Final dispositions and overall E1-01/X1 remain OPEN.
 
 ### 0.3 Selected next drill: one internal C8 root-only TERMINAL cut
 
-Historical selection from #289, now merged in #290. The current next drill is
+Historical selection from #289, now merged in #290. A later selected drill is
 section 0.4. Execution record: [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md);
 results and validation limits are in that ledger. Its bounded plan is preserved below.
 
@@ -118,6 +118,22 @@ setup. Independent orphan recovery goes before separate queue settlement/replay
 so the killed leg exercises PREPARED recovery. SIGKILL/resume, preserved failure,
 fail-closed gate and Docker validation are required. No runtime change presumed;
 C0, three-DC and final gate dispositions remain separate.
+
+### 0.6 C0 execution and next bounded reconciliation (2026-10-15)
+
+[E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) adds only the root-persisted,
+before-PREPARED process cut. Parent durable reads distinguish it from C1 and
+require an uncommitted exact claim, absent orphan/lifecycle/discovery and intact
+canonical/K1. Fresh productive root recovery must visit and classify this exact
+unsettled authority and retain the entire snapshot, both while its producer is
+paused and after confirmed SIGKILL/replay. Resume must still finish normally.
+Explicit fixture disposal revokes the dead producer's exact uncommitted claim
+before root cleanup; it is not an automatic recovery/convergence witness.
+
+The next bounded step is documentation/source reconciliation of merged A–H
+against each C0–C8 obligation and qualification, before selecting any new runtime
+work. Do not infer closure from counting cut labels. Three-DC residuals, global
+scheduling and maintainer-owned E1-01/X1 dispositions remain separate.
 
 ## 1. Question and scope
 
