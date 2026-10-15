@@ -14,6 +14,7 @@ import (
 	"time"
 
 	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -86,6 +87,14 @@ func (o *e111Trace) ObserveQuery(_ context.Context, q gocql.ObservedQuery) {
 // candidate. The mutation must reach an exact COMMITTED D before it is RED.
 func e111GC(t *testing.T, fx *w2CreateFileFixture, database *dbpkg.DB, trace *e111Trace, failScan bool) {
 	t.Helper()
+	// Keep the observed/faulted native session, but declare the fixture's full
+	// topology to the real destructive gate. The fixture already requires Load;
+	// w2EvidenceSession's minimal config alone only declares its local DC.
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database = dbpkg.NewPublicationEvidenceDB(database.Session(), cfg.Database)
 	store := gcpkg.NewCassandraStore(database)
 	candidate := w2Candidate(t, gcpkg.NewCassandraStore(fx.database), fx.orgUUID, fx.blockID, fx.target.StorageClass)
 	scope := &w2ClosureOwnedQueue{GCStore: store, org: fx.orgUUID, block: fx.blockID, identity: candidate.Identity()}
