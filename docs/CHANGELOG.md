@@ -8,6 +8,16 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Reproduce and correct E1-3's observed-worker topology
+
+[The E1-3 ledger](./E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+records 1/3 PASS and two real topology-gate/barrier failures, then a nine-line
+local test adapter correction. Original legs pass in three DCs, race, EU and
+one DC; both original omission mutations fail at their behavior assertions.
+Short Go/vet and scoped cleanup audits pass. Retained auxiliary probes and
+unrun full-suite/remaining cases are explicit. No runtime/shared-helper change
+or gate closure; ordinary/production GC remains OFF.
+
 ## 2026-10-15 — Validate unchanged E1-13 in three DCs after #297
 
 [The existing E1-13 ledger](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)

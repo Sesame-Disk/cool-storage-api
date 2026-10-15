@@ -13,6 +13,7 @@ import (
 	"time"
 
 	v2pkg "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -127,6 +128,14 @@ type e13WorkerResult struct {
 func e13StartWorker(t *testing.T, fx *w2CreateFileFixture, observer *e13ProofObserver) (<-chan e13WorkerResult, <-chan struct{}) {
 	t.Helper()
 	database := w2EvidenceSession(t, splitEnvOrDefault("CASSANDRA_HOSTS", "cassandra:9042")[0], observer)
+	// Retain the observed native session; the destructive gate must receive the
+	// fixture's complete validated topology, not the helper's local-DC default.
+	// w2RepairFixture already requires config.Load through its database helper.
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database = dbpkg.NewPublicationEvidenceDB(database.Session(), cfg.Database)
 	store := gcpkg.NewCassandraStore(database)
 	candidate := w2Candidate(t, gcpkg.NewCassandraStore(fx.database), fx.orgUUID, fx.blockID, fx.target.StorageClass)
 	scope := &w2ClosureOwnedQueue{GCStore: store, org: fx.orgUUID, block: fx.blockID, identity: candidate.Identity()}

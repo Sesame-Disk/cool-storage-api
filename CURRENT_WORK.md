@@ -32,10 +32,20 @@ The source of record for order and closure states is
 - **Open follow-ups from the E1-16 runs:**
   - `ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01` (P2, multi-DC
     availability);
-  - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
-    legs do not run on three DCs.
+  - TECHNICAL-DEBT: the integration suite budget and remaining historical
+    E1 three-DC cases still need scoped validation (see current ledgers).
 
-## Active slice: E1-13 current-main three-DC evidence
+## Active slice: E1-3 observed-worker three-DC correction
+
+Base main@7fa8b2699 (#298). [E1-3 ledger](docs/E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+records 1/3 PASS and two real topology-gate/barrier failures before a nine-line
+local test adapter correction. Same three legs PASS in three DCs, race, EU and
+single-DC compatibility; both original behavior mutations are RED as expected.
+Owned cleanup is verified separately; 25 auxiliary discovery probes remain.
+No productive code changes. E1-7/E1-09/E1-10e and full-suite obligations remain
+pending; P2 umbrella, E1-01/X1/PRE-GC/A1 OPEN, ordinary/production GC OFF.
+
+## Previous merged slice: E1-13 current-main three-DC evidence (#298)
 
 Base `main@485d9b876` (#297). [E1-13 ledger](docs/E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
 records five unchanged legs PASS in three DCs, race twice and through EU, with
