@@ -2,6 +2,11 @@
 
 Frozen base: main@fc50e168db91212cdb6d74b78f3f7db8756c6310 (#268 merged).
 
+Current update (2026-10-15): the [current-main three-DC validation](#three-dc-validation-on-current-main-2026-10-15)
+uses the existing code after #296/#297. Current fixtures keep HEAD at the attempt's
+parent to produce UNKNOWN; earlier competitor-HEAD descriptions retain their
+frozen-version scope. The OS-killed actor is the sweep, not the interrupted writer.
+
 ## Contract and plan
 
 Measure one Office/CreateFile plaintext single-block durable repair not yet visited
@@ -216,3 +221,148 @@ is not accepted as full-suite evidence. The unchanged final image was restarted
 with the default go-all-test service command at 20:23 UTC; its result must be
 recorded separately. No timeout, gate, GC configuration or test assertion was
 relaxed for this retry.
+
+## Bounded three-DC validation plan (2026-10-15)
+
+Base `main@485d9b87640a66324e405ea54facdeb5d72bb5ed` (#297 merged), branch
+`codex/e113-three-dc-evidence`. Measure only the existing five E1-13 legs;
+the target's GC call already inherits #296's e111GC topology correction.
+
+1. Freeze current source/image. Reuse only the private owned #296/#297
+   Cassandra 5.0.9/SILO fixture after verifying zero roots/orphans/repairs,
+   complete NetworkTopologyStrategy RF1 declaration for dc-na/dc-eu/dc-asia,
+   all-node readiness and GC-OFF API. Record retained auxiliary storage probes
+   separately; do not claim the whole bucket is empty.
+2. Run the unchanged required five-leg matrix. Check naturally observed earlier
+   backlog buckets, target unvisited/zero-ref state, direct EQ repair guard,
+   real sweep SIGKILL/restart and native UNKNOWN/exact pub renewal. Current
+   fixtures hold HEAD at the interrupted attempt's parent; no competitor moves
+   it to SUPERSEDED. Do not relabel the fixture's panic as a writer OS crash.
+3. Repeat with race twice and native sessions through dc-eu, sequentially.
+   Execute original filtered/unavailable/child-filtered negatives and the
+   guard-only omission mutation in a disposable source copy. Require the real
+   COMMITTED certificate, target-not-visited marker, all three existing owned
+   cleanup checks and restored source identity.
+4. Preserve and diagnose any failure before a bounded correction. If current
+   code passes, publish only evidence/tracking, with no invented code fix.
+5. Audit source/topology, commands/exits, cleanup, links and claims before PR.
+   Finite backlog is not a fairness/latency guarantee. Other E1 cases, the P2
+   umbrella, E1-01/X1/PRE-GC/A1 and ordinary GC-OFF disposition remain separate.
+
+## Three-DC validation on current main (2026-10-15)
+
+Current code passes the existing five-leg matrix without changing source, gates or
+assertions. The target-not-yet-visited-gc leg calls e111GC and inherits #296's
+validated complete topology declaration; this validation assumes no new fix.
+
+### Source, topology and controls
+
+Base `main@485d9b87640a66324e405ea54facdeb5d72bb5ed`; image snapshot
+`5e3049ee1` adds only the frozen plan. Runner `sesamefs-e113-3dc-current`:
+`sha256:3d662f78e63f3a7793be7d1563c2f6b0aa375cd4bf405cefc7cb922128156ac9`.
+LF-normalized source hashes:
+
+| File | SHA256 |
+|---|---|
+| e113_discovery_delay_test.go | 5ca8787791a03651942948cf45a7a513045c7d460bfb3b1c732b3e59eeb86867 |
+| e111_repair_liveness_test.go | f90b15131d8ebd54ae937a546f0fa87a2b96601d988bc6e69c68f2e43abc746f |
+| w2_native_wire_test.go | d22a369ca0b7150463589480823ca84805b7c535345edaa8fe4fcf58e556a842 |
+
+Current-source backend binary SHA256:
+`f95399fbbcf07e5f853c04067839247222280b1bf02511e0142bfb95177cc6ab`.
+The private owned sesamefs-e111-3dc project reuses #296/#297 volumes without host
+ports. Before execution, independent EACH_QUORUM counts of roots, orphans and
+repairs were zero; twelve auxiliary discoverStorageClass probes were separately
+identified by content. No empty-bucket precondition or cleanup claim is made.
+Cassandra 5.0.9 has three healthy UN nodes; the dedicated sesamefs_e19 keyspace's
+actual/declared NetworkTopologyStrategy map is dc-na:1,dc-eu:1,dc-asia:1. SILO
+RELEASE.2026-09-16T00-00-00Z image remains
+`sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46`.
+
+One current-source GC-OFF API coordinates through dc-na; all supplied API URLs
+resolve to that private backend, and the matrix checks their GC-OFF condition.
+Initial native test/worker/sweep sessions use dc-na; the separate EU execution
+uses dc-eu for those sessions with the same NA API. There is no separate API
+replica per DC, divergent-replica/outage injection or every-coordinator proof.
+Pre-existing TestMain cleanup-DB declaration warnings retain their original scope.
+
+The selected repairs belong to separate owned organizations. The fixture chooses
+naturally earlier productive buckets without rewriting their ordering. Its
+existing created_at/lease controls and explicit sweep eligibility time +2h
+permit this finite observation while equal/later unselected extras remain deferred;
+all created fixtures, including extras, undergo the same independent cleanup.
+These controls are not a discovery SLA, same-org scale test, fairness bound,
+large-load result or arbitrary-delay/concurrent-worker proof.
+
+With an isolated, migrated GC-OFF Cassandra/SILO Docker fixture and explicit
+hosts/local-DC/complete-map configuration (see [testing](./TESTING.md)), run in
+the built runner:
+
+```bash
+for v in ${!SESAMEFS_REQUIRE_@}; do unset "$v"; done
+export SESAMEFS_REQUIRE_E113_DISCOVERY_DELAY_EVIDENCE=1
+unset SESAMEFS_E113_ISOLATED_URL
+go test -tags integration -v -count=1 -timeout 10m -run '^(TestRepairDiscoveryDelaySafety|TestRepairDiscoveryDelaySafetyCompleteness)$' ./internal/integration
+```
+
+The initial command also includes the existing gate-inventory/fanout guards.
+Race repeats use -race -count=2; EU changes native hosts/local DC only. Original
+scripts/e113-discovery-delay-gates.sh and scripts/e113-discovery-delay-mutation.sh
+run sequentially in a disposable container with their E19 hostname resolving
+to the private backend. Mutations never enter the workspace or immutable image.
+
+### Results and failure accounting
+
+Current code passes without an additional correction. Ignored tmp/ logs each
+have an explicit .exit file; the old source/results above remain historical.
+
+| Log | Result |
+|---|---|
+| e113-3dc-current.log | Five legs PASS, one verified sweep SIGKILL/restart, 18 fixtures with each of metadata/K1, expiry and pending-owner cleanup verified; gate/fanout guards PASS; exit 0. |
+| e113-3dc-race.log | -race -count=2: 10/10 legs PASS, two sweep SIGKILL/restarts, 36 fixtures with all three cleanup checks; exit 0. |
+| e113-3dc-eu.log | Five legs PASS through dc-eu, one sweep SIGKILL/restart, 17 fixtures with all three cleanup checks; exit 0. |
+| e113-3dc-negatives.log | Original filtered/unavailable/child-filtered controls PASS. Original guard-omission schedule records target NOT visited and exact productive COMMITTED D(P1), expects a nonzero test result and verifies all three cleanup surfaces; wrapper exit 0. |
+
+No positive leg failed or skipped. Natural bucket distribution changes the
+number of created fixtures; the acceptance rule remains at least three earlier
+repairs for backlog legs. No bucket relocation, ordering substitution, weaker
+assertion or new test was introduced. The omission's COMMITTED certificate is
+only a disposable mutation result, not a failure on current main. Its source
+restoration is independently checked: publication_liveness.go matches the
+immutable image byte-for-byte after execution.
+
+At the controlled pause, independent target reads show no durable classifier
+anchor/cursor/exhaustion, zero global refs and a non-expiring repair. The real
+worker observes the pending repair at EACH_QUORUM, releases the claim, retains
+the exact candidate/P1/K1 and creates no D/root. Resume visits the selected
+backlog before target, receives actual native UNKNOWN and renews the exact
+repair-owned pub: without fs promotion, HEAD/commit/root/P changes or repair
+removal. The fresh-process leg verifies sweep SIGKILL and rediscovery of the
+same first backlog before target; writers use the existing interruption seam,
+not OS death. No fleet-wide in-flight-read quiescence or general scheduling
+progress guarantee follows from this finite observation.
+
+Independent final EACH_QUORUM counts of roots, orphans and repairs are zero.
+All created E1-13 fixtures, including extras, verify owned metadata/K1, expiry
+canonical/projection and pending-owner canonical/projection absence. Auxiliary
+storage-class discovery probes are separate: 12 existed before, 17 afterward,
+all identified by discover.txt contents. discoverStorageClass deletes its library
+by API but retains these physical probes with GC OFF; the private volumes are
+retained, not declared globally empty. No auxiliary cleanup fix is proposed.
+
+Not run: full Go/vet, full standard integration/API/OIDC, standalone Sync/frontend,
+a new one-DC suite, the other E1 three-DC cases, divergent replicas or a broader
+outage/scale schedule. This PR changes only evidence/tracking documentation.
+The measured current E1-13 matrix no longer reproduces its recorded fixture
+progress failure after #296; no rerun of an older E1-13 RED or universal causal
+attribution is claimed. E1-3, E1-7, E1-09 and E1-10e remain pending. The P2
+umbrella and E1-01/X1/PRE-GC/A1 stay OPEN; ordinary/production GC stays OFF.
+The PREPARED-without-projection qualification from #295 remains unchanged.
+Final scoped audit: no introduced blocker identified. All non-Markdown files
+match main@485d9b876; the source hashes match the tested image. Original gates,
+assertions, eligibility controls, native session/query paths and all cleanup
+helpers remain unchanged. All 253 relative file links, new evidence anchor,
+command consistency and git diff --check PASS. Positive matrices have no SKIPs;
+expected mutation failures are distinguished from ordinary results. No empty
+bucket, unbounded scheduling, general three-DC suite or gate-closure claim.
+Backward compatible: yes, documentation/evidence tracking only.

@@ -35,7 +35,18 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-12 current-main three-DC evidence
+## Active slice: E1-13 current-main three-DC evidence
+
+Base `main@485d9b876` (#297). [E1-13 ledger](docs/E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+records five unchanged legs PASS in three DCs, race twice and through EU, with
+unvisited-target EQ protection, native UNKNOWN, sweep SIGKILL/restart and original
+gate/omission negatives. All created fixtures verify metadata/K1, expiry and
+pending-owner cleanup; 17 auxiliary storage probes remain in private volumes.
+The GC leg inherits #296's adapter correction; this slice changes docs only.
+Four other historical E1 cases and full-suite obligations remain pending.
+E1-01/X1/PRE-GC/A1 stay OPEN; ordinary/production GC OFF.
+
+## Previous merged slice: E1-12 current-main three-DC evidence (#297)
 
 Base `main@a5adc93e3` (#296). [E1-12 ledger](docs/E1-12-KNOWN-LOSER-CRASH-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
 records six unchanged legs PASS in three DCs, race twice and an EU-coordinator
