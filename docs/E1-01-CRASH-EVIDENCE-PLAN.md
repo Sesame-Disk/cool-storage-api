@@ -1,6 +1,6 @@
 # E1-01 — bounded crash-evidence plan
 
-Status: SOURCE INVENTORY / OPEN, updated 2026-10-15 against `main@a71eec36a` (#292).
+Status: SOURCE INVENTORY / OPEN, reconciled 2026-10-15 against `main@2e74e4cad215b1b59ca1fdb0030e21d0376eb67c` (#294).
 Original planning base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279); its dated inventory and execution plan remain below.
 The original planning/inventory PRs changed documentation only. Execution results
 belong to the linked A/B/C/D/E/F/G/H ledgers; this inventory closes no gate.
@@ -15,19 +15,33 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 
 ### 0.1 Recorded evidence by exact cut
 
-| Cut | Current evidence and remaining qualification |
-|---|---|
-| C0: recovery root persisted, before PREPARED orphan LWT | [E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) records productive C0 SIGKILL/resume with independent pre-action and post-kill retention/replay (in review, single DC). Root/claim/canonical/K1 retention is correct; explicit fixture disposal supplies no automatic reclamation evidence. |
-| C1/C2 | [E1-01A](./E1-01A-G2-PROCESS-CRASH.md), merged #281: productive preparation/committed handoff, SIGKILL, resume controls and independent recovery/replay. |
-| C3: exact lifecycle PUBLISHED, orphan still PREPARED | [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) records productive C3 SIGKILL/resume and independent recovery/replay (merged #292, single DC). C2 stops before Promote, C4 after its successful return; neither independently supplied this middle-of-promotion witness. |
-| C4/C5 | [E1-01B](./E1-01B-G3-PROCESS-CRASH.md), merged #283: before/after canonical retirement, process death, continuation and independent recovery/replay. |
-| C6/C7 | [E1-01C](./E1-01C-PHYSICAL-RECOVERY-CRASH.md), merged #287: confirmed S3 DELETE before phase persistence, then phase persisted before TERMINAL. |
-| C8 entry | [E1-01D](./E1-01D-TERMINAL-CLEANUP-CRASH.md), merged #288: TERMINAL before the aggregate DeleteS3Orphan call. This does not witness its internal delete boundaries. |
-| C8 internal | [E1-01E](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md) records root-only TERMINAL K evidence after orphan/discovery removal (merged #290, single DC). [E1-01F](./E1-01F-DISCOVERY-RETAINED-CRASH.md) records the separate orphan-absent/discovery-present/root-present K cut (merged #291, single DC). U/R controls retain their original scope; no all-C8 closure. |
+All entries below have recorded Linux Docker process-death evidence on one DC.
+`P1` is the exact physical target, `D1` its claim, and `K1` its immutable object.
+The named tests link to current instrumentation/oracles; the A–H ledgers retain
+frozen versions, outcomes, negative controls and limitations. These are recorded
+results, not new executions in this reconciliation PR.
 
-The A/B/C/D ledgers retain their frozen sources and scope. E adds only its
-recorded internal boundary; its ledger separates new results from reused controls.
-None closes all E1-01 or X1.
+| Cut | Current hold and independent durable precondition | Recorded kill/recovery result |
+|---|---|---|
+| C0 | [H](../internal/integration/e101h_root_before_prepared_crash_test.go): successful exact root INSERT, before PREPARED submission; uncommitted blocks claim, root present, orphan/discovery/lifecycle absent, canonical/K1 intact | [#294 / H ledger](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md): fresh recovery visits absent orphan/unpublished lifecycle and retains the complete snapshot while paused and after SIGKILL/replay. Resume reaches TERMINAL. Later explicit fixture disposal is not automatic recovery. |
+| C1 | [A](../internal/integration/e101_g2_process_crash_test.go), `prepared`: successful Prepare return before Commit; exact PREPARED/root, uncommitted blocks handoff, no lifecycle, K1 intact | [#281 / A ledger](./E1-01A-G2-PROCESS-CRASH.md): abort only uncommitted D1; preserve canonical/K1 and repair authority; replay harmless. Resume completes productive deletion. |
+| C2 | A, `committed`: successful blocks handoff before Promote; exact PREPARED/root, committed D1, no lifecycle, K1 intact | A ledger: independent recovery promotes/retires exact D1/P1, deletes K1 and reaches TERMINAL; replay harmless. |
+| C3 | [G](../internal/integration/e101g_published_prepared_crash_test.go): successful exact lifecycle INSERT before orphan COMMITTED CAS; committed blocks handoff, PUBLISHED lifecycle, PREPARED orphan, canonical/K1 intact | [#292 / G ledger](./E1-01G-PUBLISHED-PREPARED-CRASH.md): orphan recovery runs before queue settlement, exercises PREPARED promotion and reaches TERMINAL; replay settles exact work. |
+| C4 | [B](../internal/integration/e101b_g3_process_crash_test.go), `before-retirement`: successful Promote return before Finalize; COMMITTED orphan/root, PUBLISHED lifecycle, committed blocks and K1 intact | [#283 / B ledger](./E1-01B-G3-PROCESS-CRASH.md): fresh org-scoped queue replay retires P1 and settles work while preserving continuation/K1, then independent physical recovery reaches TERMINAL. |
+| C5 | B, `after-retirement`: successful Finalize before candidate/queue settlement; blocks absent, exact COMMITTED orphan/root/PUBLISHED lifecycle and K1 intact | B ledger: queue replay settles retained work without altering continuation/K1; independent physical recovery reaches TERMINAL. |
+| C6 | [C](../internal/integration/e101c_physical_recovery_crash_test.go), `after-delete`: before phase call after real S3 DELETE; blocks/K1 absent, COMMITTED/pending_s3 orphan, root and PUBLISHED lifecycle | [#287 / C ledger](./E1-01C-PHYSICAL-RECOVERY-CRASH.md): fresh recovery repeats the exact physical-life operation and reaches TERMINAL; replay preserves absence. |
+| C7 | C, `after-phase`: successful phase return before terminal transition; same identity/absence, pending_mapping_cleanup and PUBLISHED lifecycle | C ledger: fresh recovery completes lifecycle metadata and reaches TERMINAL; replay harmless. Historical phase name does not require a mapping DELETE. |
+| C8 entry | [D](../internal/integration/e101d_terminal_cleanup_crash_test.go): before aggregate DeleteS3Orphan; exact TERMINAL, COMMITTED orphan/discovery/root/token present, blocks/K1 absent | [#288 / D ledger](./E1-01D-TERMINAL-CLEANUP-CRASH.md): independent metadata recovery removes exact orphan/discovery/root and preserves TERMINAL/absence on replay. |
+| C8 after orphan DELETE | [F](../internal/integration/e101f_discovery_retained_crash_test.go): successful owned orphan DELETE before discovery DELETE; TERMINAL, orphan absent, exact discovery/root/token retained | [#291 / F ledger](./E1-01F-DISCOVERY-RETAINED-CRASH.md): root-only recovery uses durable token to remove discovery then root; replay preserves TERMINAL/absence. |
+| C8 after discovery DELETE | [E](../internal/integration/e101e_root_only_terminal_crash_test.go): successful owned discovery DELETE before root DELETE; TERMINAL, orphan/discovery absent, exact root/token retained | [#290 / E ledger](./E1-01E-ROOT-ONLY-TERMINAL-CRASH.md): fresh root-only recovery removes retained root; replay preserves TERMINAL/absence. |
+
+All cuts have same-boundary resume controls and independent post-action checks.
+Shared [e101RunMatrix/e101AssertRecovered](../internal/integration/e101_g2_process_crash_test.go)
+verify SIGKILL, fresh recovery/replay and HEAD/refs/repairs; H's killed branch
+instead requires unchanged safe retention. After final root deletion the settled
+state and fresh replay are asserted; no remaining continuation at that point is
+identified here as a new crash drill. Eight preservation controls separately
+verify failed-fixture snapshots/live state before explicit owned disposal.
 
 ### 0.2 C0/C3 source obligations and limits
 
@@ -130,10 +144,58 @@ paused and after confirmed SIGKILL/replay. Resume must still finish normally.
 Explicit fixture disposal revokes the dead producer's exact uncommitted claim
 before root cleanup; it is not an automatic recovery/convergence witness.
 
-The next bounded step is documentation/source reconciliation of merged A–H
+The next bounded step selected by H was documentation/source reconciliation of merged A–H
 against each C0–C8 obligation and qualification, before selecting any new runtime
-work. Do not infer closure from counting cut labels. Three-DC residuals, global
+work; its outcome is now recorded in section 0.7. Do not infer closure from counting cut labels. Three-DC residuals, global
 scheduling and maintainer-owned E1-01/X1 dispositions remain separate.
+
+### 0.7 Reconciliation outcome and open dispositions (2026-10-15)
+
+The current worker/store order matches the table: Prepare checks the exact
+claim, publishes/reads its root, then submits PREPARED; Commit precedes Promote;
+Promote inserts PUBLISHED before the orphan COMMITTED CAS; Finalize precedes
+candidate/queue settlement. Recovery deletes exact K1 before phase persistence,
+then terminates the lifecycle before DeleteS3Orphan removes orphan, discovery
+and root in that order. Source: [worker](../internal/gc/worker.go),
+[Cassandra store](../internal/gc/store_cassandra.go). The K evidence reconciled
+here corresponds to the named C0–C8 observation points; it does not establish
+coverage of every internal durable write between them.
+
+In particular, Prepare can persist the exact PREPARED orphan LWT before
+`ensureS3OrphanProjectionResult` publishes `gc_s3_orphans_by_day`. This leaves
+root and PREPARED present with discovery still absent. H pauses before the
+orphan INSERT; A pauses after successful Prepare return, including projection
+publication. Neither is specific K evidence for this intermediate window.
+Root recovery calls `PublishS3OrphanDiscovery` before canonical recovery, but
+that route alone does not prove process-death behavior at this window. Its
+equivalence to existing evidence or need for a separate drill remains pending
+final E1-01 disposition; this docs-only PR adds no experiment or runtime finding.
+This is a source/evidence reconciliation, not proof of every error/concurrency schedule.
+
+| Obligation | Current disposition and next evidence needed |
+|---|---|
+| Enumerated C0–C8 process cuts | Recorded K evidence on one DC, with resume/replay and failure preservation. Maintainer acceptance/final E1-01 disposition remains OPEN; this PR closes no gate. |
+| Internal PREPARED-without-projection window | Root and exact PREPARED orphan present, discovery absent. No specific K witness is established here. Justify equivalence or select additional evidence in final E1-01 disposition; do not infer a product defect or require an experiment in this PR. |
+| C0 unresolved root | Safe retention is the expected outcome under current authority rules. H's Abort/DeletePrepared fixture disposal is separate. No automatic reclamation deadline or product defect is established. |
+| Global G5 scheduling, persisted checkpoints and fairness | A–H use [w2OwnedRecoveryStore](../internal/integration/w2_worker_repair_lifecycle_test.go): real root reads filtered to owned identity; LoadGCStats returns not-found and SaveGCStats is a no-op. They do not certify global progress or cursor durability. Existing [G5 real-stack controls](../internal/integration/g5_recovery_scheduling_test.go) retain their R scope; do not invent a new runtime fix from that limitation. |
+| Three-DC and ambiguity/outage coverage | A–H are single-DC healthy-service recovery schedules, not three-DC, every LWT/S3 ambiguous result or outage proof. Cross-check existing controls/results before requiring more tests. The [seven recorded E1 fixture-progress failures](./TECHNICAL-DEBT.md#e1-16-test-infrastructure-follow-ups-2026-10-10) remain OPEN with cause unestablished; #293's withdrawn loader change supplies no diagnosis/fix. |
+| Physical coexistence and final reclassification | A–H do not create a P2 publication/coexistence witness. Existing G4/G5 controls retain their scope. Reconcile their results with [D0 §25 E1](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md#e1--x1-final-evidence--reclassification), including H, R18, R27, R28, E6, 020 and R30/R31, before maintainer closure. No disposition of those separate rows is changed here. |
+
+The next execution PR should select one of the existing seven three-DC
+fixture-progress failures, reproduce it on frozen current code in an isolated
+Docker topology, and record actual replication/local DC, exact candidate,
+worker visits and durable state. For example, the existing E1-11
+[TestCurrentRuntimeRepairLiveness](../internal/integration/e111_repair_liveness_test.go)
+is a candidate to diagnose; it is not yet selected as a proven cause or fix.
+Require the original gate and owned cleanup; do not bypass topology checks or
+assume openIntegrationProjectionDB is involved. If the failure reproduces,
+classify product versus fixture/availability and make only the demonstrated
+cause's bounded RED→GREEN correction. If it does not, preserve that result and
+leave the obligation open. Add no extra cut or generic harness refactor here.
+
+E1-01/X1 and PRE-GC/A1 remain OPEN; ordinary/production GC remains OFF.
+The identity audit and other X1/PRE-GC rows remain in the
+[critical-path source of record](./X1-CRITICAL-PATH.md).
 
 ## 1. Question and scope
 
@@ -257,7 +319,7 @@ explicit, justified disposition under the existing contract. No synthetic future
 
 ## 5. Original later-slice order and continuing gates
 
-A/B/C/D are now merged; section 0 selects the next still-unproven internal cut.
+Historical slice order, now implemented by merged A–H. Section 0.7 records the current qualifications; this list does not select another drill.
 
 After C1/C2 evidence is reviewed, select only still-unproven current cuts from the inventory:
 canonical-retirement C4/C5 in one small PR; physical-delete/terminal cleanup C6–C8 split at the phase or terminal boundary;
@@ -320,3 +382,44 @@ guards, not new real-service or K evidence. No new test was added to mirror pros
 Not run for this documentation-only diff: integration, race, API/OIDC, Sync and
 three-DC tests. Prior A/B/C/D results retain their own ledgers and frozen sources.
 E1-01/X1 remain OPEN; production GC stays OFF and no development GC flag changed.
+## 8. Merged A–H reconciliation audit (2026-10-15)
+
+Reviewed against `main@2e74e4cad215b1b59ca1fdb0030e21d0376eb67c` (#294).
+Current pause/oracle code, worker/store order, merged PR identities and the
+A–H frozen ledgers were inspected. The original H full-run log confirms all
+A–H matrices/eight preservation controls and both recorded runner exits 0;
+those remain historical results, not new integration execution here.
+
+Five Markdown files only. All 281 relative file links in the changed documents
+and 20 named test functions in this plan resolve; new section anchors resolve,
+and the existing section-0 anchor is preserved. Source checks confirm Prepare,
+Promote, physical-delete/phase and terminal/orphan/discovery/root ordering.
+All eight gates remain in TestMain and both Compose commands. Fixture-local
+checkpoint overrides were checked against their actual implementations.
+`git diff --check` PASS. The initial scoped audit missed an overly broad
+coverage conclusion; the crossed-audit correction below supersedes it.
+
+Docker image `sesamefs-e101-reconciliation`:
+`sha256:dab75325dc6d5168cd17c1f92545d1e28d1ba38c8f7717e7f46a8f3d3f4040dc`.
+`go test -count=1 -timeout 5m -run '^Test(G[1-5]|X1PhysicalLifeHandoff)' ./internal/gc`
+PASS (0.073s, exit 0); ignored logs `tmp/e101-reconciliation-build.log` and
+`tmp/e101-reconciliation-unit.log`, recorded unit exit 0. Only documentation
+changed after this image build. No new tests were added to mirror prose.
+Not run for this docs-only PR: full Go tree, vet, integration, race, API/OIDC,
+Sync/frontend and three-DC suites. No new service/crash evidence or gate closure.
+
+### Crossed-audit correction — named cuts versus internal writes
+
+The P2 THIS-PR documentation finding is accepted: the initial conclusion about
+no additional uncovered successful-transition cut exceeded the named-point
+reconciliation. Section 0.7 and its CURRENT_WORK/index/changelog summaries now
+limit K coverage to those points and explicitly retain PREPARED-without-projection
+as pending evidence equivalence/additional-drill disposition. No runtime defect
+is established, no new experiment is added and no gate disposition changes.
+
+Correction checks: all 281 relative file links and the three section anchors
+still resolve; source order and A/H pause locations were rechecked; no broad
+absence-of-additional-cuts claim remains in the new inventory/summaries.
+`git diff --check` PASS; final diff remains five Markdown files. Prior Docker
+unit results above predate this prose correction. Runtime tests, integration,
+race and three-DC suites were not repeated for the correction.

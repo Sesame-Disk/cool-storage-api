@@ -1,5 +1,17 @@
 # Open Work Index
 
+## E1-01 reconciled C0–C8 inventory (2026-10-15)
+
+[Current matrix and open dispositions](./E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
+match current worker/store transitions to merged A–H process evidence (#294
+included). Recorded named points have one-DC evidence; internal durable writes
+are not exhaustively covered. PREPARED before discovery publication awaits
+equivalence/additional-evidence disposition in E1-01. Global G5
+progress, three-DC/ambiguity qualifications and final D0 dispositions are separate.
+Next execution is one representative existing three-DC fixture-progress diagnosis,
+with no assumed helper cause or speculative refactor. E1-01/X1 remain OPEN;
+ordinary/production GC OFF. No issue or gate is opened or closed by this inventory.
+
 ## E1-01H root before PREPARED evidence (2026-10-15)
 
 [E1-01H](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) adds the C0 process cut:
@@ -7,9 +19,9 @@ root present, exact deleting/uncommitted claim, orphan/discovery/lifecycle absen
 canonical/K1 intact. Fresh recovery retains C0 while paused and after SIGKILL;
 resume proceeds to TERMINAL. Fixture disposal is explicit, after verification.
 Directed/race/negatives and standard integration/API/OIDC PASS; A–H and all eight
-preservation controls PASS. Frozen ledger gives scope and audit. G is merged
-in #292. Next: reconcile C0–C8 evidence and remaining qualifications against the
-current code; no automatic E1-01/X1 closure or activation authority.
+preservation controls PASS. Frozen ledger gives scope and audit. H is merged
+in #294; the current reconciliation is linked above. No automatic E1-01/X1
+closure or activation authority.
 
 ## E1-01G PUBLISHED/PREPARED evidence (2026-10-14)
 
