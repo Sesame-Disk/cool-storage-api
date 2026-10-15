@@ -2369,3 +2369,27 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 **2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
 
 **E1 in-process-GC legs cannot run on a three-DC fixture (P2).** `openIntegrationProjectionDB` builds its `DatabaseConfig` without replication, so it declares only the local DC. On a three-DC keyspace the in-process GC's destructive topology gate correctly refuses the G2 handoff. As a result, E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13 fail on fixture progress ("GC retirement n=0", "worker did not visit owned real candidate"), not on safety. These legs are single-DC evidence by design. If they are wanted on three DCs, the harness must declare the fixture topology, for example from `CASSANDRA_REPLICATION_DCS`.
+
+**2026-10-15 (harness aligned; the mechanism above does not hold).**
+`openIntegrationProjectionDB` now loads the server config the way
+`shareProjectionDBForTest` has since `fa73da717` (2026-10-02), so the harness
+declares the fixture topology everywhere rather than in most places and no harness
+DB declares a local-only topology. Two corrections to the entry above:
+
+- **The attribution is unsupported.** E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and
+  E1-13 route through `shareProjectionDBForTest`, not through
+  `openIntegrationProjectionDB`, and that helper already loaded the server config
+  two days before this entry was written. Their recorded symptom therefore has
+  some other cause, which is **not identified here and stays open**.
+- **The named helper's reach is small.** Its callers are the H1 initial-head tests,
+  the single-DC `TestW2SyncXDCProvenanceCostCharacterization` and `TestMain`'s
+  cleanup; none runs destructive GC, so none was refused by the gate for this
+  reason. The capability this entry asks for is therefore narrower than recorded —
+  and it is now uniform.
+
+Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
+(`datacenter1:1`) the gate accepts the harness config; with a synthetic
+`dc-na:1,dc-eu:1,dc-asia:1` declaration it refuses with the exact-mismatch error
+naming those datacenters, which the hand-built config could not produce because it
+ignored `CASSANDRA_REPLICATION_DCS`. H1 initial-head tests pass unchanged. The
+seven legs were not re-run on a three-DC fixture.

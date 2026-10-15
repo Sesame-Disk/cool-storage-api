@@ -8,6 +8,27 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Harness declares the fixture topology everywhere
+
+Test-harness only; no runtime, schema or gate change.
+`openIntegrationProjectionDB` now loads the server config the way
+`shareProjectionDBForTest` has since `fa73da717`, so the last topology-blind harness
+DB is gone: every harness connection declares
+`CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS`, which is what the
+destructive GC gate compares against the live keyspace.
+
+Verified 2026-10-15 on the isolated single-DC stack: with the dev map declared
+(`datacenter1:1`) the gate accepts the harness config; with a synthetic
+`dc-na:1,dc-eu:1,dc-asia:1` declaration it refuses with the exact-mismatch error
+naming those datacenters, a refusal the hand-built config could not produce because
+it ignored the variable. H1 initial-head tests pass unchanged.
+
+This **corrects** the three-DC entry in `docs/TECHNICAL-DEBT.md` rather than closing
+it: the entry's mechanism attribution — that this helper blocks seven named E1 legs —
+is unsupported, because those legs use the topology-aware sibling helper, so the
+recorded "GC retirement n=0" symptom has some other, still unidentified cause. X1
+remains OPEN and `GC_ENABLED=false` remains mandatory.
+
 ## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
 
 [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) witnesses C3 inside productive

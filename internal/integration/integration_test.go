@@ -650,16 +650,18 @@ func lookupUserIDByEmailForCleanup(session *gocql.Session, email string) (string
 	return userID, userID != "", nil
 }
 
+// openIntegrationProjectionDB opens the projection database against the fixture's
+// declared topology, the same way shareProjectionDBForTest does: the server config
+// carries every DC, and the destructive GC gate compares the live keyspace
+// replication against this declaration exactly. A hand-built config that declares
+// only the local DC refuses the G2 handoff on a three-DC fixture, which is the
+// fixture progress failure recorded in docs/TECHNICAL-DEBT.md.
 func openIntegrationProjectionDB() (*dbpkg.DB, error) {
-	cfg := config.DatabaseConfig{
-		Hosts:       splitEnvOrDefault("CASSANDRA_HOSTS", "cassandra:9042"),
-		Keyspace:    envOrDefault("CASSANDRA_KEYSPACE", "sesamefs"),
-		Consistency: envOrDefault("CASSANDRA_CONSISTENCY", "LOCAL_QUORUM"),
-		LocalDC:     envOrDefault("CASSANDRA_LOCAL_DC", "datacenter1"),
-		Username:    os.Getenv("CASSANDRA_USERNAME"),
-		Password:    os.Getenv("CASSANDRA_PASSWORD"),
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
 	}
-	return dbpkg.New(cfg)
+	return dbpkg.New(cfg.Database)
 }
 
 func resolveIntegrationBaseURL(baseURL string) (string, error) {

@@ -35,7 +35,21 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: E1-01G PUBLISHED/PREPARED process crash
+## Active slice: harness topology declaration (test-only)
+
+Branch `test/harness-fixture-topology`, base main@a71eec36a (#292). `openIntegrationProjectionDB`
+now loads the server config — topology included — the way `shareProjectionDBForTest`
+has since `fa73da717`, so no harness DB declares a local-only topology and every
+harness connection carries `CASSANDRA_REPLICATION_CLASS`/`CASSANDRA_REPLICATION_DCS`
+into the destructive GC gate's declared-vs-live comparison. Verified on the isolated
+single-DC stack: the gate accepts the declared dev map and refuses a synthetic
+three-DC declaration naming `dc-na`/`dc-eu`/`dc-asia`; H1 initial-head tests pass.
+`docs/TECHNICAL-DEBT.md`'s three-DC entry is corrected, not closed: its attribution
+to this helper for seven E1 legs is unsupported — those legs use the topology-aware
+sibling — so that symptom's cause remains open and the legs were not re-run on three
+DC. See [docs/CHANGELOG.md](docs/CHANGELOG.md) (2026-10-15).
+
+## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 
 Branch `codex/e101-published-prepared-crash`, base main@6f8fc2630 (#291).
 [E1-01G](docs/E1-01G-PUBLISHED-PREPARED-CRASH.md) is bounded to C3: successful
