@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Reproduce and correct E1-7's retirement worker declaration
+
+[The E1-7 ledger](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+records original 4/6 PASS and two real topology-gate retirement failures, then
+eight local test-helper lines that preserve the native session and full proof.
+Six legs pass in three DCs, race and EU; original gate/RecvFS-persistence negatives
+and post-teardown cleanup checks pass. Other helper callers receive scoped
+compatibility checks (39 assertions PASS); six independent COMMITTED teardown
+residues were disposed and tracked as P2 follow-up. Retained probes, pending
+three-DC cases and unrun full
+suite remain explicit. No runtime/shared-session-helper change or gate closure.
+
 ## 2026-10-15 — Reproduce and correct E1-3's observed-worker topology
 
 [The E1-3 ledger](./E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)

@@ -1,5 +1,13 @@
 # Known Issues - SesameFS
 
+## E1 compatibility fixture cleanup (2026-10-15)
+
+**P2 FOLLOW-UP / GENERAL, OPEN.** E1-10e and E1-17 COMMITTED cases leave orphan/
+recovery-root metadata after their block/lifecycle/object teardown. Six owned
+pairs were reproduced during E1-7 compatibility and explicitly disposed;
+twenty older pairs remain retained. This is independent test hygiene, tracked
+in [technical debt](./TECHNICAL-DEBT.md#e1-compatibility-committed-teardown-residues).
+
 ## W2-10 content resurrection closed (E1-17, 2026-10-12)
 
 `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01` is closed for X1.
