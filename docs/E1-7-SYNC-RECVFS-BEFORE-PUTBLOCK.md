@@ -156,3 +156,25 @@ No backend image was redeployed. In-process handler evidence compiles current
 source; external HTTP regression uses the existing dev stack. No optional 3DC
 phase is certified. Production config still has GC_ENABLED=false; local manual
 worker/discovery controls do not certify production candidate discovery/grace.
+
+## Scoped three-DC verification plan (2026-10-15)
+
+Base main@7a8bf5b86 (merged #299). Freeze before Go changes. Scope: the six
+existing E1-7 ordered Sync legs, not the wider Sync protocol or E1-17 handlers.
+
+1. Run unchanged TestE17SyncRecvFSBeforePutBlock on isolated Cassandra 5.0.9 /
+   SILO, actual NTS RF1 in dc-na/dc-eu/dc-asia, GC-OFF backend. Require its named
+   evidence gate; record failures, actual topology and owned cleanup.
+2. Diagnose before fixing. If a local observed-worker wrapper omits validated
+   fixture replication, correct only that adapter, preserving the native session,
+   real gate, proof reads, original assertions and bounded peer handling.
+3. Repeat all six legs, race, EU coordinator and one-DC compatibility. Preserve
+   required filtered/unavailable negatives and the original RecvFS-persistence
+   omission control, exclusively in disposable containers; restore/compare source.
+4. Verify owned metadata/K1/expiry cleanup and classify retained auxiliary probes;
+   run relevant short Go/vet and static guards in Docker. Audit source/diff/docs
+   and current main, then open a focused PR with exact evidence and limits.
+
+No runtime/schema/default/shared-helper refactor without a reproduced need.
+No full-suite, external-client/auth, TTL, partition or all-order claim follows
+from directed tests. P2 umbrella, E1-01/X1/PRE-GC/A1 stay OPEN; ordinary GC OFF.
