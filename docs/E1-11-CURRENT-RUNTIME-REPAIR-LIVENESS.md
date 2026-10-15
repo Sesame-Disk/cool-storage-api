@@ -280,3 +280,30 @@ PASS. Raw metrics.go text differs only in comments; earlier raw-Go identity
 statements describe their recorded snapshots, not this textual correction.
 The recorded full go-all-test and race results are prior runs, not new executions
 claimed here. Updated scoped audit has no unresolved introduced P0/P1/P2.
+## Bounded three-DC diagnosis plan (2026-10-15)
+
+Base `main@550a2257bcdfe6902bad64d9541714367ff96f1e` (#295 merged), branch
+`codex/e111-three-dc-diagnosis`. Scope: the existing six E1-11 legs and their
+recorded three-DC fixture-progress failure; no new safety invariant or gate closure.
+
+1. Freeze unmodified test/runtime sources. Use a fresh private Docker project:
+   Cassandra 5.0.9, NetworkTopologyStrategy RF1 in dc-na/dc-eu/dc-asia, SILO and
+   a current-source GC-OFF backend. Verify all three nodes, actual/declared map,
+   readiness, owned candidate and session used by the productive worker.
+2. Run the existing required E1-11 matrix unchanged. Preserve failures and
+   teardown evidence. Trace shareProjectionDBForTest and the observed native
+   worker session separately; do not assume the withdrawn #293 diagnosis.
+3. Only after reproduction, isolate one cause. A test-session configuration
+   correction must preserve the real topology gate, native wire faults,
+   LOCAL_QUORUM/SERIAL/EACH_QUORUM queries and existing proof/cleanup assertions.
+   Do not refactor independent helpers or silently certify other E1 residuals.
+4. Require the identical matrix GREEN on the same three-DC fixture, appropriate
+   race repetitions, the original fail-closed gate controls and relevant one-DC
+   compatibility evidence. A runtime defect would require its own bounded fix.
+5. Audit source/image identity, positive versus expected-negative exits, missing
+   or skipped evidence, and owned cleanup before opening the focused PR. Report
+   all unrun suites and retain E1-01/X1/PRE-GC/A1 OPEN; ordinary GC stays OFF.
+
+Hypothesis to test: E1-11 constructs its observed worker via w2EvidenceSession,
+whose DatabaseConfig declares only LocalDC, omitting the configured replication
+map. This is not openIntegrationProjectionDB and is not yet causal evidence.
