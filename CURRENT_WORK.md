@@ -1,6 +1,6 @@
 # Current Work
 
-## Status snapshot (2026-10-12)
+## Status snapshot (2026-10-15)
 
 The source of record for order and closure states is
 [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md). This is a summary.
@@ -15,7 +15,7 @@ The source of record for order and closure states is
 - **W2 checklist:** every row, W2-0..14, is closed for X1. W2-10 (content
   resurrection) was closed by E1-17 (CLOSED-FIX).
 - **Remaining before X1 CLOSED:**
-  1. E1-01, after inventorying the G1–G5 crash evidence (next);
+  1. E1-01, after final source/evidence reconciliation of A–H (next);
   2. the three-DC residuals (28 of the 30 G5 failures now pass);
   3. the D0 §25 reclassification list;
   4. the identity claim-table PRE-X1 audit debt.
@@ -35,7 +35,22 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite is at its 40m budget, and the E1
     legs do not run on three DCs.
 
-## Active slice: correct the E1 three-DC diagnosis (PR #293, docs only)
+## Active slice: E1-01H root before PREPARED process crash
+
+Branch `codex/e101-root-before-prepared-crash`, rebased onto main@6324057eb (#293).
+[E1-01H](docs/E1-01H-ROOT-BEFORE-PREPARED-CRASH.md) adds C0: the exact root
+INSERT succeeds before PREPARED is submitted. The productive org-scoped worker
+has a real uncommitted claim and zero liveness. Independent recovery visits the
+missing orphan/unpublished lifecycle while the producer is paused, then again
+after SIGKILL and on replay: exact root/claim/canonical/K1 retention is correct.
+Resume must finish G2/G3 and fresh recovery reaches exact TERMINAL. Explicit
+owned-fixture disposal is separately identified; no automatic reclamation claim.
+Directed/race, short Go/vet, negative controls and standard integration/API/OIDC
+PASS; both full-runner exits 0. A–H and all eight preservation controls PASS.
+Scoped audit found no blockers; frozen ledger records one-DC scope. No runtime change;
+E1-01/X1 remain OPEN, ordinary/production GC OFF.
+
+## Previous merged slice: correct the E1 three-DC diagnosis (PR #293, docs only)
 
 Branch `test/harness-fixture-topology`, base main@a71eec36a (#292).
 The seven recorded E1 fixture-progress failures already use shareProjectionDBForTest;
@@ -49,6 +64,7 @@ is deferred and the evidence needed to reconsider it. [The dated archive](docs/l
 preserves withdrawn-version results, including real H1 three-DC evidence, without
 certifying this final diff or closing the seven E1 obligations. E1/X1 remain OPEN;
 ordinary/production GC OFF. This is a diagnosis correction, not an X1 runtime fix.
+
 
 ## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 
