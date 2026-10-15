@@ -177,3 +177,27 @@ zero test grace and dequeue discovery is narrowed to that candidate. Claims,
 EACH_QUORUM proof, lifecycle/orphan/root publication and physical recovery remain
 productive. This does not demonstrate automatic candidate creation at pub: expiry
 (W2-14), discovery latency, production grace policy or background scheduling.
+## Bounded three-DC validation plan (2026-10-15)
+
+Base `main@a5adc93e3a49185fc4ec5369c26ffa17354f6be7` (#296 merged), branch
+`codex/e112-three-dc-evidence`. Scope: the existing six E1-12 legs, with the
+inherited e111GC topology correction already present. No new fix is presumed.
+
+1. Freeze current source/image and verify the private Cassandra 5.0.9/SILO
+   fixture, actual and declared NetworkTopologyStrategy RF1 map across
+   dc-na/dc-eu/dc-asia, all-node readiness and GC-OFF API. Reuse only the owned
+   #296 fixture after independent zero-root/orphan/repair checks; retain volumes.
+2. Require the existing E1-12 six-leg gate on unmodified current code. Inspect
+   real applied=false, verified writer SIGKILL, TTL expiry, exact worker guard,
+   separate-process sweep/replay and current SUPERSEDED outcome where applicable.
+   Retain metadata/K1 and expiry-tracker/projection cleanup assertions.
+3. Run race repetitions and a separate EU-coordinator matrix sequentially.
+   Run the original filtered/unavailable/child-filtered gate negatives and
+   pending-repair omission mutation only in a disposable container copy; verify
+   its exact COMMITTED certificate, owned cleanup and source restoration.
+4. If current code fails, preserve the concrete failure and isolate its cause
+   before any bounded correction. If it passes, publish evidence/tracking only;
+   do not add tests, a generic harness refactor or speculative product changes.
+5. Audit commands/exits, skipped evidence, source/topology identity, cleanup and
+   links before the focused PR. Report unrun suites. Other E1 cases, E1-01/X1,
+   PRE-GC/A1 and GC activation dispositions remain separate and OPEN.
