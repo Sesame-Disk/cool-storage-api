@@ -2426,3 +2426,15 @@ original gate/omission negatives and all three owned cleanup surfaces. Retained
 auxiliary probes and finite-backlog limits are explicit. This is current scoped
 positive evidence, not proof of every historical failure's cause. E1-3, E1-7,
 E1-09 and E1-10e remain pending; the P2 umbrella/full-suite obligations stay OPEN.
+
+**2026-10-15 E1-3 scoped diagnosis.** The unchanged three-leg matrix reproduces
+one control PASS and two worker failures: e13StartWorker's w2EvidenceSession
+wrapper declares only dc-na:1 against the real three-DC map. The productive gate
+correctly refuses G2. Nine local test-only lines pass config.Load's validated
+fixture declaration to that same observed session, turning all three legs GREEN
+in three DCs, race, EU and one DC. Both original behavior mutations remain RED.
+[Source/evidence and cleanup limits](./E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+record exact assertions, retained auxiliary probes and checks omitted. This
+resolves the measured E1-3 blocker only: shared helpers stay unchanged,
+E1-7/E1-09/E1-10e and full-suite obligations remain pending; umbrella P2 and
+E1-01/X1/PRE-GC/A1 stay OPEN. Ordinary/production GC remains OFF.

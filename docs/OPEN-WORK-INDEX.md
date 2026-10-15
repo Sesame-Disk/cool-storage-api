@@ -1,5 +1,15 @@
 # Open Work Index
 
+## E1-3 scoped three-DC fixture correction (2026-10-15)
+
+[Reproduction and evidence](./E1-3-LATE-PUBLICATION-PRE-D-PROOF.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
+show two original GC legs blocked by a local-only declaration against real
+three-DC replication. Nine test-only lines pass the complete validated fixture
+map to the same observed session. All three legs, race, EU, one DC, original
+mutation negatives and short Go/vet pass with their stated scopes. Owned cleanup
+and retained auxiliary probes are explicit. E1-7/E1-09/E1-10e remain pending;
+umbrella/full-suite obligations and E1-01/X1/PRE-GC/A1 stay OPEN, GC OFF.
+
 ## E1-13 scoped three-DC evidence (2026-10-15)
 
 [Current-main E1-13 validation](./E1-13-REPAIR-DISCOVERY-DELAY-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
