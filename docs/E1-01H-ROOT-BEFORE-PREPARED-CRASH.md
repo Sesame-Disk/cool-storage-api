@@ -176,6 +176,34 @@ The three Go files still match the frozen tested image. Diff scope is nine
 planned files: integration tests, two Compose gate additions, and documentation.
 Relative file links, reproduction shell syntax, Compose consistency (exactly the
 new H gate on the two unchanged commands/settings) and git diff --check PASS.
-Fetched main remains `a71eec36a04614e5b3646ae523a406488062a4be`; no rebase needed.
+At the original audit, fetched main was `a71eec36a04614e5b3646ae523a406488062a4be`; the later rebase is recorded below.
 No new runtime defect or gate closure is claimed. Backward compatible: yes,
 test/evidence only. Subsequent commits update evidence/tracking documentation.
+## Rebase audit — 2026-10-15, after #293
+
+Safely rebased onto `main@6324057eb4e77ba4941e0d401e1159adb918a073`.
+Original published head `e09f6e09c21879832f93d32c2656fe02847f9011` is retained
+at `refs/backup/pr294-before-rebase-20261015`. Only CURRENT_WORK/changelog
+conflicted; both H evidence and #293's corrected, deferred harness diagnosis
+are preserved. No withdrawn #293 helper/config/runner implementation is restored.
+Range-diff preserves the implementation commit; all non-Markdown files are
+identical to the original published head, including every runner command.
+
+Revalidation uses newly built `sesamefs-pr294-rebased`, image
+`sha256:c794f92c258a2b575c5e77ecf2d35f48e5d05e519e415af1291649e423c4c291`,
+source head `d4fe5b0a15867911a2c7f8e9ba2506a509bff9e7` before this docs update.
+All three LF-normalized Go hashes match the frozen ledger above. The private
+single-DC Cassandra/SILO stack is reused, with E19 background GC disabled.
+
+- `pr294-rebase-directed.log`: H SIGKILL/resume, failure preservation and
+  gate/fanout guards PASS, 66.098s, exit 0.
+- `pr294-rebase-race-gates.log`: H matrix/preservation and guards with
+  `-race -count=2` PASS, 92.052s. Omitted resume and unavailable backend
+  each reject with expected test exit 1; wrapper exit 0.
+- `pr294-rebase-unit-vet.log`: complete short Go tree, ordinary vet and
+  integration vet PASS, exit 0.
+
+The original full required integration/API/OIDC results above are historical
+validation of identical code, not a new full-suite run after rebase. No extra
+standalone Sync/frontend or three-DC suite was run. This documentation-only
+base advance does not change the evidence scope or any gate disposition.

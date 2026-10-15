@@ -36,7 +36,6 @@ versions and limits. They are not new validation of this final docs-only diff.
 Reconsider code only after a concrete existing-caller failure and a bounded fix
 are demonstrated. No E1/X1/PRE-GC/A1 closure or activation is implied.
 
-
 ## 2026-10-14 — E1-01G PUBLISHED/PREPARED process crash
 
 [E1-01G](./E1-01G-PUBLISHED-PREPARED-CRASH.md) witnesses C3 inside productive

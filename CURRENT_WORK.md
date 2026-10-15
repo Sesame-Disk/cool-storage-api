@@ -65,7 +65,6 @@ preserves withdrawn-version results, including real H1 three-DC evidence, withou
 certifying this final diff or closing the seven E1 obligations. E1/X1 remain OPEN;
 ordinary/production GC OFF. This is a diagnosis correction, not an X1 runtime fix.
 
-
 ## Previous merged slice: E1-01G PUBLISHED/PREPARED process crash (#292)
 
 Branch `codex/e101-published-prepared-crash`, base main@6f8fc2630 (#291).
