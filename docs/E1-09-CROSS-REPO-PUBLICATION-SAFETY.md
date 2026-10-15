@@ -346,3 +346,28 @@ Final Go source SHA-256 (host/current Docker test image):
 | internal/integration/gc_integration_test.go | ed7b8bf4610d0281c29328b6e130ea4100fddadcf3eeb68719e47a0c169eb49d |
 | internal/integration/share_projection_regression_test.go | 746994e959a1f5a41d07f7a04ecad89df9d1927097c51f37ec07db34f7c38f0c |
 | internal/integration/w2_wire_crash_closure_test.go | eeb31e4f75e22a567f01851921baa5856d5084323614c47435420f09bc4f0651 |
+
+## Scoped current-main three-DC plan (2026-10-15)
+
+Base main@8c7bd3d48 (merged #300). Freeze before execution. Scope: existing
+TestE19CrossRepoPublication, copy/move across seven phases (14 named legs).
+
+1. Execute unchanged source on the private Cassandra 5.0.9/SILO fixture with
+   actual NTS RF1 per dc-na/dc-eu/dc-asia, migrated sesamefs_e19 and GC-OFF API.
+   Require the existing completeness gate and exact named outcomes. Do not
+   assume #300 resolves every historical failure.
+2. Repeat race and EU coordinator; verify actual parent/child isolation plus
+   required filtered/unavailable/enabled-GC rejection and existing meaningful
+   source/publication omission controls. Mutations stay in disposable containers;
+   restore and compare before final original-source execution.
+3. Verify owned block/ref/mapping/repair/expiry/lifecycle/root/discovery/object
+   cleanup independently and classify retained auxiliary probes. Existing
+   E1-10e/E1-17 COMMITTED teardown debt stays separate; do not erase older data.
+4. If no defect reproduces, change only this evidence ledger and concise tracking.
+   Otherwise preserve RED before a minimal correction and scope assessment.
+   Audit links, source/image identity, exact exits, complete diff and current
+   main; stop private services retaining volumes, then open a focused PR.
+
+No full-suite/client/auth/all-order/partition/TTL or gate-closure claim. Previous
+one-DC compatibility is historical evidence, not a substitute for this matrix.
+P2 umbrella, E1-01/X1/PRE-GC/A1 stay OPEN; ordinary/production GC OFF.
