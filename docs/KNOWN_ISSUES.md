@@ -6,8 +6,8 @@
 existing-P2 / late-K1 / HEAD witness on one DC with healthy services. Recommend
 X3/leak for measured K1 residue; no retired-P1 publication or runtime defect was
 reproduced. Stale discovery refuses safely without its durable root token.
-I1/M1 keep their P2 PRE-X1 tags; final maintainer acceptance, X1 and PRE-GC/A1
-remain separate. Ordinary GC remains OFF.
+[I1's guard criterion is now met](./I1-IDENTITY-EXECUTION-INVENTORY.md); M1 retains
+P2 PRE-X1. Final maintainer acceptance, X1 and PRE-GC/A1 remain separate. Ordinary GC remains OFF.
 
 ## Previous E1 final audit dispositions (#308, 2026-10-16)
 
@@ -6754,11 +6754,11 @@ immutable claim or the no-repair behavior in #233.
 
 ### PRE-X1 audit debt: identity claim-table CQL inventory and CAS mutation granularity
 
-**Status**: Open — follow-up / PRE-X1
+**Status**: I1 CLOSED-FIX (guard quality); M1 Open — follow-up / PRE-X1
 **Severity**: P2 — structural guard and evidence quality
 **Blocks #233**: No
 
-The `identity_authority_claims` guard still relies on a literal/string inventory
+The original `identity_authority_claims` guard relied on a literal/string inventory
 that can miss a table name assembled from fragments across production files.
 Before PRE-X1, move that table to a closed-world inventory evaluated at each
 Query/Batch execution site, following the execution-site approach used for
@@ -6778,6 +6778,13 @@ remain P2 PRE-X1 quality debt. The existing identity guard passes and current
 literal claim sites are one INSERT/one SELECT; that does not prove execution-site
 completeness. H8 belongs to the mapping cold-path guard, not the identity
 primitive. No new current-runtime defect or productive guard is claimed.
+
+**I1 update (2026-10-16):** [Execution inventory evidence](./I1-IDENTITY-EXECUTION-INVENTORY.md)
+closes the identity portion for current classified source: shared Query/Batch
+analysis, exact INSERT/read owners and 1/1 counts, preserved literal/schema
+checks, two demonstrated old-guard blind spots and 13 compiled negatives.
+Normal/race DB pass with nine seed skips. This is a test-guard fix, not a runtime
+data-loss fix. M1 retains P2 PRE-X1; E1/X1 acceptance and GC activation remain separate.
 
 ### ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01: A continuity LWT racing a hard delete can leave a HEAD-less ghost `libraries` row
 
