@@ -1,5 +1,15 @@
 # Open Work Index
 
+## E1-10e scoped three-DC evidence (2026-10-15)
+
+[Current-main E1-10e validation](./E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
+passes four functional legs, parent/child race twice, EU and required/omission
+negatives without code changes. The known COMMITTED teardown residue reproduces;
+seven current owned tuples were explicitly disposed only after guarded checks.
+Automatic cleanup is not certified. All seven historical E1 families now have
+individual scoped evidence, not a combined-suite PASS. Reconciliation/full-suite,
+P2 umbrella/cleanup and E1-01/X1/PRE-GC/A1 remain OPEN. Ordinary GC OFF.
+
 ## E1-09 scoped three-DC evidence (2026-10-15)
 
 [Current-main E1-09 validation](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)

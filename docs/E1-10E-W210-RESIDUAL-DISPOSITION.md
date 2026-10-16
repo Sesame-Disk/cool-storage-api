@@ -446,3 +446,138 @@ committed, terminal and published-sync-history.
 No full-suite, all-shape/client/auth/partition/TTL or gate-closure claim. Historic
 one-DC results are not fresh three-DC evidence. Existing P2 teardown/umbrella,
 E1-01/X1/PRE-GC/A1 remain OPEN; ordinary/production GC OFF.
+
+## Three-DC validation on current main (2026-10-15)
+
+### Limits and measured outcome
+
+Local date 2026-10-15; Docker logs cross midnight UTC into 2026-10-16.
+Frozen plan `417bbbff6`, base main@3deddb4f95b28c22695a688969fa34be390b12b4
+(merged #301). All four unchanged functional legs PASS. The known COMMITTED
+teardown gap also reproduces: one exact orphan/root/discovery survives the
+original teardown after block/refs/lifecycle/K removal. Functional PASS is not
+an automatic-cleanup PASS. Seven current owned authorities across these runs
+were explicitly disposed with verified preconditions; the P2 remains OPEN.
+
+No new productive defect reproduces, so no Go/harness fix is included. The
+retirement helper already inherits #300's full fixture declaration. This is
+current scoped evidence, not proof of every historical failure's cause. Earlier
+results/dispositions remain dated snapshots; current gate decisions follow X1.
+
+### Source and environment
+
+Plan-only Docker image sesamefs-e110e-3dc-current:
+`sha256:289ecd67dc407d640bda0eb1459d22fbdea592b8c702b6c35f0b5e89fd879c6b`.
+Host/image/restored source agree on LF-normalized SHA256:
+
+| Source | SHA256 |
+|---|---|
+| e110e_unpublished_resurrection_test.go | 4202cbdf396c49f62646e61229cc5552b79284c71277c63a9dad4c99a4336562 |
+| e17_sync_recvfs_test.go | a064846b55a622e01a5119a3afe5e72bbce40bac546918adcfef3c5f989dd5f8 |
+| trash.go | 0e1affa3e214da171e88e999e11a345b5dbbcd3b6b83d8d57c208bdb98d889dc |
+| resurrection_admission.go | f92d5819873f923fa016ecfbc75933170df6067be842a92574d4b05679cd7ccf |
+
+Private sesamefs-e111-3dc stack, migrated sesamefs_e19, Cassandra 5.0.9,
+actual NTS RF1 per dc-na/dc-eu/dc-asia checked before/after, all nodes UN/healthy.
+SILO RELEASE.2026-09-16T00-00-00Z image
+`sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46`.
+API/seed uses dc-na; native/verification sessions use dc-na, then dc-eu in the
+separate EU run. This measures healthy topology, not divergence/outage fallback.
+Current backend binary SHA256
+`f95399fbbcf07e5f853c04067839247222280b1bf02511e0142bfb95177cc6ab`;
+authenticated status enabled=false, worker never run. Every supplied URL points
+to this isolated backend. Real-service executions are sequential, GC OFF.
+
+### Results and negatives
+
+Ignored logs with explicit exits under tmp/:
+
+| Log | Result |
+|---|---|
+| e110e-3dc-current.log | Original four legs, completeness, existing isolation-status/evidence/fanout controls PASS, exit 0. One known COMMITTED residue subsequently disposed. |
+| e110e-3dc-isolated-race.log | Actual parent/child -race -count=2, both children 4/4 (8 total), parents PASS, exit 0; two owned residues disposed. Child timeouts unchanged. |
+| e110e-3dc-eu.log | Full 4/4 through dc-eu PASS, exit 0; one residue disposed. |
+| e110e-3dc-negative-filtered.log | Direct live-only PASS, required gate rejects three missing names, expected exit 1. |
+| e110e-3dc-negative-unavailable.log | Required parent bootstrap rejects unreachable API, expected exit 1. |
+| e110e-3dc-negative-child_filtered.log | Actual child preserves live-only filter, required child gate rejects three missing names and parent fails, expected exit 1. |
+| e110e-3dc-negative-child_unavailable.log | Healthy parent rejects failed isolated child bootstrap, expected exit 1. |
+| e110e-3dc-negative-omission.log | Container-only omission of RevertDirents capture + pre-HEAD source recheck restores three unsafe HEAD publications, expected exit 1; one residue disposed. |
+| e110e-3dc-negatives.log | All five expected exits/markers, three behavior failures and source restoration/comparison PASS; wrapper exit 0. |
+| e110e-3dc-cleanup-audit.log | Four original legs plus GC-OFF check PASS; read-only post-teardown checks see three absent recovery tuples and exactly one known COMMITTED residue, then explicit disposal. |
+| e110e-3dc-restored-race.log | After byte comparisons and audit removal, original-source -race -count=1: 4/4 and completeness PASS, exit 0; one residue disposed. |
+
+All positive matrices require the existing E110E evidence gate; exact named
+PASS counts were checked, with no SKIPs/race reports. Existing status-response
+unit controls reject enabled/unknown GC; no GC-enabled real backend is started.
+TestMain cleanup retains its pre-existing partial-topology warning; the real
+retirement worker uses the complete declaration. No general helper fix is claimed.
+
+The omission is scoped to RevertDirents's two admission call sites in disposable
+trash.go. Actual historical reads, commit construction and HEAD remain real.
+All three failures contain `unpublished source admitted:` with success response,
+HEAD attempt=1 and changed HEAD; live-unpublished, COMMITTED and TERMINAL each
+fail their original oracle. Build/setup/completeness failure alone is not RED
+evidence. Host source stays unchanged; container runtime is restored byte-for-byte.
+
+### Cleanup audit and explicit fixture disposal
+
+A disposable read-only observer runs after original fixture teardown. All four
+owned block/ref/lifecycle/mapping/repair/expiry partitions and K are absent;
+root/orphan/discovery are zero for three legs and exactly one each for COMMITTED.
+It adds no cleanup writes and does not turn that known residue into a cleanup
+PASS. Audit source is removed and original test/runtime compared before final
+race. Source up: removal remains an explicit expiry-state control, not TTL wait.
+
+For current, isolated-race, EU, omission, cleanup-audit and restored-race,
+e110e-3dc-<run>-residue.cql.log / -owned.json correlate exact org/block/P/claim/time
+against that execution's log. Seven matching tuples (1+2+1+1+1+1) were disposed.
+Each e110e-3dc-<run>-disposal.log verifies block/refs/lifecycle/K absent BEFORE
+calling existing DeleteS3Orphan with its exact canonical first_seen_at, then
+checks orphan/root/by-day absence. Post-disposal aggregate logs verify all three
+recovery surfaces zero. These are post-run fixture disposals, not productive
+recovery/TERMINAL evidence. The utility bypasses TestMain only for this explicit
+post-run operation; no utility result is credited as a matrix leg or gate closure.
+
+Final independent EACH_QUORUM roots/orphans/discovery/publication-repair counts
+are zero. The bucket retains 50 identified auxiliary discovery probes (41 prior
++ 9 new); every remaining payload matches gc-test-discover.txt-*. Soft-deleted
+library history is retained; no empty-stack/global-queue claim. Earlier one-DC
+records and E1-17 fixtures are untouched. The independent COMMITTED teardown
+follow-up stays OPEN. The private stack is stopped, volumes retained.
+
+### Reproduction and scope audit
+
+Inside the Docker image, on isolated GC-OFF API/SILO with migrated keyspace,
+explicit complete CASSANDRA_HOSTS/LOCAL_DC/REPLICATION_DCS and SESAMEFS_URL:
+
+```bash
+for v in ${!SESAMEFS_REQUIRE_@}; do unset "$v"; done
+export SESAMEFS_REQUIRE_E110E_UNPUBLISHED_RESURRECTION_EVIDENCE=1
+go test -tags integration -v -count=1 -timeout 8m -run '^TestUnpublishedResurrectionSourceAdmission' ./internal/integration
+SESAMEFS_E110E_ISOLATED_URL="$SESAMEFS_URL" go test -tags integration -race -v -count=2 -timeout 10m -run '^TestUnpublishedResurrectionSourceAdmission$' ./internal/integration
+```
+
+Repeat the direct matrix with dc-eu host/local DC and the same complete map.
+These commands still leave the known COMMITTED metadata until explicit verified
+fixture disposal; no automatic teardown fix is implied. Original barriers,
+statuses, exact GC/HEAD/tree/P/K/refs oracles and child timeouts stay unchanged.
+In-process owner-context RevertDirents and productive Sync/web-upload precursor
+certify only this root plaintext file/block schedule, not external route/auth,
+all handlers/shapes, encrypted/multi-block/directories or every interleaving.
+
+Not rerun: full standard integration/API/OIDC, short Go/vet, one-DC compatibility,
+standalone Sync/frontend, other matrices, divergence/partition or real TTL-policy
+expiry. Older results above and #300 compatibility are preserved as historical,
+not fresh evidence. All seven originally listed E1 fixture families now have
+individual scoped current-main ledgers; a combined required-suite rerun and
+failure/disposition reconciliation remain outstanding. P2 umbrella/cleanup,
+E1-01 (including PREPARED before discovery), X1 and PRE-GC/A1 remain OPEN.
+Backward compatible: yes, documentation/evidence only; ordinary GC remains OFF.
+
+Final scoped audit: no introduced blocker identified. Five Markdown files only;
+Go/runtime, tests, scripts, Compose, defaults and dependencies match the frozen
+base. Source/image hashes, restored-source comparisons, named positive/negative
+exits, seven guarded disposals, 270 relative file links, evidence anchor and
+whitespace checks pass. Main remains the tested base; no rebase/rewrite needed.
+Known automatic teardown debt, retained probes/history and combined-suite/gate
+obligations stay explicit and OPEN; no global empty-stack or activation claim.

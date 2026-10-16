@@ -2461,6 +2461,15 @@ owned cleanup and retained auxiliary probes. E1-10e and full-suite duties remain
 pending; P2 umbrella and independent COMMITTED teardown debt stay OPEN. No
 E1-01/X1/PRE-GC/A1 closure; ordinary/production GC OFF.
 
+**2026-10-15 E1-10e current-main validation.** After #300/#301, all four
+unchanged functional legs pass in healthy three DCs, parent/child race twice,
+EU and original required/admission-omission controls. [Frozen evidence](./E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
+separates the reproduced COMMITTED teardown gap from functional PASS and records
+seven guarded post-run disposals. All seven originally listed fixture families
+have individual scoped evidence; the union/full required suite and failure
+reconciliation are not rerun/certified. Umbrella P2 stays OPEN; no productive
+fix, E1-01/X1/PRE-GC/A1 disposition or ordinary GC activation follows.
+
 ## E1 compatibility COMMITTED teardown residues
 
 **P2, FOLLOW-UP / GENERAL, OPEN (2026-10-15).** In the E1-7 one-DC compatibility
@@ -2475,3 +2484,10 @@ E1-7 topology correction. [Frozen audit and exact disposal](./E1-7-SYNC-RECVFS-B
 Follow-up: make owned COMMITTED teardown retire exact recovery metadata and
 verify discovery/root/orphan absence, without weakening the measured COMMITTED
 state or touching unrelated fixtures. No X1/PRE-GC/A1 gate is closed here.
+
+**2026-10-15 three-DC confirmation (E1-10e).** Original teardown still leaves one
+COMMITTED orphan/root/discovery tuple. Read-only post-teardown audit confirms
+block/refs/lifecycle/K absent; seven exact current tuples across the directed,
+race, EU, omission and audit runs were explicitly disposed through existing
+exact APIs. Earlier one-DC records and E1-17 fixtures were untouched. This is
+verified run hygiene, not a merged automatic cleanup correction; P2 remains OPEN.
