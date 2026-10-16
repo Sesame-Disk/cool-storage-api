@@ -17,13 +17,14 @@ process evidence remains an evidence obligation, not a demonstrated runtime bug.
 
 All entries below have recorded Linux Docker process-death evidence on one DC.
 `P1` is the exact physical target, `D1` its claim, and `K1` its immutable object.
-The named tests link to current instrumentation/oracles; the A–H ledgers retain
+The named tests link to current instrumentation/oracles; the A–I ledgers retain
 frozen versions, outcomes, negative controls and limitations. These are recorded
 results, not new executions in this reconciliation PR.
 
 | Cut | Current hold and independent durable precondition | Recorded kill/recovery result |
 |---|---|---|
 | C0 | [H](../internal/integration/e101h_root_before_prepared_crash_test.go): successful exact root INSERT, before PREPARED submission; uncommitted blocks claim, root present, orphan/discovery/lifecycle absent, canonical/K1 intact | [#294 / H ledger](./E1-01H-ROOT-BEFORE-PREPARED-CRASH.md): fresh recovery visits absent orphan/unpublished lifecycle and retains the complete snapshot while paused and after SIGKILL/replay. Resume reaches TERMINAL. Later explicit fixture disposal is not automatic recovery. |
+| C0→C1 internal | [I](../internal/integration/e101i_prepared_before_discovery_crash_test.go): successful exact PREPARED INSERT before discovery publication; root/PREPARED present, discovery/lifecycle absent, uncommitted claim and canonical/K1 intact | [I ledger](./E1-01I-PREPARED-BEFORE-DISCOVERY.md): SIGKILL followed by fresh root recovery republishes discovery, aborts only uncommitted D and preserves canonical/K1; fresh replay is harmless. Resume completes normal deletion. One DC; no runtime defect reproduced. |
 | C1 | [A](../internal/integration/e101_g2_process_crash_test.go), `prepared`: successful Prepare return before Commit; exact PREPARED/root, uncommitted blocks handoff, no lifecycle, K1 intact | [#281 / A ledger](./E1-01A-G2-PROCESS-CRASH.md): abort only uncommitted D1; preserve canonical/K1 and repair authority; replay harmless. Resume completes productive deletion. |
 | C2 | A, `committed`: successful blocks handoff before Promote; exact PREPARED/root, committed D1, no lifecycle, K1 intact | A ledger: independent recovery promotes/retires exact D1/P1, deletes K1 and reaches TERMINAL; replay harmless. |
 | C3 | [G](../internal/integration/e101g_published_prepared_crash_test.go): successful exact lifecycle INSERT before orphan COMMITTED CAS; committed blocks handoff, PUBLISHED lifecycle, PREPARED orphan, canonical/K1 intact | [#292 / G ledger](./E1-01G-PUBLISHED-PREPARED-CRASH.md): orphan recovery runs before queue settlement, exercises PREPARED promotion and reaches TERMINAL; replay settles exact work. |
@@ -165,17 +166,20 @@ In particular, Prepare can persist the exact PREPARED orphan LWT before
 `ensureS3OrphanProjectionResult` publishes `gc_s3_orphans_by_day`. This leaves
 root and PREPARED present with discovery still absent. H pauses before the
 orphan INSERT; A pauses after successful Prepare return, including projection
-publication. Neither is specific K evidence for this intermediate window.
+publication. Neither is specific K evidence for this intermediate window. The additional
+[E1-01I drill](./E1-01I-PREPARED-BEFORE-DISCOVERY.md) now records that exact
+window through the current producer, SIGKILL, independent root recovery and replay
+on one DC.
 Root recovery calls `PublishS3OrphanDiscovery` before canonical recovery, but
 that route alone does not prove process-death behavior at this window. Its
-equivalence to existing evidence or need for a separate drill remains pending
-final E1-01 disposition; this docs-only PR adds no experiment or runtime finding.
+specific process evidence is recorded in I; final E1-01 disposition and broader
+qualifications remain pending. No runtime defect was reproduced by that drill.
 This is a source/evidence reconciliation, not proof of every error/concurrency schedule.
 
 | Obligation | Current disposition and next evidence needed |
 |---|---|
 | Enumerated C0–C8 process cuts | Recorded K evidence on one DC, with resume/replay and failure preservation. Maintainer acceptance/final E1-01 disposition remains OPEN; this PR closes no gate. |
-| Internal PREPARED-without-projection window | Root and exact PREPARED orphan present, discovery absent. No specific K witness is established here. Justify equivalence or select additional evidence in final E1-01 disposition; do not infer a product defect or require an experiment in this PR. |
+| Internal PREPARED-without-projection window | Root and exact PREPARED orphan present, discovery absent. [I](./E1-01I-PREPARED-BEFORE-DISCOVERY.md) records a specific one-DC K witness: root recovery republishes discovery, aborts uncommitted D and preserves canonical/K1; resume completes deletion. Final acceptance and broader qualifications remain OPEN. |
 | C0 unresolved root | Safe retention is the expected outcome under current authority rules. H's Abort/DeletePrepared fixture disposal is separate. No automatic reclamation deadline or product defect is established. |
 | Global G5 scheduling, persisted checkpoints and fairness | A–H use [w2OwnedRecoveryStore](../internal/integration/w2_worker_repair_lifecycle_test.go): real root reads filtered to owned identity; LoadGCStats returns not-found and SaveGCStats is a no-op. They do not certify global progress or cursor durability. Existing [G5 real-stack controls](../internal/integration/g5_recovery_scheduling_test.go) retain their R scope; do not invent a new runtime fix from that limitation. |
 | Three-DC and ambiguity/outage coverage | A–H are single-DC healthy-service recovery schedules, not three-DC, every LWT/S3 ambiguous result or outage proof. Cross-check existing controls/results before requiring more tests. The [seven recorded E1 fixture-progress failures](./TECHNICAL-DEBT.md#e1-16-test-infrastructure-follow-ups-2026-10-10) remain OPEN with cause unestablished; #293's withdrawn loader change supplies no diagnosis/fix. |

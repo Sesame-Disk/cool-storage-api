@@ -8,6 +8,14 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — Witness PREPARED before discovery after process death
+
+[E1-01I](./E1-01I-PREPARED-BEFORE-DISCOVERY.md) adds a test-only internal Prepare
+cut: exact PREPARED/root present, discovery absent and claim uncommitted. Fresh
+root recovery republishes discovery and aborts safely after SIGKILL; resume and
+replay controls retain their separate outcomes. No productive code/schema/API
+change, overall E1/X1 closure or GC activation.
+
 ## 2026-10-16 — Diagnose three-API upload residuals and retain error causes
 
 [Current three-API evidence](./E1-THREE-API-RESIDUALS.md) reproduces SeafHTTP
