@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -262,4 +265,31 @@ func (s *e1ProtectedSuccessor) assertCleanup(t *testing.T, database *dbpkg.DB, s
 		t.Errorf("H1 teardown lifecycle remains: %s err=%v", claim, err)
 	}
 	t.Logf("H1 cleanup checked owned P1/P2 objects, canonical, refs, orphan/root and lifecycle: org=%s block=%s", s.org, s.block)
+}
+
+// Standard Compose allows GC on its development node; manual D1 scheduling
+// uses the existing GC-OFF isolated endpoint instead. A zero-exit skipped child
+// supplies no witness and must fail this wrapper.
+func e1RunProtectedSuccessorIsolated(t *testing.T, endpoint string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, binary, "-test.run=^TestE1DelayedPutWithProtectedSuccessor$", "-test.v", "-test.count=1", "-test.timeout=2m")
+	for _, entry := range os.Environ() {
+		name := strings.SplitN(entry, "=", 2)[0]
+		if strings.HasPrefix(name, "SESAMEFS_REQUIRE_") || strings.HasSuffix(name, "_CHILD") || name == "SESAMEFS_URL" || name == "SESAMEFS_URL_2" || name == "SESAMEFS_URL_3" || name == "CASSANDRA_KEYSPACE" {
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
+	cmd.Env = append(cmd.Env, "SESAMEFS_E1_H1_CHILD=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
+	output, err := cmd.CombinedOutput()
+	t.Logf("isolated H1 child:\n%s", output)
+	if err != nil || !bytes.Contains(output, []byte("H1 PASS:")) || !bytes.Contains(output, []byte("H1 cleanup checked owned")) {
+		t.Fatalf("isolated H1 did not supply successful schedule and cleanup evidence: %v", err)
+	}
 }

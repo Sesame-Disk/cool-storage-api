@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,10 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 // The combined D0 H witness: P2 is protected before D1 deletes K1, and the
 // delayed writer subsequently attempts real metadata/HEAD publication.
 func TestE1DelayedPutWithProtectedSuccessor(t *testing.T) {
+	if endpoint := os.Getenv("SESAMEFS_E19_ISOLATED_URL"); endpoint != "" && os.Getenv("SESAMEFS_E1_H1_CHILD") != "1" {
+		e1RunProtectedSuccessorIsolated(t, endpoint)
+		return
+	}
 	e19RequireNoBackgroundGC(t)
 	e1DelayedPut(t, true)
 }
