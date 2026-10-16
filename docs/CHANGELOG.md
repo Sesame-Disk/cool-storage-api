@@ -8,6 +8,14 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — E1 final disposition audit
+
+[Source/evidence dispositions](./E1-FINAL-DISPOSITION.md) reconcile the D0
+checklist and identify H1/I1/M1 plus maintainer acceptance. Pending TTL/legacy recovery
+questions are separated from current exact-D safety; queue/repair retention
+stays PRE-GC and 020 is KEEP. GC/DB short packages pass with nine seed skips;
+no fresh integration/race certificate, runtime change, X1 closure or activation.
+
 ## 2026-10-16 — Witness PREPARED before discovery after process death
 
 [E1-01I](./E1-01I-PREPARED-BEFORE-DISCOVERY.md) adds a test-only internal Prepare

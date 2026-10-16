@@ -1,5 +1,18 @@
 # X1 critical path — reset to the #201 roadmap
 
+## E1 final disposition recommendation (2026-10-16)
+
+[The final audit](./E1-FINAL-DISPOSITION.md) resolves the D0 disposition list
+for maintainer review: R18/R27's historical executors are superseded, pending
+R28 TTL is fixed, 020 is KEEP, and E6/R31 block safety is separated from their
+OPEN convergence debt. The named healthy-service A-I crash obligation is
+recommended CLOSED-EVIDENCE with explicit topology/fault qualifications.
+Remaining bounded work is H1's full existing-P2 late-PUT/publication schedule,
+I1's identity execution-site guard and M1's independent H8 terminal negatives,
+then final E1 acceptance. Historical three-DC failures remain FAIL; this is
+no full-suite or production certificate. X1 remains OPEN and ordinary GC OFF.
+Dated pending lists below retain their snapshots; use this audit's finite list.
+
 ## E1 current combined three-DC evidence (2026-10-15)
 
 After #303, the [named E1 union](./E1-COMBINED-THREE-DC-VALIDATION.md) supplies
@@ -434,6 +447,8 @@ added here to count.
 | Library hard-delete lease: global SERIAL (✅ closed by PR #234) and fenced final batch | `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` (closed), `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` (open; current-runtime, §7) |
 | Post-D reference and R31 convergence moved from X1 by E1-16, severity unchanged: stale renewal after clear (E1-15A), writer post-D staging crash (E1-15B), known-loser durability (W2-12), repair discovery scale (W2-13), `pub:` zero-ref transition (W2-14), owned-`pub:` cleanup race and progress Paxos domain | `ISSUE-PUBLISH-REPAIR-STALE-RENEWAL-AFTER-CLEAR-01`, `ISSUE-PUBLICATION-POST-D-LIVENESS-BEFORE-VALIDATION-01`, `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01`, `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01`, `ISSUE-GC-PUB-REF-ZERO-REF-01`, `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01`, `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01` |
 | Abandoned publication repairs can keep every later life of L uncollectable (E1-15C). P2 PRE-GC since 2026-10-12, measure first: existing repair metrics, then a retain reason only if retention is real, then a disposition from the data. No TTL on the repair row; any cleanup needs authority the original writer's HEAD CAS cannot outrun | `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` |
+| E6 ordinary queue lifecycle arbitration remains OPEN PRE-GC at its recorded Low/Low-Med severity; exact-D block safety does not imply exactly-once queue transitions | `ISSUE-GC-ENGINE-ROBUSTNESS-01`; [E1 disposition](./E1-FINAL-DISPOSITION.md) |
+| R30 original-attempt pub retention remains PRE-GC; no aggregate retention bound or attempt-lineage solution is accepted here | [E1 R30 disposition](./E1-FINAL-DISPOSITION.md) and the original R30 record in GC-X1-CLOSURE-OPTIONS |
 | Startup check refusing `GC_ENABLED=true` while any A1 gate item (tagged entry or row above) is open | first A1 item |
 
 Closed by the greenfield precondition, not carried into A1: Technical Debt
