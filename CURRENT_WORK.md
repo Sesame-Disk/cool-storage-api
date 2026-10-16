@@ -1,5 +1,13 @@
 # Current Work
 
+## Scoped E1 owned teardown correction (2026-10-15)
+
+E1-10e/E1-17 COMMITTED fixture residues now have a scoped automatic cleanup
+correction, with one-/three-DC RED/GREEN and real child race evidence. Original
+COMMITTED assertions are preserved. See the [plan and audit](docs/E1-OWNED-TEARDOWN-PLAN.md).
+This closes only the P2 test-hygiene defect for new fixtures; older retained data,
+combined-suite reconciliation and X1/PRE-GC/A1 remain separate. GC stays OFF.
+
 ## Status snapshot (2026-10-15)
 
 The source of record for order and closure states is

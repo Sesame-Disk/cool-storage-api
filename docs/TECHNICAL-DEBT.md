@@ -2472,6 +2472,13 @@ fix, E1-01/X1/PRE-GC/A1 disposition or ordinary GC activation follows.
 
 ## E1 compatibility COMMITTED teardown residues
 
+**Current status: P2 FOLLOW-UP / GENERAL, CLOSED-FIX for new fixtures (2026-10-15).**
+[Scoped correction and Docker audit](./E1-OWNED-TEARDOWN-PLAN.md) preserve the
+measured COMMITTED state, then dispose only the captured owned authority and
+verify orphan/root/discovery absence. Twenty older one-DC authorities remain
+retained. No productive safety or X1/PRE-GC/A1 closure follows. The dated
+finding and pre-fix evidence below are preserved as history.
+
 **P2, FOLLOW-UP / GENERAL, OPEN (2026-10-15).** In the E1-7 one-DC compatibility
 run, E1-10e/committed and all five E1-17 */committed cases leave exact orphan/root
 rows: x1Cleanup drops canonical/lifecycle state but not these tables, while
