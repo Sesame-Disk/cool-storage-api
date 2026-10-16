@@ -124,6 +124,14 @@ func TestE101GCProcessChild(t *testing.T) {
 		e101hRetentionChild(t, database, data)
 		return
 	}
+	if data.Mode == "repair-projection" && e101iCut(data.Cut) {
+		e101iRecoveryChild(t, database, data)
+		return
+	}
+	if data.Mode == "worker" && e101iCut(data.Cut) {
+		e101iChild(t, data)
+		return
+	}
 	if data.Mode == "worker" && e101hCut(data.Cut) {
 		e101hChild(t, data)
 		return
@@ -285,7 +293,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 					if err != nil || json.Unmarshal(encoded, &data.Authority) != nil {
 						t.Fatalf("read exact boundary authority: %v", err)
 					}
-					if e101gCut(cut) || e101hCut(cut) {
+					if e101gCut(cut) || e101hCut(cut) || e101iCut(cut) {
 						data.FirstSeenAt = e101dFirstSeen(t, data)
 					}
 					boundary(t, fx, data)
@@ -314,7 +322,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						}
 						err := <-exited
 						finished = true
-						if err != nil || (e101RecoveryCut(cut) && !bytes.Contains(output.Bytes(), []byte("E101C_PHYSICAL_COMPLETED"))) || (e101gCut(cut) && !bytes.Contains(output.Bytes(), []byte(e101gWorkerCompleted))) || (e101hCut(cut) && !bytes.Contains(output.Bytes(), []byte(e101hWorkerCompleted))) {
+						if err != nil || (e101RecoveryCut(cut) && !bytes.Contains(output.Bytes(), []byte("E101C_PHYSICAL_COMPLETED"))) || (e101gCut(cut) && !bytes.Contains(output.Bytes(), []byte(e101gWorkerCompleted))) || (e101hCut(cut) && !bytes.Contains(output.Bytes(), []byte(e101hWorkerCompleted))) || (e101iCut(cut) && !bytes.Contains(output.Bytes(), []byte(e101iWorkerCompleted))) {
 							t.Fatalf("no-kill worker: %v\n%s", err, output.String())
 						}
 					}
@@ -327,7 +335,7 @@ func e101RunMatrix(t *testing.T, cuts []string, observed map[string]bool, bounda
 						return
 					}
 					data.Expect = "terminal"
-					if cut == "prepared" && action == "kill" {
+					if (cut == "prepared" || e101iCut(cut)) && action == "kill" {
 						data.Expect = "aborted"
 					}
 					if beforeRecovery != nil {
@@ -413,6 +421,9 @@ func e101AssertRecovered(t *testing.T, fx *w2CreateFileFixture, data e101Process
 	if e101dCut(data.Cut) || e101eCut(data.Cut) || e101fCut(data.Cut) || e101gCut(data.Cut) || e101hCut(data.Cut) {
 		e101dAssertSettled(t, fx.database, data)
 	}
+	if e101iCut(data.Cut) {
+		e101iAssertSettled(t, fx, data)
+	}
 	t.Logf("independently observed %s P=%+v D=%+v", data.Expect, data.Authority.Target, data.Authority)
 }
 
@@ -484,7 +495,7 @@ func e101Capture(database *dbpkg.DB, data e101ProcessData) e101Snapshot {
 		}
 		read(table, "SELECT * FROM "+table+" WHERE org_id=? AND block_id=?", cl, data.Org.String(), data.Block)
 	}
-	if e101dCut(data.Cut) || e101eCut(data.Cut) || e101fCut(data.Cut) || e101gCut(data.Cut) || e101hCut(data.Cut) {
+	if e101dCut(data.Cut) || e101eCut(data.Cut) || e101fCut(data.Cut) || e101gCut(data.Cut) || e101hCut(data.Cut) || e101iCut(data.Cut) {
 		if data.FirstSeenAt.IsZero() {
 			s.Errors["discovery"] = "missing exact first_seen_at"
 		} else {
@@ -568,8 +579,11 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 		cmd.Env = append(cmd.Env, entry)
 	}
 	cmd.Env = append(cmd.Env, gate+"=1", "SESAMEFS_E101_FAIL_AFTER_KILL=1", "SESAMEFS_E101_EVIDENCE_DIR="+dir)
-	// Keep E/F/G/H fixture-owning processes on e19: a second forwarding TestMain
+	// Keep E/F/G/H/I fixture-owning processes on e19: a second forwarding TestMain
 	// cannot inherit its liveRepoIDs and could sweep a root-only library.
+	if e101iCut(cut) {
+		cmd.Env = append(cmd.Env, "SESAMEFS_E101I_CHILD=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
+	}
 	if e101hCut(cut) {
 		cmd.Env = append(cmd.Env, "SESAMEFS_E101H_CHILD=1", "CASSANDRA_KEYSPACE=sesamefs_e19", "SESAMEFS_URL="+endpoint, "SESAMEFS_URL_2="+endpoint, "SESAMEFS_URL_3="+endpoint)
 	}
@@ -606,7 +620,7 @@ func e101FailureControl(t *testing.T, testName, cut, gate string, blocks, lifecy
 	if !retainedWork {
 		expectedCandidates = 0
 	}
-	if ((e101dCut(cut) || e101fCut(cut) || e101gCut(cut)) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || ((e101eCut(cut) || e101hCut(cut)) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 0) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != expectedOrphans || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
+	if ((e101dCut(cut) || e101fCut(cut) || e101gCut(cut)) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 1) || ((e101eCut(cut) || e101hCut(cut) || e101iCut(cut)) && len(failure.After.Rows["gc_s3_orphans_by_day"]) != 0) || failure.Before == nil || len(failure.Before.Errors) != 0 || len(failure.After.Errors) != 0 || !reflect.DeepEqual(*failure.Before, failure.After) || !failure.After.RootFound || failure.After.QueueFound != retainedWork || failure.After.K1Exists != retainedWork || (retainedWork && len(failure.After.K1Bytes) == 0) || len(failure.After.Rows["blocks"]) != blocks || len(failure.After.Rows["gc_s3_orphans"]) != expectedOrphans || len(failure.After.Rows["gc_block_candidates"]) != expectedCandidates || len(failure.After.Rows["head"]) != 1 || len(failure.After.Rows["gc_block_delete_lifecycles"]) != lifecycles {
 		t.Fatal("failure snapshot lost or changed the exact durable boundary state")
 	}
 	// A new session must observe the same live state AFTER the failed subprocess and TestMain sweeps.

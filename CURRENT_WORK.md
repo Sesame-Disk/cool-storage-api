@@ -1,6 +1,13 @@
 # Current Work
 
-## Active slice: E1 three-API residual diagnostics (2026-10-16)
+## Active slice: E1-01I PREPARED before discovery (2026-10-16)
+
+[E1-01I](docs/E1-01I-PREPARED-BEFORE-DISCOVERY.md) tests the real producer's internal
+PREPARED-without-projection window with SIGKILL/resume and independent recovery.
+This advances D0 §25 G1/G2 and E1 crash evidence; no runtime fix or overall X1
+closure is claimed. Other E1/identity/D0/full-suite obligations stay OPEN; GC OFF.
+
+## Previous merged slice: E1 three-API residual diagnostics (2026-10-16)
 
 Base main@331166aa5 (#305). [Three-API results](docs/E1-THREE-API-RESIDUALS.md)
 reproduce SeafHTTP and V2 upload 500s on distinct NA/EU/Asia backends; the

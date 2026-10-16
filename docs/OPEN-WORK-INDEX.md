@@ -1,5 +1,11 @@
 # Open Work Index
 
+## E1-01I exact PREPARED-without-discovery process evidence
+
+[The focused drill](./E1-01I-PREPARED-BEFORE-DISCOVERY.md) supplies the missing
+one-DC process witness for this internal Prepare window. Final E1-01 disposition,
+three-DC/ambiguity/global scheduling, D0 and identity audit remain OPEN. GC OFF.
+
 ## E1 three-API residual diagnosis (2026-10-16)
 
 [The current ledger](./E1-THREE-API-RESIDUALS.md) separates actual three-process,
@@ -106,11 +112,10 @@ diagnosis obligations. E1-01/X1/PRE-GC/A1 stay OPEN; ordinary GC OFF.
 [Current matrix and open dispositions](./E1-01-CRASH-EVIDENCE-PLAN.md#07-reconciliation-outcome-and-open-dispositions-2026-10-15)
 match current worker/store transitions to merged A–H process evidence (#294
 included). Recorded named points have one-DC evidence; internal durable writes
-are not exhaustively covered. PREPARED before discovery publication awaits
-equivalence/additional-evidence disposition in E1-01. Global G5
+are not exhaustively covered. The later [I drill](./E1-01I-PREPARED-BEFORE-DISCOVERY.md)
+adds the specific PREPARED-before-discovery witness; final E1-01 disposition stays OPEN. Global G5
 progress, three-DC/ambiguity qualifications and final D0 dispositions are separate.
-Next execution is one representative existing three-DC fixture-progress diagnosis,
-with no assumed helper cause or speculative refactor. E1-01/X1 remain OPEN;
+The inventory's selected three-DC fixture diagnoses are recorded in the later E1 ledgers above. E1-01/X1 remain OPEN;
 ordinary/production GC OFF. No issue or gate is opened or closed by this inventory.
 
 ## E1-01H root before PREPARED evidence (2026-10-15)

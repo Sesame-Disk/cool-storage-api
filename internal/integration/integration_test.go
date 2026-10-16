@@ -54,7 +54,8 @@ func TestMain(m *testing.M) {
 	// comment could not: R26 was added to docker-compose and missed here, and the
 	// omission was invisible in the standard run only because P4A happens to be set
 	// alongside it.
-	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_PREPARED_CRASH_EVIDENCE") == "1" ||
+	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_PREPARED_DISCOVERY_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_PREPARED_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_PUBLISHED_PREPARED_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_DISCOVERY_RETAINED_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_ONLY_CRASH_EVIDENCE") == "1" ||
@@ -167,6 +168,12 @@ func TestMain(m *testing.M) {
 	}()
 
 	code := m.Run()
+	if os.Getenv(e101iEvidenceEnv) == "1" {
+		if missing := e101iMissing(); len(missing) > 0 {
+			fmt.Printf("%s=1 requires both prepared-before-discovery crash/control legs; missing=%s\n", e101iEvidenceEnv, strings.Join(missing, ","))
+			code = 1
+		}
+	}
 	if os.Getenv(e101hEvidenceEnv) == "1" {
 		if missing := e101hMissing(); len(missing) > 0 {
 			fmt.Printf("%s=1 requires both root-before-prepared crash/control legs; missing=%s\n", e101hEvidenceEnv, strings.Join(missing, ","))
