@@ -419,3 +419,30 @@ Logs in workstation TEMP (not tracked):
 sesamefs-264-fallback-{contract,race,db,final-contracts,vet,go-all,cleanup,quota}.log.
 The db.log contains the detected then-corrected inventory failure; final-contracts
 and the full-run log contain the successful definitive checks.
+
+## Scoped current-main three-DC plan (2026-10-15)
+
+Base main@3deddb4f9 (merged #301). Freeze before execution. Scope is the existing
+four TestUnpublishedResurrectionSourceAdmission legs: live-unpublished,
+committed, terminal and published-sync-history.
+
+1. Run unchanged source with its required gate on private Cassandra 5.0.9 /
+   SILO, actual NTS RF1 in dc-na/dc-eu/dc-asia, migrated sesamefs_e19, GC-OFF API.
+   Record functional outcomes separately from the known COMMITTED teardown gap.
+2. Repeat through actual parent/child race and EU; preserve required filtered,
+   child-filtered and unavailable-endpoint rejection. Re-run the original
+   source-admission omission only in disposable container source; require real
+   publication assertions, then restore/compare before final original-source run.
+3. Identify each run's exact owned authorities from execution logs. Verify
+   block/refs/lifecycle/K absence before explicit exact orphan/root/discovery
+   disposal where unchanged COMMITTED teardown leaves them. Verify other owned
+   metadata/repairs/expiry and classify auxiliary probes. Do not erase older data
+   or claim the independent E1-17 teardown issue is resolved.
+4. If no new defect reproduces, change only evidence and concise tracking;
+   otherwise preserve RED and assess the minimum justified correction. Audit
+   source/image hashes, links, commands, exact exits, complete diff and current
+   main. Stop private services retaining volumes and open a focused PR.
+
+No full-suite, all-shape/client/auth/partition/TTL or gate-closure claim. Historic
+one-DC results are not fresh three-DC evidence. Existing P2 teardown/umbrella,
+E1-01/X1/PRE-GC/A1 remain OPEN; ordinary/production GC OFF.
