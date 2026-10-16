@@ -2368,6 +2368,13 @@ Each new mandatory evidence leg pushes the standard suite past its budget. Decid
 
 **2026-10-12 (E1-17).** The timeout was raised explicitly from 40m to 50m in both compose runners. E1-17 adds about 25s of required evidence to a suite that ended 0.5s under 40m. The root cause above is unchanged, and this raise does not resolve it.
 
+**Current joint evidence (2026-10-15, after #303).** The [combined ledger](./E1-COMBINED-THREE-DC-VALIDATION.md)
+reconciles all seven named families and E1-17 compatibility in one serial process:
+normal and race 59/59 PASS with exact-name checks and existing required gates. This
+supersedes individual-only coverage; it does not close the wider full-suite
+obligations/budget or X1/PRE-GC/A1. The unsupported global-helper attribution
+remains withdrawn. Dated findings and intermediate slice results below preserve
+provenance; current named-family evidence is in the linked ledger.
 **E1 three-DC fixture-progress failures (P2, OPEN; E1-11 scoped correction below).**
 Historical runs recorded "GC retirement n=0" / "worker did not visit owned real
 candidate" for E1-3, E1-7, E1-09, E1-10e, E1-11, E1-12 and E1-13. The earlier
