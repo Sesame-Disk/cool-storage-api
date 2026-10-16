@@ -3,11 +3,11 @@
 ## E1 final disposition: finite X1 work (2026-10-16)
 
 [D0 dispositions and remaining work](./E1-FINAL-DISPOSITION.md#remaining-x1-work)
-identify H1 (full existing-P2 late PUT/publication), I1 (identity claim execution
-inventory), M1 (ten independent H8 terminal negatives), then maintainer E1
-acceptance. R18/R27 historical mechanisms are superseded, pending R28 TTL is
-fixed and 020 is KEEP; E6/R30/R31 convergence remains PRE-GC. A-I acceptance is recommended only for
-its stated scope. Availability failures stay FAIL; X1 OPEN, ordinary GC OFF.
+identified three actions. [H1 now supplies the combined witness](./E1-H1-PROTECTED-SUCCESSOR.md);
+I1 (identity claim execution inventory), M1 (ten independent H8 terminal
+negatives) and maintainer E1 acceptance remain. R18/R27 historical mechanisms
+are superseded, pending R28 TTL is fixed and 020 is KEEP; E6/R30/R31 convergence
+remains PRE-GC. A-I acceptance is recommended only for its stated scope. Availability failures stay FAIL; X1 OPEN, ordinary GC OFF.
 
 ## E1-01I exact PREPARED-without-discovery process evidence
 

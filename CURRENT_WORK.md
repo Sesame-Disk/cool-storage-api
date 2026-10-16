@@ -1,6 +1,14 @@
 # Current Work
 
-## Active slice: E1 final disposition audit (2026-10-16)
+## Active slice: H1 protected successor / late PUT (2026-10-16)
+
+[H1](docs/E1-H1-PROTECTED-SUCCESSOR.md) supplies the combined real Sync/GC witness:
+P2 protected before D1 physical recovery, late K1 PUT, HEAD resolving P2 and safe
+stale-discovery refusal. Repeated Docker normal/race checks and directed oracle
+negatives pass; no productive defect or fix was needed. Recommend X3 for measured
+K1 residue. I1/M1 and maintainer E1 acceptance remain; X1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: E1 final disposition audit (#308, 2026-10-16)
 
 [The source/evidence audit](docs/E1-FINAL-DISPOSITION.md) narrows the remaining
 X1 list to H1, I1 and M1 plus maintainer acceptance. R18/R27's legacy rationale
@@ -58,8 +66,8 @@ The source of record for order and closure states is
   resurrection) was closed by E1-17 (CLOSED-FIX).
 - **Remaining before X1 CLOSED:** the [final disposition audit](docs/E1-FINAL-DISPOSITION.md)
   recommends scoped acceptance of A-I and resolves the named D0 rows. Three
-  bounded actions remain: H1's complete existing-P2/late-PUT/publication witness,
-  I1's identity execution-site inventory and M1's separate H8 CAS negatives.
+  actions were identified: [H1 is now measured](docs/E1-H1-PROTECTED-SUCCESSOR.md);
+  I1's identity execution-site inventory and M1's separate H8 CAS negatives remain.
   Maintainer final E1 acceptance remains required; failed/unrun deployment
   evidence retains its limits, and no full-suite PASS is claimed.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6

@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — H1 protected successor across late PUT/publication
+
+[H1 evidence](./E1-H1-PROTECTED-SUCCESSOR.md) combines real D1 retirement,
+protected P2 before physical recovery, late K1 PUT and actual HEAD on P2.
+Repeated normal/race Docker controls and two oracle negatives pass; stale
+D1 discovery refuses safely and owned physical/GC artifacts are cleaned.
+Test-only; recommend measured K1 residue as X3, pending final acceptance.
+X1 remains OPEN and ordinary GC OFF.
+
 ## 2026-10-16 — E1 final disposition audit
 
 [Source/evidence dispositions](./E1-FINAL-DISPOSITION.md) reconcile the D0
