@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — Diagnose three-API upload residuals and retain error causes
+
+[Current three-API evidence](./E1-THREE-API-RESIDUALS.md) reproduces SeafHTTP
+and V2 500s with real three-DC Cassandra; the synthetic retirement test passes.
+Generic upload error writers now log the internal cause while retaining exact
+client responses and publication/lease/retry semantics. This is an observability
+correction, not functional GREEN: baseline and final upload tests still fail.
+API/API-v2 short/race/error-contract tests and vet pass. Owned synthetic residue
+is explicitly disposed; five repairs and ordinary upload data are retained.
+Availability/full-suite and X1/PRE-GC/A1 gates remain OPEN; ordinary GC OFF.
+
 ## 2026-10-16 — Preserve replaced source identity during cross-repo moves (#305)
 
 A cross-repo move now removes the source only if its current fs_id still matches

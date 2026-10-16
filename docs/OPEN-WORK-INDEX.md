@@ -1,5 +1,17 @@
 # Open Work Index
 
+## E1 three-API residual diagnosis (2026-10-16)
+
+[The current ledger](./E1-THREE-API-RESIDUALS.md) separates actual three-process,
+three-DC reproduction from the earlier one-API union. Baseline GC 3/3 PASS,
+SeafHTTP 3/3 FAIL, V2 2/3 FAIL. Two generic upload error writers now retain the
+server-side cause; no availability fix or functional GREEN is claimed.
+[SeafHTTP acquisition](./KNOWN_ISSUES.md#issue-seafhttp-upload-finalize-lease-error-500-01),
+[V2 HEAD CAS](./KNOWN_ISSUES.md#issue-v2-upload-head-cas-timeout-500-01) and
+[synthetic fixture teardown](./KNOWN_ISSUES.md#issue-gc-synthetic-sibling-teardown-01)
+remain OPEN with their own scopes. Full-suite/identity/sync residuals and
+X1/PRE-GC/A1 remain separate; ordinary GC OFF.
+
 ## E1 combined three-DC validation (2026-10-15)
 
 [Current combined ledger and reconciliation](./E1-COMBINED-THREE-DC-VALIDATION.md)

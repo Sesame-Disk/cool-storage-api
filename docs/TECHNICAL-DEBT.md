@@ -1,5 +1,19 @@
 # Technical Debt & Migration Plan
 
+## Current three-API residual diagnosis (2026-10-16)
+
+[The focused ledger](./E1-THREE-API-RESIDUALS.md) reproduces SeafHTTP FAIL 3/3,
+V2 FAIL 2/3 and GC PASS 3/3 before edits, with the same functional counts in the
+final race run. Native SERIAL CAS timeouts occur in lease acquisition and HEAD
+publication; failed confirmation can retain UNKNOWN. Two server log lines fix
+missing diagnostics without changing responses or retry/lease semantics.
+[SeafHTTP](./KNOWN_ISSUES.md#issue-seafhttp-upload-finalize-lease-error-500-01),
+[V2](./KNOWN_ISSUES.md#issue-v2-upload-head-cas-timeout-500-01) and
+[synthetic teardown](./KNOWN_ISSUES.md#issue-gc-synthetic-sibling-teardown-01)
+remain OPEN. Five repairs and ordinary upload history/data remain retained;
+post-run disposal of six owned synthetic authorities is not automatic cleanup.
+This does not close the suite budget/full-suite or X1/PRE-GC/A1 obligations.
+
 This document tracks known technical debt and provides actionable plans for addressing each issue while the system remains in use.
 
 ---

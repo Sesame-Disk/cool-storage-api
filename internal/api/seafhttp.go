@@ -2724,6 +2724,7 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 	case errors.Is(err, errStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
+		log.Printf("[HandleUpload] Unexpected upload failure (%s): %v", genericMsg, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
 	}
 }
