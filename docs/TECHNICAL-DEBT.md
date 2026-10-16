@@ -2451,6 +2451,16 @@ E1-09/E1-10e still need their own three-DC measurements; the umbrella P2 and
 full-suite obligations remain OPEN. No runtime or E1-01/X1/PRE-GC/A1 closure;
 ordinary/production GC stays OFF.
 
+**2026-10-15 E1-09 current-main validation.** After #300, all 14 unchanged
+cross-repo copy/move legs pass on the private healthy three-DC fixture, through
+actual parent/child race twice and through EU. The retirement path already uses
+the corrected e17CommitGC; no additional fix or universal historical cause is
+claimed. [Frozen evidence](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+records required negatives, four meaningful final-gate omission failures, exact
+owned cleanup and retained auxiliary probes. E1-10e and full-suite duties remain
+pending; P2 umbrella and independent COMMITTED teardown debt stay OPEN. No
+E1-01/X1/PRE-GC/A1 closure; ordinary/production GC OFF.
+
 ## E1 compatibility COMMITTED teardown residues
 
 **P2, FOLLOW-UP / GENERAL, OPEN (2026-10-15).** In the E1-7 one-DC compatibility

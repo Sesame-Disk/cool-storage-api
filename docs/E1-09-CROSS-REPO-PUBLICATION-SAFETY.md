@@ -371,3 +371,130 @@ TestE19CrossRepoPublication, copy/move across seven phases (14 named legs).
 No full-suite/client/auth/all-order/partition/TTL or gate-closure claim. Previous
 one-DC compatibility is historical evidence, not a substitute for this matrix.
 P2 umbrella, E1-01/X1/PRE-GC/A1 stay OPEN; ordinary/production GC OFF.
+
+## Three-DC validation on current main (2026-10-15)
+
+### Scope and disposition
+
+Frozen plan `1e80a0630`, base main@8c7bd3d4878ec33a472684f936675a91b8c5fb18
+(merged #300). No current-code failure reproduces in the unchanged 14-leg
+matrix: copy/move across normal, committed, terminal, captured-committed,
+captured-terminal, repair-first and head-conflict all PASS. e17CommitGC already
+inherits #300's validated fixture declaration on its observed native session.
+No new Go/runtime/harness fix is justified or included; this slice changes docs.
+This is current scoped positive evidence, not a causal replay of every historical
+three-DC failure. Earlier results and rollout notes retain their dated context;
+current gate decisions follow X1 and ordinary/production GC remains OFF.
+
+### Frozen source and environment
+
+Image sesamefs-e19-3dc-current, built at the plan-only revision:
+`sha256:f7df7a2cc9a4a94a23744561a50b07117407dc06cde773e48f61260ad31ab246`.
+Host/image/restored runner agree on LF-normalized source SHA256:
+
+| Source | SHA256 |
+|---|---|
+| e19_cross_repo_test.go | 977677c72963680d015df6258e11ce35398d7d04058161cda70b7a5654fec274 |
+| e17_sync_recvfs_test.go | a064846b55a622e01a5119a3afe5e72bbce40bac546918adcfef3c5f989dd5f8 |
+| w2_native_wire_test.go | d22a369ca0b7150463589480823ca84805b7c535345edaa8fe4fcf58e556a842 |
+| batch_operations.go | 14006009ee2c55f810628a232a0d1e086ebd2165bb0ad6f5723a9ac3578418d4 |
+| cross_repo_publication.go | ca1456a57a5f9dad0942d6041bd1bd88077e9f7c1f38fcf3ec553f3a6591cadd |
+
+The private sesamefs-e111-3dc stack reuses owned volumes, migrated sesamefs_e19,
+Cassandra 5.0.9 and actual NTS RF1 in dc-na/dc-eu/dc-asia, checked before/after;
+all three nodes are UN/healthy. SILO RELEASE.2026-09-16T00-00-00Z image
+`sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46`.
+API/seed uses dc-na; native/verification sessions use dc-na, then dc-eu in the
+separate EU run. This is healthy topology, not an unavailable/divergent replica
+schedule. Backend built from unchanged current source, binary SHA256
+`f95399fbbcf07e5f853c04067839247222280b1bf02511e0142bfb95177cc6ab`.
+Authenticated admin status reports enabled=false, worker never run. Every
+supplied API URL points to this controlled backend. Real-service runs are
+sequential; no ordinary/shared deployment is enabled or redeployed.
+
+### Results and controls
+
+Ignored logs and explicit exits under tmp/:
+
+| Log | Measured result |
+|---|---|
+| e19-3dc-current.log | Unchanged 14/14 legs, completeness, isolation-status controls, evidence wiring and no-global-fanout guards PASS; exit 0. |
+| e19-3dc-isolated-race.log | Actual parent/child path, -race -count=2: both fresh children prove all 14 names (28 total), parents PASS, exit 0. Existing child 3m timeout unchanged. |
+| e19-3dc-eu.log | Full 14-leg matrix plus existing E19 contracts through dc-eu PASS, exit 0. |
+| e19-3dc-negative-filtered.log | Direct copy/normal PASS; required gate reports the other 13 names, expected exit 1. |
+| e19-3dc-negative-unavailable.log | Required parent bootstrap rejects unreachable API before tests, expected exit 1. |
+| e19-3dc-negative-child_unavailable.log | Healthy parent rejects failed isolated child bootstrap; no child evidence credited, expected exit 1. |
+| e19-3dc-negative-omission.log | Omit only final validateCopiedBlockPublication call in container: all four copy/move captured COMMITTED/TERMINAL cases fail their real reachable-destination oracle, expected exit 1; four cleanups verified. |
+| e19-3dc-negatives.log | All expected exits/markers, four behavior failures/cleanups and restored-source comparisons PASS; wrapper exit 0. |
+| e19-3dc-cleanup-audit.log | Restored runtime, 14/14 legs plus GC-OFF check PASS; 14 read-only post-teardown verifications. Wrapper exit 0. |
+| e19-3dc-restored-race.log | After runtime/test restoration and byte comparisons: original-source -race -count=1, 14/14 plus E19 contracts PASS; exit 0. |
+
+All positive directed matrices ran with the existing required E19 gate, with
+exact named PASS counts, no SKIPs or race reports. The status unit control uses
+existing httptest responses: enabled=true, unknown/malformed state and bad HTTP
+are rejected. It does not start a GC-enabled real backend. TestMain cleanup still
+logs its pre-existing partial-topology declaration; the destructive worker uses
+the corrected full declaration. No general shared-helper fix is claimed.
+
+The omission does not bypass source capture, staging, repair or HEAD. Copy
+reports success with reachable retired-P content; move may report source failure
+but still exposes the unsafe destination. Four failures specifically contain
+`RED: destination reachable after exact P1 retirement`; compilation/setup or
+completeness failures alone are not counted. Container-only instrumentation
+records that original behavior failure before extra exact recovery disposes D1,
+then fails the test. No mutation reaches host source or this PR.
+
+Extra container-only audit callbacks run AFTER the existing teardown and add no
+cleanup writes. They check exact owned block/ref/lifecycle/orphan/mapping rows,
+source AND destination repair partitions, canonical expiry trackers/by-day rows,
+recovery roots/discovery and physical K. All 14 positive fixtures and four
+mutation fixtures verify absence. Old COMMITTED authority is recovered through
+the productive exact path; soft-deleted library history is not claimed purged.
+Audit instrumentation is removed, both modified container files byte-compared
+with originals, and the final race executes original source/oracles.
+
+Independent EACH_QUORUM aggregate roots/orphans/publication-repair counts are
+zero before/after; orphan discovery is also zero after. The bucket retains 41
+auxiliary storage-class probes (33 prior + 8 new); every remaining object payload
+matches gc-test-discover.txt-*. No E19 fixture K remains and no empty-bucket
+claim is made. The separate E1-10e/E1-17 COMMITTED teardown follow-up remains
+OPEN; this run does not touch its older one-DC records. The private three-DC
+stack is stopped after verification, volumes retained.
+
+### Reproduction and audit limits
+
+In the built Docker image, with isolated GC-OFF API/SILO, migrated keyspace,
+complete explicit CASSANDRA_HOSTS/LOCAL_DC/REPLICATION_DCS and SESAMEFS_URL:
+
+```bash
+for v in ${!SESAMEFS_REQUIRE_@}; do unset "$v"; done
+export SESAMEFS_REQUIRE_E19_CROSS_REPO_EVIDENCE=1
+go test -tags integration -v -count=1 -timeout 8m -run '^TestE19' ./internal/integration
+SESAMEFS_E19_ISOLATED_URL="$SESAMEFS_URL" go test -tags integration -race -v -count=2 -timeout 10m -run '^TestE19CrossRepoPublication$' ./internal/integration
+```
+
+Repeat the direct matrix with dc-eu host/local DC; keep the complete declared
+map. Existing per-leg barriers, task waits and isolated child timeout remain
+unchanged. Productive source HTTP purge, real cascade/zero-proof/retirement,
+final exact-P and actual destination HTTP download remain the named oracles.
+Source up: lapse is an explicit expiry-state control; repair-first observes
+its shortened real pub: TTL, not production TTL-policy/scanner coverage.
+
+Not rerun: full standard integration/API/OIDC, short Go/vet, one-DC compatibility,
+standalone Sync/frontend or other three-DC matrices. Their dated results above
+and #300's one-DC 14/14 are historical evidence, not new executions here.
+This slice changes documentation only; Go source, schema, defaults,
+dependencies and runners match the frozen base.
+No external batch auth/routing, client, directory/multi-block/encrypted case,
+all-order, partition or global-progress claim. E1-10e and full-suite obligations
+remain pending; umbrella P2, E1-01 (including PREPARED before discovery), X1 and
+PRE-GC/A1 stay OPEN. Backward compatible: yes, documentation/evidence only.
+
+Final scoped audit: no introduced blocker identified. All tracked changes are
+five Markdown files; Go, scripts, Compose, configuration and dependencies match
+the frozen base. Source/image hashes, original restored oracles, exact named
+positive/negative exits, 266 relative file links, new evidence anchor and
+whitespace checks pass. Main remains the tested base, with no rebase/rewrite
+needed. Retained probes and soft-deleted library history do not imply an empty
+bucket/database or global queue convergence; only the stated owned surfaces
+are certified. No issue/gate is closed by this evidence slice.

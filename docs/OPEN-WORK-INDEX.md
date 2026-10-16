@@ -1,5 +1,14 @@
 # Open Work Index
 
+## E1-09 scoped three-DC evidence (2026-10-15)
+
+[Current-main E1-09 validation](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+passes all 14 existing copy/move legs, parent/child race twice, EU and original
+required/omission negatives after #300, without code changes. Owned cleanup
+and retained probes are measured separately. E1-10e still needs its own
+three-DC matrix; full-suite obligations, P2 umbrella/COMMITTED teardown debt
+and E1-01/X1/PRE-GC/A1 stay OPEN. Ordinary/production GC OFF.
+
 ## E1-7 scoped three-DC retirement correction (2026-10-15)
 
 [Reproduction and evidence](./E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)

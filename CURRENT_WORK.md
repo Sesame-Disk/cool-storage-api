@@ -35,7 +35,17 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite budget and remaining historical
     E1 three-DC cases still need scoped validation (see current ledgers).
 
-## Active slice: E1-7 observed retirement worker correction
+## Active slice: E1-09 unchanged-current-main three-DC evidence
+
+Base main@8c7bd3d48 (#300). [E1-09 ledger](docs/E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
+records 14/14 unchanged copy/move legs PASS, parent/child race twice (28 names),
+EU 14/14, required parent/child negatives and the original final-gate omission
+control. Four mutation and fourteen restored fixtures verify owned cleanup;
+41 auxiliary probes remain retained. The retirement helper already includes
+the #300 correction. E1-10e and full-suite obligations remain pending, with the separate P2
+COMMITTED teardown debt still OPEN. E1-01/X1/PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: E1-7 observed retirement worker correction (#300)
 
 Base main@7a8bf5b86 (#299). [E1-7 ledger](docs/E1-7-SYNC-RECVFS-BEFORE-PUTBLOCK.md#three-dc-reproduction-and-scoped-correction-2026-10-15)
 records original 4/6 PASS and two retirement failures at the real topology gate.
