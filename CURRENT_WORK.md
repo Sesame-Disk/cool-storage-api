@@ -1,6 +1,14 @@
 # Current Work
 
-## Active slice: E1-01I PREPARED before discovery (2026-10-16)
+## Active slice: E1 final disposition audit (2026-10-16)
+
+[The source/evidence audit](docs/E1-FINAL-DISPOSITION.md) narrows the remaining
+X1 list to H1, I1 and M1 plus maintainer acceptance. R18/R27's legacy rationale
+is superseded; pending R28 authority no longer TTLs; 020 is KEEP. E6/R30/R31
+convergence stays PRE-GC. This is a reviewable disposition recommendation,
+not an X1 closure or GC activation. Recommended next slice: H1.
+
+## Previous merged slice: E1-01I (#307) PREPARED before discovery (2026-10-16)
 
 [E1-01I](docs/E1-01I-PREPARED-BEFORE-DISCOVERY.md) tests the real producer's internal
 PREPARED-without-projection window with SIGKILL/resume and independent recovery.
@@ -34,7 +42,7 @@ COMMITTED assertions are preserved. See the [plan and audit](docs/E1-OWNED-TEARD
 This closes only the P2 test-hygiene defect for new fixtures; older retained data,
 combined-suite reconciliation and X1/PRE-GC/A1 remain separate. GC stays OFF.
 
-## Status snapshot (2026-10-15)
+## Status snapshot (2026-10-16)
 
 The source of record for order and closure states is
 [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md). This is a summary.
@@ -48,11 +56,12 @@ The source of record for order and closure states is
   (PRE-GC), not X1.
 - **W2 checklist:** every row, W2-0..14, is closed for X1. W2-10 (content
   resurrection) was closed by E1-17 (CLOSED-FIX).
-- **Remaining before X1 CLOSED:**
-  1. E1-01 final disposition after the A–H reconciliation (recorded; still OPEN);
-  2. full-suite three-DC residuals/reconciliation (named E1 union recorded above);
-  3. the D0 §25 reclassification list;
-  4. the identity claim-table PRE-X1 audit debt.
+- **Remaining before X1 CLOSED:** the [final disposition audit](docs/E1-FINAL-DISPOSITION.md)
+  recommends scoped acceptance of A-I and resolves the named D0 rows. Three
+  bounded actions remain: H1's complete existing-P2/late-PUT/publication witness,
+  I1's identity execution-site inventory and M1's separate H8 CAS negatives.
+  Maintainer final E1 acceptance remains required; failed/unrun deployment
+  evidence retains its limits, and no full-suite PASS is claimed.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
   table. Highlights:
   - Phase 5 cascade (P0 latent) and the Phase 6 TOCTOU;

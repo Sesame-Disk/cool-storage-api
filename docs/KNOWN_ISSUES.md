@@ -1,5 +1,13 @@
 # Known Issues - SesameFS
 
+## E1 final audit dispositions (2026-10-16)
+
+[The source/evidence audit](./E1-FINAL-DISPOSITION.md) preserves existing
+severities and PRE-GC obligations while separating exact physical-life safety.
+R30 original-attempt reference retention stays PRE-GC; the current repair owns
+`pub:<repo:commit:fs>`, not the historical fresh-repair-UUID identity. H and the
+identity/H8 PRE-X1 evidence debt remain open. No X1 or activation closure.
+
 ## E1 compatibility fixture cleanup (2026-10-15)
 
 **P2 FOLLOW-UP / GENERAL, CLOSED-FIX for new fixtures.** The [scoped correction](./E1-OWNED-TEARDOWN-PLAN.md)
@@ -6749,11 +6757,18 @@ Query/Batch execution site, following the execution-site approach used for
 not expand the Mapping Authority claim-table fix into the older identity claim
 guard.
 
-The H8 upload mutation also exercises several CAS terminals in one source
-mutation. Because another terminal can keep the mutation red, the result does
+The H8 upload mutation in `scripts/pc-d1b3-mapping-authority-mutation-validation.sh`
+also exercises ten CAS terminals in one source mutation. Because another terminal
+can keep the mutation red, the result does
 not independently prove that every terminal remains inventoried. Split H8
 into one directed mutation per terminal before treating those checks as
 independent evidence. This is test debt, not a runtime blocker for #233.
+
+**E1 final audit (2026-10-16):** [I1/M1](./E1-FINAL-DISPOSITION.md#remaining-x1-work)
+remain P2 PRE-X1 quality debt. The existing identity guard passes and current
+literal claim sites are one INSERT/one SELECT; that does not prove execution-site
+completeness. H8 belongs to the mapping cold-path guard, not the identity
+primitive. No new current-runtime defect or productive guard is claimed.
 
 ### ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01: A continuity LWT racing a hard delete can leave a HEAD-less ghost `libraries` row
 
@@ -8225,6 +8240,11 @@ P6 issue above.
   follow-up, not closed by the P4a late-loser fix: a `block_claim_foreign_owner` result now
   exits at `processOrg` without calling `CompleteItem`, `RequeueItem`, `FailItem` or retry
   mutation, but ordinary retry/postpone paths still need one lifecycle authority.
+
+  **E1 disposition (2026-10-16): OPEN PRE-GC** for queue lifecycle/liveness,
+  with the existing Low/Low-Med severity preserved. The [exact-D block safety
+  argument](./E1-FINAL-DISPOSITION.md) does not close these ordinary queue races
+  or certify other item types. Replaying the same D/K1 is not new authority over K2.
 
   One interleaving belongs explicitly in that race matrix, because it shows why the
   follow-up cannot be "put a CAS on `RequeueItem`". P4a binds the QUEUE decision to the
