@@ -11809,7 +11809,7 @@ Do not weaken the per-file admission or turn a missing object into an empty dire
 
 ## ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01
 
-**Status:** OPEN. **Severity:** P2 / CURRENT-RUNTIME availability follow-up, multi-DC; pre-existing. It is not X1: no HEAD is published and no reference is written by the failing request.
+**Status:** OPEN. **Severity:** P2 / CURRENT-RUNTIME availability follow-up, multi-DC; pre-existing. The measured lease-acquisition failures precede HEAD publication. No X1 safety closure or violation follows from these availability results.
 
 `TestMultiInstanceSeafHTTPUploadWhileMovingNoLostFiles` fails intermittently on a real three-DC fixture, where concurrent SeafHTTP uploads race a same-repo move:
 
@@ -11819,10 +11819,41 @@ Do not weaken the per-file admission or turn a missing object into an empty dire
 | E1-16 full run, 2026-10-10 | FAIL |
 | E1-16 isolated `-count=3` | 1 of 3 FAIL |
 
-The client receives `500 {"error":"file stored but metadata update failed"}` about 400 ms into finalization. Server evidence places the failure before `commitUploadedFile`, in `acquireSeafHTTPUploadFinalizePermit`: the local permit, or the LWT of `acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals`. That function returns any acquisition error unchanged, and `writeSeafHTTPUploadError` maps every unclassified error to the generic 500. The error is not logged, so the exact cause is not identified.
+**Historical observation (2026-10-10).** The client received `500 {"error":"file stored but metadata update failed"}` about 400 ms into finalization. Server evidence places the failure before `commitUploadedFile`, in `acquireSeafHTTPUploadFinalizePermit`: the local permit, or the LWT of `acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals`. That function returns any acquisition error unchanged, and `writeSeafHTTPUploadError` maps every unclassified error to the generic 500. The error was not logged, so that run did not identify the exact cause.
 
-Next step: log the acquisition error, then classify a contention or ambiguous-LWT outcome as retryable (409/503) if that is what it is. The client retry contract keys on the 409 conflict response (`writeSeafHTTPUploadError` CLIENT_CONTRACT comment), not on this 500. Do not change lease semantics without that evidence.
+**2026-10-16 current reproduction after #305.** The [three-API ledger](./E1-THREE-API-RESIDUALS.md)
+records SeafHTTP FAIL 3/3 before edits; one fails in the competing move's HEAD
+CAS and two in upload finalization. A temporary diagnostic run captures the
+upload lease's native SERIAL CAS WriteTimeout (Received=1, BlockFor=2). Generic
+upload error writers now retain the cause in server logs while preserving
+client responses and all lease/publication/retry semantics. This fixes missing
+diagnostics, not the 500. Original failures and the new availability issue below
+remain OPEN; current evidence does not prove every historical failure's cause.
+Next step: design and verify an outcome-aware lease-acquisition recovery or retry policy for the captured error. A CAS timeout alone does not establish non-publication or safe ownership; a blanket conversion to 409/503 requires separate outcome and caller-compatibility evidence. The client retry contract keys on the 409 conflict response (`writeSeafHTTPUploadError` CLIENT_CONTRACT comment), not on this 500. Do not change lease semantics without that evidence.
 
+
+## ISSUE-V2-UPLOAD-HEAD-CAS-TIMEOUT-500-01
+
+**Status:** OPEN (2026-10-16). **Severity:** P2 / CURRENT-RUNTIME availability,
+pre-existing; reproduces on main before this diagnostic-only change.
+TestConcurrentTwoRegionV2UploadsNoLostCommits fails 2/3 in the three-API baseline
+with upload 500s. The [current ledger](./E1-THREE-API-RESIDUALS.md) captures native
+SERIAL CAS WriteTimeout during HEAD publication; a separate run also captures a
+failed SERIAL confirmation and ErrLibraryHeadPublicationUnknown. Current entries
+or content may already be published despite an error response. Do not infer a
+negative publication proof from the 500 or blindly retry/rollback. Preserve the
+existing unknown-outcome contract and isolate a future correction with its own
+public-path RED/GREEN evidence. This PR adds diagnostic visibility only.
+
+## ISSUE-GC-SYNTHETIC-SIBLING-TEARDOWN-01
+
+**Status:** OPEN (2026-10-16). **Severity:** P2 / FOLLOW-UP / GENERAL test hygiene.
+The synthetic plain/encrypted-sibling retirement test removes blocks/mappings/
+queue rows but leaves its intentionally measured COMMITTED orphan, independent
+root/discovery and PUBLISHED lifecycle after teardown. [The ledger](./E1-THREE-API-RESIDUALS.md)
+records owned post-run disposal, not automatic cleanup or productive recovery.
+A future fixture-only cleanup must preserve the original post-G3 assertions and
+use the exact owned authority; do not expand shared x1Cleanup or enable GC.
 
 ### E1-10e: unpublished source counterexample and scoped fix (2026-10-06)
 

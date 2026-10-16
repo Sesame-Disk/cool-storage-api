@@ -3614,6 +3614,7 @@ func writeUploadFileError(c *gin.Context, err error) {
 	case errors.Is(err, errUploadStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
+		log.Printf("[UploadFile] Unexpected metadata failure: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 	}
 }

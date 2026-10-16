@@ -1,6 +1,16 @@
 # Current Work
 
-## Active slice: E1 combined three-DC validation (2026-10-15)
+## Active slice: E1 three-API residual diagnostics (2026-10-16)
+
+Base main@331166aa5 (#305). [Three-API results](docs/E1-THREE-API-RESIDUALS.md)
+reproduce SeafHTTP and V2 upload 500s on distinct NA/EU/Asia backends; the
+synthetic GC case passes 3/3 before edits and 3/3 with race. Two log lines retain
+previously hidden lease/HEAD causes. Functional upload runs still FAIL; no
+availability fix is claimed. Five repairs and upload history/bytes are retained;
+six owned synthetic authorities were disposed exactly. Full-suite residuals,
+E1-01/D0/identity/X1/PRE-GC/A1 stay OPEN; ordinary GC OFF.
+
+## Previous merged slice: E1 combined three-DC validation (#304, 2026-10-15)
 
 Base main@221997f45 (#303). The [combined ledger](docs/E1-COMBINED-THREE-DC-VALIDATION.md)
 records a serial union of all seven historical E1 families (44 cases), plus
