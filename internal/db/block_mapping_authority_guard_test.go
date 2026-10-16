@@ -2201,6 +2201,15 @@ func TestBlockMappingAuthoritySerialReadRetriesOnlyAmbiguousCAS(t *testing.T) {
 // bindings, and same-package helper returns. It inventories every mapping
 // mutation and every SELECT reader, including the explicitly pre-GC exception.
 func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
+	if violations := authorityExecutionInventory(t); len(violations) > 0 {
+		t.Fatalf("PCD1B3 BLOCK MAPPING MUTATION INVENTORY: %v", violations)
+	}
+}
+
+// Share the existing closed-world Query/Batch analysis with identity claims.
+// Dynamic classifications and resolver semantics have one source of record.
+func authorityExecutionInventory(t *testing.T) []string {
+	t.Helper()
 	repoRoot := r3RepositoryRoot(t)
 	const ordinaryWriter = "insertBlockIDMappingForWriteCheckFn"
 	const freezeWriter = "freezeBlockMappingProjection"
@@ -2314,6 +2323,8 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 	readerCallsites := map[string]map[string]bool{}
 	claimTableCallsites := map[string]bool{}
 	claimInsertExecutionCount, claimSelectExecutionCount := 0, 0
+	identitySites := map[string]bool{}
+	identityInserts, identitySelects := 0, 0
 	insertCallsites := map[string]bool{}
 	freezeCallsites := map[string]bool{}
 	dynamicQueryCallsites := map[string]bool{}
@@ -2413,6 +2424,9 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 						violations = append(violations, relPath+":"+owner+" has an unresolved/dynamic gocql.BatchEntry statement")
 						continue
 					}
+					if strings.Contains(strings.ToLower(resolved.text), identityAuthorityClaimsTable) {
+						violations = append(violations, relPath+":"+owner+" unauthorized identity BatchEntry execution")
+					}
 					if blockMappingTableMentionPattern.MatchString(resolved.text) {
 						violations = append(violations, relPath+":"+owner+" submits block_id_mappings CQL through gocql.BatchEntry")
 					}
@@ -2466,6 +2480,10 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 				})
 			}
 			if !resolved.constant {
+				if strings.Contains(strings.ToLower(resolved.text), identityAuthorityClaimsTable) {
+					violations = append(violations, relPath+":"+owner+" unresolved/dynamic Query may touch "+identityAuthorityClaimsTable)
+					return true
+				}
 				if strings.Contains(strings.ToLower(resolved.text), blockMappingAuthorityClaimsTable) {
 					violations = append(violations, relPath+":"+owner+" unresolved/dynamic Query may touch "+blockMappingAuthorityClaimsTable)
 					return true
@@ -2491,6 +2509,22 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 				}
 				violations = append(violations, relPath+": unresolved/dynamic Query argument in "+owner+"; classify or allowlist this call site")
 				return true
+			}
+			if strings.Contains(strings.ToLower(normalized), identityAuthorityClaimsTable) {
+				site := relPath + ":" + strconv.Itoa(int(call.Pos()))
+				if !identitySites[site] {
+					identitySites[site] = true
+					selector, direct := call.Fun.(*ast.SelectorExpr)
+					sessionQuery := direct && callName == "Query" && blockMappingReceiverExprIsProvenNonBatch(selector.X, body, parameters, source, map[string]bool{}, 0)
+					switch {
+					case sessionQuery && relPath == "internal/db/identity_authority.go" && owner == "ClaimIdentityAuthorityAt" && normalized == identityAuthorityExactInsert:
+						identityInserts++
+					case sessionQuery && relPath == "internal/db/identity_authority.go" && owner == "ReadIdentityAuthority" && normalized == identityAuthorityExactSelect:
+						identitySelects++
+					default:
+						violations = append(violations, relPath+":"+owner+" unauthorized identity execution of "+identityAuthorityClaimsTable)
+					}
+				}
 			}
 			claimTableMention := strings.Contains(strings.ToLower(normalized), blockMappingAuthorityClaimsTable)
 			if claimTableMention {
@@ -2610,6 +2644,9 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 			violations = append(violations, contract.path+":"+owner+" SELECT inventory count="+strconv.Itoa(readerCounts[owner])+", want 1")
 		}
 	}
+	if identityInserts != 1 || identitySelects != 1 {
+		violations = append(violations, "identity_authority_claims execution inventory INSERT="+strconv.Itoa(identityInserts)+" SELECT="+strconv.Itoa(identitySelects)+", want 1/1")
+	}
 	if claimInsertExecutionCount != 1 || claimSelectExecutionCount != 1 {
 		violations = append(violations, "block_mapping_authority_claims execution inventory INSERT="+strconv.Itoa(claimInsertExecutionCount)+" SELECT="+strconv.Itoa(claimSelectExecutionCount)+", want 1/1")
 	}
@@ -2701,9 +2738,7 @@ func TestBlockMappingMutationsAreRepositoryWideInventoried(t *testing.T) {
 		violations = append(violations, "dominant-timestamp block_id_mappings freeze inventory count="+strconv.Itoa(freezeCount)+", want 1")
 	}
 	sort.Strings(violations)
-	if len(violations) > 0 {
-		t.Fatalf("PCD1B3 BLOCK MAPPING MUTATION INVENTORY: %v", violations)
-	}
+	return violations
 }
 
 func blockMappingAuthorityFuncBody(t *testing.T, source, signature string) string {
