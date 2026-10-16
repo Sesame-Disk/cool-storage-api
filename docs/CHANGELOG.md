@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Correct owned E1-10e/E1-17 COMMITTED teardown
+
+Two fixture callbacks now dispose only their captured exact recovery authority
+after verified block/refs/lifecycle/K cleanup. Original COMMITTED/admission
+assertions remain unchanged. Docker regression reproduces six COMMITTED residue
+failures in both one and three DCs; corrected matrices and child race pass.
+[Plan, evidence and audit](./E1-OWNED-TEARDOWN-PLAN.md). No productive behavior or
+X1/PRE-GC/A1 gate change; ordinary GC OFF.
+
 ## 2026-10-15 — Validate unchanged E1-10e on three DCs after #301
 
 [The E1-10e ledger](./E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)

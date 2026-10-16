@@ -2,7 +2,9 @@
 
 ## E1 compatibility fixture cleanup (2026-10-15)
 
-**P2 FOLLOW-UP / GENERAL, OPEN.** E1-10e and E1-17 COMMITTED cases leave orphan/
+**P2 FOLLOW-UP / GENERAL, CLOSED-FIX for new fixtures.** The [scoped correction](./E1-OWNED-TEARDOWN-PLAN.md)
+preserves COMMITTED assertions and verifies automatic exact teardown in Docker.
+The original finding: E1-10e and E1-17 COMMITTED cases left orphan/
 recovery-root metadata after their block/lifecycle/object teardown. Six owned
 pairs were reproduced during E1-7 compatibility and explicitly disposed;
 twenty older pairs remain retained. This is independent test hygiene, tracked

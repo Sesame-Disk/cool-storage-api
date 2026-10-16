@@ -1,5 +1,13 @@
 # Open Work Index
 
+## E1 compatibility teardown correction (2026-10-15)
+
+The P2 cleanup defect is CLOSED-FIX for new E1-10e/E1-17 fixtures; see the
+[scoped plan and Docker audit](./E1-OWNED-TEARDOWN-PLAN.md).
+Original COMMITTED evidence remains intact. Twenty older one-DC authorities
+remain retained. Full-suite/reconciliation duties, umbrella P2 and
+E1-01/X1/PRE-GC/A1 stay OPEN. Ordinary GC OFF.
+
 ## E1-10e scoped three-DC evidence (2026-10-15)
 
 [Current-main E1-10e validation](./E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
@@ -664,7 +672,6 @@ that absence is not extrapolated to reused content. No runtime fix is added.
 CLOSED-EVIDENCE applies only to that measured ordered contract. W2-5/E1-05
 overall, R31/W2-11..14, W2-10, E1 and X1 remain OPEN; production GC remains OFF.
 
-
 ## E1-09 / W2-9 source-purge publication fix — 2026-10-05
 
 `ISSUE-W2-CROSSREPO-RETIRED-LIFE-PUBLICATION-01`: productive source purge and
@@ -677,7 +684,6 @@ Async task progress also had a reproduced data race; fields are now snapshotted
 under the TaskStore lock. Move source disappearance after safe destination
 publication remains existing partial-operation semantics, not rollback.
 [Evidence and limits](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md).
-
 
 ### E1-10e: unpublished source counterexample and scoped fix (2026-10-06)
 

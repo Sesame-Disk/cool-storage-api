@@ -60,6 +60,7 @@ func TestUnpublishedResurrectionSourceAdmission(t *testing.T) {
 			web := newSessionUploadHeadFixture(t, database, newBorrowedFSHeadHandler(t, database, class))
 			fx := &w2CreateFileFixture{w2UploadFileFixture: &w2UploadFileFixture{borrowedFSHeadFixture: web.borrowedFSHeadFixture}}
 			sourceRef := web.sessionRef
+			var retired gcpkg.BlockDeleteAuthority
 			// Canonical metadata disappears at COMMITTED: retain exact K for teardown.
 			cleanupStore := newVerificationS3Store(t)
 			cleanupKey := fx.target.StorageKey
@@ -68,10 +69,13 @@ func TestUnpublishedResurrectionSourceAdmission(t *testing.T) {
 				defer cancel()
 				if err := cleanupStore.Delete(ctx, cleanupKey); err != nil {
 					t.Errorf("cleanup exact K: %v", err)
+					return
 				}
 				if found, err := cleanupStore.Exists(ctx, cleanupKey); err != nil || found {
 					t.Errorf("cleanup exact K remains: %v %v", found, err)
+					return
 				}
+				e1DisposeOwnedRecovery(t, fx, retired)
 			})
 			x1Cleanup(t, database, fx.orgUUID, fx.blockID)
 			syncRef := dbpkg.BlockReferrerForUpload("sync:" + fx.repoID + ":" + fx.blockID)
@@ -99,7 +103,6 @@ func TestUnpublishedResurrectionSourceAdmission(t *testing.T) {
 				t.Fatalf("unexpected repair %+v", rows)
 			}
 			original := fx.target
-			var retired gcpkg.BlockDeleteAuthority
 			if leg == "committed" || leg == "terminal" {
 				// Owned temporary lapse only; never delete a historical permanent fs:.
 				if err := database.RemoveBlockReference(fx.orgID, fx.blockID, sourceRef); err != nil {
