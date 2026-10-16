@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Validate unchanged E1-10e on three DCs after #301
+
+[The E1-10e ledger](./E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
+records 4/4 current functional legs, 8/8 child race cases, EU 4/4 and original
+required/admission-omission controls. Automatic COMMITTED cleanup still leaves
+metadata; seven exact owned authorities were disposed after verified preconditions,
+without claiming that P2 fixed. Fifty auxiliary probes remain retained. No Go
+changes or full-suite/gate closure; combined reconciliation stays pending.
+
 ## 2026-10-15 — Validate unchanged E1-09 on three DCs after #300
 
 [The existing E1-09 ledger](./E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)

@@ -35,7 +35,18 @@ The source of record for order and closure states is
   - TECHNICAL-DEBT: the integration suite budget and remaining historical
     E1 three-DC cases still need scoped validation (see current ledgers).
 
-## Active slice: E1-09 unchanged-current-main three-DC evidence
+## Active slice: E1-10e current-main three-DC evidence
+
+Base main@3deddb4f9 (#301). [E1-10e ledger](docs/E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
+records four unchanged functional legs PASS, parent/child race twice, EU and
+original required/admission-omission negatives. Automatic COMMITTED teardown
+still leaves metadata: seven owned authorities were verified and explicitly
+disposed after runs; this is not an automatic-cleanup PASS or code fix. Fifty
+auxiliary probes remain retained. All seven historical families have individual
+scoped evidence; combined-suite/reconciliation and P2 cleanup remain pending.
+E1-01/X1/PRE-GC/A1 OPEN; ordinary/production GC OFF.
+
+## Previous merged slice: E1-09 unchanged-current-main three-DC evidence (#301)
 
 Base main@8c7bd3d48 (#300). [E1-09 ledger](docs/E1-09-CROSS-REPO-PUBLICATION-SAFETY.md#three-dc-validation-on-current-main-2026-10-15)
 records 14/14 unchanged copy/move legs PASS, parent/child race twice (28 names),
