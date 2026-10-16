@@ -74,12 +74,13 @@ func TestShouldSkipSourceRemovalAfterMove(t *testing.T) {
 		{name: "traverse error", err: errors.New("boom"), want: true},
 		{name: "nil result", want: true},
 		{name: "missing target entry", result: &PathTraverseResult{}, want: true},
-		{name: "existing target entry", result: &PathTraverseResult{TargetEntry: &FSEntry{Name: "file.txt"}}, want: false},
+		{name: "copied target entry", result: &PathTraverseResult{TargetEntry: &FSEntry{Name: "file.txt", ID: "fs-a"}}, want: false},
+		{name: "replaced target entry", result: &PathTraverseResult{TargetEntry: &FSEntry{Name: "file.txt", ID: "fs-b"}}, want: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldSkipSourceRemovalAfterMove(tt.result, tt.err); got != tt.want {
+			if got := shouldSkipSourceRemovalAfterMove(tt.result, tt.err, "fs-a"); got != tt.want {
 				t.Fatalf("shouldSkipSourceRemovalAfterMove() = %v, want %v", got, tt.want)
 			}
 		})
