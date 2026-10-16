@@ -1,4 +1,12 @@
 # Open Work Index
+## E1 combined three-DC validation (2026-10-15)
+
+[Current combined ledger and reconciliation](./E1-COMBINED-THREE-DC-VALIDATION.md)
+record the 44-case historical-family union plus 15 E1-17 compatibility cases
+in one process. Normal and race 59/59 runs pass with exact-name and gate checks.
+Full-suite residuals/budget, umbrella P2 and E1-01/D0/identity/X1/PRE-GC/A1
+remain OPEN. Ordinary GC OFF. Earlier slice entries below are dated snapshots;
+the current ledger supersedes their individual-only/cleanup-pending statements.
 
 ## E1 compatibility teardown correction (2026-10-15)
 

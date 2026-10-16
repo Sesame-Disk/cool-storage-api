@@ -1,6 +1,14 @@
 # Current Work
+## Active slice: E1 combined three-DC validation (2026-10-15)
 
-## Scoped E1 owned teardown correction (2026-10-15)
+Base main@221997f45 (#303). The [combined ledger](docs/E1-COMBINED-THREE-DC-VALIDATION.md)
+records a serial union of all seven historical E1 families (44 cases), plus
+E1-17 compatibility (15), with exact-name enforcement and existing gates.
+Normal and race 59/59 runs pass without skips. This supersedes individual-only
+coverage for these named matrices; full-suite residuals/budget, E1-01, D0 and
+identity audits, X1/PRE-GC/A1 remain OPEN. Ordinary GC stays OFF.
+
+## Previous merged slice: E1 owned teardown correction (#303, 2026-10-15)
 
 E1-10e/E1-17 COMMITTED fixture residues now have a scoped automatic cleanup
 correction, with one-/three-DC RED/GREEN and real child race evidence. Original
@@ -24,7 +32,7 @@ The source of record for order and closure states is
   resurrection) was closed by E1-17 (CLOSED-FIX).
 - **Remaining before X1 CLOSED:**
   1. E1-01 final disposition after the A–H reconciliation (recorded; still OPEN);
-  2. the three-DC residuals (28 of the 30 G5 failures now pass);
+  2. full-suite three-DC residuals/reconciliation (named E1 union recorded above);
   3. the D0 §25 reclassification list;
   4. the identity claim-table PRE-X1 audit debt.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
@@ -40,11 +48,12 @@ The source of record for order and closure states is
 - **Open follow-ups from the E1-16 runs:**
   - `ISSUE-SEAFHTTP-UPLOAD-FINALIZE-LEASE-ERROR-500-01` (P2, multi-DC
     availability);
-  - TECHNICAL-DEBT: the integration suite budget and remaining historical
-    E1 three-DC cases still need scoped validation (see current ledgers).
+  - TECHNICAL-DEBT: integration suite budget and independent full-suite
+    three-DC residuals remain OPEN; named E1 matrices have joint evidence above.
 
-## Active slice: E1-10e current-main three-DC evidence
+## Previous merged slice: E1-10e current-main three-DC evidence (#302)
 
+Historical pre-#303 snapshot; current cleanup/union status is above.
 Base main@3deddb4f9 (#301). [E1-10e ledger](docs/E1-10E-W210-RESIDUAL-DISPOSITION.md#three-dc-validation-on-current-main-2026-10-15)
 records four unchanged functional legs PASS, parent/child race twice, EU and
 original required/admission-omission negatives. Automatic COMMITTED teardown

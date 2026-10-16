@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-15 — Validate the combined E1 three-DC matrix after #303
+
+[The combined ledger](./E1-COMBINED-THREE-DC-VALIDATION.md) records the 44-case
+historical-family union plus 15 E1-17 compatibility cases, together in one serial
+Go process, passing 59/59 normally and with race. Existing gates and explicit
+case-name checks enforce completeness.
+The seven-family reconciliation corrects historical causal overreach while
+preserving independent full-suite/sync residuals. No runtime, schema, test,
+configuration or activation change. X1/PRE-GC/A1 remain OPEN; ordinary GC OFF.
 ## 2026-10-15 — Correct owned E1-10e/E1-17 COMMITTED teardown
 
 Two fixture callbacks now dispose only their captured exact recovery authority

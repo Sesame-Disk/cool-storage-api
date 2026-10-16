@@ -204,6 +204,13 @@ and X1 non-overlap characterization tests. `TestBlockMappingAuthority3DC`
 SKIPs because it needs its own script. Only
 `TestMultiInstanceSeafHTTPUploadWhileMovingNoLostFiles` still fails.
 
+**Later reconciliation (2026-10-15, after #303).** The [59-case E1 union](./E1-COMBINED-THREE-DC-VALIDATION.md)
+provides current joint evidence for the seven E1 families plus E1-17. The
+openIntegrationProjectionDB attribution in the dated classification below was
+withdrawn in #293; proved declaration omissions were in specific observed-session
+wrappers (#296/#299/#300). Current PASS does not prove one cause for all historical
+failures. Other integration/sync residuals and the full-suite budget remain OPEN;
+this dated full-suite result is not relabeled PASS.
 **Classification of the 10 integration failures.** No failure is an X1/W2
 safety violation:
 
