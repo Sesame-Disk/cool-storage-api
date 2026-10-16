@@ -214,6 +214,16 @@ func (s *e1ProtectedSuccessor) publishAndReplay(t *testing.T, database *dbpkg.DB
 			t.Fatalf("H1 replay republished root: found=%v err=%v", found, err)
 		}
 	}
+	// A reachable HEAD must remain readable with P1 physically unavailable,
+	// not just return matching bytes while the late K1 residue also exists.
+	if err := bs.DeleteBlockByStorageKey(t.Context(), s.k1); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := bs.ObjectExists(t.Context(), s.k1); err != nil || exists {
+		t.Fatalf("H1 cannot prove P1-independent HEAD: K1 exists=%v err=%v", exists, err)
+	}
+	assertDownload()
+	s.assertP2(t, database, store, bs, content, refs)
 	// The physical K1 residue is an owned leak, never an accepted canonical life.
 	t.Cleanup(func() {
 		if err := bs.DeleteBlockByStorageKey(context.Background(), s.k1); err != nil {
