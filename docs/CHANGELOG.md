@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — Preserve replaced source identity during cross-repo moves (#305)
+
+A cross-repo move now removes the source only if its current fs_id still matches
+what the successful destination attempt copied. A concurrent replacement stays
+in place; the response remains successful and its source counters are retained.
+The P1 GENERAL source-identity finding is corrected without changing same-repo
+moves or the API/schema contract. Fresh Docker audit after rebasing onto #304:
+identity regression 3/3 in one DC, 3/3 with race on three-DC Cassandra; E1-09
+14/14 in each topology; four move/copy/quota compatibility tests; API/DB short
+and race suites plus targeted vet pass. A guard-omission control reproduces the
+original lost-replacement failure. Full integration/API/OIDC and client suites
+are not rerun. No X1/PRE-GC/A1 change; ordinary GC stays OFF.
 ## 2026-10-15 — Validate the combined E1 three-DC matrix after #303
 
 [The combined ledger](./E1-COMBINED-THREE-DC-VALIDATION.md) records the 44-case
