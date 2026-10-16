@@ -53,7 +53,7 @@ races, unknown outcomes or the PRE-GC/A1 gate. Severities are preserved.
 
 | Item | Recommended disposition | Current argument and evidence |
 |---|---|---|
-| H, late PUT | **STILL X1: bounded evidence gap**, not a new runtime finding | [The real Sync test](../internal/integration/e1_delayed_put_test.go) delays an authorized P1 PUT, completes D1, then observes K1 residue and a distinct P2. It does not install/protect P2 before D1's physical DELETE or attempt the later HEAD publication. [G4 coexistence](../internal/integration/g4_physical_life_coexistence_test.go) independently proves intact K2 during D1 recovery. Neither alone is D0 section 21's complete combined schedule. Keep H open; only the measured delayed-PUT subset is X3/leak. |
+| H, late PUT | **H1 measured; recommend X3/leak for the named schedule**, pending maintainer acceptance | The original audit lacked P2-before-DELETE plus HEAD. [H1](./E1-H1-PROTECTED-SUCCESSOR.md) now combines authorized K1 PUT, real D1 retirement, legitimate protected P2 before physical recovery, late K1 residue, actual metadata/HEAD/canonical download and stale D1 discovery refusal. K2 metadata/bytes/refs and HEAD survive; normal/race controls pass. This is one-DC healthy-service evidence, not universal fault coverage or overall X1 closure. |
 | R18, late logical refs veto old physical deletion | **SUPERSEDED** for current protocol; existing legacy disposition preserved | [recoverCanonicalS3Orphan](../internal/gc/worker.go) continues exact committed D without another global refs veto. [G4 late-ref and ownership controls](../internal/gc/p4b_authority_handoff_test.go) and real coexistence retain P2. The old A+ refs-deferred executor is not the current greenfield path; the known issue already records this. No quarantine protocol is required to fix an unreachable historical executor. |
 | R27, immutable day projection cannot schedule retry | **SUPERSEDED** as a current discovery dependency; **LIVENESS / PRE-GC** assumptions remain | [RecoverS3Orphans](../internal/gc/worker.go) enumerates fixed-bucket durable roots, not a 90-day by-day walk. [G5 real-stack restart](../internal/integration/g5_recovery_scheduling_test.go) persists namespaced seek checkpoints and revisits a failed prefix. Advancing/bounded-skew clocks, finite pre-cutoff claims and healthy checkpoint progress are qualifications, not unconditional fairness or a deadline. |
 | R28, pending authority disappears or partially expires | **CLOSED-FIX for the pending-authority TTL criterion** | [Migration 021](../internal/db/migrations/021_gc_s3_orphan_exact_identity.cql) creates exact orphan, discovery and root tables with TTL 0. Current Prepare/attempt/projection writes add no row TTL. G1 roots and G5 restart replace the coupled legacy TTL/day-horizon mechanism. Migration 001 still contains the historical 90-day tables; inspecting it alone is not the effective migrated schema. This does not certify terminal-row retention policy or unsupported legacy upgrades. |
@@ -106,13 +106,13 @@ this audit does not require fixing an independent 500 to invent physical safety.
 
 ## Remaining X1 work
 
-These are two open evidence-debt families, split into three bounded actions,
-followed by the maintainer's final acceptance. This is not an inventory of all
-PRE-GC/A1 work.
+H1 now supplies the named combined witness. I1/M1 remain two bounded quality
+actions, followed by the maintainer's final acceptance. This is not an inventory
+of all PRE-GC/A1 work.
 
 | Action | Exact unmet criterion | Small next action and closure condition |
 |---|---|---|
-| **H1 — recommended next slice** | D0 section 21's combined existing-P2 / late-K1 / publication schedule lacks a literal witness | Extend the existing real Sync delayed-PUT fixture with a legitimate protected P2 installed before D1 deletes K1. Release the already-authorized K1 PUT, exercise the actual metadata/HEAD continuation, and replay stale D1. PASS must show K2 bytes/metadata/refs intact, no P1 reinstall or HEAD dependency, and any successful publication resolves P2. Include no-GC/control/replay and exact cleanup. Fix runtime only on a reproducible RED. |
+| **H1 — measured; disposition pending acceptance** | Named existing-P2 / late-K1 / publication witness is now supplied | [H1 result](./E1-H1-PROTECTED-SUCCESSOR.md): real protected P2 precedes D1 physical recovery; late PUT and actual HEAD resolve P2; stale discovery refuses without a durable token; fresh discovery is empty. Controls, repeats, race, directed negatives and owned cleanup pass. Recommend X3 for observed K1 residue within this scope; final E1 decision remains the maintainer's. |
 | **I1 — identity claim guard, P2 PRE-X1** | Current guard inventories literal strings rather than every Query/Batch execution site | Reuse the existing execution-site approach for the two actual identity claim operations. Require exact write-once INSERT/read and fail-closed classification of current dynamic sites; directed negatives must test the existing immutable-claim contract. No new productive registry/guard or hypothetical runtime finding. Close the recorded structural audit debt after independent checks. |
 | **M1 — H8 mutation granularity, P2 PRE-X1 quality debt** | One combined mutation does not independently evidence ten supported CAS terminals | Split scripts/pc-d1b3-mapping-authority-mutation-validation.sh H8 into ten directed cases, one terminal each, requiring compile success and the matching guard rejection. H8 belongs to the mapping cold-path guard, not the identity primitive. Keep the existing guard; do not add a new runtime mechanism. |
 | **Final acceptance — maintainer decision** | E1/X1 sign-off has not happened | Review these dispositions, H1/I1/M1 results, the scoped E1-01 recommendation and failed/unrun deployment evidence. Accept a stated physical-safety scope or identify a concrete unmet criterion. Then propose X1 CLOSED in the final review; no unconditional closure or activation is implied by this PR. |
@@ -122,7 +122,8 @@ current retired-P1 publication. The maintainer may instead explicitly accept the
 present source/evidence scope and reclassify either as TECH DEBT / GENERAL,
 keeping P2 severity and the follow-up open. Such a decision must be recorded;
 this audit neither silently waives the tag nor makes a hypothetical future caller
-a new runtime blocker. H1 remains the recommended physical-safety evidence slice.
+a new runtime blocker. H1's subsequent result resolves its named witness gap;
+I1/M1 and final acceptance remain separate.
 
 The current identity source has only its one INSERT and one SELECT in
 [identity_authority.go](../internal/db/identity_authority.go). Its existing

@@ -7,7 +7,9 @@ for maintainer review: R18/R27's historical executors are superseded, pending
 R28 TTL is fixed, 020 is KEEP, and E6/R31 block safety is separated from their
 OPEN convergence debt. The named healthy-service A-I crash obligation is
 recommended CLOSED-EVIDENCE with explicit topology/fault qualifications.
-Remaining bounded work is H1's full existing-P2 late-PUT/publication schedule,
+[H1 now supplies its combined one-DC witness](./E1-H1-PROTECTED-SUCCESSOR.md):
+protected P2 before physical recovery, late PUT, HEAD on P2 and safe stale-D1
+refusal. Recommend X3 for measured K1 residue. Remaining bounded quality work is
 I1's identity execution-site guard and M1's independent H8 terminal negatives,
 then final E1 acceptance. Historical three-DC failures remain FAIL; this is
 no full-suite or production certificate. X1 remains OPEN and ordinary GC OFF.

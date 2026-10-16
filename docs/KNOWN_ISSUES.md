@@ -1,6 +1,15 @@
 # Known Issues - SesameFS
 
-## E1 final audit dispositions (2026-10-16)
+## H late-PUT evidence update (2026-10-16)
+
+[H1](./E1-H1-PROTECTED-SUCCESSOR.md) supplies the previously missing combined
+existing-P2 / late-K1 / HEAD witness on one DC with healthy services. Recommend
+X3/leak for measured K1 residue; no retired-P1 publication or runtime defect was
+reproduced. Stale discovery refuses safely without its durable root token.
+I1/M1 keep their P2 PRE-X1 tags; final maintainer acceptance, X1 and PRE-GC/A1
+remain separate. Ordinary GC remains OFF.
+
+## Previous E1 final audit dispositions (#308, 2026-10-16)
 
 [The source/evidence audit](./E1-FINAL-DISPOSITION.md) preserves existing
 severities and PRE-GC obligations while separating exact physical-life safety.
