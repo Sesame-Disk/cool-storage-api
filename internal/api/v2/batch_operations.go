@@ -121,8 +121,11 @@ func isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir stri
 	return opType == "move" && srcRepoID == dstRepoID && normalizePath(srcParentPath) == normalizePath(dstDir)
 }
 
-func shouldSkipSourceRemovalAfterMove(result *PathTraverseResult, err error) bool {
-	return err != nil || result == nil || result.TargetEntry == nil
+// shouldSkipSourceRemovalAfterMove reports whether a cross-repo move must leave the
+// source alone: the path is gone, or it now names a different object than the one
+// copied to the destination (a concurrent writer replaced it after the copy).
+func shouldSkipSourceRemovalAfterMove(result *PathTraverseResult, err error, copiedFSID string) bool {
+	return err != nil || result == nil || result.TargetEntry == nil || result.TargetEntry.ID != copiedFSID
 }
 
 func isPathWithin(candidatePath, parentPath string) bool {
@@ -625,6 +628,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	var srcFiles int64
 	skipped := false
 	sourceRemovalPublished := false
+	copiedSourceFSID := ""
 	replacedTagCleanupPath := ""
 	replacedTagCleanupByPrefix := false
 
@@ -860,6 +864,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		itemName = currentItemName
 		srcSize = currentSrcSize
 		srcFiles = currentSrcFiles
+		copiedSourceFSID = srcResult.TargetEntry.ID
 		return nil
 	})
 	if err != nil {
@@ -885,7 +890,10 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			}
 
 			srcResult, err := fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
-			if shouldSkipSourceRemovalAfterMove(srcResult, err) {
+			if shouldSkipSourceRemovalAfterMove(srcResult, err, copiedSourceFSID) {
+				if err == nil && srcResult != nil && srcResult.TargetEntry != nil {
+					log.Printf("[processSingleItem] source %s now holds %s, not the copied %s; leaving it in place", srcPath, srcResult.TargetEntry.ID, copiedSourceFSID)
+				}
 				return nil
 			}
 

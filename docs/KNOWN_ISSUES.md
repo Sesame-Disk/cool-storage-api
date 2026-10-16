@@ -11763,7 +11763,9 @@ publication remains existing partial-operation semantics, not rollback.
 
 ## ISSUE-CROSSREPO-MOVE-SOURCE-IDENTITY-RACE-01
 
-**Status:** OPEN. **Severity:** P1 / GENERAL follow-up, pre-existing; not introduced by PR #258 and not a blocker of its physical-life publication contract.
+**Status:** CLOSED-FIX (2026-10-16). **Severity:** P1 / GENERAL follow-up, pre-existing; not introduced by PR #258 and not a blocker of its physical-life publication contract.
+
+**Resolution.** `processSingleItem` now keeps the fs_id of the source entry that the published destination attempt copied. Source removal skips when the current entry at the path has a different fs_id, the same way it already skips a source that is gone. The move still returns success, and the replacement stays in the source. The source storage counter is not decremented, because the writer's own update already accounted for the replacement. A directory whose contents change between copy and removal is also left in place, so the user ends up with both copies rather than losing the concurrent edit. `TestCrossRepoMoveSourceRemovalChecksCopiedIdentity` holds the move after its destination HEAD CAS, replaces the source through the update link and releases it. It was RED on main (200, source emptied, FS-B gone) and is GREEN with the fix. The original finding follows as history.
 
 After destination publication, `processSingleItem` retries source removal against the latest source HEAD, resolves the path again and calls `RemoveEntryFromList` by name. It does not compare the current entry's fs_id with the entry copied by the destination attempt. A concurrent writer can replace `/a.txt` FS-A with FS-B after FS-A was copied; source removal can then delete FS-B while the destination contains only FS-A. Reanchoring to the newer HEAD means the source CAS does not establish copied-object identity. This is confirmed by source inspection; no deterministic runtime reproduction is claimed here.
 

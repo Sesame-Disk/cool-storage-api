@@ -45,9 +45,8 @@ func (b *crossRepoMoveDestinationHeadBarrier) ObserveQuery(_ context.Context, q 
 // ISSUE-CROSSREPO-MOVE-SOURCE-IDENTITY-RACE-01. A cross-repo move copies FS-A
 // to the destination and then removes the source by name from the latest
 // source HEAD. If a writer replaces /a.txt with FS-B in between, the move must
-// not remove FS-B: the destination only received FS-A. The test asserts that
-// invariant only; whether the move then reports a conflict or a no-op is left
-// to the fix.
+// not remove FS-B: the destination only received FS-A. Like a source that is
+// already gone, a replaced source is left in place and the move still succeeds.
 func TestCrossRepoMoveSourceRemovalChecksCopiedIdentity(t *testing.T) {
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
@@ -129,5 +128,8 @@ func TestCrossRepoMoveSourceRemovalChecksCopiedIdentity(t *testing.T) {
 	t.Logf("cross-repo move response=%d %s; FS-A=%s FS-B=%s source after=%+v err=%v", rec.Code, rec.Body.String(), fsA, fsB, after, err)
 	if err != nil || after.TargetEntry == nil || after.TargetEntry.ID != fsB {
 		t.Fatalf("RED: cross-repo move removed replacement FS-B %s from the source; only FS-A %s reached the destination", fsB, fsA)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("move with a replaced source must keep its success contract: %d %s", rec.Code, rec.Body.String())
 	}
 }

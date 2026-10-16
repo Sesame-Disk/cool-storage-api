@@ -192,10 +192,10 @@ Separate from the capture/final-validator bounds in #258.
 ## PR #258 source-removal identity follow-up (2026-10-05)
 
 [ISSUE-CROSSREPO-MOVE-SOURCE-IDENTITY-RACE-01](./KNOWN_ISSUES.md#issue-crossrepo-move-source-identity-race-01)
-is P1 GENERAL / OPEN, pre-existing: after copying FS-A, move can reanchor
-source cleanup to a replacement FS-B and remove it by name without checking
-its fs_id. Separate from E1-09 physical-life safety and existing move partial
-success; not fixed or closed by #258.
+is P1 GENERAL, pre-existing, CLOSED-FIX 2026-10-16: source
+removal now leaves a replacement FS-B in place when its fs_id differs from the
+copied FS-A, and the move still succeeds. Separate from E1-09 physical-life
+safety and existing move partial success; not fixed or closed by #258.
 
 ## Greenfield first-production reconciliation (2026-09-30)
 
