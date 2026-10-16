@@ -1,9 +1,11 @@
 # X1 critical path — reset to the #201 roadmap
+
 ## E1 current combined three-DC evidence (2026-10-15)
 
 After #303, the [named E1 union](./E1-COMBINED-THREE-DC-VALIDATION.md) supplies
 current joint evidence for seven historical fixture families plus E1-17.
-Normal and race 59-case batches pass, each in one fresh process with existing gates and explicit
+Normal and race 59-case batches pass, each in one fresh process with existing
+gates and explicit
 name checks. This supersedes individual-only coverage, not the older full-suite
 result. Independent three-DC/full-suite residuals and budget, E1-01, D0 and
 identity audit remain pending. No X1/PRE-GC/A1 closure; ordinary GC stays OFF.

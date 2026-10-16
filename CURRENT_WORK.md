@@ -1,4 +1,5 @@
 # Current Work
+
 ## Active slice: E1 combined three-DC validation (2026-10-15)
 
 Base main@221997f45 (#303). The [combined ledger](docs/E1-COMBINED-THREE-DC-VALIDATION.md)

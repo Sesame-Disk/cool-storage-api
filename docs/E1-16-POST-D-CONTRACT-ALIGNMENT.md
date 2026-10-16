@@ -211,6 +211,7 @@ withdrawn in #293; proved declaration omissions were in specific observed-sessio
 wrappers (#296/#299/#300). Current PASS does not prove one cause for all historical
 failures. Other integration/sync residuals and the full-suite budget remain OPEN;
 this dated full-suite result is not relabeled PASS.
+
 **Classification of the 10 integration failures.** No failure is an X1/W2
 safety violation:
 

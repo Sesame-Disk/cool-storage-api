@@ -1,4 +1,5 @@
 # Open Work Index
+
 ## E1 combined three-DC validation (2026-10-15)
 
 [Current combined ledger and reconciliation](./E1-COMBINED-THREE-DC-VALIDATION.md)
