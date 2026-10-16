@@ -31,6 +31,18 @@ import (
 // repair-authority check has authorized exact P1/K1, lets the real G5 worker
 // commit and fully retire D1, then releases the real object PUT to K1.
 func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
+	e1DelayedPut(t, false)
+}
+
+// The combined D0 H witness: P2 is protected before D1 deletes K1, and the
+// delayed writer subsequently attempts real metadata/HEAD publication.
+func TestE1DelayedPutWithProtectedSuccessor(t *testing.T) {
+	e19RequireNoBackgroundGC(t)
+	e1DelayedPut(t, true)
+}
+
+func e1DelayedPut(t *testing.T, protectedSuccessor bool) {
+	t.Helper()
 	requireCassandra(t)
 	database := shareProjectionDBForTest(t)
 	store := gcpkg.NewCassandraStore(database)
@@ -81,6 +93,12 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 		}
 	})
 
+	var successor *e1ProtectedSuccessor
+	t.Cleanup(func() {
+		if successor != nil {
+			successor.assertCleanup(t, database, store, blockStore)
+		}
+	})
 	content := []byte("e1 delayed put after committed D " + uuid.NewString())
 	blockID, key := x1SeedPhysical(t, database, blockStore, orgID, content, class)
 	x1Cleanup(t, database, orgID, blockID)
@@ -111,10 +129,14 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 	defer release()
 	var firstPut sync.Once
 	restorePut := apipkg.SetSyncPutBlockAutoDirectForIntegration(func(ctx context.Context, targetStore *storage.BlockStore, storageKey string, data []byte) (string, error) {
-		firstPut.Do(func() {
-			putStarted <- storageKey
-			<-releasePut
-		})
+		// Only the captured K1 is held; sync.Once alone would also block the
+		// competing P2 writer while its callback is still running.
+		if storageKey == key {
+			firstPut.Do(func() {
+				putStarted <- storageKey
+				<-releasePut
+			})
+		}
 		return targetStore.PutObjectAutoDirect(ctx, storageKey, data)
 	})
 	defer restorePut()
@@ -129,6 +151,16 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 	go func() {
 		handler.PutBlock(ctx)
 		close(done)
+	}()
+	// Join before restoring the global integration hook or cleaning up rows,
+	// including when a new H1 boundary assertion fails while K1 is held.
+	defer func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(45 * time.Second):
+			t.Error("delayed PutBlock did not stop before hook restoration/teardown")
+		}
 	}()
 
 	select {
@@ -155,10 +187,13 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 		<-done
 		t.Fatalf("real G5 worker did not process P1 candidate: processed=%d err=%v", processed, err)
 	}
-	// ProcessOrgOnce commits D1 and retires the canonical row; the durable G5
-	// recovery root owns the separate physical-delete continuation.
-	w2AssertCommittedContinuation(t, store, orgID, blockID, class, key, blockStore)
+	// ProcessOrgOnce retires the canonical row before physical recovery.
 	x1AssertCanonicalAbsent(t, store, orgID, blockID)
+	if protectedSuccessor {
+		successor = e1InstallProtectedSuccessor(t, database, store, blockStore, orgID, repoID, blockID, class, key, content, invoke)
+	} else {
+		w2AssertCommittedContinuation(t, store, orgID, blockID, class, key, blockStore)
+	}
 	if exists, err := blockStore.ObjectExists(t.Context(), key); err != nil || exists {
 		release()
 		<-done
@@ -233,6 +268,9 @@ func TestE1DelayedPutCannotRestoreRetiredPhysicalLife(t *testing.T) {
 		if err := database.Session().Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND representation_id = ? AND external_id = ?`, orgID.String(), representationID, externalID).Scan(&mappedID); err != nil || mappedID != blockID {
 			t.Fatalf("legacy mapping after successful new-life upload = %q, err=%v; want %s", mappedID, err, blockID)
 		}
+	}
+	if successor != nil {
+		successor.publishAndReplay(t, database, store, blockStore, handler, tenant.userID, content)
 	}
 	t.Logf("E1-PUT-01 result: D1 claim=%s terminal P1=(%s,%s); delayed PUT response=%d; K1_reappeared=true; canonical_after=%s; refs_after=%v; mapping_checked=%t", claimID, class, key, recorder.Code, func() string {
 		if currentErr != nil {
