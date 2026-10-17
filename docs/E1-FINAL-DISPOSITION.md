@@ -89,6 +89,46 @@ excluded, literals retained). No new integration, race, API/client or native
 fault run is claimed for this docs-only decision. No shared stack was started
 or changed. Local ignored evidence: tmp/e1-acceptance-*.
 
+## Post-merge revalidation (2026-10-17)
+
+The maintainer merged #312 (main@ee30d736f). X1 is CLOSED within the scope above;
+PRE-GC/A1 remain OPEN and ordinary GC stays OFF. A post-merge audit re-ran the
+accepted evidence in Docker. Productive `cmd`/`internal` sources are unchanged
+from e132c7c64; only tests, scripts and documentation changed since then.
+
+| Check (Go 1.25.14, Cassandra 5.0.9) | Result |
+|---|---|
+| Standard `go-all-test`: short units, full one-DC integration with every evidence gate (A-I cuts, H1), API, OIDC | Units ok; integration 566 top-level PASS, 0 FAIL; API 20/20 suites; OIDC 1/1. Nested FAIL lines belong to the intentional E1-01 failure-preservation children; their parents pass |
+| [59-case three-DC union](./E1-COMBINED-THREE-DC-VALIDATION.md), normal then race, fresh processes | 59/59 each, checked by name per family (3/6/14/4/6/6/5/15); no FAIL, SKIP or race |
+| G4/G5 directed three-DC and P3 fence visibility | 5/5 PASS |
+| W2 post-HEAD R31 three-DC, including dc-asia outage | 8/8 legs PASS |
+| X2 legs 1, 2, 2b, 3a, 3b and P3 fail-closed with dc-na down | All PASS |
+| W2 repair guard three-DC | Six phases PASS; LOCAL_QUORUM read mutation is RED as required |
+| Identity authority, HEAD serial domain and hard-delete lease three-DC | 8/8, 2/2, 1/1 plus evidence gates |
+| [M1](./M1-INDEPENDENT-CAS-EVIDENCE.md) and [I1](./I1-IDENTITY-EXECUTION-INVENTORY.md) mutations, on a source copy | 10/10 RED; 13/13 RED and two GREEN controls |
+| `go test -race -short` gc, db, publication | 798, 528 (+9 seed SKIP), 33 PASS; no race |
+
+Three-API residuals keep their FAIL disposition: V2 failed 3/3 and SeafHTTP 2/3
+(previously 2/3 and 3/3); GC passed 3/3. Every failure is a SERIAL CAS timeout on
+the finalize lease or HEAD update that returns 500. The server confirmed that the
+canonical HEAD did not change for each ambiguous HEAD CAS. This is the tracked
+[availability issue](./KNOWN_ISSUES.md#issue-seafhttp-upload-finalize-lease-error-500-01),
+not a retired-P1 publication.
+
+The three-DC fixture was dedicated, had no host ports and used its own S3; it was
+deleted after the run. All three per-DC APIs reported GC disabled with
+`last_worker_run=never`. Fixture GC authority rows left by test teardown (orphans
+3, roots 5, lifecycles 12) were not attributed row by row and were discarded with
+the fixture. The multi-phase scripts were ported onto that fixture without
+changing test sources; the first union attempt lacked `SESAMEFS_TEST_IN_CONTAINER=1`,
+ran no behavioral case and is excluded. Not rerun: X2/P3 `--mutate` modes,
+E1-15F, W2 Sync XDC, H1 initial-head, PC-D1B4/mapping/baseline scripts, client
+sync and native S3 fault injection.
+
+The audit also found operator-facing comments that still said GC may be enabled
+"only after X1 closes". After this merge, that wording would have permitted
+activation while PRE-GC/A1 are open. They now require both gates. No default changes.
+
 ## Status reconciliation correction (2026-10-17)
 
 Review of #312 found that the new decision banner did not dispose the canonical
