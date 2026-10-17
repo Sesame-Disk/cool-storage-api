@@ -8,6 +8,19 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — Final E1/X1 acceptance decision
+
+[Scoped decision submitted for maintainer merge](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+accepts physical-life evidence, H=X3 for the measured late PUT and I1/M1 criteria;
+its merge closes X1 in that scope. Named A-I one-DC cuts, qualified three-DC and
+source/model arguments keep their limits; availability/full-suite failures stay
+FAIL. Certified witness consumption is not needed for covered W2 closure.
+Documentation only; PRE-GC/A1 remain OPEN and ordinary GC OFF. Next runtime slice
+is the tracked Phase 5 shared-fs_object reproduction, outside this decision.
+2026-10-17 review correction: map the canonical X1 issue's original criteria to
+current evidence and reconcile deployment/API/architecture/registry summaries;
+closure remains conditional on the same maintainer merge.
+
 ## 2026-10-16 — M1 independent H8 CAS evidence
 
 [M1](./M1-INDEPENDENT-CAS-EVIDENCE.md) splits H8 into ten separately selectable,

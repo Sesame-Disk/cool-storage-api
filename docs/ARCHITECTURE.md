@@ -760,19 +760,26 @@ A reference row is `((org_id, block_id), referrer)` where:
 
 **Operations** (`block_references` steady-state INSERT/DELETE is idempotent and
 non-LWT; canonical metadata creation and lifecycle state transitions are separate):
-- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or non-creating `RepairBlockMetadataIfCurrent` for an existing canonical target. It backs off if the row is mid-GC (`gc_state='deleting'`) or an orphan fence exists. Tuple-only registration wrappers are not production entrypoints. A rejected existing-incarnation repair intentionally retains `up:`; its recovery/liveness cost is R18/R27 and remains open.
+- **File upload**: `RegisterUploadedBlockTarget` first adds `AddBlockReference(up:…, TTL)`, then uses create-only `InstallBlockMetadata` for a freshly minted target or non-creating `RepairBlockMetadataIfCurrent` for an existing canonical target. It backs off for a condemned canonical row; an old COMMITTED orphan is not a mutex on a later life. Tuple-only registration wrappers are not production entrypoints. A rejected existing-incarnation repair intentionally retains `up:`; its recovery/liveness cost follows the [current R18/R27 disposition](./E1-FINAL-DISPOSITION.md#d0-section-25-dispositions).
 - **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block. These are the **permanent** refs, promoted only after the fs_object row is persisted (the publish race holds liveness via provisional publish-attempt refs); the call fails closed if the fs_object row is missing. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
 - **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
-- **GC block deletion (G2/G3 implementation / transitional)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT with exact `(P, attempt)`; **re-check** `BlockHasReferencesGlobal` at `EACH_QUORUM` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `PrepareBlockDeleteOrphan` writes the exact PREPARED recovery row and root, `CommitBlockDeleteOrphanHandoff` records irreversible D on `blocks`, and `PromoteBlockDeleteOrphan` advances the orphan to COMMITTED (G2). Once that exact COMMITTED authority is confirmed, `FinalizeBlockDelete` retires the canonical `blocks(L)` row (G3); it never touches `gc_s3_orphans` or the lifecycle tombstone, so the durable orphan/lifecycle authority survives canonical retirement unconditionally. This branch stops before physical S3 deletion; a future physical executor owns that continuation. `GC_ENABLED=false` remains mandatory. Deletes intentionally do not health-fail over to another class/backend.
-- **S3 orphan recovery**: walks the independent exact `(P,D)` recovery root first, directly settles PREPARED metadata, then walks the `_by_day` discovery identity for physical-executor work. It reloads the canonical `gc_s3_orphans` row at `EACH_QUORUM`, SERIAL-observes lifecycle 020, re-checks `BlockHasReferencesGlobal`, resolves the backend from the persisted `(org_id, storage_class)`, and uses `ValidatePhysicalLocator` before deleting that exact key. Discovery is identity-only: its primary key carries the exact `(P,D)` identity, but it has no mutable recovery payload or destructive authority; canonical `gc_s3_orphans` remains authoritative. The root and canonical orphan identities are non-expiring; the P4c-orphan logical-block PK replacement and X1 physical-life closure remain open. A projection-delete failure after canonical deletion may leave stale discovery behind the configured overlap.
+- **GC block deletion (current G1-G5 protocol)**: `processBlock` acquires exact-P authority with a fresh per-attempt claim, then uses the global pre-D publication-liveness check. Live refs veto a new D; repair-only liveness retains work. Durable root/PREPARED, committed handoff and published exact P/D lifecycle precede canonical retirement. G4 recovery continues only persisted K1/D1, with a fresh topology check and org-scoped locator validation; a replacement canonical P2/K2 is independent. Deletes do not health-fail over to another class/backend.
+- **S3 orphan recovery**: G5 walks fixed-bucket durable roots with persisted seek checkpoints, without a by-day age horizon. Recovery reloads exact canonical/lifecycle authority; discovery is not authorization. Unknown outcomes retain authority or refuse; TERMINAL cannot authorize another delete. COMMITTED continuation does not take a new logical-reference veto or retarget to current K2. Root/canonical pending authority is non-expiring; scheduling/clock and convergence qualifications remain PRE-GC. See [G4](./GC-G4-IMPLEMENTATION-PLAN.md) and [G5 evidence](./GC-G5-3DC-VALIDATION.md).
 
-**Lifecycle (current / transitional)**:
+**Physical-life status:** [X1's original criteria](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+close within the accepted scope on maintainer merge of the final E1 decision;
+before then OPEN. PRE-GC/A1 remain OPEN and `GC_ENABLED=false` is mandatory in
+every DC. Earlier G2/G3 descriptions of a future physical executor and a logical
+orphan mutex are superseded by G4/G5, not additional current prerequisites.
+
+**Lifecycle (current physical protocol; logical refs abbreviated)**:
 ```
-Upload:        block_references += up:<operation>    (TTL)  + blocks row (metadata)
-Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
-fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
-Block GC:      pre-check none → claim → re-verify none → PREPARED root/orphan → handoff D → COMMITTED → blocks(L) retired (G3; physical delete later)
-Upload race:   writer sees gc_state='deleting' or orphan(L) → backs off
+Upload:        block_references += up:<operation> (TTL); install fresh P or repair exact current P
+Commit:        HEAD publication retains protection until permanent fs: exists
+fs_object GC:  block_references -= fs:<lib>:<fs_id>; activation still gated by PRE-GC/A1
+Block GC:      exact attempt -> global pre-D liveness -> root/PREPARED -> COMMITTED D -> lifecycle -> retire P1
+Recovery:      persisted D1/K1 -> exact physical DELETE -> phase -> TERMINAL -> exact cleanup
+Replacement:   rowless canonical install may create P2/K2; D1 continues only K1
 ```
 
 **Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
@@ -784,8 +791,9 @@ must be enabled in only one DC (see `configs/config.prod.yaml` comments and
 KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period is a mitigation
 for ordinary cross-DC lag, not a correctness bound: with RF 1 per DC,
 `LOCAL_QUORUM` reference writes and reads need not intersect. Destructive GC remains
-disabled pending the physical-delete ABA blocker
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`). The replication DC set and RF are an
+disabled while X1 or PRE-GC/A1 is open. [X1's criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+takes effect on maintainer merge of the scoped E1 decision; before then X1 is OPEN.
+PRE-GC/A1 remain OPEN regardless of that merge. The replication DC set and RF are an
 operationally stable X2 precondition; changing them with existing reference state
 requires a separately certified migration before GC can be reconsidered.
 

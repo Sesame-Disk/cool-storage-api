@@ -1,6 +1,17 @@
 # E1-01 — bounded crash-evidence plan
 
-Status: SOURCE INVENTORY / OPEN, reconciled 2026-10-15 against `main@2e74e4cad215b1b59ca1fdb0030e21d0376eb67c` (#294).
+## Current acceptance disposition (2026-10-16)
+
+[Final E1 decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+accepts **named A-I healthy-service one-DC process cuts** on maintainer merge;
+before merge this is a proposal. This includes PREPARED without projection,
+not every internal durable write or topology/fault cross-product. Root-only C0
+retention is not autonomous recovery. Qualified three-DC evidence is separate.
+Scoped X1 closes only on that acceptance; PRE-GC/A1 stay OPEN, ordinary GC OFF.
+The dated inventory and execution plans below retain their historical status;
+the final decision supersedes their X1/E1-01 pending conclusions within this scope.
+
+Historical inventory status: SOURCE INVENTORY / OPEN, reconciled 2026-10-15 against `main@2e74e4cad215b1b59ca1fdb0030e21d0376eb67c` (#294).
 Original planning base: `main@73b7bcc702c155a02d721e6132cce4ac001df14e` (#279); its dated inventory and execution plan remain below.
 The original planning/inventory PRs changed documentation only. Execution results
 belong to the linked A/B/C/D/E/F/G/H ledgers; this inventory closes no gate.

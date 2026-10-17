@@ -1,6 +1,6 @@
 # Upload-Fence Audit — Findings Registry
 
-**Date:** 2026-07-21 · **Last updated:** 2026-09-02
+**Date:** 2026-07-21 · **Last updated:** 2026-10-17
 **Origin:** eight successive audits of the GC upload-fence work, 2026-07-20/21.
 **Companion:** [GC-UPLOAD-FENCE-PR-PLAN.md](./GC-UPLOAD-FENCE-PR-PLAN.md) — which PR closes what.
 **X1 architecture:** [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) — accepted D0 freeze (docs only; X1 remains OPEN). Historical option comparison and race matrix: [GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md) (not the active roadmap).
@@ -22,7 +22,14 @@ F6, F14 and the observed-fence half of F1. PR-4 as
 **Every F row is now closed.** What remains is the X list — items the series
 never scoped, deferred, or knowingly accepted. PR-11 (remove the per-block Paxos,
 X4) is deferred pending a production latency measurement. X2 closed 2026-08-14.
-**X1 remains open and destructive GC stays disabled fleet-wide.**
+**Current X1 disposition (2026-10-17):** the [status-of-record entry](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+disposes physical identity, per-attempt ownership, exact continuation and W2
+publication criteria. Closure is effective on maintainer merge of [the scoped
+E1 decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16);
+before then OPEN. PRE-GC/A1 remain OPEN and GC stays disabled fleet-wide.
+The X1 row below is discovery-time reasoning, including the former shared claim
+ID, not a statement that today's worker still derives its claim from a candidate.
+The D0 OPEN label above describes the frozen 2026-09-02 architecture snapshot.
 
 Every row is verified against code at the cited location, except where the row
 explicitly identifies engine-dependent behavior that still needs a non-skipping

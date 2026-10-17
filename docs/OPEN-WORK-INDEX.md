@@ -1,14 +1,17 @@
 # Open Work Index
 
-## E1 final disposition: finite X1 work (2026-10-16)
+## E1/X1 final acceptance; PRE-GC next (2026-10-16)
 
-[D0 dispositions and remaining work](./E1-FINAL-DISPOSITION.md#remaining-x1-work)
-identified three actions. [H1 now supplies the combined witness](./E1-H1-PROTECTED-SUCCESSOR.md);
-[I1 now meets the identity execution-inventory criterion](./I1-IDENTITY-EXECUTION-INVENTORY.md).
-[M1 now supplies the ten independent H8 negatives](./M1-INDEPENDENT-CAS-EVIDENCE.md).
-Maintainer final E1/X1 acceptance is next; no further H1/I1/M1 implementation is listed. R18/R27 historical mechanisms
-are superseded, pending R28 TTL is fixed and 020 is KEEP; E6/R30/R31 convergence
-remains PRE-GC. A-I acceptance is recommended only for its stated scope. Availability failures stay FAIL; X1 OPEN, ordinary GC OFF.
+[The acceptance decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+closes scoped physical-life X1 effective on maintainer merge; before merge it is
+OPEN. H1/I1/M1 criteria are supplied; H's measured K1 residue is X3 on acceptance.
+Named A-I cuts and qualified three-DC/source evidence are accepted with explicit
+fault/topology limits. Availability/full-suite failures stay FAIL. PRE-GC/A1 stay
+OPEN and ordinary GC OFF. Next bounded implementation: real-stack RED for
+`ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`, then a focused fix. All PRE-GC and
+PRE-ACTIVATION tags plus critical-path section 6 still count; no activation here.
+Earlier dated entries below are historical snapshots superseded only for the
+accepted X1 scope, not their independent open work.
 
 ## E1-01I exact PREPARED-without-discovery process evidence
 
@@ -344,9 +347,12 @@ High/Medium table a few lines below. Do not restore that claim.
 
 Three gates, kept separate on purpose:
 
-- **Enabling destructive GC** — blocked by X1
-  (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and then by the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6);
-  X1 closure alone does not authorize activation. X2 closed 2026-08-14.
+- **Enabling destructive GC** — still blocked by the complete PRE-GC/A1 gate
+  ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6). X1's scoped closure takes
+  effect on maintainer merge of the E1 decision; before then X1 is also OPEN.
+  [Its original criteria and dispositions](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+  remain traceable. Neither closure alone nor the lease authorizes activation.
+  X2 closed 2026-08-14.
   See the GC section below.
 - **Single-node go-live** — blocked by the resource-amplification finding
   below (`ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`) and the API-key mutation-scope
@@ -445,13 +451,14 @@ stays in [KNOWN_ISSUES.md](./KNOWN_ISSUES.md).
 
 ## Blockers that keep destructive GC disabled
 
-X1 is OPEN. The accepted closure architecture is documented
-([GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md));
-it is not implemented and does not enable deletion. X2 closed 2026-08-14
-(implemented 2026-08-13), proven on a real three-DC cluster.
-`gc.enabled: false` remains required on every replica in every DC — activation
-rests on X1 and then on the PRE-GC / A1 gate
-([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6).
+[The final E1 decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+closes scoped physical-life X1 on maintainer merge; before then it remains OPEN.
+The frozen D0 below is historical architecture; G1-G5 and W2 are now implemented
+and evidenced within the accepted scope. X2 closed 2026-08-14, proven on a real
+three-DC cluster. `gc.enabled: false` remains mandatory in every DC because
+PRE-GC/A1 are still OPEN ([complete gate](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites)).
+The following architecture narrative retains its dated development history;
+its pending X1 lists are superseded by the decision above.
 
 **Read X1 as the whole fence-and-physical-identity workstream, not just the stale
 DELETE.** Never-reused physical keys are necessary but not sufficient: a shared
@@ -478,7 +485,7 @@ logical-block PK replacement, and X1 remain open.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race. Accepted architecture: exact `(P,D)` handoff into orphan as continuation authority; not strict physical non-overlap | Registry X1 · [handoff plan](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) · [historical options](./GC-X1-CLOSURE-OPTIONS.md) |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Historical Blocker; **CLOSED-FIX / CLOSED-EVIDENCE in accepted scope on maintainer merge; before merge OPEN** | Exact physical key, per-attempt ownership, P/D continuation and W2 publication criteria are explicitly disposed; PRE-GC/A1 remain OPEN and GC OFF | [Current criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes) · [E1 acceptance](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16) |
 | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [X2 runbook](./GC-X2-MULTIDC-VALIDATION.md) |
 
 ## High / Medium — open (audit follow-ups)
