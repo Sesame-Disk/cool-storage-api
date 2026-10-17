@@ -362,7 +362,7 @@ PUT /api2/repos/:id/file/?p=/path
 **GC Configuration:**
 ```yaml
 gc:
-  enabled: false  # Required on every replica/DC while X1 remains open
+  enabled: false  # Required on every replica/DC while X1 or PRE-GC/A1 is open
   interval: 24h
   grace_period: 24h
   batch_size: 1000
@@ -371,11 +371,14 @@ gc:
 ```
 
 The lease is not an activation signal. Keep `GC_ENABLED=false` everywhere until
-`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) closes. X2 is closed under the
-stable-topology operational contract; a replication DC-set or RF change with existing
-reference state requires a separately certified migration before GC can be reconsidered.
-Only then may designated replicas in one DC participate under the lease; every other DC
-remains disabled.
+both X1 and the complete [PRE-GC/A1 gate](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites)
+close. [X1's original criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+closes its accepted physical-life scope on maintainer merge of the E1 decision;
+before then X1 is OPEN. PRE-GC/A1 remain OPEN, so that merge cannot enable GC.
+X2 retains its stable-topology contract; a replication DC-set or RF change with
+existing reference state requires a separately certified migration. After all
+activation gates close, designated replicas in one DC may participate under the
+lease; every other DC remains disabled.
 
 ---
 

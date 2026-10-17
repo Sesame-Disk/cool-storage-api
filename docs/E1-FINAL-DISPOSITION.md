@@ -89,6 +89,24 @@ excluded, literals retained). No new integration, race, API/client or native
 fault run is claimed for this docs-only decision. No shared stack was started
 or changed. Local ignored evidence: tmp/e1-acceptance-*.
 
+## Status reconciliation correction (2026-10-17)
+
+Review of #312 found that the new decision banner did not dispose the canonical
+`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` entry or its live summaries. That
+was a THIS-PR documentation blocker: merge would leave contradictory statuses.
+The [issue now maps each original criterion to current evidence](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes),
+with closure conditional on the same maintainer merge. Historical Blocker severity
+and discovery narrative are retained. Registry reasoning stays dated; deployment,
+API, architecture and blocker summaries consistently keep PRE-GC/A1 OPEN and GC OFF. No new
+runtime fix or new execution of historical integration evidence is claimed.
+
+Correction validation: Docker `go test -json -short -count=1 ./internal/gc ./internal/db`
+exits 0 (GC 798 PASS, DB 528 PASS and the same nine seed SKIP). Final-document
+`TestX1PhysicalLifeHandoff*` guards pass; 61 added local links/headings and diff
+whitespace pass. Frozen D0 and productive source stay unchanged. Integration,
+race and API/client/native fault checks were not rerun; a reported quota-test
+integration failure is not converted into PASS by this documentation correction.
+
 ## Final acceptance plan (2026-10-16)
 
 Base main@aa5d1d69e (#311). This slice proposes a maintainer decision, not

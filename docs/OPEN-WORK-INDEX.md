@@ -347,9 +347,12 @@ High/Medium table a few lines below. Do not restore that claim.
 
 Three gates, kept separate on purpose:
 
-- **Enabling destructive GC** — blocked by X1
-  (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) and then by the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6);
-  X1 closure alone does not authorize activation. X2 closed 2026-08-14.
+- **Enabling destructive GC** — still blocked by the complete PRE-GC/A1 gate
+  ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6). X1's scoped closure takes
+  effect on maintainer merge of the E1 decision; before then X1 is also OPEN.
+  [Its original criteria and dispositions](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+  remain traceable. Neither closure alone nor the lease authorizes activation.
+  X2 closed 2026-08-14.
   See the GC section below.
 - **Single-node go-live** — blocked by the resource-amplification finding
   below (`ISSUE-SYNC-FSID-WORK-AMPLIFICATION-01`) and the API-key mutation-scope
@@ -482,7 +485,7 @@ logical-block PK replacement, and X1 remain open.
 
 | Issue | Sev | One line | Detail |
 |---|---|---|---|
-| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Blocker | Physical-delete ABA **plus** the publication-fence race. Accepted architecture: exact `(P,D)` handoff into orphan as continuation authority; not strict physical non-overlap | Registry X1 · [handoff plan](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md) · [historical options](./GC-X1-CLOSURE-OPTIONS.md) |
+| `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` | Historical Blocker; **CLOSED-FIX / CLOSED-EVIDENCE in accepted scope on maintainer merge; before merge OPEN** | Exact physical key, per-attempt ownership, P/D continuation and W2 publication criteria are explicitly disposed; PRE-GC/A1 remain OPEN and GC OFF | [Current criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes) · [E1 acceptance](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16) |
 | `ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01` | ✅ Closed 2026-08-14 | Destructive liveness reads at `EACH_QUORUM` behind a topology gate; five-leg three-DC evidence green, both mutations (`LOCAL_QUORUM` and `QUORUM`) confirmed red | [Registry X2](./UPLOAD-FENCE-FINDINGS-REGISTRY.md) · [X2 runbook](./GC-X2-MULTIDC-VALIDATION.md) |
 
 ## High / Medium — open (audit follow-ups)

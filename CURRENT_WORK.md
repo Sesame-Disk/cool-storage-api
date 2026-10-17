@@ -8,7 +8,9 @@ merge X1 remains OPEN. H1's measured K1 residue becomes X3; I1/M1 are supplied.
 Named A-I one-DC cuts and qualified three-DC evidence do not certify every fault
 or topology. Three-API availability failures remain FAIL. PRE-GC/A1 OPEN;
 ordinary GC OFF. Next bounded runtime work: reproduce Phase 5 shared-fs_object
-cascade before its fix. Earlier entries below preserve their dated snapshots.
+cascade before its fix. The 2026-10-17 correction explicitly disposes the canonical
+X1 issue and reconciles operational references. Earlier entries below preserve
+their dated snapshots.
 
 ## Previous merged slice: M1 independent CAS evidence (#311, 2026-10-16)
 

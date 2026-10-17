@@ -670,8 +670,9 @@ ACCOUNTS_DISABLE_ORG_USER_WRITES=true
 # If you use the bundled nginx on Docker's external sfs-net network, inspect the
 # actual subnet first and use that exact CIDR instead of guessing.
 
-# Destructive GC safety gate: X1 is open (X2 is closed under its stable-topology
-# operational contract). Keep false on EVERY backend replica in EVERY DC. Do not
+# Destructive GC safety gate: PRE-GC/A1 remain open; scoped X1 acceptance alone
+# is not activation (X2 retains its stable-topology contract). Keep false on
+# EVERY backend replica in EVERY DC. Do not
 # designate a GC replica yet.
 GC_ENABLED=false
 
@@ -742,7 +743,7 @@ instead of attempting `CREATE KEYSPACE` through the restricted app role.
 
 > `ACCOUNTS_DISABLE_ORG_USER_WRITES` should normally stay `true`. That keeps tenant org-admin user lifecycle writes disabled so Accounts remains the operational authority. Platform superadmins still bypass that tenant lock as an operational fallback, but Accounts should prefer the `/admin/...` surface.
 
-> `gc.enabled` defaults to `false` in YAML. While X1 (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) remains open, keep `GC_ENABLED=false` on **every replica in every DC**. X2 is closed under the stable-topology operational contract; changing the replication DC set or RF with existing reference state requires a separately certified migration before GC can be reconsidered. The LWT lease does not close X1. X1 closure alone does not authorize activation: only after X1 closes **and** the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6) closes may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease; all replicas in every other DC must remain false.
+> `gc.enabled` defaults to `false` in YAML. Keep `GC_ENABLED=false` on **every replica in every DC** while X1 or PRE-GC/A1 remains open. [X1's criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes) takes effect on maintainer merge of the scoped E1 decision; before then X1 is OPEN. PRE-GC/A1 remain OPEN regardless of that merge. X2 is closed under the stable-topology operational contract; changing the replication DC set or RF with existing reference state requires a separately certified migration before GC can be reconsidered. The LWT lease does not close X1. X1 closure alone does not authorize activation: only after X1 closes **and** the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md) §6) closes may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease; all replicas in every other DC must remain false.
 
 > `SERVER_TRUSTED_PROXIES` should never be set to `0.0.0.0/0`, `::/0`, or another blanket range. In the supported two-nginx topology above, trust only the internal SesameFS nginx network that talks directly to Go. If you leave it unset, SesameFS ignores forwarded-IP headers and uses the direct socket peer instead.
 
@@ -1093,7 +1094,7 @@ quota; aggregate fleet admission can scale with node count.
 > an older GC binary against populated `gc_queue` / `gc_failed_items` tables. A fresh install
 > applies every migration at first boot, before any scanner or worker runs, so there is no
 > version skew and no pre-011 backlog to drain. Deploy normally, but keep GC disabled
-> fleet-wide while X1 remains open.
+> fleet-wide while X1 or PRE-GC/A1 remains open.
 
 Migration 011 adds `library_guard_mode` to `gc_queue` / `gc_failed_items` and the
 scanner starts stamping orphan work as `canonical_absent` (P6b execution-time
@@ -1896,7 +1897,9 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
 > sesamefs.deploy_sentinel;` after the cutover or just let the TTL'd rows
 > age out and leave it in place.
 
-#### M5.5 — GC remains disabled while X1 is open
+<a id="m55--gc-remains-disabled-while-x1-is-open"></a>
+
+#### M5.5 — GC remains disabled until all activation gates close
 
 Current production verification is that every replica in every DC reports
 `GC_ENABLED=false`; do not use the lease as permission to enable destructive GC.

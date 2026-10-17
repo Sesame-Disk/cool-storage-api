@@ -17,6 +17,9 @@ source/model arguments keep their limits; availability/full-suite failures stay
 FAIL. Certified witness consumption is not needed for covered W2 closure.
 Documentation only; PRE-GC/A1 remain OPEN and ordinary GC OFF. Next runtime slice
 is the tracked Phase 5 shared-fs_object reproduction, outside this decision.
+2026-10-17 review correction: map the canonical X1 issue's original criteria to
+current evidence and reconcile deployment/API/architecture/registry summaries;
+closure remains conditional on the same maintainer merge.
 
 ## 2026-10-16 — M1 independent H8 CAS evidence
 

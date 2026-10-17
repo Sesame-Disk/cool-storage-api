@@ -182,7 +182,7 @@ certify. Neither closes `ISSUE-LIB-DELETED-FENCE-01`, a productive consumer, PC-
 | **API-key read scope bypasses upload-link and file-share mutations** | 🔴 Open — verified preexisting 2026-08-22 | Six authenticated mutation handlers resolve the user's underlying library authority or link ownership without applying the current credential's API-key scope. A `read` API key can create, update or delete upload links and, for an owner/admin user, create, update or delete user/group shares. Both direct API-key auth and derived sessions are affected. See ISSUE-APIKEY-READ-SCOPE-UPLOADLINK-FILESHARE-01. |
 | **Desktop SSO pending-token store** | 🔴 Open — multi-instance only | In-memory per process; poll and callback on different instances never deliver the token. See ISSUE-SSO-PENDING-TOKEN-NODE-LOCAL-01. |
 | OIDC Authentication | ✅ Complete (Phase 1) | `docs/OIDC.md` |
-| Garbage Collection | 🔴 **Destructive GC disabled; X1 open** | **P10 fixed 2026-07-16 through PR-3:** physical keys, normal GC deletion, and orphan recovery are org-scoped. **New audit blockers:** an authorized physical delete can race a byte-identical re-upload (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`, still open), while the cross-DC visibility blocker (`ISSUE-GC-CROSS-DC-REFERENCE-VISIBILITY-01`) is **closed 2026-08-14** (implemented 2026-08-13) — destructive liveness reads at `EACH_QUORUM` behind a topology gate, proven on a real three-DC cluster with the regression mutation-verified. Keep destructive GC disabled: it rests on X1 and then on the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md) §6). Additional retention, observability, test-hygiene and scale debt remains. See the GC audit section and `UPLOAD-FENCE-FINDINGS-REGISTRY.md`. |
+| Garbage Collection | 🔴 **Destructive GC disabled; PRE-GC/A1 OPEN** | X1 (`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`) closes for the stated physical-life scope on maintainer merge of [the E1 decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16); before merge OPEN. Its [criterion disposition](#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes) separates exact identity, ownership, recovery and publication from remaining convergence. X2 is closed under its stable-topology contract. GC stays OFF fleet-wide until the complete [PRE-GC/A1 gate](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites) also closes; this is not production readiness. |
 | Monitoring/Health Checks | ✅ Complete | `/health`, `/ready`, `/metrics` + slog logging |
 | **Sync Protocol Permissions** | ✅ Fixed (2026-08-07) | `syncAuthMiddleware` accepted public share-link download tokens as repository credentials. Reproduced live as an unauthorized cross-library block write by an anonymous visitor, plus an escalation through `/download-info` into a full repository sync token. `isRepositorySyncToken` now validates the whole scope — `Source == ""`, `Path == "/"`, `RepoID` bound to the route — before the bearer becomes an identity; all three clauses are mutation-verified. A follow-up split `TokenTypeSync` out of `TokenTypeDownload`, so a download bearer is now refused at the store rather than by shape. See ISSUE-SYNC-LINK-TOKEN-AUTH-01. |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
@@ -2961,10 +2961,36 @@ path or enable destructive GC as part of this issue. See B.3 in
 
 ### ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01: Physical-delete ABA can remove re-uploaded bytes
 
-**Status**: 🔴 Open — independently blocks destructive GC
+**Status**: **CLOSED-FIX / CLOSED-EVIDENCE for the accepted physical-life scope,
+effective on maintainer merge of [#312](https://github.com/Sesame-Disk/sesamefs/pull/312)**.
+Before that merge: OPEN. The merge accepts the [final E1 decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16),
+including its greenfield/same-release premises and evidence limits; it closes this
+issue's X1 criteria, not PRE-GC/A1 or destructive-GC activation.
 **Discovered**: 2026-07-21
 **Priority**: Blocker — potential loss of a live physical object
 **Affected**: `gc_s3_orphans`, S3 orphan recovery, upload rematerialization
+
+#### Disposition of the original X1 criteria (2026-10-17)
+
+| Original criterion | Current implementation and evidence | Disposition on acceptance |
+|---|---|---|
+| Stale DELETE must not remove a new physical life | Fresh canonical K2 differs from retired K1; recovery validates the stored org/class/K1 locator and deletes only that exact key. [G4 real-service coexistence](./GC-G4-IMPLEMENTATION-PLAN.md#evidence-and-remaining-gates) and corrected [G5 evidence](./GC-G5-3DC-VALIDATION.md) cover intact P2 metadata/bytes/refs after D1 recovery. | CLOSED-FIX / CLOSED-EVIDENCE for the covered protocol; physical non-overlap is not required. |
+| Two workers must not share claim authority; stale release/takeover must preserve the owner | [processBlock](../internal/gc/worker.go) generates a fresh UUID per attempt. [P4a ownership controls](../internal/gc/p4a_claim_ownership_test.go) cover distinct attempts, losing release/finalize, stale takeover and exact target. | CLOSED-FIX for ownership; the separate pre-PREPARED candidate-settlement scheduling race remains PRE-GC. |
+| An authorized deletion must retain exact continuation after the canonical row retires | G1/G2/G3 root, COMMITTED handoff and durable P/D lifecycle precede retirement. G4 continues D1 without touching P2; terminal replay cannot reacquire authority. [A-I process cuts](./E1-01-CRASH-EVIDENCE-PLAN.md#01-recorded-evidence-by-exact-cut) cover named handoff/cleanup windows. | CLOSED-FIX / CLOSED-EVIDENCE; root-only C0 safety is retention, not autonomous completion. Unknown/refusal, scheduling and fault qualifications remain in the final decision. |
+| R3/BorrowedFS and all W2 writers must not publish HEAD depending on retired P1 | [W2 inventory](./X1-CRITICAL-PATH.md#4-w2-exit-checklist) disposes every W2 row: own protection/repair and exact-P checks, or E1-17 settled source admission. [E1-16](./E1-16-POST-D-CONTRACT-ALIGNMENT.md) records the physical contract; named native wire/SIGKILL/three-DC evidence retains its limits. | CLOSED-FIX / CLOSED-EVIDENCE per W2 row. The historical W1-only explanation below no longer describes the complete implementation. |
+| Delayed authorized PUT and replacement publication | [H1](./E1-H1-PROTECTED-SUCCESSOR.md) combines protected P2 before physical recovery, late K1 PUT and actual HEAD/canonical reads on P2. | Measured K1 residue is X3/leak for this healthy one-DC schedule; no universal native S3 fault claim. Leak/retention disposition before A1 remains required. |
+
+The historical Blocker severity is preserved; this is a disposition of its
+failure sequences, not a severity downgrade. PRE-GC/A1 and their full tagged
+inventory remain OPEN, including Phase 5/6 metadata deletion, queue/repair
+convergence, clock health and hard-delete fencing. Availability failures stay
+FAIL. Ordinary `GC_ENABLED=false` remains mandatory in every DC.
+
+#### Historical discovery and partial-implementation narrative
+
+The following records the original sequence and W1-only evidence. Its OPEN and
+"not closed" conclusions are historical, superseded for the accepted scope by
+the disposition above; retain it as provenance, not a second current status.
 
 An S3 delete already authorized for `blocks/<org>/<hash>` can complete after its
 visible Cassandra fence clears and after a writer stores byte-identical content at
@@ -3444,10 +3470,12 @@ integration tests skip when fewer than three DCs are configured, so a two-DC
 environment cannot report a false pass.
 
 **Closing X2 does not enable destructive GC.** `GC_ENABLED=false` remains mandatory on
-every replica in every DC. `ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01` (X1) is now the
-sole runtime activation blocker. Design evidence: `UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2;
-the analysis that established X2's independence from X1 is in
-[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md). **X1 remains OPEN.**
+every replica in every DC. X1's original criteria are disposed in
+[its current issue entry](#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes):
+scoped closure is effective on maintainer merge of the E1 decision; before then
+OPEN. PRE-GC/A1 remain OPEN and independently prohibit activation. Design evidence:
+`UPLOAD-FENCE-FINDINGS-REGISTRY.md` X2; the historical independence analysis is in
+[GC-X1-CLOSURE-OPTIONS.md](./GC-X1-CLOSURE-OPTIONS.md).
 The accepted architecture is frozen in
 [GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md](./GC-X1-PHYSICAL-LIFE-HANDOFF-PLAN.md)
 (D0, 2026-09-02, documentation only). The generational-fence protocol explored
@@ -3508,7 +3536,7 @@ change, it is still not durable object intent, and it would not close X3 on its 
 
 ### ISSUE-GC-MULTIINSTANCE-01: Multi-instance GC coordination and split-brain hardening
 
-**Status**: 🟡 Lease implemented; destructive activation blocked independently by X1
+**Status**: 🟡 Lease implemented; destructive activation blocked by OPEN PRE-GC/A1 (and X1 until maintainer acceptance)
 **Discovered**: 2026-03-17
 **Priority**: 🟡 High — required before scaling to multiple replicas
 **Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
@@ -3532,7 +3560,7 @@ incorrect admin counters. This statement does not close or downgrade the indepen
 destructive-GC blockers above.
 
 **Current operational decision (updated 2026-08-14):**
-- Keep `gc.enabled=false` and `GC_ENABLED=false` on every replica in every DC while X1 remains open.
+- Keep `gc.enabled=false` and `GC_ENABLED=false` on every replica in every DC while X1 or PRE-GC/A1 remains open.
 - X2 is closed under the stable-topology operational contract. A replication DC-set or RF change with existing reference state requires a separately certified migration before GC can be reconsidered.
 - The Cassandra LWT lease (`gc_leases`) coordinates participants but does not close X1 and is not permission to enable GC.
 - Only after X1 closes **and** the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md) §6) closes may designated replicas in one DC set `GC_ENABLED=true` and participate under the lease. Every replica in every other DC remains false.
@@ -5804,7 +5832,7 @@ canonical presence is expected.
 Per project posture (pre-production, empty server, no legacy-data preservation) there is no
 production orphan backlog to inherit, and the stop-the-world GC upgrade (see `docs/DEPLOY.md`)
 plus a queue/DLQ drain removes any transient rows. Re-enabling remains prohibited
-while X1 is open; after it closes, the backlog preflight is an additional gate.
+while X1 or PRE-GC/A1 is open; the backlog preflight is an additional activation gate.
 
 #### Options if a real backlog ever exists
 
