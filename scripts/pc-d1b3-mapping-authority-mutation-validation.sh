@@ -449,11 +449,54 @@ h7_upload_precheck_aliased_serial_consistency() {
 	expect_red "H7 aliased SERIAL consistency in upload pre-check" "reaches a global SERIAL read through" '^TestBlockMappingAuthorityAcquisitionIsColdPathOnly$'
 }
 
-# H8: cover the complete driver LWT/CAS terminal family, including legacy
-# session batch methods and every supported Context form.
+# H8: one driver CAS terminal per mutation. Another terminal (or conditional
+# CQL) must never stand in for the selected terminal's own diagnostic.
+h8_cas_terminal() {
+    local terminal="$1" setup="$2" invocation="$3" compiled
+    M1_CAS_SETUP="$setup" M1_CAS_INVOCATION="$invocation" mutate "$WRITERS" 's/(func \(db \*DB\) getBlockIDMappingForWriteCheck\([^\n]*\) \{\r?\n)/$1\tpcd1b3CASTerminalMutation(db)\n/ or die "H8 upload call site not found"; $_ .= "\nfunc pcd1b3CASTerminalMutation(db *DB) { $ENV{M1_CAS_SETUP}; $ENV{M1_CAS_INVOCATION} }\n";'
+    if ! compiled="$(docker exec "$RUNNER" go test ./internal/db -count=1 -run '^$' 2>&1)"; then
+        echo "$compiled"
+        fail "H8 $terminal did not compile; a build failure is not guard evidence"
+    fi
+    echo "COMPILED H8: $terminal"
+    expect_red "H8 $terminal" "reaches an LWT ($terminal)" '^TestBlockMappingAuthorityAcquisitionIsColdPathOnly$'
+}
+
+h8_upload_precheck_scan_cas() { h8_cas_terminal ScanCAS 'q := db.Session().Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _ = q.ScanCAS()'; }
+h8_upload_precheck_map_scan_cas() { h8_cas_terminal MapScanCAS 'q := db.Session().Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _ = q.MapScanCAS(map[string]interface{}{})'; }
+h8_upload_precheck_scan_cas_context() { h8_cas_terminal ScanCASContext 'q := db.Session().Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _ = q.ScanCASContext(context.Background())'; }
+h8_upload_precheck_map_scan_cas_context() { h8_cas_terminal MapScanCASContext 'q := db.Session().Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _ = q.MapScanCASContext(context.Background(), map[string]interface{}{})'; }
+h8_upload_precheck_exec_cas() { h8_cas_terminal ExecCAS 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = batch.ExecCAS()'; }
+h8_upload_precheck_map_exec_cas() { h8_cas_terminal MapExecCAS 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = batch.MapExecCAS(map[string]interface{}{})'; }
+h8_upload_precheck_exec_cas_context() { h8_cas_terminal ExecCASContext 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = batch.ExecCASContext(context.Background())'; }
+h8_upload_precheck_map_exec_cas_context() { h8_cas_terminal MapExecCASContext 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = batch.MapExecCASContext(context.Background(), map[string]interface{}{})'; }
+h8_upload_precheck_execute_batch_cas() { h8_cas_terminal ExecuteBatchCAS 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = db.Session().ExecuteBatchCAS(batch)'; }
+h8_upload_precheck_map_execute_batch_cas() { h8_cas_terminal MapExecuteBatchCAS 'batch := db.Session().Batch(gocql.LoggedBatch); batch.Query("UPDATE unrelated SET state = ? IF EXISTS", "x")' '_, _, _ = db.Session().MapExecuteBatchCAS(batch, map[string]interface{}{})'; }
+
+H8_MUTATIONS=(
+    h8_upload_precheck_scan_cas
+    h8_upload_precheck_map_scan_cas
+    h8_upload_precheck_scan_cas_context
+    h8_upload_precheck_map_scan_cas_context
+    h8_upload_precheck_exec_cas
+    h8_upload_precheck_map_exec_cas
+    h8_upload_precheck_exec_cas_context
+    h8_upload_precheck_map_exec_cas_context
+    h8_upload_precheck_execute_batch_cas
+    h8_upload_precheck_map_execute_batch_cas
+)
+
+# Preserve the old public selector, now running ten independent cases and a
+# non-CAS control through the same upload helper path.
 h8_upload_precheck_all_cas_terminals() {
-	mutate "$WRITERS" 's/(func \(db \*DB\) getBlockIDMappingForWriteCheck\([^\n]*\) \{\n)/$1\tpcd1b3AllCASTerminalsMutation(db)\n/; s/\z/\nfunc pcd1b3AllCASTerminalsMutation(db *DB) { q := db.Session().Query("UPDATE unrelated SET state = ? IF EXISTS", "x"); _, _ = q.ScanCAS(); _, _ = q.MapScanCAS(map[string]interface{}{}); _, _ = q.ScanCASContext(context.Background()); _, _ = q.MapScanCASContext(context.Background(), map[string]interface{}{}); batch := db.Session().Batch(gocql.LoggedBatch); _, _, _ = batch.ExecCAS(); _, _, _ = batch.MapExecCAS(map[string]interface{}{}); _, _, _ = batch.ExecCASContext(context.Background()); _, _, _ = batch.MapExecCASContext(context.Background(), map[string]interface{}{}); _, _, _ = db.Session().ExecuteBatchCAS(batch); _, _, _ = db.Session().MapExecuteBatchCAS(batch, map[string]interface{}{}) }\n/'
-	expect_red "H8 upload pre-check reaches all CAS terminal variants" "reaches an LWT (" '^TestBlockMappingAuthorityAcquisitionIsColdPathOnly$'
+    local mutation out
+    for mutation in "${H8_MUTATIONS[@]}"; do "$mutation"; done
+    mutate "$WRITERS" 's/(func \(db \*DB\) getBlockIDMappingForWriteCheck\([^\n]*\) \{\r?\n)/$1\tpcd1b3NonCASMutation(db)\n/ or die "H8 upload call site not found"; $_ .= "\nfunc pcd1b3NonCASMutation(db *DB) { _ = db.Session().Query(\"UPDATE unrelated SET state = ?\", \"x\").Exec() }\n";'
+    if ! out="$(docker exec "$RUNNER" go test ./internal/db -count=1 -run '^TestBlockMappingAuthorityAcquisitionIsColdPathOnly$' 2>&1)"; then
+        echo "$out"; fail "H8 ordinary non-CAS control failed"
+    fi
+    echo "GREEN H8: ordinary non-CAS upload helper"
+    restore
 }
 
 # H9: a local function-value alias must not hide an LWT helper from the
@@ -594,7 +637,7 @@ ALL_MUTATIONS=(
     a7_ports_freeze_function_value
     a8_ports_claim_function_value
     h7_upload_precheck_aliased_serial_consistency
-    h8_upload_precheck_all_cas_terminals
+    "${H8_MUTATIONS[@]}"
     h9_upload_precheck_lwt_function_value_alias
     t20_pointer_alias_query_mutation
     t21_helper_returned_batch_entries
@@ -646,6 +689,11 @@ baseline="$(docker exec "$RUNNER" go test ./internal/db -count=1 -run '^(TestCon
 
 if [ -n "${1:-}" ]; then
 	while [ "$#" -gt 0 ]; do
+		if [ "$1" = h8_upload_precheck_all_cas_terminals ]; then
+			h8_upload_precheck_all_cas_terminals
+			shift
+			continue
+		fi
 		selected=0
 		for mutation in "${ALL_MUTATIONS[@]}"; do
 			if [ "$mutation" = "$1" ]; then

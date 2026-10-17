@@ -11,7 +11,8 @@ recommended CLOSED-EVIDENCE with explicit topology/fault qualifications.
 protected P2 before physical recovery, late PUT, HEAD on P2 and safe stale-D1
 refusal. Recommend X3 for measured K1 residue. [I1's identity execution-site
 guard is now implemented and evidenced](./I1-IDENTITY-EXECUTION-INVENTORY.md).
-M1's independent H8 terminal negatives remain, then final E1 acceptance.
+[M1's ten independent H8 terminal negatives are now evidenced](./M1-INDEPENDENT-CAS-EVIDENCE.md).
+H1/I1/M1 supply their named results; final E1/X1 acceptance is the next action.
 Historical three-DC failures remain FAIL; this is no full-suite or production
 certificate. X1 remains OPEN and ordinary GC OFF.
 Dated pending lists below retain their snapshots; use this audit's finite list.

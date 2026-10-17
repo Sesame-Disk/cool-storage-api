@@ -1,6 +1,15 @@
 # Current Work
 
-## Active slice: I1 identity execution inventory (2026-10-16)
+## Active slice: M1 independent CAS evidence (2026-10-16)
+
+[M1](docs/M1-INDEPENDENT-CAS-EVIDENCE.md) closes the P2 mutation-granularity
+criterion: ten independently compiled CAS cases require their own diagnostic;
+the non-CAS control passes. Normal/race source guards pass without skips.
+The masking counterexample confirms the value; runtime/guard stay unchanged.
+H1/I1/M1 results are supplied. Next: maintainer final E1/X1 acceptance, with
+existing evidence limits preserved. X1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: I1 identity execution inventory (#310, 2026-10-16)
 
 [I1](docs/I1-IDENTITY-EXECUTION-INVENTORY.md) fixes the P2 guard completeness
 criterion using the existing Query/Batch inventory. The old guard's cross-file
@@ -75,8 +84,8 @@ The source of record for order and closure states is
 - **Remaining before X1 CLOSED:** the [final disposition audit](docs/E1-FINAL-DISPOSITION.md)
   recommends scoped acceptance of A-I and resolves the named D0 rows. Three
   actions were identified: [H1 is now measured](docs/E1-H1-PROTECTED-SUCCESSOR.md);
-  [I1's criterion is met](docs/I1-IDENTITY-EXECUTION-INVENTORY.md); M1's separate
-  H8 CAS negatives remain.
+  [I1's criterion is met](docs/I1-IDENTITY-EXECUTION-INVENTORY.md) and
+  [M1's independent negatives are evidenced](docs/M1-INDEPENDENT-CAS-EVIDENCE.md).
   Maintainer final E1 acceptance remains required; failed/unrun deployment
   evidence retains its limits, and no full-suite PASS is claimed.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6

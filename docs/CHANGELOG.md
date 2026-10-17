@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — M1 independent H8 CAS evidence
+
+[M1](./M1-INDEPENDENT-CAS-EVIDENCE.md) splits H8 into ten separately selectable,
+compiled terminal negatives, preserving its legacy selector and adding a GREEN
+non-CAS control. Exact diagnostics reject a masking counterexample. Normal/race
+source guards pass without skips; source restoration is verified. Runtime and
+guard unchanged. Named H1/I1/M1 work is supplied; final E1/X1 acceptance remains,
+ordinary GC OFF.
+
 ## 2026-10-16 — I1 identity execution inventory
 
 [I1](./I1-IDENTITY-EXECUTION-INVENTORY.md) closes the identity guard's P2
