@@ -1,13 +1,22 @@
 # Current Work
 
-## Active slice: M1 independent CAS evidence (2026-10-16)
+## Active slice: final E1/X1 acceptance (2026-10-16)
 
-[M1](docs/M1-INDEPENDENT-CAS-EVIDENCE.md) closes the P2 mutation-granularity
+[Decision submitted for merge](docs/E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16):
+accept scoped physical-life evidence and close X1 on maintainer merge. Before
+merge X1 remains OPEN. H1's measured K1 residue becomes X3; I1/M1 are supplied.
+Named A-I one-DC cuts and qualified three-DC evidence do not certify every fault
+or topology. Three-API availability failures remain FAIL. PRE-GC/A1 OPEN;
+ordinary GC OFF. Next bounded runtime work: reproduce Phase 5 shared-fs_object
+cascade before its fix. Earlier entries below preserve their dated snapshots.
+
+## Previous merged slice: M1 independent CAS evidence (#311, 2026-10-16)
+
+[M1](docs/M1-INDEPENDENT-CAS-EVIDENCE.md) meets the P2 mutation-granularity
 criterion: ten independently compiled CAS cases require their own diagnostic;
 the non-CAS control passes. Normal/race source guards pass without skips.
 The masking counterexample confirms the value; runtime/guard stay unchanged.
-H1/I1/M1 results are supplied. Next: maintainer final E1/X1 acceptance, with
-existing evidence limits preserved. X1 OPEN, ordinary GC OFF.
+H1/I1/M1 results are supplied for the final decision above.
 
 ## Previous merged slice: I1 identity execution inventory (#310, 2026-10-16)
 
@@ -73,21 +82,19 @@ The source of record for order and closure states is
 [docs/X1-CRITICAL-PATH.md](docs/X1-CRITICAL-PATH.md). This is a summary.
 
 - **GC:** `GC_ENABLED=false` is mandatory fleet-wide.
-- **Path:** W1 → G1–G5 (G1–G3 #207/#209/#212, G4 #247, G5 #248) → **E1 (in
-  progress)** → X1 CLOSED → PRE-GC → A1 → GC ON. X1 is OPEN.
+- **Path:** W1/W2 and G1–G5 → E1 acceptance → X1 CLOSED → PRE-GC → A1.
+  The final decision closes scoped X1 on maintainer merge; before then OPEN.
+  PRE-GC/A1 stay OPEN and GC stays OFF.
 - **X1 contract:** a physical invariant (E1-16, #277). After COMMITTED D(P1),
   nothing may reinstall P1, revoke or postpone D1, or publish HEAD content
   that depends on retired P1. Logical references of L after D1 are retention
   (PRE-GC), not X1.
 - **W2 checklist:** every row, W2-0..14, is closed for X1. W2-10 (content
   resurrection) was closed by E1-17 (CLOSED-FIX).
-- **Remaining before X1 CLOSED:** the [final disposition audit](docs/E1-FINAL-DISPOSITION.md)
-  recommends scoped acceptance of A-I and resolves the named D0 rows. Three
-  actions were identified: [H1 is now measured](docs/E1-H1-PROTECTED-SUCCESSOR.md);
-  [I1's criterion is met](docs/I1-IDENTITY-EXECUTION-INVENTORY.md) and
-  [M1's independent negatives are evidenced](docs/M1-INDEPENDENT-CAS-EVIDENCE.md).
-  Maintainer final E1 acceptance remains required; failed/unrun deployment
-  evidence retains its limits, and no full-suite PASS is claimed.
+- **Acceptance:** [the final decision](docs/E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+  accepts H1/I1/M1, the named A-I cuts and qualified three-DC/source evidence
+  on maintainer merge. Failed/unrun deployment evidence keeps its limits;
+  no full-suite PASS or activation is claimed.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
   table. Highlights:
   - Phase 5 cascade (P0 latent) and the Phase 6 TOCTOU;

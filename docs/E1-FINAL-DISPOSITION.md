@@ -1,5 +1,94 @@
 # E1 final disposition audit
 
+## Final acceptance decision (2026-10-16)
+
+**Decision submitted for maintainer merge: accept the scoped E1 evidence and
+close X1 for the physical-life contract below.** Before merge, this is a proposal
+and main's X1 remains OPEN. The maintainer's merge is the acceptance event;
+after it, X1 is CLOSED within this scope. PRE-GC/A1 remain OPEN and ordinary
+GC remains OFF in every DC. This decision is not a production-readiness or
+activation certificate.
+
+### Accepted contract and deployment
+
+After COMMITTED D(P1), no reinstall of P1, revocation/postponement of D1 or HEAD
+dependency on retired P1 is allowed. A later P2 has independent physical
+identity/key; replay of D1 must not destroy K2. Logical references to L and
+collection progress remain separate from this physical contract. Accept the
+[D0 dispositions](#d0-section-25-dispositions), including **H = X3/leak for the
+measured late-K1 schedule**, with I1 CLOSED-FIX and M1 CLOSED-EVIDENCE for their
+named quality criteria. This does not accept unbounded leak/retention for A1.
+
+The [first-production deployment contract](./X1-CRITICAL-PATH.md#first-production-deployment-contract)
+requires empty greenfield state, all migrations and the same compatible audited
+release on all writers and GC before traffic. Unsupported incompatible mixed
+rollouts are not certified; their existing findings retain their severity and
+GENERAL scope. These assumptions do not waive races in the current code.
+
+### Evidence accepted, by obligation
+
+| Obligation | Accepted basis | Qualification retained |
+|---|---|---|
+| Writer-first / GC-first; W1/W2; BorrowedFS and R3 publication funnels | [W2 closure inventory](./X1-CRITICAL-PATH.md#4-w2-exit-checklist), [E1-16 contract](./E1-16-POST-D-CONTRACT-ALIGNMENT.md), [E1-17 source admission](./E1-17-W2-10-RESIDUAL-HANDLERS.md), named [three-DC union](./E1-COMBINED-THREE-DC-VALIDATION.md) | Own exact-P protection/repair or settled source admission; not a promise that arbitrary logical post-D refs are forbidden. Concurrent Phase 5/6 metadata deletion stays PRE-GC. |
+| G1-G5 handoff, durable recovery, P1/P2 coexistence and stale D1 | [G5 corrected validation](./GC-G5-3DC-VALIDATION.md), [G4 coexistence controls](../internal/gc/g4_physical_life_coexistence_test.go), [H1 real protected successor](./E1-H1-PROTECTED-SUCCESSOR.md) | H1 is one DC with healthy services. Initial missing K1 is a legitimate repair trigger; G4 separately starts with both objects. Source continuity below is not a new execution of older matrices. |
+| Crash at handoff phases | [A-I exact-cut inventory](./E1-01-CRASH-EVIDENCE-PLAN.md#01-recorded-evidence-by-exact-cut) | Accept named healthy-service one-DC cuts C0-C8, including PREPARED without projection and internal cleanup cuts. Not every durable write or cut/fault/topology cross-product. Root-only C0 retention is safety, not autonomous completion. |
+| Queue/pending/cursor/discovery loss and restart | Source [worker](../internal/gc/worker.go)/[store](../internal/gc/store_cassandra.go), [G1 root/projection unit controls](../internal/gc/g1_orphan_exact_identity_test.go), G5 real checkpoint/restart, A-I durable-state/replay controls | Exact root/canonical/lifecycle authority, not discovery or a queue row, authorizes deletion. Pending authority has no TTL. Source/model loss cases are not all native disk-loss experiments; clock/fairness and queue convergence stay PRE-GC. |
+| LWT ambiguity, stale orphan mutation and S3 ambiguity | Exact-authority source argument below; [G2 ambiguity](../internal/gc/g2_prepared_committed_test.go), [G3 ambiguity](../internal/gc/g3_committed_canonical_retirement_test.go), G4 refusal/post-delete failure unit tests; [native publication wire evidence](./E1-COMBINED-THREE-DC-VALIDATION.md) | Native publication outcomes cover their named funnels. GC unknown-outcome/S3 retry safety is accepted from source plus unit/refusal evidence, not represented as native GC/S3 fault certification. |
+| R31 possibly accepted HEAD protection | [E1-11](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md), E1-12/13 in the union, E1-16 disposition | Non-expiring repair before HEAD and EACH_QUORUM veto until permanent refs; W2-10 instead uses settled source admission. Discovery/renewal/loser settlement is still PRE-GC. |
+| Three-DC coverage | G5 dated real-service controls and 59-case E1 normal/race union | The union uses one API daemon over three-DC Cassandra. Actual [three-API runs](./E1-THREE-API-RESIDUALS.md) retain SeafHTTP 3/3 FAIL and V2 2/3 FAIL; package exits 1. Those are independent availability findings, not physical safety PASS. |
+| Identity and terminal evidence quality | [I1 execution inventory](./I1-IDENTITY-EXECUTION-INVENTORY.md), [M1 ten independent CAS negatives](./M1-INDEPENDENT-CAS-EVIDENCE.md) | Current-source guard evidence, not an architectural proof against hypothetical new mutation paths. |
+
+In `recoverCanonicalS3Orphan`, exact lifecycle observation and settlement precede
+physical deletion; unknown/mismatched authority refuses. After a fresh topology
+check, recovery reloads the same canonical orphan, validates its physical locator
+with its organization's store, and calls `DeleteBlockByStorageKey` with that
+orphan's immutable K1. A DELETE error retains recovery authority; a lost successful
+response or failed phase advance may repeat K1. It cannot select replacement K2
+from current block metadata. Exact terminal settlement prevents renewed authority.
+`TestG4RecoveryFailsClosedWithoutExactSettlement` and
+`TestG4RecoveryPostDeleteFailuresPreserveReplacement` support this argument. This accepts safe repetition, not exactly-once execution or a
+native S3 timeout experiment. Loss of the durable authority itself grants no
+permission; auxiliary loss must not manufacture a token.
+
+### Certified baseline and reopening
+
+Resolve [the certified-baseline question](./X1-CRITICAL-PATH.md#5-publicationcoordinator-and-the-pc-d1-line):
+the covered W2 protections suffice for this X1 decision. A productive certified
+witness consumer, PC-D1B.5 completion and its full certification-window matrix
+are not required to close this physical gate. Existing coordinator, identity and
+mapping protections stay intact/frozen. A future consumer owns its CW-M17/global
+SERIAL obligations; GC destroyer requirements remain on PRE-GC's own list.
+
+Reopen X1 for a concrete current-code sequence violating the accepted physical
+contract, a falsified evidence claim, or a deployment change invalidating an
+accepted premise. A new topology/fault requirement needs its named invariant and
+path; this decision is not universal fault certification. Known availability,
+retention and metadata-cascade failures retain their severity and tracking.
+Older full-suite failures, special mapping failures/skips and encrypted-client
+limits are not converted into PASS. Dated OPEN snapshots below and in linked
+ledgers describe their original point in history; this decision supersedes their
+X1 pending lists only within the accepted scope. The frozen D0 stays unchanged.
+
+**Next gate: PRE-GC/A1, still OPEN.** Its source is the complete tagged inventory
+plus [critical-path section 6](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites),
+not just the latest PR. Next bounded runtime slice: reproduce the tracked Phase 5
+shared-fs_object cascade on owned real-stack fixtures, then fix only the verified
+failure with RED/GREEN evidence. That implementation is outside this PR.
+
+### Validation of this acceptance PR
+
+Docker Go 1.25.14, tracked source at plan commit 00f802e03 plus the updated docs:
+`go test -json -short -count=1 ./internal/gc ./internal/db` exits 0; GC 798
+PASS test/subtest events, DB 528 PASS and the same nine seed SKIP named in the
+historical validation below. These seed fixtures were not exercised against
+Cassandra. Existing documentation/source guards pass; no new tests were added.
+All added local links/headings and diff whitespace were checked. All productive
+`cmd`/`internal` sources are unchanged from #308's base e132c7c64; the 11 GC Go
+files also retain token equality with corrected G5 88737973e (comments/positions
+excluded, literals retained). No new integration, race, API/client or native
+fault run is claimed for this docs-only decision. No shared stack was started
+or changed. Local ignored evidence: tmp/e1-acceptance-*.
+
 ## Final acceptance plan (2026-10-16)
 
 Base main@aa5d1d69e (#311). This slice proposes a maintainer decision, not
@@ -54,6 +143,9 @@ A newly reproduced runtime defect remains a separate bounded RED/GREEN fix.
 Backward compatible: yes, documentation/evidence disposition only.
 
 ## Audit result and contract
+
+Historical #308 snapshot; the final acceptance decision above supersedes its
+pending conclusions only for the stated scope.
 
 **X1 remains OPEN. No runtime defect was reproduced by this audit.** The narrow
 recommendations below resolve D0's named disposition questions for maintainer
@@ -127,15 +219,15 @@ this audit does not require fixing an independent 500 to invent physical safety.
 
 H1 supplies the named combined witness and [I1's guard criterion is now met](./I1-IDENTITY-EXECUTION-INVENTORY.md).
 [M1 now supplies the independent terminal evidence](./M1-INDEPENDENT-CAS-EVIDENCE.md).
-The next action is the maintainer's final E1/X1 acceptance; no further H1/I1/M1
-implementation is listed here. This is not an inventory of all PRE-GC/A1 work.
+The final acceptance decision above is submitted for maintainer merge; no further
+H1/I1/M1 implementation is listed here. This is not an inventory of all PRE-GC/A1 work.
 
 | Action | Exact unmet criterion | Small next action and closure condition |
 |---|---|---|
 | **H1 — measured; disposition pending acceptance** | Named existing-P2 / late-K1 / publication witness is now supplied | [H1 result](./E1-H1-PROTECTED-SUCCESSOR.md): real protected P2 precedes D1 physical recovery; late PUT and actual HEAD resolve P2; stale discovery refuses without a durable token; fresh discovery is empty. Controls, repeats, race, directed negatives and owned cleanup pass. Recommend X3 for observed K1 residue within this scope; final E1 decision remains the maintainer's. |
 | **I1 — CLOSED-FIX, P2 guard quality** | Execution-site criterion met for current classified source | [I1 evidence](./I1-IDENTITY-EXECUTION-INVENTORY.md) reuses the existing Query/Batch inventory, pins one exact INSERT/read at their approved owners and preserves schema/literal checks. Two old-guard blind spots are demonstrated; 13 compiled negatives and two controls pass, as do DB normal/race with nine short seed skips. No runtime defect or overall gate closure is claimed. |
 | **M1 — CLOSED-EVIDENCE, P2 quality** | Independent-terminal criterion met | [M1 evidence](./M1-INDEPENDENT-CAS-EVIDENCE.md): ten separately selectable mutations compile and require their own terminal diagnostic; non-CAS control passes. A disabled ScanCAS recognition stays hidden in the old aggregate predicate but is refused by the new selector. Existing guard/runtime unchanged; final E1 acceptance remains separate. |
-| **Final acceptance — maintainer decision** | E1/X1 sign-off has not happened | Review these dispositions, H1/I1/M1 results, the scoped E1-01 recommendation and failed/unrun deployment evidence. Accept a stated physical-safety scope or identify a concrete unmet criterion. Then propose X1 CLOSED in the final review; no unconditional closure or activation is implied by this PR. |
+| **Final acceptance — effective on maintainer merge** | Decision submitted above | Merge accepts the stated evidence/qualifications and closes scoped X1. Before merge this remains a proposal. PRE-GC/A1 stay OPEN; no activation is authorized. |
 
 I1 and M1 resolve the two recorded P2 PRE-X1 quality conditions within their
 stated source/evidence scopes. Neither demonstrates a current retired-P1

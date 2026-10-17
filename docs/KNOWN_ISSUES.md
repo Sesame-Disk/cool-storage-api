@@ -1,5 +1,15 @@
 # Known Issues - SesameFS
 
+## Scoped E1/X1 acceptance (2026-10-16)
+
+[Final decision submitted for maintainer merge](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16):
+close physical-life X1 on that merge; until then X1 remains OPEN. Accept H as
+X3/leak for the measured schedule and the scoped A-I/three-DC/source evidence;
+I1/M1's PRE-X1 quality criteria are met. This supersedes dated X1 pending lists,
+not independent findings or severities. PRE-GC/A1 remain OPEN, ordinary GC OFF.
+In particular Phase 5/6, hard-delete fencing, queue/repair convergence, clock
+health and upload availability failures are not closed by this decision.
+
 ## H late-PUT evidence update (2026-10-16)
 
 [H1](./E1-H1-PROTECTED-SUCCESSOR.md) supplies the previously missing combined

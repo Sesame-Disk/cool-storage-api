@@ -1,21 +1,21 @@
 # X1 critical path — reset to the #201 roadmap
 
-## E1 final disposition recommendation (2026-10-16)
+## E1/X1 acceptance decision (2026-10-16)
 
-[The final audit](./E1-FINAL-DISPOSITION.md) resolves the D0 disposition list
-for maintainer review: R18/R27's historical executors are superseded, pending
-R28 TTL is fixed, 020 is KEEP, and E6/R31 block safety is separated from their
-OPEN convergence debt. The named healthy-service A-I crash obligation is
-recommended CLOSED-EVIDENCE with explicit topology/fault qualifications.
-[H1 now supplies its combined one-DC witness](./E1-H1-PROTECTED-SUCCESSOR.md):
-protected P2 before physical recovery, late PUT, HEAD on P2 and safe stale-D1
-refusal. Recommend X3 for measured K1 residue. [I1's identity execution-site
-guard is now implemented and evidenced](./I1-IDENTITY-EXECUTION-INVENTORY.md).
-[M1's ten independent H8 terminal negatives are now evidenced](./M1-INDEPENDENT-CAS-EVIDENCE.md).
-H1/I1/M1 supply their named results; final E1/X1 acceptance is the next action.
-Historical three-DC failures remain FAIL; this is no full-suite or production
-certificate. X1 remains OPEN and ordinary GC OFF.
-Dated pending lists below retain their snapshots; use this audit's finite list.
+[The final decision](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)
+proposes **X1 CLOSED for the stated physical-life contract, effective on maintainer
+merge**. Before that merge it remains OPEN. H1 supplies the protected-P2/late-PUT
+witness (measured K1 residue = X3); I1/M1 meet their named quality criteria.
+Accept named A-I healthy-service one-DC cuts and the qualified three-DC/source
+arguments, not universal fault or full-suite coverage. Actual three-API
+availability failures retain their severity and FAIL results.
+
+PRE-GC/A1 remain OPEN; ordinary GC stays OFF in every DC. The certified baseline
+is not needed for this covered W2 closure; existing protections stay frozen and
+future consumers own their obligations. Next: reproduce the tracked Phase 5
+shared-fs_object cascade, then a bounded RED/GREEN fix. Section 6's full tagged
+inventory remains binding. Earlier dated sections retain historical OPEN snapshots;
+the linked decision supersedes their X1 pending lists within its stated scope.
 
 ## E1 current combined three-DC evidence (2026-10-15)
 
