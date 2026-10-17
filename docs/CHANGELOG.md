@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-17 — Phase 5 shared-tree preservation
+
+[Metadata-only unguarded commit retirement](./GC-PHASE5-SHARED-FSOBJECTS.md)
+fixes the reproduced cascade that deleted content-addressed trees shared with
+HEAD/retained commits. Mock and real Cassandra/S3 RED/GREEN; guarded library
+cascades are preserved. Exclusive-tree reclamation is deliberately deferred;
+Phase 6/concurrent metadata deletion and hard-delete remain separate PRE-GC
+obligations. No schema/API/default change; PRE-GC/A1 OPEN, ordinary GC OFF.
+
 ## 2026-10-17 — Post-merge X1 revalidation and GC gate wording
 
 After #312 merged, a [Docker revalidation](./E1-FINAL-DISPOSITION.md#post-merge-revalidation-2026-10-17)

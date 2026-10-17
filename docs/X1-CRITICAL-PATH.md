@@ -12,8 +12,9 @@ availability failures retain their severity and FAIL results.
 
 PRE-GC/A1 remain OPEN; ordinary GC stays OFF in every DC. The certified baseline
 is not needed for this covered W2 closure; existing protections stay frozen and
-future consumers own their obligations. Next: reproduce the tracked Phase 5
-shared-fs_object cascade, then a bounded RED/GREEN fix. Section 6's full tagged
+future consumers own their obligations. The [Phase 5 correction](./GC-PHASE5-SHARED-FSOBJECTS.md)
+now disposes its shared-tree cascade with RED/GREEN evidence; reclamation and
+Phase 6 remain PRE-GC. Section 6's full tagged
 inventory remains binding. Earlier dated sections retain historical OPEN snapshots;
 the linked decision supersedes their X1 pending lists within its stated scope.
 
@@ -441,7 +442,7 @@ added here to count.
 | Item | Tracking |
 |---|---|
 | G5 cycle revisit assumes advancing claim clocks with bounded, observed fleet skew and finite pre-cutoff claims. NTP/equivalent plus a verified clock-health activation/suspension procedure is required PRE-GC; G5 provides no enforcement and no fixed wall-clock revisit bound | `ISSUE-GC-ROOT-CYCLE-CLOCK-ASSUMPTION-01` |
-| Phase 5 expired-version cascade keeps fs_objects shared with HEAD (P0 latent) | `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01` |
+| Phase 5 unsafe cascade CLOSED-FIX on merge: unguarded commit retirement is metadata-only. Exclusive fs_objects/refs can remain retained; sharing-aware reclamation/retention disposition remains PRE-GC. Phase 6/concurrent metadata deletion is separate | `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`; [plan/evidence](./GC-PHASE5-SHARED-FSOBJECTS.md) |
 | Phase 6 execute-time TOCTOU: the keep-set is computed at scan time and fs_object items carry no library guard and no execute-time reachability recheck, so a HEAD that re-references an fs_id between scan and execution loses the fs_object row. Closing W2-10 (block liveness for content resurrection) does **not** close this; the certification-window fence does not either (PC-D1B.4 §15) | recorded under `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01` (PC-D1B.4 finding F3) |
 | Stale-claim settle race: after `ReleaseStaleBlockClaim` reports `BlockClaimAbsent`, `settleBlockCandidate` deletes the candidate conditioned only on `candidate_at`, so a claim won by another worker in the gap can lose its recovery authority (liveness: block stranded in `deleting`, no data loss). OPEN, P1 FOLLOW-UP / PRE-GC; evaluate in E1. Outside G5 durable-root scope; closure must preserve scheduling independently of fresh zero-ref grace | `ISSUE-GC-STALE-CLAIM-SETTLE-RACE-01` |
 | Certification-window fence, **only as far as the GC destroyers D1–D3 need it** (re-scope PC-D1B.4 §18 before implementing; the full CW-M1..M34 list is not automatically required). Includes `ISSUE-PCD1B-STALE-TOMBSTONE-DISPLAY-METADATA-01` if generation-timestamped deletes are adopted | `ISSUE-PCD1B4-CERTIFICATION-WINDOW-FENCE-01` |

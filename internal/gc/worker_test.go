@@ -597,52 +597,66 @@ func TestWorker_ProcessFSObject_DryRunLeavesQueueAndRefsUntouched(t *testing.T) 
 }
 
 func TestWorker_ProcessCommit_CascadesFSObjects(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
+	for _, guard := range []struct {
+		name   string
+		mode   LibraryGuardMode
+		legacy bool
+	}{
+		{"canonical_absent", LibraryGuardCanonicalMustBeAbsent, false},
+		{"deleted_identity_after_parent", LibraryGuardDeletedAtIdentity, false},
+		{"legacy_deleted_check_after_parent", LibraryGuardNone, true},
+	} {
+		t.Run(guard.name, func(t *testing.T) {
+			store := NewMockStore()
+			stats := &Stats{}
+			q := NewQueue(store)
+			w := NewWorker(store, nil, q, 100, 0, false, stats)
 
-	orgID := uuid.New()
-	libID := uuid.New()
+			orgID := uuid.New()
+			libID := uuid.New()
 
-	// Commit points to a root fs_object
-	store.AddCommit(libID, "commit-abc", "fs-root")
+			// Commit points to a root fs_object
+			store.AddCommit(libID, "commit-abc", "fs-root")
 
-	if err := store.EnqueueBatch([]QueueItem{{
-		OrgID:                 orgID,
-		QueuedAt:              time.Now().Add(-2 * time.Hour),
-		ItemType:              ItemCommit,
-		ItemID:                "commit-abc",
-		LibraryID:             libID,
-		BlockRepresentationID: db.PlainBlockRepresentationID,
-	}}); err != nil {
-		t.Fatalf("seed commit failed: %v", err)
-	}
+			if err := store.EnqueueBatch([]QueueItem{{
+				OrgID:                       orgID,
+				QueuedAt:                    time.Now().Add(-2 * time.Hour),
+				LibraryGuardMode:            guard.mode,
+				RequiresLibraryDeletedCheck: guard.legacy,
+				ItemType:                    ItemCommit,
+				ItemID:                      "commit-abc",
+				LibraryID:                   libID,
+				BlockRepresentationID:       db.PlainBlockRepresentationID,
+			}}); err != nil {
+				t.Fatalf("seed commit failed: %v", err)
+			}
 
-	ctx := context.Background()
-	n, err := w.ProcessOnce(ctx)
-	if err != nil {
-		t.Fatalf("ProcessOnce failed: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
-	}
+			ctx := context.Background()
+			n, err := w.ProcessOnce(ctx)
+			if err != nil {
+				t.Fatalf("ProcessOnce failed: %v", err)
+			}
+			if n != 1 {
+				t.Errorf("expected 1 processed, got %d", n)
+			}
 
-	// Commit should be deleted
-	if store.GetCommitRecord(libID, "commit-abc") != nil {
-		t.Error("commit should be deleted")
-	}
+			// Commit should be deleted
+			if store.GetCommitRecord(libID, "commit-abc") != nil {
+				t.Error("commit should be deleted")
+			}
 
-	// Root fs_object should be enqueued for cascade deletion
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemFSObject && item.ItemID == "fs-root" {
-			fsItems++
-		}
-	}
-	if fsItems != 1 {
-		t.Errorf("expected 1 fs_object enqueued for cascade, got %d", fsItems)
+			// Root fs_object should be enqueued for cascade deletion
+			items := store.QueueItems(orgID)
+			fsItems := 0
+			for _, item := range items {
+				if item.ItemType == ItemFSObject && item.ItemID == "fs-root" {
+					fsItems++
+				}
+			}
+			if fsItems != 1 {
+				t.Errorf("expected 1 fs_object enqueued for cascade, got %d", fsItems)
+			}
+		})
 	}
 }
 
@@ -960,7 +974,7 @@ func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
 		t.Fatalf("IncrementRetry failed: %v", err)
 	}
 
-	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libID}); err != nil {
+	if err := w.processCommit(QueueItem{LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libID}); err != nil {
 		t.Fatalf("processCommit failed: %v", err)
 	}
 
@@ -993,7 +1007,7 @@ func TestWorker_ProcessCommit_DoesNotCrossSuppressRootFSObjectAcrossLibraries(t 
 	store.AddCommit(libTarget, "commit-abc", "shared-root")
 	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "shared-root", libPending, "", 0)
 
-	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID}); err != nil {
+	if err := w.processCommit(QueueItem{LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID}); err != nil {
 		t.Fatalf("processCommit failed: %v", err)
 	}
 

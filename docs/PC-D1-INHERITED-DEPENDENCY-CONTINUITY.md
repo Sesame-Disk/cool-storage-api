@@ -64,11 +64,12 @@ exact vector and fails if an implementation silently treats the logical delta
 as a complete work set.
 
 This is a positive-continuity gap, not a claim that GC is already safe. The
-existing executable Phase 5 characterization,
-`TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD`, shows a
-dangling expired commit can delete `fs_objects` still reachable from HEAD.
-`ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01` remains a separate P0 PRE-GC
-fix, and is dormant only while `GC_ENABLED=false`.
+historical Phase 5 characterization showed a dangling expired commit deleting
+`fs_objects` still reachable from HEAD. [The scoped Phase 5 fix](./GC-PHASE5-SHARED-FSOBJECTS.md)
+now retires unguarded commits without cascading into their trees, with the
+preservation regression `TestPhase5CommitRetirementPreservesFSObjectsSharedWithHEAD`.
+Phase 6/concurrent metadata destruction and reclamation remain PRE-GC; this fix
+does not certify general inherited continuity or change the frozen PC-D1 scope.
 
 ## 2. Architecture comparison
 

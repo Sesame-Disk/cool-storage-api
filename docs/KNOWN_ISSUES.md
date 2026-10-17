@@ -6398,6 +6398,11 @@ This keeps coordinator and GC ownership distinct: the coordinator/frontier certi
 PC-2 may assume the canonical witness columns, fail-closed authority validity, and HEAD-fenced/atomic global-SERIAL primitives; it may not assume that PR #233's mapping authority has merged, or that the exact-P/liveness handshake, lifecycle serialization, or a productive consumer already exist.
 No funnel is migrated by PC-D1A, and no GC configuration changes are part of this issue closure.
 
+**Historical PC-0 counterexample:** its Phase 5 cascade is now fixed by
+[metadata-only commit retirement](./GC-PHASE5-SHARED-FSOBJECTS.md); the original
+argument below remains discovery provenance, not today's cascade behavior.
+Phase 6/concurrent metadata destruction still do not supply universal continuity.
+
 "The current GC already protects them" is **not** one of the options. GC Phase 5 (`scanExpiredVersions`) enqueues any
 commit outside the HEAD parent chain older than `version_ttl_days`;
 `processCommit → processFSObject` then cascades the commit's whole tree,
@@ -7125,12 +7130,17 @@ characterization PR.
 
 ### ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01: Phase 5 expired-version cascade deletes fs_objects shared with the live HEAD
 
-**Status**: 🔴 Open — **P0 latent**; dormant only while `GC_ENABLED=false`; must be fixed before any GC activation with `version_ttl_days > 0`
-**Severity**: Critical when GC is enabled (HEAD tree corruption / data loss); no production exposure today
-**Scope**: PRE-GC runtime follow-up — discovered by the PC-0 audit (2026-09-10), **not fixed** in the characterization PR
+**Status**: **CLOSED-FIX for the unsafe commit-to-tree cascade on merge of this change** (2026-10-17).
+[Phase 5 plan and evidence](./GC-PHASE5-SHARED-FSOBJECTS.md): unguarded commit retirement
+is metadata-only. Shared trees/refs are preserved; guarded library destruction
+keeps its cascade. **PRE-GC reclamation disposition remains OPEN**: exclusive
+fs_objects/refs are deliberately retained until a sharing-aware pass; no retention
+bound or Phase 6 safety is certified. Ordinary GC remains OFF.
+**Severity**: Historical P0 latent for the reproduced destructive cascade; preserved, not downgraded. This fix does not authorize activation.
+**Scope**: PRE-GC runtime follow-up — discovered by PC-0 (2026-09-10); fixed for commit-to-tree cascade here. Phase 6, concurrent commit publication/destruction and hard-delete fencing remain separate obligations.
 **Affected**: `Scanner.scanExpiredVersions` (Phase 5), `Worker.processCommit`, `Worker.processFSObject`, `removeFSObjectBlockReferences` in `internal/gc`
 
-#### Problem
+#### Historical problem (reproduced RED before the fix)
 
 Phase 5 walks the HEAD parent chain to build a keep-set of **commits** and
 enqueues every other commit older than `version_ttl_days` as `ItemCommit`.
@@ -7165,11 +7175,12 @@ commit C-head (HEAD):              root-H → dir-D → file-F   (same fs_ids)
 Phase 5: enqueue C-old → cascade root-X → dir-D, file-F deleted → C-head broken
 ```
 
-Executable counterexample (MockStore, `internal/gc`):
-`TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD`
-— after the cascade, `dir-D` and `file-F` return `fs_object not found`
-while `commit-H` still references them. The test freezes the observed
-behavior and must be inverted into a regression test by the fix.
+The former MockStore characterization
+`TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD` is inverted
+into `TestPhase5CommitRetirementPreservesFSObjectsSharedWithHEAD`. The real
+Cassandra/S3 `TestPhase5SharedTreesRealStack` reproduces loss with current identity
+gateways and passes after the fix for shared subtrees and identical roots,
+including an old HEAD ancestor and a recent off-chain commit.
 
 #### Why it matters beyond GC
 
@@ -7178,14 +7189,23 @@ already protects inherited dependencies" from the options of
 `ISSUE-PC0-INHERITED-DEPENDENCY-CONTINUITY-01`, and it is the negative side
 of `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`.
 
-#### Fix direction (not here)
+#### Accepted fix and remaining reclamation obligation
 
-Phase 5 must either prune by diff against a keep-set of fs_objects reachable
-from retained commits (as Phase 6 does) or delete only the `commits` row and
-leave fs_object/reference retirement to a sharing-aware pass. Add a
-scanner/worker regression test with a shared subtree. `ISSUE-TRASH-CLEAN-01`'s
-planned "enqueue expired commits' fs_objects" must not inherit the same
-cascade.
+The worker now deletes only the commit row for unguarded items, including
+already-queued Phase 5 commits. Root/descendant fs_objects and permanent refs
+are not enqueued or mutated by that retirement. Guarded library cleanup retains
+its existing behavior, including the legacy deleted-check flag. No queue/schema
+migration, API field/status change or GC-default change is required.
+
+Exclusive trees can now be over-retained when no sharing-aware cleanup runs;
+that is the chosen safety trade-off, not a reclamation fix. Phase 6 remains
+unsafe under its execute-time TOCTOU and is not endorsed as an activation-ready
+replacement. Previously queued fs_object descendants are not retroactively
+classified, and previously deleted data are not repaired. Resolve retention and
+metadata-destruction fencing under the full PRE-GC/A1 gate before enabling GC.
+
+The planned `ISSUE-TRASH-CLEAN-01` cleanup must not bypass this protection by
+directly enqueuing shared fs_objects; its separate cleanup obligations remain.
 
 #### Related
 
