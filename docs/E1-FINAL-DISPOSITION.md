@@ -106,29 +106,30 @@ this audit does not require fixing an independent 500 to invent physical safety.
 
 ## Remaining X1 work
 
-H1 now supplies the named combined witness. I1/M1 remain two bounded quality
-actions, followed by the maintainer's final acceptance. This is not an inventory
-of all PRE-GC/A1 work.
+H1 supplies the named combined witness and [I1's guard criterion is now met](./I1-IDENTITY-EXECUTION-INVENTORY.md).
+M1 remains the bounded quality action before the maintainer's final acceptance.
+This is not an inventory of all PRE-GC/A1 work.
 
 | Action | Exact unmet criterion | Small next action and closure condition |
 |---|---|---|
 | **H1 — measured; disposition pending acceptance** | Named existing-P2 / late-K1 / publication witness is now supplied | [H1 result](./E1-H1-PROTECTED-SUCCESSOR.md): real protected P2 precedes D1 physical recovery; late PUT and actual HEAD resolve P2; stale discovery refuses without a durable token; fresh discovery is empty. Controls, repeats, race, directed negatives and owned cleanup pass. Recommend X3 for observed K1 residue within this scope; final E1 decision remains the maintainer's. |
-| **I1 — identity claim guard, P2 PRE-X1** | Current guard inventories literal strings rather than every Query/Batch execution site | Reuse the existing execution-site approach for the two actual identity claim operations. Require exact write-once INSERT/read and fail-closed classification of current dynamic sites; directed negatives must test the existing immutable-claim contract. No new productive registry/guard or hypothetical runtime finding. Close the recorded structural audit debt after independent checks. |
+| **I1 — CLOSED-FIX, P2 guard quality** | Execution-site criterion met for current classified source | [I1 evidence](./I1-IDENTITY-EXECUTION-INVENTORY.md) reuses the existing Query/Batch inventory, pins one exact INSERT/read at their approved owners and preserves schema/literal checks. Two old-guard blind spots are demonstrated; 13 compiled negatives and two controls pass, as do DB normal/race with nine short seed skips. No runtime defect or overall gate closure is claimed. |
 | **M1 — H8 mutation granularity, P2 PRE-X1 quality debt** | One combined mutation does not independently evidence ten supported CAS terminals | Split scripts/pc-d1b3-mapping-authority-mutation-validation.sh H8 into ten directed cases, one terminal each, requiring compile success and the matching guard rejection. H8 belongs to the mapping cold-path guard, not the identity primitive. Keep the existing guard; do not add a new runtime mechanism. |
 | **Final acceptance — maintainer decision** | E1/X1 sign-off has not happened | Review these dispositions, H1/I1/M1 results, the scoped E1-01 recommendation and failed/unrun deployment evidence. Accept a stated physical-safety scope or identify a concrete unmet criterion. Then propose X1 CLOSED in the final review; no unconditional closure or activation is implied by this PR. |
 
-I1/M1 preserve an existing PRE-X1 quality condition; neither is evidence of a
-current retired-P1 publication. The maintainer may instead explicitly accept the
-present source/evidence scope and reclassify either as TECH DEBT / GENERAL,
-keeping P2 severity and the follow-up open. Such a decision must be recorded;
+I1 resolves its recorded guard condition; M1 retains the P2 PRE-X1 quality
+condition. Neither is evidence of a current retired-P1 publication. The
+maintainer may instead explicitly accept the present evidence scope and
+reclassify M1 as TECH DEBT / GENERAL, keeping P2 severity and the follow-up open. Such a decision must be recorded;
 this audit neither silently waives the tag nor makes a hypothetical future caller
 a new runtime blocker. H1's subsequent result resolves its named witness gap;
-I1/M1 and final acceptance remain separate.
+M1 and final acceptance remain separate.
 
 The current identity source has only its one INSERT and one SELECT in
-[identity_authority.go](../internal/db/identity_authority.go). Its existing
+[identity_authority.go](../internal/db/identity_authority.go). Its
 [immutability guard](../internal/db/identity_authority_immutability_guard_test.go)
-passes; that does not close its known completeness debt. The mapping guard's
+now also requires the shared execution inventory; the former literal-only
+completeness debt is resolved by I1. The mapping guard's
 execution inventory is in [TestBlockMappingMutationsAreRepositoryWideInventoried](../internal/db/block_mapping_authority_guard_test.go),
 not just its older similarly named literal immutability test. H8 currently
 inserts four Query CAS, four Batch CAS and two Session batch CAS calls at once.

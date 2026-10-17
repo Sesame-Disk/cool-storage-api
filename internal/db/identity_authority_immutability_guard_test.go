@@ -16,6 +16,10 @@ import (
 
 const identityAuthorityClaimsTable = "identity_authority_claims"
 
+// Freeze the actual executed projections, not just the presence of table literals.
+const identityAuthorityExactInsert = "INSERT INTO identity_authority_claims (library_id, identity_kind, identity_id, digest_version, digest, created_at) VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+const identityAuthorityExactSelect = "SELECT digest_version, digest, created_at FROM identity_authority_claims WHERE library_id = ? AND identity_kind = ? AND identity_id = ?"
+
 var (
 	identityAuthorityInsertPattern = regexp.MustCompile(`(?is)^INSERT\s+INTO\s+identity_authority_claims\s*\([^)]*\)\s*VALUES\s*\([^)]*\)\s*IF\s+NOT\s+EXISTS$`)
 	identityAuthoritySelectPattern = regexp.MustCompile(`(?is)^SELECT\s+.+\s+FROM\s+identity_authority_claims\s+WHERE\s+.+$`)
@@ -185,6 +189,7 @@ func TestIdentityAuthorityClaimsAreImmutableRepositoryWide(t *testing.T) {
 	if createCount != 1 {
 		violations = append(violations, "schema CREATE TABLE count="+strconv.Itoa(createCount)+", want 1")
 	}
+	violations = append(violations, authorityExecutionInventory(t)...)
 	sort.Strings(violations)
 	if len(violations) > 0 {
 		t.Fatalf("PCD1B CLAIM IMMUTABILITY: unauthorized operation on %s: %v", identityAuthorityClaimsTable, violations)

@@ -9,10 +9,11 @@ OPEN convergence debt. The named healthy-service A-I crash obligation is
 recommended CLOSED-EVIDENCE with explicit topology/fault qualifications.
 [H1 now supplies its combined one-DC witness](./E1-H1-PROTECTED-SUCCESSOR.md):
 protected P2 before physical recovery, late PUT, HEAD on P2 and safe stale-D1
-refusal. Recommend X3 for measured K1 residue. Remaining bounded quality work is
-I1's identity execution-site guard and M1's independent H8 terminal negatives,
-then final E1 acceptance. Historical three-DC failures remain FAIL; this is
-no full-suite or production certificate. X1 remains OPEN and ordinary GC OFF.
+refusal. Recommend X3 for measured K1 residue. [I1's identity execution-site
+guard is now implemented and evidenced](./I1-IDENTITY-EXECUTION-INVENTORY.md).
+M1's independent H8 terminal negatives remain, then final E1 acceptance.
+Historical three-DC failures remain FAIL; this is no full-suite or production
+certificate. X1 remains OPEN and ordinary GC OFF.
 Dated pending lists below retain their snapshots; use this audit's finite list.
 
 ## E1 current combined three-DC evidence (2026-10-15)

@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-16 — I1 identity execution inventory
+
+[I1](./I1-IDENTITY-EXECUTION-INVENTORY.md) closes the identity guard's P2
+completeness criterion by sharing the existing Query/Batch inventory. Exact
+owners/CQL and 1/1 sites reject cross-file and duplicate-execution blind spots.
+Thirteen compiled negatives and two controls pass; DB normal/race each record
+528 named PASS and nine seed SKIP. No runtime change; M1/E1 acceptance remain,
+X1 OPEN and ordinary GC OFF.
+
 ## 2026-10-16 — H1 protected successor across late PUT/publication
 
 [H1 evidence](./E1-H1-PROTECTED-SUCCESSOR.md) combines real D1 retirement,

@@ -322,12 +322,91 @@ m_premature_consumer() {
 	expect_red '^TestIdentityAuthorityPrimitiveHasNoRawProductionCallerOutsideGateway$' "scope: a production consumer of the primitive appeared" "production consumers"
 }
 
+# I1: resolve identity CQL at the actual Query/Batch sites using the existing
+# shared execution inventory. Both table fragments live in different production
+# files; the old per-file literal inventory alone could not see these operations.
+i1_fixture() {
+    local statement="$1" execution="$2"
+    restore
+    cp "$TARGET" "$BACKUP"
+    cp "$GATEWAY_TARGET" "$GATEWAY_BACKUP"
+    printf '\nconst i1ClaimPrefix = "identity_authority_"\nfunc i1ClaimTable() string { return i1ClaimPrefix + i1ClaimSuffix }\nfunc i1GuardMutation(session *gocql.Session) { statement := %s; %s }\n' "$statement" "$execution" >> "$TARGET"
+    printf '\nconst i1ClaimSuffix = "claims"\n' >> "$GATEWAY_TARGET"
+}
+
+i1_expect_red() {
+    local label="$1" diagnostic="$2" compiled
+    if ! compiled="$(run_tests '^$')"; then
+        echo "$compiled"
+        fail "$label did not compile; a build failure is not guard evidence"
+    fi
+    expect_red '^TestIdentityAuthorityClaimsAreImmutableRepositoryWide$' "$label" "$diagnostic"
+}
+
+i1_positive_local_query() {
+    mutate 's/(\texisting := map\[string\]interface\{\}\{\}\r?\n)\tapplied, err := session.Query\((`[^`]+`), /statement := $2\n$1\tapplied, err := session.Query(statement, /'
+    local out
+    if ! out="$(run_tests '^TestIdentityAuthorityClaimsAreImmutableRepositoryWide$')"; then
+        echo "$out"; fail "I1 legitimate local statement control failed"
+    fi
+    echo "GREEN control: I1 approved identity Query through a local binding"
+}
+
+i1_execution_mutations() {
+    i1_positive_local_query
+    i1_fixture '"SELECT now() FROM system.local"' '_ = session.Query(statement).Exec()'
+    local out
+    if ! out="$(run_tests '^TestIdentityAuthorityClaimsAreImmutableRepositoryWide$')"; then
+        echo "$out"; fail "I1 unrelated Query control failed"
+    fi
+    echo "GREEN control: I1 unrelated resolved Query"
+    i1_fixture '"UPDATE " + i1ClaimTable() + " SET digest = ? WHERE library_id = ?"' '_ = session.Query(statement).Exec()'
+    i1_expect_red 'I1 cross-file helper UPDATE' 'unauthorized identity execution'
+    i1_fixture '"DELETE FROM " + i1ClaimPrefix + i1ClaimSuffix + " WHERE library_id = ?"' '_ = session.Query(statement).Exec()'
+    i1_expect_red 'I1 cross-file concatenated DELETE' 'unauthorized identity execution'
+    i1_fixture 'fmt.Sprintf("TRUNCATE %s%s", i1ClaimPrefix, i1ClaimSuffix)' '_ = session.Query(statement).Exec()'
+    i1_expect_red 'I1 formatted TRUNCATE' 'unresolved/dynamic Query argument in i1GuardMutation'
+    i1_fixture '"INSERT INTO " + i1ClaimTable() + " (library_id) VALUES (?) USING TTL 10"' '_ = session.Query(statement).Exec()'
+    i1_expect_red 'I1 INSERT with TTL' 'unauthorized identity execution'
+    i1_fixture '"SELECT digest_version, digest, created_at FROM " + i1ClaimTable() + " WHERE library_id = ? AND identity_kind = ? AND identity_id = ?"' '_ = session.Query(statement).Exec()'
+    i1_expect_red 'I1 SELECT outside approved owner' 'unauthorized identity execution'
+    i1_fixture '"UPDATE " + i1ClaimTable() + " SET digest = ? WHERE library_id = ?"' 'b := session.Batch(gocql.LoggedBatch); b.Query(statement); _ = session.ExecuteBatch(b)'
+    i1_expect_red 'I1 Batch.Query' 'unauthorized identity execution'
+    i1_fixture '"DELETE FROM " + i1ClaimTable() + " WHERE library_id = ?"' 'b := session.Batch(gocql.LoggedBatch); b.Bind(statement, func(*gocql.QueryInfo) ([]interface{}, error) { return nil, nil }); _ = session.ExecuteBatch(b)'
+    i1_expect_red 'I1 Batch.Bind' 'unauthorized identity execution'
+    i1_fixture '"TRUNCATE " + i1ClaimTable()' 'b := session.Batch(gocql.LoggedBatch); b.Entries = append(b.Entries, gocql.BatchEntry{Stmt: statement}); _ = session.ExecuteBatch(b)'
+    i1_expect_red 'I1 BatchEntry' 'unauthorized identity BatchEntry execution'
+    i1_fixture 'strings.Join([]string{"DELETE FROM ", i1ClaimPrefix, i1ClaimSuffix}, "")' 'query := session.Query; _ = query(statement).Exec()'
+    i1_expect_red 'I1 Query method alias' 'Session.Query method values/aliases'
+    mutate 's/\z/\nfunc i1GuardMutation(session *gocql.Session, statement string) { _ = session.Query(statement).Exec() }\n/'
+    i1_expect_red 'I1 unclassified dynamic Query' 'unresolved/dynamic Query argument in i1GuardMutation'
+    mutate 's/(\texisting := map\[string\]interface\{\}\{\}\r?\n)\tapplied, err := session.Query\((`[^`]+`), /statement := $2\n$1\t_ = session.Query(statement).Exec()\n\tapplied, err := session.Query(statement, /'
+    i1_expect_red 'I1 duplicate approved INSERT site with one literal' 'identity_authority_claims execution inventory INSERT=2 SELECT=1'
+    mutate 's/(\texisting := map\[string\]interface\{\}\{\}\r?\n)\tapplied, err := session.Query\((`[^`]+`), /statement := $2\n$1\tb := session.Batch(gocql.LoggedBatch); b.Query(statement); _ = session.ExecuteBatch(b)\n\tapplied, err := session.Query(statement, /'
+    i1_expect_red 'I1 approved INSERT submitted through Batch.Query' 'unauthorized identity execution'
+    mutate 's/SELECT digest_version, digest, created_at\r?\n/SELECT digest_version, digest, created_at, identity_id\n/'
+    i1_expect_red 'I1 SELECT projection drift' 'unauthorized identity execution'
+    restore
+}
+
+case "${PCD1B_MUTATION_SCOPE:-all}" in
+    all|i1) ;;
+    *) fail "unknown PCD1B_MUTATION_SCOPE (use all or i1)" ;;
+esac
+
 echo "== baseline must be GREEN =="
 restore
 if ! run_tests 'TestIdentity|TestFileIdentity|TestCommitIdentity|TestClaimIdentity|TestClassifyIdentity' >/dev/null 2>&1; then
 	fail "baseline is not green; fix the tests before validating mutations"
 fi
 echo "baseline green"
+
+i1_execution_mutations
+if [ "${PCD1B_MUTATION_SCOPE:-all}" = i1 ]; then
+    echo "== all I1 mutations RED; controls GREEN; sources restored =="
+    exit 0
+fi
+
 
 m17_drop_canonical_list
 m17_drop_length_prefix
