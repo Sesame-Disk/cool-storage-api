@@ -1,5 +1,24 @@
 # E1 final disposition audit
 
+## Final acceptance plan (2026-10-16)
+
+Base main@aa5d1d69e (#311). This slice proposes a maintainer decision, not
+another runtime change. Its merge accepts only the stated physical-life scope.
+
+1. Reconcile D0 section 25 with W1/W2, G1-G5, A-I and H1; distinguish source,
+   unit, real-stack, process-death and three-DC evidence. Preserve failed and
+   unrun cases, including three distinct API residuals and native S3 ambiguity.
+2. Record the exact accepted contract, deployment assumptions, H=X3 disposition
+   and certified-baseline decision. Identify what would reopen X1. Make the
+   maintainer's merge the explicit acceptance event; keep PRE-GC/A1 OPEN.
+3. Update current summaries and the named A-I inventory; retain dated snapshots
+   and the frozen D0 record. Do not change runtime, guards, schema or defaults.
+4. Check links, commands, source continuity and existing GC/DB short tests in
+   Docker. Report seed skips and integration/race checks not rerun. Audit the
+   final diff, refresh main, commit task files and open a focused PR.
+
+Backward compatible: yes, documentation only. Ordinary GC remains OFF.
+
 ## Frozen plan (2026-10-16)
 
 Base main@e132c7c64 (#307). Scope: the D0 section 25 E1 disposition list
