@@ -6,8 +6,9 @@
 existing-P2 / late-K1 / HEAD witness on one DC with healthy services. Recommend
 X3/leak for measured K1 residue; no retired-P1 publication or runtime defect was
 reproduced. Stale discovery refuses safely without its durable root token.
-[I1's guard criterion is now met](./I1-IDENTITY-EXECUTION-INVENTORY.md); M1 retains
-P2 PRE-X1. Final maintainer acceptance, X1 and PRE-GC/A1 remain separate. Ordinary GC remains OFF.
+[I1's guard criterion is met](./I1-IDENTITY-EXECUTION-INVENTORY.md), as is
+[M1's independent-terminal evidence criterion](./M1-INDEPENDENT-CAS-EVIDENCE.md).
+Final maintainer acceptance, X1 and PRE-GC/A1 remain separate. Ordinary GC remains OFF.
 
 ## Previous E1 final audit dispositions (#308, 2026-10-16)
 
@@ -6754,7 +6755,7 @@ immutable claim or the no-repair behavior in #233.
 
 ### PRE-X1 audit debt: identity claim-table CQL inventory and CAS mutation granularity
 
-**Status**: I1 CLOSED-FIX (guard quality); M1 Open — follow-up / PRE-X1
+**Status**: I1 CLOSED-FIX (guard quality); M1 CLOSED-EVIDENCE (independent-terminal quality criterion)
 **Severity**: P2 — structural guard and evidence quality
 **Blocks #233**: No
 
@@ -6785,6 +6786,13 @@ analysis, exact INSERT/read owners and 1/1 counts, preserved literal/schema
 checks, two demonstrated old-guard blind spots and 13 compiled negatives.
 Normal/race DB pass with nine seed skips. This is a test-guard fix, not a runtime
 data-loss fix. M1 retains P2 PRE-X1; E1/X1 acceptance and GC activation remain separate.
+
+**M1 update (2026-10-16):** [Independent H8 evidence](./M1-INDEPENDENT-CAS-EVIDENCE.md)
+closes the remaining mutation-granularity condition. Ten compiled cases each
+require their selected terminal diagnostic, with a GREEN non-CAS control and
+normal/race source guards. A disabled ScanCAS recognition is masked by the old
+aggregate predicate but refused by the new selector. No production guard/runtime
+change; H1/I1/M1 results now await maintainer final E1 acceptance. X1 OPEN, GC OFF.
 
 ### ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01: A continuity LWT racing a hard delete can leave a HEAD-less ghost `libraries` row
 
