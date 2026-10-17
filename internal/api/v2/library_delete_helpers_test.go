@@ -106,7 +106,7 @@ func TestPermanentDeleteResolvedRepo_KeepsLeaseAliveDuringLinkCleanup(t *testing
 		}
 	}
 	hardDeleteCalled := 0
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -157,7 +157,7 @@ func TestPermanentDeleteResolvedRepo_RejectsWhenLeaseIsLostDuringLinkCleanup(t *
 		}
 	}
 	hardDeleteCalled := 0
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -223,7 +223,7 @@ func TestPermanentDeleteResolvedRepo_StopsFurtherLinkDeletesAfterLeaseLoss(t *te
 		}
 	}
 	hardDeleteCalled := 0
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -257,7 +257,7 @@ func TestPermanentDeleteResolvedRepo_FailClosedOnRepresentationError(t *testing.
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -305,7 +305,7 @@ func TestDeleteResolvedTrashLibrary_FailClosedOnRepresentationError(t *testing.T
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -368,7 +368,7 @@ func TestPermanentDeleteResolvedRepo_StampsResolvedRepresentationOnSuccess(t *te
 				cleanupLinksCalled++
 				return nil
 			}
-			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
+			hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time, _ uuid.UUID) error {
 				gotRepresentation = blockRepresentationID
 				gotWriterDeletedAt = deletedAt
 				return nil
@@ -440,7 +440,7 @@ func TestDeleteResolvedTrashLibrary_ImmediatelyEnqueuesLibraryCascadeOnSuccess(t
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time, _ uuid.UUID) error {
 		gotRepresentation = blockRepresentationID
 		gotWriterDeletedAt = deletedAt
 		return nil
@@ -489,7 +489,7 @@ func TestPermanentDeleteResolvedRepo_RejectsWhenLibraryIsNoLongerTrashed(t *test
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -530,7 +530,7 @@ func TestDeleteResolvedTrashLibrary_RejectsWhenHardDeleteLeaseBusy(t *testing.T)
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -563,7 +563,7 @@ func TestAdminCleanTrashLibraries_SkipsRepresentationFailuresWithoutSideEffects(
 		}
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -597,7 +597,7 @@ func TestAdminCleanTrashLibraries_BatchFailureDoesNotRunPostCommitSideEffects(t 
 	resolveDeleteBlockRepresentationFn = func(_ *db.DB, _, _ string) (string, error) {
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		return errors.New("batch exec failed")
 	}
 	cleanupAllLibraryTagsForDeleteFn = func(_ *db.DB, _ string) error {
@@ -635,7 +635,7 @@ func TestAdminCleanTrashLibraries_PartialSuccessLeavesBadLibraryUntouched(t *tes
 		}
 		return db.PlainBlockRepresentationID, nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalls = append(hardDeleteCalls, libraryID)
 		return nil
 	}
@@ -684,7 +684,7 @@ func TestProcessOrgTrashCandidates_SkipsRepresentationFailuresWithoutSideEffects
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -717,7 +717,7 @@ func TestProcessOrgTrashCandidates_LinkCleanupFailureSkipsWithoutHardDelete(t *t
 	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
 		return errors.New("link cleanup failed")
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -751,7 +751,7 @@ func TestProcessOrgTrashCandidates_HardDeleteFailureSkipsEnqueue(t *testing.T) {
 	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		return errors.New("batch exec failed")
 	}
 	libEnq := &mockLibraryGCEnqueuer{}
@@ -786,7 +786,7 @@ func TestProcessOrgTrashCandidates_PartialSuccessLeavesBadLibraryUntouched(t *te
 	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalls = append(hardDeleteCalls, libraryID)
 		return nil
 	}
@@ -828,7 +828,7 @@ func TestProcessOrgTrashCandidates_SkipsRestoredCandidateAndContinues(t *testing
 	cleanupLibraryLinksForDeleteFn = func(_ *db.DB, _, _ string) error {
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, libraryID, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalls = append(hardDeleteCalls, libraryID)
 		return nil
 	}
@@ -869,7 +869,7 @@ func TestProcessOrgTrashCandidates_SkipsStaleTrashIdentityAfterRestoreAndRetrash
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, _ string, _ time.Time, _ uuid.UUID) error {
 		hardDeleteCalled++
 		return nil
 	}
@@ -907,7 +907,7 @@ func TestProcessOrgTrashCandidates_SuccessEnqueuesDedupCascadePreservingDeletedA
 		cleanupLinksCalled++
 		return nil
 	}
-	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time) error {
+	hardDeleteLibraryRowsFn = func(_ *db.DB, _, _, _, blockRepresentationID string, deletedAt time.Time, _ uuid.UUID) error {
 		gotRepresentation = blockRepresentationID
 		gotWriterDeletedAt = deletedAt
 		return nil

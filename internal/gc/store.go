@@ -531,6 +531,7 @@ type GCStore interface {
 	// Library trash auto-purge (soft-deleted libraries past retention period)
 	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)
 	HardDeleteLibrary(orgID, libraryID uuid.UUID) error
+	WithLibraryLifecycleMutation(libraryID, leaseToken uuid.UUID, mutation func() error) error
 
 	// Storage counter cleanup after permanent library deletion.
 	// Deletes the lib-scope counter row. Aggregate scopes (org, user, platform)

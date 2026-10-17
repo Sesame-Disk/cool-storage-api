@@ -1,5 +1,13 @@
 # Current Work
 
+## Library lifecycle final-write exclusion (2026-10-17)
+
+API permanent delete/restore and GC library/org final batches use a durable final
+section under the still-owned library lease. Both stale HTTP schedules have real
+Cassandra RED/GREEN evidence; final-section recovery remains P1 CURRENT-RUNTIME /
+PRE-GC. No automatic timeout unlock, mixed-version certificate or activation.
+[Plan, protocol and evidence](docs/LIBRARY-LIFECYCLE-FINAL-FENCING.md).
+
 ## Active slice: Phase 5 shared-tree preservation (2026-10-17)
 
 [Plan and evidence](docs/GC-PHASE5-SHARED-FSOBJECTS.md): unguarded expired-commit

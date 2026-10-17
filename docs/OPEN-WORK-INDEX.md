@@ -1,5 +1,15 @@
 # Open Work Index
 
+## Library final-write safety; recovery remains open (2026-10-17)
+
+[Final lifecycle exclusion](./LIBRARY-LIFECYCLE-FINAL-FENCING.md) prevents a stale
+API/GC lease owner from applying its final library batch after takeover. A final
+section error/crash retains exclusion indefinitely; recovery/availability remains
+P1 CURRENT-RUNTIME / PRE-GC under `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`.
+Pre-existing mixed counter/ordinary tag cleanup is tracked separately as
+`ISSUE-LIBRARY-TAG-CLEANUP-MIXED-BATCH-01` (P2 FOLLOW-UP / GENERAL).
+Phase 6, Phase 5 reclamation and PRE-GC/A1 remain OPEN; ordinary GC stays OFF.
+
 ## Phase 5 shared-tree cascade fix (2026-10-17)
 
 [Metadata-only commit retirement](./GC-PHASE5-SHARED-FSOBJECTS.md) closes the

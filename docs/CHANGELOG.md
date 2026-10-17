@@ -1,5 +1,14 @@
 # Changelog - SesameFS
 
+## 2026-10-17 — Library lifecycle final-write exclusion
+
+Library permanent delete/restore and GC final canonical deletion now enter a
+non-expiring, token-owned final section. Migration 028 is additive; existing
+HTTP contracts remain. Stale preparatory owners cannot execute their final batch
+after takeover. Error/crash recovery remains open and can block an affected
+library indefinitely; rollout/rollback requires drained writers. See the
+[protocol/evidence](./LIBRARY-LIFECYCLE-FINAL-FENCING.md). PRE-GC/A1 OPEN, GC OFF.
+
 Session-by-session development history for SesameFS.
 
 **Format**: Each session includes completion date, major features, files changed.

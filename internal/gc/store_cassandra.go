@@ -173,22 +173,22 @@ func releaseHardDeleteLock(session *gocql.Session, tableName, keyColumn string, 
 // AcquireLibraryHardDeleteLockLease acquires the library hard-delete lock using
 // the same stale-aware CAS semantics as the GC worker.
 func AcquireLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) (bool, error) {
-	acquired, err := acquireHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
+	acquired, err := acquireLibraryLifecycleLease(session, libraryID, leaseToken)
 	return settleHardDeleteLockAcquire(acquired, err, func() error {
 		return ReleaseLibraryHardDeleteLockLease(session, libraryID, leaseToken)
 	})
 }
 
-// RenewLibraryHardDeleteLockLease fences ownership of the library hard-delete
-// lock and refreshes its TTL.
+// RenewLibraryHardDeleteLockLease checks ownership. Preparatory TTLs refresh;
+// finalizing sections remain non-expiring until acknowledged mutation completion.
 func RenewLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) (bool, error) {
-	return renewHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
+	return renewLibraryLifecycleLease(session, libraryID, leaseToken)
 }
 
 // ReleaseLibraryHardDeleteLockLease releases the library hard-delete lock only
 // when the same lease token still owns it.
 func ReleaseLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseToken uuid.UUID) error {
-	return releaseHardDeleteLock(session, "gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
+	return releaseLibraryLifecycleLease(session, libraryID, leaseToken)
 }
 
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
@@ -6260,6 +6260,8 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 	return result, nil
 }
 
+// HardDeleteLibrary builds the final batch; productive callers must execute it
+// inside WithLibraryLifecycleMutation using their current library lease token.
 func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	session := s.db.Session()
 	batch := session.Batch(gocql.LoggedBatch)

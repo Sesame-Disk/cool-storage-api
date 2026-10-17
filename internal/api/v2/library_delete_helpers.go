@@ -49,7 +49,7 @@ var (
 	releaseLibraryHardDeleteLockLeaseFn = func(database *dbpkg.DB, libraryID, leaseToken uuid.UUID) error {
 		return gcpkg.ReleaseLibraryHardDeleteLockLease(database.Session(), libraryID, leaseToken)
 	}
-	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string, deletedAt time.Time) error {
+	hardDeleteLibraryRowsFn = func(database *dbpkg.DB, orgID, libraryID, storageClass, blockRepresentationID string, deletedAt time.Time, leaseToken uuid.UUID) error {
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		if err := addDeleteAdminLibraryReadModelQueries(database, batch, orgID, libraryID); err != nil {
 			return errors.Join(errHardDeleteLibraryReadModel, err)
@@ -72,7 +72,15 @@ var (
 			markerDeletedAt = time.Now()
 		}
 		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class, block_representation_id, purge_requested_at) VALUES (?, ?, ?, ?, ?, ?)`, libraryID, orgID, markerDeletedAt, storageClass, blockRepresentationID, time.Now())
-		if err := batch.Exec(); err != nil {
+		libraryUUID, err := uuid.Parse(libraryID)
+		if err != nil {
+			return err
+		}
+		err = gcpkg.WithLibraryLifecycleMutation(database.Session(), libraryUUID, leaseToken, batch.Exec)
+		if errors.Is(err, gcpkg.ErrLibraryLifecycleOwnershipLost) {
+			return errPermanentDeleteInProgress
+		}
+		if err != nil {
 			return errors.Join(errHardDeleteLibraryBatchExec, err)
 		}
 		return nil
@@ -232,7 +240,7 @@ func permanentlyDeleteTrashedLibraryCandidate(database *dbpkg.DB, candidate tras
 		return "", errPermanentDeleteInProgress
 	}
 
-	if err := hardDeleteLibraryRowsFn(database, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt); err != nil {
+	if err := hardDeleteLibraryRowsFn(database, candidate.OrgID, candidate.LibraryID, candidate.StorageClass, blockRepresentationID, candidate.DeletedAt, leaseToken); err != nil {
 		return "", err
 	}
 	return blockRepresentationID, nil

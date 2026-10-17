@@ -449,7 +449,7 @@ added here to count.
 | HEAD-less ghost `libraries` row counts as canonically absent for GC/restore | `ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01` |
 | Historical repair-health-gate proposal: E1-11 closes the covered current-version W2-11 pre-D safety contract through the existing non-expiring repair guard, without CLOSED-GATED or a new health gate. W2-12..14 and other PRE-GC requirements remain OPEN | [E1-11 disposition](./E1-11-CURRENT-RUNTIME-REPAIR-LIVENESS.md) |
 | GC mapping resolver `CassandraStore.lookupBlockMapping()` reclassified from session consistency | `PCD1B3-PRE-GC-SESSION-CONSISTENCY-EXCEPTION` marker |
-| Library hard-delete lease: global SERIAL (✅ closed by PR #234) and fenced final batch | `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` (closed), `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` (open; current-runtime, §7) |
+| Library hard-delete lease: global SERIAL (✅ closed by PR #234) and final-write exclusion/recovery | `ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` (closed), `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` (open; current-runtime, §7) |
 | Post-D reference and R31 convergence moved from X1 by E1-16, severity unchanged: stale renewal after clear (E1-15A), writer post-D staging crash (E1-15B), known-loser durability (W2-12), repair discovery scale (W2-13), `pub:` zero-ref transition (W2-14), owned-`pub:` cleanup race and progress Paxos domain | `ISSUE-PUBLISH-REPAIR-STALE-RENEWAL-AFTER-CLEAR-01`, `ISSUE-PUBLICATION-POST-D-LIVENESS-BEFORE-VALIDATION-01`, `ISSUE-PUBLISH-REPAIR-KNOWN-LOSER-DURABILITY-01`, `ISSUE-PUBLISH-REPAIR-DISCOVERY-SCALE-01`, `ISSUE-GC-PUB-REF-ZERO-REF-01`, `ISSUE-PUBLISH-REPAIR-OWNED-PUB-CLEANUP-RACE-01`, `ISSUE-PUBLISH-REPAIR-PROGRESS-PAXOS-DOMAIN-01` |
 | Abandoned publication repairs can keep every later life of L uncollectable (E1-15C). P2 PRE-GC since 2026-10-12, measure first: existing repair metrics, then a retain reason only if retention is real, then a disposition from the data. No TTL on the repair row; any cleanup needs authority the original writer's HEAD CAS cannot outrun | `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01` |
 | E6 ordinary queue lifecycle arbitration remains OPEN PRE-GC at its recorded Low/Low-Med severity; exact-D block safety does not imply exactly-once queue transitions | `ISSUE-GC-ENGINE-ROBUSTNESS-01`; [E1 disposition](./E1-FINAL-DISPOSITION.md) |
@@ -465,20 +465,19 @@ reopens as PRE-ACTIVATION.
 
 ## 7. Current-runtime work outside the critical path
 
-The library hard-delete lease issues are current-runtime defects, not only
-PRE-GC: restore and `PermanentDeleteRepo` run through the API independently of
-`GC_ENABLED`. The SERIAL-domain issue is **config-dependent**: the shipped
-`configs/config.prod.yaml` uses `serial_consistency: SERIAL`, but
-`LOCAL_SERIAL` is a supported setting (used by the multi-region compose
-configurations; startup only logs a warning) and the lease LWTs inherit it.
-Both issues are worked in parallel with W2: first the global SERIAL pin of the lease LWTs
-(`ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01`), then the generation-fenced
-final batch (`ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`). The SERIAL pin alone
-does not close the non-fencing race.
+Library restore and `PermanentDeleteRepo` run through the API independently of
+`GC_ENABLED`; their lifecycle safety is current-runtime work as well as PRE-GC.
+Global SERIAL pinning landed in PR #234 for library, user and org leases
+(`ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` closed), including when the session
+uses the supported LOCAL_SERIAL setting.
 
-Status: the global SERIAL pin landed in PR #234 for the library, user and org
-leases (`ISSUE-GC-HARD-DELETE-LEASE-SERIAL-DOMAIN-01` closed); the generation-fenced
-final batch (`ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`) remains open.
+[Durable final exclusion](./LIBRARY-LIFECYCLE-FINAL-FENCING.md) now prevents the
+old library lease owner from applying its final API/GC batch after takeover.
+`ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01` remains OPEN CURRENT-RUNTIME / PRE-GC
+for crash/error recovery and availability: a retained final section blocks the
+library indefinitely. No automatic expiry unlock is safe while an old write may
+remain in flight. User/org final fencing, the full cascade and PRE-GC/A1 are not
+closed by this bounded library final-write correction.
 
 
 ### Confirmed E1 / PRE-GC dependency from G4 cross-audit (2026-10-02)

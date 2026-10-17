@@ -1,5 +1,15 @@
 # Deploying SesameFS to Production
 
+
+Library lifecycle rollout/rollback: migration 028 adds the durable `finalizing`
+lease cell. Drain and stop **all** old API and worker owners before deploying the
+new lifecycle writers. Rolling old/new overlap is not certified: old lease code
+can steal or release final sections. Do not drop the additive column on rollback;
+first quiesce owners and settle/reconcile every retained final section. A final
+write error/crash deliberately blocks the affected library indefinitely, with no
+automatic timeout unlock. Follow [the recovery limits](./LIBRARY-LIFECYCLE-FINAL-FENCING.md#recovery-rollout-and-rollback).
+Ordinary GC remains disabled; this change closes no activation gate.
+
 This guide is organized around the repository's default production path: multi-region SesameFS nodes deployed from published images, with the same `docker-compose.prod.yml` on every server and node-local differences carried only in `.env`.
 Single-region is still supported, but it is the legacy compatibility path and should be treated as a simplified fallback rather than the primary operating model.
 ---

@@ -1067,7 +1067,7 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	if !owned {
 		return fmt.Errorf("lost library restore lock for %s", libraryID)
 	}
-	if err := batch.Exec(); err != nil {
+	if err := gcpkg.WithLibraryLifecycleMutation(db.Session(), libraryUUID, leaseToken, batch.Exec); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
 

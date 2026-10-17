@@ -827,8 +827,9 @@ var hardDeleteLockStaleAfter = 3 * hardDeleteLockHeartbeatInterval
 var fsObjectReferenceFenceInterval = 5 * time.Minute
 
 type hardDeleteLease struct {
-	stopCh  chan struct{}
-	release func() error
+	stopCh   chan struct{}
+	release  func() error
+	finalize func(func() error) error
 
 	mu         sync.Mutex
 	err        error
@@ -3218,7 +3219,7 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return err
 	}
 
-	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt, fenceLibrary); err != nil {
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.BlockRepresentationID, item.StorageClass, identityAt, fenceLibrary, lease.finalize); err != nil {
 		return err
 	}
 	return lease.Check()
@@ -3259,6 +3260,10 @@ func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.
 	}, func() error {
 		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
 	})
+	lease.finalize = func(mutation func() error) error {
+		return w.store.WithLibraryLifecycleMutation(libraryID, leaseToken, mutation)
+	}
+
 	fence := func() error {
 		owned, err := w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
 		if err != nil {
@@ -3272,7 +3277,7 @@ func (w *Worker) acquireLibraryCascadeLease(ctx context.Context, libraryID uuid.
 	return lease, fence, nil
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time, fenceLibrary func() error) error {
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresentationID, storageClass string, libraryDeletedAt time.Time, fenceLibrary func() error, finalize func(func() error) error) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
@@ -3281,7 +3286,8 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
-	// Fence before the point of no return, then hard-delete the canonical row +
+	// Renew, then enter durable final exclusion before the point of no return.
+	// A renewal alone cannot protect a paused owner from takeover. Delete the canonical row +
 	// marker FIRST. Ordering matters: once the canonical `libraries` row is gone,
 	// restoreDeletedLibrary can no longer resurrect the library, so a concurrent
 	// restore cannot observe a deleted storage counter and reactivate an
@@ -3290,7 +3296,7 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 	if err := fenceLibrary(); err != nil {
 		return err
 	}
-	if err := w.store.HardDeleteLibrary(orgID, libraryID); err != nil {
+	if err := finalize(func() error { return w.store.HardDeleteLibrary(orgID, libraryID) }); err != nil {
 		return fmt.Errorf("failed to hard-delete library %s: %w", libraryID, err)
 	}
 
@@ -3433,7 +3439,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 			if err := libraryLease.Check(); err != nil {
 				return err
 			}
-			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, *deletedLibraryAt, fenceLibrary); err != nil {
+			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, blockRepresentationID, lib.StorageClass, *deletedLibraryAt, fenceLibrary, libraryLease.finalize); err != nil {
 				return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 			}
 			return libraryLease.Check()

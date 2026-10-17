@@ -170,3 +170,43 @@ func TestSettleHardDeleteLockAcquire(t *testing.T) {
 		})
 	}
 }
+
+// Library finalization has its own lease helpers. Keep every one in the global
+// SERIAL domain even when the configured session default is LOCAL_SERIAL.
+func TestLibraryLifecycleFinalizationPinsGlobalSerial(t *testing.T) {
+	_, testFile, _, _ := runtime.Caller(0)
+	sourcePath := filepath.Join(filepath.Dir(testFile), "library_lifecycle.go")
+	file, err := parser.ParseFile(token.NewFileSet(), sourcePath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, helper := range []struct {
+		name  string
+		count int
+	}{
+		{"acquireLibraryLifecycleLease", 2}, {"renewLibraryLifecycleLease", 2},
+		{"releaseLibraryLifecycleLease", 1}, {"WithLibraryLifecycleMutation", 2},
+	} {
+		queries, pinned := 0, 0
+		ast.Inspect(hardDeleteLeaseFuncDecl(t, file, helper.name).Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if method.Sel.Name == "Query" {
+				queries++
+			}
+			if method.Sel.Name == "SerialConsistency" && isSessionQueryCall(method.X) && len(call.Args) == 1 && isGocqlSelector(call.Args[0], "Serial") {
+				pinned++
+			}
+			return true
+		})
+		if queries != helper.count || pinned != helper.count {
+			t.Errorf("%s: queries=%d pinned=%d want=%d", helper.name, queries, pinned, helper.count)
+		}
+	}
+}

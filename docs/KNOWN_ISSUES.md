@@ -6988,6 +6988,22 @@ readiness.
 **Affected**: `DELETE /api/v2.1/repos/deleted/:repo_id[/]` (`PermanentDeleteRepo`), `acquireHardDeleteLock` / `renewHardDeleteLock` / `releaseHardDeleteLock`, `hardDeleteLibraryRowsFn`, `restoreDeletedLibrary` and their final lifecycle batches
 **Registered**: 2026-09-24, PR #232 final cross-audit
 
+**2026-10-17 disposition:** final-batch stale-owner safety is corrected by the
+[library lifecycle exclusion protocol](./LIBRARY-LIFECYCLE-FINAL-FENCING.md):
+API permanent delete/restore and GC library/org final batches enter a global
+SERIAL, non-expiring final section under the current lease token. Preparatory
+stale takeover remains available; final sections cannot be stolen or released
+by ordinary cleanup. The original race below is the before-fix counterexample.
+
+**The issue remains OPEN for recovery/availability, CURRENT-RUNTIME / PRE-GC,
+P1 unchanged.** An error, unknown outcome or crash after entering the section
+retains that library's latch indefinitely. There is no automatic recovery or
+safe timeout unlock. Quiesced recovery and drained rollout/rollback requirements
+are recorded in the linked protocol. This safety fix is not a claim that the
+whole library cascade, Phase 6, user/org lifecycle or PRE-GC/A1 is closed.
+
+#### Before-fix counterexample and original recommendation
+
 The current authenticated API route is registered independently of GC worker
 configuration. `PermanentDeleteRepo` calls
 `permanentlyDeleteTrashedLibraryCandidate()`, which synchronously reaches
@@ -12026,3 +12042,17 @@ cleanups, and check each parent invocation from a cleanup registered before
 `requireCassandra`; retain TestMain's omitted-test check. Verify both orders of
 early SKIP and cleanup SKIP in Docker. E1-16 runtime/test implementation is
 unchanged by #286; no X1/E1 closure or activation decision follows from this issue.
+
+
+### ISSUE-LIBRARY-TAG-CLEANUP-MIXED-BATCH-01: Permanent-delete tag cleanup mixes counter and ordinary mutations
+
+**Status**: OPEN — FOLLOW-UP / GENERAL, pre-existing; not introduced by final-write exclusion.
+**Severity**: P2 (metadata cleanup failure).
+**Evidence (2026-10-17)**: the real-Cassandra lifecycle HTTP test's acknowledged
+permanent delete returns 200, but its existing best-effort tag side effect logs
+`Counter and non-counter mutations cannot exist in the same batch`.
+`CleanupAllLibraryTags` batches ordinary tag-table deletes with counter-table
+deletes. The same output occurs with the unchanged worker/API runtime. No tagged
+payload retention was measured by this fixture, so this is failed cleanup evidence,
+not a measured tag-residue count. Correct counter/ordinary batching and test with
+actual tag fixtures in a separate PR. See [lifecycle evidence](./LIBRARY-LIFECYCLE-FINAL-FENCING.md).

@@ -2696,9 +2696,8 @@ func authorityExecutionInventory(t *testing.T) []string {
 		}
 		identity := tableName + "/" + columnName
 		allowed := map[string]bool{
-			"gc_library_hard_delete_locks/library_id": true,
-			"gc_user_hard_delete_locks/user_id":       true,
-			"gc_org_hard_delete_locks/org_id":         true,
+			"gc_user_hard_delete_locks/user_id": true,
+			"gc_org_hard_delete_locks/org_id":   true,
 		}
 		if !allowed[identity] {
 			violations = append(violations, "internal/gc/store_cassandra.go: unclassified hard-delete lock table identity "+identity)
@@ -2708,7 +2707,6 @@ func authorityExecutionInventory(t *testing.T) []string {
 	})
 	for name, identities := range lockCalls {
 		for _, identity := range []string{
-			"gc_library_hard_delete_locks/library_id",
 			"gc_user_hard_delete_locks/user_id",
 			"gc_org_hard_delete_locks/org_id",
 		} {

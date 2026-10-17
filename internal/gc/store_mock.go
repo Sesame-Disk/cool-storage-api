@@ -446,6 +446,7 @@ type mockStorageCounterReconciliation struct {
 }
 
 type mockHardDeleteLock struct {
+	Finalizing bool
 	LeaseToken uuid.UUID
 	StartedAt  time.Time
 	Heartbeat  time.Time
@@ -454,7 +455,7 @@ type mockHardDeleteLock struct {
 func mockAcquireHardDeleteLock(locks map[uuid.UUID]mockHardDeleteLock, targetID, leaseToken uuid.UUID) bool {
 	now := time.Now().UTC()
 	lock, locked := locks[targetID]
-	if locked && now.Sub(lock.Heartbeat) < hardDeleteLockStaleAfter {
+	if locked && (lock.Finalizing || now.Sub(lock.Heartbeat) < hardDeleteLockStaleAfter) {
 		return false
 	}
 	locks[targetID] = mockHardDeleteLock{LeaseToken: leaseToken, StartedAt: now, Heartbeat: now}
@@ -3947,6 +3948,27 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 	}
 	return result, nil
 }
+
+// WithLibraryLifecycleMutation models final-section exclusion under the same mutex.
+func (m *MockStore) WithLibraryLifecycleMutation(libraryID, token uuid.UUID, mutation func() error) error {
+	m.mu.Lock()
+	lock, ok := m.libraryHardDeleteLocks[libraryID]
+	if !ok || lock.LeaseToken != token || lock.Finalizing {
+		m.mu.Unlock()
+		return ErrLibraryLifecycleOwnershipLost
+	}
+	lock.Finalizing = true
+	m.libraryHardDeleteLocks[libraryID] = lock
+	m.mu.Unlock()
+	if err := mutation(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.libraryHardDeleteLocks, libraryID)
+	return nil
+}
+
 func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4174,7 +4196,7 @@ func (m *MockStore) ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	lock, locked := m.libraryHardDeleteLocks[libraryID]
-	if !locked || lock.LeaseToken != leaseToken {
+	if !locked || lock.LeaseToken != leaseToken || lock.Finalizing {
 		return nil
 	}
 	delete(m.libraryHardDeleteLocks, libraryID)
