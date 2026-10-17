@@ -791,8 +791,9 @@ must be enabled in only one DC (see `configs/config.prod.yaml` comments and
 KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period is a mitigation
 for ordinary cross-DC lag, not a correctness bound: with RF 1 per DC,
 `LOCAL_QUORUM` reference writes and reads need not intersect. Destructive GC remains
-disabled pending the physical-delete ABA blocker
-(`ISSUE-GC-UPLOAD-FENCE-REMATERIALIZATION-01`). The replication DC set and RF are an
+disabled while X1 or PRE-GC/A1 is open. [X1's criterion disposition](./KNOWN_ISSUES.md#issue-gc-upload-fence-rematerialization-01-physical-delete-aba-can-remove-re-uploaded-bytes)
+takes effect on maintainer merge of the scoped E1 decision; before then X1 is OPEN.
+PRE-GC/A1 remain OPEN regardless of that merge. The replication DC set and RF are an
 operationally stable X2 precondition; changing them with existing reference state
 requires a separately certified migration before GC can be reconsidered.
 
