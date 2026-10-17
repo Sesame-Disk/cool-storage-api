@@ -609,7 +609,7 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1 still blocks destructive GC |
+| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1 is CLOSED for its accepted scope, and the OPEN PRE-GC/A1 gate still blocks destructive GC |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
 | **Test coverage** | Good | Unit, race, and Docker integration suites cover the GC lifecycle; failure and concurrency coverage should continue expanding |
 | **Error handling** | Adequate | Retries with cap; S3 orphan is the main gap |

@@ -8,7 +8,7 @@ Use [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.
 current deployment blockers, and [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md) for GC gates.
 An old checklist or priority here does not override those records.
 
-**Current GC gate:** GC production activation is blocked by X1 (X2 closed 2026-08-14); see `X1-CRITICAL-PATH.md`
+**Current GC gate:** X1 is CLOSED for its accepted physical-life scope (2026-10-17). Destructive GC remains blocked by the OPEN PRE-GC/A1 activation gate; `GC_ENABLED=false` is mandatory fleet-wide (X2 closed 2026-08-14); see `X1-CRITICAL-PATH.md`
 
 This planning snapshot groups v1 blockers, high-priority items and fast-follow tasks as assessed
 on its planning date. The issue records above govern current classification. The sections include historical state analysis,
