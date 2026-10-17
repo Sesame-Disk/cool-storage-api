@@ -1,5 +1,23 @@
 # Technical Debt & Migration Plan
 
+## Phase 5 follow-ups: suite wiring and trash-clean tracking
+
+- **P3 FOLLOW-UP / GENERAL — real-stack suite coverage, OPEN (2026-10-17).**
+  `TestPhase5SharedTreesRealStack` is tagged integration in `internal/gc` and
+  requires `SESAMEFS_PHASE5_REAL_STACK=1`; the standard suite only tags
+  `internal/integration/...`. The mock regression is automatic, but real
+  Cassandra/S3 evidence requires the [explicit documented run](./GC-PHASE5-SHARED-FSOBJECTS.md#reproduction-prerequisites).
+  A bounded follow-up should wire the owned fixture run into a standard Docker
+  suite and require both named subtests with no SKIP/no-tests false success.
+  Preserve ordinary GC-OFF and exact owned cleanup; no activation gate is closed.
+- **P3 FOLLOW-UP / GENERAL — trash-clean documentation accuracy, OPEN.**
+  [ISSUE-TRASH-CLEAN-01](./KNOWN_ISSUES.md#issue-trash-clean-01-cleanrepotrash-is-a-no-op-stub)
+  still carries the historical no-op diagnosis, while current code selects and
+  enqueues expired commits through the GC hook. Reconcile intended semantics,
+  hook/error handling and remaining reclamation with caller/test evidence before
+  changing its runtime disposition. Preserve existing issue severity; this is
+  tracking debt, not a new speculative bug or a request to expand the Phase 5 fix.
+
 ## Current three-API residual diagnosis (2026-10-16)
 
 [The focused ledger](./E1-THREE-API-RESIDUALS.md) reproduces SeafHTTP FAIL 3/3,

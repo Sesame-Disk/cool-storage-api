@@ -6,6 +6,8 @@
 reproduced unsafe cascade on merge: real Cassandra/S3 RED/GREEN preserves HEAD,
 retained history, refs and bytes. Reclamation/retention disposition stays PRE-GC;
 Phase 6 and hard-delete remain OPEN. X1 scope unchanged; PRE-GC/A1 OPEN, GC OFF.
+The rule covers every unguarded commit, including CleanRepoTrash. Real-stack
+suite wiring and the pre-existing Trash diagnosis remain [P3 follow-ups](./TECHNICAL-DEBT.md#phase-5-follow-ups-suite-wiring-and-trash-clean-tracking).
 
 ## E1/X1 final acceptance; PRE-GC next (2026-10-16)
 

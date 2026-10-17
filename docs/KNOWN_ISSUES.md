@@ -4875,6 +4875,18 @@ Historical orphans from before this change will be caught by scanner Phase 3/4 (
 
 ### ISSUE-TRASH-CLEAN-01: `CleanRepoTrash` is a No-Op Stub
 
+**Current code correction (2026-10-17):** this title and the diagnosis below are
+historical. The handler now selects off-HEAD-chain commits outside keep_days and
+calls the registered GC commit enqueuer; it is not a blanket no-op. The current
+worker treats these unguarded commits as metadata-only retirement, with the
+[same shared-tree protection/retention trade-off as Phase 5](./GC-PHASE5-SHARED-FSOBJECTS.md#result-and-contract).
+The issue remains OPEN for [follow-up reconciliation](./TECHNICAL-DEBT.md#phase-5-follow-ups-suite-wiring-and-trash-clean-tracking)
+of expected cleanup/error behavior against the actual handler. No runtime issue
+is closed or downgraded by this tracking correction; no Trash API changes here.
+The original heading is retained so existing links still resolve.
+
+#### Historical diagnosis (2026-02-24)
+
 **Status**: ⚠️ Known gap — not yet implemented
 **Discovered**: 2026-02-24
 **Priority**: 🟡 Medium — user action has no effect; frontend shows success but nothing is cleaned
@@ -7191,8 +7203,12 @@ of `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`.
 
 #### Accepted fix and remaining reclamation obligation
 
-The worker now deletes only the commit row for unguarded items, including
-already-queued Phase 5 commits. Root/descendant fs_objects and permanent refs
+The worker now deletes only the commit row for every unguarded ItemCommit,
+including Phase 5, `CleanRepoTrash -> Service.EnqueueCommits` on live libraries
+when the GC hook is registered, and already-queued unguarded work. CleanRepoTrash
+gets the same shared-tree protection and exclusive-tree retention trade-off.
+Pre-011 rows with no mode/flag decode as unguarded; a true legacy deleted-check
+flag still resolves to the guarded library path. Root/descendant fs_objects and permanent refs
 are not enqueued or mutated by that retirement. Guarded library cleanup retains
 its existing behavior, including the legacy deleted-check flag. No queue/schema
 migration, API field/status change or GC-default change is required.
@@ -7204,8 +7220,10 @@ replacement. Previously queued fs_object descendants are not retroactively
 classified, and previously deleted data are not repaired. Resolve retention and
 metadata-destruction fencing under the full PRE-GC/A1 gate before enabling GC.
 
-The planned `ISSUE-TRASH-CLEAN-01` cleanup must not bypass this protection by
-directly enqueuing shared fs_objects; its separate cleanup obligations remain.
+`CleanRepoTrash` already queues commits; its historical no-op diagnosis needs
+[separate reconciliation](./TECHNICAL-DEBT.md#phase-5-follow-ups-suite-wiring-and-trash-clean-tracking).
+Further trash cleanup must not bypass this protection by directly enqueuing
+shared fs_objects. This change does not certify the Trash HTTP path separately.
 
 #### Related
 

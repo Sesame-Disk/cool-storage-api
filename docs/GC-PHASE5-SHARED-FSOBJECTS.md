@@ -34,8 +34,15 @@ data is corrected; reduced reclamation is explicit and needs disposition before 
 
 The original cascade is reproduced on unchanged main runtime before the fix.
 `processCommit` now enqueues a root only when the existing effective library guard
-is non-empty. Unguarded Phase 5 items delete only their commit row. The guarded
-library path, its checks/retries and legacy deleted-check fallback remain intact.
+is non-empty. **Every unguarded ItemCommit** deletes only its commit row, regardless
+of producer. This includes Phase 5 and the live-library `CleanRepoTrash` path:
+[trash selection](../internal/api/v2/trash.go) calls `EnqueueCommits` through the
+registered GC hook; [Service.EnqueueCommits](../internal/gc/gc.go) stamps no guard.
+Both receive the same safety benefit and exclusive-tree retention trade-off.
+Old pre-011 rows with neither mode nor deleted-check flag also decode as unguarded;
+rows with the legacy true flag retain their effective deleted-identity guard.
+This is compatibility behavior, not a legacy-deployment activation certificate.
+The guarded library path, its checks/retries and legacy fallback remain intact.
 Only worker.go changes productive behavior; there is no scanner/schema/queue/API
 or configuration change.
 
@@ -75,10 +82,27 @@ the entire local stack is OFF or authorized for ordinary deployment.
 | Final targeted commit controls and real normal rerun | PASS, exit 0; guarded, legacy, metadata-only and cleanup checks |
 | go vet -tags integration ./internal/gc; gofmt; added local links; diff whitespace | PASS |
 
-Inside the Docker source runner (CONFIG_PATH, Cassandra auth/keyspace and storage
-class settings must point at the isolated test stack; ordinary GC stays false):
+### Reproduction prerequisites
+
+Use an owned, isolated Cassandra/S3 fixture. Before running the test, create its
+keyspace with the fixture's actual NetworkTopologyStrategy/DC/RF and grant the
+application role access. The repository's Cassandra bootstrap in
+[docker-compose.yaml](../docker-compose.yaml) shows this ordering. `db.New` requires
+an existing keyspace: the migration command does not provision one. From the
+runner's repository root, export the fixture's Cassandra auth/hosts/keyspace and
+per-class S3 settings, apply all migrations with `go run ./cmd/sesamefs migrate`,
+and ensure the S3 bucket exists and is reachable. Do not bootstrap an ordinary
+shared deployment for this test.
+
+Go executes this test with cwd `internal/gc`. Set CONFIG_PATH to an **absolute**
+fixture config path (recommended); a relative path must account for that cwd.
+The commands below run inside the Docker source runner from the repository root;
+the example config and dev-only flags apply to the test driver, not a server:
 
 ```sh
+export CONFIG_PATH="$(pwd)/configs/config.docker.yaml"
+export GC_ENABLED=false AUTH_DEV_MODE=true ONLYOFFICE_ENABLED=false
+# Cassandra auth/keyspace and storage-class overrides must match the owned fixture.
 go test -json -short -count=1 ./internal/gc ./internal/db ./internal/integration
 go test -race -json -short -count=1 ./internal/gc ./internal/db
 SESAMEFS_PHASE5_REAL_STACK=1 go test -json -tags integration -count=1 -timeout 4m -run '^TestPhase5SharedTreesRealStack$' ./internal/gc
@@ -101,6 +125,16 @@ locally in tmp/phase5-evidence-20261017/. Its SHA256SUMS lists 32 files; the man
 SHA-256 is f0fd387c32858ddf076fdfeefc61ac39c8f754068480bbb6a72aa18b93b5f407.
 Initial setup failures remain in tmp/phase5-real-red*. These are local artifacts,
 not independent CI.
+
+## Automation and tracking follow-ups
+
+The mock preservation regression runs in ordinary GC unit tests. The real test
+is in `internal/gc` behind both the integration tag and explicit opt-in; current
+`go-all-test` / `go-integration` only apply that tag to `internal/integration/...`.
+They do not run this real case. [Follow-up tracking](./TECHNICAL-DEBT.md#phase-5-follow-ups-suite-wiring-and-trash-clean-tracking)
+records safe suite wiring with exact named-case/no-SKIP acceptance, and the
+pre-existing stale `ISSUE-TRASH-CLEAN-01` diagnosis. No suite wiring or Trash API
+change is added here. Actual real-stack coverage remains the explicit runs above.
 
 ## Limits and rollback
 

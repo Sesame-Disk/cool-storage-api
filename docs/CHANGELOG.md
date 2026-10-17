@@ -16,6 +16,9 @@ HEAD/retained commits. Mock and real Cassandra/S3 RED/GREEN; guarded library
 cascades are preserved. Exclusive-tree reclamation is deliberately deferred;
 Phase 6/concurrent metadata deletion and hard-delete remain separate PRE-GC
 obligations. No schema/API/default change; PRE-GC/A1 OPEN, ordinary GC OFF.
+Review clarification: every unguarded commit is covered, including CleanRepoTrash;
+fixture bootstrap/config-path prerequisites and suite-wiring/tracking follow-ups
+are explicit. No additional runtime change.
 
 ## 2026-10-17 — Post-merge X1 revalidation and GC gate wording
 

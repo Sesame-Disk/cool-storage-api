@@ -2797,8 +2797,8 @@ func (w *Worker) processCommit(item QueueItem) error {
 	}
 	defer releaseGuard()
 
-	// A commit does not own its content-addressed tree. Unguarded version
-	// retirement (Phase 5) must delete only commit metadata: HEAD and retained
+	// A commit does not own its content-addressed tree. Unguarded commit
+	// retirement (Phase 5 or CleanRepoTrash) deletes only metadata: HEAD and retained
 	// commits may share the root or any descendant. Reclamation of those objects
 	// needs a separate sharing-aware pass; do not fabricate cascade authority.
 	// Guarded library cleanup retains its existing recursive enqueue and retry
