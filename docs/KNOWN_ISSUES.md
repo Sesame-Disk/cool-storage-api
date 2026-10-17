@@ -7006,6 +7006,17 @@ safe timeout unlock. Quiesced recovery and drained rollout/rollback requirements
 are recorded in the linked protocol. This safety fix is not a claim that the
 whole library cascade, Phase 6, user/org lifecycle or PRE-GC/A1 is closed.
 
+**Introduced by #315 (deliberate, pending maintainer acceptance):** the
+indefinite latch is new. Main expires the lease (TTL 6 h, stale takeover after
+90 min). It never blocks a library, but it allows the corruption described below.
+While retained, restore returns 500 and permanent delete returns 409. The GC
+cascade postpones forever, with no DLQ and no alert. An organization cascade
+containing the library cannot finish. Even errors that prove nothing was applied
+retain the latch. Proposed, unscheduled follow-ups are FU-1 (exact-token release
+on proven non-application) and FU-2 (operator recovery command plus
+retained-latch visibility). See
+[trade-off and follow-ups](./LIBRARY-LIFECYCLE-FINAL-FENCING.md#availability-trade-off-introduced-by-this-pr-pending-maintainer-decision).
+
 #### Before-fix counterexample and original recommendation
 
 The current authenticated API route is registered independently of GC worker

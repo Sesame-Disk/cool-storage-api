@@ -96,6 +96,79 @@ before starting older writers. Leave the additive column in place; no data-table
 rollback is needed. Returning to old writers restores the original stale-owner
 risk. Ordinary GC remains OFF during rollout, validation, recovery and rollback.
 
+## Availability trade-off introduced by this PR (pending maintainer decision)
+
+Introduced by PR #315: **yes, deliberately.** Main has no indefinite latch. It
+has the stale-owner corruption instead. This PR exchanges one risk for the other.
+Status: OPEN, P1 CURRENT-RUNTIME / PRE-GC under
+`ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`. The maintainer must accept it; the
+follow-ups below are proposals, not yet scheduled.
+
+| | main@14e8d0cfb | This PR |
+|---|---|---|
+| Lease lifetime | TTL 6 h (`hardDeleteLockTTLSeconds`); stale takeover after 90 min (3 x 30 min heartbeat) | Same while preparatory; no TTL and no takeover inside the final section |
+| Failure mode | Silent corruption: stale delete removes a restored library; stale restore recreates a deleted one | Visible fail-closed block of one library's lifecycle |
+| Trigger | Concurrent restore/delete plus an owner pause; reproduced through the API with GC off | Crash or error inside a final section lasting milliseconds |
+| Recovery | Automatic, after the damage is written | Manual operator procedure; no tool |
+
+The latch is retained when any of these happens after promotion and before
+acknowledged completion:
+
+- the process stops (deploy, OOM, kill) between promotion and completion;
+- the final batch returns any error, including errors that guarantee nothing
+  was applied (for example Cassandra `Unavailable`); all errors are treated alike;
+- the restore counter adjustment panics;
+- the promotion LWT returns an unknown outcome after it was applied, or the
+  completion LWT fails or reports not applied.
+
+While the latch is retained, only that library's lifecycle is blocked:
+
+- restore (user and org-admin) returns 500; permanent delete returns 409
+  ("already in progress"); bulk trash cleaning skips the library and counts
+  it as failed on every run;
+- the GC library cascade postpones without spending a retry
+  (`shouldPostponeWithoutRetry`). It is requeued every grace period forever,
+  never reaches the DLQ and raises no dedicated alert;
+- an organization cascade containing the library cannot finish;
+- ordinary file operations on an active library do not read this lease.
+
+If the batch was applied and only completion failed, the canonical state already
+reflects the operation. A restored library works normally until its next trash
+lifecycle. A deleted library keeps its purge marker, but its cascade can never
+take the lease, so its content is never reclaimed once GC is enabled.
+
+No timeout unlock is safe. A paused owner or a logged batch replayed later from
+Cassandra's batchlog could still land after the timeout. That reproduces the
+original defect. Removing the latch entirely would require conditional canonical
+writes across partitions (`libraries`, `libraries_by_id`, projections). One
+Cassandra LWT cannot cover them; that limitation is why this PR uses a latch.
+
+### Proposed follow-ups (not scheduled)
+
+- **FU-1. Release on proven non-application.** Release the latch with an
+  exact-token conditional delete when the batch error proves that nothing was
+  applied: coordinator `Unavailable`, or a client-side failure before the request
+  was sent. Keep every timeout, `BATCH_LOG`/`BATCH` write timeout and unknown
+  outcome retained. Needs evidence per error class against real Cassandra (an
+  injected error type is not enough) and a RED test showing the latch is
+  needlessly retained today. Reduces how often the latch is retained, does not
+  replace recovery.
+- **FU-2. Operator recovery command and visibility.** A quiesced-maintenance CLI
+  that lists retained latches with their age, shows canonical row, purge marker
+  and projection state for the library, and removes one latch only with
+  `IF lease_token=? AND finalizing=true` after the operator confirms settlement.
+  Add a metric or log for latches retained beyond a threshold, so a blocked
+  library is discovered without waiting for user reports. Must follow the
+  recovery prerequisites above; it must never unlock automatically.
+- **Hygiene (not a finding).** `GCStore.HardDeleteLibrary` still executes the
+  delete batch outside a final section. It has no production caller, only tests.
+  Consider removing it from the interface so that no future runtime caller
+  bypasses the protocol.
+
+Decision needed from the maintainer: accept the trade-off for merge (recommended:
+visible, rare, non-destructive versus reproducible silent corruption), and decide
+whether FU-1 and FU-2 are required before GC activation or before v1.
+
 ## Docker evidence and reproduction
 
 Use an isolated Cassandra 5.0.9 instance, no host ports, with an explicitly owned

@@ -10,6 +10,9 @@ PRE-GC. No automatic timeout unlock, mixed-version certificate or activation.
 Review correction: retain restore exclusion through aggregate adjustment and
 prepare worker projections before finalization. Counter-window and preparation
 failure regressions have RED/GREEN coverage; recovery remains OPEN.
+Pending maintainer decision: accept the indefinite final-section latch this PR
+introduces, and schedule follow-ups FU-1 and FU-2 (see
+[trade-off](docs/LIBRARY-LIFECYCLE-FINAL-FENCING.md#availability-trade-off-introduced-by-this-pr-pending-maintainer-decision)).
 
 ## Active slice: Phase 5 shared-tree preservation (2026-10-17)
 
