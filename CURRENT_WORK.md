@@ -1,10 +1,18 @@
 # Current Work
 
-## Active slice: final E1/X1 acceptance (2026-10-16)
+## Active slice: post-merge X1 audit and GC gate wording (2026-10-17)
 
-[Decision submitted for merge](docs/E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16):
-accept scoped physical-life evidence and close X1 on maintainer merge. Before
-merge X1 remains OPEN. H1's measured K1 residue becomes X3; I1/M1 are supplied.
+[Post-merge Docker revalidation](docs/E1-FINAL-DISPOSITION.md#post-merge-revalidation-2026-10-17)
+reproduces the accepted evidence on unchanged productive source, including the
+59-case three-DC union (normal and race) and real DC-outage legs. Operator-facing
+config/doc comments that still said "only after X1 closes" now require both X1
+and PRE-GC/A1. Three-API availability failures remain FAIL. Documentation only;
+PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: final E1/X1 acceptance (#312, 2026-10-17)
+
+[Decision merged](docs/E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16):
+X1 is CLOSED for the scoped physical-life contract. H1's measured K1 residue becomes X3; I1/M1 are supplied.
 Named A-I one-DC cuts and qualified three-DC evidence do not certify every fault
 or topology. Three-API availability failures remain FAIL. PRE-GC/A1 OPEN;
 ordinary GC OFF. Next bounded runtime work: reproduce Phase 5 shared-fs_object

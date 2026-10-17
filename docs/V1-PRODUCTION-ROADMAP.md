@@ -8,7 +8,7 @@ Use [OPEN-WORK-INDEX.md](OPEN-WORK-INDEX.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.
 current deployment blockers, and [X1-CRITICAL-PATH.md](X1-CRITICAL-PATH.md) for GC gates.
 An old checklist or priority here does not override those records.
 
-**Current GC gate:** GC production activation is blocked by X1 (X2 closed 2026-08-14); see `X1-CRITICAL-PATH.md`
+**Current GC gate:** X1 is CLOSED for its accepted physical-life scope (2026-10-17). Destructive GC remains blocked by the OPEN PRE-GC/A1 activation gate; `GC_ENABLED=false` is mandatory fleet-wide (X2 closed 2026-08-14); see `X1-CRITICAL-PATH.md`
 
 This planning snapshot groups v1 blockers, high-priority items and fast-follow tasks as assessed
 on its planning date. The issue records above govern current classification. The sections include historical state analysis,
@@ -561,7 +561,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 | **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Accounts can reuse the same API key system through a dedicated platform service account; the remaining work belongs to item #1.** | — |
-| **15** | **GC destructive-delete safety and activation** | **P0** | **The LWT lease (`gc_leases`) is implemented. X2 cross-DC reference visibility is closed under the stable-topology contract; X1 physical-delete ABA remains open. Keep `GC_ENABLED=false` on every replica in every DC. Only after X1 closes may designated replicas in one DC participate under the lease; all other DCs remain disabled. A replication DC-set or RF change with existing reference state requires a separately certified migration. `SERIAL` does not make ordinary `LOCAL_QUORUM` reference writes globally visible.** | **blocker: X1; then observability / crash drills** |
+| **15** | **GC destructive-delete safety and activation** | **P0** | **The LWT lease (`gc_leases`) is implemented. X2 cross-DC reference visibility is closed under the stable-topology contract; X1 physical-delete ABA is closed for its [scoped physical-life contract](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16), and the PRE-GC / A1 gate remains open. Keep `GC_ENABLED=false` on every replica in every DC. Only after PRE-GC/A1 also closes may designated replicas in one DC participate under the lease; all other DCs remain disabled. A replication DC-set or RF change with existing reference state requires a separately certified migration. `SERIAL` does not make ordinary `LOCAL_QUORUM` reference writes globally visible.** | **blocker: PRE-GC / A1; then observability / crash drills** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---

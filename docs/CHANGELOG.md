@@ -8,6 +8,15 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-17 — Post-merge X1 revalidation and GC gate wording
+
+After #312 merged, a [Docker revalidation](./E1-FINAL-DISPOSITION.md#post-merge-revalidation-2026-10-17)
+on unchanged productive source re-ran the one-DC suite, the 59-case three-DC union
+(normal and race), and the W2/X2/P3/repair-guard outage legs, plus M1/I1
+mutations. All pass. Three-API availability failures remain FAIL. Operator-facing
+comments that allowed GC "after X1 closes" now also require PRE-GC/A1.
+Documentation only; ordinary GC OFF.
+
 ## 2026-10-16 — Final E1/X1 acceptance decision
 
 [Scoped decision submitted for maintainer merge](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16)

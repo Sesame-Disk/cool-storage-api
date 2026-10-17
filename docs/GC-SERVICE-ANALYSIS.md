@@ -34,12 +34,15 @@ plan integration tests for long-running monitoring.
 > [GC-DELETE-CLEANUP-INVESTIGATION.md](GC-DELETE-CLEANUP-INVESTIGATION.md);
 > per-item issues: `ISSUE-GC-*` in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 >
-> **Production activation gate (updated 2026-08-14):** X1 physical-delete ABA
-> remains open; X2 cross-DC reference visibility is closed under its stable-topology
-> operational contract. Keep `GC_ENABLED=false` on every replica in every DC. The
-> leader lease does not close X1. Only after X1 closes may designated replicas in one
-> DC participate under the lease, and a replication DC-set or RF change with existing
-> reference state requires a separately certified migration.
+> **Production activation gate (updated 2026-10-17):** X1 physical-delete ABA is
+> closed for its [scoped physical-life contract](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16);
+> the PRE-GC / A1 gate ([X1-CRITICAL-PATH.md](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites))
+> remains open. X2 cross-DC reference visibility is closed under its stable-topology
+> operational contract. Keep `GC_ENABLED=false` on every replica in every DC while X1
+> or PRE-GC/A1 remains open; X1 closure alone does not enable GC, and the leader lease
+> is not permission to enable it. Only after PRE-GC/A1 also closes may designated
+> replicas in one DC participate under the lease, and a replication DC-set or RF change
+> with existing reference state requires a separately certified migration.
 
 ---
 
@@ -189,7 +192,7 @@ These are deliberate safety mechanisms that are correctly implemented and tested
    Cassandra claims/generations cannot revoke an S3 DELETE already in flight; only
    never-reused physical keys close that ABA component, but that is not the whole X1
    workstream. This mechanism must not be
-   treated as production-safe activation while X1 is open.
+   treated as production-safe activation while X1 or PRE-GC/A1 is open.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to finish registering or promoting references.
 3. **Idempotent cleanup by liveness rows** — keyed `block_references` rows replace the
@@ -594,8 +597,9 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 **Scaling recommendations:**
 - Increase `batch_size` (e.g., 500) for faster processing
 - Reduce `worker_interval` (e.g., 10s) for more frequent ticks
-- Production: keep GC disabled on every node/DC while X1 remains open. X2 is closed
-  under the stable-topology operational contract. After X1 closes, designated replicas
+- Production: keep GC disabled on every node/DC while X1 or PRE-GC/A1 remains open.
+  X2 is closed under the stable-topology operational contract. After both X1 and
+  PRE-GC/A1 close, designated replicas
   in one DC may participate under the existing LWT lease; a replication DC-set or RF
   change with existing reference state requires a separately certified migration.
 
@@ -605,7 +609,7 @@ For a deployment with millions of blocks, this may not keep up with deletion rat
 
 | Aspect | Rating | Notes |
 |--------|--------|-------|
-| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1 still blocks destructive GC |
+| **Safety mechanisms** | Production-blocked | LWT, grace period, idempotency, locks, and scanner safety nets exist; X1 is CLOSED for its accepted scope, and the OPEN PRE-GC/A1 gate still blocks destructive GC |
 | **Cascade correctness** | Good | Ordering is correct; partial failure handling could improve |
 | **Test coverage** | Good | Unit, race, and Docker integration suites cover the GC lifecycle; failure and concurrency coverage should continue expanding |
 | **Error handling** | Adequate | Retries with cap; S3 orphan is the main gap |
