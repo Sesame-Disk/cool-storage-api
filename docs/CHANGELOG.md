@@ -8,6 +8,9 @@ HTTP contracts remain. Stale preparatory owners cannot execute their final batch
 after takeover. Error/crash recovery remains open and can block an affected
 library indefinitely; rollout/rollback requires drained writers. See the
 [protocol/evidence](./LIBRARY-LIFECYCLE-FINAL-FENCING.md). PRE-GC/A1 OPEN, GC OFF.
+Review correction: restore counter adjustment stays inside exclusion; worker
+read-model preparation stays outside it. Added counter-window and retry/latch
+regressions; existing best-effort counter error behavior is unchanged.
 
 Session-by-session development history for SesameFS.
 

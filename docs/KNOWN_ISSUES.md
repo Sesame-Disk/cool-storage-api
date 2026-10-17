@@ -6993,7 +6993,11 @@ readiness.
 API permanent delete/restore and GC library/org final batches enter a global
 SERIAL, non-expiring final section under the current lease token. Preparatory
 stale takeover remains available; final sections cannot be stolen or released
-by ordinary cleanup. The original race below is the before-fix counterexample.
+by ordinary cleanup. The original race below is the before-fix counterexample. Review correction:
+restore retains exclusion through its synchronous aggregate-counter adjustment;
+worker projection reads/batch preparation run before finalization, so a read
+failure preserves preparatory release and queue retry. Counter helper errors
+remain best-effort; this is not transactional counter recovery.
 
 **The issue remains OPEN for recovery/availability, CURRENT-RUNTIME / PRE-GC,
 P1 unchanged.** An error, unknown outcome or crash after entering the section

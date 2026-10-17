@@ -49,14 +49,16 @@ SERIAL even with a LOCAL_SERIAL session. User/org lease semantics are unchanged.
 3. Takeover compares the observed heartbeat and requires finalizing=null. A
    renewal either refreshes the preparatory TTL or renews a final section without
    expiry. Ordinary deferred release requires finalizing=null.
-4. Run the unchanged final batch. Acknowledged success conditionally removes the
+4. Execute the prepared final batch. Restore also finishes its synchronous
+   aggregate-counter adjustment before acknowledged completion removes the
    final section. Any error/panic/unknown outcome leaves exclusion in place; an
    attempt with the same finalizing token cannot replay the callback.
 
 Call sites: API permanent delete (`hardDeleteLibraryRowsFn`), library restore
 (`restoreDeletedLibrary`), and the GC library/org cascades' final
-`HardDeleteLibrary` batch. Canonical rows, markers and final-batch read models
-stay inside this section. Share-link cleanup before finalization and asynchronous
+prepared library-delete batch. Its projection reads happen before promotion;
+read/preparation failures release the preparatory lease and preserve queue retry.
+Canonical rows, markers and final-batch read models stay inside this section. Share-link cleanup before finalization and asynchronous
 tag cleanup are not certified by this fix. Existing queue children and block/S3
 protocols do not change. No S3 mutation is introduced here.
 
@@ -150,7 +152,7 @@ Full application integration, API/OIDC scripts, sync/desktop/mobile, three DCs,
 physical S3 deletion and native fault/crash recovery are not run by this slice.
 This is local evidence, not independent CI or an activation certificate.
 
-### Final audit result (2026-10-17)
+### Initial audit result (306542a9b, superseded by the review correction below)
 
 | Check | Result |
 |---|---|
@@ -175,3 +177,64 @@ recovery/availability limit is deliberate and remains OPEN; accepting this safet
 trade-off does not accept activation. The existing shared development primary
 still reports GC_ENABLED=true, pre-existing and unchanged. No shared stack
 settings or data were used for the new fixture; the policy remains ordinary GC OFF.
+
+
+## Review correction: counter lifetime and preparation failures (2026-10-17)
+
+The initial head released restore exclusion before the synchronous aggregate
+adjustment. A real Cassandra regression on 306542a9b reproduces org usage 900
+instead of 1000 after a concurrent soft/permanent delete removes the library's
+counter. A second pause while the helper reads its source allows a permanent
+delete with 200 when it should receive 409. Both are THIS-PR regressions; the
+initial no-blocker audit above is superseded. Restore now executes the final
+batch and AdjustAggregateStorageCounters in the same callback before release.
+The helper's pre-existing best-effort read/write error handling is unchanged:
+this does not make counters transactional or guarantee repair under failures.
+
+The initial worker also built its batch/read models inside final exclusion.
+PrepareLibraryHardDelete now builds the batch first, then the worker renews and
+promotes its token before executing only the prepared write. A projection-read
+failure is retryable and cannot create a durable final latch. The canonical
+mutation inventory now names the builder, with the same lifecycle classification.
+A unit regression and a real-Cassandra worker fixture inject a preparation-read
+error at the store boundary; they verify no final-section entry, no canonical
+delete, no retained lock and preserved queue retry. The unit case is RED on
+306542a9b. This is boundary fault injection, not a native server ReadTimeout.
+
+Both new counter schedules, both original stale-owner schedules, existing restore
+guards and final-section tests pass on the corrected runtime. Normal and race
+runs include the real worker and injected preparation failure. The general
+unknown-write/panic/crash availability trade-off remains OPEN P1 CURRENT-RUNTIME /
+PRE-GC. No timeout unlock, automatic recovery or new activation decision is added.
+
+The review also checked library and org cascade call sites, renewal after
+preparation (a lost token cannot execute the prepared batch), final batch queries,
+API status compatibility and counter/delete ordering. No additional regression
+was found within those exercised paths. Full tagged integration, API/OIDC,
+clients, three DCs and native faults remain unrun; zero regressions universally
+is not established by these tests. Existing mixed counter/tag cleanup still logs
+its tracked pre-existing failure; it is not certified here.
+
+### Review verification results
+
+Final corrected source: both counter schedules and the injected preparation
+failure are RED against 306542a9b and GREEN after correction. Normal and race
+selected runs each have GC 10 / API 9 PASS events, no SKIP or races. These include
+the default worker regression, real worker normal/preparation-failure legs,
+original lifecycle schedules, two counter windows and existing restore guards.
+Final affected-package race: GC 803 / DB 528 / API 2041 PASS, with the same nine
+seed and five DB-dependent API SKIP. Final short suite: 21 tested packages PASS,
+22 named test SKIP; full tagged integration is not implied. Vet with integration
+tags, formatting, added links, inventories and documentation guards pass.
+
+The owned Cassandra fixture has zero retained library leases; its keyspace and
+container/anonymous data have been removed. The new counter fixtures assert
+canonical/lease cleanup; isolated keyspace teardown removes their remaining
+counter/reconciliation projections. Shared deployments are unchanged.
+
+Accepted review evidence: `tmp/lifecycle-review-evidence-20261017/`, 41 files,
+including final source snapshots matching the Docker runner. Manifest SHA-256:
+`3f8bb4522146d9897ab61478fd4adbccd0481e977b0538acd18feb29221162df`.
+The original 35-file evidence bundle stays frozen. Initial Cassandra readiness
+failure and the first stale inventory assertion are excluded from accepted GREEN;
+neither is presented as passing. This remains local validation without CI.

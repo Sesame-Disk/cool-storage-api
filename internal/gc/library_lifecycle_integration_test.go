@@ -156,48 +156,73 @@ func TestLibraryLifecycleFinalSectionRealCassandra(t *testing.T) {
 			t.Fatalf("stale callback executed=%v err=%v", called, err)
 		}
 	})
-	t.Run("worker_final_batch", func(t *testing.T) {
-		org, library, owner := uuid.New(), uuid.New(), uuid.New()
-		deleted := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Millisecond)
-		must := func(err error) {
-			t.Helper()
-			if err != nil {
-				t.Fatal(err)
-			}
+	for _, preparationFailure := range []bool{true, false} {
+		name := "worker_final_batch"
+		if preparationFailure {
+			name = "worker_preparation_read_failure"
 		}
-		must(s.Query(`INSERT INTO libraries (org_id,library_id,owner_id,name,storage_class,block_representation_id,created_at,deleted_at) VALUES (?,?,?,?,?,?,?,?)`, org.String(), library.String(), owner.String(), "lifecycle-worker", "hot", db.PlainBlockRepresentationID, deleted, deleted).Exec())
-		must(s.Query(`INSERT INTO libraries_by_id (library_id,org_id) VALUES (?,?)`, library.String(), org.String()).Exec())
-		must(s.Query(`INSERT INTO deleted_libraries (library_id,org_id,deleted_at,storage_class,block_representation_id) VALUES (?,?,?,?,?)`, library.String(), org.String(), deleted, "hot", db.PlainBlockRepresentationID).Exec())
-		t.Cleanup(func() {
-			for _, query := range []struct {
-				cql  string
-				args []interface{}
-			}{
-				{`DELETE FROM libraries WHERE org_id=? AND library_id=?`, []interface{}{org.String(), library.String()}},
-				{`DELETE FROM libraries_by_id WHERE library_id=?`, []interface{}{library.String()}},
-				{`DELETE FROM deleted_libraries WHERE library_id=?`, []interface{}{library.String()}},
-				{`DELETE FROM gc_library_hard_delete_locks WHERE library_id=?`, []interface{}{library.String()}},
-			} {
-				if err := s.Query(query.cql, query.args...).Exec(); err != nil {
-					t.Error(err)
+		t.Run(name, func(t *testing.T) {
+			org, library, owner := uuid.New(), uuid.New(), uuid.New()
+			deleted := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Millisecond)
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
 				}
 			}
+			must(s.Query(`INSERT INTO libraries (org_id,library_id,owner_id,name,storage_class,block_representation_id,created_at,deleted_at) VALUES (?,?,?,?,?,?,?,?)`, org.String(), library.String(), owner.String(), "lifecycle-worker", "hot", db.PlainBlockRepresentationID, deleted, deleted).Exec())
+			must(s.Query(`INSERT INTO libraries_by_id (library_id,org_id) VALUES (?,?)`, library.String(), org.String()).Exec())
+			must(s.Query(`INSERT INTO deleted_libraries (library_id,org_id,deleted_at,storage_class,block_representation_id) VALUES (?,?,?,?,?)`, library.String(), org.String(), deleted, "hot", db.PlainBlockRepresentationID).Exec())
+			t.Cleanup(func() {
+				for _, query := range []struct {
+					cql  string
+					args []interface{}
+				}{
+					{`DELETE FROM libraries WHERE org_id=? AND library_id=?`, []interface{}{org.String(), library.String()}},
+					{`DELETE FROM libraries_by_id WHERE library_id=?`, []interface{}{library.String()}},
+					{`DELETE FROM deleted_libraries WHERE library_id=?`, []interface{}{library.String()}},
+					{`DELETE FROM gc_library_hard_delete_locks WHERE library_id=?`, []interface{}{library.String()}},
+				} {
+					if err := s.Query(query.cql, query.args...).Exec(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			var workerStore GCStore = store
+			fault := &libraryPreparationFailureStore{GCStore: store}
+			if preparationFailure {
+				workerStore = fault
+			}
+			queue := NewQueue(workerStore)
+			must(queue.EnqueueBatch([]QueueItem{{OrgID: org, LibraryID: library, ItemType: ItemLibraryCascade, ItemID: library.String(), QueuedAt: deleted, IdentityAt: deleted, StorageClass: "hot", BlockRepresentationID: db.PlainBlockRepresentationID}}))
+			worker := NewWorker(workerStore, nil, queue, 10, 0, false, &Stats{})
+			n, err := worker.ProcessOrgOnce(context.Background(), org)
+			expected := 1
+			if preparationFailure {
+				expected = 0
+			}
+			if err != nil || n != expected {
+				t.Fatalf("worker n=%d expected=%d err=%v", n, expected, err)
+			}
+			if preparationFailure && (!fault.prepared || fault.enteredFinal) {
+				t.Fatalf("prepared=%v enteredFinal=%v", fault.prepared, fault.enteredFinal)
+			}
+			if preparationFailure {
+				retry, err := store.DequeueBatch(org, 10, time.Now().Add(24*time.Hour))
+				must(err)
+				if len(retry) != 1 || retry[0].ItemType != ItemLibraryCascade {
+					t.Fatalf("preparation failure lost retry: %+v", retry)
+				}
+			}
+			exists, err := store.CanonicalLibraryExists(org, library)
+			must(err)
+			if exists != preparationFailure {
+				t.Fatal("unexpected canonical state after worker outcome")
+			}
+			var lock string
+			if err := s.Query(`SELECT library_id FROM gc_library_hard_delete_locks WHERE library_id=?`, library.String()).Scan(&lock); !errors.Is(err, gocql.ErrNotFound) {
+				t.Fatalf("worker final section remains: %v", err)
+			}
 		})
-		queue := NewQueue(store)
-		must(queue.EnqueueBatch([]QueueItem{{OrgID: org, LibraryID: library, ItemType: ItemLibraryCascade, ItemID: library.String(), QueuedAt: deleted, IdentityAt: deleted, StorageClass: "hot", BlockRepresentationID: db.PlainBlockRepresentationID}}))
-		worker := NewWorker(store, nil, queue, 10, 0, false, &Stats{})
-		n, err := worker.ProcessOrgOnce(context.Background(), org)
-		if err != nil || n != 1 {
-			t.Fatalf("worker n=%d err=%v", n, err)
-		}
-		exists, err := store.CanonicalLibraryExists(org, library)
-		must(err)
-		if exists {
-			t.Fatal("worker did not execute final batch")
-		}
-		var lock string
-		if err := s.Query(`SELECT library_id FROM gc_library_hard_delete_locks WHERE library_id=?`, library.String()).Scan(&lock); !errors.Is(err, gocql.ErrNotFound) {
-			t.Fatalf("worker final section remains: %v", err)
-		}
-	})
+	}
 }

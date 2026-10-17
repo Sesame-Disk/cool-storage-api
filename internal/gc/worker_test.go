@@ -3318,3 +3318,54 @@ func TestWorker_ProcessLibraryCascade_EndToEndUsesQueuedRepresentationWithoutMet
 		t.Fatalf("block queue items = %#v, want only encrypted internal block %s", blockItems, encryptedInternalID)
 	}
 }
+
+// Fail preparation at the store boundary. This models a projection read failure
+// without claiming a native Cassandra timeout; final mutation must not start.
+type libraryPreparationFailureStore struct {
+	GCStore
+	enteredFinal bool
+	prepared     bool
+}
+
+func (s *libraryPreparationFailureStore) PrepareLibraryHardDelete(org, library uuid.UUID) (func() error, error) {
+	s.prepared = true
+	return nil, errors.New("injected projection read failure")
+}
+
+// The old worker performed this read preparation inside HardDeleteLibrary.
+func (s *libraryPreparationFailureStore) HardDeleteLibrary(org, library uuid.UUID) error {
+	return errors.New("injected projection read failure")
+}
+func (s *libraryPreparationFailureStore) WithLibraryLifecycleMutation(library, token uuid.UUID, mutation func() error) error {
+	s.enteredFinal = true
+	return s.GCStore.WithLibraryLifecycleMutation(library, token, mutation)
+}
+func TestWorkerLibraryPreparationFailureDoesNotFinalize(t *testing.T) {
+	base := NewMockStore()
+	org, library := uuid.New(), uuid.New()
+	at := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Millisecond)
+	base.AddOrganization(org)
+	base.AddDeletedLibrary(org, library, "hot", at)
+	store := &libraryPreparationFailureStore{GCStore: base}
+	queue := NewQueue(store)
+	if err := queue.EnqueueBatch([]QueueItem{{OrgID: org, LibraryID: library, ItemType: ItemLibraryCascade, ItemID: library.String(), QueuedAt: at, IdentityAt: at, StorageClass: "hot", BlockRepresentationID: db.PlainBlockRepresentationID}}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := NewWorker(store, nil, queue, 10, 0, false, &Stats{}).ProcessOrgOnce(context.Background(), org)
+	if err != nil || n != 0 {
+		t.Errorf("preparation failure n=%d err=%v", n, err)
+	}
+	if !store.prepared || store.enteredFinal {
+		t.Errorf("prepared=%v enteredFinal=%v", store.prepared, store.enteredFinal)
+	}
+	if len(base.QueueItems(org)) != 1 {
+		t.Errorf("preparation failure lost queued retry: %+v", base.QueueItems(org))
+	}
+	exists, err := base.CanonicalLibraryExists(org, library)
+	if err != nil || !exists {
+		t.Errorf("library removed on preparation failure: exists=%v err=%v", exists, err)
+	}
+	if ok, err := base.AcquireLibraryHardDeleteLock(library, uuid.New()); err != nil || !ok {
+		t.Errorf("preparation failure stranded lease: acquired=%v err=%v", ok, err)
+	}
+}

@@ -84,7 +84,7 @@ var pcd1b4ExpectedLifecycleStatements = []pcd1b4LifecycleSite{
 	{path: "internal/api/v2/write_helpers.go", decl: "restoreDeletedLibrary", kind: pcd1b4Restore, role: pcd1b4NoChange},
 	// Canonical row removal: the witness columns go with the row.
 	{path: "internal/api/v2/library_delete_helpers.go", decl: "hardDeleteLibraryRowsFn", kind: pcd1b4RowDelete, role: pcd1b4NoChange},
-	{path: "internal/gc/store_cassandra.go", decl: "CassandraStore.HardDeleteLibrary", kind: pcd1b4RowDelete, role: pcd1b4NoChange},
+	{path: "internal/gc/store_cassandra.go", decl: "CassandraStore.PrepareLibraryHardDelete", kind: pcd1b4RowDelete, role: pcd1b4NoChange},
 	{path: "internal/api/v2/write_helpers.go", decl: "deleteUnpublishedLibraryRow", kind: pcd1b4RowDelete, role: pcd1b4NoChange},
 	// Witness writers: the only statements that set the continuity columns.
 	{path: "internal/db/library_continuity.go", decl: "CommitLibraryContinuityWitness", kind: pcd1b4WitnessWrite, role: pcd1b4PredicateEpoch},

@@ -1067,13 +1067,18 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	if !owned {
 		return fmt.Errorf("lost library restore lock for %s", libraryID)
 	}
-	if err := gcpkg.WithLibraryLifecycleMutation(db.Session(), libraryUUID, leaseToken, batch.Exec); err != nil {
+	if err := gcpkg.WithLibraryLifecycleMutation(db.Session(), libraryUUID, leaseToken, func() error {
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+		// Keep exclusion through this synchronous adjustment. A permanent delete
+		// must not remove the library counter before restore has read it.
+		// The helper's existing best-effort error behavior is unchanged.
+		traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
-
-	// Re-add the library's storage to aggregates after the canonical row and
-	// deleted marker have been restored.
-	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
 	return nil
 }
 

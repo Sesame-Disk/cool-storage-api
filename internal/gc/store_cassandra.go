@@ -6260,13 +6260,14 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 	return result, nil
 }
 
-// HardDeleteLibrary builds the final batch; productive callers must execute it
-// inside WithLibraryLifecycleMutation using their current library lease token.
-func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
+// PrepareLibraryHardDelete resolves read models and builds the final batch while
+// the lease is still preparatory. Only the returned write runs in durable final
+// exclusion; a read failure must remain retryable without a retained final latch.
+func (s *CassandraStore) PrepareLibraryHardDelete(orgID, libraryID uuid.UUID) (func() error, error) {
 	session := s.db.Session()
 	batch := session.Batch(gocql.LoggedBatch)
 	if err := db.AddDeleteAdminLibraryReadModelQueries(session, batch, orgID.String(), libraryID.String()); err != nil {
-		return err
+		return nil, err
 	}
 
 	db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID.String(), libraryID.String())
@@ -6277,7 +6278,17 @@ func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 		libraryID.String())
 	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`,
 		libraryID.String())
-	return batch.Exec()
+	return batch.Exec, nil
+}
+
+// HardDeleteLibrary executes a prepared batch directly. Worker lifecycle callers
+// use PrepareLibraryHardDelete and execute its result under final exclusion.
+func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
+	mutation, err := s.PrepareLibraryHardDelete(orgID, libraryID)
+	if err != nil {
+		return err
+	}
+	return mutation()
 }
 
 // --- Org cascade (Fase 4) ---

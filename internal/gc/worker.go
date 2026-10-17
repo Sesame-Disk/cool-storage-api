@@ -3286,6 +3286,11 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
+	mutation, err := w.store.PrepareLibraryHardDelete(orgID, libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to prepare library hard delete %s: %w", libraryID, err)
+	}
+
 	// Renew, then enter durable final exclusion before the point of no return.
 	// A renewal alone cannot protect a paused owner from takeover. Delete the canonical row +
 	// marker FIRST. Ordering matters: once the canonical `libraries` row is gone,
@@ -3296,7 +3301,7 @@ func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, blockRepresent
 	if err := fenceLibrary(); err != nil {
 		return err
 	}
-	if err := finalize(func() error { return w.store.HardDeleteLibrary(orgID, libraryID) }); err != nil {
+	if err := finalize(mutation); err != nil {
 		return fmt.Errorf("failed to hard-delete library %s: %w", libraryID, err)
 	}
 

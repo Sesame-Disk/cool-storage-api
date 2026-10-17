@@ -7,6 +7,9 @@ section under the still-owned library lease. Both stale HTTP schedules have real
 Cassandra RED/GREEN evidence; final-section recovery remains P1 CURRENT-RUNTIME /
 PRE-GC. No automatic timeout unlock, mixed-version certificate or activation.
 [Plan, protocol and evidence](docs/LIBRARY-LIFECYCLE-FINAL-FENCING.md).
+Review correction: retain restore exclusion through aggregate adjustment and
+prepare worker projections before finalization. Counter-window and preparation
+failure regressions have RED/GREEN coverage; recovery remains OPEN.
 
 ## Active slice: Phase 5 shared-tree preservation (2026-10-17)
 

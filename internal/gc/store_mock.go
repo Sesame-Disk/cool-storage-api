@@ -3969,6 +3969,10 @@ func (m *MockStore) WithLibraryLifecycleMutation(libraryID, token uuid.UUID, mut
 	return nil
 }
 
+func (m *MockStore) PrepareLibraryHardDelete(orgID, libraryID uuid.UUID) (func() error, error) {
+	return func() error { return m.HardDeleteLibrary(orgID, libraryID) }, nil
+}
+
 func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
