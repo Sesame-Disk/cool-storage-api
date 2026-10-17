@@ -9,28 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD is the
-// executable counterexample recorded by PC-0 for
-// ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01 and for option 1 of
-// ISSUE-PC0-INHERITED-DEPENDENCY-CONTINUITY-01 ("ordinary GC reachability
-// already protects inherited dependencies"): it does not.
-//
-// scanExpiredVersions (Phase 5) enqueues any commit outside the HEAD parent
-// chain that is older than version_ttl_days as ItemCommit. processCommit then
-// enqueues the commit's root fs_object and processFSObject cascades through
-// the whole tree, removing block references and deleting fs_object rows
-// without asking whether the same content-addressed fs_id is still reachable
-// from the live HEAD. Dangling commits that share almost their entire tree
-// with HEAD exist in normal operation (v2 CAS losers keep their commits row,
-// Sync PutCommit rows whose client never promoted them, Sync auto-merge
-// targets).
-//
-// This test FREEZES THE OBSERVED, UNSAFE behavior so the counterexample is
-// reproducible and cannot drift silently. It is not an endorsement. When
-// Phase 5 becomes sharing-aware (PRE-GC follow-up), invert the final
-// assertion into a regression test and close the issue. GC_ENABLED=false in
-// production keeps this dormant today.
-func TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD(t *testing.T) {
+// Regression for ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01. The original
+// characterization demonstrated that an expired dangling commit deleted nodes
+// shared with HEAD. Unguarded commit retirement must not cascade into its tree.
+func TestPhase5CommitRetirementPreservesFSObjectsSharedWithHEAD(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -50,6 +32,7 @@ func TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD(t *test
 	store.AddFSObject(libID, "file-F", "file", []string{"blockB"})
 	store.AddBlock(orgID, "blockB", "standard", 1)
 	store.AddBlockReferenceForTest(orgID, "blockB", db.BlockReferrerForFSObject(libID.String(), "file-F"))
+	referencesBefore := store.BlockReferenceCount(orgID, "blockB")
 
 	// Exactly the queue item scanExpiredVersions produces for commit-X.
 	if err := store.EnqueueBatch([]QueueItem{{
@@ -78,13 +61,18 @@ func TestPC0Characterization_Phase5CascadeRemovesFSObjectsSharedWithHEAD(t *test
 	if store.GetCommitRecord(libID, "commit-H") == nil {
 		t.Fatal("HEAD commit row itself must survive; Phase 5 only targets non-HEAD-chain commits")
 	}
-	_, errD := store.GetFSObject(libID, "dir-D")
-	_, errF := store.GetFSObject(libID, "file-F")
-	t.Logf("OBSERVED after Phase-5 cascade of dangling commit-X: dir-D err=%v, file-F err=%v, blockB refs=%d (HEAD=commit-H still references dir-D/file-F)",
-		errD, errF, store.BlockReferenceCount(orgID, "blockB"))
-
-	// OBSERVED (the bug): both shared nodes are gone and HEAD's tree is broken.
-	if errD == nil || errF == nil {
-		t.Fatalf("PC0 CHARACTERIZATION CHANGED: Phase-5 cascade no longer removes fs_objects shared with HEAD (dir-D err=%v, file-F err=%v). If Phase 5 is now sharing-aware, invert this assertion into a regression test and close ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01", errD, errF)
+	if store.GetCommitRecord(libID, "commit-X") != nil {
+		t.Fatal("expired commit must still be retired")
+	}
+	for _, id := range []string{"root-H", "root-X", "dir-D", "file-F"} {
+		if _, err := store.GetFSObject(libID, id); err != nil {
+			t.Errorf("commit retirement deleted shared or retained tree node %s: %v", id, err)
+		}
+	}
+	if n := store.BlockReferenceCount(orgID, "blockB"); n != referencesBefore {
+		t.Errorf("permanent shared fs: reference count = %d, want %d", n, referencesBefore)
+	}
+	if n := len(store.QueueItems(orgID)); n != 0 {
+		t.Errorf("commit retirement left %d descendant queue items", n)
 	}
 }

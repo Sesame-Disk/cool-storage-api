@@ -1,6 +1,15 @@
 # Current Work
 
-## Active slice: post-merge X1 audit and GC gate wording (2026-10-17)
+## Active slice: Phase 5 shared-tree preservation (2026-10-17)
+
+[Plan and evidence](docs/GC-PHASE5-SHARED-FSOBJECTS.md): unguarded expired-commit
+retirement removes only commit metadata. Current real Cassandra/S3 RED loses
+shared directories; GREEN preserves HEAD, an old ancestor, recent history, refs
+and bytes. Guarded library cascades remain. Exclusive trees may be retained;
+reclamation/Phase 6/concurrent metadata destruction remain PRE-GC. X1 unchanged,
+PRE-GC/A1 OPEN, ordinary GC OFF. No GC activation or hard-delete fix here.
+
+## Previous merged slice: GC gate wording and revalidation (#313, 2026-10-17)
 
 [Post-merge Docker revalidation](docs/E1-FINAL-DISPOSITION.md#post-merge-revalidation-2026-10-17)
 reproduces the accepted evidence on unchanged productive source, including the
@@ -107,7 +116,7 @@ The source of record for order and closure states is
   no full-suite PASS or activation is claimed.
 - **PRE-GC / A1 gate:** every open `PRE-GC`/`PRE-ACTIVATION` tag plus the X1 §6
   table. Highlights:
-  - Phase 5 cascade (P0 latent) and the Phase 6 TOCTOU;
+  - Phase 5 cascade fixed in this slice; reclamation disposition and Phase 6 TOCTOU remain;
   - the stale-claim settle race and the clock assumption;
   - the certification-window fence (to be re-scoped);
   - the HEAD-less ghost row;

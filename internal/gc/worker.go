@@ -2774,7 +2774,7 @@ func s3OrphanRecoveryStateEqual(left, right S3OrphanInfo) bool {
 }
 
 func (w *Worker) processCommit(item QueueItem) error {
-	// Get the commit to find its root_fs_id for cascading deletion
+	// Read the commit; only guarded library cleanup may cascade into its root.
 	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
 	if err != nil {
 		// Commit may already be deleted
@@ -2797,12 +2797,13 @@ func (w *Worker) processCommit(item QueueItem) error {
 	}
 	defer releaseGuard()
 
-	// Enqueue the root fs_object for cascading deletion (fs_object → blocks).
-	// Use parent's QueuedAt so cascade children skip the grace period.
-	// CRITICAL: if enqueue fails, we must NOT delete the commit — otherwise
-	// the root fs_object becomes an orphan with no GC entry. The next scanner
-	// sweep will re-discover and re-enqueue this commit.
-	if commit.RootFSID != "" {
+	// A commit does not own its content-addressed tree. Unguarded commit
+	// retirement (Phase 5 or CleanRepoTrash) deletes only metadata: HEAD and retained
+	// commits may share the root or any descendant. Reclamation of those objects
+	// needs a separate sharing-aware pass; do not fabricate cascade authority.
+	// Guarded library cleanup retains its existing recursive enqueue and retry
+	// semantics, including legacy requires_library_deleted_check items.
+	if effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck) != LibraryGuardNone && commit.RootFSID != "" {
 		exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, ItemFSObject, commit.RootFSID, AnyGCItemIdentity())
 		if err != nil {
 			return fmt.Errorf("failed to inspect root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
