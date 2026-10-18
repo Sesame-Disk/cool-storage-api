@@ -7007,15 +7007,18 @@ are recorded in the linked protocol. This safety fix is not a claim that the
 whole library cascade, Phase 6, user/org lifecycle or PRE-GC/A1 is closed.
 
 **Introduced by #315 (deliberate, pending maintainer acceptance):** the
-indefinite latch is new. Main expires the lease (TTL 6 h, stale takeover after
-90 min). It never blocks a library, but it allows the corruption described below.
-While retained, restore returns 500 and permanent delete returns 409. The GC
-cascade postpones forever, with no DLQ and no alert. An organization cascade
-containing the library cannot finish. Even errors that prove nothing was applied
-retain the latch. Proposed, unscheduled follow-ups are FU-1 (exact-token release
-on proven non-application) and FU-2 (operator recovery command plus
-retained-latch visibility). See
-[trade-off and follow-ups](./LIBRARY-LIFECYCLE-FINAL-FENCING.md#availability-trade-off-introduced-by-this-pr-pending-maintainer-decision).
+indefinite final latch is new. Main can temporarily block lease acquisition;
+TTL expiry/stale takeover restores lease access, not corrupted data. The effects
+of retained final exclusion depend on canonical state: an eligible trashed
+library reaching the lease check can produce restore 500/delete 409 and a
+matching GC cascade can keep postponing. After an applied GC final delete,
+canonical rows and marker are gone, so recovery and already-queued guarded
+children can proceed without this lease. An org cascade is blocked by the latch
+only if it still enumerates that library and must acquire its lease. No dedicated
+retained-latch alert or automatic recovery is implemented. Proposed, unscheduled
+FU-1/FU-2 remain subject to maintainer decision; no duration/incidence estimate or
+activation waiver is established. See
+[the state-specific effects and follow-ups](./LIBRARY-LIFECYCLE-FINAL-FENCING.md#availability-trade-off-introduced-by-this-pr-pending-maintainer-decision).
 
 #### Before-fix counterexample and original recommendation
 

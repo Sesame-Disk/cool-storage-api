@@ -98,8 +98,9 @@ risk. Ordinary GC remains OFF during rollout, validation, recovery and rollback.
 
 ## Availability trade-off introduced by this PR (pending maintainer decision)
 
-Introduced by PR #315: **yes, deliberately.** Main has no indefinite latch. It
-has the stale-owner corruption instead. This PR exchanges one risk for the other.
+Introduced by PR #315: **yes, deliberately.** Main has no indefinite final latch
+and permits the reproduced stale-owner corruption. This PR adds final-write
+exclusion with the availability cost described below.
 Status: OPEN, P1 CURRENT-RUNTIME / PRE-GC under
 `ISSUE-GC-HARD-DELETE-LEASE-NONFENCING-01`. The maintainer must accept it; the
 follow-ups below are proposals, not yet scheduled.
@@ -107,52 +108,68 @@ follow-ups below are proposals, not yet scheduled.
 | | main@14e8d0cfb | This PR |
 |---|---|---|
 | Lease lifetime | TTL 6 h (`hardDeleteLockTTLSeconds`); stale takeover after 90 min (3 x 30 min heartbeat) | Same while preparatory; no TTL and no takeover inside the final section |
-| Failure mode | Silent corruption: stale delete removes a restored library; stale restore recreates a deleted one | Visible fail-closed block of one library's lifecycle |
-| Trigger | Concurrent restore/delete plus an owner pause; reproduced through the API with GC off | Crash or error inside a final section lasting milliseconds |
-| Recovery | Automatic, after the damage is written | Manual operator procedure; no tool |
+| Failure mode | Silent corruption: stale delete removes a restored library; stale restore recreates a deleted one | Retained final lease; effects depend on canonical state (table below) |
+| Trigger | Concurrent restore/delete plus an owner pause; reproduced through the API with GC off | Crash or propagated error after promotion; duration and incidence have not been measured |
+| Recovery | Lease expiry/stale takeover can restore access to the lease; neither repairs corrupted data | A retained final section needs quiesced operator recovery; no tool is implemented |
 
-The latch is retained when any of these happens after promotion and before
-acknowledged completion:
+After acknowledged promotion, the callback error/panic paths do not release the
+final latch. A process stopped before completion can likewise leave it retained.
+The callback path does not distinguish proven non-application from uncertain
+batch errors; a panic during restore counter adjustment also leaves exclusion.
 
-- the process stops (deploy, OOM, kill) between promotion and completion;
-- the final batch returns any error, including errors that guarantee nothing
-  was applied (for example Cassandra `Unavailable`); all errors are treated alike;
-- the restore counter adjustment panics;
-- the promotion LWT returns an unknown outcome after it was applied, or the
-  completion LWT fails or reports not applied.
+Unknown promotion/completion outcomes require settlement. A promotion may have
+applied despite its error. Conversely, a completion error or not-applied result
+does not prove a latch still exists: the conditional deletion may already have
+succeeded, or its row/token may no longer match. The code reports an error and
+does not recreate exclusion. Diagnose the actual durable state before recovery.
 
-While the latch is retained, only that library's lifecycle is blocked:
+The effect depends on the canonical state and on which path left the latch.
+The following assumes the relevant writes are applied and visible; partial or
+unknown batches still require the recovery procedure above.
 
-- restore (user and org-admin) returns 500; permanent delete returns 409
-  ("already in progress"); bulk trash cleaning skips the library and counts
-  it as failed on every run;
-- the GC library cascade postpones without spending a retry
-  (`shouldPostponeWithoutRetry`). It is requeued every grace period forever,
-  never reaches the DLQ and raises no dedicated alert;
-- an organization cascade containing the library cannot finish;
-- ordinary file operations on an active library do not read this lease.
+| State/path | Effect of retained exclusion |
+|---|---|
+| A still-trashed canonical library selected for restore/delete | If permission and trash checks pass and execution reaches lease acquisition, restore fails with 500 and permanent delete with 409. Bulk trash deletion counts a selected lease refusal as failed and continues with other candidates. |
+| API permanent-delete batch applied, completion failed | The API batch removes canonical/lookup rows and preserves the purge marker. A matching library cascade must acquire the lease and can remain postponed, retaining content that has not already been queued for cleanup. |
+| GC library-delete batch applied, completion failed | The worker batch removes both canonical rows and the deletion marker after enqueuing contents. A later cascade can take its marker-absent/canonical-absent recovery path without acquiring this lease. Already-queued children carrying the deleted-identity guard can likewise proceed after confirming canonical absence. The latch alone does not prove permanent content retention. |
+| Restore batch applied | The library can be active and ordinary file operations do not consult this lease. API trash prechecks can reject it before lease acquisition; a later trash lifecycle may encounter the retained latch. |
 
-If the batch was applied and only completion failed, the canonical state already
-reflects the operation. A restored library works normally until its next trash
-lifecycle. A deleted library keeps its purge marker, but its cascade can never
-take the lease, so its content is never reclaimed once GC is enabled.
+The API can return 404 for an absent canonical library or reject an active
+library at its trash precheck; 500/409 are not universal latch symptoms. See the
+[API prechecks and responses](../internal/api/v2/deleted_libraries.go) and
+[bulk selection/lease handling](../internal/api/v2/library_delete_helpers.go).
 
-No timeout unlock is safe. A paused owner or a logged batch replayed later from
-Cassandra's batchlog could still land after the timeout. That reproduces the
-original defect. Removing the latch entirely would require conditional canonical
-writes across partitions (`libraries`, `libraries_by_id`, projections). One
-Cassandra LWT cannot cover them; that limitation is why this PR uses a latch.
+A GC refusal that reaches `shouldPostponeWithoutRetry` requeues without spending
+a retry; work becomes eligible after the configured grace period, subject to
+worker scheduling. It can keep postponing while the marker/identity still
+matches and the retained latch prevents acquisition. This refusal alone does not
+send the item to the DLQ. There is no dedicated retained-latch alert implemented
+here; existing logs/metrics are not a recovery mechanism.
+
+The org cascade acquires a library lease for each library returned by its current
+canonical enumeration. A retained latch can prevent progress if that library is
+still enumerated. A canonically removed library need not appear, so the mere
+presence of a latch does not establish that its org cascade cannot finish.
+These paths are in [the worker](../internal/gc/worker.go); canonical enumeration
+and the different final deletion batches are in
+[the Cassandra store](../internal/gc/store_cassandra.go).
+
+Elapsed time alone cannot establish a safe unlock. A paused owner or a delayed
+batch may still write after a timeout. The current final batches span canonical
+and projection partitions; their lease LWT does not make those writes one
+conditional transaction. Replacing this protocol needs equivalent authority for
+every covered mutation; this PR does not select or certify an alternative.
 
 ### Proposed follow-ups (not scheduled)
 
 - **FU-1. Release on proven non-application.** Release the latch with an
-  exact-token conditional delete when the batch error proves that nothing was
-  applied: coordinator `Unavailable`, or a client-side failure before the request
-  was sent. Keep every timeout, `BATCH_LOG`/`BATCH` write timeout and unknown
-  outcome retained. Needs evidence per error class against real Cassandra (an
-  injected error type is not enough) and a RED test showing the latch is
-  needlessly retained today. Reduces how often the latch is retained, does not
-  replace recovery.
+  exact-token conditional delete only after proving that no covered mutation
+  was applied or can still apply. Candidate cases include rejection before a
+  request was sent; a final error type alone is not proof about earlier attempts
+  or retries. Keep uncertain outcomes retained. Needs evidence for the complete
+  request/attempt history against real Cassandra (an injected error type is not
+  enough) and a RED test showing needless retention today. Reduces how often the
+  latch is retained; does not replace recovery.
 - **FU-2. Operator recovery command and visibility.** A quiesced-maintenance CLI
   that lists retained latches with their age, shows canonical row, purge marker
   and projection state for the library, and removes one latch only with
@@ -165,9 +182,11 @@ Cassandra LWT cannot cover them; that limitation is why this PR uses a latch.
   Consider removing it from the interface so that no future runtime caller
   bypasses the protocol.
 
-Decision needed from the maintainer: accept the trade-off for merge (recommended:
-visible, rare, non-destructive versus reproducible silent corruption), and decide
-whether FU-1 and FU-2 are required before GC activation or before v1.
+Decision needed from the maintainer: accept the documented availability cost of
+final-write exclusion for merge, and decide when FU-1 and FU-2 must be completed.
+No incidence or latency estimate is established here. Recovery remains OPEN
+CURRENT-RUNTIME / PRE-GC; scheduling proposals do not waive PRE-GC/A1 or authorize
+GC activation.
 
 ## Docker evidence and reproduction
 
