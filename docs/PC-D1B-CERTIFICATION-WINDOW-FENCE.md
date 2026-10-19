@@ -977,7 +977,9 @@ implements the frozen contract afterward; it is required before destructive GC
 activation or a productive consumer.
 
 **Scope (exact):**
-1. Next available migration (`028` if #233's `027_block_mapping_authority_claims.cql` lands first): the three fence columns.
+1. The three fence columns: in `001_initial_schema.cql` before the first
+   production deploy, or the next numbered migration (`002+`) once `001` is
+   frozen ([v1 baseline fold](./DATABASE-GUIDE.md#v1-baseline-fold-2026-10-19)).
 2. `internal/db`: intent/completion/capture primitives (global SERIAL,
     observed E/P/S plus the canonical non-null `created_at` existence
     predicate, tri-state outcomes); typed intent capability; mint
