@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-19 — Phase 6 execute-time TOCTOU reproduced (P6-1)
+
+Evidence only. `TestGCPhase6InFlightSyncPublicationKeepsHeadTree`, behind
+`SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE`, drives productive Sync handlers,
+the real Phase 6 selector and the organization-scoped worker on real
+Cassandra/S3. A publication inside the selector's gap loses HEAD's root/file
+fs_objects and permanent `fs:` reference (RED 8/8, 2 with race); a writer
+before the scan is kept. Registers `ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01`
+(P1 PRE-GC) and `ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01` (P2). Adds the
+`Scanner.ScanAutoDeleteExpiredObjectsOnce` test entry point; no runtime
+behaviour change. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md).
+
 ## 2026-10-19 — v1 baseline schema fold
 
 The pre-production migration chain `001`–`027` (last at `14e8d0cfb`) is folded

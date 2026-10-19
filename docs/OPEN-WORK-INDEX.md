@@ -1,5 +1,15 @@
 # Open Work Index
 
+## Phase 6 execute-time TOCTOU reproduced (2026-10-19)
+
+[Real Cassandra/S3 RED](./GC-PHASE6-FSOBJECT-TOCTOU.md) on main@bb89d7b12: a Sync
+publication landing inside the Phase 6 selector's gap loses HEAD's root/file
+fs_objects and its permanent `fs:` reference; the same writer before the scan is
+kept. Bytes survived (Sync `up:` pin); later physical loss not measured.
+`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` is OPEN, P1 PRE-GC; the fix and
+its behaviour change are a separate maintainer decision. Also registered:
+`ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01` (P2 follow-up). PRE-GC/A1 OPEN, GC OFF.
+
 ## Phase 5 shared-tree cascade fix (2026-10-17)
 
 [Metadata-only commit retirement](./GC-PHASE5-SHARED-FSOBJECTS.md) closes the

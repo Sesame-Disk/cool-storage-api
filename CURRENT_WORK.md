@@ -1,6 +1,15 @@
 # Current Work
 
-## Active slice: v1 baseline schema fold (2026-10-19)
+## Active slice: Phase 6 TOCTOU evidence, P6-1 (2026-10-19)
+
+[Plan and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md): real Cassandra/S3 RED on
+main@bb89d7b12. An in-flight productive Sync publication inside the Phase 6
+selector's gap loses HEAD's root/file fs_objects and permanent `fs:` reference;
+a writer listed before the scan is kept. Evidence-gated test only, no fix and no
+runtime behaviour change. Next: the maintainer decides the P6-2 option (plan §5).
+`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` OPEN; PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous slice: v1 baseline schema fold (2026-10-19)
 
 [Fold record](docs/DATABASE-GUIDE.md#v1-baseline-fold-2026-10-19): the
 pre-production migration chain `001`–`027` is folded into

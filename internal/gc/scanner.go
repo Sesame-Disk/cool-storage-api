@@ -66,6 +66,13 @@ func (s *Scanner) ScanExpiredDeletedLibrariesOnce(ctx context.Context) (int, err
 	return s.scanExpiredDeletedLibraries(ctx)
 }
 
+// ScanAutoDeleteExpiredObjectsOnce runs only the auto-delete (Phase 6) phase.
+// Integration tests use this narrow entry point to exercise the production
+// selector against owned fixtures without a full ScanOnce pass.
+func (s *Scanner) ScanAutoDeleteExpiredObjectsOnce(ctx context.Context) (int, error) {
+	return s.scanAutoDeleteExpiredObjects(ctx)
+}
+
 // SetOrphanRecoverer wires the S3 orphan recovery/reconciliation dependency. Optional; if
 // unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
 func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {

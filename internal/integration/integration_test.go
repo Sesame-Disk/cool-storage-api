@@ -55,6 +55,7 @@ func TestMain(m *testing.M) {
 	// omission was invisible in the standard run only because P4A happens to be set
 	// alongside it.
 	requireEvidence := os.Getenv("SESAMEFS_REQUIRE_E101_PREPARED_DISCOVERY_CRASH_EVIDENCE") == "1" ||
+		os.Getenv("SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_ROOT_PREPARED_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_PUBLISHED_PREPARED_CRASH_EVIDENCE") == "1" ||
 		os.Getenv("SESAMEFS_REQUIRE_E101_DISCOVERY_RETAINED_CRASH_EVIDENCE") == "1" ||
