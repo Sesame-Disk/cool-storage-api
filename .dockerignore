@@ -18,8 +18,6 @@ mobile-frontend/.astro/
 **/tmp/
 **/.gocache/
 .testbin/
-# Committed macOS binary; no Dockerfile copies it.
-sesamefs-api
 
 # Local environment and tool state (may hold secrets). Compose reads .env from
 # the host, not from the build context.
