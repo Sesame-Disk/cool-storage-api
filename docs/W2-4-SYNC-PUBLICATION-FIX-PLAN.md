@@ -99,3 +99,6 @@ the shell runner's missing Dockerfile.test, archived Debian package URLs in
 the Seafile image, and non-executable host wait helper. The temporary CLI image
 uses Debian bookworm, Python 3 and the same Seafile AppImage version. These
 workarounds do not modify committed product or desktop infrastructure.
+(2026-10-19: the shell runner's Dockerfile was never committed because the
+`.gitignore` rule `*.test` hid it; `api-test`, `oidc-test` and the multi-region
+`test-runner` now build from `Dockerfile.gotest`, PR #317.)

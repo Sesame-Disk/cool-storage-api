@@ -1,6 +1,6 @@
 # Multi-Region Testing Guide
 
-> **Scope (2026-10-12):** this guide covers the original `docker-compose-multiregion.yaml` stack, still used by `scripts/test-failover.sh`, `scripts/run-tests.sh` and `scripts/bootstrap.sh`. Its test-runner service references `Dockerfile.test`, which no longer exists, so parts of it may not run as written. For the current two-datacenter cluster (two Cassandra DCs, per-region storage and API nodes) use `./scripts/run-mr-cluster.sh` as described in the README section "Multi-Region Testing".
+> **Scope (2026-10-12):** this guide covers the original `docker-compose-multiregion.yaml` stack, still used by `scripts/test-failover.sh`, `scripts/run-tests.sh` and `scripts/bootstrap.sh`. Its test-runner service builds from `Dockerfile.gotest` (bash, curl, jq). Inside any container the test scripts skip the failover steps that stop/start containers and the storage-location check (run those from the host), and parts of this guide may not run as written. For the current two-datacenter cluster (two Cassandra DCs, per-region storage and API nodes) use `./scripts/run-mr-cluster.sh` as described in the README section "Multi-Region Testing".
 
 This document describes how to set up and test the multi-region storage capabilities of SesameFS.
 
@@ -479,7 +479,7 @@ docker-compose -f docker-compose-multiregion.yaml down -v
 |------|---------|
 | `docker-compose.yaml` | Development stack (single instance) |
 | `docker-compose-multiregion.yaml` | Multi-region stack definition |
-| `Dockerfile.test` | Test container image |
+| `Dockerfile.gotest` | Test-runner image (see the scope note above) |
 | `configs/nginx-multiregion.conf` | Nginx load balancer config |
 | `configs/config-usa.yaml` | USA server structural configuration; credentials and other secrets still come from compose env vars |
 | `configs/config-eu.yaml` | EU server structural configuration; credentials and other secrets still come from compose env vars |

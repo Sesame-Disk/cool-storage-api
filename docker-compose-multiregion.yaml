@@ -165,7 +165,7 @@ services:
   test-runner:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.gotest
     volumes:
       - ./scripts:/scripts:ro
       - /var/run/docker.sock:/var/run/docker.sock
