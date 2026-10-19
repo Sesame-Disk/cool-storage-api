@@ -10,3 +10,18 @@ tmp/
 frontend/build/
 mobile-frontend/dist/
 mobile-frontend/.astro/
+
+# Local build and test artifacts. Every image builds or tests from tracked
+# sources, so none of these is needed in a build context.
+**/*.exe
+**/*.test
+**/tmp/
+**/.gocache/
+.testbin/
+# Committed macOS binary; no Dockerfile copies it.
+sesamefs-api
+
+# Local environment and tool state (may hold secrets). Compose reads .env from
+# the host, not from the build context.
+**/.env
+.claude/
