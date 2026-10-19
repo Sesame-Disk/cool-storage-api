@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -196,9 +197,16 @@ func (m *Migrator) ensureTable() error {
 // loadFiles reads all embedded *.cql files, parses them and returns them sorted
 // by version number. Duplicate version numbers cause an immediate error.
 func (m *Migrator) loadFiles() ([]MigrationFile, error) {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	return loadMigrationFiles(migrationsFS, "migrations")
+}
+
+// loadMigrationFiles parses every *.cql file in dir of fsys exactly as the
+// embedded set is parsed. The schema-baseline equivalence harness uses it to
+// apply a reference migration set extracted from another git ref.
+func loadMigrationFiles(fsys fs.FS, dir string) ([]MigrationFile, error) {
+	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
-		return nil, fmt.Errorf("reading embedded migrations directory: %w", err)
+		return nil, fmt.Errorf("reading migrations directory %q: %w", dir, err)
 	}
 
 	var files []MigrationFile
@@ -210,7 +218,7 @@ func (m *Migrator) loadFiles() ([]MigrationFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid migration filename %q: %w", entry.Name(), err)
 		}
-		raw, err := fs.ReadFile(migrationsFS, "migrations/"+entry.Name())
+		raw, err := fs.ReadFile(fsys, path.Join(dir, entry.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("reading migration %s: %w", entry.Name(), err)
 		}

@@ -9,23 +9,8 @@ import (
 	"testing"
 )
 
-func TestLibraryRollbackPendingMigrationExists(t *testing.T) {
-	m := &Migrator{}
-	files, err := m.loadFiles()
-	if err != nil {
-		t.Fatalf("loadFiles: %v", err)
-	}
-	for _, file := range files {
-		if file.Version != 23 {
-			continue
-		}
-		text := strings.ToLower(file.Content)
-		if !strings.Contains(text, "create table if not exists library_rollback_pending") {
-			t.Fatal("migration 023 does not create library_rollback_pending")
-		}
-		return
-	}
-	t.Fatal("migration 023 is missing")
+func TestLibraryRollbackPendingTableExists(t *testing.T) {
+	requireEffectiveTableDDL(t, "library_rollback_pending")
 }
 
 func TestLibraryRollbackPendingHasExactPerLibraryIdentity(t *testing.T) {
@@ -56,20 +41,12 @@ func TestLibraryRollbackPendingHasNoTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadFiles: %v", err)
 	}
-	foundCreate := false
 	var statements []string
 	for _, file := range files {
 		statements = append(statements, file.Statements...)
-		if file.Version != 23 {
-			continue
-		}
-		text := strings.ToLower(file.Content)
-		if strings.Contains(text, "default_time_to_live = 0") || strings.Contains(text, "default_time_to_live=0") {
-			foundCreate = true
-		}
 	}
-	if !foundCreate {
-		t.Fatal("migration 023 must set default_time_to_live = 0 so pending rollback work cannot expire")
+	if !regexp.MustCompile(`(?i)default_time_to_live\s*=\s*0\b`).MatchString(requireEffectiveTableDDL(t, "library_rollback_pending")) {
+		t.Fatal("library_rollback_pending must set default_time_to_live = 0 explicitly so pending rollback work cannot expire")
 	}
 
 	ttl, ok := effectiveTableDefaultTTL(t, "library_rollback_pending")

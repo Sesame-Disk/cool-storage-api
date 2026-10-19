@@ -11,7 +11,7 @@ import (
 )
 
 func TestS3OrphanMigrationHasNoExpirySchedule(t *testing.T) {
-	schemaPath := filepath.Join("..", "db", "migrations", "021_gc_s3_orphan_exact_identity.cql")
+	schemaPath := filepath.Join("..", "db", "migrations", "001_initial_schema.cql")
 	schema, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", schemaPath, err)

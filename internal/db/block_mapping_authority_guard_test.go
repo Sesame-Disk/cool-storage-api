@@ -1782,7 +1782,7 @@ func TestBlockMappingAuthorityClaimsAreImmutableRepositoryWide(t *testing.T) {
 			if !strings.Contains(strings.ToLower(normalized), blockMappingAuthorityClaimsTable) {
 				continue
 			}
-			if !strings.HasSuffix(filepath.ToSlash(path), "/027_block_mapping_authority_claims.cql") ||
+			if !strings.HasSuffix(filepath.ToSlash(path), "/001_initial_schema.cql") ||
 				!blockMappingAuthorityCreatePattern.MatchString(normalized) ||
 				strings.Contains(strings.ToLower(normalized), "default_time_to_live") {
 				violations = append(violations, filepath.ToSlash(path)+": unauthorized schema operation on "+blockMappingAuthorityClaimsTable)

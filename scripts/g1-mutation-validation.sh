@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MIGRATION=internal/db/migrations/021_gc_s3_orphan_exact_identity.cql
+MIGRATION=internal/db/migrations/001_initial_schema.cql
 STORE=internal/gc/store_cassandra.go
 MOCK=internal/gc/store_mock.go
 WORKER=internal/gc/worker.go
@@ -92,7 +92,7 @@ m4_recovery_root_required() {
 }
 
 m5_no_orphan_ttl() {
-  mutate "$MIGRATION" 's{default_time_to_live = 0}{default_time_to_live = 7776000}'
+  mutate "$MIGRATION" 's{(CREATE TABLE IF NOT EXISTS gc_s3_orphans \(.*?)default_time_to_live = 0}{${1}default_time_to_live = 7776000}s'
   expect_red 'TestS3OrphanMigrationHasNoExpirySchedule' 'must have no expiry schedule' \
     'pending orphan identity regains a TTL'
   restore

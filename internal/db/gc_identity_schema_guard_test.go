@@ -128,24 +128,17 @@ func TestG1MigrationDeclaresExactOrphanRecoveryRoot(t *testing.T) {
 	}
 }
 
-func TestG1LifecycleMigrationAddsWriteOnceFirstSeenToken(t *testing.T) {
-	m := &Migrator{}
-	files, err := m.loadFiles()
-	if err != nil {
-		t.Fatalf("loadFiles: %v", err)
+func TestG1LifecycleSchemaHasWriteOnceFirstSeenToken(t *testing.T) {
+	ddl := requireEffectiveTableDDL(t, "gc_block_delete_lifecycles")
+	if !ddlDeclaresColumn(ddl, "first_seen_at", "TIMESTAMP") {
+		t.Fatal("gc_block_delete_lifecycles must carry the write-once G1 first_seen_at TIMESTAMP token")
 	}
-	for _, file := range files {
-		if file.Version != 22 {
-			continue
-		}
-		text := strings.ToLower(file.Content)
-		if strings.Contains(text, "alter table gc_block_delete_lifecycles add first_seen_at timestamp") ||
-			strings.Contains(text, "alter table gc_block_delete_lifecycles add if not exists first_seen_at timestamp") {
-			return
-		}
-		t.Fatalf("migration 022 does not add gc_block_delete_lifecycles.first_seen_at")
+	keys := effectivePrimaryKeys(t, map[string]bool{"gc_block_delete_lifecycles": true})
+	got := keys["gc_block_delete_lifecycles"]
+	want := []string{"org_id", "block_id", "claim_id"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("gc_block_delete_lifecycles PRIMARY KEY = %v, want %v: a later life D2 must occupy a different row", got, want)
 	}
-	t.Fatal("migration 022 is missing")
 }
 
 var (

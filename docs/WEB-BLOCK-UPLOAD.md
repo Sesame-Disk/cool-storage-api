@@ -1016,7 +1016,7 @@ flag were on*.
      `blockUploadStagingAdmissionFromConfig` at creation; `/blocks/upload` reads the
      frozen values from the session (falling back to live config only for sessions
      minted before this change — rollout compat). Regression-guarded by
-     `TestMigration008AddsBlockUploadStagingCapsAndFrozenAdmission`.
+     `TestSchemaHasBlockUploadStagingCapsAndFrozenAdmission`.
 
    Rejections are counted by `block_upload_session_admission_rejections_total{reason}`
    (`max_sessions` | `staged_blocks`). Publishable-file bound per user is still

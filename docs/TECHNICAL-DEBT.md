@@ -187,6 +187,23 @@ projection before deleting the root.
   drop the now-stale `return settled, nil` half of the pattern, or match up to
   `confirmSettledBlockClaimVisibility(orgID, blockID, attempt)` only.
 
+- **Run-to-completion inventory (2026-10-19, v1 baseline fold PR).** With each
+  script's `fail()` made non-exiting so every mutation runs, g1/p4a/pcd1b were run
+  in Docker on `origin/main` (`14e8d0cfb`) and on the fold branch: identical
+  results, 131 mutations RED on each, and the same non-load-bearing set on each.
+  g1: `m3_canonical_delete_omits_delete_authority` (above),
+  `m9_missing_canonical_is_settled`, `m10_writer_fence_ignores_orphan`,
+  `m16_utc_root_day`, `m17_root_errors_do_not_freeze_by_day_cursor`. p4a:
+  `m_settled_own_claim_skips_each_quorum` (above), `m_destructive_locator_from_readback`,
+  `m_late_loser_settles_candidate`, `m_divergent_read_retries`,
+  `m_topology_gate_discards_foreign_owner`, `m_unwind_bypasses_the_wrapper`.
+  pcd1b: `b20_verifier_fallback`. Each either no longer applies to current
+  `internal/gc/worker.go` / `store_cassandra.go` / `internal/db/block_references.go`
+  or applies and leaves the suite green or red for another reason. Because the
+  stock scripts exit on the first failure, a plain run stops early and hides the
+  mutations after it. Pre-existing tooling drift; every schema mutation in these
+  scripts is RED. Fix belongs with the P4b/G1 tooling cleanup above.
+
 ---
 
 ## 1. Multi-Host ServiceURL — ✅ FIXED (2026-02-09, simplified 2026-03-30)

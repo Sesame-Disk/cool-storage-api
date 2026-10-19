@@ -1,15 +1,23 @@
--- Migration 001: Initial schema
+-- Migration 001: Initial schema (v1 production baseline)
 -- Canonical baseline for all SesameFS tables.
--- In design mode this file is the single source of truth for the full schema:
--- all known columns, reverse-lookup projections, and read models required for a
--- clean boot are baked in here directly instead of being layered through
--- historical ALTERs. Reverse lookups use purpose-built projection tables rather
--- than secondary indexes (which force scatter-gather reads and degrade in
+-- This file is the single source of truth for the full schema: all known
+-- columns, reverse-lookup projections, and read models required for a clean
+-- boot are baked in here directly instead of being layered through historical
+-- ALTERs. Reverse lookups use purpose-built projection tables rather than
+-- secondary indexes (which force scatter-gather reads and degrade in
 -- multi-region clusters).
 --
--- Existing deployments that intentionally reuse this baseline will re-run the
--- CREATE TABLE statements safely where the schema already exists.
--- Fresh installs: this file creates the complete schema in one pass.
+-- Fold provenance: after X1 closed (#312) the pre-production migration chain
+-- 001..027 (last at commit 14e8d0cfb) was folded into this file for the
+-- greenfield first production deploy. scripts/schema-baseline-equivalence.sh
+-- proves the fold: against that commit it requires identical system_schema
+-- rows and seeded data. Rationale that lived in the folded migrations is kept
+-- next to the tables it explains below.
+--
+-- Fresh installs: this file creates the complete schema in one pass. A
+-- keyspace built from the pre-fold chain fails the 001 checksum check and must
+-- be recreated; there is no upgrade path from it. Once 001 has been applied in
+-- production it is frozen: every later schema change is a new NNN_*.cql file.
 
 -- ─── Core / Identity ─────────────────────────────────────────────────────────
 
@@ -115,34 +123,107 @@ CREATE TABLE IF NOT EXISTS libraries (
     deleted_by        UUID,
     created_at        TIMESTAMP,
     updated_at        TIMESTAMP,
+    -- Block representation of this library (see block_id_mappings): the same
+    -- client-visible SHA-1 can name different stored bytes in different
+    -- representations.
+    block_representation_id             TEXT,
+    -- PC-D1A explicit baseline continuity witness. NULL means that no
+    -- certified witness exists for the current HEAD.
+    continuity_certified_head_commit_id TEXT,
+    continuity_contract_version         TEXT,
     PRIMARY KEY ((org_id), library_id)
 );
 
 -- Lookup table: find library by library_id without knowing org_id.
 -- Dual-write: keep in sync with libraries on every write.
 CREATE TABLE IF NOT EXISTS libraries_by_id (
-    library_id        UUID PRIMARY KEY,
-    org_id            UUID,
-    owner_id          UUID,
-    name              TEXT,
-    head_commit_id    TEXT,
-    encrypted         BOOLEAN,
-    enc_version       INT,
-    magic             TEXT,
-    random_key        TEXT,
-    salt              TEXT,
-    magic_strong      TEXT,
-    random_key_strong TEXT
+    library_id              UUID PRIMARY KEY,
+    org_id                  UUID,
+    owner_id                UUID,
+    name                    TEXT,
+    head_commit_id          TEXT,
+    encrypted               BOOLEAN,
+    enc_version             INT,
+    magic                   TEXT,
+    random_key              TEXT,
+    salt                    TEXT,
+    magic_strong            TEXT,
+    random_key_strong       TEXT,
+    block_representation_id TEXT
 );
 
 -- 90-day TTL: ensures GC scanner can resolve org_id for orphaned blocks
 -- before the record expires.
+--
+-- block_representation_id: fs_object GC may run after the library is soft- or
+-- hard-deleted, when re-resolving SHA-1 block ids from live library state is no
+-- longer reliable, so the representation is persisted here (and on queued GC
+-- work) for deterministic recovery across crashes, retries and DLQ round-trips.
+--
+-- purge_requested_at: durable "reclaim on the retention-independent schedule"
+-- signal stamped by permanent-delete writers (ISSUE-GC-ORG-TRASH-NO-CASCADE-01).
+-- A permanent delete re-inserts the marker with deleted_at = now(), which would
+-- otherwise defer the cascade by the full TrashRetentionDays. Phase 13 treats a
+-- row as eligible when purge_requested_at IS set OR deleted_at < cutoff. This
+-- does NOT bypass the GC grace period: the cascade item is still enqueued with
+-- QueuedAt = deleted_at and processed only after grace_period. Normal
+-- soft-delete leaves it null. It is a rebuildable scanner signal only; the
+-- cascade still revalidates canonical state before any destructive work.
 CREATE TABLE IF NOT EXISTS deleted_libraries (
-    library_id    UUID PRIMARY KEY,
-    org_id        UUID,
-    deleted_at    TIMESTAMP,
-    storage_class TEXT
+    library_id              UUID PRIMARY KEY,
+    org_id                  UUID,
+    deleted_at              TIMESTAMP,
+    storage_class           TEXT,
+    block_representation_id TEXT,
+    purge_requested_at      TIMESTAMP
 ) WITH default_time_to_live = 7776000;
+
+-- Durable discovery marker for new-library rollback cleanup.
+--
+-- rollbackNewLibrary takes authority with DELETE FROM libraries ... IF
+-- head_commit_id = null before tearing down derived rows. If the process dies
+-- (or the cleanup batch fails) after that LWT applies, the canonical row is
+-- gone while libraries_by_id, active owner/org/global projections, policies,
+-- fs_objects and commits remain. This table makes that cleanup discoverable
+-- across restart without becoming a second authority: the HEAD LWT remains
+-- the only gate. The marker is recovery/discovery, never permission to
+-- destroy a library whose HEAD another initializer published.
+--
+-- Fixed recovery buckets avoid a single global partition and allow a
+-- paginated bounded scan. Logical identity is one pending rollback per
+-- (org_id, library_id); the bucket is not part of that identity.
+-- No TTL: pending work must remain recoverable until settlement.
+CREATE TABLE IF NOT EXISTS library_rollback_pending (
+    recovery_bucket INT,
+    org_id          UUID,
+    library_id      UUID,
+    owner_id        UUID,
+    created_at      TIMESTAMP,
+    recorded_at     TIMESTAMP,
+    PRIMARY KEY ((recovery_bucket), org_id, library_id)
+) WITH CLUSTERING ORDER BY (org_id ASC, library_id ASC)
+  AND default_time_to_live = 0;
+
+-- Online brute-force protection for encrypted libraries. PBKDF2 at 1000
+-- iterations (Seafile compat) is fast enough that an authenticated attacker
+-- could try thousands of passwords per second against /set-password; even the
+-- Argon2id strong path is only slow per-attempt (~200ms) and tempting to
+-- bulk-probe. This table records failed attempts per (repo_id, key) so the
+-- application can block further attempts after a threshold and enforce
+-- exponential backoff across process restarts.
+--
+-- Rows are keyed by actor (user_id|ip) to avoid one abusive client denying
+-- service to the rest of the org. TTL of 24h bounds table growth and also
+-- caps the worst-case block duration naturally.
+CREATE TABLE IF NOT EXISTS encrypted_repo_password_failures (
+    repo_id        TEXT,
+    actor_key      TEXT,
+    failure_count  INT,
+    first_failure  TIMESTAMP,
+    last_failure   TIMESTAMP,
+    blocked_until  TIMESTAMP,
+    PRIMARY KEY ((repo_id), actor_key)
+) WITH default_time_to_live = 86400;
 
 -- GC discovery index for libraries with an active retention policy. This is a
 -- rebuildable projection only: the canonical libraries row remains the source
@@ -242,16 +323,20 @@ CREATE TABLE IF NOT EXISTS commits (
     PRIMARY KEY ((library_id), commit_id)
 );
 
+-- block_ids holds the canonical SHA-256 block ids. seafile_block_ids_sha1 is
+-- the SHA-1 block-id list used at the Seafile compatibility boundary (fs_object
+-- serialization + fs_id).
 CREATE TABLE IF NOT EXISTS fs_objects (
-    library_id  UUID,
-    fs_id       TEXT,
-    obj_type    TEXT,
-    obj_name    TEXT,
-    full_path   TEXT,
-    dir_entries TEXT,
-    block_ids   LIST<TEXT>,
-    size_bytes  BIGINT,
-    mtime       BIGINT,
+    library_id             UUID,
+    fs_id                  TEXT,
+    obj_type               TEXT,
+    obj_name               TEXT,
+    full_path              TEXT,
+    dir_entries            TEXT,
+    block_ids              LIST<TEXT>,
+    seafile_block_ids_sha1 LIST<TEXT>,
+    size_bytes             BIGINT,
+    mtime                  BIGINT,
     PRIMARY KEY ((library_id), fs_id)
 );
 
@@ -269,17 +354,34 @@ CREATE TABLE IF NOT EXISTS fs_objects (
 -- release/finalize so only the owning delete attempt can complete that claim.
 -- Writers back off when they observe `gc_state='deleting'`. See block_references
 -- below.
+--
+-- `sha1` is the authoritative SHA-256 -> SHA-1 lookup, sourced from the real
+-- block bytes the server hashes on upload/finalize. Block encryption is
+-- deterministic (AES-256-CBC with a derived, fixed IV), so SHA-1(plaintext) <->
+-- SHA-256(ciphertext) is 1:1 even for encrypted libraries; that is why there is
+-- no reverse block_id_mappings_by_internal projection.
+--
+-- `gc_orphan_handoff` is the durable block-delete authority handoff (P4b-2 /
+-- R14b). `blocks` and `gc_s3_orphans` are separate Paxos partitions, so there is
+-- no cross-table CAS: after the last liveness authorization this marker commits
+-- the exact delete authority (P, D) here so a later worker can only resume that
+-- same lifecycle, and the canonical orphan stores the same D. It is unset
+-- (null) until commit and true afterwards. Never write false: null remains the
+-- only "not yet committed" value the LWTs test.
 CREATE TABLE IF NOT EXISTS blocks (
-    org_id        UUID,
-    block_id      TEXT,
-    size_bytes    INT,
-    storage_class TEXT,
-    storage_key   TEXT,
-    gc_state      TEXT,
-    gc_claim_id   TEXT,
-    gc_claimed_at TIMESTAMP,
-    created_at    TIMESTAMP,
-    last_accessed TIMESTAMP,
+    org_id            UUID,
+    block_id          TEXT,
+    size_bytes        INT,
+    storage_class     TEXT,
+    storage_key       TEXT,
+    representation_id TEXT,
+    sha1              TEXT,
+    gc_state          TEXT,
+    gc_claim_id       TEXT,
+    gc_claimed_at     TIMESTAMP,
+    gc_orphan_handoff BOOLEAN,
+    created_at        TIMESTAMP,
+    last_accessed     TIMESTAMP,
     PRIMARY KEY ((org_id, block_id))
 );
 
@@ -306,18 +408,31 @@ CREATE TABLE IF NOT EXISTS block_references (
 
 -- Canonical GC candidates table. Per-block partition like `blocks` so reference
 -- decrement to zero never contends with another org's GC traffic.
+--
+-- A block candidate is identified by its exact physical incarnation
+-- P = (storage_class, storage_key) (R14/R26). storage_class alone does not
+-- identify an incarnation -- a re-minted key keeps the class -- so a candidate
+-- enqueued for P1 must never be able to claim, finalize or clear P2 after P1
+-- died and P2 was installed on the same logical block. Two lives of one logical
+-- block occupy two rows everywhere GC work is durable: this candidate, its
+-- discovery projection, the queue, the pending markers and the DLQ. The claim
+-- CAS names both columns, so a candidate that cannot produce an exact key fails
+-- closed: nothing may derive a replacement key from block_id. candidate_at
+-- stays a mutable value outside the key, or every re-decision becomes another
+-- row.
 CREATE TABLE IF NOT EXISTS gc_block_candidates (
     org_id        UUID,
     block_id      TEXT,
     storage_class TEXT,
+    storage_key   TEXT,
     candidate_at  TIMESTAMP,
-    PRIMARY KEY ((org_id, block_id))
+    PRIMARY KEY ((org_id, block_id), storage_class, storage_key)
 );
 
 -- Discovery projection for `gc_block_candidates`: partition by (candidate_day,
 -- bucket) so the GC scanner can enumerate today's candidates across many
 -- partitions in parallel. `bucket = GCDiscoveryBucket(org_id, block_id)`.
--- Pattern mirrors `gc_share_links_by_expiry`.
+-- Pattern mirrors `gc_share_links_by_expiry`. The exact P is part of the key.
 CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day (
     candidate_day DATE,
     bucket        INT,
@@ -325,8 +440,9 @@ CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day (
     org_id        UUID,
     block_id      TEXT,
     storage_class TEXT,
-    PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id)
-) WITH CLUSTERING ORDER BY (candidate_at ASC, org_id ASC, block_id ASC);
+    storage_key   TEXT,
+    PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id, storage_class, storage_key)
+) WITH CLUSTERING ORDER BY (candidate_at ASC, org_id ASC, block_id ASC, storage_class ASC, storage_key ASC);
 
 -- Tracks one cleanup deadline per provisional upload referrer so abandoned
 -- uploads can be recovered one `up:` row at a time without injecting still-live
@@ -355,25 +471,187 @@ CREATE TABLE IF NOT EXISTS gc_provisional_block_refs_by_day (
 ) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, block_id ASC, referrer ASC);
 
 -- SHA-1 (external/Seafile client) → SHA-256 (internal) content-address mapping.
--- Per-(org, external) partition so concurrent uploads of different content
--- never share a Paxos partition.
+-- The desktop client downloads blocks by SHA-1, so this resolution stays.
+-- Keyed by the full (org, representation, external) identity: the same
+-- client-visible SHA-1 can legitimately name different stored bytes in
+-- different library block representations, and concurrent uploads of
+-- different content never share a Paxos partition. There is no reverse table;
+-- blocks.sha1 is the single-valued SHA-256 -> SHA-1 source.
 CREATE TABLE IF NOT EXISTS block_id_mappings (
-    org_id      UUID,
-    external_id TEXT,
-    internal_id TEXT,
-    created_at  TIMESTAMP,
-    PRIMARY KEY ((org_id, external_id))
+    org_id            UUID,
+    representation_id TEXT,
+    external_id       TEXT,
+    internal_id       TEXT,
+    created_at        TIMESTAMP,
+    PRIMARY KEY ((org_id, representation_id, external_id))
 );
 
--- Reverse lookup: internal SHA-256 → external SHA-1. `external_id` is kept as
--- a clustering column because multiple external aliases can point to the same
--- internal hash and we need to iterate them together.
-CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
-    org_id      UUID,
-    internal_id TEXT,
-    external_id TEXT,
-    created_at  TIMESTAMP,
-    PRIMARY KEY ((org_id, internal_id), external_id)
+-- PC-D1B.3: durable Mapping Authority for external SHA-1 -> canonical SHA-256.
+--
+-- `block_id_mappings` is an operational, mutable projection. Its row existing,
+-- or every replica agreeing on it, is not proof. The desktop sync upload path
+-- accepts a client-asserted SHA-1. Writers do a plain read-before-write INSERT
+-- with no LWT, so two same-key writers can both read "absent" and the later
+-- INSERT wins. A delayed or in-flight mutation, including a hint, can land after
+-- any read. This table is the separate, write-once authority that the
+-- certified-baseline certifier consumes for SHA-1-only file dependencies
+-- (docs/PC-D1B-METADATA-IDENTITY-AUTHORITY.md, PC-D1B.3). Promotion also
+-- freezes the ordinary row to the claim so later ordinary writes are inert.
+--
+-- The key is exactly the `block_id_mappings` identity
+-- ((org_id, representation_id, external_id)), so one mapping identity has one
+-- Paxos partition and never shares an LWT domain with any other mapping.
+--
+-- A claim is written only by the cold-path promotion after independent
+-- provenance: the canonical block belongs to the claimed representation and
+-- its stored bytes hash to both internal_id (SHA-256) and external_id (SHA-1).
+-- `evidence` records the provenance rule (only `physical_bytes_v1` is usable).
+-- Claims are INSERT ... IF NOT EXISTS under global SERIAL: the first claim
+-- fixes internal_id, an identical retry is idempotent and a different value is
+-- a conflict. Nothing updates or deletes a claim.
+--
+-- No TTL, deliberately, and the claim is independent of the mutable row:
+-- rewriting a `block_id_mappings` row must never retire or change the
+-- authority. Production never deletes `block_id_mappings` rows (R11a).
+-- Retirement is a separate future protocol
+-- (ISSUE-PCD1B-AUTHORITY-CLAIM-RETIREMENT-01).
+CREATE TABLE IF NOT EXISTS block_mapping_authority_claims (
+	org_id            UUID,
+	representation_id TEXT,
+	external_id       TEXT,
+	internal_id       TEXT,
+	contract_version  TEXT,
+	evidence          TEXT,
+	created_at        TIMESTAMP,
+	PRIMARY KEY ((org_id, representation_id, external_id))
+);
+
+-- PC-D1B: per-identity metadata authority claims.
+--
+-- A complete `commits` / `fs_objects` row is not proof that it is the
+-- authoritative version of that identity: no shared write-once protocol covers
+-- every writer, so two complete rows can disagree. This table is the durable
+-- provenance the certified-baseline certifier needs before it may witness a
+-- HEAD (ISSUE-PCD1B-METADATA-IDENTITY-AUTHORITY-01,
+-- docs/PC-D1B-METADATA-IDENTITY-AUTHORITY.md).
+--
+-- Partition key is the FULL triple, not (library_id) with clustering columns.
+-- `commits` and `fs_objects` are keyed ((library_id), id): claiming through a
+-- library-wide partition would serialize every identity in a library into one
+-- LWT partition. `block_id_mappings` already uses the full-triple layout for
+-- the same reason.
+--
+-- `digest` is the V1 digest of the frozen semantic projection defined by the
+-- identity-authority contract. It covers immutable commit and fs-object fields
+-- consumed by tree traversal, history, ancestry and retention readers, including
+-- `creator_id`, `description` and `created_at` on commits. Cassandra UUID values
+-- are parsed and encoded canonically; TEXT fields are encoded exactly as stored.
+-- Mutable display/path metadata is excluded, including `fs_objects.obj_name`,
+-- `fs_objects.full_path` and `fs_objects.mtime`. The claim is write-once: the
+-- first claim fixes the digest, an identical retry is idempotent, and a
+-- different digest is a conflict.
+--
+-- No TTL, deliberately. The claim must outlive its source row so a deleted and
+-- re-created key cannot mint fresh provenance (metadata ABA). The accepted cost
+-- is that claims accumulate for failed initializations, losing commits and
+-- deleted identities/libraries; retiring one is its own fenced protocol and is
+-- tracked as ISSUE-PCD1B-AUTHORITY-CLAIM-RETIREMENT-01.
+CREATE TABLE IF NOT EXISTS identity_authority_claims (
+	library_id     UUID,
+	identity_kind  TEXT,
+	identity_id    TEXT,
+	digest_version TEXT,
+	digest         TEXT,
+	created_at     TIMESTAMP,
+	PRIMARY KEY ((library_id, identity_kind, identity_id))
+);
+
+-- ─── Web Block Upload ────────────────────────────────────────────────────────
+
+-- Server-issued sessions for the web content-addressed (block) upload flow.
+-- See docs/WEB-BLOCK-UPLOAD.md.
+--
+-- A session ties a batch of /blocks/upload calls and the final file-from-blocks
+-- commit to one (org, user, repo), bounds them with a TTL, and records the
+-- committed result so a retried commit is idempotent instead of creating a
+-- duplicate auto-renamed file. `session_id` is a random 256-bit token that also
+-- serves as the provisional block reference owner ("up:<session_id>"), so a
+-- block uploaded under a session is only publishable by that same session.
+--
+-- Rows carry a TTL (aligned with the provisional block reference TTL) so
+-- abandoned sessions self-expire.
+--
+-- The admission contract is frozen at session creation so the rules in effect
+-- when the session was minted stay stable for its whole 48h life, even across
+-- config changes or restarts, without adding coordination to the
+-- /blocks/upload hot path:
+--   - slot                    : the per-user concurrency slot claimed (freed at commit).
+--   - expected_size           : the client-declared file size (fail-fast at creation,
+--                               re-checked against the manifest at commit).
+--   - expected_size_declared  : distinguishes an explicit size=0 (empty file) from
+--                               "size missing" so the commit guard only applies when
+--                               a size was actually declared.
+--   - block_size_bytes        : the authoritative CAS block size echoed to the client
+--                               and reused by /blocks/upload, so a live config change
+--                               cannot reject an in-flight upload's body size.
+--   - staged_bucket_count /
+--     staged_bucket_cap        : the staged-block ledger parameters, frozen so retries
+--                               hash into the SAME bucket partitions (a config change
+--                               must not move a block to a different bucket and count
+--                               it twice).
+CREATE TABLE IF NOT EXISTS block_upload_sessions (
+    session_id             TEXT,
+    org_id                 UUID,
+    user_id                UUID,
+    repo_id                UUID,
+    parent_dir             TEXT,
+    created_at             TIMESTAMP,
+    expires_at             TIMESTAMP,
+    committed              BOOLEAN,
+    manifest_digest        TEXT,
+    result_path            TEXT,
+    result_filename        TEXT,
+    result_commit_id       TEXT,
+    slot                   INT,
+    expected_size          BIGINT,
+    expected_size_declared BOOLEAN,
+    block_size_bytes       BIGINT,
+    staged_bucket_count    INT,
+    staged_bucket_cap      INT,
+    PRIMARY KEY (session_id)
+);
+
+-- Two drift-free, counter-free caps bound uncommitted (staged) backend bytes for
+-- the web block-upload flow without breaking legitimate large uploads and
+-- without reintroducing the same-size-overwrite rejection (R5):
+--
+--   (1) Per-user concurrent uncommitted-session cap — claimed atomically via LWT
+--       slots at session creation (never per block). One row per claimed slot;
+--       rows carry the session TTL so an abandoned session self-expires. The
+--       claimed slot number is stored on the session row so commit cleanup is a
+--       direct delete.
+CREATE TABLE IF NOT EXISTS block_upload_session_slots_by_user (
+    org_id     UUID,
+    user_id    UUID,
+    slot       INT,
+    session_id TEXT,
+    created_at TIMESTAMP,
+    PRIMARY KEY ((org_id, user_id), slot)
+);
+
+--   (2) Per-session staged-block cap — a BUCKETED ledger of the distinct NEW blocks
+--       a session has staged. Bucketing keeps the admission read O(1) rows (one small
+--       bucket) instead of an O(N^2) partition re-scan for large files. Normal rows +
+--       per-row TTL (no Cassandra COUNTER): the reserve is idempotent by
+--       ((session_id, bucket), block_id), so a retried block is never double-counted,
+--       and an abandoned session's rows self-expire.
+CREATE TABLE IF NOT EXISTS block_upload_session_staged_blocks (
+    session_id TEXT,
+    bucket     INT,
+    block_id   TEXT,
+    size_bytes BIGINT,
+    created_at TIMESTAMP,
+    PRIMARY KEY ((session_id, bucket), block_id)
 );
 
 -- ─── Share Links ─────────────────────────────────────────────────────────────
@@ -723,7 +1001,8 @@ CREATE TABLE IF NOT EXISTS repo_api_tokens_by_token (
 );
 
 -- Stateless file-operation tokens (Cassandra TTL handles expiration).
--- "token" is quoted because it is a reserved CQL keyword.
+-- "token" is quoted because it is a reserved CQL keyword. source_id is the
+-- stable, non-secret identity of a link-origin token's source.
 CREATE TABLE IF NOT EXISTS access_tokens (
     "token"    TEXT PRIMARY KEY,
     token_type TEXT,
@@ -733,6 +1012,7 @@ CREATE TABLE IF NOT EXISTS access_tokens (
     user_id    UUID,
     created_at TIMESTAMP,
     source     TEXT,
+    source_id  TEXT,
     replace_existing BOOLEAN
 );
 
@@ -766,15 +1046,26 @@ CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks (
 -- the exact IDs originally used in the pub:<commit> rows; this must not be
 -- reconstructed from fs_objects because different publish surfaces do not all
 -- stage the same identifier shape.
+--
+-- The reachability_* columns are durable positive-reachability progress: they
+-- let the cold-path classifier resume a walk from one SERIAL HEAD observation
+-- instead of restarting at a moving live HEAD. `reachability_anchor_exhausted`
+-- records a clean walk to genesis so a later SERIAL HEAD timeout cannot replay
+-- that prefix. Unset/null means the snapshot is not exhausted (Cassandra
+-- BOOLEAN unset is null, which is not equal to false). They are not cleanup
+-- authority and must not be written by the ordinary queue INSERT.
 CREATE TABLE IF NOT EXISTS published_block_reference_repairs (
-    bucket           INT,
-    org_id           UUID,
-    repo_id          UUID,
-    commit_id        TEXT,
-    fs_id            TEXT,
-    staged_block_ids LIST<TEXT>,
-    created_at       TIMESTAMP,
-    lease_expires_at TIMESTAMP,
+    bucket                             INT,
+    org_id                             UUID,
+    repo_id                            UUID,
+    commit_id                          TEXT,
+    fs_id                              TEXT,
+    staged_block_ids                   LIST<TEXT>,
+    created_at                         TIMESTAMP,
+    lease_expires_at                   TIMESTAMP,
+    reachability_anchor_head_commit_id TEXT,
+    reachability_cursor_commit_id      TEXT,
+    reachability_anchor_exhausted      BOOLEAN,
     PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)
 ) WITH default_time_to_live = 0;
 
@@ -1109,36 +1400,97 @@ CREATE TABLE IF NOT EXISTS file_tags_by_tag (
 
 -- ─── GC ──────────────────────────────────────────────────────────────────────
 
+-- Compaction: gc_queue, gc_pending_items, gc_active_orgs, gc_dirty_orgs and
+-- gc_failed_items use LeveledCompactionStrategy (docs/SCHEMA-BOTTLENECK-AUDIT.md
+-- item I, ISSUE-GC-QUEUE-RECOUNT-01). They are the only GC tables that combine
+-- (a) a long-lived hot partition with (b) continuous range/partition scans at
+-- the exact coordinates where insert+delete churn leaves tombstones:
+--
+--   gc_queue          (org_id, bucket)  -- DequeueBatch scans the head where
+--                                          completed-item tombstones accumulate
+--   gc_pending_items  (org_id, bucket)  -- pending markers, scanned + deleted
+--   gc_active_orgs    (bucket)          -- full-partition scan, churned membership
+--   gc_dirty_orgs     (bucket)          -- full-partition scan, churned membership
+--   gc_failed_items   (org_id)          -- DLQ, scanned + deleted by the expiry sweep
+--
+-- LCS reduces read amplification at those coordinates: ~90% of reads hit a
+-- single SSTable per level and the tombstone "chases" the row it shadows down
+-- the levels instead of sitting in a separate STCS SSTable that is re-scanned on
+-- every worker tick. The tombstone_threshold/tombstone_compaction_interval knobs
+-- are anticipatory: tombstone_threshold only counts tombstones already past
+-- gc_grace_seconds (kept at the 10-day default), so they only accelerate purge
+-- AFTER grace. Lowering gc_grace_seconds on these idempotent, leader-only-drained
+-- tables is a deferred follow-up, gated on re-measuring tombstone warnings under
+-- multi-node load. The date-bucketed discovery projections (gc_*_by_day,
+-- gc_failed_items_by_expiry) intentionally keep the default strategy: an aged
+-- partition falls out of the read window and its tombstones are never re-scanned.
+--
+-- Exact physical identity: block work carries the candidate's exact
+-- P = (candidate_storage_class, candidate_storage_key) in the queue, pending
+-- marker and DLQ keys (see gc_block_candidates). Non-block GC rows carry empty
+-- P values and are identified by identity_at.
+--
+-- block_representation_id persists the block representation with queued work
+-- (see deleted_libraries). library_guard_mode distinguishes a deleted-library
+-- cascade (child item must match one deleted_at identity) from orphan
+-- revalidation (must prove the canonical library row is absent); the boolean
+-- requires_library_deleted_check cannot express that distinction.
+
 -- Durable queue: items are removed only by explicit completion, requeue, or
 -- DLQ transfer. Ordered ASC for worker FIFO processing.
 CREATE TABLE IF NOT EXISTS gc_queue (
-    org_id        UUID,
-    bucket        INT,
-    queued_at     TIMESTAMP,
-    identity_at   TIMESTAMP,
+    org_id                         UUID,
+    bucket                         INT,
+    queued_at                      TIMESTAMP,
+    identity_at                    TIMESTAMP,
     requires_library_deleted_check BOOLEAN,
-    item_type     TEXT,
-    item_id       TEXT,
-    library_id    UUID,
-    storage_class TEXT,
-    retry_count   INT,
-    PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id)
-) WITH default_time_to_live = 0
+    library_guard_mode             TEXT,
+    item_type                      TEXT,
+    item_id                        TEXT,
+    library_id                     UUID,
+    block_representation_id        TEXT,
+    storage_class                  TEXT,
+    candidate_storage_class        TEXT,
+    candidate_storage_key          TEXT,
+    retry_count                    INT,
+    PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+  AND default_time_to_live = 0
   AND CLUSTERING ORDER BY (queued_at ASC);
 
+-- bloom_filter_fp_chance is pinned on gc_active_orgs and gc_dirty_orgs because
+-- Cassandra derives its default from the compaction class at CREATE time (0.1
+-- for LCS, 0.01 otherwise). These two tables were created with the default
+-- strategy and switched to LCS by ALTER before the v1 fold, which kept 0.01;
+-- pinning it keeps the folded baseline identical. Changing it is a separate,
+-- measured tuning decision, not part of the fold.
 CREATE TABLE IF NOT EXISTS gc_active_orgs (
     bucket           INT,
     org_id           UUID,
     last_enqueued_at TIMESTAMP,
     PRIMARY KEY ((bucket), org_id)
-);
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+  AND bloom_filter_fp_chance = 0.01;
 
 CREATE TABLE IF NOT EXISTS gc_dirty_orgs (
     bucket    INT,
     org_id    UUID,
     marked_at TIMESTAMP,
     PRIMARY KEY ((bucket), org_id)
-);
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+  AND bloom_filter_fp_chance = 0.01;
 
 CREATE TABLE IF NOT EXISTS gc_org_stats (
     org_id           UUID PRIMARY KEY,
@@ -1150,23 +1502,32 @@ CREATE TABLE IF NOT EXISTS gc_org_stats (
 );
 
 CREATE TABLE IF NOT EXISTS gc_failed_items (
-    org_id            UUID,
-    failed_at         TIMESTAMP,
-    expires_at        TIMESTAMP,
-    queued_at         TIMESTAMP,
-    identity_at       TIMESTAMP,
+    org_id                         UUID,
+    failed_at                      TIMESTAMP,
+    expires_at                     TIMESTAMP,
+    queued_at                      TIMESTAMP,
+    identity_at                    TIMESTAMP,
     requires_library_deleted_check BOOLEAN,
-    item_type         TEXT,
-    item_id           TEXT,
-    library_id        UUID,
-    storage_class     TEXT,
-    retry_count       INT,
-    last_error        TEXT,
-    failure_code      TEXT,
-    resolution_status TEXT,
-    resolved_at       TIMESTAMP,
-    PRIMARY KEY ((org_id), failed_at, item_type, item_id)
-) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
+    library_guard_mode             TEXT,
+    item_type                      TEXT,
+    item_id                        TEXT,
+    library_id                     UUID,
+    block_representation_id        TEXT,
+    storage_class                  TEXT,
+    candidate_storage_class        TEXT,
+    candidate_storage_key          TEXT,
+    retry_count                    INT,
+    last_error                     TEXT,
+    failure_code                   TEXT,
+    resolution_status              TEXT,
+    resolved_at                    TIMESTAMP,
+    PRIMARY KEY ((org_id), failed_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+  AND CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC, candidate_storage_class ASC, candidate_storage_key ASC, identity_at ASC)
   AND default_time_to_live = 0;
 -- ^ No table TTL on purpose. DLQ cleanup is the scanner-driven explicit expiry
 -- below: it deletes at failed_at + 30d, removes the projection and pending
@@ -1183,29 +1544,39 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
 -- store so failed_depth and pending markers move together with the DLQ row and
 -- the org is marked dirty for an exact refresh.
 CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
-    expiry_day DATE,
-    bucket     INT,
-    expires_at TIMESTAMP,
-    org_id     UUID,
-    failed_at  TIMESTAMP,
-    item_type  TEXT,
-    item_id    TEXT,
-    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id)
-) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC)
+    expiry_day              DATE,
+    bucket                  INT,
+    expires_at              TIMESTAMP,
+    org_id                  UUID,
+    failed_at               TIMESTAMP,
+    item_type               TEXT,
+    item_id                 TEXT,
+    candidate_storage_class TEXT,
+    candidate_storage_key   TEXT,
+    identity_at             TIMESTAMP,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id, candidate_storage_class, candidate_storage_key, identity_at)
+) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC, candidate_storage_class ASC, candidate_storage_key ASC, identity_at ASC)
   AND default_time_to_live = 0;
 
 -- Live queue and DLQ markers persist until the queue/DLQ row is resolved.
 -- Failed-item retention is enforced explicitly by gc_failed_items_by_expiry so
 -- pending markers cannot expire before the failed row that suppresses retries.
 CREATE TABLE IF NOT EXISTS gc_pending_items (
-    org_id      UUID,
-    bucket      INT,
-    item_type   TEXT,
-    library_id  UUID,
-    item_id     TEXT,
-    identity_at TIMESTAMP,
-    PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id, identity_at)
-) WITH default_time_to_live = 0;
+    org_id                  UUID,
+    bucket                  INT,
+    item_type               TEXT,
+    library_id              UUID,
+    item_id                 TEXT,
+    candidate_storage_class TEXT,
+    candidate_storage_key   TEXT,
+    identity_at             TIMESTAMP,
+    PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id, candidate_storage_class, candidate_storage_key, identity_at)
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+  AND default_time_to_live = 0;
 
 -- Metadata/checkpoint table for GC snapshots, scanner cursors, and projection
 -- rebuild state. The runtime may persist last successful scan days and the
@@ -1234,24 +1605,51 @@ IF NOT EXISTS;
 
 -- When the GC worker deletes the canonical `blocks` row before the backing S3
 -- object, any S3 failure would otherwise leak storage forever. This recovery
--- table lets the scanner retry deletes later. The 90-day TTL bounds growth.
--- Per-block partition like `blocks` itself: a hot platform org no longer
--- concentrates all S3-orphan rows in one Cassandra partition.
+-- table lets the scanner retry deletes later. Per-block partition like `blocks`
+-- itself: a hot platform org does not concentrate all S3-orphan rows in one
+-- Cassandra partition.
+--
+-- Exact (P,D) identity: P = (storage_class, storage_key) and
+-- D = (gc_claim_id, gc_claimed_at) are part of the key, so two lives of one
+-- logical block occupy two rows and the orphan stores the same D committed by
+-- blocks.gc_orphan_handoff. storage_key is the exact canonical physical locator:
+-- recovery reloads it from this row at EACH_QUORUM and must never derive a
+-- replacement key from block_id. external_sha1 + recovery_phase persist the
+-- server-derived SHA-1 and recovery phase (pending_s3 / pending_mapping_cleanup)
+-- for the conservative canonical-state characterization across restarts. No
+-- TTL: recovery identities must not expire before settlement.
 CREATE TABLE IF NOT EXISTS gc_s3_orphans (
     org_id          UUID,
     block_id        TEXT,
     storage_class   TEXT,
+    storage_key     TEXT,
+    gc_claim_id     TEXT,
+    gc_claimed_at   TIMESTAMP,
     first_seen_at   TIMESTAMP,
     last_attempt_at TIMESTAMP,
     retry_count     INT,
     last_error      TEXT,
-    PRIMARY KEY ((org_id, block_id))
-) WITH default_time_to_live = 7776000;
+    external_sha1   TEXT,
+    recovery_phase  TEXT,
+    recovery_state  TEXT,
+    PRIMARY KEY ((org_id, block_id), storage_class, storage_key, gc_claim_id, gc_claimed_at)
+) WITH default_time_to_live = 0;
 
 -- Discovery projection for `gc_s3_orphans`: partition by (first_seen_day, bucket)
 -- so the scanner can walk recent orphans in parallel without enumerating
--- partitions by org. Same TTL as the canonical row so the projection cannot
--- outlive the source. Pattern mirrors `gc_block_candidates_by_day`.
+-- partitions by org. Pattern mirrors `gc_block_candidates_by_day`.
+--
+-- Non-authoritative scheduling projection and physically identity-only (R22a/
+-- R22b): every column is part of the key, so a row carries no regular cells, no
+-- ambiguous prefix and no mutable state, and recovery authority stays on the
+-- canonical row. Its primary-key liveness IS the row, and only INSERT writes
+-- that liveness; an UPDATE is inexpressible while no regular column exists.
+-- Re-adding a regular column would make an UPDATE-based writer expressible
+-- again, and such a row's lifetime would become its payload cell's: it would
+-- disappear when that cell is deleted or expires, dropping an identity that was
+-- still supposed to be recoverable. Publication must stay an INSERT
+-- (TestR22bProjectionWriteIsInsert; TestGC_R22bProjectionRowIsIdentityOnly
+-- checks against the real engine that such a row reads back and enumerates).
 CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day (
     first_seen_day DATE,
     bucket         INT,
@@ -1259,9 +1657,72 @@ CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day (
     org_id         UUID,
     block_id       TEXT,
     storage_class  TEXT,
-    PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id)
-) WITH CLUSTERING ORDER BY (first_seen_at ASC, org_id ASC, block_id ASC)
-  AND default_time_to_live = 7776000;
+    storage_key    TEXT,
+    gc_claim_id    TEXT,
+    gc_claimed_at  TIMESTAMP,
+    PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id,
+                 storage_class, storage_key, gc_claim_id, gc_claimed_at)
+) WITH CLUSTERING ORDER BY (
+    first_seen_at ASC,
+    org_id ASC,
+    block_id ASC,
+    storage_class ASC,
+    storage_key ASC,
+    gc_claim_id ASC,
+    gc_claimed_at ASC
+)
+  AND default_time_to_live = 0;
+
+-- Independent, non-expiring restart root for orphan recovery (G1). Fixed
+-- buckets deliberately avoid a time horizon: cold start scans every bucket and
+-- can find identities of any age. The root is an enumeration surface only and
+-- carries no lifecycle state; canonical recovery state remains authoritative
+-- and a root row never authorizes a physical delete.
+CREATE TABLE IF NOT EXISTS gc_s3_orphan_recovery_roots (
+    root_bucket   INT,
+    gc_claimed_at TIMESTAMP,
+    org_id        UUID,
+    block_id      TEXT,
+    storage_class TEXT,
+    storage_key   TEXT,
+    gc_claim_id   TEXT,
+    created_at    TIMESTAMP,
+    first_seen_at TIMESTAMP,
+    PRIMARY KEY ((root_bucket), gc_claimed_at, org_id, block_id,
+                 storage_class, storage_key, gc_claim_id)
+) WITH CLUSTERING ORDER BY (
+    gc_claimed_at ASC,
+    org_id ASC,
+    block_id ASC,
+    storage_class ASC,
+    storage_key ASC,
+    gc_claim_id ASC
+)
+  AND default_time_to_live = 0;
+
+-- Durable block-delete lifecycle tombstone of D (P4b-2). gc_orphan_handoff on
+-- blocks is irreversible for a live row, but Finalize deletes that row and
+-- recovery then clears gc_s3_orphans; a stale CommittedOwner that still holds D
+-- in memory must not publish the orphan again or treat AlreadyFinalized as
+-- license to DELETE P. Once phase is terminal, the same claim_id cannot
+-- publish, finalize, or physically delete.
+--
+-- PRIMARY KEY includes claim_id so a later life D2 of the same logical block
+-- occupies a different row. Do not DELETE these rows. first_seen_at is the
+-- write-once G1 token: StartBlockDeleteOrphan selects it through the lifecycle
+-- INSERT IF NOT EXISTS before publishing the ordinary recovery root, so the
+-- root stays free of LWT/SERIAL while concurrent callers reuse one token.
+CREATE TABLE IF NOT EXISTS gc_block_delete_lifecycles (
+    org_id        UUID,
+    block_id      TEXT,
+    claim_id      TEXT,
+    claimed_at    TIMESTAMP,
+    storage_class TEXT,
+    storage_key   TEXT,
+    phase         TEXT,
+    first_seen_at TIMESTAMP,
+    PRIMARY KEY ((org_id, block_id), claim_id)
+);
 
 -- Leadership lease so only one enabled replica runs worker/scanner/rollover
 -- work at a time.
