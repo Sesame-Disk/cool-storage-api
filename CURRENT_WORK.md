@@ -5,9 +5,13 @@
 [Plan and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md): real Cassandra/S3 RED on
 main@bb89d7b12. An in-flight productive Sync publication inside the Phase 6
 selector's gap loses HEAD's root/file fs_objects and permanent `fs:` reference;
-a writer listed before the scan is kept. Evidence-gated test only, no fix and no
+a writer listed before the scan is kept. The audit also reproduced a race-free
+worker directory cascade that deletes a shared HEAD file and, once its `up:`
+pin lapses, queues HEAD's block for GC. Evidence-gated test only, no fix and no
 runtime behaviour change. Next: the maintainer decides the P6-2 option (plan §5).
-`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` OPEN; PRE-GC/A1 OPEN, ordinary GC OFF.
+`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` and
+`ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01` OPEN; PRE-GC/A1 OPEN,
+ordinary GC OFF.
 
 ## Previous slice: v1 baseline schema fold (2026-10-19)
 

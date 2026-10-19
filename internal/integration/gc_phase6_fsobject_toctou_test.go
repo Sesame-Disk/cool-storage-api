@@ -20,9 +20,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// Destructive real-stack evidence for ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01.
-// It asserts the safety property, so it is RED on a runtime without a fix and
-// stays out of ordinary runs until that fix makes it GREEN.
+// Destructive real-stack evidence for ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01
+// and ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01. It asserts the
+// safety property, so it is RED on a runtime without a fix and stays out of
+// ordinary runs until that fix makes it GREEN.
 const gcPhase6TOCTOUEvidenceEnv = "SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE"
 
 // The real Phase 6 selector, narrowed to one owned library. The productive
@@ -61,8 +62,8 @@ func (s *phase6InFlightStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]
 // library's fs_object rows. Every mutation runs through the real store.
 type phase6OwnedQueue struct {
 	gcpkg.GCStore
-	org, library uuid.UUID
-	executed     []string
+	library  uuid.UUID
+	dequeued []string
 }
 
 func (s *phase6OwnedQueue) DequeueBatch(org uuid.UUID, _ int, cutoff time.Time) ([]gcpkg.QueueItem, error) {
@@ -72,9 +73,9 @@ func (s *phase6OwnedQueue) DequeueBatch(org uuid.UUID, _ int, cutoff time.Time) 
 	}
 	var owned []gcpkg.QueueItem
 	for _, row := range rows {
-		if row.OrgID == s.org && row.LibraryID == s.library && row.ItemType == gcpkg.ItemFSObject {
+		if row.LibraryID == s.library && row.ItemType == gcpkg.ItemFSObject {
 			owned = append(owned, row)
-			s.executed = append(s.executed, row.ItemID)
+			s.dequeued = append(s.dequeued, row.ItemID)
 		}
 	}
 	return owned, nil
@@ -97,18 +98,33 @@ func phase6OwnedItems(t *testing.T, store *gcpkg.CassandraStore, org, library uu
 	return owned
 }
 
-// The server shares this keyspace; its own GC would scan the same library.
+// Every configured API replica shares this keyspace; one with GC on would scan
+// the same library. Replicas not named in the environment cannot be checked:
+// the evidence needs an isolated backend.
 func phase6RequireServerGCOff(t *testing.T) {
 	t.Helper()
-	resp := superadminClient.Get(t, "/api/v2.1/admin/gc/status")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("cannot confirm server GC is off: GET /api/v2.1/admin/gc/status = %d", resp.StatusCode)
-	}
-	var body map[string]interface{}
-	decodeJSON(t, resp, &body)
-	if enabled, ok := body["enabled"].(bool); !ok || enabled {
-		t.Fatalf("Phase 6 evidence needs an isolated backend with GC disabled: enabled=%v", body["enabled"])
+	seen := map[string]bool{}
+	for _, key := range []string{"SESAMEFS_URL", "SESAMEFS_URL_2", "SESAMEFS_URL_3"} {
+		url := os.Getenv(key)
+		if key == "SESAMEFS_URL" {
+			url = superadminClient.baseURL
+		}
+		if url == "" || seen[url] {
+			continue
+		}
+		seen[url] = true
+		resp := newTestClient(url, superadminClient.token).Get(t, "/api/v2.1/admin/gc/status")
+		var body map[string]interface{}
+		if resp.StatusCode == http.StatusOK {
+			decodeJSON(t, resp, &body)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("cannot confirm GC is off on %s (%s): status %d", url, key, resp.StatusCode)
+		}
+		if enabled, ok := body["enabled"].(bool); !ok || enabled {
+			t.Fatalf("Phase 6 evidence needs every replica with GC disabled: %s enabled=%v", url, body["enabled"])
+		}
 	}
 }
 
@@ -124,10 +140,22 @@ func phase6FSObjectExists(t *testing.T, store *gcpkg.CassandraStore, library uui
 	return true
 }
 
-// Two legs share one productive Sync writer. "in-flight-gap" lands it between
-// the selector's commit and fs_object listings (the RED). "listed-before-scan"
-// lands it first, so its commit is in the keep set: the control that the gap,
-// not the writer or the oracle, causes the loss.
+const (
+	phase6InFlightGap      = "in-flight-gap"
+	phase6ListedBeforeScan = "listed-before-scan"
+	phase6OrphanSharesFile = "orphan-shares-head-file"
+	phase6OrphanSharesAged = "orphan-shares-aged-head-file"
+)
+
+// All legs share one productive Sync writer and one received-but-uncommitted
+// orphan directory. "in-flight-gap" lands the writer between the selector's
+// commit and fs_object listings. "listed-before-scan" lands it first, so its
+// commit is in the keep set: the control that the gap, not the writer or the
+// oracle, causes that loss. "orphan-shares-head-file" publishes HEAD before the
+// scan and gives the orphan HEAD's file as its child: no race, only the
+// worker's directory cascade. "orphan-shares-aged-head-file" is the same after
+// an explicit lapse of the Sync up: pin (its 48h TTL), as for a file that has
+// been in HEAD longer: the permanent fs: is then its only reference.
 func TestGCPhase6InFlightSyncPublicationKeepsHeadTree(t *testing.T) {
 	if os.Getenv(gcPhase6TOCTOUEvidenceEnv) != "1" {
 		t.Skipf("destructive Phase 6 evidence on owned fixtures; RED until the Phase 6 fix: %s=1", gcPhase6TOCTOUEvidenceEnv)
@@ -138,21 +166,28 @@ func TestGCPhase6InFlightSyncPublicationKeepsHeadTree(t *testing.T) {
 		t.Fatalf("Phase 6 evidence requires Cassandra: %v", err)
 	}
 	phase6RequireServerGCOff(t)
-	for _, leg := range []struct {
-		name  string
-		inGap bool
-	}{{"in-flight-gap", true}, {"listed-before-scan", false}} {
-		t.Run(leg.name, func(t *testing.T) { phase6Leg(t, database, leg.name, leg.inGap) })
+	for _, leg := range []string{phase6InFlightGap, phase6ListedBeforeScan, phase6OrphanSharesFile, phase6OrphanSharesAged} {
+		t.Run(leg, func(t *testing.T) { phase6Leg(t, database, leg) })
 	}
 }
 
-func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
+func phase6Leg(t *testing.T, database *dbpkg.DB, leg string) {
 	class := x1StorageClass(t)
 	fx := &w2CreateFileFixture{w2UploadFileFixture: newW2UploadFileFixture(t, database, newBorrowedFSHeadHandler(t, database, class))}
-	syncRef := dbpkg.BlockReferrerForUpload("sync:" + fx.repoID + ":" + fx.blockID)
-	cleanupUploadedBlockArtifactsForTest(t, fx.orgID, fx.repoID, fx.blockID, fx.sha1ID, syncRef)
 	library := uuid.MustParse(fx.repoID)
 	store := gcpkg.NewCassandraStore(database)
+	handler := w24Handler(t, database, class)
+
+	// The Sync upload (same objects as the E1-7 fresh leg).
+	fileJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"block_ids": []string{fx.sha1ID}, "size": len(fx.content), "type": 1, "version": 1})
+	file := syncSHA1HexForTest(fileJSON)
+	rootJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"dirents": []apipkg.FSEntry{{ID: file, Mode: 33188, Mtime: time.Now().Unix(), Name: fx.filename, Size: int64(len(fx.content))}}, "type": 3, "version": 1})
+	root := syncSHA1HexForTest(rootJSON)
+	commit := syncSHA1HexForTest([]byte("phase6-" + uuid.NewString()))
+	payload := mustMarshalSyncObjectForTest(t, map[string]interface{}{"commit_id": commit, "repo_id": fx.repoID, "root_id": root, "parent_id": fx.headBefore, "description": "Phase 6 in-flight publication", "ctime": time.Now().Unix(), "version": 1})
+	syncRef := dbpkg.BlockReferrerForUpload("sync:" + fx.repoID + ":" + fx.blockID)
+	permanent := dbpkg.BlockReferrerForFSObject(fx.repoID, file)
+	cleanupUploadedBlockArtifactsForTest(t, fx.orgID, fx.repoID, fx.blockID, fx.sha1ID, syncRef, permanent)
 	t.Cleanup(func() {
 		for bucket := 0; bucket < dbpkg.PublishedBlockReferenceRepairBuckets; bucket++ {
 			if err := database.Session().Query(`DELETE FROM published_block_reference_repairs WHERE bucket = ? AND org_id = ? AND repo_id = ?`, bucket, fx.orgID, fx.repoID).Exec(); err != nil {
@@ -181,33 +216,49 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
 		resp.Body.Close()
 	})
 
-	handler := w24Handler(t, database, class)
-	// Positive control: received metadata that no commit references.
-	orphanJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"dirents": []apipkg.FSEntry{{ID: sha1hex([]byte("phase6-orphan-child-" + uuid.NewString())), Mode: 33188, Mtime: time.Now().Unix(), Name: "phase6-orphan-" + uuid.NewString()[:8] + ".txt", Size: 1}}, "type": 3, "version": 1})
-	orphan := syncSHA1HexForTest(orphanJSON)
-	e17OK(t, e17Request(fx, http.MethodPost, "/recv-fs", "", "", packSyncFSObjectsForTest(t, syncPackedFSObject{fsID: orphan, jsonData: orphanJSON}), handler.RecvFS))
-
-	// The in-flight Sync upload (same objects as the E1-7 fresh leg).
-	fileJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"block_ids": []string{fx.sha1ID}, "size": len(fx.content), "type": 1, "version": 1})
-	file := syncSHA1HexForTest(fileJSON)
-	rootJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"dirents": []apipkg.FSEntry{{ID: file, Mode: 33188, Mtime: time.Now().Unix(), Name: fx.filename, Size: int64(len(fx.content))}}, "type": 3, "version": 1})
-	root := syncSHA1HexForTest(rootJSON)
-	commit := syncSHA1HexForTest([]byte("phase6-" + uuid.NewString()))
-	payload := mustMarshalSyncObjectForTest(t, map[string]interface{}{"commit_id": commit, "repo_id": fx.repoID, "root_id": root, "parent_id": fx.headBefore, "description": "Phase 6 in-flight publication", "ctime": time.Now().Unix(), "version": 1})
-	if phase6FSObjectExists(t, store, library, file) || phase6FSObjectExists(t, store, library, root) || !phase6FSObjectExists(t, store, library, orphan) {
-		t.Fatal("fixture precondition: only the orphan control exists before the scan")
-	}
-
 	writer := func() {
 		e17OK(t, e17Request(fx, http.MethodPut, "/commit/"+commit, "commit_id", commit, payload, handler.PutCommit))
 		e17OK(t, e17Request(fx, http.MethodPost, "/recv-fs", "", "", packSyncFSObjectsForTest(t, syncPackedFSObject{fsID: file, jsonData: fileJSON}, syncPackedFSObject{fsID: root, jsonData: rootJSON}), handler.RecvFS))
 	}
+	publish := func() {
+		e17OK(t, e17Request(fx, http.MethodPut, "/block/"+fx.sha1ID, "block_id", fx.sha1ID, fx.content, handler.PutBlock))
+		fx.target = fx.readTarget(t)
+		e17OK(t, e17Request(fx, http.MethodPut, "/commit/HEAD?head="+commit, "commit_id", "HEAD", nil, handler.PutCommit))
+		if head := borrowedFSReadHead(t, database, fx.orgID, fx.repoID); head != commit {
+			t.Fatalf("HEAD=%s want=%s", head, commit)
+		}
+		w24AssertHeadReaches(t, fx, commit, file)
+		e17AssertRefs(t, fx, syncRef, permanent)
+	}
+	// Positive control: received metadata that no commit references. Its child
+	// does not exist, except in the cascade leg, where it is HEAD's file.
+	cascade := leg == phase6OrphanSharesFile || leg == phase6OrphanSharesAged
+	orphanChild := sha1hex([]byte("phase6-orphan-child-" + uuid.NewString()))
+	if cascade {
+		writer()
+		publish()
+		orphanChild = file
+	}
+	if leg == phase6OrphanSharesAged {
+		if err := database.RemoveBlockReference(fx.orgID, fx.blockID, syncRef); err != nil {
+			t.Fatal(err)
+		}
+		e17AssertRefs(t, fx, permanent)
+	}
+	orphanJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"dirents": []apipkg.FSEntry{{ID: orphanChild, Mode: 33188, Mtime: time.Now().Unix(), Name: "phase6-orphan-" + uuid.NewString()[:8] + ".txt", Size: 1}}, "type": 3, "version": 1})
+	orphan := syncSHA1HexForTest(orphanJSON)
+	e17OK(t, e17Request(fx, http.MethodPost, "/recv-fs", "", "", packSyncFSObjectsForTest(t, syncPackedFSObject{fsID: orphan, jsonData: orphanJSON}), handler.RecvFS))
+	if exists := phase6FSObjectExists(t, store, library, file); exists != cascade || !phase6FSObjectExists(t, store, library, orphan) {
+		t.Fatal("fixture precondition: before the scan only the orphan control (and, in the cascade leg, HEAD's tree) exists")
+	}
+
 	scope := &phase6InFlightStore{GCStore: store, library: library, inGap: func() {}}
 	want := []string{orphan}
-	if inGap {
+	switch leg {
+	case phase6InFlightGap:
 		scope.inGap = writer
 		want = append(want, root, file)
-	} else {
+	case phase6ListedBeforeScan:
 		writer()
 	}
 	n, err := gcpkg.NewScanner(scope, gcpkg.NewQueue(scope), &gcpkg.Stats{}, config.GCConfig{}).ScanAutoDeleteExpiredObjectsOnce(t.Context())
@@ -229,18 +280,12 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
 	}
 
 	// The client completes; HEAD now depends on the selected objects.
-	e17OK(t, e17Request(fx, http.MethodPut, "/block/"+fx.sha1ID, "block_id", fx.sha1ID, fx.content, handler.PutBlock))
-	fx.target = fx.readTarget(t)
-	e17OK(t, e17Request(fx, http.MethodPut, "/commit/HEAD?head="+commit, "commit_id", "HEAD", nil, handler.PutCommit))
-	if head := borrowedFSReadHead(t, database, fx.orgID, fx.repoID); head != commit {
-		t.Fatalf("HEAD=%s want=%s", head, commit)
+	if !cascade {
+		publish()
 	}
-	w24AssertHeadReaches(t, fx, commit, file)
-	permanent := dbpkg.BlockReferrerForFSObject(fx.repoID, file)
-	e17AssertRefs(t, fx, syncRef, permanent)
 
 	// The real worker executes the selection made against the old HEAD.
-	owned := &phase6OwnedQueue{GCStore: store, org: fx.orgUUID, library: library}
+	owned := &phase6OwnedQueue{GCStore: store, library: library}
 	worker := w2Worker(t, owned, class)
 	for pass := 0; pass < 4; pass++ {
 		processed, err := worker.ProcessOrgOnce(t.Context(), fx.orgUUID)
@@ -265,10 +310,10 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
 	}
 	// Safety oracle. Each check is reported separately so RED names every loss.
 	if !phase6FSObjectExists(t, store, library, root) {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: HEAD root fs_object %s deleted", root)
+		t.Errorf("PHASE6 VIOLATION (%s): HEAD root fs_object %s deleted", leg, root)
 	}
 	if !phase6FSObjectExists(t, store, library, file) {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: HEAD file fs_object %s deleted", file)
+		t.Errorf("PHASE6 VIOLATION (%s): HEAD file fs_object %s deleted", leg, file)
 	}
 	refs, err := database.ListBlockReferrers(fx.orgID, fx.blockID)
 	if err != nil {
@@ -276,7 +321,7 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
 	}
 	sort.Strings(refs)
 	if !containsStringForTest(refs, permanent) {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: permanent %s removed while HEAD reaches it; refs=%v", permanent, refs)
+		t.Errorf("PHASE6 VIOLATION (%s): permanent %s removed while HEAD reaches it; refs=%v", leg, permanent, refs)
 	}
 	var candidates int
 	if err := database.Session().Query(`SELECT count(*) FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, fx.orgID, fx.blockID).Scan(&candidates); err != nil {
@@ -289,16 +334,16 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, inGap bool) {
 		}
 	}
 	if candidates != 0 || blockRows != 0 {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: HEAD block %s became a GC candidate: candidates=%d queued=%d", fx.blockID, candidates, blockRows)
+		t.Errorf("PHASE6 VIOLATION (%s): HEAD block %s became a GC candidate: candidates=%d queued=%d", leg, fx.blockID, candidates, blockRows)
 	}
 	canonical, canonicalErr := store.GetBlockInfo(fx.orgUUID, fx.blockID)
 	if canonicalErr != nil || canonical.StorageKey != fx.target.StorageKey {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: canonical P changed: %+v err=%v", canonical, canonicalErr)
+		t.Errorf("PHASE6 VIOLATION (%s): canonical P changed: %+v err=%v", leg, canonical, canonicalErr)
 	}
 	data, bytesErr := newVerificationBlockStore(t, fx.orgID).GetBlockByStorageKey(t.Context(), fx.target.StorageKey)
 	if bytesErr != nil || !bytes.Equal(data, fx.content) {
-		t.Errorf("PHASE6 TOCTOU VIOLATION: HEAD bytes at %s lost: %v", fx.target.StorageKey, bytesErr)
+		t.Errorf("PHASE6 VIOLATION (%s): HEAD bytes at %s lost: %v", leg, fx.target.StorageKey, bytesErr)
 	}
-	t.Logf("EVIDENCE phase6 leg=%s: HEAD=%s root=%s file=%s orphan=%s executed=%v refs=[%s] candidates=%d queuedBlock=%d canonical=%v bytes=%v",
-		leg, commit, root, file, orphan, owned.executed, strings.Join(refs, " "), candidates, blockRows, canonicalErr == nil, bytesErr == nil)
+	t.Logf("EVIDENCE phase6 leg=%s: HEAD=%s root=%s file=%s orphan=%s dequeued=%v refs=[%s] candidates=%d queuedBlock=%d canonical=%v bytes=%v",
+		leg, commit, root, file, orphan, owned.dequeued, strings.Join(refs, " "), candidates, blockRows, canonicalErr == nil, bytesErr == nil)
 }
