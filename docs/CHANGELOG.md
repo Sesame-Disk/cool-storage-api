@@ -17,7 +17,7 @@ Cassandra/S3. A publication inside the selector's gap loses HEAD's root/file
 fs_objects and permanent `fs:` reference; a writer before the scan is kept.
 Without a race, the worker's directory cascade deletes a HEAD file shared by a
 selected directory and, with the `up:` pin lapsed, queues HEAD's block for GC.
-Each RED leg failed identically in 4/4 final runs (1 with race). Registers
+Each RED leg failed identically in 3/3 final runs (1 with race). Registers
 `ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` (P1 PRE-GC),
 `ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01` (P0 latent provisional,
 PRE-GC) and `ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01` (P2). Adds the

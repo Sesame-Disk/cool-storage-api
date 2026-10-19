@@ -7255,7 +7255,7 @@ Reproduced schedule: a productive Sync `PutCommit` + `RecvFS` lands between the
 selector's commit listing and its fs_object listing; the client then completes
 `PutBlock` and `PUT commit/HEAD`; the real worker executes the stale selection.
 HEAD's root and file fs_objects and the permanent `fs:<repo>:<file>` reference
-are deleted while HEAD depends on them (12/12 runs, 3 with race; 4 on the final test source). The same
+are deleted while HEAD depends on them (15/15 runs, 4 with race; 3 on the final test source). The same
 writer landing before the scan keeps everything (control). The Sync `up:` pin
 (48h TTL) was the only remaining reference, so no block candidate was created and
 the canonical row and S3 bytes survived in this run; whether its later expiry
@@ -7290,8 +7290,8 @@ references.
 
 Reproduced with HEAD published before the scan and a received orphan directory
 whose child is HEAD's file: the scan selects only the orphan, then the worker
-deletes HEAD's file fs_object and its permanent `fs:` reference (4/4 runs, 1
-with race). With the Sync `up:` pin explicitly lapsed first (its 48h TTL, as for
+deletes HEAD's file fs_object and its permanent `fs:` reference (7/7 runs, 2
+with race; 3 on the final test source). With the Sync `up:` pin explicitly lapsed first (its 48h TTL, as for
 a file that has been in HEAD longer), zero references remain and the worker
 itself puts HEAD's block in `gc_block_candidates` and the queue. The block item
 was not executed, so S3 deletion is not measured. The off-chain-commit form was

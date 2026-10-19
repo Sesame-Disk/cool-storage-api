@@ -100,10 +100,12 @@ cascade propagates that mode to every child it enqueues.
 ([test](../internal/integration/gc_phase6_fsobject_toctou_test.go)) runs only
 with `SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE=1`, which is wired into
 TestMain's evidence chain. The standard Compose integration runners deliberately
-do not set it while it is RED. It fails closed if Cassandra is unreachable or
-any configured API replica (`SESAMEFS_URL`, `_2`, `_3`) reports GC enabled,
-because such a replica would scan the same library. Replicas not named in the
-environment cannot be checked: run it only against an isolated backend.
+do not set it while it is RED. It fails closed if Cassandra is unreachable, and
+through the shared `e19RequireNoBackgroundGC` check if it is not in the Docker
+evidence runner or any API replica (`SESAMEFS_URL`, `_2`, `_3`, defaulting to
+node-2/node-3) does not report GC disabled, because such a replica would scan
+the same library. A leg that skips before its oracle (for example, S3 or the
+storage class unavailable) fails the test instead of passing as evidence.
 
 - **Writer:** productive Sync handlers in-process (`PutCommit`, `RecvFS`,
   `PutBlock`, `PUT commit/HEAD`), the same objects as the E1-7 fresh leg.
@@ -116,6 +118,8 @@ environment cannot be checked: run it only against an isolated backend.
 - **Worker:** the real `ProcessOrgOnce`. The fixture library lives in a shared
   org, so dequeue returns only that library's fs_object rows; block rows are
   reported, not executed. The run must drain that selection, or it fails.
+  Owned rows are found through `DequeueBatch` on the shared org, as in the E1
+  helpers; its 100000-row bound would hide rows only in a far busier org.
 - **Legs:**
 
   | Leg | Schedule | On main |
@@ -148,8 +152,9 @@ and worker code ran from the branch source. The primary development backend
 
 | Run | Result |
 |---|---|
-| Final source, 4 runs (3 normal, 1 `-race`) | Identical in each. `in-flight-gap`: root fs_object deleted, file fs_object deleted, permanent `fs:<repo>:<file>` removed; only `up:sync` remains, no candidate, canonical and S3 bytes intact. `listed-before-scan`: PASS. `orphan-shares-head-file`: file fs_object deleted and permanent `fs:` removed; root intact; only `up:sync` remains, no candidate. `orphan-shares-aged-head-file`: file fs_object deleted, permanent `fs:` removed, zero references left, HEAD's block in `gc_block_candidates` and queued (candidates=1, queued=1); canonical row and bytes still intact because the block item was not executed. Exit 1; no data race, no cleanup error |
-| Earlier iterations of the race legs, 8 runs (6 normal, 2 `-race`) | the same three race violations and a passing control in every run. The first had only the gap leg; four predate the `errors.Is` change and the drain check; three predate the replica check and the cascade legs |
+| Final source, 3 runs (2 normal, 1 `-race`) | Identical in each. `in-flight-gap`: root fs_object deleted, file fs_object deleted, permanent `fs:<repo>:<file>` removed; only `up:sync` remains, no candidate, canonical and S3 bytes intact. `listed-before-scan`: PASS. `orphan-shares-head-file`: file fs_object deleted and permanent `fs:` removed; root intact; only `up:sync` remains, no candidate. `orphan-shares-aged-head-file`: file fs_object deleted, permanent `fs:` removed, zero references left, HEAD's block in `gc_block_candidates` and queued (candidates=1, queued=1); canonical row and bytes still intact because the block item was not executed. Exit 1; no data race, no cleanup error |
+| Earlier iterations, 12 runs (9 normal, 3 `-race`) | the same race violations and a passing control in all 12; the same cascade violations in the 4 that had the cascade legs. The first had only the gap leg; four predate the `errors.Is` change and the drain check; three predate the replica check and the cascade legs; four predate the shared isolation helper and the leg-reached guard |
+| Harness fail-closed check | with `SESAMEFS_TEST_IN_CONTAINER` unset and the gate set, the test fails before any fixture is created |
 | Evidence-gate wiring and global-fanout guards | PASS in each run above |
 | Same test without the gate | SKIP, exit 0 |
 | `go test -short ./internal/gc`, normal and `-race` | PASS, exit 0 |

@@ -98,36 +98,6 @@ func phase6OwnedItems(t *testing.T, store *gcpkg.CassandraStore, org, library uu
 	return owned
 }
 
-// Every configured API replica shares this keyspace; one with GC on would scan
-// the same library. Replicas not named in the environment cannot be checked:
-// the evidence needs an isolated backend.
-func phase6RequireServerGCOff(t *testing.T) {
-	t.Helper()
-	seen := map[string]bool{}
-	for _, key := range []string{"SESAMEFS_URL", "SESAMEFS_URL_2", "SESAMEFS_URL_3"} {
-		url := os.Getenv(key)
-		if key == "SESAMEFS_URL" {
-			url = superadminClient.baseURL
-		}
-		if url == "" || seen[url] {
-			continue
-		}
-		seen[url] = true
-		resp := newTestClient(url, superadminClient.token).Get(t, "/api/v2.1/admin/gc/status")
-		var body map[string]interface{}
-		if resp.StatusCode == http.StatusOK {
-			decodeJSON(t, resp, &body)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("cannot confirm GC is off on %s (%s): status %d", url, key, resp.StatusCode)
-		}
-		if enabled, ok := body["enabled"].(bool); !ok || enabled {
-			t.Fatalf("Phase 6 evidence needs every replica with GC disabled: %s enabled=%v", url, body["enabled"])
-		}
-	}
-}
-
 func phase6FSObjectExists(t *testing.T, store *gcpkg.CassandraStore, library uuid.UUID, fsID string) bool {
 	t.Helper()
 	_, err := store.GetFSObject(library, fsID)
@@ -165,13 +135,20 @@ func TestGCPhase6InFlightSyncPublicationKeepsHeadTree(t *testing.T) {
 	if err := database.Session().Query(`SELECT release_version FROM system.local`).Scan(&release); err != nil {
 		t.Fatalf("Phase 6 evidence requires Cassandra: %v", err)
 	}
-	phase6RequireServerGCOff(t)
+	// Every replica sharing this keyspace must report GC off: one with GC on
+	// would scan the same auto-delete library and race the worker.
+	e19RequireNoBackgroundGC(t)
 	for _, leg := range []string{phase6InFlightGap, phase6ListedBeforeScan, phase6OrphanSharesFile, phase6OrphanSharesAged} {
-		t.Run(leg, func(t *testing.T) { phase6Leg(t, database, leg) })
+		reached := false
+		t.Run(leg, func(t *testing.T) { phase6Leg(t, database, leg, &reached) })
+		// A helper SKIP (S3 or storage class unavailable) must not pass as evidence.
+		if !reached {
+			t.Fatalf("leg %s did not reach its oracle", leg)
+		}
 	}
 }
 
-func phase6Leg(t *testing.T, database *dbpkg.DB, leg string) {
+func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, reached *bool) {
 	class := x1StorageClass(t)
 	fx := &w2CreateFileFixture{w2UploadFileFixture: newW2UploadFileFixture(t, database, newBorrowedFSHeadHandler(t, database, class))}
 	library := uuid.MustParse(fx.repoID)
@@ -296,11 +273,16 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string) {
 			break
 		}
 	}
+	var blockRows int
 	for _, item := range phase6OwnedItems(t, store, fx.orgUUID, library, fx.blockID) {
 		if item.ItemType == gcpkg.ItemFSObject {
 			t.Fatalf("worker did not drain the owned selection; a partial run proves nothing: %+v", item)
 		}
+		if item.ItemType == gcpkg.ItemBlock {
+			blockRows++
+		}
 	}
+	*reached = true
 
 	if phase6FSObjectExists(t, store, library, orphan) {
 		t.Fatal("positive control: the worker did not execute the orphan fs_object, so the oracle below would be vacuous")
@@ -326,12 +308,6 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string) {
 	var candidates int
 	if err := database.Session().Query(`SELECT count(*) FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, fx.orgID, fx.blockID).Scan(&candidates); err != nil {
 		t.Fatal(err)
-	}
-	var blockRows int
-	for _, item := range phase6OwnedItems(t, store, fx.orgUUID, library, fx.blockID) {
-		if item.ItemType == gcpkg.ItemBlock {
-			blockRows++
-		}
 	}
 	if candidates != 0 || blockRows != 0 {
 		t.Errorf("PHASE6 VIOLATION (%s): HEAD block %s became a GC candidate: candidates=%d queued=%d", leg, fx.blockID, candidates, blockRows)
