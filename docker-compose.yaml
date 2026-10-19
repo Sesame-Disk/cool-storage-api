@@ -709,7 +709,8 @@ services:
   api-test:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.gotest
+    entrypoint: ["/bin/bash", "-lc"]
     command:
       - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/test.sh api
     environment:
@@ -724,7 +725,8 @@ services:
   oidc-test:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.gotest
+    entrypoint: ["/bin/bash", "-lc"]
     command:
       - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/test.sh oidc
     environment:
