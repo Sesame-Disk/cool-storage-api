@@ -14,10 +14,58 @@ Migrations are managed by `internal/db/migrator.go` using versioned `.cql` files
 
 ```
 internal/db/migrations/
-  001_initial_schema.cql     ← complete clean-boot baseline (all current tables)
-  002_password_rate_limit.cql ← encrypted library password failure tracking
-  NNN_description.cql        ← future incremental changes
+  001_initial_schema.cql     ← v1 production baseline (complete schema, one pass)
+  NNN_description.cql        ← incremental changes after the first production deploy
 ```
+
+### v1 baseline fold (2026-10-19)
+
+After X1 closed (#312), the pre-production chain `001`–`027` (last at commit
+`14e8d0cfb`) was folded into `001_initial_schema.cql` for the greenfield first
+production deploy ([deployment contract](./X1-CRITICAL-PATH.md#first-production-deployment-contract)).
+The chain was scaffolding against rebuildable dev/staging keyspaces; no upgrade
+path from it exists or is supported.
+
+- **Proof:** `./scripts/schema-baseline-equivalence.sh 14e8d0cfb` applies the old
+  chain and the current set to two fresh keyspaces on a disposable Cassandra
+  (production parser and `Migrator.apply` on both sides) and requires identical
+  `system_schema` rows (tables and options, columns, dropped columns, indexes,
+  views, types, functions, aggregates, masks) and seeded data. Run it again
+  whenever migrations are folded.
+- **Pinned option:** `gc_active_orgs` and `gc_dirty_orgs` declare
+  `bloom_filter_fp_chance = 0.01`. Cassandra derives that default from the
+  compaction class at `CREATE` time; the chain created them with the default
+  strategy and switched to LCS by `ALTER`, so they kept 0.01. Changing it is a
+  separate, measured tuning decision.
+- **Existing keyspaces:** a keyspace built from the old chain fails the `001`
+  checksum check. Recreate it (`docker compose down -v`; for the two-region
+  cluster remove its volumes too).
+- **Freeze:** once `001` is applied in production it is never edited again;
+  every later change is a new numbered file.
+
+Where each folded migration now lives (the rationale moved next to the table):
+
+| Old | Now in `001` |
+|---|---|
+| 002 | `encrypted_repo_password_failures` |
+| 003 | LCS on `gc_queue`, `gc_pending_items`, `gc_active_orgs`, `gc_dirty_orgs`, `gc_failed_items` |
+| 004, 008 | `block_upload_sessions` (frozen admission columns), `block_upload_session_slots_by_user`, `block_upload_session_staged_blocks` |
+| 005 | `fs_objects.seafile_block_ids_sha1`, `blocks.sha1` |
+| 006 | `block_id_mappings_by_internal` no longer exists |
+| 007, 014–016, 019, 021 | `gc_s3_orphans` exact (P,D) key, `gc_s3_orphans_by_day` identity-only, `gc_s3_orphan_recovery_roots`, `blocks.gc_orphan_handoff` |
+| 009 | `block_id_mappings` keyed `((org_id, representation_id, external_id))`, `libraries[_by_id].block_representation_id`, `blocks.representation_id` |
+| 010–012 | `deleted_libraries.block_representation_id` / `purge_requested_at`, queue/DLQ `block_representation_id` / `library_guard_mode` |
+| 013 | `access_tokens.source_id` |
+| 017, 018 | exact-P keys on `gc_block_candidates[_by_day]`, `gc_queue`, `gc_pending_items`, `gc_failed_items[_by_expiry]` |
+| 020, 022 | `gc_block_delete_lifecycles` (with `first_seen_at`) |
+| 023 | `library_rollback_pending` |
+| 024 | `published_block_reference_repairs.reachability_*` |
+| 025 | `libraries.continuity_certified_head_commit_id` / `continuity_contract_version` |
+| 026 | `identity_authority_claims` |
+| 027 | `block_mapping_authority_claims` |
+
+Older documents that cite a migration number refer to this chain; the table
+above maps them to the baseline.
 
 ### Tracking table
 
@@ -35,14 +83,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | Scenario | Behaviour |
 |----------|-----------|
 | Fresh install | Applies migrations in version order |
-| Existing DB (first deploy of new system) | Detects legacy tables → stamps all migrations as applied without executing |
+| Keyspace built from the pre-v1 chain | `001` checksum mismatch → server refuses to boot; recreate the keyspace |
 | Normal restart | Skips already-applied migrations; applies any new ones |
 | Modified migration file | Checksum mismatch → server refuses to boot |
 | Failed statement | Migration is not stamped → retried on next startup |
 
 ### Adding a new migration
 
-1. Create `internal/db/migrations/NNN_description.cql` with the new CQL statements.
+1. Create `internal/db/migrations/NNN_description.cql` with the new CQL statements (the next number after the baseline is `002`).
 2. Deploy — the migration runs automatically on startup.
 3. **Never edit a migration file after it has been applied.** Create a new numbered file instead.
 
@@ -61,7 +109,8 @@ sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
 |------|---------|
 | `internal/db/migrator.go` | `Migrator` — `Run()`, `Status()`, `DryRun()`, `Check()` |
 | `internal/db/migrations/*.cql` | Versioned schema files (embedded in binary) |
-| `internal/db/db.go` | `DB.Migrate()` — calls runner + idempotent Go backfills |
+| `internal/db/db.go` | `DB.Migrate()` — runs the migration runner |
+| `scripts/schema-baseline-equivalence.sh` | Proves a migration fold is schema-identical to a reference git ref |
 
 ---
 

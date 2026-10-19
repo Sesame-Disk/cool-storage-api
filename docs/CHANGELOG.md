@@ -8,6 +8,36 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-19 — v1 baseline schema fold
+
+The pre-production migration chain `001`–`027` (last at `14e8d0cfb`) is folded
+into `001_initial_schema.cql` for the greenfield first production deploy, as the
+chain itself recorded (018/019/020/021) once X1 closed. Each table is declared in
+its final form; the rationale of the folded migrations moved next to its table.
+[DATABASE-GUIDE](./DATABASE-GUIDE.md#v1-baseline-fold-2026-10-19) maps every
+old migration number to its new location and records the freeze rule.
+
+- **Evidence:** `scripts/schema-baseline-equivalence.sh` (new) applies the old
+  chain and the folded set through the production parser and `Migrator.apply`
+  to two fresh keyspaces on a disposable Cassandra 5.0.9 and compares every
+  `system_schema` row plus seeded data: 957 rows per side, 115 tables, no
+  difference. Positive control (`14e8d0cfb` against itself) also identical.
+- **Found by the harness:** Cassandra derives `bloom_filter_fp_chance` from the
+  compaction class at `CREATE` time, so `gc_active_orgs` / `gc_dirty_orgs`
+  (created with the default strategy, switched to LCS by `ALTER`) keep 0.01
+  while a direct LCS `CREATE` gives 0.1. The baseline pins 0.01; retuning is a
+  separate decision.
+- Schema guards that named a migration file now assert the effective DDL of the
+  table (`effectiveTableDDL`), so they keep holding when `002+` exists. The
+  guard that forbade folding while X1 was open now requires the lifecycle table
+  in the baseline. `TestX1PhysicalLifeHandoffCurrentOrphanIdentityAndTTL` had
+  been reading the superseded 001 orphan definition (dropped and recreated by
+  021); it now pins the effective exact (P,D) key and no TTL. Mutation scripts
+  g1/p4a/pcd1b target `001`; g1's TTL mutation is scoped to `gc_s3_orphans`.
+- Every existing keyspace must be recreated. No runtime behaviour change; the
+  migrator gained only `loadMigrationFiles(fs.FS, dir)` for the harness.
+  PRE-GC/A1 OPEN, ordinary GC OFF.
+
 ## 2026-10-17 — Phase 5 shared-tree preservation
 
 [Metadata-only unguarded commit retirement](./GC-PHASE5-SHARED-FSOBJECTS.md)

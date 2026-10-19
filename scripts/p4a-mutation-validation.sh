@@ -42,7 +42,7 @@ STORE=internal/gc/store_cassandra.go
 WORKER=internal/gc/worker.go
 MOCK=internal/gc/store_mock.go
 PROJECTIONS=internal/db/gc_projection_write_helpers.go
-MIGRATION=internal/db/migrations/018_gc_exact_p_candidate_identity.cql
+MIGRATION=internal/db/migrations/001_initial_schema.cql
 SCHEMA001=internal/db/migrations/001_initial_schema.cql
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }

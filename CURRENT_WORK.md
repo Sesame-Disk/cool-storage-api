@@ -1,6 +1,17 @@
 # Current Work
 
-## Active slice: Phase 5 shared-tree preservation (2026-10-17)
+## Active slice: v1 baseline schema fold (2026-10-19)
+
+[Fold record](docs/DATABASE-GUIDE.md#v1-baseline-fold-2026-10-19): the
+pre-production migration chain `001`–`027` is folded into
+`001_initial_schema.cql` for the greenfield first production deploy, as planned
+once X1 closed. `scripts/schema-baseline-equivalence.sh` proves the fold against
+`14e8d0cfb` on real Cassandra: identical `system_schema` rows and seeds. Every
+existing keyspace must be recreated (`down -v`); after the first production
+deploy `001` is frozen and changes resume at `002`. No runtime behaviour change.
+PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: Phase 5 shared-tree preservation (#314, 2026-10-17)
 
 [Plan and evidence](docs/GC-PHASE5-SHARED-FSOBJECTS.md): unguarded expired-commit
 retirement removes only commit metadata. Current real Cassandra/S3 RED loses

@@ -604,6 +604,9 @@ Not findings — things nobody has proven either way.
   live fence; coverage proves the three retry wrapper mechanisms instead.
 - **PR-10 did not run the full Compose integration suite** (PR-2..PR-6 did).
 - `TECHNICAL-DEBT.md` §32 — the three retry wrappers were never consolidated.
+- **Stale GC/identity mutation gates:** 12 mutations in g1/p4a/pcd1b are not
+  load-bearing on current `main` (run-to-completion inventory, 2026-10-19, in
+  `TECHNICAL-DEBT.md` next to the P4b/G1 tooling entries). Schema mutations are RED.
 - **No repo-root CI workflow** yet (see `TECHNICAL-DEBT.md` / roadmap) — tracked
   as verification debt, not duplicated as a security ISSUE here.
 

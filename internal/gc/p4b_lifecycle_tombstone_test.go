@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -76,20 +77,24 @@ func TestP4B_InsertBlockDeleteLifecycleSourceContract(t *testing.T) {
 	}
 }
 
-func TestP4B_LifecycleTableIsNotFoldedIntoInitialSchema(t *testing.T) {
+// The lifecycle tombstone of D is part of the v1 baseline (folded after X1
+// closed). It must be keyed by claim_id so a later life D2 occupies another row,
+// and it must never expire: the rows are never deleted by design.
+func TestP4B_LifecycleTableIsInTheBaselineKeyedByClaim(t *testing.T) {
 	source, err := os.ReadFile("../db/migrations/001_initial_schema.cql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(source), "gc_block_delete_lifecycles") {
-		t.Fatal("do not fold gc_block_delete_lifecycles into 001_initial_schema.cql; X1 is still OPEN")
+	match := regexp.MustCompile(`(?s)CREATE TABLE IF NOT EXISTS gc_block_delete_lifecycles \((.*?);`).FindSubmatch(source)
+	if match == nil {
+		t.Fatal("001_initial_schema.cql must create gc_block_delete_lifecycles")
 	}
-	body, err := os.ReadFile("../db/migrations/020_gc_block_delete_lifecycle.cql")
-	if err != nil {
-		t.Fatal(err)
+	body := string(match[1])
+	if !strings.Contains(body, "PRIMARY KEY ((org_id, block_id), claim_id)") {
+		t.Fatal("gc_block_delete_lifecycles PRIMARY KEY must be ((org_id, block_id), claim_id)")
 	}
-	if !strings.Contains(string(body), "CREATE TABLE IF NOT EXISTS gc_block_delete_lifecycles") {
-		t.Fatal("migration 020 must create gc_block_delete_lifecycles")
+	if strings.Contains(strings.ToLower(body), "default_time_to_live") && !regexp.MustCompile(`default_time_to_live\s*=\s*0\b`).MatchString(body) {
+		t.Fatal("gc_block_delete_lifecycles must not expire: D tombstones are never deleted")
 	}
 }
 

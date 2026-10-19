@@ -601,6 +601,7 @@ migration runner can apply the current schema baseline.
 | `run-tests.sh` | Container-based runner | — | Multi-region stack |
 | `bootstrap.sh` | Environment setup wrapper around compose `cassandra-bootstrap` + app migrations | — | Docker |
 | `bootstrap-multiregion.sh` | Legacy compatibility alias for `bootstrap.sh multiregion` | — | Docker |
+| `schema-baseline-equivalence.sh [ref]` | Proves the working tree's migration set builds exactly the schema of `ref` (default `origin/main`): identical `system_schema` rows and seeds on a disposable Cassandra. Run whenever migrations are folded into `001` | 1 | Docker only |
 
 | Go integration tests | `internal/integration/*_test.go` | Backend regression and end-to-end invariants | Backend |
 
@@ -1040,7 +1041,7 @@ ineligible for a #228 witness until that follow-up lands. Its own contract is
 stated at the claim and digest layer, with no certifier in the picture:
 
 ```bash
-docker run --rm -v "${PWD}:/build" -w /build sesamefs-pcd1b-gotest go test ./internal/db -short -run 'TestIdentity|TestFileIdentity|TestCommitIdentity|TestClaimIdentity|TestClassifyIdentity|TestMigration026'
+docker run --rm -v "${PWD}:/build" -w /build sesamefs-pcd1b-gotest go test ./internal/db -short -run 'TestIdentity|TestFileIdentity|TestCommitIdentity|TestClaimIdentity|TestClassifyIdentity|TestIdentityAuthorityClaimsUsePerIdentityPartitionWithoutTTL'
 PCD1B_MUTATION_IMAGE=sesamefs-pcd1b-gotest bash scripts/pcd1b-identity-authority-mutation-validation.sh
 ```
 
@@ -1152,7 +1153,7 @@ All commands run in Docker:
 PROJECT="sesamefs-pcd1b3-validation-$(date -u +%Y%m%d-%H%M%S)-$$"
 
 # Unit, AST and migration contracts
-docker compose -p "$PROJECT" --profile test run --rm --build --entrypoint go gotest test ./internal/db -run 'Mapping|Continuity|Certif|Migration027'
+docker compose -p "$PROJECT" --profile test run --rm --build --entrypoint go gotest test ./internal/db -run 'Mapping|Continuity|Certif|BlockMappingAuthorityClaims'
 
 # Real Cassandra + MinIO in the same private project
 SESAMEFS_HOST_PORT=0 CASSANDRA_HOST_PORT=0 MINIO_API_HOST_PORT=0 MINIO_CONSOLE_HOST_PORT=0 FRONTEND_HOST_PORT=0 ONLYOFFICE_HOST_PORT=0 \

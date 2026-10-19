@@ -380,35 +380,27 @@ func TestX1PhysicalLifeHandoffCurrentOrphanIdentityAndTTL(t *testing.T) {
 	if len(orphans) < 2 {
 		t.Fatal("could not find CREATE TABLE gc_s3_orphans")
 	}
-	if !strings.Contains(orphans[1], "PRIMARY KEY ((org_id, block_id))") {
-		t.Fatal("P4c-orphan is still open: gc_s3_orphans PRIMARY KEY must remain ((org_id, block_id)) until G1")
+	// G1 replaced the logical ((org_id, block_id)) orphan key and its 90-day TTL
+	// with the exact (P,D) identity and no expiry. Before the v1 fold this test
+	// read the superseded 001 definition, which migration 021 dropped and
+	// recreated; the baseline now holds the effective shape.
+	if !strings.Contains(orphans[1], "PRIMARY KEY ((org_id, block_id), storage_class, storage_key, gc_claim_id, gc_claimed_at)") {
+		t.Fatal("gc_s3_orphans PRIMARY KEY must be the exact (P,D) identity: two lives of one logical block occupy two rows")
 	}
-	if !strings.Contains(orphans[1], "default_time_to_live = 7776000") {
-		t.Fatal("current pending-orphan TTL is still 7776000; D0 must not present that as acceptable post-handoff authority")
+	if !regexp.MustCompile(`default_time_to_live\s*=\s*0\b`).MatchString(orphans[1]) {
+		t.Fatal("gc_s3_orphans must not expire: a 90-day TTL is not acceptable post-handoff authority")
 	}
 
 	byDay := regexp.MustCompile(`(?s)CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day \((.*?);`).FindStringSubmatch(text)
 	if len(byDay) < 2 {
 		t.Fatal("could not find CREATE TABLE gc_s3_orphans_by_day")
 	}
-	if !strings.Contains(byDay[1], "default_time_to_live = 7776000") {
-		t.Fatal("gc_s3_orphans_by_day still carries the 90-day TTL in the base schema")
+	if !regexp.MustCompile(`default_time_to_live\s*=\s*0\b`).MatchString(byDay[1]) {
+		t.Fatal("gc_s3_orphans_by_day must not carry the former 90-day TTL")
 	}
 
-	m019, err := os.ReadFile(filepath.Join("..", "db", "migrations", "019_gc_block_delete_authority_handoff.cql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(m019), "PRIMARY KEY of gc_s3_orphans / gc_s3_orphans_by_day is unchanged (P4c-orphan)") {
-		t.Fatal("migration 019 must still record that the orphan PK was left for P4c-orphan")
-	}
-
-	m020, err := os.ReadFile(filepath.Join("..", "db", "migrations", "020_gc_block_delete_lifecycle.cql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(m020), "CREATE TABLE IF NOT EXISTS gc_block_delete_lifecycles") {
-		t.Fatal("D0 keeps lifecycle 020; the migration must still create gc_block_delete_lifecycles")
+	if !strings.Contains(text, "CREATE TABLE IF NOT EXISTS gc_block_delete_lifecycles") {
+		t.Fatal("D0 keeps the durable lifecycle; the baseline must create gc_block_delete_lifecycles")
 	}
 }
 

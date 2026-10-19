@@ -173,7 +173,7 @@ func TestIdentityAuthorityClaimsAreImmutableRepositoryWide(t *testing.T) {
 			if !strings.Contains(strings.ToLower(normalized), identityAuthorityClaimsTable) {
 				continue
 			}
-			allowedCreate := strings.HasSuffix(filepath.ToSlash(relPath), "/026_identity_authority_claims.cql") &&
+			allowedCreate := strings.HasSuffix(filepath.ToSlash(relPath), "/001_initial_schema.cql") &&
 				identityAuthorityCreatePattern.MatchString(normalized)
 			if !allowedCreate || strings.Contains(strings.ToLower(normalized), "default_time_to_live") || strings.Contains(strings.ToUpper(normalized), "USING TTL") {
 				violations = append(violations, filepath.ToSlash(relPath)+": unauthorized operation on "+identityAuthorityClaimsTable)
