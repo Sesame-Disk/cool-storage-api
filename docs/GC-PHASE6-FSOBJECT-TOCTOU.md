@@ -159,7 +159,7 @@ and worker code ran from the branch source. The primary development backend
 | Same test without the gate | SKIP, exit 0 |
 | `go test -short ./internal/gc`, normal and `-race` | PASS, exit 0 |
 | `go vet` (tagged and untagged) on `internal/gc`, `internal/integration`; `gofmt -l` on changed Go files | clean |
-| Residue | no `auto_delete` policy row left in `sesamefs_e19`; no candidate, `blocks` or `block_references` row for the four aged-leg blocks; the test asserts the owned queue is empty after teardown |
+| Residue | no `auto_delete` policy row left in `sesamefs_e19`; no candidate, `blocks` or `block_references` row for the seven aged-leg blocks; the test asserts the owned queue is empty after teardown |
 
 ```sh
 for v in ${!SESAMEFS_REQUIRE_@}; do unset "$v"; done
