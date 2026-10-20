@@ -7321,7 +7321,7 @@ semantics first) before Phase 6 reclamation is redesigned.
 
 ### ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01: No safe reclamation of unreachable metadata in live libraries
 
-**Status**: 🔴 Open — registered 2026-10-19 with P6-2. Disposition required before A1
+**Status**: 🔴 Open — registered 2026-10-19 with P6-2. Disposition required before A1. Since P6-3a (2026-10-20) the retention can be measured read-only with `sesamefs gc-metadata-retention-report`; no numbers from a representative deployment are recorded yet. [Plan, usage and limits](./GC-LIVE-LIBRARY-RECLAMATION.md)
 **Severity**: Medium (P2) — retention and storage growth, not data loss
 **Scope**: PRE-GC / A1. A1 needs a decided disposition, not necessarily an implementation: either a safe reclamation, or an explicit acceptance of the retention (and of the reduced `auto_delete_days` contract) based on measurement
 **Affected**: GC Phase 6 (suspended), Phase 5 metadata-only retirement (#314)

@@ -354,6 +354,7 @@ type mockFSObject struct {
 	ObjType    string
 	BlockIDs   []string
 	DirEntries []string
+	SizeBytes  int64
 }
 
 type mockLibrary struct {
@@ -3315,6 +3316,36 @@ func (m *MockStore) ListCommitsForLibrary(libraryID uuid.UUID) ([]CommitInfo, er
 		}
 	}
 	return commits, nil
+}
+
+func (m *MockStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRetentionRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var rows []FSObjectRetentionRow
+	for key, obj := range m.fsObjects {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			rows = append(rows, FSObjectRetentionRow{
+				FSID:       obj.FSID,
+				ObjType:    obj.ObjType,
+				BlockIDs:   obj.BlockIDs,
+				DirEntries: obj.DirEntries,
+				SizeBytes:  obj.SizeBytes,
+			})
+		}
+	}
+	return rows, nil
+}
+
+func (m *MockStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	lib, ok := m.libraries[libraryID]
+	if !ok || lib.OrgID != orgID {
+		return "", false, false, nil
+	}
+	return lib.HeadCommitID, !lib.DeletedAt.IsZero(), true, nil
 }
 
 func (m *MockStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjectInfo, error) {

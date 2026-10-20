@@ -4580,6 +4580,50 @@ func (s *CassandraStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjec
 	return objects, nil
 }
 
+// ListFSObjectRetentionRows reads one library's fs_object partition with sizes,
+// for the read-only metadata retention report.
+func (s *CassandraStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRetentionRow, error) {
+	iter := s.db.Session().Query(`
+		SELECT fs_id, obj_type, block_ids, dir_entries, size_bytes FROM fs_objects WHERE library_id = ?
+	`, libraryID.String()).Iter()
+
+	var rows []FSObjectRetentionRow
+	var fsID, objType, dirEntriesJSON string
+	var blockIDs []string
+	var sizeBytes int64
+	for iter.Scan(&fsID, &objType, &blockIDs, &dirEntriesJSON, &sizeBytes) {
+		rows = append(rows, FSObjectRetentionRow{
+			FSID:       fsID,
+			ObjType:    objType,
+			BlockIDs:   blockIDs,
+			DirEntries: parseDirEntries(dirEntriesJSON),
+			SizeBytes:  sizeBytes,
+		})
+		dirEntriesJSON, blockIDs, sizeBytes = "", nil, 0
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// GetLibraryHeadForRetention reads the canonical libraries row for the read-only
+// metadata retention report: its HEAD and whether deleted_at is set.
+func (s *CassandraStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
+	var head string
+	var deletedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT head_commit_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Scan(&head, &deletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return "", false, false, nil
+	}
+	if err != nil {
+		return "", false, false, err
+	}
+	return head, deletedAt != nil && !deletedAt.IsZero(), true, nil
+}
+
 // --- Scanner operations ---
 
 func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {

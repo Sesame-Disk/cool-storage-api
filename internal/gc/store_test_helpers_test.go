@@ -47,6 +47,13 @@ func (m *MockStore) SeedGuardedQueueItemForTest(orgID uuid.UUID, queuedAt time.T
 	panic("SeedGuardedQueueItemForTest: seeded row not found")
 }
 
+// SetFSObjectSizeForTest sets fs_objects.size_bytes on a mock row.
+func (m *MockStore) SetFSObjectSizeForTest(libraryID uuid.UUID, fsID string, size int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fsObjects[libraryID.String()+":"+fsID].SizeBytes = size
+}
+
 // hardDeleteLibraryForTest puts a fixture library where a guarded fs_object item
 // may legitimately run: soft-deleted, then hard-deleted (canonical row and marker
 // gone), as after a completed library cascade.
