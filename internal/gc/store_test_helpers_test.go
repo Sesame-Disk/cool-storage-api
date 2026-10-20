@@ -54,6 +54,13 @@ func (m *MockStore) SetFSObjectSizeForTest(libraryID uuid.UUID, fsID string, siz
 	m.fsObjects[libraryID.String()+":"+fsID].SizeBytes = size
 }
 
+// SetLibraryOrgNullForTest models a libraries_by_id row whose org_id is NULL.
+func (m *MockStore) SetLibraryOrgNullForTest(libraryID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.libraries[libraryID].OrgIDNull = true
+}
+
 // hardDeleteLibraryForTest puts a fixture library where a guarded fs_object item
 // may legitimately run: soft-deleted, then hard-deleted (canonical row and marker
 // gone), as after a completed library cascade.

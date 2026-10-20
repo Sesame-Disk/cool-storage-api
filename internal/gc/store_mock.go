@@ -358,7 +358,10 @@ type mockFSObject struct {
 }
 
 type mockLibrary struct {
-	OrgID                 uuid.UUID
+	OrgID uuid.UUID
+	// OrgIDNull models a NULL libraries_by_id.org_id. A zero OrgID alone is the
+	// platform org, a real org.
+	OrgIDNull             bool
 	LibraryID             uuid.UUID
 	OwnerID               uuid.UUID
 	BlockRepresentationID string
@@ -3340,20 +3343,23 @@ func (m *MockStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRe
 
 // ListLibrariesForRetention mirrors libraries_by_id: m.libraries keeps soft-deleted
 // libraries (with DeletedAt) and drops hard-deleted ones.
-func (m *MockStore) ListLibrariesForRetention(orgID, libraryID uuid.UUID) ([]LibraryRef, error) {
+func (m *MockStore) ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var refs []LibraryRef
 	for id, lib := range m.libraries {
-		if libraryID != uuid.Nil && id != libraryID {
+		if scope.LibraryID != uuid.Nil && id != scope.LibraryID {
 			continue
 		}
-		if libraryID == uuid.Nil && orgID != uuid.Nil && lib.OrgID != orgID {
+		// Like the canonical libraries partition: a NULL-org row is in no org.
+		if scope.LibraryID == uuid.Nil && scope.OrgSet && (lib.OrgIDNull || lib.OrgID != scope.OrgID) {
 			continue
 		}
-		{
-			refs = append(refs, LibraryRef{OrgID: lib.OrgID, LibraryID: id})
+		ref := LibraryRef{LibraryID: id}
+		if !lib.OrgIDNull {
+			ref.OrgID, ref.OrgKnown = lib.OrgID, true
 		}
+		refs = append(refs, ref)
 	}
 	return refs, nil
 }

@@ -203,7 +203,7 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 		return summary, seen
 	}
 
-	summary, seen := collect(MetadataRetentionScope{OrgID: orgA})
+	summary, seen := collect(MetadataRetentionScope{OrgID: orgA, OrgSet: true})
 	if summary.LibrariesListed != 3 || summary.LibrariesMeasured != 2 || summary.LibrariesNotLive != 1 || summary.LibrariesIncomplete != 0 || len(seen) != 2 {
 		t.Fatalf("org scope (listed counts in-scope libraries only): %+v seen=%d", summary, len(seen))
 	}
@@ -221,7 +221,7 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	if summary.LibrariesMeasured != 1 || len(seen) != 1 || seen[libB].FSObjects != 1 {
 		t.Fatalf("library scope: %+v %+v", summary, seen)
 	}
-	summary, seen = collect(MetadataRetentionScope{LibraryID: libB, OrgID: orgA})
+	summary, seen = collect(MetadataRetentionScope{LibraryID: libB, OrgID: orgA, OrgSet: true})
 	if summary.LibrariesListed != 0 || len(seen) != 0 {
 		t.Fatalf("-library of another org must match nothing: %+v %+v", summary, seen)
 	}
@@ -241,7 +241,8 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	// is not listed at all.
 	libHeadless, libNoOrg := uuid.New(), uuid.New()
 	store.AddLibraryWithAutoDelete(orgA, libHeadless, "hot", "", 0)
-	store.AddLibraryWithAutoDelete(uuid.Nil, libNoOrg, "hot", "x", 0)
+	store.AddLibraryWithAutoDelete(orgA, libNoOrg, "hot", "x", 0)
+	store.SetLibraryOrgNullForTest(libNoOrg)
 	if err := store.HardDeleteLibrary(orgA, libDeleted); err != nil {
 		t.Fatal(err)
 	}
@@ -254,6 +255,47 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	}
 	if _, ok := seen[libHeadless]; ok {
 		t.Fatal("headless library must not be emitted as a measurement")
+	}
+}
+
+// The all-zero UUID is the platform org (middleware.PlatformOrgID), where
+// superadmins create libraries. It must be measured like any org, both unscoped
+// and as an explicit -org filter, and never confused with a NULL org_id.
+func TestCollectMetadataRetention_PlatformOrgIsARealOrg(t *testing.T) {
+	store := NewMockStore()
+	platformLib, otherLib, nullOrgLib := uuid.New(), uuid.New(), uuid.New()
+	for lib, org := range map[uuid.UUID]uuid.UUID{platformLib: uuid.Nil, otherLib: uuid.New(), nullOrgLib: uuid.New()} {
+		store.AddLibraryWithAutoDelete(org, lib, "hot", "c", 0)
+		store.AddCommitWithDetails(lib, "c", "r", "", time.Now())
+		store.AddFSObjectWithEntries(lib, "r", "dir", nil, nil)
+	}
+	store.SetLibraryOrgNullForTest(nullOrgLib)
+	collect := func(scope MetadataRetentionScope) (MetadataRetentionSummary, map[uuid.UUID]LibraryMetadataRetention) {
+		t.Helper()
+		seen := map[uuid.UUID]LibraryMetadataRetention{}
+		summary, err := CollectMetadataRetention(store, scope, func(r LibraryMetadataRetention) error { seen[r.LibraryID] = r; return nil })
+		if err != nil {
+			t.Fatalf("collect %+v: %v", scope, err)
+		}
+		return summary, seen
+	}
+
+	summary, seen := collect(MetadataRetentionScope{})
+	if r := seen[platformLib]; !r.Complete || r.OrgID != uuid.Nil {
+		t.Fatalf("platform-org library must be measured, not reported org-less: %+v (summary %+v)", r, summary)
+	}
+	if summary.LibrariesMeasured != 2 || summary.LibrariesIncomplete != 1 || seen[nullOrgLib].Complete {
+		t.Fatalf("only the NULL-org row is incomplete: %+v", summary)
+	}
+
+	summary, seen = collect(MetadataRetentionScope{OrgID: uuid.Nil, OrgSet: true})
+	if summary.LibrariesListed != 1 || len(seen) != 1 || !seen[platformLib].Complete {
+		t.Fatalf("-org <platform org> must select exactly the platform org: %+v %+v", summary, seen)
+	}
+	// -library of another org under -org <platform org> matches nothing.
+	summary, seen = collect(MetadataRetentionScope{LibraryID: otherLib, OrgID: uuid.Nil, OrgSet: true})
+	if summary.LibrariesListed != 0 || len(seen) != 0 {
+		t.Fatalf("-library outside -org <platform org> must match nothing: %+v %+v", summary, seen)
 	}
 }
 

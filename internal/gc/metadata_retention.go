@@ -35,9 +35,12 @@ type FSObjectRetentionRow struct {
 	SizeBytes  int64
 }
 
-// LibraryRef names a library and the org recorded for it in libraries_by_id.
+// LibraryRef names a library and the org recorded for it. OrgKnown is false only
+// when the org_id column is NULL: the all-zero UUID is the platform org
+// (middleware.PlatformOrgID), a real org, not a missing one.
 type LibraryRef struct {
 	OrgID     uuid.UUID
+	OrgKnown  bool
 	LibraryID uuid.UUID
 }
 
@@ -58,10 +61,10 @@ type MetadataRetentionReader interface {
 type MetadataRetentionLister interface {
 	MetadataRetentionReader
 	// ListLibrariesForRetention lists libraries with their org: the one row for
-	// libraryID when it is set (none if absent), else the org's libraries when
-	// orgID is set, else all of them. Hard-deleted libraries are not listed;
+	// scope.LibraryID when it is set (none if absent), else the org's libraries
+	// when scope.OrgSet, else all of them. Hard-deleted libraries are not listed;
 	// they are not live. Callers still filter by org.
-	ListLibrariesForRetention(orgID, libraryID uuid.UUID) ([]LibraryRef, error)
+	ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error)
 }
 
 var _ MetadataRetentionLister = (*CassandraStore)(nil)
@@ -221,10 +224,13 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	return report, nil
 }
 
-// MetadataRetentionScope narrows the report. Zero UUIDs mean any; MaxLibraries 0
-// means no limit on the libraries measured or reported incomplete.
+// MetadataRetentionScope narrows the report. The org filter is explicit (OrgSet)
+// because the all-zero UUID is the platform org, not "any org". LibraryID
+// uuid.Nil means any library: no library has that id. MaxLibraries 0 means no
+// limit on the libraries measured or reported incomplete.
 type MetadataRetentionScope struct {
 	OrgID        uuid.UUID
+	OrgSet       bool
 	LibraryID    uuid.UUID
 	MaxLibraries int
 }
@@ -256,19 +262,19 @@ type MetadataRetentionSummary struct {
 // returned error covers the enumeration only.
 func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetentionScope, emit func(LibraryMetadataRetention) error) (MetadataRetentionSummary, error) {
 	summary := MetadataRetentionSummary{Summary: true}
-	refs, err := r.ListLibrariesForRetention(scope.OrgID, scope.LibraryID)
+	refs, err := r.ListLibrariesForRetention(scope)
 	if err != nil {
 		return summary, fmt.Errorf("list libraries: %w", err)
 	}
 	for _, ref := range refs {
-		if scope.OrgID != uuid.Nil && ref.OrgID != scope.OrgID {
+		if scope.OrgSet && (!ref.OrgKnown || ref.OrgID != scope.OrgID) {
 			continue
 		}
 		if scope.MaxLibraries > 0 && summary.LibrariesMeasured+summary.LibrariesIncomplete >= scope.MaxLibraries {
 			break
 		}
 		summary.LibrariesListed++
-		if ref.OrgID == uuid.Nil {
+		if !ref.OrgKnown {
 			summary.LibrariesIncomplete++
 			if err := emit(LibraryMetadataRetention{LibraryID: ref.LibraryID, Error: "libraries_by_id row has no org_id"}); err != nil {
 				return summary, err

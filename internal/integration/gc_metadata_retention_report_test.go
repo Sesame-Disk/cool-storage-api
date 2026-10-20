@@ -137,7 +137,7 @@ func TestGCMetadataRetentionReportMeasuresProductiveSyncState(t *testing.T) {
 	// The org scope reads the org's canonical libraries partition. The org is
 	// shared with other fixtures, so only require this library's exact report.
 	var orgReport *gcpkg.LibraryMetadataRetention
-	summary, err = gcpkg.CollectMetadataRetention(store, gcpkg.MetadataRetentionScope{OrgID: fx.orgUUID}, func(r gcpkg.LibraryMetadataRetention) error {
+	summary, err = gcpkg.CollectMetadataRetention(store, gcpkg.MetadataRetentionScope{OrgID: fx.orgUUID, OrgSet: true}, func(r gcpkg.LibraryMetadataRetention) error {
 		if r.LibraryID == library {
 			r := r
 			orgReport = &r
@@ -160,4 +160,36 @@ func TestGCMetadataRetentionReportMeasuresProductiveSyncState(t *testing.T) {
 		t.Fatalf("queue rows changed: %d -> %d", queueBefore, got)
 	}
 	t.Logf("EVIDENCE retention report: before=%+v after=%+v", before, after)
+}
+
+// Superadmins live in the platform org, whose id is the all-zero UUID
+// (middleware.PlatformOrgID), and their libraries carry that org_id. The report
+// must measure them, unscoped and under -org <platform org>, instead of reading
+// the zero UUID as a missing org.
+func TestGCMetadataRetentionReportMeasuresPlatformOrgLibraries(t *testing.T) {
+	requireCassandra(t)
+	database := shareProjectionDBForTest(t)
+	repoID := createTestLibrary(t, superadminClient, "inttest-retention-platform-"+uuid.NewString()[:8])
+	library := uuid.MustParse(repoID)
+	var orgID *string
+	if err := database.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil || orgID == nil {
+		t.Fatalf("read org_id: %v %v", orgID, err)
+	}
+	if uuid.MustParse(*orgID) != uuid.Nil {
+		t.Skipf("superadmin library landed in org %s, not the platform org; nothing to check", *orgID)
+	}
+	store := gcpkg.NewCassandraStore(database)
+	for _, scope := range []gcpkg.MetadataRetentionScope{{LibraryID: library}, {OrgID: uuid.Nil, OrgSet: true}} {
+		var report *gcpkg.LibraryMetadataRetention
+		summary, err := gcpkg.CollectMetadataRetention(store, scope, func(r gcpkg.LibraryMetadataRetention) error {
+			if r.LibraryID == library {
+				r := r
+				report = &r
+			}
+			return nil
+		})
+		if err != nil || report == nil || !report.Complete || report.OrgID != uuid.Nil || report.HeadChainCommits < 1 {
+			t.Fatalf("scope %+v: platform-org library must be measured complete: report=%+v summary=%+v err=%v", scope, report, summary, err)
+		}
+	}
 }

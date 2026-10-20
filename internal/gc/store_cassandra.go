@@ -4619,40 +4619,48 @@ func parseDirEntriesStrict(jsonStr string) ([]string, error) {
 }
 
 // ListLibrariesForRetention lists libraries with their org for the read-only
-// metadata retention report: one libraries_by_id point read when libraryID is
-// set, the org's canonical libraries partition when only orgID is set, otherwise
+// metadata retention report: one libraries_by_id point read when a library is in
+// scope, the org's canonical libraries partition when only an org is, otherwise
 // a libraries_by_id scan. Unlike FindOrgForLibrary there is no fallback that
-// could turn a read error into "not found".
-func (s *CassandraStore) ListLibrariesForRetention(orgID, libraryID uuid.UUID) ([]LibraryRef, error) {
-	if libraryID == uuid.Nil && orgID != uuid.Nil {
-		iter := s.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, orgID.String()).Iter()
-		var refs []LibraryRef
-		var libraryIDStr string
-		for iter.Scan(&libraryIDStr) {
-			refs = append(refs, LibraryRef{OrgID: orgID, LibraryID: parseUUID(libraryIDStr)})
+// could turn a read error into "not found". org_id is scanned into a pointer so
+// a NULL column is told apart from the all-zero platform org.
+func (s *CassandraStore) ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error) {
+	refFor := func(libraryID uuid.UUID, orgID *string) LibraryRef {
+		if orgID == nil {
+			return LibraryRef{LibraryID: libraryID}
 		}
-		if err := iter.Close(); err != nil {
-			return nil, err
-		}
-		return refs, nil
+		return LibraryRef{OrgID: parseUUID(*orgID), OrgKnown: true, LibraryID: libraryID}
 	}
-	if libraryID != uuid.Nil {
-		var orgIDStr string
-		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Scan(&orgIDStr)
+	if scope.LibraryID != uuid.Nil {
+		var orgID *string
+		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, scope.LibraryID.String()).Scan(&orgID)
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		return []LibraryRef{{OrgID: parseUUID(orgIDStr), LibraryID: libraryID}}, nil
+		return []LibraryRef{refFor(scope.LibraryID, orgID)}, nil
+	}
+	if scope.OrgSet {
+		iter := s.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, scope.OrgID.String()).Iter()
+		var refs []LibraryRef
+		var libraryIDStr string
+		for iter.Scan(&libraryIDStr) {
+			refs = append(refs, LibraryRef{OrgID: scope.OrgID, OrgKnown: true, LibraryID: parseUUID(libraryIDStr)})
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+		return refs, nil
 	}
 	iter := s.db.Session().Query(`SELECT library_id, org_id FROM libraries_by_id`).Iter()
 	var refs []LibraryRef
-	var libraryIDStr, orgIDStr string
-	for iter.Scan(&libraryIDStr, &orgIDStr) {
-		refs = append(refs, LibraryRef{OrgID: parseUUID(orgIDStr), LibraryID: parseUUID(libraryIDStr)})
-		orgIDStr = ""
+	var libraryIDStr string
+	var orgID *string
+	for iter.Scan(&libraryIDStr, &orgID) {
+		refs = append(refs, refFor(parseUUID(libraryIDStr), orgID))
+		orgID = nil
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err

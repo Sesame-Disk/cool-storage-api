@@ -68,6 +68,12 @@ not garbage by definition.
   `libraries` partition instead. Libraries that exist only in
   `deleted_libraries` are already hard-deleted, so not live. There is no org
   lookup with a fallback that could turn a read error into "not found".
+- The all-zero UUID is the platform org (`middleware.PlatformOrgID`), where
+  superadmins create libraries: it is measured like any org, and `-org` with it
+  filters to that org. Only a NULL `org_id` makes a row incomplete; `org_id` is
+  read into a pointer to tell the two apart. `-library` with the all-zero UUID is
+  rejected (exit 1), because no library has that id and the scope would read it
+  as "any library".
 - `cmd/sesamefs`: `gc-metadata-retention-report [-library ID] [-org ID]
   [-max-libraries N]` prints one JSON line per measured or incomplete library and
   a summary line. Exit 0 when every library in scope is complete; 1 for a usage,
