@@ -73,7 +73,9 @@ not garbage by definition.
   filters to that org. Only a NULL `org_id` makes a row incomplete; `org_id` is
   read into a pointer to tell the two apart. `-library` with the all-zero UUID is
   rejected (exit 1), because no library has that id and the scope would read it
-  as "any library".
+  as "any library". A given `-library` or `-org` with an empty value (for example
+  `-org "$ORG_ID"` with the variable unset) is a usage error too, never a silent
+  full scan.
 - `cmd/sesamefs`: `gc-metadata-retention-report [-library ID] [-org ID]
   [-max-libraries N]` prints one JSON line per measured or incomplete library and
   a summary line. Exit 0 when every library in scope is complete; 1 for a usage,

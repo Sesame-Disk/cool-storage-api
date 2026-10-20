@@ -45,7 +45,18 @@ func parseGCMetadataRetentionArgs(args []string) (scope gc.MetadataRetentionScop
 		fmt.Fprintf(os.Stderr, "unexpected arguments %q: use -library or -org\n", flags.Args())
 		return scope, 1, false
 	}
-	if *libraryFlag != "" {
+	// A filter is in force when its flag was given, not when its value is
+	// non-empty: `-org "$ORG_ID"` with an unset variable must fail, not silently
+	// widen the run to the whole deployment.
+	given := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	for _, name := range []string{"library", "org"} {
+		if given[name] && flags.Lookup(name).Value.String() == "" {
+			fmt.Fprintf(os.Stderr, "invalid -%s: empty value (omit the flag to measure every library)\n", name)
+			return scope, 1, false
+		}
+	}
+	if given["library"] {
 		id, err := uuid.Parse(*libraryFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "invalid -library %q: %v\n", *libraryFlag, err)
@@ -59,7 +70,7 @@ func parseGCMetadataRetentionArgs(args []string) (scope gc.MetadataRetentionScop
 		}
 		scope.LibraryID = id
 	}
-	if *orgFlag != "" {
+	if given["org"] {
 		id, err := uuid.Parse(*orgFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "invalid -org %q: %v\n", *orgFlag, err)

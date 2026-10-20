@@ -19,6 +19,10 @@ func TestGCMetadataRetentionReportRejectsBadUsage(t *testing.T) {
 		"unknown flag":          {"-limit", "5"},
 		"invalid library":       {"-library", "not-a-uuid"},
 		"nil library":           {"-library", nilUUID},
+		"empty library =":       {"-library="},
+		"empty library arg":     {"-library", ""},
+		"empty org =":           {"-org="},
+		"empty org arg":         {"-org", ""},
 		"invalid org":           {"-org", "nope"},
 		"negative limit":        {"-max-libraries", "-1"},
 	} {
