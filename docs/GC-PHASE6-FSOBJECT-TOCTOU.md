@@ -32,6 +32,22 @@ Contract:
    `gc_items_processed_total{type="fs_object"}`, although nothing was deleted;
    read the suspension counter to tell them apart.
 
+Known interactions, accepted:
+
+- **Dedupe with a stale unguarded row.** Guarded cascades skip a child that
+  already has any pending row. If an unguarded row for that child predates the
+  change, the guarded parent skips it, and the worker then completes the stale
+  row without mutation. The child is retained, not lost: once that row is gone,
+  Phase 4 re-enqueues the deleted library's remaining fs_objects with a guard on
+  its next scan. This needs rows queued before this change; on the greenfield
+  v1 deployment GC has never run.
+- **Representation drift signal.** The removed selector counted
+  representation drift for auto-delete libraries before refusing to enqueue
+  under a wrong representation. With nothing enqueued, there is nothing for it
+  to guard; other phases and the delete paths keep their own checks.
+- **Log volume.** One log line per suspended row per pass, the same volume as
+  the old per-row dry-run "would delete" line.
+
 Not done here: rejecting unguarded `ItemFSObject` rows at enqueue time. No
 production producer writes them after #314 and this change (Phase 4 and library
 cascades are guarded; `EnqueueLibraryContents` has test callers only, and its
@@ -317,11 +333,13 @@ fold (#316) and would need a destructive `down -v`. Directed runs used a Go
 | Mutations | removing the worker barrier fails both suspension unit tests; a barrier on the raw field only (ignoring the legacy flag) fails the legacy-flag test; main's selector fails the scanner suspension test; dropping the phase-run timestamp fails it too |
 | `go vet ./...`, `go vet -tags integration ./internal/integration`, `gofmt -l` on changed Go files, `git diff --check` | clean |
 
-After `go-all-test`, the first review round changed only comments, a metric help
-string, the scanner unit test's gauge reset and documentation; the unit tests
-and the gauge mutation were rerun on that source. The integration test is
-byte-identical to the `go-all-test` commit; the runtime differs only in a doc
-comment (`EnqueueLibraryContents`) and the counter's help string.
+After `go-all-test`, the two review rounds changed the runtime only in comments,
+the counter's help string, and an `Add(0)` that keeps
+`gc_items_enqueued_total{phase="auto_delete"}` present. Tests changed only in
+the scanner gauge reset, an exact-row seed helper and comments. On that final
+source the GC/metrics unit tests (normal and `-race`), the gauge mutation and
+the directed Phase 6 real-stack test (normal and `-race`, four legs, no data
+race) were rerun and pass. `go-all-test` was not repeated.
 
 Not run: three-DC, crash/process-death, sync clients (`sync-test`), frontend
 suites. The fs_object mechanics under a guard are covered by unit tests and the

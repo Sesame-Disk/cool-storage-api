@@ -857,6 +857,8 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 // unguarded fs_object item already queued.
 func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 6 (auto_delete_days) is suspended: no fs_objects are enqueued")
+	// Keep the enqueued series present at zero so dashboards see a running phase.
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("auto_delete").Add(0)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete").SetToCurrentTime()
 	return 0, nil
 }

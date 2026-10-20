@@ -32,9 +32,11 @@ const (
 	gcPhase6ChildEnv          = "SESAMEFS_GC_PHASE6_CHILD"
 )
 
-// The real Phase 6 selector, narrowed to one owned library. The productive
-// writer runs once inside the selector's own gap: after the commit listing that
-// built the keep set, before the fs_object listing it was compared against.
+// The Phase 6 selector, narrowed to one owned library. Before the suspension the
+// productive writer ran here inside the selector's own gap (after the commit
+// listing that built the keep set, before the fs_object listing). The suspended
+// selector must not list fs_objects at all, so `fired` staying false is the
+// regression guard; on main it fired and enqueued the race rows.
 type phase6InFlightStore struct {
 	gcpkg.GCStore
 	library uuid.UUID
@@ -125,9 +127,9 @@ const (
 
 // All legs share one productive Sync writer and one received-but-uncommitted
 // orphan directory.
-//   - selector-suspended: the writer lands inside the selector's gap (the
-//     reproduced race) and the orphan has HEAD's file as its child (the
-//     reproduced cascade); the suspended selector must enqueue nothing.
+//   - selector-suspended: the P6-1 race and cascade inputs (the writer is armed
+//     for the selector's gap; the orphan has HEAD's file as its child); the
+//     suspended selector must enqueue nothing and never reach the gap.
 //   - stale-in-flight-selection: the rows the old selector produced for that
 //     race (orphan, root, file) are queued before HEAD publishes them.
 //   - stale-orphan-shares-head-file: HEAD is published; a stale row names the

@@ -1,8 +1,8 @@
 # Current Work
 
-## Active slice: Phase 6 suspended, P6-2 (2026-10-20)
+## Active slice: Phase 6 suspended, P6-2 (2026-10-19)
 
-[Contract and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-20):
+[Contract and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19):
 maintainer-chosen option A. The Phase 6 selector is a no-op; the worker completes
 unguarded fs_object rows without mutation before any read or child enqueue;
 guarded cascades are unchanged. The P6-1 schedules are GREEN here and RED on

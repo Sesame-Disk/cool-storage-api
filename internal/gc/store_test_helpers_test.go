@@ -37,8 +37,14 @@ func (m *MockStore) SeedGuardedQueueItemForTest(orgID uuid.UUID, queuedAt time.T
 	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", 0)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rows := m.queue[orgID]
-	rows[len(rows)-1].LibraryGuardMode = guard
+	for i := range m.queue[orgID] {
+		row := &m.queue[orgID][i]
+		if row.ItemType == itemType && row.ItemID == itemID && row.LibraryID == libraryID && row.QueuedAt.Equal(queuedAt) {
+			row.LibraryGuardMode = guard
+			return
+		}
+	}
+	panic("SeedGuardedQueueItemForTest: seeded row not found")
 }
 
 // hardDeleteLibraryForTest puts a fixture library where a guarded fs_object item
