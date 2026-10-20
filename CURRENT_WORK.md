@@ -1,6 +1,16 @@
 # Current Work
 
-## Active slice: Phase 6 suspended, P6-2 (2026-10-19)
+## Active slice: live-library retention report, P6-3a (2026-10-20)
+
+[Plan and evidence](docs/GC-LIVE-LIBRARY-RECLAMATION.md): a read-only
+`gc-metadata-retention-report` subcommand measures fs_object retention per live
+library from three reads (HEAD, commits, fs_objects) through a read-only
+interface. Unit and real-stack tests with exact counts; no GC, queue, schema or
+API change. Next: record numbers from a representative GC-OFF deployment, then
+decide the disposition of `ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`.
+PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: Phase 6 suspended, P6-2 (#319, 2026-10-19)
 
 [Contract and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19):
 maintainer-chosen option A. The Phase 6 selector is a no-op; the worker completes

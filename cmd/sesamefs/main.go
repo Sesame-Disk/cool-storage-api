@@ -30,8 +30,9 @@ func main() {
 	// Load .env file if it exists
 	if err := godotenv.Load(); err != nil {
 		// Will be logged properly after logging.Setup, but that requires config first.
-		// Use fmt here since slog isn't configured yet.
-		fmt.Println("No .env file found, using environment variables")
+		// Use fmt here since slog isn't configured yet. A diagnostic, so stderr:
+		// commands such as gc-metadata-retention-report write data to stdout.
+		fmt.Fprintln(os.Stderr, "No .env file found, using environment variables")
 	}
 
 	// Parse command
@@ -52,9 +53,11 @@ func main() {
 		printVersion()
 	case "backfill-search-index":
 		runBackfillSearchIndex()
+	case "gc-metadata-retention-report":
+		runGCMetadataRetentionReport()
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
-		fmt.Println("Available commands: serve, health, migrate, version, backfill-search-index")
+		fmt.Println("Available commands: serve, health, migrate, version, backfill-search-index, gc-metadata-retention-report")
 		os.Exit(1)
 	}
 }

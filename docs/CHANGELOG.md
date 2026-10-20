@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-20 — Live-library retention report (P6-3a)
+
+New read-only subcommand `sesamefs gc-metadata-retention-report` for
+`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`: per live library it classifies
+fs_objects as reachable from HEAD's chain, only off-chain or unreferenced, and
+reports retained files, logical bytes, `fs:` references and dangling entries,
+then a summary. `MeasureLibraryMetadataRetention` takes a read-only interface;
+`CassandraStore`/`MockStore` gain two reads. The "No .env file found" startup
+diagnostic now goes to stderr so data commands keep stdout clean. No GC, queue,
+schema or API change. [Plan and evidence](./GC-LIVE-LIBRARY-RECLAMATION.md).
+
 ## 2026-10-19 — Phase 6 suspended (P6-2)
 
 Maintainer-chosen option A. `scanAutoDeleteExpiredObjects` is an explicit no-op

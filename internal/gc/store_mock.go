@@ -354,10 +354,14 @@ type mockFSObject struct {
 	ObjType    string
 	BlockIDs   []string
 	DirEntries []string
+	SizeBytes  int64
 }
 
 type mockLibrary struct {
-	OrgID                 uuid.UUID
+	OrgID uuid.UUID
+	// OrgIDNull models a NULL libraries_by_id.org_id. A zero OrgID alone is the
+	// platform org, a real org.
+	OrgIDNull             bool
 	LibraryID             uuid.UUID
 	OwnerID               uuid.UUID
 	BlockRepresentationID string
@@ -3315,6 +3319,59 @@ func (m *MockStore) ListCommitsForLibrary(libraryID uuid.UUID) ([]CommitInfo, er
 		}
 	}
 	return commits, nil
+}
+
+func (m *MockStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRetentionRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var rows []FSObjectRetentionRow
+	for key, obj := range m.fsObjects {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			rows = append(rows, FSObjectRetentionRow{
+				FSID:       obj.FSID,
+				ObjType:    obj.ObjType,
+				BlockIDs:   obj.BlockIDs,
+				DirEntries: obj.DirEntries,
+				SizeBytes:  obj.SizeBytes,
+			})
+		}
+	}
+	return rows, nil
+}
+
+// ListLibrariesForRetention mirrors libraries_by_id: m.libraries keeps soft-deleted
+// libraries (with DeletedAt) and drops hard-deleted ones.
+func (m *MockStore) ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var refs []LibraryRef
+	for id, lib := range m.libraries {
+		if scope.LibraryID != uuid.Nil && id != scope.LibraryID {
+			continue
+		}
+		// Like the canonical libraries partition: a NULL-org row is in no org.
+		if scope.LibraryID == uuid.Nil && scope.OrgSet && (lib.OrgIDNull || lib.OrgID != scope.OrgID) {
+			continue
+		}
+		ref := LibraryRef{LibraryID: id}
+		if !lib.OrgIDNull {
+			ref.OrgID, ref.OrgKnown = lib.OrgID, true
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+func (m *MockStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	lib, ok := m.libraries[libraryID]
+	if !ok || lib.OrgID != orgID {
+		return "", false, false, nil
+	}
+	return lib.HeadCommitID, !lib.DeletedAt.IsZero(), true, nil
 }
 
 func (m *MockStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjectInfo, error) {

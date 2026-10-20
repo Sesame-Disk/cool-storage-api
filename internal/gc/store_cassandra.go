@@ -194,25 +194,10 @@ func ReleaseLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseT
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
 // Each entry has an "id" field that is the child fs_id.
 func parseDirEntries(jsonStr string) []string {
-	if jsonStr == "" {
-		return nil
-	}
-	var entries []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &entries); err != nil {
-		return nil
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	ids := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.ID != "" {
-			ids = append(ids, e.ID)
-		}
-	}
-	if len(ids) == 0 {
+	// Lenient: a malformed list reads as an empty directory. Measurements use
+	// parseDirEntriesStrict, the one decoder both share.
+	ids, err := parseDirEntriesStrict(jsonStr)
+	if err != nil || len(ids) == 0 {
 		return nil
 	}
 	return ids
@@ -4578,6 +4563,133 @@ func (s *CassandraStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjec
 		return nil, err
 	}
 	return objects, nil
+}
+
+// ListFSObjectRetentionRows reads one library's fs_object partition with sizes,
+// for the read-only metadata retention report.
+func (s *CassandraStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRetentionRow, error) {
+	iter := s.db.Session().Query(`
+		SELECT fs_id, obj_type, block_ids, dir_entries, size_bytes FROM fs_objects WHERE library_id = ?
+	`, libraryID.String()).Iter()
+
+	var rows []FSObjectRetentionRow
+	var fsID, objType, dirEntriesJSON string
+	var blockIDs []string
+	var sizeBytes int64
+	for iter.Scan(&fsID, &objType, &blockIDs, &dirEntriesJSON, &sizeBytes) {
+		entries, err := parseDirEntriesStrict(dirEntriesJSON)
+		if err != nil {
+			_ = iter.Close()
+			return nil, fmt.Errorf("fs_object %s: %w", fsID, err)
+		}
+		rows = append(rows, FSObjectRetentionRow{
+			FSID:       fsID,
+			ObjType:    objType,
+			BlockIDs:   blockIDs,
+			DirEntries: entries,
+			SizeBytes:  sizeBytes,
+		})
+		dirEntriesJSON, blockIDs, sizeBytes = "", nil, 0
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// parseDirEntriesStrict is parseDirEntries for measurements: malformed JSON is an
+// error rather than an empty directory, which would hide the subtree.
+func parseDirEntriesStrict(jsonStr string) ([]string, error) {
+	if jsonStr == "" {
+		return nil, nil
+	}
+	var entries []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &entries); err != nil {
+		return nil, fmt.Errorf("malformed dir_entries: %w", err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.ID != "" {
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids, nil
+}
+
+// ListLibrariesForRetention lists libraries with their org for the read-only
+// metadata retention report: one libraries_by_id point read when a library is in
+// scope, the org's canonical libraries partition when only an org is, otherwise
+// a libraries_by_id scan. Unlike FindOrgForLibrary there is no fallback that
+// could turn a read error into "not found". org_id is scanned into a pointer so
+// a NULL column is told apart from the all-zero platform org.
+func (s *CassandraStore) ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error) {
+	refFor := func(libraryID uuid.UUID, orgID *string) LibraryRef {
+		// Not parseUUID: its uuid.Nil on failure would read as the platform org.
+		if orgID == nil {
+			return LibraryRef{LibraryID: libraryID}
+		}
+		parsed, err := uuid.Parse(*orgID)
+		if err != nil {
+			return LibraryRef{LibraryID: libraryID}
+		}
+		return LibraryRef{OrgID: parsed, OrgKnown: true, LibraryID: libraryID}
+	}
+	if scope.LibraryID != uuid.Nil {
+		var orgID *string
+		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, scope.LibraryID.String()).Scan(&orgID)
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return []LibraryRef{refFor(scope.LibraryID, orgID)}, nil
+	}
+	if scope.OrgSet {
+		iter := s.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, scope.OrgID.String()).Iter()
+		var refs []LibraryRef
+		var libraryIDStr string
+		for iter.Scan(&libraryIDStr) {
+			refs = append(refs, LibraryRef{OrgID: scope.OrgID, OrgKnown: true, LibraryID: parseUUID(libraryIDStr)})
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+		return refs, nil
+	}
+	iter := s.db.Session().Query(`SELECT library_id, org_id FROM libraries_by_id`).Iter()
+	var refs []LibraryRef
+	var libraryIDStr string
+	var orgID *string
+	for iter.Scan(&libraryIDStr, &orgID) {
+		refs = append(refs, refFor(parseUUID(libraryIDStr), orgID))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+// GetLibraryHeadForRetention reads the canonical libraries row for the read-only
+// metadata retention report: its HEAD and whether deleted_at is set. HEAD is
+// decided by global SERIAL LWTs, so it is read in that same domain; a local
+// quorum read could return a stale HEAD on another DC and misclassify a newer
+// tree as retained.
+func (s *CassandraStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
+	var head string
+	var deletedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT head_commit_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Consistency(db.LibraryHeadSerialConsistency).Scan(&head, &deletedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return "", false, false, nil
+	}
+	if err != nil {
+		return "", false, false, err
+	}
+	return head, deletedAt != nil && !deletedAt.IsZero(), true, nil
 }
 
 // --- Scanner operations ---
