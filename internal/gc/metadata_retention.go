@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -22,6 +21,11 @@ const emptyDirFSID = "0000000000000000000000000000000000000000"
 // set. Deleted libraries are reclaimed by the library cascade, not measured here.
 var ErrLibraryNotLive = errors.New("library is not live")
 
+// ErrLibraryWithoutHead reports a canonical row with no HEAD (for example the
+// ghost row of ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01). GC treats such a row as
+// canonically absent, so it is counted separately and not measured.
+var ErrLibraryWithoutHead = errors.New("library has no HEAD")
+
 // FSObjectRetentionRow is one fs_object row with the columns the report needs.
 type FSObjectRetentionRow struct {
 	FSID       string
@@ -31,6 +35,12 @@ type FSObjectRetentionRow struct {
 	SizeBytes  int64
 }
 
+// LibraryRef names a library and the org recorded for it in libraries_by_id.
+type LibraryRef struct {
+	OrgID     uuid.UUID
+	LibraryID uuid.UUID
+}
+
 // MetadataRetentionReader contains read methods only, so the measurement cannot
 // mutate state by construction.
 type MetadataRetentionReader interface {
@@ -38,6 +48,8 @@ type MetadataRetentionReader interface {
 	// whether deleted_at is set. found is false when the row does not exist.
 	GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (headCommitID string, deleted bool, found bool, err error)
 	ListCommitsWithTimestamps(libraryID uuid.UUID) ([]CommitWithTimestamp, error)
+	// ListFSObjectRetentionRows fails on a row it cannot decode instead of
+	// dropping its entries, so a corrupt tree is never measured as complete.
 	ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRetentionRow, error)
 }
 
@@ -45,8 +57,10 @@ type MetadataRetentionReader interface {
 // report command.
 type MetadataRetentionLister interface {
 	MetadataRetentionReader
-	ListDistinctFSObjectLibraries() ([]uuid.UUID, error)
-	FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error)
+	// ListLibrariesForRetention lists libraries_by_id rows with their org: all of
+	// them, or the one row for libraryID when it is not uuid.Nil (none if absent).
+	// Libraries already hard-deleted are not listed; they are not live.
+	ListLibrariesForRetention(libraryID uuid.UUID) ([]LibraryRef, error)
 }
 
 var _ MetadataRetentionLister = (*CassandraStore)(nil)
@@ -75,10 +89,11 @@ type LibraryMetadataRetention struct {
 
 // MeasureLibraryMetadataRetention measures one live library from three reads:
 // the canonical HEAD, the commit partition and the fs_object partition. It
-// returns ErrLibraryNotLive for a missing or deleted library. Any other failure,
-// including a HEAD commit with no row, yields Complete=false and the error; no
-// partial numbers are reported as complete. The reads are not one consistent cut,
-// so a concurrent publication can move objects between categories.
+// returns ErrLibraryNotLive for a missing or deleted library and
+// ErrLibraryWithoutHead for a HEAD-less row. Any other failure, including a HEAD
+// commit with no row or an undecodable fs_object, yields Complete=false and the
+// error; no partial numbers are reported as complete. The reads are not one
+// consistent cut, so a concurrent publication can move objects between categories.
 func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID uuid.UUID) (LibraryMetadataRetention, error) {
 	report := LibraryMetadataRetention{OrgID: orgID, LibraryID: libraryID}
 	fail := func(err error) (LibraryMetadataRetention, error) {
@@ -92,6 +107,9 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	}
 	if !found || deleted {
 		return report, ErrLibraryNotLive
+	}
+	if head == "" {
+		return report, ErrLibraryWithoutHead
 	}
 	report.HeadCommitID = head
 
@@ -144,12 +162,19 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 		}
 	}
 	fromHead := make(map[string]bool)
-	fromAny := make(map[string]bool)
 	for _, c := range commits {
 		if headChain[c.CommitID] {
 			walk(c.RootFSID, fromHead)
 		}
-		walk(c.RootFSID, fromAny)
+	}
+	fromAny := make(map[string]bool, len(fromHead))
+	for id := range fromHead {
+		fromAny[id] = true
+	}
+	for _, c := range commits {
+		if !headChain[c.CommitID] {
+			walk(c.RootFSID, fromAny)
+		}
 	}
 
 	report.Commits = len(commits)
@@ -167,7 +192,8 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 		default:
 			report.Unreferenced++
 		}
-		if row.ObjType == "file" {
+		// An empty obj_type is read as a file elsewhere (api/v2 fs helpers).
+		if row.ObjType == "file" || row.ObjType == "" {
 			report.RetainedFiles++
 			report.RetainedLogicalBytes += row.SizeBytes
 			distinct := make(map[string]bool, len(row.BlockIDs))
@@ -182,7 +208,7 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 }
 
 // MetadataRetentionScope narrows the report. Zero UUIDs mean any; MaxLibraries 0
-// means no limit on live libraries measured.
+// means no limit on the libraries measured or reported incomplete.
 type MetadataRetentionScope struct {
 	OrgID        uuid.UUID
 	LibraryID    uuid.UUID
@@ -190,12 +216,15 @@ type MetadataRetentionScope struct {
 }
 
 // MetadataRetentionSummary totals one report run over the complete libraries.
+// LibrariesListed counts in-scope libraries visited; it equals measured +
+// incomplete + not live + without HEAD.
 type MetadataRetentionSummary struct {
 	Summary                bool  `json:"summary"`
 	LibrariesListed        int   `json:"libraries_listed"`
 	LibrariesMeasured      int   `json:"libraries_measured"`
-	LibrariesNotLive       int   `json:"libraries_not_live"`
 	LibrariesIncomplete    int   `json:"libraries_incomplete"`
+	LibrariesNotLive       int   `json:"libraries_not_live"`
+	LibrariesWithoutHead   int   `json:"libraries_without_head"`
 	FSObjects              int   `json:"fs_objects"`
 	ReachableFromHeadChain int   `json:"reachable_from_head_chain"`
 	ReachableOnlyOffChain  int   `json:"reachable_only_off_chain"`
@@ -206,42 +235,36 @@ type MetadataRetentionSummary struct {
 	DanglingReferences     int   `json:"dangling_references"`
 }
 
-// CollectMetadataRetention enumerates libraries the way scanner Phases 3/4 do and
-// emits one measurement per live library in scope. Libraries that cannot be
-// resolved to an org, or whose measurement fails, are emitted as incomplete and
-// counted; the run continues. The returned error covers the enumeration only.
+// CollectMetadataRetention lists libraries_by_id rows in scope and emits one
+// measurement per live library. A row with no org, or whose measurement fails,
+// is emitted as incomplete and counted; the run continues. The returned error
+// covers the enumeration only.
 func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetentionScope, emit func(LibraryMetadataRetention)) (MetadataRetentionSummary, error) {
 	summary := MetadataRetentionSummary{Summary: true}
-	libraries := []uuid.UUID{scope.LibraryID}
-	if scope.LibraryID == uuid.Nil {
-		listed, err := r.ListDistinctFSObjectLibraries()
-		if err != nil {
-			return summary, fmt.Errorf("list libraries: %w", err)
-		}
-		libraries = listed
+	refs, err := r.ListLibrariesForRetention(scope.LibraryID)
+	if err != nil {
+		return summary, fmt.Errorf("list libraries: %w", err)
 	}
-	for _, libraryID := range libraries {
+	for _, ref := range refs {
+		if scope.OrgID != uuid.Nil && ref.OrgID != scope.OrgID {
+			continue
+		}
 		if scope.MaxLibraries > 0 && summary.LibrariesMeasured+summary.LibrariesIncomplete >= scope.MaxLibraries {
 			break
 		}
 		summary.LibrariesListed++
-		orgID, err := r.FindOrgForLibrary(libraryID)
-		if errors.Is(err, gocql.ErrNotFound) {
-			// Listed from the same tables a moment ago: hard-deleted since.
-			summary.LibrariesNotLive++
-			continue
-		}
-		if err != nil || orgID == uuid.Nil {
+		if ref.OrgID == uuid.Nil {
 			summary.LibrariesIncomplete++
-			emit(LibraryMetadataRetention{OrgID: orgID, LibraryID: libraryID, Error: fmt.Sprintf("resolve org: %v", err)})
+			emit(LibraryMetadataRetention{LibraryID: ref.LibraryID, Error: "libraries_by_id row has no org_id"})
 			continue
 		}
-		if scope.OrgID != uuid.Nil && orgID != scope.OrgID {
-			continue
-		}
-		report, err := MeasureLibraryMetadataRetention(r, orgID, libraryID)
-		if errors.Is(err, ErrLibraryNotLive) {
+		report, err := MeasureLibraryMetadataRetention(r, ref.OrgID, ref.LibraryID)
+		switch {
+		case errors.Is(err, ErrLibraryNotLive):
 			summary.LibrariesNotLive++
+			continue
+		case errors.Is(err, ErrLibraryWithoutHead):
+			summary.LibrariesWithoutHead++
 			continue
 		}
 		emit(report)

@@ -167,8 +167,8 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	}
 
 	summary, seen := collect(MetadataRetentionScope{OrgID: orgA})
-	if summary.LibrariesMeasured != 2 || summary.LibrariesNotLive != 1 || summary.LibrariesIncomplete != 0 || len(seen) != 2 {
-		t.Fatalf("org scope: %+v seen=%d", summary, len(seen))
+	if summary.LibrariesListed != 3 || summary.LibrariesMeasured != 2 || summary.LibrariesNotLive != 1 || summary.LibrariesIncomplete != 0 || len(seen) != 2 {
+		t.Fatalf("org scope (listed counts in-scope libraries only): %+v seen=%d", summary, len(seen))
 	}
 	if _, ok := seen[libB]; ok {
 		t.Fatal("org scope leaked another org's library")
@@ -193,5 +193,51 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	summary, seen = collect(MetadataRetentionScope{})
 	if summary.LibrariesMeasured != 3 || summary.LibrariesNotLive != 1 || len(seen) != 3 {
 		t.Fatalf("unscoped: %+v seen=%d", summary, len(seen))
+	}
+
+	// A HEAD-less canonical row (ghost row) is counted apart, not as incomplete;
+	// a libraries_by_id row without an org is incomplete; a hard-deleted library
+	// is not listed at all.
+	libHeadless, libNoOrg := uuid.New(), uuid.New()
+	store.AddLibraryWithAutoDelete(orgA, libHeadless, "hot", "", 0)
+	store.AddLibraryWithAutoDelete(uuid.Nil, libNoOrg, "hot", "x", 0)
+	if err := store.HardDeleteLibrary(orgA, libDeleted); err != nil {
+		t.Fatal(err)
+	}
+	summary, seen = collect(MetadataRetentionScope{})
+	if summary.LibrariesListed != 5 || summary.LibrariesMeasured != 3 || summary.LibrariesWithoutHead != 1 || summary.LibrariesIncomplete != 1 || summary.LibrariesNotLive != 0 {
+		t.Fatalf("headless/org-less/hard-deleted: %+v", summary)
+	}
+	if r, ok := seen[libNoOrg]; !ok || r.Complete || r.Error == "" {
+		t.Fatalf("org-less row must be emitted incomplete: %+v", r)
+	}
+	if _, ok := seen[libHeadless]; ok {
+		t.Fatal("headless library must not be emitted as a measurement")
+	}
+}
+
+func TestMeasureLibraryMetadataRetention_EmptyObjTypeIsAFile(t *testing.T) {
+	store := NewMockStore()
+	orgID, libID := uuid.New(), uuid.New()
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "c1", 0)
+	store.AddCommitWithDetails(libID, "c1", "root", "", time.Now())
+	store.AddFSObjectWithEntries(libID, "root", "dir", nil, nil)
+	store.AddFSObject(libID, "untyped", "", []string{"b1"})
+	store.SetFSObjectSizeForTest(libID, "untyped", 9)
+	got, err := MeasureLibraryMetadataRetention(store, orgID, libID)
+	if err != nil || got.RetainedFiles != 1 || got.RetainedLogicalBytes != 9 || got.RetainedFSRefs != 1 {
+		t.Fatalf("empty obj_type must count as a retained file: %+v err=%v", got, err)
+	}
+}
+
+func TestParseDirEntriesStrict(t *testing.T) {
+	if ids, err := parseDirEntriesStrict(""); err != nil || ids != nil {
+		t.Fatalf("empty: %v %v", ids, err)
+	}
+	if ids, err := parseDirEntriesStrict(`[{"id":"a"},{"id":""},{"id":"b"}]`); err != nil || !reflect.DeepEqual(ids, []string{"a", "b"}) {
+		t.Fatalf("valid: %v %v", ids, err)
+	}
+	if _, err := parseDirEntriesStrict(`[{"id":"a"`); err == nil {
+		t.Fatal("malformed dir_entries must be an error, not an empty directory")
 	}
 }

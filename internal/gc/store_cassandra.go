@@ -4592,11 +4592,16 @@ func (s *CassandraStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObj
 	var blockIDs []string
 	var sizeBytes int64
 	for iter.Scan(&fsID, &objType, &blockIDs, &dirEntriesJSON, &sizeBytes) {
+		entries, err := parseDirEntriesStrict(dirEntriesJSON)
+		if err != nil {
+			_ = iter.Close()
+			return nil, fmt.Errorf("fs_object %s: %w", fsID, err)
+		}
 		rows = append(rows, FSObjectRetentionRow{
 			FSID:       fsID,
 			ObjType:    objType,
 			BlockIDs:   blockIDs,
-			DirEntries: parseDirEntries(dirEntriesJSON),
+			DirEntries: entries,
 			SizeBytes:  sizeBytes,
 		})
 		dirEntriesJSON, blockIDs, sizeBytes = "", nil, 0
@@ -4605,6 +4610,56 @@ func (s *CassandraStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObj
 		return nil, err
 	}
 	return rows, nil
+}
+
+// parseDirEntriesStrict is parseDirEntries for measurements: malformed JSON is an
+// error rather than an empty directory, which would hide the subtree.
+func parseDirEntriesStrict(jsonStr string) ([]string, error) {
+	if jsonStr == "" {
+		return nil, nil
+	}
+	var entries []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &entries); err != nil {
+		return nil, fmt.Errorf("malformed dir_entries: %w", err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.ID != "" {
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids, nil
+}
+
+// ListLibrariesForRetention lists libraries_by_id rows with their org for the
+// read-only metadata retention report: one point read when libraryID is set,
+// otherwise a full scan. Unlike FindOrgForLibrary there is no fallback that could
+// turn a read error into "not found".
+func (s *CassandraStore) ListLibrariesForRetention(libraryID uuid.UUID) ([]LibraryRef, error) {
+	if libraryID != uuid.Nil {
+		var orgID string
+		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Scan(&orgID)
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return []LibraryRef{{OrgID: parseUUID(orgID), LibraryID: libraryID}}, nil
+	}
+	iter := s.db.Session().Query(`SELECT library_id, org_id FROM libraries_by_id`).Iter()
+	var refs []LibraryRef
+	var libraryIDStr, orgID string
+	for iter.Scan(&libraryIDStr, &orgID) {
+		refs = append(refs, LibraryRef{OrgID: parseUUID(orgID), LibraryID: parseUUID(libraryIDStr)})
+		orgID = ""
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 // GetLibraryHeadForRetention reads the canonical libraries row for the read-only

@@ -3338,6 +3338,20 @@ func (m *MockStore) ListFSObjectRetentionRows(libraryID uuid.UUID) ([]FSObjectRe
 	return rows, nil
 }
 
+// ListLibrariesForRetention mirrors libraries_by_id: m.libraries keeps soft-deleted
+// libraries (with DeletedAt) and drops hard-deleted ones.
+func (m *MockStore) ListLibrariesForRetention(libraryID uuid.UUID) ([]LibraryRef, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var refs []LibraryRef
+	for id, lib := range m.libraries {
+		if libraryID == uuid.Nil || id == libraryID {
+			refs = append(refs, LibraryRef{OrgID: lib.OrgID, LibraryID: id})
+		}
+	}
+	return refs, nil
+}
+
 func (m *MockStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

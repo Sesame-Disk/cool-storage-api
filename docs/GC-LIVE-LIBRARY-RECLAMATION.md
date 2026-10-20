@@ -25,7 +25,7 @@ For one live library (canonical `libraries` row present, `deleted_at` unset):
 | `unreferenced` | objects no commit reaches: in-flight or failed publications, residue of retired commits |
 | `retained_files`, `retained_logical_bytes` | file objects outside HEAD's chain and the sum of their `size_bytes` |
 | `retained_fs_refs` | distinct (object, block) pairs among those files: the permanent `fs:` references they keep alive |
-| `dangling_references` | tree entries naming an fs_id with no row (the all-zero empty-directory id is excluded) |
+| `dangling_references` | distinct fs_ids named by a tree reached from some commit but with no row (the all-zero empty-directory id is excluded; unreferenced trees are not walked) |
 
 `retained_*` covers everything outside HEAD's chain, which is the upper bound a
 reclamation could ever touch. `reachable_only_off_chain` is reported separately
@@ -54,14 +54,21 @@ not garbage by definition.
   `CassandraStore` and `MockStore` implement two new reads: the canonical HEAD with
   `deleted_at`, and the fs_object rows with `size_bytes`. Three reads per library:
   HEAD, the commit partition, the fs_object partition; the graph walk is in memory.
-  A failed read or a missing HEAD commit makes the library `complete: false` with
-  the error; no partial numbers are reported as complete.
+  A failed read, a missing HEAD commit or an fs_object whose `dir_entries` cannot
+  be decoded makes the library `complete: false` with the error; no partial
+  numbers are reported as complete. A canonical row with no HEAD (the ghost row
+  of `ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01`, which GC treats as absent) is
+  counted as `libraries_without_head`, not measured.
+- Enumeration reads `(library_id, org_id)` from `libraries_by_id`: one scan, or
+  one point read for `-library`. Libraries that exist only in `deleted_libraries`
+  are already hard-deleted, so not live. There is no org lookup with a fallback
+  that could turn a read error into "not found".
 - `cmd/sesamefs`: `gc-metadata-retention-report [-library ID] [-org ID]
-  [-max-libraries N]` prints one JSON line per library and a summary line. It
-  enumerates libraries like Phase 3/4 (`libraries_by_id`, `deleted_libraries`)
-  and skips those that are not live. Exit 0 when every library is complete, 2
-  otherwise. Its cost is proportional to the scanned partitions, so scope it on
-  large deployments.
+  [-max-libraries N]` prints one JSON line per measured or incomplete library and
+  a summary line. Exit 0 when every library in scope is complete; 1 for a usage,
+  configuration, connection or output error (including positional arguments);
+  2 when the enumeration fails or any library is incomplete. Its cost is one
+  `libraries_by_id` scan plus three partition reads per live library.
 
 ### Usage
 
@@ -73,8 +80,10 @@ sesamefs gc-metadata-retention-report -org <org_id> -max-libraries 100 > retenti
 ```
 
 `-max-libraries` counts measured or incomplete libraries; libraries that are not
-live are listed and skipped without counting. The last line is the summary
-(`"summary": true`). Run it with GC OFF, at least twice some days apart.
+live or have no HEAD are skipped without counting. The last line is the summary
+(`"summary": true`); its `libraries_listed` equals measured + incomplete + not
+live + without HEAD for the scope. Run it with GC OFF, at least twice some days
+apart.
 
 ### Verification
 
@@ -82,7 +91,9 @@ live are listed and skipped without counting. The last line is the summary
   commit that shares a subtree with HEAD, an unreferenced orphan tree with sized
   files, duplicate block ids and a dangling entry; soft-deleted and missing
   libraries are not live; a failing read and a missing HEAD commit are incomplete,
-  never complete; the enumeration honours its filters and limit.
+  never complete; HEAD-less, org-less and hard-deleted rows; empty `obj_type`;
+  strict `dir_entries` decoding; the enumeration honours its filters and limit.
+  The command rejects bad usage with exit 1 before touching configuration.
 - Real stack: productive Sync writes on Cassandra/S3 (HEAD publication, an
   off-chain commit, an unreferenced received tree), then the report on that
   library through `CassandraStore`, with exact counts and an unchanged queue, refs
