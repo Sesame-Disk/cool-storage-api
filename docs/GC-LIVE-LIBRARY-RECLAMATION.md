@@ -98,8 +98,11 @@ apart.
   commit that shares a subtree with HEAD, an unreferenced orphan tree with sized
   files, duplicate block ids and a dangling entry; soft-deleted and missing
   libraries are not live; a failing read and a missing HEAD commit are incomplete,
-  never complete; HEAD-less, org-less and hard-deleted rows; empty `obj_type`;
-  strict `dir_entries` decoding; the enumeration honours its filters and limit.
+  never complete; a dangling entry under HEAD is incomplete and stays out of the
+  totals; HEAD-less, org-less and hard-deleted rows; empty `obj_type`; strict
+  `dir_entries` decoding; the enumeration honours its filters (including a
+  `-library` of another org) and limit, and stops at the first failed emit.
+  Twelve mutations of these properties each fail a test.
   The command rejects bad usage with exit 1 before touching configuration.
 - Real stack: productive Sync writes on Cassandra/S3 (HEAD publication, an
   off-chain commit, an unreferenced received tree), then the report on that
