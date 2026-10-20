@@ -2355,8 +2355,14 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SuspendedEnqueuesNothing(t *testin
 	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
 
 	ctx := context.Background()
+	// The gauge is process-global and other tests run ScanOnce; reset it so the
+	// check below proves this call recorded the run.
+	metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete").Set(0)
 	if n, err := s.ScanAutoDeleteExpiredObjectsOnce(ctx); err != nil || n != 0 {
 		t.Fatalf("suspended Phase 6: n=%d err=%v, want 0, nil", n, err)
+	}
+	if ts := testutil.ToFloat64(metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete")); ts == 0 {
+		t.Error("suspended phase must still record its run timestamp")
 	}
 	if err := s.ScanOnce(ctx); err != nil {
 		t.Fatalf("ScanOnce failed: %v", err)
@@ -2370,9 +2376,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SuspendedEnqueuesNothing(t *testin
 		if _, err := store.GetFSObject(libID, fsID); err != nil {
 			t.Errorf("fs_object %s disturbed: %v", fsID, err)
 		}
-	}
-	if ts := testutil.ToFloat64(metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete")); ts == 0 {
-		t.Error("suspended phase must still record its run timestamp")
 	}
 }
 

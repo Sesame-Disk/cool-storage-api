@@ -3630,6 +3630,9 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementFSObjectBlocks).
+// Its rows are unguarded: since the Phase 6 suspension the worker completes
+// unguarded fs_object rows without mutation, so this reclaims commits only.
+// Production library cleanup uses the guarded enqueueLibraryContentsAt.
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
 	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), LibraryGuardNone)
 }

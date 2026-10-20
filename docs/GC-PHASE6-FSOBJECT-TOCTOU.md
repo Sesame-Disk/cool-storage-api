@@ -1,8 +1,8 @@
 # Phase 6: fs_object destruction against a newer HEAD
 
-## P6-2: Phase 6 suspended (2026-10-20)
+## P6-2: Phase 6 suspended (2026-10-19)
 
-Base main@d886ffe9d (#318). The maintainer chose option A (§5) on 2026-10-20.
+Base main@d886ffe9d (#318). The maintainer chose option A (§5) on 2026-10-19.
 Scope: close the two destructive paths reproduced in P6-1. Reclamation of
 live-library metadata is not restored here; it is tracked as
 `ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01` (PRE-GC / A1).
@@ -27,7 +27,16 @@ Contract:
 4. The queue lifecycle is unchanged: a nil return completes the row, so there is
    no retry and no DLQ. Global dry-run semantics are unchanged too: a dry-run
    worker completes nothing, so a suspended row stays queued and is counted
-   again on each tick.
+   again on each tick. The new counter therefore counts decisions, not distinct
+   rows. A completed suspended row also increments the existing
+   `gc_items_processed_total{type="fs_object"}`, although nothing was deleted;
+   read the suspension counter to tell them apart.
+
+Not done here: rejecting unguarded `ItemFSObject` rows at enqueue time. No
+production producer writes them after #314 and this change (Phase 4 and library
+cascades are guarded; `EnqueueLibraryContents` has test callers only, and its
+comment now says it reclaims commits only). The worker check also covers rows
+queued earlier. An enqueue-time rejection remains a possible hardening for P6-3.
 
 Not promised: `auto_delete_days` still reads and writes, but Phase 6 performs no
 reclamation in live libraries ([TECHNICAL-DEBT §18](./TECHNICAL-DEBT.md#18-library-history-retention-and-auto-delete-semantics-2026-05-15)
@@ -75,7 +84,7 @@ Tests (RED on main, GREEN here):
   the seeded rows), and the oracle checks fs_objects, the permanent `fs:`, the
   absence of block candidates, canonical P and the S3 bytes.
 
-Evidence: see [P6-2 evidence](#p6-2-evidence-2026-10-20).
+Evidence: see [P6-2 evidence](#p6-2-evidence-2026-10-19).
 
 ## Bounded plan, P6-1 (2026-10-19)
 
@@ -257,9 +266,9 @@ the queued block item (so S3 deletion is not measured), a natural `up:`
 expiry, and clients. Logs are local artifacts, not independent CI; see the PR
 for the manifest hash.
 
-## 5. P6-2 options (decided 2026-10-20: A)
+## 5. P6-2 options (decided 2026-10-19: A)
 
-The maintainer chose A; it is implemented in [P6-2](#p6-2-phase-6-suspended-2026-10-20).
+The maintainer chose A; it is implemented in [P6-2](#p6-2-phase-6-suspended-2026-10-19).
 B and C were rejected for the reasons in the table.
 
 | Option | Behaviour | Cost |
@@ -288,3 +297,32 @@ plaintext block and one root file. It does not execute the block item or show
 S3 deletion, and it certifies no schedule other than the ones measured. X1's
 accepted scope is unchanged. PRE-GC/A1 remain OPEN; ordinary GC stays OFF in
 every DC.
+
+## P6-2 evidence (2026-10-19)
+
+The standard suite ran in a private Compose project (`-p sesamefs-p62`): fresh
+volumes, no published ports, every image built from a clean `git archive` of
+the P6-2 commit `406633d0e`, and a cold boot with `sesamefs` first. The existing
+development stack was not used, because its keyspaces predate the v1 baseline
+fold (#316) and would need a destructive `down -v`. Directed runs used a Go
+1.25.14 runner on the local compose network against the isolated, GC-OFF
+`sesamefs-e19`, through the same isolated re-execution the standard runners use.
+
+| Run | Result |
+|---|---|
+| `go-all-test` (`go test ./... -short -cover`, the required integration run with every standard evidence gate plus the Phase 6 gate, `test.sh api`, `test.sh oidc`) | exit 0. Short Go: 23 packages ok, 0 FAIL. Integration: `ok` in 955.7s; `TestGCPhase6InFlightSyncPublicationKeepsHeadTree` PASS in all four legs through the e19 re-execution. API: 20/20 suites. OIDC: 1/1 suite. 0 top-level FAIL. The 31 nested `--- FAIL` lines are the E1-01 harness controls that inject a failure into a child process (`E101_INJECTED_FAILURE`); every parent passes. 77 conditional SKIP lines are not positive evidence |
+| Phase 6 real-stack test, directed, 3 runs (2 normal, 1 `-race`) | PASS, all four legs; no data race; owned queue empty after teardown |
+| The same test on main's GC runtime (main `worker.go` and `scanner.go`, branch test) | FAIL in all four legs: the selector enqueues 3 rows; the stale race rows delete HEAD's root, file and the orphan and remove the permanent `fs:`; both cascade legs delete HEAD's file and its `fs:`; the lapsed-pin leg also queues HEAD's block as a candidate. The worker suspends 0 rows |
+| `go test -short ./internal/gc ./internal/metrics`, normal and `-race` | PASS |
+| Mutations | removing the worker barrier fails both suspension unit tests; a barrier on the raw field only (ignoring the legacy flag) fails the legacy-flag test; main's selector fails the scanner suspension test; dropping the phase-run timestamp fails it too |
+| `go vet ./...`, `go vet -tags integration ./internal/integration`, `gofmt -l` on changed Go files, `git diff --check` | clean |
+
+After `go-all-test`, the first review round changed only comments, a metric help
+string, the scanner unit test's gauge reset and documentation; the unit tests
+and the gauge mutation were rerun on that source. The integration test is
+byte-identical to the `go-all-test` commit; the runtime differs only in a doc
+comment (`EnqueueLibraryContents`) and the counter's help string.
+
+Not run: three-DC, crash/process-death, sync clients (`sync-test`), frontend
+suites. The fs_object mechanics under a guard are covered by unit tests and the
+pending-item scope regression only, not by a new real-stack leg.
