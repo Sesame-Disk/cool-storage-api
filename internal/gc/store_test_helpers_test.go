@@ -58,7 +58,11 @@ func (m *MockStore) SetFSObjectSizeForTest(libraryID uuid.UUID, fsID string, siz
 func (m *MockStore) SetLibraryOrgNullForTest(libraryID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.libraries[libraryID].OrgIDNull = true
+	lib, ok := m.libraries[libraryID]
+	if !ok {
+		panic("SetLibraryOrgNullForTest: unknown library " + libraryID.String())
+	}
+	lib.OrgIDNull = true
 }
 
 // hardDeleteLibraryForTest puts a fixture library where a guarded fs_object item

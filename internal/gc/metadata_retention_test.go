@@ -287,6 +287,15 @@ func TestCollectMetadataRetention_PlatformOrgIsARealOrg(t *testing.T) {
 	if summary.LibrariesMeasured != 2 || summary.LibrariesIncomplete != 1 || seen[nullOrgLib].Complete {
 		t.Fatalf("only the NULL-org row is incomplete: %+v", summary)
 	}
+	if !seen[nullOrgLib].OrgUnknown || seen[platformLib].OrgUnknown {
+		t.Fatalf("only the NULL-org line is marked org_unknown, so its zero org_id is not read as the platform org: null=%+v platform=%+v", seen[nullOrgLib], seen[platformLib])
+	}
+	if _, err := CollectMetadataRetention(store, MetadataRetentionScope{OrgID: uuid.New()}, func(LibraryMetadataRetention) error {
+		t.Fatal("an OrgID without OrgSet must not scan anything")
+		return nil
+	}); err == nil {
+		t.Fatal("an OrgID without OrgSet must be rejected, not read as an unscoped run")
+	}
 
 	summary, seen = collect(MetadataRetentionScope{OrgID: uuid.Nil, OrgSet: true})
 	if summary.LibrariesListed != 1 || len(seen) != 1 || !seen[platformLib].Complete {

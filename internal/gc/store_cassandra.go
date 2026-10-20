@@ -4626,10 +4626,15 @@ func parseDirEntriesStrict(jsonStr string) ([]string, error) {
 // a NULL column is told apart from the all-zero platform org.
 func (s *CassandraStore) ListLibrariesForRetention(scope MetadataRetentionScope) ([]LibraryRef, error) {
 	refFor := func(libraryID uuid.UUID, orgID *string) LibraryRef {
+		// Not parseUUID: its uuid.Nil on failure would read as the platform org.
 		if orgID == nil {
 			return LibraryRef{LibraryID: libraryID}
 		}
-		return LibraryRef{OrgID: parseUUID(*orgID), OrgKnown: true, LibraryID: libraryID}
+		parsed, err := uuid.Parse(*orgID)
+		if err != nil {
+			return LibraryRef{LibraryID: libraryID}
+		}
+		return LibraryRef{OrgID: parsed, OrgKnown: true, LibraryID: libraryID}
 	}
 	if scope.LibraryID != uuid.Nil {
 		var orgID *string
@@ -4660,7 +4665,6 @@ func (s *CassandraStore) ListLibrariesForRetention(scope MetadataRetentionScope)
 	var orgID *string
 	for iter.Scan(&libraryIDStr, &orgID) {
 		refs = append(refs, refFor(parseUUID(libraryIDStr), orgID))
-		orgID = nil
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err

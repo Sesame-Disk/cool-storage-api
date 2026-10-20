@@ -73,7 +73,10 @@ var _ MetadataRetentionLister = (*CassandraStore)(nil)
 // fields cover every fs_object outside HEAD's commit chain: the upper bound any
 // reclamation could touch. Bytes are logical (size_bytes), not physical.
 type LibraryMetadataRetention struct {
-	OrgID                  uuid.UUID `json:"org_id"`
+	OrgID uuid.UUID `json:"org_id"`
+	// OrgUnknown marks a row whose org_id is NULL or unreadable; OrgID is then
+	// zero, which on its own would name the platform org.
+	OrgUnknown             bool      `json:"org_unknown,omitempty"`
 	LibraryID              uuid.UUID `json:"library_id"`
 	HeadCommitID           string    `json:"head_commit_id"`
 	Commits                int       `json:"commits"`
@@ -262,6 +265,10 @@ type MetadataRetentionSummary struct {
 // returned error covers the enumeration only.
 func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetentionScope, emit func(LibraryMetadataRetention) error) (MetadataRetentionSummary, error) {
 	summary := MetadataRetentionSummary{Summary: true}
+	if scope.OrgID != uuid.Nil && !scope.OrgSet {
+		// Without OrgSet the org is ignored: refuse rather than scan everything.
+		return summary, errors.New("retention scope has OrgID without OrgSet")
+	}
 	refs, err := r.ListLibrariesForRetention(scope)
 	if err != nil {
 		return summary, fmt.Errorf("list libraries: %w", err)
@@ -276,7 +283,7 @@ func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetention
 		summary.LibrariesListed++
 		if !ref.OrgKnown {
 			summary.LibrariesIncomplete++
-			if err := emit(LibraryMetadataRetention{LibraryID: ref.LibraryID, Error: "libraries_by_id row has no org_id"}); err != nil {
+			if err := emit(LibraryMetadataRetention{OrgUnknown: true, LibraryID: ref.LibraryID, Error: "libraries_by_id row has no readable org_id"}); err != nil {
 				return summary, err
 			}
 			continue

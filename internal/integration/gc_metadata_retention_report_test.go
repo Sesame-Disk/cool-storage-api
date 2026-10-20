@@ -176,7 +176,7 @@ func TestGCMetadataRetentionReportMeasuresPlatformOrgLibraries(t *testing.T) {
 		t.Fatalf("read org_id: %v %v", orgID, err)
 	}
 	if uuid.MustParse(*orgID) != uuid.Nil {
-		t.Skipf("superadmin library landed in org %s, not the platform org; nothing to check", *orgID)
+		t.Fatalf("superadmin library landed in org %s, not the platform org: the platform-org path is unverified", *orgID)
 	}
 	store := gcpkg.NewCassandraStore(database)
 	for _, scope := range []gcpkg.MetadataRetentionScope{{LibraryID: library}, {OrgID: uuid.Nil, OrgSet: true}} {
