@@ -1,6 +1,17 @@
 # Current Work
 
-## Active slice: Phase 6 TOCTOU evidence, P6-1 (2026-10-19)
+## Active slice: Phase 6 suspended, P6-2 (2026-10-20)
+
+[Contract and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-20):
+maintainer-chosen option A. The Phase 6 selector is a no-op; the worker completes
+unguarded fs_object rows without mutation before any read or child enqueue;
+guarded cascades are unchanged. The P6-1 schedules are GREEN here and RED on
+main's GC runtime, and the real-stack test joins both standard runners. Closes
+the two Phase 6 destructive paths on merge. Reclamation stays OPEN as
+`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01` (PRE-GC / A1), next as P6-3.
+PRE-GC/A1 OPEN, ordinary GC OFF.
+
+## Previous merged slice: Phase 6 TOCTOU evidence, P6-1 (#318, 2026-10-19)
 
 [Plan and evidence](docs/GC-PHASE6-FSOBJECT-TOCTOU.md): real Cassandra/S3 RED on
 main@bb89d7b12. An in-flight productive Sync publication inside the Phase 6

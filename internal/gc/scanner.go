@@ -67,8 +67,8 @@ func (s *Scanner) ScanExpiredDeletedLibrariesOnce(ctx context.Context) (int, err
 }
 
 // ScanAutoDeleteExpiredObjectsOnce runs only the auto-delete (Phase 6) phase.
-// Integration tests use this narrow entry point to exercise the production
-// selector against owned fixtures without a full ScanOnce pass.
+// Integration tests use this narrow entry point to verify against owned
+// fixtures that the suspended phase enqueues nothing, without a full ScanOnce pass.
 func (s *Scanner) ScanAutoDeleteExpiredObjectsOnce(ctx context.Context) (int, error) {
 	return s.scanAutoDeleteExpiredObjects(ctx)
 }
@@ -847,139 +847,18 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 	return enqueued, nil
 }
 
-// scanAutoDeleteExpiredObjects finds fs_objects that are not referenced by the
-// HEAD commit tree or any recent commit tree (within auto_delete_days), and
-// enqueues them for deletion.
+// scanAutoDeleteExpiredObjects is the auto_delete_days phase (Phase 6). It is
+// suspended: its keep set was computed against a HEAD that a concurrent
+// publication could replace, and its directory cascade reached children that HEAD
+// still used (ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01,
+// ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01). It enqueues nothing
+// until a sharing- and publication-safe reclamation replaces it
+// (ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01). The worker also refuses any
+// unguarded fs_object item already queued.
 func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 6: Scanning for auto-delete expired fs_objects...")
-
-	libs, err := s.store.ListLibrariesWithAutoDelete()
-	if err != nil {
-		return 0, err
-	}
-
-	enqueued := 0
-	for _, lib := range libs {
-		select {
-		case <-ctx.Done():
-			return enqueued, ctx.Err()
-		default:
-		}
-
-		if lib.RepresentationInvalid {
-			countLibraryRepresentationDrift(lib.BlockRepresentationID)
-			log.Printf("[GC Scanner] Phase 6: skipping library %s: stored block_representation_id %q is invalid for the library identity/encryption state", lib.LibraryID, lib.BlockRepresentationID)
-			continue
-		}
-		if err := validateQueueItemBlockRepresentation(QueueItem{
-			ItemType:              ItemFSObject,
-			ItemID:                lib.HeadCommitID,
-			LibraryID:             lib.LibraryID,
-			BlockRepresentationID: lib.BlockRepresentationID,
-		}); err != nil {
-			countLibraryRepresentationDrift(lib.BlockRepresentationID)
-			log.Printf("[GC Scanner] Phase 6: skipping library %s: %v", lib.LibraryID, err)
-			continue
-		}
-		if lib.RepresentationDefaulted {
-			countLibraryRepresentationDefaulted()
-			log.Printf("[GC Scanner] Phase 6: library %s has no stored block_representation_id; processing under derived default %q (drift)", lib.LibraryID, lib.BlockRepresentationID)
-		}
-
-		commits, err := s.store.ListCommitsWithTimestamps(lib.LibraryID)
-		if err != nil {
-			log.Printf("[GC Scanner] Phase 6: failed to list commits for library %s: %v", lib.LibraryID, err)
-			continue
-		}
-
-		// Build a lookup map for walking the parent chain
-		commitMap := make(map[string]CommitWithTimestamp, len(commits))
-		for _, c := range commits {
-			commitMap[c.CommitID] = c
-		}
-
-		// Walk HEAD chain to build keepCommits
-		keepCommits := make(map[string]bool)
-		current := lib.HeadCommitID
-		for current != "" {
-			if keepCommits[current] {
-				break // cycle protection
-			}
-			keepCommits[current] = true
-			if c, ok := commitMap[current]; ok {
-				current = c.ParentID
-			} else {
-				break
-			}
-		}
-
-		// Add commits within auto_delete_days window to keepCommits
-		cutoff := time.Now().AddDate(0, 0, -lib.AutoDeleteDays)
-		for _, c := range commits {
-			if !c.CreatedAt.Before(cutoff) {
-				keepCommits[c.CommitID] = true
-			}
-		}
-
-		// Walk filesystem trees of all keepCommits to build keepFSSet (iterative)
-		keepFSSet := make(map[string]bool)
-		keepSetIncomplete := false
-		for commitID := range keepCommits {
-			if c, ok := commitMap[commitID]; ok && c.RootFSID != "" {
-				if err := s.walkFSTree(lib.LibraryID, c.RootFSID, keepFSSet); err != nil {
-					log.Printf("[GC Scanner] Phase 6: skipping auto-delete for library %s after keep-tree read failure at commit %s root %s: %v", lib.LibraryID, commitID, c.RootFSID, err)
-					keepSetIncomplete = true
-					break
-				}
-			}
-		}
-		if keepSetIncomplete {
-			continue
-		}
-
-		// List all fs_object IDs for this library and enqueue orphans
-		allFSIDs, err := s.store.ListFSObjectIDsForLibrary(lib.LibraryID)
-		if err != nil {
-			log.Printf("[GC Scanner] Phase 6: failed to list fs_objects for library %s: %v", lib.LibraryID, err)
-			continue
-		}
-
-		now := time.Now()
-		var batch []QueueItem
-		for _, fsID := range allFSIDs {
-			if !keepFSSet[fsID] {
-				exists, err := s.pendingWorkExists(lib.OrgID, lib.LibraryID, ItemFSObject, fsID)
-				if err != nil {
-					log.Printf("[GC Scanner] Phase 6: failed to inspect pending fs_object %s for library %s: %v", fsID, lib.LibraryID, err)
-					continue
-				}
-				if exists {
-					continue
-				}
-				batch = append(batch, QueueItem{
-					OrgID:                 lib.OrgID,
-					QueuedAt:              now,
-					IdentityAt:            now,
-					ItemType:              ItemFSObject,
-					ItemID:                fsID,
-					LibraryID:             lib.LibraryID,
-					BlockRepresentationID: lib.BlockRepresentationID,
-				})
-			}
-		}
-		if len(batch) > 0 {
-			if err := s.queue.EnqueueBatch(batch); err != nil {
-				log.Printf("[GC Scanner] Phase 6: failed to batch enqueue fs_objects for library %s: %v", lib.LibraryID, err)
-			} else {
-				enqueued += len(batch)
-			}
-		}
-	}
-
-	log.Printf("[GC Scanner] Phase 6 complete: enqueued %d auto-delete expired fs_objects", enqueued)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("auto_delete").Add(float64(enqueued))
+	log.Println("[GC Scanner] Phase 6 (auto_delete_days) is suspended: no fs_objects are enqueued")
 	metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete").SetToCurrentTime()
-	return enqueued, nil
+	return 0, nil
 }
 
 // scanExpiredShares finds user-to-user library shares past their expiration date.
@@ -1468,39 +1347,4 @@ func (s *Scanner) scanS3OrphanRecovery(ctx context.Context) (int, error) {
 	recordScannerAction("s3_orphan_recovery", "recovered", recovered)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("s3_orphan_recovery").SetToCurrentTime()
 	return recovered, err
-}
-
-// walkFSTree iteratively walks a filesystem tree starting from fsID,
-// adding all visited fs_ids to the visited set. Uses an explicit stack
-// instead of recursion to avoid stack overflow on deep directory trees.
-func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[string]bool) error {
-	if fsID == "" || visited[fsID] {
-		return nil
-	}
-
-	stack := []string{fsID}
-	for len(stack) > 0 {
-		// Pop
-		current := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if current == "" || visited[current] {
-			continue
-		}
-		visited[current] = true
-
-		obj, err := s.store.GetFSObject(libraryID, current)
-		if err != nil {
-			return fmt.Errorf("load fs_object %s for library %s: %w", current, libraryID, err)
-		}
-
-		// Push children
-		for _, childID := range obj.DirEntries {
-			if !visited[childID] {
-				stack = append(stack, childID)
-			}
-		}
-	}
-
-	return nil
 }

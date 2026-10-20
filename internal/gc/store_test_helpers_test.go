@@ -30,6 +30,30 @@ func (m *MockStore) SeedQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, it
 	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, storageClass, retryCount)
 }
 
+// SeedGuardedQueueItemForTest is SeedQueueItemForTest with a library guard. Since
+// Phase 6 is suspended the worker completes unguarded fs_object rows without any
+// mutation, so tests of the destructive fs_object path stage guarded rows.
+func (m *MockStore) SeedGuardedQueueItemForTest(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, guard LibraryGuardMode) {
+	m.seedQueueItemRow(orgID, queuedAt, itemType, itemID, libraryID, "", 0)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rows := m.queue[orgID]
+	rows[len(rows)-1].LibraryGuardMode = guard
+}
+
+// hardDeleteLibraryForTest puts a fixture library where a guarded fs_object item
+// may legitimately run: soft-deleted, then hard-deleted (canonical row and marker
+// gone), as after a completed library cascade.
+func hardDeleteLibraryForTest(t testing.TB, store *MockStore, orgID, libraryID uuid.UUID) {
+	t.Helper()
+	if err := store.SoftDeleteLibrary(orgID, libraryID, uuid.Nil); err != nil {
+		t.Fatalf("SoftDeleteLibrary failed: %v", err)
+	}
+	if err := store.HardDeleteLibrary(orgID, libraryID); err != nil {
+		t.Fatalf("HardDeleteLibrary failed: %v", err)
+	}
+}
+
 // enqueueExactBlockCandidateForTest queues a block only after its exact candidate
 // has been captured. Tests use this instead of the legacy single-row enqueue path.
 func enqueueExactBlockCandidateForTest(t testing.TB, store *MockStore, candidate BlockGCCandidateInfo, retryCount int) {

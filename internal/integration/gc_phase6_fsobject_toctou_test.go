@@ -16,19 +16,25 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // Destructive real-stack evidence for ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01
-// and ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01. It asserts the
-// safety property, so it is RED on a runtime without a fix and stays out of
-// ordinary runs until that fix makes it GREEN.
-const gcPhase6TOCTOUEvidenceEnv = "SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE"
+// and ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01. On main@bb89d7b12 the
+// same schedules lost HEAD metadata (docs/GC-PHASE6-FSOBJECT-TOCTOU.md §4). With
+// Phase 6 suspended, the selector enqueues nothing and the worker completes the
+// stale unguarded rows it used to produce without mutation.
+const (
+	gcPhase6TOCTOUEvidenceEnv = "SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE"
+	gcPhase6ChildEnv          = "SESAMEFS_GC_PHASE6_CHILD"
+)
 
 // The real Phase 6 selector, narrowed to one owned library. The productive
 // writer runs once inside the selector's own gap: after the commit listing that
-// builds the keep set, before the fs_object listing it is compared against.
+// built the keep set, before the fs_object listing it was compared against.
 type phase6InFlightStore struct {
 	gcpkg.GCStore
 	library uuid.UUID
@@ -111,24 +117,35 @@ func phase6FSObjectExists(t *testing.T, store *gcpkg.CassandraStore, library uui
 }
 
 const (
-	phase6InFlightGap      = "in-flight-gap"
-	phase6ListedBeforeScan = "listed-before-scan"
-	phase6OrphanSharesFile = "orphan-shares-head-file"
-	phase6OrphanSharesAged = "orphan-shares-aged-head-file"
+	phase6SelectorSuspended = "selector-suspended"
+	phase6StaleInFlight     = "stale-in-flight-selection"
+	phase6OrphanSharesFile  = "stale-orphan-shares-head-file"
+	phase6OrphanSharesAged  = "stale-orphan-shares-aged-head-file"
 )
 
 // All legs share one productive Sync writer and one received-but-uncommitted
-// orphan directory. "in-flight-gap" lands the writer between the selector's
-// commit and fs_object listings. "listed-before-scan" lands it first, so its
-// commit is in the keep set: the control that the gap, not the writer or the
-// oracle, causes that loss. "orphan-shares-head-file" publishes HEAD before the
-// scan and gives the orphan HEAD's file as its child: no race, only the
-// worker's directory cascade. "orphan-shares-aged-head-file" is the same after
-// an explicit lapse of the Sync up: pin (its 48h TTL), as for a file that has
-// been in HEAD longer: the permanent fs: is then its only reference.
+// orphan directory.
+//   - selector-suspended: the writer lands inside the selector's gap (the
+//     reproduced race) and the orphan has HEAD's file as its child (the
+//     reproduced cascade); the suspended selector must enqueue nothing.
+//   - stale-in-flight-selection: the rows the old selector produced for that
+//     race (orphan, root, file) are queued before HEAD publishes them.
+//   - stale-orphan-shares-head-file: HEAD is published; a stale row names the
+//     orphan directory whose child is HEAD's file.
+//   - stale-orphan-shares-aged-head-file: the same after an explicit lapse of the
+//     Sync up: pin (its 48h TTL); the permanent fs: is HEAD's only reference.
+//
+// In every stale leg the worker must complete each row, mutate nothing, and
+// count each one as suspended.
 func TestGCPhase6InFlightSyncPublicationKeepsHeadTree(t *testing.T) {
+	// The standard runners point SESAMEFS_URL at the ordinary fleet, whose GC may be
+	// on. Re-run this test as a child against the isolated, GC-OFF backend.
+	if endpoint := os.Getenv("SESAMEFS_E19_ISOLATED_URL"); endpoint != "" && os.Getenv(gcPhase6ChildEnv) != "1" {
+		e101IsolatedMatrix(t, endpoint, "TestGCPhase6InFlightSyncPublicationKeepsHeadTree", gcPhase6TOCTOUEvidenceEnv, gcPhase6ChildEnv, map[string]bool{}, nil)
+		return
+	}
 	if os.Getenv(gcPhase6TOCTOUEvidenceEnv) != "1" {
-		t.Skipf("destructive Phase 6 evidence on owned fixtures; RED until the Phase 6 fix: %s=1", gcPhase6TOCTOUEvidenceEnv)
+		t.Skipf("destructive Phase 6 evidence needs an isolated GC-OFF backend: set SESAMEFS_E19_ISOLATED_URL or %s=1", gcPhase6TOCTOUEvidenceEnv)
 	}
 	database := shareProjectionDBForTest(t)
 	var release string
@@ -138,12 +155,12 @@ func TestGCPhase6InFlightSyncPublicationKeepsHeadTree(t *testing.T) {
 	// Every replica sharing this keyspace must report GC off: one with GC on
 	// would scan the same auto-delete library and race the worker.
 	e19RequireNoBackgroundGC(t)
-	for _, leg := range []string{phase6InFlightGap, phase6ListedBeforeScan, phase6OrphanSharesFile, phase6OrphanSharesAged} {
+	for _, leg := range []string{phase6SelectorSuspended, phase6StaleInFlight, phase6OrphanSharesFile, phase6OrphanSharesAged} {
 		reached := false
 		t.Run(leg, func(t *testing.T) { phase6Leg(t, database, leg, &reached) })
 		// A helper SKIP (S3 or storage class unavailable) must not pass as evidence.
 		if !reached {
-			t.Fatalf("leg %s did not reach its oracle", leg)
+			t.Errorf("leg %s did not reach its oracle", leg)
 		}
 	}
 }
@@ -207,13 +224,15 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, reached *bool) {
 		w24AssertHeadReaches(t, fx, commit, file)
 		e17AssertRefs(t, fx, syncRef, permanent)
 	}
-	// Positive control: received metadata that no commit references. Its child
-	// does not exist, except in the cascade leg, where it is HEAD's file.
-	cascade := leg == phase6OrphanSharesFile || leg == phase6OrphanSharesAged
+	// Received metadata that no commit references. Its child does not exist in the
+	// in-flight leg; elsewhere it is HEAD's file.
+	cascade := leg != phase6StaleInFlight
 	orphanChild := sha1hex([]byte("phase6-orphan-child-" + uuid.NewString()))
-	if cascade {
+	if leg == phase6OrphanSharesFile || leg == phase6OrphanSharesAged {
 		writer()
 		publish()
+	}
+	if cascade {
 		orphanChild = file
 	}
 	if leg == phase6OrphanSharesAged {
@@ -225,43 +244,48 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, reached *bool) {
 	orphanJSON := mustMarshalSyncObjectForTest(t, map[string]interface{}{"dirents": []apipkg.FSEntry{{ID: orphanChild, Mode: 33188, Mtime: time.Now().Unix(), Name: "phase6-orphan-" + uuid.NewString()[:8] + ".txt", Size: 1}}, "type": 3, "version": 1})
 	orphan := syncSHA1HexForTest(orphanJSON)
 	e17OK(t, e17Request(fx, http.MethodPost, "/recv-fs", "", "", packSyncFSObjectsForTest(t, syncPackedFSObject{fsID: orphan, jsonData: orphanJSON}), handler.RecvFS))
-	if exists := phase6FSObjectExists(t, store, library, file); exists != cascade || !phase6FSObjectExists(t, store, library, orphan) {
-		t.Fatal("fixture precondition: before the scan only the orphan control (and, in the cascade leg, HEAD's tree) exists")
-	}
 
-	scope := &phase6InFlightStore{GCStore: store, library: library, inGap: func() {}}
-	want := []string{orphan}
+	// Stale work: exactly the rows the pre-suspension selector produced.
+	var seeded []string
 	switch leg {
-	case phase6InFlightGap:
-		scope.inGap = writer
-		want = append(want, root, file)
-	case phase6ListedBeforeScan:
+	case phase6SelectorSuspended:
+		scope := &phase6InFlightStore{GCStore: store, library: library, inGap: writer}
+		n, err := gcpkg.NewScanner(scope, gcpkg.NewQueue(scope), &gcpkg.Stats{}, config.GCConfig{}).ScanAutoDeleteExpiredObjectsOnce(t.Context())
+		if err != nil || n != 0 {
+			t.Fatalf("suspended Phase 6 selector: n=%d err=%v, want 0, nil", n, err)
+		}
+		if scope.fired {
+			t.Fatal("suspended Phase 6 selector still lists fs_objects")
+		}
+		writer() // the in-gap write did not run: complete the upload for the oracle
+		publish()
+	case phase6StaleInFlight:
 		writer()
+		seeded = []string{orphan, root, file}
+	default:
+		seeded = []string{orphan}
 	}
-	n, err := gcpkg.NewScanner(scope, gcpkg.NewQueue(scope), &gcpkg.Stats{}, config.GCConfig{}).ScanAutoDeleteExpiredObjectsOnce(t.Context())
-	if err != nil || !scope.fired {
-		t.Fatalf("Phase 6 selector: n=%d fired=%v err=%v", n, scope.fired, err)
-	}
-	selected := map[string]gcpkg.QueueItem{}
-	for _, item := range phase6OwnedItems(t, store, fx.orgUUID, library, fx.blockID) {
-		selected[item.ItemID] = item
-	}
-	for _, id := range want {
-		item, ok := selected[id]
-		if !ok || item.ItemType != gcpkg.ItemFSObject || item.LibraryGuardMode != gcpkg.LibraryGuardNone || item.RequiresLibraryDeletedCheck {
-			t.Fatalf("selection not reproduced: %s not selected as an unguarded fs_object: %+v (n=%d)", id, item, n)
+	if len(seeded) > 0 {
+		now := time.Now()
+		var stale []gcpkg.QueueItem
+		for _, id := range seeded {
+			stale = append(stale, gcpkg.QueueItem{OrgID: fx.orgUUID, QueuedAt: now, IdentityAt: now, ItemType: gcpkg.ItemFSObject, ItemID: id, LibraryID: library, BlockRepresentationID: dbpkg.PlainBlockRepresentationID})
+		}
+		if err := gcpkg.NewQueue(store).EnqueueBatch(stale); err != nil {
+			t.Fatalf("seed stale unguarded rows: %v", err)
 		}
 	}
-	if len(selected) != len(want) || n != len(want) {
-		t.Fatalf("selection must be exactly %v (HEAD tree kept): n=%d rows=%d", want, n, len(selected))
+	if leg == phase6StaleInFlight {
+		publish() // HEAD now depends on the rows queued against the old HEAD
+	}
+	for _, item := range phase6OwnedItems(t, store, fx.orgUUID, library, fx.blockID) {
+		if item.ItemType != gcpkg.ItemFSObject || item.LibraryGuardMode != gcpkg.LibraryGuardNone || item.RequiresLibraryDeletedCheck {
+			t.Fatalf("unexpected owned queue row before the worker: %+v", item)
+		}
 	}
 
-	// The client completes; HEAD now depends on the selected objects.
-	if !cascade {
-		publish()
-	}
-
-	// The real worker executes the selection made against the old HEAD.
+	// The real worker executes the stale rows.
+	suspendedBefore := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal)
 	owned := &phase6OwnedQueue{GCStore: store, library: library}
 	worker := w2Worker(t, owned, class)
 	for pass := 0; pass < 4; pass++ {
@@ -276,26 +300,23 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, reached *bool) {
 	var blockRows int
 	for _, item := range phase6OwnedItems(t, store, fx.orgUUID, library, fx.blockID) {
 		if item.ItemType == gcpkg.ItemFSObject {
-			t.Fatalf("worker did not drain the owned selection; a partial run proves nothing: %+v", item)
+			t.Errorf("PHASE6 VIOLATION (%s): fs_object row %s left queued or fanned out", leg, item.ItemID)
 		}
 		if item.ItemType == gcpkg.ItemBlock {
 			blockRows++
 		}
 	}
 	*reached = true
+	suspended := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal) - suspendedBefore
 
-	if phase6FSObjectExists(t, store, library, orphan) {
-		t.Fatal("positive control: the worker did not execute the orphan fs_object, so the oracle below would be vacuous")
-	}
 	if head := borrowedFSReadHead(t, database, fx.orgID, fx.repoID); head != commit {
 		t.Errorf("HEAD moved: %s", head)
 	}
-	// Safety oracle. Each check is reported separately so RED names every loss.
-	if !phase6FSObjectExists(t, store, library, root) {
-		t.Errorf("PHASE6 VIOLATION (%s): HEAD root fs_object %s deleted", leg, root)
-	}
-	if !phase6FSObjectExists(t, store, library, file) {
-		t.Errorf("PHASE6 VIOLATION (%s): HEAD file fs_object %s deleted", leg, file)
+	// Safety oracle. Each check is reported separately so a regression names every loss.
+	for name, fsID := range map[string]string{"HEAD root": root, "HEAD file": file, "orphan": orphan} {
+		if !phase6FSObjectExists(t, store, library, fsID) {
+			t.Errorf("PHASE6 VIOLATION (%s): %s fs_object %s deleted", leg, name, fsID)
+		}
 	}
 	refs, err := database.ListBlockReferrers(fx.orgID, fx.blockID)
 	if err != nil {
@@ -320,6 +341,11 @@ func phase6Leg(t *testing.T, database *dbpkg.DB, leg string, reached *bool) {
 	if bytesErr != nil || !bytes.Equal(data, fx.content) {
 		t.Errorf("PHASE6 VIOLATION (%s): HEAD bytes at %s lost: %v", leg, fx.target.StorageKey, bytesErr)
 	}
-	t.Logf("EVIDENCE phase6 leg=%s: HEAD=%s root=%s file=%s orphan=%s dequeued=%v refs=[%s] candidates=%d queuedBlock=%d canonical=%v bytes=%v",
-		leg, commit, root, file, orphan, owned.dequeued, strings.Join(refs, " "), candidates, blockRows, canonicalErr == nil, bytesErr == nil)
+	// Non-vacuity: every stale row was dequeued and counted as suspended, so the
+	// oracle above was reached through the worker, not around it.
+	if suspended != float64(len(seeded)) || len(owned.dequeued) != len(seeded) {
+		t.Errorf("worker must visit and suspend every stale row: seeded=%d dequeued=%v suspended=%v", len(seeded), owned.dequeued, suspended)
+	}
+	t.Logf("EVIDENCE phase6 leg=%s: HEAD=%s root=%s file=%s orphan=%s seeded=%d dequeued=%v suspended=%v refs=[%s] candidates=%d queuedBlock=%d canonical=%v bytes=%v",
+		leg, commit, root, file, orphan, len(seeded), owned.dequeued, suspended, strings.Join(refs, " "), candidates, blockRows, canonicalErr == nil, bytesErr == nil)
 }

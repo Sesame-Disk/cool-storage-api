@@ -59,6 +59,16 @@ var (
 		[]string{"phase"},
 	)
 
+	// GCUnguardedFSObjectItemsSuspendedTotal counts ItemFSObject queue items with no
+	// effective library guard that the worker completed without any mutation while
+	// Phase 6 reclamation is suspended (docs/GC-PHASE6-FSOBJECT-TOCTOU.md).
+	GCUnguardedFSObjectItemsSuspendedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gc_unguarded_fs_object_items_suspended_total",
+			Help: "Total number of unguarded fs_object GC items completed without mutation while Phase 6 is suspended.",
+		},
+	)
+
 	// GCScannerActionsTotal counts direct cleanup/recovery actions performed by scanner phases.
 	GCScannerActionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -1424,6 +1434,7 @@ func Register() {
 		GCQueueSize,
 		GCItemsProcessedTotal,
 		GCItemsEnqueuedTotal,
+		GCUnguardedFSObjectItemsSuspendedTotal,
 		GCScannerActionsTotal,
 		GCErrorsTotal,
 		GCItemsSkippedTotal,

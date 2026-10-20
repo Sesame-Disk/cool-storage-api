@@ -1,5 +1,82 @@
 # Phase 6: fs_object destruction against a newer HEAD
 
+## P6-2: Phase 6 suspended (2026-10-20)
+
+Base main@d886ffe9d (#318). The maintainer chose option A (§5) on 2026-10-20.
+Scope: close the two destructive paths reproduced in P6-1. Reclamation of
+live-library metadata is not restored here; it is tracked as
+`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01` (PRE-GC / A1).
+
+Contract:
+
+1. `scanAutoDeleteExpiredObjects` is an explicit no-op. It logs the suspension,
+   still records `gc_scanner_last_phase_run_timestamp_seconds{phase="auto_delete"}`
+   and enqueues nothing. Its selector and the `walkFSTree` keep-set walker,
+   used only by it, are removed; git history keeps them for P6-3.
+   `ScanAutoDeleteExpiredObjectsOnce` stays, so integration tests can verify
+   the no-op.
+2. `processFSObject` first checks the effective guard
+   (`effectiveLibraryGuardMode`, which honours the legacy
+   `RequiresLibraryDeletedCheck` flag). An unguarded item is completed before any
+   read, dry-run log, child enqueue, reference removal or delete, including
+   rows queued before this change. It increments
+   `gc_unguarded_fs_object_items_suspended_total` (no labels) and logs one line.
+3. Guarded fs_object items (`CanonicalMustBeAbsent`, `DeletedAtIdentity`, and the
+   legacy flag) keep their existing path. Library, user and org cascades and
+   Phase 4 are unchanged.
+4. The queue lifecycle is unchanged: a nil return completes the row, so there is
+   no retry and no DLQ. Global dry-run semantics are unchanged too: a dry-run
+   worker completes nothing, so a suspended row stays queued and is counted
+   again on each tick.
+
+Not promised: `auto_delete_days` still reads and writes, but Phase 6 performs no
+reclamation in live libraries ([TECHNICAL-DEBT §18](./TECHNICAL-DEBT.md#18-library-history-retention-and-auto-delete-semantics-2026-05-15)
+records that it never deleted current files either). Phase 5's exclusive-tree
+retention stays open. Nothing here authorizes GC activation; PRE-GC/A1 remain
+OPEN and ordinary GC stays OFF.
+
+Backward compatible: yes for API, schema, queue format and configuration. The
+behaviour change is deliberate and limited to GC with `auto_delete_days` set:
+Phase 6 no longer deletes anything. Rollback is a code revert with no migration;
+it restores both destructive paths, so GC must stay OFF if it is rolled back.
+
+Tests (RED on main, GREEN here):
+
+- Unit, ordinary suite:
+  - `TestWorker_ProcessFSObject_UnguardedItemCompletesWithoutMutation`: a file
+    still referenced and an orphan directory sharing that file are both
+    completed, with no child, block, retry or DLQ row and the reference intact.
+  - `..._UnguardedItemSuspendedBeforeDryRun`: dry-run keeps the row queued
+    and mutates nothing.
+  - `..._LegacyDeletedCheckFlagIsNotSuspended`: a row with only the legacy flag
+    still runs its guarded destructive path after a completed hard delete.
+  - `TestScanner_ScanAutoDeleteExpiredObjects_SuspendedEnqueuesNothing`: a
+    fixture the old selector enqueued (an orphan, and an off-chain commit root
+    sharing HEAD's file) produces no fs_object work through the phase entry
+    point or a full `ScanOnce`.
+- The eleven old selector unit tests are removed, because no selector remains
+  to test. The fs_object mechanics tests (cascade of blocks and children, retry
+  idempotence, library-scoped dedupe, queued representation, dry-run) now stage
+  legitimate guarded rows after a completed hard delete, so the guarded path
+  keeps its coverage. The pending-item scope regression
+  (`ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01`) now uses the Phase 4 shape.
+- Real stack: `TestGCPhase6InFlightSyncPublicationKeepsHeadTree` runs in both
+  standard Compose runners through the isolated e19 re-execution used by the
+  E1-01 tests, with its gate set there. Legs:
+
+  | Leg | Schedule |
+  |---|---|
+  | `selector-suspended` | the P6-1 race and cascade inputs; the selector must enqueue nothing and not even list fs_objects |
+  | `stale-in-flight-selection` | the exact rows the old selector produced for the race, queued before HEAD publishes |
+  | `stale-orphan-shares-head-file` | a stale orphan directory row whose child is HEAD's file |
+  | `stale-orphan-shares-aged-head-file` | the same with the Sync `up:` pin lapsed |
+
+  The worker must dequeue and suspend every stale row (counter delta equal to
+  the seeded rows), and the oracle checks fs_objects, the permanent `fs:`, the
+  absence of block candidates, canonical P and the S3 bytes.
+
+Evidence: see [P6-2 evidence](#p6-2-evidence-2026-10-20).
+
 ## Bounded plan, P6-1 (2026-10-19)
 
 Base main@bb89d7b12 (#317). Scope: `ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01`
@@ -96,6 +173,9 @@ cascade propagates that mode to every child it enqueues.
 
 ## 3. Test design
 
+This section describes the P6-1 RED test. P6-2 rebuilt it as the GREEN test
+described at the top; the schedules and oracle below are kept as the RED record.
+
 `TestGCPhase6InFlightSyncPublicationKeepsHeadTree`
 ([test](../internal/integration/gc_phase6_fsobject_toctou_test.go)) runs only
 with `SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE=1`, which is wired into
@@ -177,7 +257,10 @@ the queued block item (so S3 deletion is not measured), a natural `up:`
 expiry, and clients. Logs are local artifacts, not independent CI; see the PR
 for the manifest hash.
 
-## 5. P6-2 options (maintainer decision pending)
+## 5. P6-2 options (decided 2026-10-20: A)
+
+The maintainer chose A; it is implemented in [P6-2](#p6-2-phase-6-suspended-2026-10-20).
+B and C were rejected for the reasons in the table.
 
 | Option | Behaviour | Cost |
 |---|---|---|

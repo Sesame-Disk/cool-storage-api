@@ -694,7 +694,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | 3 | Orphaned commits (library no longer exists) | Enqueue for deletion |
 | 4 | Orphaned fs_objects (library no longer exists) | Enqueue for deletion |
 | 5 | Expired versions (`version_ttl_days`) | Enqueue old commits |
-| 6 | Auto-delete expired objects (`auto_delete_days`) | Enqueue old fs_objects |
+| 6 | Auto-delete expired objects (`auto_delete_days`) | **Suspended (no-op) since 2026-10-20**; the worker also completes unguarded fs_object rows without mutation. See [GC-PHASE6-FSOBJECT-TOCTOU](./GC-PHASE6-FSOBJECT-TOCTOU.md) |
 | 7 | Expired user-to-user shares | Delete directly |
 | 8 | Expired/completed restore jobs | Delete directly |
 | 9 | Orphaned group shares (group deleted but shares remain) | Delete directly |

@@ -2067,42 +2067,6 @@ func TestScanner_ScanExpiredVersions_DefaultsMissingPlaintextRepresentation(t *t
 	}
 }
 
-func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingPlaintextRepresentation(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
-	store.mu.Lock()
-	store.libraries[libID].BlockRepresentationID = ""
-	store.mu.Unlock()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
-	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
-
-	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
-
-	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil || n != 1 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
-	}
-	items := store.QueueItems(orgID)
-	if len(items) != 1 {
-		t.Fatalf("expected 1 queued orphan fs_object for defaulted plaintext library, got %#v", items)
-	}
-	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != db.PlainBlockRepresentationID {
-		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, db.PlainBlockRepresentationID)
-	}
-	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
-		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
-	}
-}
-
 // TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation pins the
 // encrypted half of the policy: an encrypted library with an empty stored
 // block_representation_id derives library:<id> (not plain:v1), processes, and
@@ -2137,44 +2101,6 @@ func TestScanner_ScanExpiredVersions_DefaultsMissingEncryptedRepresentation(t *t
 	}
 	if items[0].BlockRepresentationID != wantRep {
 		t.Fatalf("queued item representation = %q, want %q", items[0].BlockRepresentationID, wantRep)
-	}
-	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
-		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_DefaultsMissingEncryptedRepresentation(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
-	store.mu.Lock()
-	store.libraries[libID].BlockRepresentationID = ""
-	store.mu.Unlock()
-	store.SetLibraryEncrypted(libID, true)
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
-	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
-
-	wantRep := db.EncryptedLibraryBlockRepresentationID(libID.String())
-	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted"))
-
-	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil || n != 1 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
-	}
-	items := store.QueueItems(orgID)
-	if len(items) != 1 {
-		t.Fatalf("expected 1 queued orphan fs_object, got %#v", items)
-	}
-	if items[0].ItemID != "fs-orphan" || items[0].BlockRepresentationID != wantRep {
-		t.Fatalf("queued item = %s/%q, want fs-orphan/%q", items[0].ItemID, items[0].BlockRepresentationID, wantRep)
 	}
 	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_defaulted")); afterDrift != beforeDrift+1 {
 		t.Fatalf("drift metric = %v, want %v", afterDrift, beforeDrift+1)
@@ -2234,40 +2160,6 @@ func TestScanner_ScanExpiredVersions_SkipsCrossDomainRepresentation(t *testing.T
 	n, err := s.scanExpiredVersions(context.Background())
 	if err != nil || n != 0 {
 		t.Fatalf("scanExpiredVersions = (%d, %v), want (0, nil)", n, err)
-	}
-	if items := store.QueueItems(orgID); len(items) != 0 {
-		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
-	}
-	if afterDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid")); afterDrift != beforeDrift+1 {
-		t.Fatalf("invalid drift metric = %v, want %v", afterDrift, beforeDrift+1)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsCrossDomainRepresentation(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
-	// Plaintext library (encrypted stays false) stamped with an encrypted
-	// per-library representation: canonical for the UUID but the wrong domain.
-	store.mu.Lock()
-	store.libraries[libID].BlockRepresentationID = db.EncryptedLibraryBlockRepresentationID(libID.String())
-	store.mu.Unlock()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", time.Now())
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
-	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
-
-	beforeDrift := testutil.ToFloat64(metrics.GCAuditEventsTotal.WithLabelValues("gc_library_representation_invalid"))
-
-	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil || n != 0 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (0, nil)", n, err)
 	}
 	if items := store.QueueItems(orgID); len(items) != 0 {
 		t.Fatalf("expected no queued work for cross-domain representation, got %#v", items)
@@ -2441,322 +2333,46 @@ func TestScanner_ScanExpiredVersions_SkipsZeroTTL(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanAutoDeleteExpiredObjects_Basic(t *testing.T) {
+// Phase 6 is suspended (ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01,
+// ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01). The fixture holds what
+// the old selector enqueued: an orphan object, and the root of a commit outside
+// HEAD's ancestry and the auto-delete window that shares HEAD's file. Neither the
+// phase entry point nor a full ScanOnce may produce fs_object work for it.
+func TestScanner_ScanAutoDeleteExpiredObjects_SuspendedEnqueuesNothing(t *testing.T) {
 	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
+	s := NewScanner(store, NewQueue(store), &Stats{}, config.GCConfig{})
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
 	libID := uuid.New()
-
-	headCommitID := "commit-head"
-
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 1)
-
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
 	now := time.Now()
-	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
-
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
-	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
-
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
+	store.AddCommitWithDetails(libID, "commit-old", "fs-old-root", "", now.Add(-48*time.Hour))
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-dir1"})
+	store.AddFSObjectWithEntries(libID, "fs-dir1", "dir", nil, []string{"fs-file"})
+	store.AddFSObject(libID, "fs-file", "file", []string{"blk-1"})
+	store.AddFSObjectWithEntries(libID, "fs-old-root", "dir", nil, []string{"fs-file"})
 	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
 
 	ctx := context.Background()
-	err := s.ScanOnce(ctx)
-	if err != nil {
+	if n, err := s.ScanAutoDeleteExpiredObjectsOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("suspended Phase 6: n=%d err=%v, want 0, nil", n, err)
+	}
+	if err := s.ScanOnce(ctx); err != nil {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
-
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemFSObject {
-			fsItems++
-			if item.ItemID != "fs-orphan" {
-				t.Errorf("unexpected fs_object enqueued: %s", item.ItemID)
-			}
-		}
-	}
-	if fsItems != 1 {
-		t.Errorf("expected 1 orphaned fs_object enqueued, got %d", fsItems)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsRetriedQueuedFSObject(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	libID := uuid.New()
-	store.AddOrganization(orgID)
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-keep"})
-	store.AddFSObject(libID, "fs-keep", "file", []string{"blk-keep"})
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-orphan"})
-	store.SeedQueueItemForTest(orgID, now.Add(-2*time.Hour).UTC().Truncate(time.Millisecond), ItemFSObject, "fs-orphan", libID, "", 0)
-
-	items, err := store.DequeueBatch(orgID, 1, time.Now())
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
-	}
-	if err := q.IncrementRetry(items[0]); err != nil {
-		t.Fatalf("IncrementRetry failed: %v", err)
-	}
-
-	if n, err := s.scanAutoDeleteExpiredObjects(context.Background()); err != nil || n != 0 {
-		t.Fatalf("scanAutoDeleteExpiredObjects after retry = (%d, %v), want (0, nil)", n, err)
-	}
-	if got := len(store.QueueItems(orgID)); got != 1 {
-		t.Fatalf("expected 1 queued auto-delete fs_object after dedupe, got %d", got)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	libPending := uuid.New()
-	libExpired := uuid.New()
-	store.AddOrganization(orgID)
-	store.AddLibraryWithAutoDelete(orgID, libPending, "hot", "head-pending", 1)
-	store.AddLibraryWithAutoDelete(orgID, libExpired, "hot", "head-expired", 1)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libPending, "head-pending", "fs-root-pending", "", now)
-	store.AddFSObjectWithEntries(libPending, "fs-root-pending", "dir", nil, nil)
-	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
-	store.AddCommitWithDetails(libExpired, "head-expired", "fs-root-expired", "", now)
-	store.AddFSObjectWithEntries(libExpired, "fs-root-expired", "dir", nil, nil)
-	store.AddFSObject(libExpired, "shared-fs", "file", []string{"blk-expired"})
-	store.SeedQueueItemForTest(orgID, now.Add(-2*time.Hour).UTC().Truncate(time.Millisecond), ItemFSObject, "shared-fs", libPending, "", 0)
-
-	if n, err := s.scanAutoDeleteExpiredObjects(context.Background()); err != nil || n != 1 {
-		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
-	}
-
-	expiredCount := 0
 	for _, item := range store.QueueItems(orgID) {
-		if item.ItemType == ItemFSObject && item.LibraryID == libExpired && item.ItemID == "shared-fs" {
-			expiredCount++
-		}
-	}
-	if expiredCount != 1 {
-		t.Fatalf("expected auto-delete fs_object in second library to enqueue despite same id pending elsewhere, got %d", expiredCount)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_PreservesHEADTree(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-
-	headCommitID := "commit-head"
-
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 1)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
-
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-subdir"})
-	store.AddFSObjectWithEntries(libID, "fs-subdir", "dir", nil, []string{"fs-file"})
-	store.AddFSObject(libID, "fs-file", "file", []string{"blk-1"})
-
-	ctx := context.Background()
-	err := s.ScanOnce(ctx)
-	if err != nil {
-		t.Fatalf("ScanOnce failed: %v", err)
-	}
-
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	for _, item := range items {
 		if item.ItemType == ItemFSObject {
-			fsItems++
+			t.Fatalf("suspended Phase 6 enqueued fs_object work: %+v", item)
 		}
 	}
-	if fsItems != 0 {
-		t.Errorf("expected 0 fs_objects enqueued (all in HEAD tree), got %d", fsItems)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_PreservesRecentCommits(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-
-	headCommitID := "commit-head"
-	recentCommitID := "commit-recent"
-
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 30)
-
-	now := time.Now()
-	fiveDaysAgo := now.Add(-5 * 24 * time.Hour)
-
-	store.AddCommitWithDetails(libID, headCommitID, "fs-root-head", "", now)
-	store.AddFSObjectWithEntries(libID, "fs-root-head", "dir", nil, []string{"fs-file-head"})
-	store.AddFSObject(libID, "fs-file-head", "file", []string{"blk-1"})
-
-	store.AddCommitWithDetails(libID, recentCommitID, "fs-root-recent", "", fiveDaysAgo)
-	store.AddFSObjectWithEntries(libID, "fs-root-recent", "dir", nil, []string{"fs-file-recent"})
-	store.AddFSObject(libID, "fs-file-recent", "file", []string{"blk-2"})
-
-	ctx := context.Background()
-	err := s.ScanOnce(ctx)
-	if err != nil {
-		t.Fatalf("ScanOnce failed: %v", err)
-	}
-
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemFSObject {
-			fsItems++
+	for _, fsID := range []string{"fs-root", "fs-dir1", "fs-file", "fs-old-root", "fs-orphan"} {
+		if _, err := store.GetFSObject(libID, fsID); err != nil {
+			t.Errorf("fs_object %s disturbed: %v", fsID, err)
 		}
 	}
-	if fsItems != 0 {
-		t.Errorf("expected 0 fs_objects enqueued (recent commit within window), got %d", fsItems)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsZeroAutoDelete(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 0)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
-	store.AddFSObject(libID, "fs-root", "dir", nil)
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-1"})
-
-	ctx := context.Background()
-	err := s.ScanOnce(ctx)
-	if err != nil {
-		t.Fatalf("ScanOnce failed: %v", err)
-	}
-
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemFSObject {
-			fsItems++
-		}
-	}
-	if fsItems != 0 {
-		t.Errorf("expected 0 fs_objects enqueued (auto_delete disabled), got %d", fsItems)
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	libID := uuid.New()
-
-	headCommitID := "commit-head"
-
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 1)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
-
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-dir1"})
-	store.AddFSObjectWithEntries(libID, "fs-dir1", "dir", nil, []string{"fs-dir2"})
-	store.AddFSObjectWithEntries(libID, "fs-dir2", "dir", nil, []string{"fs-file"})
-	store.AddFSObject(libID, "fs-file", "file", []string{"blk-1"})
-
-	store.AddFSObject(libID, "fs-orphan-1", "file", []string{"blk-2"})
-	store.AddFSObject(libID, "fs-orphan-2", "dir", nil)
-
-	ctx := context.Background()
-	err := s.ScanOnce(ctx)
-	if err != nil {
-		t.Fatalf("ScanOnce failed: %v", err)
-	}
-
-	items := store.QueueItems(orgID)
-	fsItems := 0
-	enqueuedIDs := make(map[string]bool)
-	for _, item := range items {
-		if item.ItemType == ItemFSObject {
-			fsItems++
-			enqueuedIDs[item.ItemID] = true
-		}
-	}
-	if fsItems != 2 {
-		t.Errorf("expected 2 orphaned fs_objects enqueued, got %d", fsItems)
-	}
-	if !enqueuedIDs["fs-orphan-1"] {
-		t.Error("expected fs-orphan-1 to be enqueued")
-	}
-	if !enqueuedIDs["fs-orphan-2"] {
-		t.Error("expected fs-orphan-2 to be enqueued")
-	}
-	for _, treeID := range []string{"fs-root", "fs-dir1", "fs-dir2", "fs-file"} {
-		if enqueuedIDs[treeID] {
-			t.Errorf("tree object %s should not be enqueued", treeID)
-		}
-	}
-}
-
-func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryOnKeepTreeReadFailure(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	s := NewScanner(store, q, stats, config.GCConfig{})
-
-	orgID := uuid.New()
-	libID := uuid.New()
-	store.AddOrganization(orgID)
-	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
-
-	now := time.Now()
-	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
-	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-live-subdir"})
-	store.AddFSObjectWithEntries(libID, "fs-live-subdir", "dir", nil, []string{"fs-live-file"})
-	store.AddFSObject(libID, "fs-live-file", "file", []string{"blk-live"})
-	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-orphan"})
-	store.SetGetFSObjectError(libID, "fs-live-subdir", errors.New("transient read failure"))
-
-	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
-	if err != nil {
-		t.Fatalf("scanAutoDeleteExpiredObjects failed: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("expected 0 fs_objects enqueued after keep-tree read failure, got %d", n)
-	}
-	if got := len(store.QueueItems(orgID)); got != 0 {
-		t.Fatalf("expected library auto-delete to fail closed, got %d queued items", got)
+	if ts := testutil.ToFloat64(metrics.GCScannerLastPhaseRun.WithLabelValues("auto_delete")); ts == 0 {
+		t.Error("suspended phase must still record its run timestamp")
 	}
 }
 
