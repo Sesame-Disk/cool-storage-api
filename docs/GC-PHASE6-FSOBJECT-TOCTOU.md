@@ -37,10 +37,14 @@ Known interactions, accepted:
 - **Dedupe with a stale unguarded row.** Guarded cascades skip a child that
   already has any pending row. If an unguarded row for that child predates the
   change, the guarded parent skips it, and the worker then completes the stale
-  row without mutation. The child is retained, not lost: once that row is gone,
-  Phase 4 re-enqueues the deleted library's remaining fs_objects with a guard on
-  its next scan. This needs rows queued before this change; on the greenfield
-  v1 deployment GC has never run.
+  row without mutation. Nothing is deleted, but the child can be retained. In the
+  normal path it is still reclaimed: the library cascade enqueues every
+  fs_object of the library directly, each with its own guarded row keyed by the
+  deletion identity, so the child usually has that row as well. If it has no
+  other guarded row, reclamation is not guaranteed: after the hard delete
+  removes `libraries_by_id` and `deleted_libraries`, Phase 4 cannot rediscover
+  the library (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`). This needs rows queued
+  before this change; on the greenfield v1 deployment GC has never run.
 - **Representation drift signal.** The removed selector counted
   representation drift for auto-delete libraries before refusing to enqueue
   under a wrong representation. With nothing enqueued, there is nothing for it

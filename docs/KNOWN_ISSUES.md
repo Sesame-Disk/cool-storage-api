@@ -7330,9 +7330,11 @@ semantics first) before Phase 6 reclamation is redesigned.
 Nothing reclaims unreachable fs_objects in a live library, or the permanent
 `fs:` references and blocks they hold. That covers objects of publications that
 never reached HEAD, roots of commits outside HEAD's ancestry, and the exclusive
-trees left when Phase 5 retires a commit. Deleted libraries are still reclaimed
-in full by the guarded cascades and Phase 4, and blocks with no reference by
-block GC. The amount retained has not been measured: measure first, as for
+trees left when Phase 5 retires a commit. Deleted libraries keep their normal
+reclamation path (the guarded library cascade, and Phase 4 while the library
+can still be discovered), and blocks with no reference keep block GC. That path
+is not a universal guarantee: artifacts left after a hard delete are invisible to
+Phase 4 (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`). The amount retained has not been measured: measure first, as for
 `ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01`.
 
 Any implementation is one design with separate consumers and explicit retention
