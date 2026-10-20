@@ -7112,6 +7112,8 @@ GC Phase 6 is the other side of the same race: its keep set is computed at
 scan time and its fs_object items carry no library guard and no execute-time
 reachability recheck, so a HEAD that re-references an fs_id outside the keep
 set between scan and execution loses it (PC-D1B.4 inventory, finding F3).
+Tracked and reproduced (in-flight Sync publication) as
+`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01` since 2026-10-19.
 
 That is a positive block-dependency delta (PC-0's own
 `LogicalPositiveBlockDelta` definition) with `BORROWED` provenance: the only
@@ -7230,6 +7232,90 @@ shared fs_objects. This change does not certify the Trash HTTP path separately.
 - `ISSUE-PC0-INHERITED-DEPENDENCY-CONTINUITY-01`, `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`
 - `ISSUE-LIB-RETENTION-01`, `ISSUE-TRASH-CLEAN-01`
 - `docs/PUBLICATION-PROTOCOL-CHARACTERIZATION.md` §6 PUBL-10, §10, §15
+
+### ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01: Phase 6 deletes fs_objects that a HEAD published after the scan depends on
+
+**Status**: 🔴 Open — RED reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19); no fix. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md)
+**Severity**: High (P1) — HEAD metadata loss and permanent-reference removal; physical byte loss not observed (see below)
+**Scope**: PRE-GC / A1. Ordinary deployments run `GC_ENABLED=false`; no current-runtime claim
+**Affected**: `Scanner.scanAutoDeleteExpiredObjects` (Phase 6), `Worker.processFSObject`, `removeFSObjectBlockReferences` in `internal/gc`
+**Registered**: 2026-10-19; the execute-time half of PC-D1B.4 finding F3, previously recorded only under `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`
+
+Phase 6 computes its keep set (HEAD ancestry plus commits newer than
+`auto_delete_days`) from a commit listing, then lists fs_objects and enqueues
+every one outside the set as an unguarded `ItemFSObject`. Nothing binds the
+item to the HEAD it was computed against or to the object's age, and the
+worker's unguarded fence is a no-op: it removes the permanent `fs:` references
+and the fs_object row without re-establishing that the selection still holds.
+After #314 Phase 6 is the only productive origin of unguarded `ItemFSObject`;
+the worker's directory cascade propagates that mode to children
+(`ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01`).
+
+Reproduced schedule: a productive Sync `PutCommit` + `RecvFS` lands between the
+selector's commit listing and its fs_object listing; the client then completes
+`PutBlock` and `PUT commit/HEAD`; the real worker executes the stale selection.
+HEAD's root and file fs_objects and the permanent `fs:<repo>:<file>` reference
+are deleted while HEAD depends on them (15/15 runs, 4 with race; 3 on the final test source). The same
+writer landing before the scan keeps everything (control). The Sync `up:` pin
+(48h TTL) was the only remaining reference, so no block candidate was created and
+the canonical row and S3 bytes survived in this run; whether its later expiry
+leads to physical deletion was not measured. Restore/revert re-referencing is
+another entry to the same race and was not run.
+
+Not closed by W2-10 (that row is about writers reinstalling retired P; its X1
+closure is unchanged) or by the certification-window fence (PC-D1B.4 §15). The
+fix is a separate PR whose behaviour change is a maintainer decision; options
+are recorded in the plan.
+
+#### Related
+
+- `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01` (F3), `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`
+- `ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01`, `ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01`
+- [X1-CRITICAL-PATH §6](./X1-CRITICAL-PATH.md#6-pre-gc-list-a1-prerequisites)
+
+### ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01: Phase 6's worker cascade deletes children that HEAD still reaches
+
+**Status**: 🔴 Open — found in the P6-1 audit and reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19); no fix. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md#1b-directory-cascade-without-the-keep-set-found-in-this-prs-audit)
+**Severity**: P0 latent, provisional: the same pattern and the same classification as `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`; deterministic, no race. The maintainer confirms
+**Scope**: PRE-GC / A1. Ordinary deployments run `GC_ENABLED=false`; no current-runtime claim
+**Affected**: `Worker.processFSObject` (directory child enqueue), `removeFSObjectBlockReferences`, `enqueueZeroRefBlocks` in `internal/gc`; selection by `Scanner.scanAutoDeleteExpiredObjects`
+
+The Phase 6 selector checks its keep set only for the fs_objects it lists. When
+the worker processes a selected directory, it enqueues every child not already
+pending with the parent's unguarded mode and never consults the keep set, so a
+child HEAD still reaches is deleted. Selected directories that share children
+with HEAD are ordinary: the root of a commit outside HEAD's ancestry once it is
+older than `auto_delete_days`, and received directories that no commit
+references.
+
+Reproduced with HEAD published before the scan and a received orphan directory
+whose child is HEAD's file: the scan selects only the orphan, then the worker
+deletes HEAD's file fs_object and its permanent `fs:` reference (7/7 runs, 2
+with race; 3 on the final test source). With the Sync `up:` pin explicitly lapsed first (its 48h TTL, as for
+a file that has been in HEAD longer), zero references remain and the worker
+itself puts HEAD's block in `gc_block_candidates` and the queue. The block item
+was not executed, so S3 deletion is not measured. The off-chain-commit form was
+not run.
+
+A fix must stop the cascade from reaching objects outside its selection's
+contract. The scanner-side keep set alone cannot. P6-2 option A (refuse every
+unguarded `ItemFSObject` before children are enqueued) covers it; an age
+criterion does not.
+
+### ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01: `expires_at` promises deletion that Phase 6 never performs for HEAD files
+
+**Status**: 🟡 Open — found 2026-10-19 while reviewing Phase 6; pre-existing, not fixed
+**Severity**: Medium (P2) — product contract
+**Scope**: FOLLOW-UP / GENERAL
+**Affected**: `ListDirectoryV21` (`internal/api/v2/files.go`), `Scanner.scanAutoDeleteExpiredObjects`
+
+The directory listing reports `expires_at = mtime + auto_delete_days` for files
+in the current tree. Phase 6 keeps every object reachable from HEAD, so it never
+removes a file that is still in HEAD, even with GC enabled: the countdown
+reaches zero and nothing happens. Phase 6 behaves as history pruning, not as
+deletion of old current files. No frontend consumer of this field was found by
+search. Define the intended `auto_delete_days` contract (confirm the Seafile
+semantics first) before Phase 6 reclamation is redesigned.
 
 ### ISSUE-PUBLISH-REPAIR-REACHABILITY-CONVERGENCE-01: The bounded repair walk can leave UNKNOWN unconvergeable while `pub:` still expires
 
