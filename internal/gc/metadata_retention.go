@@ -57,10 +57,11 @@ type MetadataRetentionReader interface {
 // report command.
 type MetadataRetentionLister interface {
 	MetadataRetentionReader
-	// ListLibrariesForRetention lists libraries_by_id rows with their org: all of
-	// them, or the one row for libraryID when it is not uuid.Nil (none if absent).
-	// Libraries already hard-deleted are not listed; they are not live.
-	ListLibrariesForRetention(libraryID uuid.UUID) ([]LibraryRef, error)
+	// ListLibrariesForRetention lists libraries with their org: the one row for
+	// libraryID when it is set (none if absent), else the org's libraries when
+	// orgID is set, else all of them. Hard-deleted libraries are not listed;
+	// they are not live. Callers still filter by org.
+	ListLibrariesForRetention(orgID, libraryID uuid.UUID) ([]LibraryRef, error)
 }
 
 var _ MetadataRetentionLister = (*CassandraStore)(nil)
@@ -83,6 +84,7 @@ type LibraryMetadataRetention struct {
 	RetainedLogicalBytes   int64     `json:"retained_logical_bytes"`
 	RetainedFSRefs         int       `json:"retained_fs_refs"`
 	DanglingReferences     int       `json:"dangling_references"`
+	HeadDanglingReferences int       `json:"head_dangling_references"`
 	Complete               bool      `json:"complete"`
 	Error                  string    `json:"error,omitempty"`
 }
@@ -143,8 +145,9 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	for _, row := range rows {
 		rowByID[row.FSID] = row
 	}
+	headDangling := make(map[string]bool)
 	dangling := make(map[string]bool)
-	walk := func(root string, reached map[string]bool) {
+	walk := func(root string, reached, dangling map[string]bool) {
 		stack := []string{root}
 		for len(stack) > 0 {
 			id := stack[len(stack)-1]
@@ -164,7 +167,7 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	fromHead := make(map[string]bool)
 	for _, c := range commits {
 		if headChain[c.CommitID] {
-			walk(c.RootFSID, fromHead)
+			walk(c.RootFSID, fromHead, headDangling)
 		}
 	}
 	fromAny := make(map[string]bool, len(fromHead))
@@ -173,8 +176,11 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	}
 	for _, c := range commits {
 		if !headChain[c.CommitID] {
-			walk(c.RootFSID, fromAny)
+			walk(c.RootFSID, fromAny, dangling)
 		}
+	}
+	for id := range headDangling {
+		dangling[id] = true
 	}
 
 	report.Commits = len(commits)
@@ -182,6 +188,8 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 	report.OffChainCommits = len(commits) - len(headChain)
 	report.FSObjects = len(rows)
 	report.DanglingReferences = len(dangling)
+	report.HeadDanglingReferences = len(headDangling)
+	distinct := make(map[string]bool)
 	for _, row := range rows {
 		switch {
 		case fromHead[row.FSID]:
@@ -196,12 +204,18 @@ func MeasureLibraryMetadataRetention(r MetadataRetentionReader, orgID, libraryID
 		if row.ObjType == "file" || row.ObjType == "" {
 			report.RetainedFiles++
 			report.RetainedLogicalBytes += row.SizeBytes
-			distinct := make(map[string]bool, len(row.BlockIDs))
+			clear(distinct)
 			for _, blockID := range row.BlockIDs {
 				distinct[blockID] = true
 			}
 			report.RetainedFSRefs += len(distinct)
 		}
+	}
+	if len(headDangling) > 0 {
+		// A missing directory under HEAD hides its subtree, whose live rows would be
+		// counted as retained: the classification is unreliable, so not complete.
+		report.Error = fmt.Sprintf("HEAD's tree names %d fs_object(s) with no row; retained counts are unreliable", len(headDangling))
+		return report, errors.New(report.Error)
 	}
 	report.Complete = true
 	return report, nil
@@ -235,13 +249,14 @@ type MetadataRetentionSummary struct {
 	DanglingReferences     int   `json:"dangling_references"`
 }
 
-// CollectMetadataRetention lists libraries_by_id rows in scope and emits one
-// measurement per live library. A row with no org, or whose measurement fails,
-// is emitted as incomplete and counted; the run continues. The returned error
-// covers the enumeration only.
-func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetentionScope, emit func(LibraryMetadataRetention)) (MetadataRetentionSummary, error) {
+// CollectMetadataRetention lists libraries in scope and emits one measurement per
+// live library. A row with no org, or whose measurement fails, is emitted as
+// incomplete and counted; the run continues. It stops at the first error emit
+// returns (for example a failed output write) and returns it; otherwise the
+// returned error covers the enumeration only.
+func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetentionScope, emit func(LibraryMetadataRetention) error) (MetadataRetentionSummary, error) {
 	summary := MetadataRetentionSummary{Summary: true}
-	refs, err := r.ListLibrariesForRetention(scope.LibraryID)
+	refs, err := r.ListLibrariesForRetention(scope.OrgID, scope.LibraryID)
 	if err != nil {
 		return summary, fmt.Errorf("list libraries: %w", err)
 	}
@@ -255,7 +270,9 @@ func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetention
 		summary.LibrariesListed++
 		if ref.OrgID == uuid.Nil {
 			summary.LibrariesIncomplete++
-			emit(LibraryMetadataRetention{LibraryID: ref.LibraryID, Error: "libraries_by_id row has no org_id"})
+			if err := emit(LibraryMetadataRetention{LibraryID: ref.LibraryID, Error: "libraries_by_id row has no org_id"}); err != nil {
+				return summary, err
+			}
 			continue
 		}
 		report, err := MeasureLibraryMetadataRetention(r, ref.OrgID, ref.LibraryID)
@@ -267,7 +284,9 @@ func CollectMetadataRetention(r MetadataRetentionLister, scope MetadataRetention
 			summary.LibrariesWithoutHead++
 			continue
 		}
-		emit(report)
+		if err := emit(report); err != nil {
+			return summary, err
+		}
 		if !report.Complete {
 			summary.LibrariesIncomplete++
 			continue

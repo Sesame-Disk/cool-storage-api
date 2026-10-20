@@ -26,6 +26,7 @@ For one live library (canonical `libraries` row present, `deleted_at` unset):
 | `retained_files`, `retained_logical_bytes` | file objects outside HEAD's chain and the sum of their `size_bytes` |
 | `retained_fs_refs` | distinct (object, block) pairs among those files: the permanent `fs:` references they keep alive |
 | `dangling_references` | distinct fs_ids named by a tree reached from some commit but with no row (the all-zero empty-directory id is excluded; unreferenced trees are not walked) |
+| `head_dangling_references` | those named under HEAD's chain. Any makes the library incomplete: a missing directory hides live files, which would otherwise be counted as retained |
 
 `retained_*` covers everything outside HEAD's chain, which is the upper bound a
 reclamation could ever touch. `reachable_only_off_chain` is reported separately
@@ -42,8 +43,11 @@ not garbage by definition.
   upload between `RecvFS` and its HEAD counts as `unreferenced`. Repeated runs
   separate stable residue from transient work.
 - **A snapshot, not a consistent cut.** HEAD, commits and fs_objects are three
-  reads. A concurrent publication can shift counts between categories; the
-  report never acts on them.
+  reads. HEAD is read at global SERIAL, the domain its LWTs use, so another DC's
+  newer HEAD is not missed; the commit and fs_object partitions are read at the
+  session consistency, so a HEAD commit not yet replicated makes the library
+  incomplete rather than misclassified. A concurrent publication can still shift
+  counts between categories; the report never acts on them.
 - **Block ids as stored.** No SHA-1↔SHA-256 mapping is resolved; references are
   counted per stored id, as the `fs:` rows are keyed.
 
@@ -59,16 +63,19 @@ not garbage by definition.
   numbers are reported as complete. A canonical row with no HEAD (the ghost row
   of `ISSUE-PCD1B-CONTINUITY-LWT-GHOST-ROW-01`, which GC treats as absent) is
   counted as `libraries_without_head`, not measured.
-- Enumeration reads `(library_id, org_id)` from `libraries_by_id`: one scan, or
-  one point read for `-library`. Libraries that exist only in `deleted_libraries`
-  are already hard-deleted, so not live. There is no org lookup with a fallback
-  that could turn a read error into "not found".
+- Enumeration reads `(library_id, org_id)` from `libraries_by_id`: one point read
+  for `-library`, a scan otherwise; `-org` alone reads that org's canonical
+  `libraries` partition instead. Libraries that exist only in
+  `deleted_libraries` are already hard-deleted, so not live. There is no org
+  lookup with a fallback that could turn a read error into "not found".
 - `cmd/sesamefs`: `gc-metadata-retention-report [-library ID] [-org ID]
   [-max-libraries N]` prints one JSON line per measured or incomplete library and
   a summary line. Exit 0 when every library in scope is complete; 1 for a usage,
-  configuration, connection or output error (including positional arguments);
-  2 when the enumeration fails or any library is incomplete. Its cost is one
-  `libraries_by_id` scan plus three partition reads per live library.
+  configuration, connection or output error (including positional arguments;
+  the run stops at the first failed write); 2 when the enumeration fails, any
+  library is incomplete, or an explicit `-library`/`-org` matched no library.
+  Its cost is the enumeration read plus a SERIAL HEAD read and two partition
+  reads per live library.
 
 ### Usage
 

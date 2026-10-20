@@ -194,25 +194,10 @@ func ReleaseLibraryHardDeleteLockLease(session *gocql.Session, libraryID, leaseT
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
 // Each entry has an "id" field that is the child fs_id.
 func parseDirEntries(jsonStr string) []string {
-	if jsonStr == "" {
-		return nil
-	}
-	var entries []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &entries); err != nil {
-		return nil
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	ids := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.ID != "" {
-			ids = append(ids, e.ID)
-		}
-	}
-	if len(ids) == 0 {
+	// Lenient: a malformed list reads as an empty directory. Measurements use
+	// parseDirEntriesStrict, the one decoder both share.
+	ids, err := parseDirEntriesStrict(jsonStr)
+	if err != nil || len(ids) == 0 {
 		return nil
 	}
 	return ids
@@ -4633,28 +4618,41 @@ func parseDirEntriesStrict(jsonStr string) ([]string, error) {
 	return ids, nil
 }
 
-// ListLibrariesForRetention lists libraries_by_id rows with their org for the
-// read-only metadata retention report: one point read when libraryID is set,
-// otherwise a full scan. Unlike FindOrgForLibrary there is no fallback that could
-// turn a read error into "not found".
-func (s *CassandraStore) ListLibrariesForRetention(libraryID uuid.UUID) ([]LibraryRef, error) {
+// ListLibrariesForRetention lists libraries with their org for the read-only
+// metadata retention report: one libraries_by_id point read when libraryID is
+// set, the org's canonical libraries partition when only orgID is set, otherwise
+// a libraries_by_id scan. Unlike FindOrgForLibrary there is no fallback that
+// could turn a read error into "not found".
+func (s *CassandraStore) ListLibrariesForRetention(orgID, libraryID uuid.UUID) ([]LibraryRef, error) {
+	if libraryID == uuid.Nil && orgID != uuid.Nil {
+		iter := s.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, orgID.String()).Iter()
+		var refs []LibraryRef
+		var libraryIDStr string
+		for iter.Scan(&libraryIDStr) {
+			refs = append(refs, LibraryRef{OrgID: orgID, LibraryID: parseUUID(libraryIDStr)})
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+		return refs, nil
+	}
 	if libraryID != uuid.Nil {
-		var orgID string
-		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Scan(&orgID)
+		var orgIDStr string
+		err := s.db.Session().Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, libraryID.String()).Scan(&orgIDStr)
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		return []LibraryRef{{OrgID: parseUUID(orgID), LibraryID: libraryID}}, nil
+		return []LibraryRef{{OrgID: parseUUID(orgIDStr), LibraryID: libraryID}}, nil
 	}
 	iter := s.db.Session().Query(`SELECT library_id, org_id FROM libraries_by_id`).Iter()
 	var refs []LibraryRef
-	var libraryIDStr, orgID string
-	for iter.Scan(&libraryIDStr, &orgID) {
-		refs = append(refs, LibraryRef{OrgID: parseUUID(orgID), LibraryID: parseUUID(libraryIDStr)})
-		orgID = ""
+	var libraryIDStr, orgIDStr string
+	for iter.Scan(&libraryIDStr, &orgIDStr) {
+		refs = append(refs, LibraryRef{OrgID: parseUUID(orgIDStr), LibraryID: parseUUID(libraryIDStr)})
+		orgIDStr = ""
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -4663,13 +4661,16 @@ func (s *CassandraStore) ListLibrariesForRetention(libraryID uuid.UUID) ([]Libra
 }
 
 // GetLibraryHeadForRetention reads the canonical libraries row for the read-only
-// metadata retention report: its HEAD and whether deleted_at is set.
+// metadata retention report: its HEAD and whether deleted_at is set. HEAD is
+// decided by global SERIAL LWTs, so it is read in that same domain; a local
+// quorum read could return a stale HEAD on another DC and misclassify a newer
+// tree as retained.
 func (s *CassandraStore) GetLibraryHeadForRetention(orgID, libraryID uuid.UUID) (string, bool, bool, error) {
 	var head string
 	var deletedAt *time.Time
 	err := s.db.Session().Query(`
 		SELECT head_commit_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID.String(), libraryID.String()).Scan(&head, &deletedAt)
+	`, orgID.String(), libraryID.String()).Consistency(db.LibraryHeadSerialConsistency).Scan(&head, &deletedAt)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return "", false, false, nil
 	}

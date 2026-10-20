@@ -20,7 +20,8 @@ import (
 //
 // Exit status: 0 every library in scope was measured completely; 1 usage,
 // configuration, connection or output error (the report is unusable); 2 the
-// enumeration failed or at least one library is incomplete.
+// enumeration failed, at least one library is incomplete, or an explicit
+// -library/-org matched no library.
 func runGCMetadataRetentionReport() {
 	os.Exit(gcMetadataRetentionReport(os.Args[2:]))
 }
@@ -78,13 +79,17 @@ func gcMetadataRetentionReport(args []string) int {
 
 	out := json.NewEncoder(os.Stdout)
 	var writeErr error
-	write := func(v interface{}) {
-		if err := out.Encode(v); err != nil && writeErr == nil {
-			writeErr = err
+	// Stop measuring at the first failed write: the rest would be discarded.
+	summary, err := gc.CollectMetadataRetention(gc.NewCassandraStore(database), scope, func(r gc.LibraryMetadataRetention) error {
+		if encErr := out.Encode(r); encErr != nil {
+			writeErr = encErr
+			return encErr
 		}
+		return nil
+	})
+	if writeErr == nil {
+		writeErr = out.Encode(summary)
 	}
-	summary, err := gc.CollectMetadataRetention(gc.NewCassandraStore(database), scope, func(r gc.LibraryMetadataRetention) { write(r) })
-	write(summary)
 	switch {
 	case writeErr != nil:
 		fmt.Fprintf(os.Stderr, "write report: %v\n", writeErr)
@@ -93,6 +98,10 @@ func gcMetadataRetentionReport(args []string) int {
 		fmt.Fprintf(os.Stderr, "retention report: %v\n", err)
 		return 2
 	case summary.LibrariesIncomplete > 0:
+		return 2
+	case (scope.LibraryID != uuid.Nil || scope.OrgID != uuid.Nil) && summary.LibrariesListed == 0:
+		// A mistyped ID must not read as a complete measurement of zero retention.
+		fmt.Fprintln(os.Stderr, "no library matched -library/-org")
 		return 2
 	}
 	return 0

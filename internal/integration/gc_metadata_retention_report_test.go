@@ -127,9 +127,25 @@ func TestGCMetadataRetentionReportMeasuresProductiveSyncState(t *testing.T) {
 
 	// The command's enumeration path, scoped to this library, reports the same.
 	var emitted []gcpkg.LibraryMetadataRetention
-	summary, err := gcpkg.CollectMetadataRetention(store, gcpkg.MetadataRetentionScope{LibraryID: library}, func(r gcpkg.LibraryMetadataRetention) { emitted = append(emitted, r) })
+	summary, err := gcpkg.CollectMetadataRetention(store, gcpkg.MetadataRetentionScope{LibraryID: library}, func(r gcpkg.LibraryMetadataRetention) error {
+		emitted = append(emitted, r)
+		return nil
+	})
 	if err != nil || summary.LibrariesMeasured != 1 || len(emitted) != 1 || !reflect.DeepEqual(emitted[0], after) {
 		t.Fatalf("collect: summary=%+v emitted=%+v err=%v", summary, emitted, err)
+	}
+	// The org scope reads the org's canonical libraries partition. The org is
+	// shared with other fixtures, so only require this library's exact report.
+	var orgReport *gcpkg.LibraryMetadataRetention
+	summary, err = gcpkg.CollectMetadataRetention(store, gcpkg.MetadataRetentionScope{OrgID: fx.orgUUID}, func(r gcpkg.LibraryMetadataRetention) error {
+		if r.LibraryID == library {
+			r := r
+			orgReport = &r
+		}
+		return nil
+	})
+	if err != nil || orgReport == nil || !reflect.DeepEqual(*orgReport, after) || summary.LibrariesListed < 1 {
+		t.Fatalf("org-scoped collect: summary=%+v report=%+v err=%v", summary, orgReport, err)
 	}
 
 	// Read-only: repeated measurements agree and nothing GC-visible changed.

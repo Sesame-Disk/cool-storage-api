@@ -3,6 +3,7 @@ package gc
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,8 +19,8 @@ var (
 //
 //	HEAD chain  h1 <- h2 (HEAD); off-chain commit "off" (parent h1)
 //	r1: [d-shared]            d-shared: [f-shared]      f-shared: b1, 10B
-//	r2: [d-shared, f-new, missing-head-child, <empty dir>]  f-new: b2, 20B
-//	roff: [d-shared, f-off]   f-off: b3, b3, b4, 30B (two distinct refs)
+//	r2: [d-shared, f-new, <empty dir>]  f-new: b2, 20B
+//	roff: [d-shared, f-off, missing-off-child]   f-off: b3, b3, b4, 30B (two distinct refs)
 //	unreferenced: o-dir [o-file, missing-orphan-child], o-file b5 40B,
 //	              o-lone b6 b7 50B
 func retentionFixture(t *testing.T) (*MockStore, uuid.UUID, uuid.UUID) {
@@ -33,11 +34,11 @@ func retentionFixture(t *testing.T) (*MockStore, uuid.UUID, uuid.UUID) {
 	store.AddCommitWithDetails(libID, "h2", "r2", "h1", now)
 	store.AddCommitWithDetails(libID, "off", "roff", "h1", now.Add(-48*time.Hour))
 	store.AddFSObjectWithEntries(libID, "r1", "dir", nil, []string{"d-shared"})
-	store.AddFSObjectWithEntries(libID, "r2", "dir", nil, []string{"d-shared", "f-new", "missing-head-child", emptyDirFSID})
+	store.AddFSObjectWithEntries(libID, "r2", "dir", nil, []string{"d-shared", "f-new", emptyDirFSID})
 	store.AddFSObjectWithEntries(libID, "d-shared", "dir", nil, []string{"f-shared"})
 	store.AddFSObject(libID, "f-shared", "file", []string{"b1"})
 	store.AddFSObject(libID, "f-new", "file", []string{"b2"})
-	store.AddFSObjectWithEntries(libID, "roff", "dir", nil, []string{"d-shared", "f-off"})
+	store.AddFSObjectWithEntries(libID, "roff", "dir", nil, []string{"d-shared", "f-off", "missing-off-child"})
 	store.AddFSObject(libID, "f-off", "file", []string{"b3", "b3", "b4"})
 	store.AddFSObjectWithEntries(libID, "o-dir", "dir", nil, []string{"o-file", "missing-orphan-child"})
 	store.AddFSObject(libID, "o-file", "file", []string{"b5"})
@@ -66,7 +67,7 @@ func TestMeasureLibraryMetadataRetention_ClassifiesEveryObject(t *testing.T) {
 		RetainedFiles:          3, // f-off, o-file, o-lone
 		RetainedLogicalBytes:   120,
 		RetainedFSRefs:         5, // f-off {b3,b4}, o-file {b5}, o-lone {b6,b7}
-		DanglingReferences:     1, // missing-head-child; the empty-dir id and unwalked orphans do not count
+		DanglingReferences:     1, // missing-off-child; the empty-dir id and unwalked orphans do not count
 		Complete:               true,
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -124,8 +125,8 @@ func (failingRetentionRows) ListFSObjectRetentionRows(uuid.UUID) ([]FSObjectRete
 func TestMeasureLibraryMetadataRetention_IncompleteOnReadFailureOrMissingHead(t *testing.T) {
 	store, orgID, libID := retentionFixture(t)
 	got, err := MeasureLibraryMetadataRetention(failingRetentionRows{store}, orgID, libID)
-	if err == nil || got.Complete || got.Error == "" || got.FSObjects != 0 {
-		t.Fatalf("read failure must be incomplete with no counts: %+v err=%v", got, err)
+	if err == nil || got.Complete || !strings.Contains(got.Error, "list fs_objects") || got.FSObjects != 0 {
+		t.Fatalf("read failure must be incomplete with no counts, reporting the read error: %+v err=%v", got, err)
 	}
 
 	missingHead, orgID2, libID2 := retentionFixture(t)
@@ -135,6 +136,42 @@ func TestMeasureLibraryMetadataRetention_IncompleteOnReadFailureOrMissingHead(t 
 	got, err = MeasureLibraryMetadataRetention(missingHead, orgID2, libID2)
 	if err == nil || got.Complete || got.FSObjects != 0 {
 		t.Fatalf("HEAD without a commit row must be incomplete: %+v err=%v", got, err)
+	}
+}
+
+// A missing directory under HEAD hides live files below it, which would then be
+// counted as retained: the library is incomplete, with the counts kept for
+// diagnosis but excluded from totals.
+func TestMeasureLibraryMetadataRetention_DanglingUnderHeadIsIncomplete(t *testing.T) {
+	store, orgID, libID := retentionFixture(t)
+	store.AddFSObjectWithEntries(libID, "r2", "dir", nil, []string{"d-shared", "f-new", "missing-head-dir"})
+	got, err := MeasureLibraryMetadataRetention(store, orgID, libID)
+	if err == nil || got.Complete || got.HeadDanglingReferences != 1 || got.DanglingReferences != 2 || got.Error == "" {
+		t.Fatalf("dangling under HEAD must be incomplete: %+v err=%v", got, err)
+	}
+	summary, err := CollectMetadataRetention(store, MetadataRetentionScope{LibraryID: libID}, func(LibraryMetadataRetention) error { return nil })
+	if err != nil || summary.LibrariesIncomplete != 1 || summary.LibrariesMeasured != 0 || summary.FSObjects != 0 {
+		t.Fatalf("incomplete library must stay out of totals: %+v err=%v", summary, err)
+	}
+}
+
+// A failed emit (the command's output write) stops the run at once.
+func TestCollectMetadataRetention_StopsOnEmitError(t *testing.T) {
+	store, _, _ := retentionFixture(t)
+	for i := 0; i < 3; i++ {
+		lib := uuid.New()
+		store.AddLibraryWithAutoDelete(uuid.New(), lib, "hot", "c", 0)
+		store.AddCommitWithDetails(lib, "c", "r", "", time.Now())
+		store.AddFSObjectWithEntries(lib, "r", "dir", nil, nil)
+	}
+	emitted := 0
+	writeErr := errors.New("stdout closed")
+	_, err := CollectMetadataRetention(store, MetadataRetentionScope{}, func(LibraryMetadataRetention) error {
+		emitted++
+		return writeErr
+	})
+	if !errors.Is(err, writeErr) || emitted != 1 {
+		t.Fatalf("emit error must stop the run: emitted=%d err=%v", emitted, err)
 	}
 }
 
@@ -159,7 +196,7 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	collect := func(scope MetadataRetentionScope) (MetadataRetentionSummary, map[uuid.UUID]LibraryMetadataRetention) {
 		t.Helper()
 		seen := map[uuid.UUID]LibraryMetadataRetention{}
-		summary, err := CollectMetadataRetention(store, scope, func(r LibraryMetadataRetention) { seen[r.LibraryID] = r })
+		summary, err := CollectMetadataRetention(store, scope, func(r LibraryMetadataRetention) error { seen[r.LibraryID] = r; return nil })
 		if err != nil {
 			t.Fatalf("collect %+v: %v", scope, err)
 		}
@@ -183,6 +220,10 @@ func TestCollectMetadataRetention_ScopesAndTotals(t *testing.T) {
 	summary, seen = collect(MetadataRetentionScope{LibraryID: libB})
 	if summary.LibrariesMeasured != 1 || len(seen) != 1 || seen[libB].FSObjects != 1 {
 		t.Fatalf("library scope: %+v %+v", summary, seen)
+	}
+	summary, seen = collect(MetadataRetentionScope{LibraryID: libB, OrgID: orgA})
+	if summary.LibrariesListed != 0 || len(seen) != 0 {
+		t.Fatalf("-library of another org must match nothing: %+v %+v", summary, seen)
 	}
 
 	summary, _ = collect(MetadataRetentionScope{MaxLibraries: 1})
