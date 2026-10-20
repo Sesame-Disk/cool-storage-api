@@ -1,5 +1,111 @@
 # Phase 6: fs_object destruction against a newer HEAD
 
+## P6-2: Phase 6 suspended (2026-10-19)
+
+Base main@d886ffe9d (#318). The maintainer chose option A (§5) on 2026-10-19.
+Scope: close the two destructive paths reproduced in P6-1. Reclamation of
+live-library metadata is not restored here; it is tracked as
+`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01` (PRE-GC / A1).
+
+Contract:
+
+1. `scanAutoDeleteExpiredObjects` is an explicit no-op. It logs the suspension,
+   still records `gc_scanner_last_phase_run_timestamp_seconds{phase="auto_delete"}`
+   and enqueues nothing. Its selector and the `walkFSTree` keep-set walker,
+   used only by it, are removed; git history keeps them for P6-3.
+   `ScanAutoDeleteExpiredObjectsOnce` stays, so integration tests can verify
+   the no-op.
+2. `processFSObject` first checks the effective guard
+   (`effectiveLibraryGuardMode`, which honours the legacy
+   `RequiresLibraryDeletedCheck` flag). An unguarded item is completed before any
+   read, dry-run log, child enqueue, reference removal or delete, including
+   rows queued before this change. It increments
+   `gc_unguarded_fs_object_items_suspended_total` (no labels) and logs one line.
+3. Guarded fs_object items (`CanonicalMustBeAbsent`, `DeletedAtIdentity`, and the
+   legacy flag) keep their existing path. Library, user and org cascades and
+   Phase 4 are unchanged.
+4. The queue lifecycle is unchanged: a nil return completes the row, so there is
+   no retry and no DLQ. Global dry-run semantics are unchanged too: a dry-run
+   worker completes nothing, so a suspended row stays queued and is counted
+   again on each tick. The new counter therefore counts decisions, not distinct
+   rows. A completed suspended row also increments the existing
+   `gc_items_processed_total{type="fs_object"}`, although nothing was deleted;
+   read the suspension counter to tell them apart.
+
+Known interactions, accepted:
+
+- **Dedupe with a stale unguarded row.** Guarded cascades skip a child that
+  already has any pending row. If an unguarded row for that child predates the
+  change, the guarded parent skips it, and the worker then completes the stale
+  row without mutation. Nothing is deleted, but the child can be retained. In the
+  normal path it is still reclaimed: the library cascade enqueues every
+  fs_object of the library directly, each with its own guarded row keyed by the
+  deletion identity, so the child usually has that row as well. If it has no
+  other guarded row, reclamation is not guaranteed: after the hard delete
+  removes `libraries_by_id` and `deleted_libraries`, Phase 4 cannot rediscover
+  the library (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`). This needs rows queued
+  before this change; on the greenfield v1 deployment GC has never run.
+- **Representation drift signal.** The removed selector counted
+  representation drift for auto-delete libraries before refusing to enqueue
+  under a wrong representation. With nothing enqueued, there is nothing for it
+  to guard; other phases and the delete paths keep their own checks.
+- **Log volume.** One log line per suspended row per pass, the same volume as
+  the old per-row dry-run "would delete" line.
+
+Not done here: rejecting unguarded `ItemFSObject` rows at enqueue time. No
+production producer writes them after #314 and this change (Phase 4 and library
+cascades are guarded; `EnqueueLibraryContents` has test callers only, and its
+comment now says it reclaims commits only). The worker check also covers rows
+queued earlier. An enqueue-time rejection remains a possible hardening for P6-3.
+
+Not promised: `auto_delete_days` still reads and writes, but Phase 6 performs no
+reclamation in live libraries ([TECHNICAL-DEBT §18](./TECHNICAL-DEBT.md#18-library-history-retention-and-auto-delete-semantics-2026-05-15)
+records that it never deleted current files either). Phase 5's exclusive-tree
+retention stays open. Nothing here authorizes GC activation; PRE-GC/A1 remain
+OPEN and ordinary GC stays OFF.
+
+Backward compatible: yes for API, schema, queue format and configuration. The
+behaviour change is deliberate and limited to GC with `auto_delete_days` set:
+Phase 6 no longer deletes anything. Rollback is a code revert with no migration;
+it restores both destructive paths, so GC must stay OFF if it is rolled back.
+
+Tests (RED on main, GREEN here):
+
+- Unit, ordinary suite:
+  - `TestWorker_ProcessFSObject_UnguardedItemCompletesWithoutMutation`: a file
+    still referenced and an orphan directory sharing that file are both
+    completed, with no child, block, retry or DLQ row and the reference intact.
+  - `..._UnguardedItemSuspendedBeforeDryRun`: dry-run keeps the row queued
+    and mutates nothing.
+  - `..._LegacyDeletedCheckFlagIsNotSuspended`: a row with only the legacy flag
+    still runs its guarded destructive path after a completed hard delete.
+  - `TestScanner_ScanAutoDeleteExpiredObjects_SuspendedEnqueuesNothing`: a
+    fixture the old selector enqueued (an orphan, and an off-chain commit root
+    sharing HEAD's file) produces no fs_object work through the phase entry
+    point or a full `ScanOnce`.
+- The eleven old selector unit tests are removed, because no selector remains
+  to test. The fs_object mechanics tests (cascade of blocks and children, retry
+  idempotence, library-scoped dedupe, queued representation, dry-run) now stage
+  legitimate guarded rows after a completed hard delete, so the guarded path
+  keeps its coverage. The pending-item scope regression
+  (`ISSUE-GC-PENDING-ITEM-BLOCK-LIBRARY-SCOPE-01`) now uses the Phase 4 shape.
+- Real stack: `TestGCPhase6InFlightSyncPublicationKeepsHeadTree` runs in both
+  standard Compose runners through the isolated e19 re-execution used by the
+  E1-01 tests, with its gate set there. Legs:
+
+  | Leg | Schedule |
+  |---|---|
+  | `selector-suspended` | the P6-1 race and cascade inputs; the selector must enqueue nothing and not even list fs_objects |
+  | `stale-in-flight-selection` | the exact rows the old selector produced for the race, queued before HEAD publishes |
+  | `stale-orphan-shares-head-file` | a stale orphan directory row whose child is HEAD's file |
+  | `stale-orphan-shares-aged-head-file` | the same with the Sync `up:` pin lapsed |
+
+  The worker must dequeue and suspend every stale row (counter delta equal to
+  the seeded rows), and the oracle checks fs_objects, the permanent `fs:`, the
+  absence of block candidates, canonical P and the S3 bytes.
+
+Evidence: see [P6-2 evidence](#p6-2-evidence-2026-10-19).
+
 ## Bounded plan, P6-1 (2026-10-19)
 
 Base main@bb89d7b12 (#317). Scope: `ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01`
@@ -96,6 +202,9 @@ cascade propagates that mode to every child it enqueues.
 
 ## 3. Test design
 
+This section describes the P6-1 RED test. P6-2 rebuilt it as the GREEN test
+described at the top; the schedules and oracle below are kept as the RED record.
+
 `TestGCPhase6InFlightSyncPublicationKeepsHeadTree`
 ([test](../internal/integration/gc_phase6_fsobject_toctou_test.go)) runs only
 with `SESAMEFS_REQUIRE_GC_PHASE6_TOCTOU_EVIDENCE=1`, which is wired into
@@ -177,7 +286,10 @@ the queued block item (so S3 deletion is not measured), a natural `up:`
 expiry, and clients. Logs are local artifacts, not independent CI; see the PR
 for the manifest hash.
 
-## 5. P6-2 options (maintainer decision pending)
+## 5. P6-2 options (decided 2026-10-19: A)
+
+The maintainer chose A; it is implemented in [P6-2](#p6-2-phase-6-suspended-2026-10-19).
+B and C were rejected for the reasons in the table.
 
 | Option | Behaviour | Cost |
 |---|---|---|
@@ -205,3 +317,34 @@ plaintext block and one root file. It does not execute the block item or show
 S3 deletion, and it certifies no schedule other than the ones measured. X1's
 accepted scope is unchanged. PRE-GC/A1 remain OPEN; ordinary GC stays OFF in
 every DC.
+
+## P6-2 evidence (2026-10-19)
+
+The standard suite ran in a private Compose project (`-p sesamefs-p62`): fresh
+volumes, no published ports, every image built from a clean `git archive` of
+the P6-2 commit `406633d0e`, and a cold boot with `sesamefs` first. The existing
+development stack was not used, because its keyspaces predate the v1 baseline
+fold (#316) and would need a destructive `down -v`. Directed runs used a Go
+1.25.14 runner on the local compose network against the isolated, GC-OFF
+`sesamefs-e19`, through the same isolated re-execution the standard runners use.
+
+| Run | Result |
+|---|---|
+| `go-all-test` (`go test ./... -short -cover`, the required integration run with every standard evidence gate plus the Phase 6 gate, `test.sh api`, `test.sh oidc`) | exit 0. Short Go: 23 packages ok, 0 FAIL. Integration: `ok` in 955.7s; `TestGCPhase6InFlightSyncPublicationKeepsHeadTree` PASS in all four legs through the e19 re-execution. API: 20/20 suites. OIDC: 1/1 suite. 0 top-level FAIL. The 31 nested `--- FAIL` lines are the E1-01 harness controls that inject a failure into a child process (`E101_INJECTED_FAILURE`); every parent passes. 77 conditional SKIP lines are not positive evidence |
+| Phase 6 real-stack test, directed, 3 runs (2 normal, 1 `-race`) | PASS, all four legs; no data race; owned queue empty after teardown |
+| The same test on main's GC runtime (main `worker.go` and `scanner.go`, branch test) | FAIL in all four legs: the selector enqueues 3 rows; the stale race rows delete HEAD's root, file and the orphan and remove the permanent `fs:`; both cascade legs delete HEAD's file and its `fs:`; the lapsed-pin leg also queues HEAD's block as a candidate. The worker suspends 0 rows |
+| `go test -short ./internal/gc ./internal/metrics`, normal and `-race` | PASS |
+| Mutations | removing the worker barrier fails both suspension unit tests; a barrier on the raw field only (ignoring the legacy flag) fails the legacy-flag test; main's selector fails the scanner suspension test; dropping the phase-run timestamp fails it too |
+| `go vet ./...`, `go vet -tags integration ./internal/integration`, `gofmt -l` on changed Go files, `git diff --check` | clean |
+
+After `go-all-test`, the two review rounds changed the runtime only in comments,
+the counter's help string, and an `Add(0)` that keeps
+`gc_items_enqueued_total{phase="auto_delete"}` present. Tests changed only in
+the scanner gauge reset, an exact-row seed helper and comments. On that final
+source the GC/metrics unit tests (normal and `-race`), the gauge mutation and
+the directed Phase 6 real-stack test (normal and `-race`, four legs, no data
+race) were rerun and pass. `go-all-test` was not repeated.
+
+Not run: three-DC, crash/process-death, sync clients (`sync-test`), frontend
+suites. The fs_object mechanics under a guard are covered by unit tests and the
+pending-item scope regression only, not by a new real-stack leg.

@@ -569,7 +569,7 @@ func TestWorker_ProcessFSObject_DryRunLeavesQueueAndRefsUntouched(t *testing.T) 
 	store.AddBlock(orgID, "blk-live", "hot", 2)
 	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-child"})
 	store.AddFSObject(libID, "fs-child", "file", []string{"blk-live"})
-	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0)
+	store.SeedGuardedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-root", libID, LibraryGuardCanonicalMustBeAbsent)
 
 	n, err := w.ProcessOnce(context.Background())
 	if err != nil {
@@ -1044,6 +1044,104 @@ func TestWorker_ProcessCommit_AlreadyDeleted(t *testing.T) {
 	}
 }
 
+// Phase 6 suspension: an unguarded fs_object row, the only shape Phase 6 ever
+// produced, is completed without any mutation, whether it names a file still
+// referenced by the live tree or an orphan directory whose child that tree uses.
+// Nothing is retried or dead-lettered.
+func TestWorker_ProcessFSObject_UnguardedItemCompletesWithoutMutation(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID, libID := uuid.New(), uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddBlock(orgID, "blk-head", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-head", libID, "fs-file")
+	store.AddFSObject(libID, "fs-file", "file", []string{"blk-head"})
+	store.AddFSObjectWithEntries(libID, "fs-orphan-dir", "dir", nil, []string{"fs-file"})
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-file", libID, "", 0)
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-orphan-dir", libID, "", 0)
+	before := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil || n != 2 {
+		t.Fatalf("ProcessOnce: n=%d err=%v, want both rows completed", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("suspended rows must leave no queue work (children, blocks or retries): %#v", items)
+	}
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("suspended rows must not be dead-lettered: %#v", failed)
+	}
+	for _, fsID := range []string{"fs-file", "fs-orphan-dir"} {
+		if store.GetFSObj(libID, fsID) == nil {
+			t.Fatalf("unguarded item deleted fs_object %s", fsID)
+		}
+	}
+	if store.GetBlock(orgID, "blk-head") == nil || store.BlockReferenceCount(orgID, "blk-head") != 1 {
+		t.Fatalf("unguarded item changed the block or its permanent reference: refs=%d", store.BlockReferenceCount(orgID, "blk-head"))
+	}
+	if got := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal); got != before+2 {
+		t.Fatalf("suspension counter = %v, want %v", got, before+2)
+	}
+}
+
+// Dry-run keeps its global semantics (nothing is completed), but the suspension
+// runs first: no "would delete" path, no child enqueue, no reference change.
+func TestWorker_ProcessFSObject_UnguardedItemSuspendedBeforeDryRun(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, true, &Stats{})
+	orgID, libID := uuid.New(), uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlock(orgID, "blk-live", "hot", 1)
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-child"})
+	store.AddFSObject(libID, "fs-child", "file", []string{"blk-live"})
+	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0)
+	before := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal)
+
+	if n, err := w.ProcessOnce(context.Background()); err != nil || n != 0 {
+		t.Fatalf("dry-run ProcessOnce: n=%d err=%v, want 0, nil", n, err)
+	}
+	if items := store.QueueItems(orgID); len(items) != 1 || items[0].ItemID != "fs-root" {
+		t.Fatalf("dry run must leave exactly the original row queued: %#v", items)
+	}
+	if store.GetFSObj(libID, "fs-root") == nil || store.BlockReferenceCount(orgID, "blk-live") != 1 {
+		t.Fatal("suspended dry-run item mutated metadata or references")
+	}
+	if got := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal); got != before+1 {
+		t.Fatalf("suspension counter = %v, want %v", got, before+1)
+	}
+}
+
+// A legacy row with only the deleted-check flag set resolves to the guarded
+// deleted-identity path, so the suspension must not swallow it: after a
+// completed library hard delete it still removes the object and its reference.
+func TestWorker_ProcessFSObject_LegacyDeletedCheckFlagIsNotSuspended(t *testing.T) {
+	store := NewMockStore()
+	w := NewWorker(store, nil, NewQueue(store), 100, 0, false, &Stats{})
+	orgID, libID := uuid.New(), uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-legacy")
+	store.AddFSObject(libID, "fs-legacy", "file", []string{"blk-a"})
+	hardDeleteLibraryForTest(t, store, orgID, libID)
+	before := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal)
+
+	item := QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, RequiresLibraryDeletedCheck: true, ItemType: ItemFSObject, ItemID: "fs-legacy", LibraryID: libID}
+	if mode := effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck); mode == LibraryGuardNone {
+		t.Fatalf("legacy flag must resolve to a guard, got %q", mode)
+	}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject failed: %v", err)
+	}
+	if store.GetFSObj(libID, "fs-legacy") != nil || store.BlockReferenceCount(orgID, "blk-a") != 0 {
+		t.Fatal("guarded legacy item did not run its destructive path")
+	}
+	if got := testutil.ToFloat64(metrics.GCUnguardedFSObjectItemsSuspendedTotal); got != before {
+		t.Fatalf("guarded legacy item was counted as suspended: %v -> %v", before, got)
+	}
+}
+
 func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -1068,9 +1166,10 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 
 	// Add library so storage class lookup works
 	store.AddLibrary(orgID, libID, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libID)
 
 	// Enqueue the fs_object
-	store.SeedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-obj-1", libID, "", 0)
+	store.SeedGuardedQueueItemForTest(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-obj-1", libID, LibraryGuardCanonicalMustBeAbsent)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -1235,11 +1334,13 @@ func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	// Create a directory with children
 	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
 	store.AddLibrary(orgID, libID, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libID)
 
 	if err := store.EnqueueBatch([]QueueItem{{
 		OrgID:                 orgID,
 		QueuedAt:              queuedAt,
 		IdentityAt:            queuedAt,
+		LibraryGuardMode:      LibraryGuardCanonicalMustBeAbsent,
 		ItemType:              ItemFSObject,
 		ItemID:                "fs-dir",
 		LibraryID:             libID,
@@ -1290,6 +1391,7 @@ func TestWorker_ProcessFSObject_SkipsAlreadyPendingChild(t *testing.T) {
 
 	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
 	store.AddLibrary(orgID, libID, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libID)
 	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "fs-child1", libID, "", 0)
 
 	items, err := store.DequeueBatch(orgID, 1, time.Now())
@@ -1300,7 +1402,7 @@ func TestWorker_ProcessFSObject_SkipsAlreadyPendingChild(t *testing.T) {
 		t.Fatalf("IncrementRetry failed: %v", err)
 	}
 
-	err = w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libID, BlockRepresentationID: db.PlainBlockRepresentationID})
+	err = w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libID, BlockRepresentationID: db.PlainBlockRepresentationID})
 	if err != nil {
 		t.Fatalf("processFSObject failed: %v", err)
 	}
@@ -1336,9 +1438,10 @@ func TestWorker_ProcessFSObject_DoesNotCrossSuppressChildAcrossLibraries(t *test
 
 	store.AddFSObjectWithEntries(libTarget, "fs-dir", "dir", nil, []string{"shared-child"})
 	store.AddLibrary(orgID, libTarget, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libTarget)
 	store.SeedQueueItemForTest(orgID, queuedAt, ItemFSObject, "shared-child", libPending, "", 0)
 
-	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID})
+	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget, BlockRepresentationID: db.PlainBlockRepresentationID})
 	if err != nil {
 		t.Fatalf("processFSObject failed: %v", err)
 	}
@@ -1371,8 +1474,9 @@ func TestWorker_ProcessFSObject_RetryIsIdempotent(t *testing.T) {
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
 	store.AddFSObject(libID, "fs-other", "file", []string{"blk-a"})
 	store.AddLibrary(orgID, libID, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libID)
 
-	first := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
+	first := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
 	if err := w.processFSObject(context.Background(), first); err != nil {
 		t.Fatalf("first processFSObject failed: %v", err)
 	}
@@ -1384,7 +1488,7 @@ func TestWorker_ProcessFSObject_RetryIsIdempotent(t *testing.T) {
 	// already-gone fs-obj-1 reference is a no-op (no marker bookkeeping needed),
 	// so blk-a keeps its fs-other reference and is not double-removed.
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
-	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
+	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
 	if err := w.processFSObject(context.Background(), second); err != nil {
 		t.Fatalf("retry processFSObject failed: %v", err)
 	}
@@ -1494,11 +1598,13 @@ func TestWorker_ProcessFSObject_IdempotencyScopedByLibrary(t *testing.T) {
 	store.AddFSObject(libB, "shared-fs", "file", []string{"blk-b"})
 	store.AddLibrary(orgID, libA, "hot")
 	store.AddLibrary(orgID, libB, "hot")
+	hardDeleteLibraryForTest(t, store, orgID, libA)
+	hardDeleteLibraryForTest(t, store, orgID, libB)
 
-	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libA}); err != nil {
+	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libA}); err != nil {
 		t.Fatalf("processFSObject libA failed: %v", err)
 	}
-	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libB}); err != nil {
+	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, LibraryGuardMode: LibraryGuardCanonicalMustBeAbsent, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libB}); err != nil {
 		t.Fatalf("processFSObject libB failed: %v", err)
 	}
 
@@ -3205,6 +3311,7 @@ func TestWorker_ProcessFSObject_HardDeletedLibraryUsesQueuedRepresentation(t *te
 		OrgID:                 orgID,
 		QueuedAt:              queuedAt,
 		IdentityAt:            queuedAt,
+		LibraryGuardMode:      LibraryGuardDeletedAtIdentity,
 		ItemType:              ItemFSObject,
 		ItemID:                "fs-hard",
 		LibraryID:             libID,

@@ -7149,7 +7149,9 @@ characterization PR.
 is metadata-only. Shared trees/refs are preserved; guarded library destruction
 keeps its cascade. **PRE-GC reclamation disposition remains OPEN**: exclusive
 fs_objects/refs are deliberately retained until a sharing-aware pass; no retention
-bound or Phase 6 safety is certified. Ordinary GC remains OFF.
+bound or Phase 6 safety is certified. Since 2026-10-19 that disposition is tracked as
+`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`, together with Phase 6's suspended
+reclamation. Ordinary GC remains OFF.
 **Severity**: Historical P0 latent for the reproduced destructive cascade; preserved, not downgraded. This fix does not authorize activation.
 **Scope**: PRE-GC runtime follow-up — discovered by PC-0 (2026-09-10); fixed for commit-to-tree cascade here. Phase 6, concurrent commit publication/destruction and hard-delete fencing remain separate obligations.
 **Affected**: `Scanner.scanExpiredVersions` (Phase 5), `Worker.processCommit`, `Worker.processFSObject`, `removeFSObjectBlockReferences` in `internal/gc`
@@ -7235,8 +7237,8 @@ shared fs_objects. This change does not certify the Trash HTTP path separately.
 
 ### ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01: Phase 6 deletes fs_objects that a HEAD published after the scan depends on
 
-**Status**: 🔴 Open — RED reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19); no fix. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md)
-**Severity**: High (P1) — HEAD metadata loss and permanent-reference removal; physical byte loss not observed (see below)
+**Status**: **CLOSED-FIX for the destructive path on merge of P6-2** (2026-10-19). Phase 6 is suspended: the selector enqueues nothing and the worker completes every unguarded `ItemFSObject` without mutation, including rows queued before the change; the same real-stack schedules are GREEN ([P6-2](./GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19)). Before merge it remains OPEN. RED reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19). **Live-library reclamation is not restored**; it stays OPEN as `ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`, and any redesign must meet this race. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md)
+**Severity**: High (P1) — HEAD metadata loss and permanent-reference removal; physical byte loss not observed (see below). Preserved, not downgraded
 **Scope**: PRE-GC / A1. Ordinary deployments run `GC_ENABLED=false`; no current-runtime claim
 **Affected**: `Scanner.scanAutoDeleteExpiredObjects` (Phase 6), `Worker.processFSObject`, `removeFSObjectBlockReferences` in `internal/gc`
 **Registered**: 2026-10-19; the execute-time half of PC-D1B.4 finding F3, previously recorded only under `ISSUE-PC0-CONTENT-RESURRECTION-PUBLICATION-01`
@@ -7275,8 +7277,8 @@ are recorded in the plan.
 
 ### ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01: Phase 6's worker cascade deletes children that HEAD still reaches
 
-**Status**: 🔴 Open — found in the P6-1 audit and reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19); no fix. [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md#1b-directory-cascade-without-the-keep-set-found-in-this-prs-audit)
-**Severity**: P0 latent, provisional: the same pattern and the same classification as `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`; deterministic, no race. The maintainer confirms
+**Status**: **CLOSED-FIX for the destructive path on merge of P6-2** (2026-10-19). The worker refuses every unguarded `ItemFSObject` before it enqueues children or touches references, so the cascade cannot start from Phase 6 work; the same real-stack schedules, including the lapsed-pin variant, are GREEN ([P6-2](./GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19)). Before merge it remains OPEN. Found in the P6-1 audit and reproduced on main@bb89d7b12 with real Cassandra/S3 (2026-10-19). Guarded library cascades still enqueue children by design, because the whole library is being destroyed. A future reclamation must respect sharing for every object it reaches (`ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`). [Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md#1b-directory-cascade-without-the-keep-set-found-in-this-prs-audit)
+**Severity**: P0 latent, provisional: the same pattern and the same classification as `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`; deterministic, no race. The maintainer confirms. Preserved, not downgraded
 **Scope**: PRE-GC / A1. Ordinary deployments run `GC_ENABLED=false`; no current-runtime claim
 **Affected**: `Worker.processFSObject` (directory child enqueue), `removeFSObjectBlockReferences`, `enqueueZeroRefBlocks` in `internal/gc`; selection by `Scanner.scanAutoDeleteExpiredObjects`
 
@@ -7304,7 +7306,7 @@ criterion does not.
 
 ### ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01: `expires_at` promises deletion that Phase 6 never performs for HEAD files
 
-**Status**: 🟡 Open — found 2026-10-19 while reviewing Phase 6; pre-existing, not fixed
+**Status**: 🟡 Open — pre-existing, not fixed. **Source of record: [TECHNICAL-DEBT §18](./TECHNICAL-DEBT.md#18-library-history-retention-and-auto-delete-semantics-2026-05-15)**, which has recorded this mismatch since 2026-05-15; this entry was opened on 2026-10-19 without noticing it and is kept only so existing links resolve. Since P6-2 (2026-10-19) Phase 6 performs no reclamation at all, so the countdown never corresponds to a deletion
 **Severity**: Medium (P2) — product contract
 **Scope**: FOLLOW-UP / GENERAL
 **Affected**: `ListDirectoryV21` (`internal/api/v2/files.go`), `Scanner.scanAutoDeleteExpiredObjects`
@@ -7316,6 +7318,41 @@ reaches zero and nothing happens. Phase 6 behaves as history pruning, not as
 deletion of old current files. No frontend consumer of this field was found by
 search. Define the intended `auto_delete_days` contract (confirm the Seafile
 semantics first) before Phase 6 reclamation is redesigned.
+
+### ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01: No safe reclamation of unreachable metadata in live libraries
+
+**Status**: 🔴 Open — registered 2026-10-19 with P6-2. Disposition required before A1
+**Severity**: Medium (P2) — retention and storage growth, not data loss
+**Scope**: PRE-GC / A1. A1 needs a decided disposition, not necessarily an implementation: either a safe reclamation, or an explicit acceptance of the retention (and of the reduced `auto_delete_days` contract) based on measurement
+**Affected**: GC Phase 6 (suspended), Phase 5 metadata-only retirement (#314)
+**Registered**: 2026-10-19, P6-2; absorbs the reclamation obligation previously recorded under `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`
+
+Nothing reclaims unreachable fs_objects in a live library, or the permanent
+`fs:` references and blocks they hold. That covers objects of publications that
+never reached HEAD, roots of commits outside HEAD's ancestry, and the exclusive
+trees left when Phase 5 retires a commit. Deleted libraries keep their normal
+reclamation path (the guarded library cascade, and Phase 4 while the library
+can still be discovered), and blocks with no reference keep block GC. That path
+is not a universal guarantee: artifacts left after a hard delete are invisible to
+Phase 4 (`ISSUE-GC-ORPHAN-ARTIFACT-DISCOVERY-01`). The amount retained has not been measured: measure first, as for
+`ISSUE-PUBLISH-REPAIR-DEAD-ROW-RETENTION-01`.
+
+Any implementation is one design with separate consumers and explicit retention
+contracts, and must meet:
+
+- publications in flight and content-addressed reuse of an `fs_id`
+  (`ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01`);
+- sharing for every object it reaches, not only those its selector listed
+  (`ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01`,
+  `ISSUE-GC-PHASE5-CASCADE-SHARED-FSOBJECTS-01`);
+- the authority cases: HEAD changes before authorization, a publication during
+  destruction, a worker resuming after losing authority, and timeout/UNKNOWN
+  results that must not release protection unconfirmed;
+- a defined `auto_delete_days` / `version_ttl_days` product contract
+  ([TECHNICAL-DEBT §18](./TECHNICAL-DEBT.md#18-library-history-retention-and-auto-delete-semantics-2026-05-15)).
+
+The certification-window fence alone does not satisfy these (PC-D1B.4 §15).
+[Plan and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md).
 
 ### ISSUE-PUBLISH-REPAIR-REACHABILITY-CONVERGENCE-01: The bounded repair walk can leave UNKNOWN unconvergeable while `pub:` still expires
 

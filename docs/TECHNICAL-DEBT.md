@@ -1531,6 +1531,13 @@ When resuming this line of work, the recommended order is:
 
 Open technical debt. The visible controls are wired and persisted, but they currently describe stronger behavior than the backend actually performs.
 
+**2026-10-19 update:** GC Phase 6 is suspended (no-op) after two reproduced
+destructive defects ([GC-PHASE6-FSOBJECT-TOCTOU](./GC-PHASE6-FSOBJECT-TOCTOU.md)).
+`auto_delete_days` still persists but drives no reclamation at all. The
+reclamation disposition is `ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`
+(PRE-GC / A1); the product decision below must precede any redesign. The Phase 6
+bullets below describe the pre-suspension behavior.
+
 ### What Works Today
 
 - `GET/PUT /api2/repos/:repo_id/history-limit/` persists `keep_days` in `libraries.version_ttl_days`.

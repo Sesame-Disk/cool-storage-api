@@ -3347,18 +3347,21 @@ func TestGC_ZeroRefBlockTwoProducerLeavesNoPendingItem(t *testing.T) {
 		_ = session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, libraryID, fsID).Exec()
 	})
 
-	// Enqueue the fs_object as the live-library version/auto-delete cleanup path does
-	// (scanner Phase 5/6): LibraryGuardNone (the library stays alive, no marker), a
-	// canonical plain representation, and a past queued_at so DequeueBatch takes it.
+	// Enqueue the fs_object as the orphaned-fs_object scan does (scanner Phase 4): the
+	// fixture library has no canonical row, so the guarded path runs and releases the
+	// fs: ref. Unguarded fs_object items are completed without mutation since Phase 6
+	// was suspended, so they can no longer drive this cascade. A canonical plain
+	// representation and a past queued_at so DequeueBatch takes it.
 	if err := queue.EnqueueBatch([]gcpkg.QueueItem{{
-		OrgID:                 orgUUID,
-		QueuedAt:              fsQueuedAt,
-		IdentityAt:            fsQueuedAt,
-		ItemType:              gcpkg.ItemFSObject,
-		ItemID:                fsID,
-		LibraryID:             libraryUUID,
-		BlockRepresentationID: db.PlainBlockRepresentationID,
-		LibraryGuardMode:      gcpkg.LibraryGuardNone,
+		OrgID:                       orgUUID,
+		QueuedAt:                    fsQueuedAt,
+		IdentityAt:                  fsQueuedAt,
+		RequiresLibraryDeletedCheck: true,
+		ItemType:                    gcpkg.ItemFSObject,
+		ItemID:                      fsID,
+		LibraryID:                   libraryUUID,
+		BlockRepresentationID:       db.PlainBlockRepresentationID,
+		LibraryGuardMode:            gcpkg.LibraryGuardCanonicalMustBeAbsent,
 	}}); err != nil {
 		t.Fatalf("enqueue fs_object: %v", err)
 	}

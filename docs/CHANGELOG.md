@@ -8,6 +8,20 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-19 — Phase 6 suspended (P6-2)
+
+Maintainer-chosen option A. `scanAutoDeleteExpiredObjects` is an explicit no-op
+(its selector and `walkFSTree` are removed). `processFSObject` completes every
+unguarded fs_object row before any read, dry-run log, child enqueue, reference
+removal or delete, and counts it in `gc_unguarded_fs_object_items_suspended_total`.
+Guarded cascades, the legacy deleted-check flag and Phase 4 are unchanged. The
+P6-1 real-stack test is rebuilt as GREEN with stale rows seeded in the old
+selector's shape, runs in both standard runners via the isolated e19
+re-execution, and is RED on main's GC runtime. Closes the two Phase 6
+destructive paths on merge. Registers `ISSUE-GC-LIVE-LIBRARY-METADATA-RECLAMATION-01`
+(PRE-GC / A1) and points `ISSUE-AUTO-DELETE-EXPIRY-CONTRACT-01` at its earlier
+source of record, TECHNICAL-DEBT §18. [Contract and evidence](./GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19).
+
 ## 2026-10-19 — Phase 6 TOCTOU and directory cascade reproduced (P6-1)
 
 Evidence only. `TestGCPhase6InFlightSyncPublicationKeepsHeadTree`, behind

@@ -59,6 +59,20 @@ var (
 		[]string{"phase"},
 	)
 
+	// GCUnguardedFSObjectItemsSuspendedTotal counts worker decisions to skip an
+	// ItemFSObject queue item with no effective library guard, without any mutation,
+	// while Phase 6 reclamation is suspended (docs/GC-PHASE6-FSOBJECT-TOCTOU.md). It
+	// counts decisions, not distinct rows: a dry-run worker completes nothing, so it
+	// counts the same row again on every pass. Such rows also appear in
+	// gc_items_processed_total{type="fs_object"} when completed, although nothing was
+	// deleted.
+	GCUnguardedFSObjectItemsSuspendedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gc_unguarded_fs_object_items_suspended_total",
+			Help: "Total number of decisions to skip an unguarded fs_object GC item without mutation while Phase 6 is suspended (repeats per pass in dry-run).",
+		},
+	)
+
 	// GCScannerActionsTotal counts direct cleanup/recovery actions performed by scanner phases.
 	GCScannerActionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -1424,6 +1438,7 @@ func Register() {
 		GCQueueSize,
 		GCItemsProcessedTotal,
 		GCItemsEnqueuedTotal,
+		GCUnguardedFSObjectItemsSuspendedTotal,
 		GCScannerActionsTotal,
 		GCErrorsTotal,
 		GCItemsSkippedTotal,

@@ -2841,6 +2841,19 @@ func (w *Worker) processCommit(item QueueItem) error {
 }
 
 func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
+	// Phase 6 suspension: an unguarded fs_object item carries no authority to
+	// destroy anything. Its selection was computed against an older HEAD, and its
+	// directory cascade would reach children the live tree still uses
+	// (ISSUE-GC-PHASE6-FSOBJECT-EXECUTION-TOCTOU-01,
+	// ISSUE-GC-PHASE6-DIRECTORY-CASCADE-SHARED-FSOBJECTS-01). Complete it before any
+	// read, child enqueue, reference removal or delete, including already-queued
+	// rows. Guarded library cascades keep their existing path below.
+	if effectiveLibraryGuardMode(item.LibraryGuardMode, item.RequiresLibraryDeletedCheck) == LibraryGuardNone {
+		log.Printf("[GC Worker] Phase 6 suspended: completing unguarded fs_object %s in library %s without mutation", item.ItemID, item.LibraryID)
+		metrics.GCUnguardedFSObjectItemsSuspendedTotal.Inc()
+		return nil
+	}
+
 	// Get the fs_object to find its block_ids
 	fsObj, err := w.store.GetFSObject(item.LibraryID, item.ItemID)
 	if err != nil {
@@ -3617,6 +3630,9 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementFSObjectBlocks).
+// Its rows are unguarded: since the Phase 6 suspension the worker completes
+// unguarded fs_object rows without mutation, so this reclaims commits only.
+// Production library cleanup uses the guarded enqueueLibraryContentsAt.
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
 	return w.enqueueLibraryContentsAt(orgID, libraryID, "", storageClass, w.clock(), LibraryGuardNone)
 }
