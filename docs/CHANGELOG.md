@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-21 — seafile-js critical advisory remediation
+
+Update `seafile-js` from 0.2.232 to 0.2.241. Its resolved `axios` and
+`form-data` dependencies move to 1.20.0 and 4.0.6, closing the critical direct
+`seafile-js` path. A clean production audit improves from 39 findings with two
+reported critical entries to 36 findings with one critical entry. The remaining
+critical nested `form-data` comes through `@seafile/sdoc-editor` →
+`rehype-mathjax` → `jsdom` and remains tracked separately; this change does not
+claim that the frontend audit is clean. No application API, schema,
+configuration or storage behavior changes.
+
 ## 2026-10-21 — Go 1.26.10 for CA certificate and TLS advisories
 
 Pin `go.mod` and both build images to Go 1.26.10. This fixes the reachable

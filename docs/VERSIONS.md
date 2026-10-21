@@ -18,7 +18,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 - **Reactstrap**: `8.9.0` (Bootstrap 4 compatible)
 
 ### Key Libraries
-- **seafile-js**: `0.2.232` (Seafile API client - hardcoded endpoints, cannot modify)
+- **seafile-js**: `0.2.241` (Seafile API client - hardcoded endpoints, cannot modify)
 - **moment**: `2.22.2` (date formatting)
 - **i18next**: `17.0.13` (internationalization)
 - **react-select**: `5.7.0`
