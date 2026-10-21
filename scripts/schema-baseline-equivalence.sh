@@ -14,7 +14,7 @@
 # Needs docker only. The Cassandra container and network are created here and
 # removed on exit; no running stack or keyspace is touched.
 #   CASSANDRA_IMAGE (default cassandra:5.0.9, the docker-compose.yaml image)
-#   GO_IMAGE        (default golang:1.25-trixie, the Dockerfile.gotest base)
+#   GO_IMAGE        (default golang:1.26.10-trixie, the Dockerfile.gotest base)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,7 +23,7 @@ export MSYS_NO_PATHCONV=1
 
 REF="${1:-origin/main}"
 CASSANDRA_IMAGE="${CASSANDRA_IMAGE:-cassandra:5.0.9}"
-GO_IMAGE="${GO_IMAGE:-golang:1.25-trixie}"
+GO_IMAGE="${GO_IMAGE:-golang:1.26.10-trixie}"
 NAME="sesamefs-schema-equiv-$$"
 WORK="$(mktemp -d)"
 

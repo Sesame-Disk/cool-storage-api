@@ -20,7 +20,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 
 | Component | Technology | Version |
 |-----------|------------|---------|
-| **Language** | Go | 1.25.12 |
+| **Language** | Go | 1.26.10 |
 | **Database** | Apache Cassandra | 5.0.9 |
 | **Object Storage** | S3-compatible | - |
 | **Archive Storage** | AWS Glacier | - |
@@ -28,6 +28,10 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 | **API Framework** | Gin | 1.11.0 |
 | **Chunking** | FastCDC | - |
 | **Container Base** | Debian Trixie | 13 slim |
+
+Source builds now require Go 1.26.10 or newer. Developers and CI environments
+still using Go 1.25 must upgrade the installed toolchain or allow Go's automatic
+toolchain selection to download Go 1.26.10.
 
 ---
 
