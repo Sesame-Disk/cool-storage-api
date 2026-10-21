@@ -249,9 +249,11 @@ concurrent SeafHTTP finalize; cause unlogged).
 ## PR #258 resource follow-up (2026-10-05)
 
 [ISSUE-FILEFROMBLOCKS-WORKER-FANOUT-01](./KNOWN_ISSUES.md#issue-filefromblocks-worker-fanout-01)
-is P2 GENERAL / OPEN, pre-existing: verifyManifestBlocks and
-ensureCommitBlockOwnLiveness still create workers before semaphore admission.
-Separate from the capture/final-validator bounds in #258.
+is P2 GENERAL, pre-existing, CLOSED-FIX on merge of the bounded fan-out
+(2026-10-21): verifyManifestBlocks and ensureCommitBlockOwnLiveness now admit a
+worker before creating it through runBoundedPublicationChecksWithContext, with
+131,072-block RED/GREEN evidence and request cancellation preserved. Separate
+from the capture/final-validator bounds in #258.
 
 ## PR #258 source-removal identity follow-up (2026-10-05)
 

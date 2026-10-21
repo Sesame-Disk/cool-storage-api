@@ -394,6 +394,24 @@ Current high-value coordinator-hardening coverage in that default path includes:
 - Unit tests remain useful for helper logic, cursor parsing, and pure functions; they are not sufficient by themselves for projection consistency work.
 - When a refactor fixes a cross-table bug, keep the regression test close to the entity area (`*_projection_regression_test.go`, `*_cursor_test.go`, etc.) so future rewrites inherit the coverage.
 
+#### Multi-region file-from-blocks e2e
+
+The `internal/e2e` package (build tag `e2e`) drives the public API of a running
+region pair. It uploads 32 distinct 1 MiB blocks to USA, commits them through
+`/file-from-blocks/`, and reads the file back byte-for-byte from both USA and EU.
+
+```bash
+docker build -f Dockerfile.gotest -t sesamefs-e2e .
+docker run --rm --network sesamefs-mr-cluster \
+  -e SESAMEFS_URL_USA=http://sesamefs-usa:8080 \
+  -e SESAMEFS_URL_EU=http://sesamefs-eu:8080 \
+  sesamefs-e2e go test -tags e2e ./internal/e2e -run TestFileFromBlocksMultiRegion -v
+```
+
+The region pair must run with `WEB_UPLOADS_ENABLE_WEB_BLOCK_UPLOAD=true` and
+`WEB_UPLOADS_BLOCK_UPLOAD_BLOCK_SIZE_MB=1`; the commit validator requires every
+non-final block to be exactly the configured size.
+
 ### Frontend Tests (`frontend`)
 
 Requires: Docker compose test profile

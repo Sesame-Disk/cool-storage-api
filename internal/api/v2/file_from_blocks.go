@@ -59,6 +59,11 @@ type commitBlockPlacement struct {
 
 const blockVerifyConcurrency = 20
 
+// classifyBlockForCommitFn is the per-block classification seam used by
+// verifyManifestBlocks. It exists so the fan-out bound can be tested without
+// a Cassandra session; production always calls (*FileHandler).classifyBlockForCommit.
+var classifyBlockForCommitFn = (*FileHandler).classifyBlockForCommit
+
 const (
 	blockUploadCommitInProgressCode               = "commit_in_progress"
 	blockUploadCommittedDifferentFileConflictCode = "session_committed_different_file"
@@ -618,37 +623,27 @@ func (h *FileHandler) verifyManifestBlocks(ctx context.Context, orgID, referrer 
 	sha1ByHash := make(map[string]string, len(uniqueHashes))
 	placementByHash := make(map[string]commitBlockPlacement)
 	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, blockVerifyConcurrency)
-	for _, hash := range uniqueHashes {
-		hash := hash
-		g.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-			case <-gctx.Done():
-				return gctx.Err()
+	err := runBoundedPublicationChecksWithContext(ctx, len(uniqueHashes), func(_ context.Context, i int) error {
+		hash := uniqueHashes[i]
+		status, sha1, provenance, location, err := classifyBlockForCommitFn(h, orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		result[hash] = status
+		sha1ByHash[hash] = sha1
+		if status == blockStatusReady {
+			placementByHash[hash] = commitBlockPlacement{
+				blockID:      hash,
+				provenance:   provenance,
+				storageClass: location.StorageClass,
+				storageKey:   location.StorageKey,
 			}
-			defer func() { <-sem }()
-			status, sha1, provenance, location, err := h.classifyBlockForCommit(orgID, referrer, hash, sizeByHash[hash], existsMap[hash])
-			if err != nil {
-				return err
-			}
-			mu.Lock()
-			result[hash] = status
-			sha1ByHash[hash] = sha1
-			if status == blockStatusReady {
-				placementByHash[hash] = commitBlockPlacement{
-					blockID:      hash,
-					provenance:   provenance,
-					storageClass: location.StorageClass,
-					storageKey:   location.StorageKey,
-				}
-			}
-			mu.Unlock()
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
+		}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
 		return nil, nil, nil, err
 	}
 	return result, sha1ByHash, placementByHash, nil
@@ -696,8 +691,6 @@ func (h *FileHandler) ensureCommitBlockOwnLiveness(ctx context.Context, orgID, l
 	referrer := db.BlockReferrerForUpload(sessionID)
 	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 	fsHelper := NewFSHelper(h.db)
-	g, gctx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, blockVerifyConcurrency)
 	seen := make(map[string]struct{}, len(blocks))
 	uniqueBlocks := make([]commitBlockPlacement, 0, len(blocks))
 	for _, block := range blocks {
@@ -711,24 +704,17 @@ func (h *FileHandler) ensureCommitBlockOwnLiveness(ctx context.Context, orgID, l
 		if strings.TrimSpace(block.storageClass) == "" || strings.TrimSpace(block.storageKey) != block.storageKey || block.storageKey == "" {
 			return fmt.Errorf("%w: incomplete canonical placement for %s", db.ErrBlockMetadataPermanent, block.blockID)
 		}
-		block := block
-		g.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-			case <-gctx.Done():
-				return gctx.Err()
-			}
-			defer func() { <-sem }()
-			if err := registerUploadedBlockAddProvisionalRefFn(fsHelper, orgID, block.blockID, referrer, libraryID, block.storageClass, expiresAt); err != nil {
-				if errors.Is(err, db.ErrBlockMetadataPermanent) {
-					return fmt.Errorf("add own liveness for %s: %w", block.blockID, err)
-				}
-				return fmt.Errorf("%w: add own liveness for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
-			}
-			return nil
-		})
 	}
-	return g.Wait()
+	return runBoundedPublicationChecksWithContext(ctx, len(uniqueBlocks), func(_ context.Context, i int) error {
+		block := uniqueBlocks[i]
+		if err := registerUploadedBlockAddProvisionalRefFn(fsHelper, orgID, block.blockID, referrer, libraryID, block.storageClass, expiresAt); err != nil {
+			if errors.Is(err, db.ErrBlockMetadataPermanent) {
+				return fmt.Errorf("add own liveness for %s: %w", block.blockID, err)
+			}
+			return fmt.Errorf("%w: add own liveness for %s: %w", ErrBlockMaterializationTransient, block.blockID, err)
+		}
+		return nil
+	})
 }
 
 // validateCommitBlockPublicationFences is the final writer-side check, run
@@ -910,19 +896,36 @@ func classifyBlockOwnership(database *db.DB, orgID, referrer, blockID string) (b
 // runBoundedPublicationChecks bounds goroutine creation, not only active I/O.
 // A canceled check prevents queued work from performing authority reads.
 func runBoundedPublicationChecks(count int, check func(context.Context, int) error) error {
-	g, ctx := errgroup.WithContext(context.Background())
+	return runBoundedPublicationChecksWithContext(context.Background(), count, check)
+}
+
+// runBoundedPublicationChecksWithContext is runBoundedPublicationChecks for a
+// caller that has a request context. Cancellation stops new workers from being
+// created and prevents queued ones from performing their reads.
+func runBoundedPublicationChecksWithContext(ctx context.Context, count int, check func(context.Context, int) error) error {
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(blockVerifyConcurrency)
-	for i := 0; i < count; i++ {
-		if ctx.Err() != nil {
+	for i := range count {
+		if gctx.Err() != nil {
 			break
 		}
 		i := i
 		g.Go(func() error {
-			if err := ctx.Err(); err != nil {
+			if err := gctx.Err(); err != nil {
 				return err
 			}
-			return check(ctx, i)
+			return check(gctx, i)
 		})
 	}
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	// Preserve the pre-existing empty-set behavior: no work was queued, so an
+	// already-canceled context is not an error for a zero-size call.
+	if count == 0 {
+		return nil
+	}
+	// errgroup.Wait cancels its derived context on return, so check the
+	// caller's context to tell parent cancellation from that cleanup.
+	return ctx.Err()
 }
