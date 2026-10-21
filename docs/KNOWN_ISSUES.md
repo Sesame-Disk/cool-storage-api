@@ -2,11 +2,11 @@
 
 ## Deferred dependency advisories (2026-10-21)
 
-**OPEN — deferred, not closed.** [PR #322](https://github.com/Sesame-Disk/sesamefs/pull/322)
-moves the Go toolchain to 1.26.10 for GO-2026-6809 (`crypto/x509`) and
+**OPEN — partially remediated, not closed.** [PR #322](https://github.com/Sesame-Disk/sesamefs/pull/322)
+moved the Go toolchain to 1.26.10 for GO-2026-6809 (`crypto/x509`) and
 GO-2026-6607 (`crypto/tls`). The findings below came from the same
-`govulncheck` / `npm audit` pass and are deliberately excluded from that PR.
-No Go module or frontend lockfile is changed for them here.
+`govulncheck` / `npm audit` pass and are being handled in separate focused
+changes.
 
 ### Go modules
 
@@ -22,29 +22,34 @@ Go suite afterwards.
 
 ### Frontend
 
-The initial production audit (2026-10-21, before the proposed lockfile change)
-reported 39 findings, including two critical findings: `seafile-js` (critical,
-range `0.2.168 - 0.2.237`) and its `form-data` dependency (`4.0.0 - 4.0.5`).
-`seafile-js` 0.2.241 fixes both; this is the first action.
+The initial production audit (2026-10-21, before the lockfile change) reported
+39 findings, including a critical `seafile-js` finding (affected range
+`0.2.168 - 0.2.237`) and critical `form-data` findings (`4.0.0 - 4.0.5`) in
+multiple dependency paths. Updating `seafile-js` to 0.2.241 moves its direct
+`form-data` dependency to 4.0.6 and closes that path.
 
-A proposed lockfile state with `seafile-js` 0.2.241 was audited on 2026-10-21:
-35 production findings remain (13 high, 19 moderate, 3 low, 0 critical).
+The resulting lockfile was installed and audited on 2026-10-21: 36 production
+findings remain (1 critical, 13 high, 19 moderate, 3 low). The remaining
+critical is independent of `seafile-js`: `@seafile/sdoc-editor` 0.5.64 pulls
+`rehype-mathjax` 5.0.0, whose `jsdom` 22.1.0 dependency still resolves
+`form-data` 4.0.0. This remains open for a separate compatible remediation.
 Direct remaining items include `@seafile/sdoc-editor` (high; major upgrade to
 3.0.256), `@seafile/seafile-editor` (moderate; major upgrade to 3.0.47),
 `i18next-http-backend` (moderate; major upgrade to 4.0.4) and `postcss` (high).
 Do not use `npm audit fix --force`.
 
-The dev/tooling audit is larger. A `rehype-mathjax` → nested `form-data`
-4.0.6 override was tested but is not committed. Re-run both
-`npm audit --omit=dev` and `npm audit` against the final lockfile, then build
-the frontend before changing it.
+The full dev/tooling audit is larger: the clean install reports 117 findings
+(8 critical, 34 high, 60 moderate, 15 low). A `rehype-mathjax` → nested
+`form-data` 4.0.6 override was tested but is not committed because it broadens
+this focused direct-dependency update and needs its own compatibility proof.
 
 ### Next
 
-1. Merge #322 as the CA-only change.
+1. Remediate the remaining nested `rehype-mathjax` / `form-data` critical with
+   focused compatibility evidence.
 2. Open a focused Go dependency PR (`x/net`, `excelize`) with the full suite.
-3. Open a focused frontend lockfile PR (`seafile-js` first, then the remaining
-   direct findings); major upgrades need their own verification.
+3. Address the remaining direct frontend findings in separate changes; major
+   upgrades need their own verification.
 
 ## Scoped E1/X1 acceptance (2026-10-16)
 
