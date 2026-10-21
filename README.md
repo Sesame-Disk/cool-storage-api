@@ -29,9 +29,12 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 | **Chunking** | FastCDC | - |
 | **Container Base** | Debian Trixie | 13 slim |
 
-Source builds now require Go 1.26.10 or newer. Developers and CI environments
-still using Go 1.25 must upgrade the installed toolchain or allow Go's automatic
-toolchain selection to download Go 1.26.10.
+Source builds require at least Go 1.26.10. For the two CA/TLS advisories fixed
+by this release, the verified fixed baselines are Go 1.26.10 and Go 1.27.3;
+Go 1.27.0 through 1.27.2 do not contain both fixes. Developers and CI still on
+Go 1.25 must upgrade or allow automatic toolchain selection to download Go
+1.26.10. Verify later Go release lines against the advisories before using them
+for security-sensitive builds.
 
 ---
 
@@ -77,7 +80,8 @@ The original phase checklist is archived in
 ### Prerequisites
 
 - **Docker & Docker Compose v2** - [Install Docker](https://docs.docker.com/get-docker/)
-- **Go 1.25+** - [Install Go](https://go.dev/doc/install) (only needed to run outside Docker)
+- **Go 1.26.10 or Go 1.27.3** - [Install Go](https://go.dev/doc/install)
+  (only needed outside Docker; verify later release lines against the CA/TLS advisories)
 
 ### Quick Start (Development)
 

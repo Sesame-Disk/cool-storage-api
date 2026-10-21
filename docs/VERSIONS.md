@@ -42,8 +42,12 @@ This document tracks the versions of all major dependencies and frameworks used 
 
 ### Core
 - **Go**: `1.26.10` (`go.mod`; build image `golang:1.26.10-trixie`)
-  - Source builds require Go 1.26.10 or newer. Go 1.25 users must upgrade or
+  - Source builds require at least Go 1.26.10. Go 1.25 users must upgrade or
     allow automatic toolchain selection to download Go 1.26.10.
+  - The verified fixed baselines for GO-2026-6809 and GO-2026-6607 are Go
+    1.26.10 and Go 1.27.3. Go 1.27.0 through 1.27.2 do not contain both fixes;
+    verify later Go release lines against the advisories rather than treating
+    every numerically newer toolchain as fixed.
 - **Gin**: `v1.11.0` (`go.mod`) — this project uses Gin, not Echo
 
 ### Database

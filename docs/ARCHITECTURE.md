@@ -807,7 +807,7 @@ requires a separately certified migration before GC can be reconsidered.
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| **Go** | 1.26.10 | Minimum source-build version; matches `go.mod` and the build image |
+| **Go** | 1.26.10 | Minimum source-build version and pinned production builder; secure newer-branch baselines are tracked in `VERSIONS.md` |
 | **Debian** | Trixie 13 slim | `debian:trixie-slim` |
 | **Cassandra** | 5.0.9 | Matches the Compose images; pin a digest for production acceptance |
 | **gocql driver** | v2.0.0 | Apache official driver |
