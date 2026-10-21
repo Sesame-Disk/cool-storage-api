@@ -1,5 +1,15 @@
 # Open Work Index
 
+## Deferred dependency advisories (2026-10-21)
+
+[PR #322](https://github.com/Sesame-Disk/sesamefs/pull/322) fixes the CA/TLS
+standard-library advisories only. The remaining reachable Go module findings
+(`golang.org/x/net`, `excelize`) and the frontend lockfile findings — critical
+`form-data` via `seafile-js` before the proposed bump, direct editor/postcss
+highs, and the dev backlog — are tracked in
+[KNOWN_ISSUES](./KNOWN_ISSUES.md#deferred-dependency-advisories-2026-10-21).
+Deferred, not closed; no dependency is changed by this note.
+
 ## Phase 6 suspended, P6-2 (2026-10-19)
 
 [Option A](./GC-PHASE6-FSOBJECT-TOCTOU.md#p6-2-phase-6-suspended-2026-10-19): the
