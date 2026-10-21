@@ -762,7 +762,7 @@ run_go_tests() {
 
         # Build and run tests in Docker
         docker build -t sesamefs-gotest -f - "$PROJECT_DIR" << 'EOF'
-FROM golang:1.25-alpine
+FROM golang:1.26.10-alpine
 RUN apk add --no-cache git
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -826,7 +826,7 @@ run_go_integration_tests() {
         log_info "Go not installed locally, using Docker..."
 
         docker build -t sesamefs-gointegration -f - "$PROJECT_DIR" << 'EOF'
-FROM golang:1.25-alpine
+FROM golang:1.26.10-alpine
 RUN apk add --no-cache git
 WORKDIR /app
 COPY go.mod go.sum ./

@@ -1,6 +1,6 @@
 # Software Versions Reference
 
-**Last Updated**: 2026-01-22
+**Last Updated**: 2026-10-21
 
 This document tracks the versions of all major dependencies and frameworks used in SesameFS. Always check this file before making assumptions about API compatibility or syntax.
 
@@ -41,7 +41,13 @@ This document tracks the versions of all major dependencies and frameworks used 
 ## Backend (Go)
 
 ### Core
-- **Go**: `1.25.12` (`go.mod`; build image `golang:1.25.12-trixie`)
+- **Go**: `1.26.10` (`go.mod`; build image `golang:1.26.10-trixie`)
+  - Source builds require at least Go 1.26.10. Go 1.25 users must upgrade or
+    allow automatic toolchain selection to download Go 1.26.10.
+  - The verified fixed baselines for GO-2026-6809 and GO-2026-6607 are Go
+    1.26.10 and Go 1.27.3. Go 1.27.0 through 1.27.2 do not contain both fixes;
+    verify later Go release lines against the advisories rather than treating
+    every numerically newer toolchain as fixed.
 - **Gin**: `v1.11.0` (`go.mod`) — this project uses Gin, not Echo
 
 ### Database
@@ -61,7 +67,7 @@ This document tracks the versions of all major dependencies and frameworks used 
 
 ### Base Images
 - **Frontend**: `node:22-bookworm` → `nginx:stable-alpine` (multi-stage build, `frontend/Dockerfile`)
-- **Backend**: `golang:1.25.12-trixie` → `debian:trixie-slim` (multi-stage build, `Dockerfile`)
+- **Backend**: `golang:1.26.10-trixie` → `debian:trixie-slim` (multi-stage build, `Dockerfile`)
 - **Cassandra**: `cassandra:5.0.9` (pin the exact digest for production/acceptance)
 - **MinIO**: (check docker-compose.yaml)
 
