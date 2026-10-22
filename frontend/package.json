@@ -114,7 +114,10 @@
     ]
   },
   "overrides": {
-    "serialize-javascript": ">=7.0.3"
+    "serialize-javascript": ">=7.0.3",
+    "rehype-mathjax": {
+      "form-data": "4.0.6"
+    }
   },
   "devDependencies": {
     "@babel/core": "^7.16.0",

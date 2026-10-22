@@ -3,13 +3,13 @@
 ## Deferred dependency advisories (2026-10-21)
 
 [PR #322](https://github.com/Sesame-Disk/sesamefs/pull/322) fixes the CA/TLS
-standard-library advisories. The `seafile-js` 0.2.241 slice closes its direct
-critical path, but a critical nested `form-data` remains through
-`@seafile/sdoc-editor` → `rehype-mathjax` → `jsdom`. That finding, the reachable
-Go module findings (`golang.org/x/net`, `excelize`), direct editor/postcss highs
+standard-library advisories. The `seafile-js` 0.2.241 slice and the
+`rehype-mathjax` → nested `form-data` 4.0.6 override close the known critical
+production paths; the production audit reports 0 critical. The reachable Go
+module findings (`golang.org/x/net`, `excelize`), direct editor/postcss highs
 and the dev backlog are tracked in
 [KNOWN_ISSUES](./KNOWN_ISSUES.md#deferred-dependency-advisories-2026-10-21).
-Partially remediated, not closed.
+No known critical production path; partially remediated, not closed.
 
 ## Phase 6 suspended, P6-2 (2026-10-19)
 
