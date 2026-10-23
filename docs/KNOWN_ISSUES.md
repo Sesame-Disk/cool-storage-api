@@ -28,27 +28,27 @@ The initial production audit (2026-10-21, before the lockfile change) reported
 multiple dependency paths. Updating `seafile-js` to 0.2.241 moves its direct
 `form-data` dependency to 4.0.6 and closes that path.
 
-The resulting lockfile was installed and audited on 2026-10-21: 36 production
-findings remain (1 critical, 13 high, 19 moderate, 3 low). The remaining
-critical is independent of `seafile-js`: `@seafile/sdoc-editor` 0.5.64 pulls
-`rehype-mathjax` 5.0.0, whose `jsdom` 22.1.0 dependency still resolves
-`form-data` 4.0.0. This remains open for a separate compatible remediation.
+The `seafile-js` lockfile was installed and audited on 2026-10-21: 36
+production findings (1 critical, 13 high, 19 moderate, 3 low). The remaining
+critical was independent of `seafile-js`: `@seafile/sdoc-editor` 0.5.64 pulls
+`rehype-mathjax` 5.0.0, whose `jsdom` 22.1.0 dependency resolved `form-data`
+4.0.0. On 2026-10-22 an npm override pinned that nested `form-data` to 4.0.6
+(within jsdom's `^4.0.0` range), closing the path. The production audit is now
+35 findings (0 critical, 13 high, 19 moderate, 3 low).
 Direct remaining items include `@seafile/sdoc-editor` (high; major upgrade to
 3.0.256), `@seafile/seafile-editor` (moderate; major upgrade to 3.0.47),
 `i18next-http-backend` (moderate; major upgrade to 4.0.4) and `postcss` (high).
 Do not use `npm audit fix --force`.
 
-The full dev/tooling audit is larger: the clean install reports 117 findings
-(8 critical, 34 high, 60 moderate, 15 low). A `rehype-mathjax` → nested
-`form-data` 4.0.6 override was tested but is not committed because it broadens
-this focused direct-dependency update and needs its own compatibility proof.
+The full audit including dev/tooling remains larger: the clean install reports
+119 findings (8 critical, 34 high, 62 moderate, 15 low). The override is
+committed in this change and verified by the production build; this does not
+claim a clean dev audit.
 
 ### Next
 
-1. Remediate the remaining nested `rehype-mathjax` / `form-data` critical with
-   focused compatibility evidence.
-2. Open a focused Go dependency PR (`x/net`, `excelize`) with the full suite.
-3. Address the remaining direct frontend findings in separate changes; major
+1. Open a focused Go dependency PR (`x/net`, `excelize`) with the full suite.
+2. Address the remaining direct frontend findings in separate changes; major
    upgrades need their own verification.
 
 ## Scoped E1/X1 acceptance (2026-10-16)

@@ -8,6 +8,18 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-22 — nested form-data override for rehype-mathjax
+
+Pin `rehype-mathjax`'s nested `form-data` to 4.0.6 via an npm override. This
+closes the remaining critical production path left by the `seafile-js` update:
+`@seafile/sdoc-editor` 0.5.64 → `rehype-mathjax` 5.0.0 → `jsdom` 22.1.0. The
+override is within jsdom's `^4.0.0` range. The production audit moves from 36
+findings with one critical to 35 findings with none (13 high, 19 moderate,
+3 low). The full audit including dev/tooling still reports 119 findings
+(8 critical, 34 high, 62 moderate, 15 low); this change does not claim a clean
+frontend audit. No application API, schema, configuration or storage behavior
+changes.
+
 ## 2026-10-21 — seafile-js critical advisory remediation
 
 Update `seafile-js` from 0.2.232 to 0.2.241. Its resolved `axios` and
