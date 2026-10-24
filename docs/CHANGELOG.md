@@ -8,6 +8,17 @@ Session-by-session development history for SesameFS.
 
 Current W2-0 disposition is [CLOSED-EVIDENCE for the covered greenfield v1 mechanism](./X1-CRITICAL-PATH.md). Dated entries below preserve their original snapshots, including superseded W2-0 OPEN claims.
 
+## 2026-10-21 — Go 1.26.10 for CA certificate and TLS advisories
+
+Pin `go.mod` and both build images to Go 1.26.10. This fixes the reachable
+standard-library advisories in `crypto/x509` (GO-2026-6809) and `crypto/tls`
+(GO-2026-6607), together with the other standard-library fixes shipped in Go
+1.26.9 and retained in Go 1.26.10. No application API, schema or configuration
+change.
+
+The separately identified `golang.org/x/net`, `excelize` and frontend npm
+findings are not part of this change and remain tracked for follow-up.
+
 ## 2026-10-21 — Bound file-from-blocks worker creation
 
 `verifyManifestBlocks` and `ensureCommitBlockOwnLiveness` created one goroutine

@@ -1,5 +1,51 @@
 # Known Issues - SesameFS
 
+## Deferred dependency advisories (2026-10-21)
+
+**OPEN — deferred, not closed.** [PR #322](https://github.com/Sesame-Disk/sesamefs/pull/322)
+moves the Go toolchain to 1.26.10 for GO-2026-6809 (`crypto/x509`) and
+GO-2026-6607 (`crypto/tls`). The findings below came from the same
+`govulncheck` / `npm audit` pass and are deliberately excluded from that PR.
+No Go module or frontend lockfile is changed for them here.
+
+### Go modules
+
+`govulncheck ./...` reports all six as reachable from this module.
+
+| Module | Current | Fixed in | Advisories |
+|---|---|---|---|
+| `golang.org/x/net` | v0.56.0 | v0.60.0 | GO-2026-6617, GO-2026-6612, GO-2026-6611, GO-2026-6603 |
+| `github.com/xuri/excelize/v2` | v2.11.0 | v2.11.1-0.20260915055537-22f76f9acb94 | GO-2026-6688, GO-2026-6684 |
+
+Keep the module updates separate from the CA toolchain change and run the full
+Go suite afterwards.
+
+### Frontend
+
+The initial production audit (2026-10-21, before the proposed lockfile change)
+reported 39 findings, including two critical findings: `seafile-js` (critical,
+range `0.2.168 - 0.2.237`) and its `form-data` dependency (`4.0.0 - 4.0.5`).
+`seafile-js` 0.2.241 fixes both; this is the first action.
+
+A proposed lockfile state with `seafile-js` 0.2.241 was audited on 2026-10-21:
+35 production findings remain (13 high, 19 moderate, 3 low, 0 critical).
+Direct remaining items include `@seafile/sdoc-editor` (high; major upgrade to
+3.0.256), `@seafile/seafile-editor` (moderate; major upgrade to 3.0.47),
+`i18next-http-backend` (moderate; major upgrade to 4.0.4) and `postcss` (high).
+Do not use `npm audit fix --force`.
+
+The dev/tooling audit is larger. A `rehype-mathjax` → nested `form-data`
+4.0.6 override was tested but is not committed. Re-run both
+`npm audit --omit=dev` and `npm audit` against the final lockfile, then build
+the frontend before changing it.
+
+### Next
+
+1. Merge #322 as the CA-only change.
+2. Open a focused Go dependency PR (`x/net`, `excelize`) with the full suite.
+3. Open a focused frontend lockfile PR (`seafile-js` first, then the remaining
+   direct findings); major upgrades need their own verification.
+
 ## Scoped E1/X1 acceptance (2026-10-16)
 
 [Final decision submitted for maintainer merge](./E1-FINAL-DISPOSITION.md#final-acceptance-decision-2026-10-16):
