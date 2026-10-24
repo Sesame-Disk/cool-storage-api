@@ -19,6 +19,21 @@ change.
 The separately identified `golang.org/x/net`, `excelize` and frontend npm
 findings are not part of this change and remain tracked for follow-up.
 
+## 2026-10-21 — Bound file-from-blocks worker creation
+
+`verifyManifestBlocks` and `ensureCommitBlockOwnLiveness` created one goroutine
+per distinct manifest block before their semaphore admission, so a supported
+131,072-block manifest could leave tens of thousands of blocked goroutines.
+Both now use `runBoundedPublicationChecksWithContext`, whose `errgroup.SetLimit`
+admits a worker before creation; the request context still stops queued work and
+classification/write errors still fail closed. Two new 131,072-block regressions
+observed 16,791/22,484 extra goroutines on pre-fix main and stay bounded after
+the fix; they pass at `-count=50` and under `-race`, and the full unit suite
+passes. A multi-region e2e commits 32 distinct 1 MiB blocks through USA and
+reads the file back byte-for-byte from both USA and EU; it passed on the
+pre-fix and fixed 2-DC stacks. Closes `ISSUE-FILEFROMBLOCKS-WORKER-FANOUT-01`
+on merge.
+
 ## 2026-10-19 — Phase 6 suspended (P6-2)
 
 Maintainer-chosen option A. `scanAutoDeleteExpiredObjects` is an explicit no-op
